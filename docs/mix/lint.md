@@ -139,7 +139,7 @@ parsed v1, inventoried 2026-09-03):
 {
   "schema_version": 2,
   "tool": "mix lint",
-  "mix_version": "0.50.0",
+  "mix_version": "0.63.0",
   "files": ["worker.mix"],
   "strict_data_files": [],
   "diagnostics": [{

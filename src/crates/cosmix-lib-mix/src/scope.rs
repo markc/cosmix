@@ -761,6 +761,29 @@ impl Scope {
     }
 
     #[inline]
+    /// Bind `name` in the GLOBAL frame — the shared handle when present,
+    /// else the owned `frames[0]`. Safe sibling of `global_slot_ptr` (no
+    /// raw pointers, no γ restriction): `dispatch_event` uses it for the
+    /// dynamic-extent `$event` binding (0.63.0), which must land in the
+    /// frame function bodies fall through to.
+    pub fn set_global(&mut self, name: &str, value: Value) {
+        if let Some(shared) = self.shared_globals.as_ref() {
+            shared.borrow_mut().insert(name.to_string(), value);
+        } else {
+            self.frames[0].insert(name.to_string(), value);
+        }
+    }
+
+    /// Read `name` from the GLOBAL frame ONLY (no local-frame walk) —
+    /// the save half of a global save/restore bracket.
+    pub fn get_global_only(&self, name: &str) -> Option<Value> {
+        if let Some(shared) = self.shared_globals.as_ref() {
+            shared.borrow().get(name).cloned()
+        } else {
+            self.frames[0].get(name).cloned()
+        }
+    }
+
     pub fn set_in_current(&mut self, name: String, value: Value) {
         if let Some(frame) = self.frames.last_mut() {
             frame.insert(name, value);

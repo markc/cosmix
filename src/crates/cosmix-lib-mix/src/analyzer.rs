@@ -1363,8 +1363,13 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
                     };
                     scan(arg);
                     walk_expr_children(arg, &mut |child| scan(child));
-                    if let Some((pos_ptr, code, pos_name)) = found {
-                        composed.insert(pos_ptr);
+                    // Emit only on first insertion: a NESTED substr
+                    // (`substr($s, 1 + substr($s, pos(..), 2), 3)`) rescans
+                    // the same pos node from both levels — one site, one
+                    // note (GLM review of d73304a6, finding 1).
+                    if let Some((pos_ptr, code, pos_name)) = found
+                        && composed.insert(pos_ptr)
+                    {
                         a.diagnostics.push(diag(
                             ctx,
                             code,
@@ -1384,38 +1389,118 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
                 }
             }
         }
+        // Blind-spot arms (GLM review of d73304a6, finding 2):
+        // `walk_expr_children` deliberately skips if-expression internals
+        // and lambda internals (they belong to the embedded-stmt-list
+        // walker), so an advisory pass that promises every spelling must
+        // reach the CONDITIONS and the expression-shaped lambda parts
+        // itself. Branch/lambda BODIES that are statement lists arrive
+        // via advisory_walk's embedded-list pass — no double visits.
+        match expr {
+            Expr::If(ifexpr) => {
+                check_expr(&ifexpr.condition, line, ctx, a, composed);
+                for (c, _) in &ifexpr.else_ifs {
+                    check_expr(c, line, ctx, a, composed);
+                }
+            }
+            Expr::FunctionLiteral { params, body } => {
+                for p in params {
+                    if let Some(d) = &p.default {
+                        check_expr(d, line, ctx, a, composed);
+                    }
+                }
+                if let FunctionBody::Expression(e) = &**body {
+                    check_expr(e, line, ctx, a, composed);
+                }
+            }
+            _ => {}
+        }
         walk_expr_children(expr, &mut |child| check_expr(child, line, ctx, a, composed));
     }
 
-    walk_stmts(stmts, &mut |stmt| {
-        // MIX-D3006 — watch note for the A.1 map-binding flip: every
-        // two-variable iteration, both spellings (`for each $i, $x` and
-        // the 0.63.0 bare `for $i, $x`). Static typing cannot tell a map
-        // iterable from a list, so the note makes every site visible for
-        // one release cycle; it is retired in A.1 when the binding flips.
-        if let StmtKind::ForEach {
-            index_var: Some(_), ..
-        } = &stmt.kind
-        {
-            a.diagnostics.push(diag(
-                ctx,
-                "MIX-D3006",
-                Severity::Note,
-                stmt.line,
-                "two-variable loop binds (index, item) for every iterable today; in release \
-                 A.1 a MAP iterable binds (key, value) instead"
-                    .to_string(),
-                Some(
-                    "over a list nothing changes; if this can iterate a map and uses the \
-                     first variable as a number, migrate to the one-variable key form now"
+    /// Self-contained statement walker: unlike the shared `walk_stmts`
+    /// geometry (built for narrow heuristics), an advisory pass that
+    /// promises coverage must also see (a) statements wrapped by
+    /// `| external` pipes and `&&`/`||` chains, (b) named-fn parameter
+    /// defaults and `= expr` bodies, and (c) the statement lists embedded
+    /// in expressions (if-expression branches, block-lambda bodies) —
+    /// each exactly once (GLM review of d73304a6, finding 2).
+    fn advisory_stmt(
+        stmt: &Stmt,
+        ctx: &FileContext,
+        a: &mut Analysis,
+        composed: &mut HashSet<*const Expr>,
+    ) {
+        match &stmt.kind {
+            StmtKind::PipeToExternal { stmt: inner, .. } => {
+                advisory_stmt(inner, ctx, a, composed);
+                return;
+            }
+            StmtKind::Chain { left, right, .. } => {
+                advisory_stmt(left, ctx, a, composed);
+                advisory_stmt(right, ctx, a, composed);
+                return;
+            }
+            // MIX-D3006 — watch note for the A.1 map-binding flip: every
+            // two-variable iteration, both spellings (`for each $i, $x`
+            // and the 0.63.0 bare `for $i, $x`). Static typing cannot
+            // tell a map iterable from a list, so the note makes every
+            // site visible for one release cycle; retired in A.1 when
+            // the binding flips.
+            StmtKind::ForEach {
+                index_var: Some(_), ..
+            } => {
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-D3006",
+                    Severity::Note,
+                    stmt.line,
+                    "two-variable loop binds (index, item) for every iterable today; in \
+                     release A.1 a MAP iterable binds (key, value) instead"
                         .to_string(),
-                ),
-            ));
+                    Some(
+                        "over a list nothing changes; if this can iterate a map and uses \
+                         the first variable as a number, migrate to the one-variable key \
+                         form now"
+                            .to_string(),
+                    ),
+                ));
+            }
+            // Named-fn parameter defaults and `= expr` bodies:
+            // walk_stmt_exprs has no FunctionDef arm and stmt_bodies
+            // returns nothing for an Expression body.
+            StmtKind::FunctionDef { params, body, .. } => {
+                for p in params {
+                    if let Some(d) = &p.default {
+                        check_expr(d, stmt.line, ctx, a, composed);
+                    }
+                }
+                if let FunctionBody::Expression(e) = body {
+                    check_expr(e, stmt.line, ctx, a, composed);
+                }
+            }
+            _ => {}
         }
         walk_stmt_exprs(stmt, &mut |expr| {
-            check_expr(expr, stmt.line, ctx, a, &mut composed)
+            check_expr(expr, stmt.line, ctx, a, composed)
         });
-    });
+        for body in stmt_bodies(&stmt.kind) {
+            for s in body {
+                advisory_stmt(s, ctx, a, composed);
+            }
+        }
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_embedded_stmt_list(expr, true, &mut |body| {
+                for s in body {
+                    advisory_stmt(s, ctx, a, composed);
+                }
+            })
+        });
+    }
+
+    for stmt in stmts {
+        advisory_stmt(stmt, ctx, a, &mut composed);
+    }
 }
 
 /// Builtins whose "not found" sentinel is `-1` and whose "found at the

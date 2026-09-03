@@ -1936,6 +1936,14 @@ pub trait ServeRuntime {
         req_body: &str,
         handler_commands: &[&str],
     ) -> Option<ReservedOutcome>;
+
+    /// Record an isolated handler fault (error or panic) so the citizen's
+    /// health surface can report it (`lifecycle.health` → `degraded`,
+    /// fault count + last-fault summary). Fault isolation keeps the
+    /// citizen alive (SPEC 18 §3.4); this hook is what keeps it from
+    /// looking *healthy* while blind. Default no-op for runtimes without
+    /// a health surface.
+    fn record_handler_fault(&self, _summary: &str) {}
 }
 
 /// Result of servicing a runtime-reserved verb (see [`ServeRuntime`]).
@@ -2736,6 +2744,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "unsubscribe",
     "reply",
     "quit",
+    "publish",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -4631,6 +4640,25 @@ impl Evaluator {
             // in a handler should affect the outer producer loop).
             self.scope.push_frame();
             self.scope.set("event".to_string(), event_value.clone());
+            // 0.63.0 — $event has DYNAMIC EXTENT across the dispatch: a
+            // fn called from the handler body must see it too. Function
+            // frames only fall through to GLOBALS, so the frame-local
+            // binding above is invisible one call deep — the historical
+            // failure was a helper raising NAME_UNDEFINED on $event,
+            // fault isolation swallowing it, and the citizen staying
+            // "healthy" while its side effects silently never happened
+            // (an hour of live bisection, hub 2133f4b). So the event is
+            // ALSO bound into the global frame for the dispatch and
+            // restored after (prior value, or Nil when there was none —
+            // Scope has no remove; a post-dispatch top-level $event
+            // reads nil, documented in bus.md). A fn-local $event
+            // param/binding still shadows it — normal resolution order.
+            // The name-based readonly guard (check_event_readonly,
+            // in_handler > 0) covers this binding exactly as it covered
+            // the frame-local one. Save/restore nests correctly for
+            // handler-within-handler dispatch.
+            let saved_global_event: Option<Value> = self.scope.get_global_only("event");
+            self.scope.set_global("event", event_value.clone());
 
             // `AssertUnwindSafe`: the `execute` future borrows `&mut
             // self`, which is `!UnwindSafe`. The assertion is sound here
@@ -4667,6 +4695,14 @@ impl Evaluator {
                         error = %e,
                         "Handler body errored; handler remains registered"
                     );
+                    // 0.63.0 — a swallowed fault must still be OBSERVABLE:
+                    // tracing alone can be routed nowhere in a plain
+                    // `mix --serve`, and a healthy-looking blind citizen
+                    // is the worst failure shape a Bus has (noded reports
+                    // delivered=1 while the handler's side effects never
+                    // happen). One line to the evaluator's stderr sink +
+                    // the serve runtime's health surface.
+                    self.record_handler_fault(&event.command, idx, &e.to_string());
                     // Continue with subsequent handlers. Do not propagate.
                 }
                 Err(panic_payload) => {
@@ -4682,6 +4718,12 @@ impl Evaluator {
                         panic = %builtins::sanitize_for_diag(&msg),
                         "Handler body PANICKED; isolated, handler remains \
                          registered (SPEC 18 §3.4)"
+                    );
+                    // Same observability rule as the error arm (0.63.0).
+                    self.record_handler_fault(
+                        &event.command,
+                        idx,
+                        &format!("panic: {}", builtins::sanitize_for_diag(&msg)),
                     );
                     // The unwound `execute` left scope frames, function
                     // floors, the function-depth counter, the var-slot
@@ -4708,6 +4750,11 @@ impl Evaluator {
                     self.ctx.require_stack.truncate(require_floor);
                 }
             }
+
+            // Restore the dispatch-scoped global $event (all arms,
+            // including panic — the rewind above does not know about it).
+            self.scope
+                .set_global("event", saved_global_event.unwrap_or(Value::Nil));
 
             // End-of-iteration permit release.
             // - Writer: RAII via drop(entry_permit) — releases the
@@ -4816,6 +4863,25 @@ impl Evaluator {
     /// error, or a per-scope-entry readonly flag. Don't just extend this
     /// function — the invariant has shifted and the name-based check
     /// is no longer load-bearing for soundness.
+    /// Surface an isolated handler fault (0.63.0): one line to the
+    /// evaluator's stderr sink (tracing can be routed nowhere in a plain
+    /// `mix --serve`, and the historical failure shape was a
+    /// healthy-looking blind citizen) plus the serve runtime's health
+    /// hook when one is installed. Never raises — this runs on the fault
+    /// path and must not displace the isolation semantics.
+    fn record_handler_fault(&mut self, command: &str, handler_index: usize, detail: &str) {
+        let summary = format!("handler fault: {command}[{handler_index}]: {detail}");
+        {
+            let mut g = self.globals.borrow_mut();
+            let _ = writeln!(g.stderr, "mix: {summary} (handler remains registered)");
+            let _ = g.stderr.flush();
+        }
+        let runtime = self.globals.borrow().serve_runtime.clone();
+        if let Some(rt) = runtime {
+            rt.record_handler_fault(&summary);
+        }
+    }
+
     fn check_event_readonly(&self, name: &str) -> MixResult<()> {
         if self.ctx.in_handler > 0 && name == "event" {
             return Err(self.runtime_err(
@@ -10624,6 +10690,18 @@ impl Evaluator {
                         return Ok(reply);
                     }
 
+                    // publish(topic, body[, opts]) — one-call topic publish
+                    // (0.63.0): builds the SPEC-02 wire frame and routes it
+                    // through `send noded topic.publish name=… retain=…
+                    // body=…`. Removes the two recorded traps: the
+                    // hand-built `---\n…\n---\n` frame, and `body=` being
+                    // required before `name=`/`retain=` header-route.
+                    // Sets $rc/$result exactly like `send`; returns rc.
+                    if name == "publish" {
+                        self.check_capability(name)?; // Knob A — CapabilityClass::Bus
+                        return self.exec_publish(eval_args).await;
+                    }
+
                     // HOF (eval) builtins — checked before pure builtins
                     // so a HOF entry can shadow a same-named pure stub
                     // during migration. In practice HOF names (sort_by,
@@ -12739,6 +12817,177 @@ impl Evaluator {
     }
 
     /// Execute a send command: evaluate args, call Bus handler, set $rc and $result.
+    /// `publish(topic, body[, opts])` — see the FunctionCall special arm.
+    ///
+    /// Contract (documented in bus.md):
+    /// - `topic`: non-empty string, no newline/CR (frame-injection guard).
+    ///   It is both the noded `name=` and, by default, the inner frame's
+    ///   `command:` header (what subscribers' `on` matches).
+    /// - `body`: the payload STRING (or nil → empty). Maps/lists are
+    ///   refused with a pointer at json_encode — no hidden encoding.
+    /// - `opts` map: `retain` (bool or "true"/"false", default false),
+    ///   `command` (override the inner frame header — the fleet publishes
+    ///   `svc.corner.entered` with inner command `corner.entered`),
+    ///   `headers` (map of extra frame header lines; keys must not
+    ///   contain `:`/newline, values must not contain newline).
+    /// - `$rc`/`$result` set exactly like `send`; the rc is returned, so
+    ///   `if publish(..) != 0` reads naturally.
+    async fn exec_publish(&mut self, args: Vec<Value>) -> MixResult<Value> {
+        let topic = match args.first() {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => {
+                return Err(self.runtime_err(
+                    "publish: topic (first argument) must be a non-empty string",
+                ));
+            }
+        };
+        if topic.contains('\n') || topic.contains('\r') {
+            return Err(self.runtime_err("publish: topic must not contain newlines"));
+        }
+        let payload = match args.get(1) {
+            None | Some(Value::Nil) => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(v @ (Value::Map(_) | Value::List(_))) => {
+                return Err(self.runtime_err(format!(
+                    "publish: body must be a string, got {} — encode it first \
+                     (json_encode) so the wire format is explicit",
+                    v.type_name()
+                )));
+            }
+            Some(v) => v.to_mix_string(),
+        };
+        let mut retain = false;
+        let mut command_hdr = topic.clone();
+        let mut extra_headers: Vec<(String, String)> = Vec::new();
+        match args.get(2) {
+            None | Some(Value::Nil) => {}
+            Some(Value::Map(opts)) => {
+                for (k, v) in opts.iter() {
+                    match k.as_str() {
+                        "retain" => {
+                            retain = match v {
+                                Value::Bool(b) => *b,
+                                Value::String(s) if s == "true" => true,
+                                Value::String(s) if s == "false" => false,
+                                other => {
+                                    return Err(self.runtime_err(format!(
+                                        "publish: retain must be a bool, got {}",
+                                        other.type_name()
+                                    )));
+                                }
+                            };
+                        }
+                        "command" => {
+                            let c = v.to_mix_string();
+                            if c.is_empty() || c.contains('\n') || c.contains('\r') {
+                                return Err(self.runtime_err(
+                                    "publish: command override must be a non-empty \
+                                     string without newlines",
+                                ));
+                            }
+                            command_hdr = c;
+                        }
+                        "headers" => {
+                            let Value::Map(hdrs) = v else {
+                                return Err(self.runtime_err(format!(
+                                    "publish: headers must be a map, got {}",
+                                    v.type_name()
+                                )));
+                            };
+                            for (hk, hv) in hdrs.iter() {
+                                let hv = hv.to_mix_string();
+                                if hk.is_empty()
+                                    || hk.contains(':')
+                                    || hk.contains('\n')
+                                    || hk.contains('\r')
+                                    || hv.contains('\n')
+                                    || hv.contains('\r')
+                                {
+                                    return Err(self.runtime_err(format!(
+                                        "publish: header '{hk}' — keys must be \
+                                         colon- and newline-free, values \
+                                         newline-free (frame-injection guard)"
+                                    )));
+                                }
+                                extra_headers.push((hk.clone(), hv));
+                            }
+                        }
+                        other => {
+                            return Err(self.runtime_err(format!(
+                                "publish: unknown option '{other}' \
+                                 (retain, command, headers)"
+                            )));
+                        }
+                    }
+                }
+            }
+            Some(other) => {
+                return Err(self.runtime_err(format!(
+                    "publish: third argument must be an options map, got {}",
+                    other.type_name()
+                )));
+            }
+        }
+        if args.len() > 3 {
+            return Err(self.runtime_err(format!(
+                "publish takes (topic, body, opts); got {} arguments",
+                args.len()
+            )));
+        }
+
+        // The SPEC-02 wire frame subscribers receive.
+        let mut frame = format!("---\ncommand: {command_hdr}\n");
+        for (k, v) in &extra_headers {
+            frame.push_str(k);
+            frame.push_str(": ");
+            frame.push_str(v);
+            frame.push('\n');
+        }
+        frame.push_str("---\n");
+        frame.push_str(&payload);
+
+        let mut args_map = IndexMap::new();
+        args_map.insert("name".to_string(), Value::String(topic));
+        args_map.insert(
+            "retain".to_string(),
+            Value::String(if retain { "true" } else { "false" }.to_string()),
+        );
+        args_map.insert("body".to_string(), Value::String(frame));
+        let args_value = Value::map(args_map);
+
+        // Same degrade/transport contract as exec_send, without the
+        // per-send timeout leg (publish is fire-to-broker; add a
+        // timeout option if a real caller ever needs one).
+        let bus_handler = self.globals.borrow().bus_handler.clone();
+        let handler = match bus_handler {
+            Some(h) => h,
+            None => {
+                self.scope
+                    .update_or_set("rc", Value::Number(RC_UNAVAILABLE as f64));
+                self.scope.update_or_set(
+                    "result",
+                    Value::String("Bus not available (no handler registered)".to_string()),
+                );
+                return Ok(Value::Number(RC_UNAVAILABLE as f64));
+            }
+        };
+        let fut = handler.send("noded", "topic.publish", &args_value);
+        match self.await_with_class_c_yield(fut).await? {
+            Ok((rc, result)) => {
+                self.scope.update_or_set("rc", Value::Number(rc as f64));
+                self.scope.update_or_set("result", result);
+                Ok(Value::Number(rc as f64))
+            }
+            Err(e) => {
+                self.scope
+                    .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
+                self.scope
+                    .update_or_set("result", Value::String(e.to_string()));
+                Ok(Value::Number(RC_TRANSPORT as f64))
+            }
+        }
+    }
+
     fn exec_send<'a>(
         &'a mut self,
         target: &'a Expr,

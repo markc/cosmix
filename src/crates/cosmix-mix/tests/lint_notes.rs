@@ -115,3 +115,33 @@ fn ufcs_spelling_is_noted_too() {
     let (_, out) = lint(&[path.to_str().unwrap()]);
     assert!(out.contains("MIX-D3001"), "UFCS spelling noted: {out}");
 }
+
+#[test]
+fn advisory_pass_sees_wrapped_and_expression_shapes() {
+    // The walker-geometry blind spots from the GLM review of d73304a6
+    // (finding 2), each pinned: piped two-var loop, chained call,
+    // if-expression condition, lambda default + expression body,
+    // named-fn `= expr` body — and the nested-substr dedupe (finding 1).
+    let src = "for each $i, $x in [1] print($i) end | cat\n\
+        send noded noded.ping && print(pos(\"a\", \"ab\"))\n\
+        $y = if pos(\"b\", \"abc\") > 0 then 1 else 2 end\n\
+        $f = fn($a = pos(\"c\", \"c\")) = regex_match(\"^x\", $a)\n\
+        fn g() = grep(\"z\", \"z\")\n\
+        $r = substr(\"abc\", 1 + substr(\"abc\", pos(\"b\", \"abc\"), 1), 1)\n";
+    let path = write_temp("blind_shapes", src);
+    let (code, out) = lint(&[path.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("blind_shapes.mix:1: MIX-D3006"), "piped loop: {out}");
+    assert!(out.contains("blind_shapes.mix:2: MIX-D3008"), "chained: {out}");
+    assert!(out.contains("blind_shapes.mix:3: MIX-D3008"), "if-expr cond: {out}");
+    assert!(out.contains("blind_shapes.mix:4: MIX-D3008"), "lambda default: {out}");
+    assert!(out.contains("blind_shapes.mix:4: MIX-D3001"), "lambda expr body: {out}");
+    assert!(out.contains("blind_shapes.mix:5: MIX-D3005"), "fn expr body: {out}");
+    // Exactly one composed note for the nested substr — not two.
+    assert_eq!(
+        out.matches("composes a 1-based position").count(),
+        1,
+        "one site, one note: {out}"
+    );
+    assert!(out.contains("0 error(s), 0 warning(s), 7 note(s)"), "{out}");
+}

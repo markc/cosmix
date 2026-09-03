@@ -49,6 +49,13 @@ pub struct MixServeRuntime {
     started_wall: String,
     /// Precomputed `<svc>.props.` prefix (avoids per-request format!).
     props_prefix: String,
+    /// Isolated handler faults recorded via
+    /// [`ServeRuntime::record_handler_fault`] (0.63.0). Interior
+    /// mutability because the runtime is shared as `Rc<dyn ServeRuntime>`;
+    /// single-threaded by construction (the evaluator is `!Send`).
+    handler_faults: std::cell::Cell<u64>,
+    /// Summary of the most recent fault, for `lifecycle.last_fault`.
+    last_fault: std::cell::RefCell<Option<String>>,
 }
 
 /// Operating-mode value for `lifecycle.mode`. A Phase-1 serve citizen
@@ -59,6 +66,10 @@ const MODE_SERVING: &str = "serving";
 /// degradation path (handler faults are isolated by WS6, not surfaced
 /// as daemon-wide health yet), so this is a constant `ok`.
 const HEALTH_OK: &str = "ok";
+/// `lifecycle.health` once at least one handler fault has been isolated
+/// (0.63.0 — the described "ok | degraded | failing" domain gains its
+/// first live degradation path).
+const HEALTH_DEGRADED: &str = "degraded";
 /// SPEC 07 §9 declared conformance level. WS4 ships L0 + L1
 /// (props.{get,list,describe}); L2 (`props.watch` + `props.changed`)
 /// and L3 (`world.<svc>`) are explicit Phase-1 non-goals.
@@ -75,17 +86,21 @@ impl MixServeRuntime {
             started_at: Instant::now(),
             started_wall: chrono::Utc::now().to_rfc3339(),
             props_prefix,
+            handler_faults: std::cell::Cell::new(0),
+            last_fault: std::cell::RefCell::new(None),
         }
     }
 
-    /// The five lifecycle leaf paths, in stable declaration order.
-    fn leaf_paths() -> [&'static str; 5] {
+    /// The seven lifecycle leaf paths, in stable declaration order.
+    fn leaf_paths() -> [&'static str; 7] {
         [
             "lifecycle.started_at",
             "lifecycle.uptime_s",
             "lifecycle.mode",
             "lifecycle.health",
             "lifecycle.props_level",
+            "lifecycle.handler_faults",
+            "lifecycle.last_fault",
         ]
     }
 
@@ -199,6 +214,16 @@ impl PropTree for MixServeRuntime {
         // uptime_s is live: recomputed from the monotonic clock on
         // every snapshot (props.get), never a stale cached field.
         let uptime_s = self.started_at.elapsed().as_secs();
+        // 0.63.0 — isolated handler faults degrade health instead of
+        // hiding: a citizen that swallowed a raise used to look exactly
+        // like a healthy one (the blind-but-healthy failure shape).
+        let faults = self.handler_faults.get();
+        let health = if faults > 0 { HEALTH_DEGRADED } else { HEALTH_OK };
+        let last_fault = self
+            .last_fault
+            .borrow()
+            .clone()
+            .unwrap_or_default();
         build_snapshot([
             (
                 PropPath::new("lifecycle.started_at").unwrap(),
@@ -214,11 +239,19 @@ impl PropTree for MixServeRuntime {
             ),
             (
                 PropPath::new("lifecycle.health").unwrap(),
-                PropValue::from(HEALTH_OK),
+                PropValue::from(health),
             ),
             (
                 PropPath::new("lifecycle.props_level").unwrap(),
                 PropValue::from(PROPS_LEVEL),
+            ),
+            (
+                PropPath::new("lifecycle.handler_faults").unwrap(),
+                PropValue::from(faults),
+            ),
+            (
+                PropPath::new("lifecycle.last_fault").unwrap(),
+                PropValue::from(last_fault),
             ),
         ])
     }
@@ -256,12 +289,41 @@ impl PropTree for MixServeRuntime {
                 String,
                 "SPEC 07 conformance level (L0 | L1 | L2 | L3).",
             )),
+            "lifecycle.handler_faults" => Some(
+                PropDescribe::leaf(
+                    path.clone(),
+                    Number,
+                    "Isolated handler faults (errors + panics) since start; \
+                     > 0 flips health to degraded.",
+                )
+                .with_transient(true),
+            ),
+            "lifecycle.last_fault" => Some(
+                PropDescribe::leaf(
+                    path.clone(),
+                    String,
+                    "Summary of the most recent isolated handler fault \
+                     (empty when none).",
+                )
+                .with_transient(true),
+            ),
             _ => None,
         }
     }
 }
 
 impl ServeRuntime for MixServeRuntime {
+    fn record_handler_fault(&self, summary: &str) {
+        self.handler_faults.set(self.handler_faults.get() + 1);
+        // Bound the stored summary: the fault detail can carry request
+        // data; the props surface is a health signal, not a log.
+        let mut s = summary.to_string();
+        if s.chars().count() > 200 {
+            s = s.chars().take(200).collect::<String>() + "…";
+        }
+        *self.last_fault.borrow_mut() = Some(s);
+    }
+
     fn handle_reserved(
         &self,
         command: &str,
@@ -394,6 +456,37 @@ mod tests {
         assert_eq!(lc["props_level"], PROPS_LEVEL);
         assert!(lc["started_at"].is_string());
         assert!(lc["uptime_s"].is_number());
+        // 0.63.0 fault surface, quiescent state.
+        assert_eq!(lc["handler_faults"], 0);
+        assert_eq!(lc["last_fault"], "");
+    }
+
+    #[test]
+    fn recorded_fault_degrades_health_and_surfaces_summary() {
+        // The observable half of SPEC 18 fault isolation (0.63.0): a
+        // citizen that swallowed a raise must stop LOOKING healthy.
+        let r = rt();
+        r.record_handler_fault("handler fault: play.note[0]: boom");
+        r.record_handler_fault("handler fault: play.note[0]: boom again");
+        let out = r
+            .handle_reserved("statecache.props.get", None, "", &[])
+            .unwrap();
+        let v: Json = serde_json::from_str(&out.body).unwrap();
+        let lc = &v["lifecycle"];
+        assert_eq!(lc["health"], HEALTH_DEGRADED);
+        assert_eq!(lc["handler_faults"], 2);
+        assert_eq!(lc["last_fault"], "handler fault: play.note[0]: boom again");
+    }
+
+    #[test]
+    fn fault_summary_is_bounded() {
+        // The props surface is a health signal, not a log — a fault
+        // detail carrying request data is truncated.
+        let r = rt();
+        r.record_handler_fault(&"x".repeat(500));
+        let stored = r.last_fault.borrow().clone().unwrap();
+        assert!(stored.chars().count() <= 201, "200 + ellipsis");
+        assert!(stored.ends_with('…'));
     }
 
     #[test]
@@ -502,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn props_list_enumerates_the_five_leaves() {
+    fn props_list_enumerates_the_seven_leaves() {
         let r = rt();
         let out = r
             .handle_reserved("statecache.props.list", None, "", &[])
@@ -518,7 +611,9 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "lifecycle.handler_faults",
                 "lifecycle.health",
+                "lifecycle.last_fault",
                 "lifecycle.mode",
                 "lifecycle.props_level",
                 "lifecycle.started_at",

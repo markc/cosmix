@@ -167,6 +167,41 @@ Gotchas:
 
 ---
 
+## `publish(topic, body[, opts])` — one-call topic publish (0.63.0)
+
+Publishing to a topic used to require two pieces of lore: the body handed
+to `noded topic.publish` must itself be a **SPEC-02 wire frame**
+(`---\ncommand: …\n---\npayload`), and the `send` needed `body=` spelled
+before `name=`/`retain=` would header-route. `publish()` does both:
+
+```mix
+$rc2 = publish("comp.corner.entered", json_encode({corner: "tl"}))
+if $rc2 != 0 then eprint("publish failed: " .. $result) end
+```
+
+- `topic` — the noded topic name; by default it is also the inner frame's
+  `command:` header (what subscribers' `on` matches).
+- `body` — the payload **string** (`json_encode` a map first — the wire
+  format is the caller's choice, never hidden). `nil`/absent → empty.
+- `opts` — `{retain: bool}` (default false); `{command: "corner.entered"}`
+  overrides the inner frame header (the fleet publishes topic
+  `comp.corner.entered` with inner command `corner.entered`);
+  `{headers: {event_seq: 1042}}` adds frame header lines. Topic, command
+  and headers are newline-checked — frame injection raises instead of
+  corrupting the wire.
+
+Sets `$rc`/`$result` exactly like `send` and returns the rc, so
+`if publish(..) != 0` reads naturally. Without a broker it degrades like
+`send`: `$rc = -3`, non-fatal.
+
+**Hyphenated targets — quote them.** `send comp-nested …` parses the bare
+hyphen as subtraction; write `send "comp-nested" …`. Hyphenated service
+names are the norm on the mesh, so this bites early — quoting is the
+supported spelling (a bare-hyphen grammar change would collide with
+arithmetic and is not planned).
+
+---
+
 ## `address` — a block of implicit sends to one target
 
 `address <target> … end` opens a block where **each line is an implicit send**
@@ -322,6 +357,16 @@ on topic.delivery
 end
 ```
 
+**`$event` has dynamic extent** (0.63.0): a `fn` the handler body calls —
+at any depth — sees the same `$event`, so helpers like
+`fn describe() return $event.headers["topic"] end` work. (Before 0.63.0
+the handler→fn hop lost it — function frames only fall through to globals
+— and the resulting `NAME_UNDEFINED` was swallowed by fault isolation:
+the blind-but-healthy citizen.) A fn's own `$event` parameter or local
+still shadows it; `$event` stays read-only inside the dispatch; after the
+dispatch a top-level `$event` global is restored (or reads `nil` if there
+was none).
+
 `$event.args` is a convenience view of the body: when the sender used the
 JSON-body path — a **positional** `send svc cmd "a" "b"` (which arrives as
 `{"_0":"a","_1":"b"}`) or a **map** arg — the body is already-parsed JSON, so
@@ -416,6 +461,15 @@ handlers. This is the AmigaOS "application with an ARexx port" model — a
 long-lived, addressable Mix process that *is* a service. The full lifecycle
 contract (registration, reconnect/backoff, handler fault isolation, graceful
 `SIGTERM`/`QUIT` shutdown, health properties) is **SPEC 18**.
+
+**Handler faults are isolated but OBSERVABLE** (0.63.0). A raise or panic
+in a handler body never kills the citizen (SPEC 18 §3.4) — but it no
+longer disappears either: one `mix: handler fault: <command>[N]: …` line
+reaches stderr, `lifecycle.health` flips to `degraded`, and
+`lifecycle.handler_faults` / `lifecycle.last_fault` count and name it in
+the props surface. Before 0.63.0 a faulting handler looked exactly like a
+healthy one (noded reported `delivered=1` while its side effects silently
+never happened).
 
 A live citizen answers the standard verbs like any Rust daemon:
 
