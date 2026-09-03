@@ -303,15 +303,35 @@ true
 true
 ```
 
-**`List == List` is always `false`** (and likewise maps) — there is no deep
-structural comparison. Destructure or compare element-by-element instead:
+**`==` / `!=` with a map or list on BOTH sides raises `TYPE_ERROR`** (0.68.0).
+Use **`deep_eq(a, b)`** for structural comparison:
 
 ```mix
-print([1, 2] == [1, 2])   -- always false, even when "equal"
+print(deep_eq([1, 2], [1, 2]))   -- true
+print([1, 2] == [1, 2])          -- raises TYPE_ERROR, naming deep_eq
 ```
 ```text
-false
+true
 ```
+
+Until 0.68.0 the comparison answered — always, whatever the contents: `false`
+for `==`, `true` for `!=`. That is a constant wearing a comparison's clothes,
+which is why it now raises rather than quietly misleading.
+
+Only **both**-collection comparisons raise. A collection against a **scalar**
+still answers, because that is a genuine type difference and `false` is
+truthful — which keeps the key-absence idiom working:
+
+```mix
+$reg = {}
+print($reg["k"] == nil)   -- true
+$reg.k = [1, 2]
+print($reg["k"] == nil)   -- false  (present; the value is a list)
+print([1, 2] == "text")   -- false
+```
+
+See [collections](collections.md#list--list-raises-0680--use-deep_eq) for the
+full rule, including which builtins are and are not affected.
 
 ### Ordering `<` `>` `<=` `>=` — numeric-first, lexicographic fallback
 

@@ -591,9 +591,10 @@ same joined:   true
 
 ### A collection compared to a SCALAR still answers — `$m[$k] == nil` works
 
-Only collection-vs-collection raises. A collection and a scalar differ by
-*type*, so `false` is the truthful answer — exactly as `1 == "a"` is honestly
-false — and nothing about it is a constant-in-disguise:
+Only collection-vs-collection raises. A same-type `false` **misleads** — it
+invites the reading "these two lists differ", which is not what was computed.
+A collection and a scalar differ by *type*, so `false` there is truthful,
+exactly as `1 == "a"` is honestly false:
 
 ```mix
 $reg = {}

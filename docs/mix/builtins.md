@@ -105,7 +105,7 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
 
 ## type  — see [numbers](numbers.md)
 
-  deep_eq         Structural equality for any two values: maps compare by key set + deep_eq values (insertion order IGNORED), lists elementwise in order, scalars as ==. The answer `==` cannot give for maps/lists (it is always false there today). Caveats, inherited from ==: a FUNCTION value is never equal (even to itself — a callback-bearing map is not deep_eq its own copy) and Buffer-vs-Bytes is false (freeze() first). Raises past 512 nesting levels
+  deep_eq         Structural equality for any two values: maps compare by key set + deep_eq values (insertion order IGNORED), lists elementwise in order, scalars as ==. The answer `==` cannot give for maps/lists — since v0.68.0 `==`/`!=` RAISES when both sides are a map or list, and names this builtin. Caveats, inherited from ==: a FUNCTION value is never equal (even to itself — a callback-bearing map is not deep_eq its own copy) and Buffer-vs-Bytes is false (freeze() first). Raises past 512 nesting levels
   type            Return type name: string, number, bool, list, map, nil
   to_number       Convert value to number (nil if not numeric)
   to_string       Convert value to its string representation

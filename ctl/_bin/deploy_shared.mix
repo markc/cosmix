@@ -373,7 +373,7 @@ for each $path in walk($stage, {include_dirs: true, follow_symlinks: false})
     chmod($path, $manifest[$relative]["mode"])
   end
 end
-if tree_manifest($stage) != $manifest then
+if not deep_eq(tree_manifest($stage), $manifest) then
   eprint("staged shared-tree manifest mismatch")
   exit(13)
 end
@@ -404,7 +404,7 @@ chown($marker_tmp, 0, 0)
 rename($marker_tmp, $marker)
 remove($archive)
 $installed_manifest = tree_manifest($dst)
-if $installed_manifest != $manifest then
+if not deep_eq($installed_manifest, $manifest) then
   eprint("installed shared-tree manifest mismatch")
   exit(15)
 end

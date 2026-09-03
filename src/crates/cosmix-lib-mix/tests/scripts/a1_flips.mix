@@ -58,6 +58,20 @@ for each $k, $v in $mut
 end
 print(trim($seen) .. " | after: " .. length($mut))
 
+-- The snapshot holds for NESTED values too, not just the entry set. The
+-- values are Rc-shared at entry, but Mix is value-semantic: assigning through
+-- `$nest.b.n` detaches that branch via copy-on-write, so the snapshot keeps
+-- the original and a later iteration binds 2, not 99. Pinned because the
+-- weaker reading — "shallow snapshot, nested mutation leaks through" — is the
+-- natural assumption from the Rc sharing, and it is wrong here.
+$nest = {a: {n: 1}, b: {n: 2}}
+$obs = ""
+for each $k, $v in $nest
+  if $k == "a" then $nest.b.n = 99 end
+  $obs = $obs .. $k .. $v.n .. " "
+end
+print(trim($obs) .. " | source now: " .. $nest.b.n)
+
 -- Nested loops over different maps keep their own bindings.
 $outer = {x: 1}
 $inner = {y: 2}
@@ -161,6 +175,7 @@ print("deep_eq nested:  " .. deep_eq([{d: [1, [2]]}], [{d: [1, [2]]}]))
 -- alpha beta
 -- 0:7 1:8 0:h 1:i 0:65
 -- a1 b2 | after: 3
+-- a1 b2 | source now: 99
 -- nested: x1 / y2
 -- p1 / global still GLOBAL
 -- TYPE_ERROR `==` is not defined for list and list — it would always answer false, not compare them. Use deep_eq(a, b) for structural comparison

@@ -313,7 +313,7 @@ $d.die_if(not $install["ok"],
   $NODE .. " remote install failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
 $d.die_if($install["value"]["archive_hash"] != $ARCHIVE_HASH,
   $NODE .. " installed from an unexpected archive")
-$d.die_if($install["value"]["files"] != $EXPECTED_FILES,
+$d.die_if(not deep_eq($install["value"]["files"], $EXPECTED_FILES),
   $NODE .. " installed file manifest mismatch")
 print("installed: archive and " .. len($EXPECTED_FILES) .. " managed file hash/es verified")
 

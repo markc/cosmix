@@ -11630,11 +11630,14 @@ impl Evaluator {
             // the MIX-D3007 note's "either operand" test, and the narrowing is
             // the whole safety of this flip.
             //
-            // The bug being fixed is a comparison that is constant REGARDLESS
-            // OF CONTENTS, and only collection-vs-collection has that shape.
-            // Collection-vs-scalar is a genuine type difference, and `false`
-            // is the truthful answer — exactly as `1 == "a"` is honestly
-            // false. Above all, `$map[$key] == nil` is THE key-absence idiom:
+            // Two reasons, and note which one is NOT being claimed:
+            // "constant regardless of contents" is true of `[1] == nil` too,
+            // so it does not by itself draw the line. What draws it is
+            // (i) a SAME-TYPE `false` MISLEADS — it invites the reading "these
+            // two lists differ", which is not what was computed — whereas a
+            // type-mismatch `false` is truthful, exactly as `1 == "a"` is
+            // honestly false; and (ii) `$map[$key] == nil` is THE key-absence
+            // idiom:
             // 3,856 `== nil`/`!= nil` sites across 381 local .mix files, 1,059
             // of them the indexed shape whose value is a list or map whenever
             // the key happens to be populated. Raising there would have broken

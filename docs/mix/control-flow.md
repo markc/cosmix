@@ -342,9 +342,10 @@ lang = Mix
 and the second was the key, which meant the value still had to be looked up
 and the pairs form did not exist. Both spellings changed together
 (`for each $k, $v` and the bare `for $k, $v`), and the **one-variable map
-form still yields keys**, unchanged — that form was always the migration
-target for code that wanted a counter, and it is what the release-cycle
-`MIX-D3006` note pointed at before the flip landed.
+form still yields keys**, unchanged — it is what the release-cycle
+`MIX-D3006` note pointed code at before the flip landed. (A map has no
+position to bind, so there is no counter form; code that genuinely wanted a
+running index over a map's keys counts one itself.)
 
 Anything else (a number, nil) raises `cannot iterate over <type>`. An empty list/map/string runs the body zero times.
 
