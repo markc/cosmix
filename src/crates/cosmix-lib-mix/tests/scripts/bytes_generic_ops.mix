@@ -1,0 +1,74 @@
+-- generic ops on bytes/buffer (v0.70.0): take, drop, reverse, index_of,
+-- contains — plus bytes_ends_with, the trailer twin of bytes_starts_with.
+--
+-- Every assertion prints a VALUE, not a "ran without error" marker, so a
+-- regression changes a printed line rather than merely surviving.
+
+$b = string_to_bytes("hello, world")
+$buf = buffer("hello, world")
+
+-- take/drop: byte-wise, negative n from the end, results are value-semantic
+-- bytes for BOTH subject kinds.
+print(bytes_to_string(take($b, 5)) .. " " .. bytes_to_string(take($buf, 5)))
+print(bytes_to_string(take($b, -5)) .. " " .. bytes_to_string(drop($b, 7)))
+print(bytes_to_string(drop($b, -7)) .. " " .. bytes_to_string(drop($buf, 7)))
+print(type(take($buf, 3)) .. " " .. type(drop($b, 3)))
+
+-- Clamping: n past either end saturates, exactly as for a list.
+print(bytes_len(take($b, 99)) .. " " .. bytes_len(drop($b, 99)) .. " " .. bytes_len(take($b, 0)))
+
+-- take on a buffer is a SNAPSHOT: mutating the buffer afterwards cannot
+-- change bytes already taken.
+$snap = take($buf, 5)
+buffer_set($buf, 0, 88)
+print(bytes_to_string($snap) .. " " .. bytes_to_string(take($buf, 5)))
+
+-- reverse: byte-wise, new bytes; round trip is identity.
+print(bytes_to_string(reverse(string_to_bytes("abc"))) .. " " .. type(reverse($b)))
+print(bytes_to_string(reverse(reverse($b))))
+
+-- index_of / contains: needle may be bytes, buffer, string, or a single
+-- byte number — the bytes_* family vocabulary. index_of answers in BYTE
+-- offsets (this is "héllo": the é is 2 bytes, so "llo" starts at 3).
+print(index_of($b, "world") .. " " .. index_of($b, "xyz") .. " " .. index_of(string_to_bytes("héllo"), "llo"))
+print(index_of($buf, 111) .. " " .. contains($b, "world") .. " " .. contains($b, "xyz") .. " " .. contains($buf, 119))
+
+-- The empty needle raises for a bytes/buffer subject (as bytes_find), and
+-- a wrong-typed subject still raises the family's strictness error.
+try
+  contains($b, "")
+catch $msg, $err
+  print($msg)
+end
+try
+  index_of($b, string_to_bytes(""))
+catch $msg, $err
+  print($msg)
+end
+
+-- bytes_ends_with: suffix forms mirror bytes_starts_with's prefix forms;
+-- an empty suffix is true. 100 = 'd', 104 = 'h'.
+print(bytes_ends_with($b, "world") .. " " .. bytes_ends_with($b, "hello") .. " " .. bytes_ends_with($b, 100) .. " " .. bytes_ends_with($b, 104))
+print(bytes_ends_with($buf, "world") .. " " .. bytes_ends_with($b, ""))
+try
+  bytes_ends_with("a string", "g")
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+
+-- Expected output:
+-- hello hello
+-- world world
+-- hello world
+-- bytes bytes
+-- 12 0 0
+-- hello Xello
+-- cba bytes
+-- hello, world
+-- 7 -1 3
+-- 4 true false true
+-- contains(): needle must not be empty for a bytes/buffer subject
+-- index_of(): needle must not be empty for a bytes/buffer subject
+-- true false true false
+-- true true
+-- RUNTIME_ERROR bytes_ends_with(): expected bytes or buffer, got string

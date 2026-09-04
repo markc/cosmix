@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.68.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.70.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -41,13 +41,13 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   join            Join list into string with delimiter (default: space)
   starts_with     Test if string starts with prefix
   ends_with       Test if string ends with suffix
-  contains        Test if string/list contains a value — the correct yes/no test, and what to use instead of a bare index_of() in a condition
+  contains        Test if string/list contains a value, or a bytes/buffer contains a byte needle (needle: bytes/buffer/string/byte number, non-empty; v0.70.0) — the correct yes/no test, and what to use instead of a bare index_of() in a condition
   repeat          Repeat string N times
   lpad            Left-pad string to width (codepoint count; see lpad_w for display cells). Optional 3rd arg is the fill character, default space: lpad(s, 12, "0") (v0.54.0)
   rpad            Right-pad string to width (codepoint count; see rpad_w for display cells). Optional 3rd arg is the fill character, default space (v0.54.0)
   lpad_w          Left-pad to width in terminal display CELLS (UAX #11; CJK/emoji=2) — aligns wide-char columns. Optional 3rd arg is the fill character (must be 1 cell wide), default space (v0.54.0)
   rpad_w          Right-pad to width in terminal display CELLS (UAX #11; CJK/emoji=2) — aligns wide-char columns. Optional 3rd arg is the fill character (must be 1 cell wide), default space (v0.54.0)
-  reverse         Reverse a string (by codepoint; splits emoji — see grapheme_reverse) or list
+  reverse         Reverse a string (by codepoint; splits emoji — see grapheme_reverse), list, or bytes/buffer (byte-wise → a new value-semantic bytes, v0.70.0)
   words           Count whitespace-delimited words in string
   word            Extract Nth word from string (1-based)
   grep            Return lines from text matching pattern (regex when enabled)
@@ -155,14 +155,14 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   pop             Remove and return last element of list (mutates)
   shift           Remove and return first element of list (mutates)
   sort            Return sorted copy of list (all-number lists sort numerically; else lexicographic)
-  index_of        Find 0-based index of value in a list, or of a needle substring in a string (codepoint-based); -1 if absent. 1-based twin: pos() (args reversed). ⚠ NEVER use bare in a condition — -1 (absent) is TRUTHY and 0 (first position) is FALSY, so both answers invert; use contains() for yes/no or compare >= 0 (MIX-W2305)
+  index_of        Find 0-based index of value in a list, of a needle substring in a string (codepoint-based), or of a byte needle in a bytes/buffer (byte offset; needle: bytes/buffer/string/byte number, non-empty; v0.70.0); -1 if absent. 1-based twin: pos() (args reversed). ⚠ NEVER use bare in a condition — -1 (absent) is TRUTHY and 0 (first position) is FALSY, so both answers invert; use contains() for yes/no or compare >= 0 (MIX-W2305)
   unique          Return list with duplicates removed
   range           Generate list of numbers from start to end with optional step. Bounds/step must be whole numbers within i64 — fractional or oversized values raise VALUE_OUT_OF_RANGE instead of silently saturating (strict since v0.59.0)
   flat            Flatten nested lists into a single list
   concat          Concatenate 2+ lists into one new list (one level; each arg must be a list)
   slice           Sub-sequence [start, end): negative indices and out-of-range clamp, a reversed range is empty (v0.2.0). Slices a list (elements), string (codepoints), or bytes/buffer (bytes → a new value-semantic bytes, v0.64.0)
-  take            First N items of a list (negative N = last N) (v0.2.0)
-  drop            Skip first N items of a list (negative N = drop last N) (v0.2.0)
+  take            First N items of a list (negative N = last N) (v0.2.0); also string (codepoints) and bytes/buffer (bytes → a new value-semantic bytes, v0.70.0)
+  drop            Skip first N items of a list (negative N = drop last N) (v0.2.0); also string (codepoints) and bytes/buffer (bytes → a new value-semantic bytes, v0.70.0)
   zip             Pair two lists element-wise into [a, b] tuples (v0.2.0)
 
 ## map  — see [collections](collections.md)
@@ -292,6 +292,7 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   bytes_to_string Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.
   bytes_find      0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional `from` (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)
   bytes_starts_with Test whether a bytes/buffer value starts with a prefix (bytes/buffer/string/byte number 0-255); an empty prefix is true (v0.64.0)
+  bytes_ends_with Test whether a bytes/buffer value ends with a suffix (bytes/buffer/string/byte number 0-255); an empty suffix is true (v0.70.0)
   bytes_split     Split a bytes/buffer value on a separator (bytes/buffer/string/byte number 0-255) → list of bytes. Same piece rules as split(): absent separator → one whole piece, leading/trailing separator → empty piece. An EMPTY separator raises (v0.64.0)
   bytes_concat    Concatenate 1+ bytes/buffer/string values into one new bytes (a string joins as its own UTF-8). A list argument raises and names bytes_from (v0.64.0)
   bytes_from      Build bytes from a LIST, flat-splicing each item — int 0-255 = one byte, string = its UTF-8, bytes/buffer = its content (same item vocabulary as buffer([items])) (v0.64.0)

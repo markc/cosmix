@@ -92,13 +92,13 @@ builtin_table! {
     ("join", CapabilityClass::Pure,            "string",  "Join list into string with delimiter (default: space)", contract!((list: list, delim?: string) -> string)),
     ("starts_with", CapabilityClass::Pure,     "string",  "Test if string starts with prefix", contract!((s: string, prefix: string) -> bool)),
     ("ends_with", CapabilityClass::Pure,       "string",  "Test if string ends with suffix", contract!((s: string, suffix: string) -> bool)),
-    ("contains", CapabilityClass::Pure,        "string",  "Test if string/list contains a value — the correct yes/no test, and what to use instead of a bare index_of() in a condition", contract!((s_or_list: any_of(string, list), v: any) -> bool)),
+    ("contains", CapabilityClass::Pure,        "string",  "Test if string/list contains a value, or a bytes/buffer contains a byte needle (needle: bytes/buffer/string/byte number, non-empty; v0.70.0) — the correct yes/no test, and what to use instead of a bare index_of() in a condition", contract!((s_or_list: any_of(string, list, bytes, buffer), v: any) -> bool; failure[raises])),
     ("repeat", CapabilityClass::Pure,          "string",  "Repeat string N times", contract!((s: string, n: number) -> string; failure[raises])),
     ("lpad", CapabilityClass::Pure,            "string",  "Left-pad string to width (codepoint count; see lpad_w for display cells). Optional 3rd arg is the fill character, default space: lpad(s, 12, \"0\") (v0.54.0)", contract!((s: string, width: number, fill?: string) -> string; failure[raises])),
     ("rpad", CapabilityClass::Pure,            "string",  "Right-pad string to width (codepoint count; see rpad_w for display cells). Optional 3rd arg is the fill character, default space (v0.54.0)", contract!((s: string, width: number, fill?: string) -> string; failure[raises])),
     ("lpad_w", CapabilityClass::Pure,          "string",  "Left-pad to width in terminal display CELLS (UAX #11; CJK/emoji=2) — aligns wide-char columns. Optional 3rd arg is the fill character (must be 1 cell wide), default space (v0.54.0)", contract!((s: string, width: number, fill?: string) -> string; failure[raises])),
     ("rpad_w", CapabilityClass::Pure,          "string",  "Right-pad to width in terminal display CELLS (UAX #11; CJK/emoji=2) — aligns wide-char columns. Optional 3rd arg is the fill character (must be 1 cell wide), default space (v0.54.0)", contract!((s: string, width: number, fill?: string) -> string; failure[raises])),
-    ("reverse", CapabilityClass::Pure,         "string",  "Reverse a string (by codepoint; splits emoji — see grapheme_reverse) or list", contract!((v: any_of(string, list)) -> any_of(string, list))),
+    ("reverse", CapabilityClass::Pure,         "string",  "Reverse a string (by codepoint; splits emoji — see grapheme_reverse), list, or bytes/buffer (byte-wise → a new value-semantic bytes, v0.70.0)", contract!((v: any_of(string, list, bytes, buffer)) -> any_of(string, list, bytes))),
     ("words", CapabilityClass::Pure,           "string",  "Count whitespace-delimited words in string", contract!((s: string) -> number)),
     ("word", CapabilityClass::Pure,            "string",  "Extract Nth word from string (1-based)", contract!((s: string, n: number) -> any_of(string, nil); failure[raises])),
     ("grep", CapabilityClass::Pure,            "string",  "Return lines from text matching pattern (regex when enabled)", contract!((pattern: string, text: string) -> list(string))),
@@ -219,14 +219,14 @@ builtin_table! {
     ("pop", CapabilityClass::Pure,             "list",    "Remove and return last element of list (mutates)", contract!((list: list) -> any; effects[mutates_args])),
     ("shift", CapabilityClass::Pure,           "list",    "Remove and return first element of list (mutates)", contract!((list: list) -> any; effects[mutates_args])),
     ("sort", CapabilityClass::Pure,            "list",    "Return sorted copy of list (all-number lists sort numerically; else lexicographic)", contract!((list: list) -> list)),
-    ("index_of", CapabilityClass::Pure,        "list",    "Find 0-based index of value in a list, or of a needle substring in a string (codepoint-based); -1 if absent. 1-based twin: pos() (args reversed). ⚠ NEVER use bare in a condition — -1 (absent) is TRUTHY and 0 (first position) is FALSY, so both answers invert; use contains() for yes/no or compare >= 0 (MIX-W2305)", contract!((seq: any_of(list, string), v: any) -> number)),
+    ("index_of", CapabilityClass::Pure,        "list",    "Find 0-based index of value in a list, of a needle substring in a string (codepoint-based), or of a byte needle in a bytes/buffer (byte offset; needle: bytes/buffer/string/byte number, non-empty; v0.70.0); -1 if absent. 1-based twin: pos() (args reversed). ⚠ NEVER use bare in a condition — -1 (absent) is TRUTHY and 0 (first position) is FALSY, so both answers invert; use contains() for yes/no or compare >= 0 (MIX-W2305)", contract!((seq: any_of(list, string, bytes, buffer), v: any) -> number; failure[raises])),
     ("unique", CapabilityClass::Pure,          "list",    "Return list with duplicates removed", contract!((list: list) -> list)),
     ("range", CapabilityClass::Pure,           "list",    "Generate list of numbers from start to end with optional step. Bounds/step must be whole numbers within i64 — fractional or oversized values raise VALUE_OUT_OF_RANGE instead of silently saturating (strict since v0.59.0)", contract!((start: number, end: number, step?: number) -> list(number); failure[raises])),
     ("flat", CapabilityClass::Pure,            "list",    "Flatten nested lists into a single list", contract!((list: list) -> list)),
     ("concat", CapabilityClass::Pure,          "list",    "Concatenate 2+ lists into one new list (one level; each arg must be a list)", contract!((a: list, b: list, rest: ...list) -> list)),
     ("slice", CapabilityClass::Pure,           "list",    "Sub-sequence [start, end): negative indices and out-of-range clamp, a reversed range is empty (v0.2.0). Slices a list (elements), string (codepoints), or bytes/buffer (bytes → a new value-semantic bytes, v0.64.0)", contract!((seq: any_of(list, string, bytes, buffer), start: number, end?: any_of(number, nil)) -> any_of(list, string, bytes))),
-    ("take", CapabilityClass::Pure,            "list",    "First N items of a list (negative N = last N) (v0.2.0)", contract!((seq: any_of(list, string), n: number) -> any_of(list, string))),
-    ("drop", CapabilityClass::Pure,            "list",    "Skip first N items of a list (negative N = drop last N) (v0.2.0)", contract!((seq: any_of(list, string), n: number) -> any_of(list, string))),
+    ("take", CapabilityClass::Pure,            "list",    "First N items of a list (negative N = last N) (v0.2.0); also string (codepoints) and bytes/buffer (bytes → a new value-semantic bytes, v0.70.0)", contract!((seq: any_of(list, string, bytes, buffer), n: number) -> any_of(list, string, bytes))),
+    ("drop", CapabilityClass::Pure,            "list",    "Skip first N items of a list (negative N = drop last N) (v0.2.0); also string (codepoints) and bytes/buffer (bytes → a new value-semantic bytes, v0.70.0)", contract!((seq: any_of(list, string, bytes, buffer), n: number) -> any_of(list, string, bytes))),
     ("zip", CapabilityClass::Pure,             "list",    "Pair two lists element-wise into [a, b] tuples (v0.2.0)", contract!((a: list, b: list) -> list(list))),
 
     ("keys", CapabilityClass::Pure,            "map",     "Return list of map keys", contract!((map: map) -> list(string))),
@@ -348,6 +348,7 @@ builtin_table! {
     ("bytes_to_string", CapabilityClass::Pure, "system",  "Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.", contract!((b: any_of(bytes, buffer), opts?: map) -> string)),
     ("bytes_find", CapabilityClass::Pure,      "system",  "0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional `from` (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)", contract!((b: any_of(bytes, buffer), needle: any_of(bytes, buffer, string, number), from?: number) -> number; failure[raises])),
     ("bytes_starts_with", CapabilityClass::Pure, "system", "Test whether a bytes/buffer value starts with a prefix (bytes/buffer/string/byte number 0-255); an empty prefix is true (v0.64.0)", contract!((b: any_of(bytes, buffer), prefix: any_of(bytes, buffer, string, number)) -> bool; failure[raises])),
+    ("bytes_ends_with", CapabilityClass::Pure, "system", "Test whether a bytes/buffer value ends with a suffix (bytes/buffer/string/byte number 0-255); an empty suffix is true (v0.70.0)", contract!((b: any_of(bytes, buffer), suffix: any_of(bytes, buffer, string, number)) -> bool; failure[raises])),
     ("bytes_split", CapabilityClass::Pure,     "system",  "Split a bytes/buffer value on a separator (bytes/buffer/string/byte number 0-255) → list of bytes. Same piece rules as split(): absent separator → one whole piece, leading/trailing separator → empty piece. An EMPTY separator raises (v0.64.0)", contract!((b: any_of(bytes, buffer), sep: any_of(bytes, buffer, string, number)) -> list(bytes); failure[raises])),
     ("bytes_concat", CapabilityClass::Pure,    "system",  "Concatenate 1+ bytes/buffer/string values into one new bytes (a string joins as its own UTF-8). A list argument raises and names bytes_from (v0.64.0)", contract!((a: any_of(bytes, buffer, string), rest: ...any_of(bytes, buffer, string)) -> bytes; failure[raises])),
     ("bytes_from", CapabilityClass::Pure,      "system",  "Build bytes from a LIST, flat-splicing each item — int 0-255 = one byte, string = its UTF-8, bytes/buffer = its content (same item vocabulary as buffer([items])) (v0.64.0)", contract!((items: list) -> bytes; failure[raises])),
@@ -755,6 +756,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "bytes_to_string" => builtin_bytes_to_string(args),
         "bytes_find" => builtin_bytes_find(args),
         "bytes_starts_with" => builtin_bytes_starts_with(args),
+        "bytes_ends_with" => builtin_bytes_ends_with(args),
         "bytes_split" => builtin_bytes_split(args),
         "bytes_concat" => builtin_bytes_concat(args),
         "bytes_from" => builtin_bytes_from(args),
@@ -1630,9 +1632,29 @@ fn builtin_contains(args: Vec<Value>) -> MixResult<Option<Value>> {
             Ok(Some(Value::Bool(s.contains(&sub))))
         }
         Value::List(items) => Ok(Some(Value::Bool(items.contains(&args[1])))),
+        // bytes/buffer: subsequence test, needle vocabulary as the bytes_*
+        // family (bytes/buffer/string/byte number). An EMPTY needle raises,
+        // as it does for bytes_find — an empty needle is almost always an
+        // empty variable, and a silent `true` for it is the wrong-answer
+        // class the bytes family refuses. (The string arm keeps its
+        // contains($s, "") == true; that contract predates this one.)
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let subject = subject_bytes("contains", &args[0])?;
+            let needle = operand_bytes("contains", "needle", &args[1])?;
+            if needle.is_empty() {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: "contains(): needle must not be empty for a bytes/buffer subject"
+                        .to_string(),
+                });
+            }
+            Ok(Some(Value::Bool(
+                find_subslice(&subject, &needle, 0).is_some(),
+            )))
+        }
         _ => Err(MixError::RuntimeError {
             span: None,
-            msg: "contains() expects a string or list".to_string(),
+            msg: "contains() expects a string, list, bytes or buffer".to_string(),
         }),
     }
 }
@@ -1831,9 +1853,17 @@ fn builtin_reverse(args: Vec<Value>) -> MixResult<Option<Value>> {
             reversed.reverse();
             Ok(Some(Value::list(reversed)))
         }
+        // bytes/buffer: byte-wise, into a new value-semantic `bytes` — the
+        // same "a buffer subject hands back an independent snapshot" rule
+        // as slice (v0.64.0).
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let mut out = subject_bytes("reverse", &args[0])?.into_owned();
+            out.reverse();
+            Ok(Some(Value::bytes(out)))
+        }
         _ => Err(MixError::RuntimeError {
             span: None,
-            msg: "reverse() expects a string or list".to_string(),
+            msg: "reverse() expects a string, list, bytes or buffer".to_string(),
         }),
     }
 }
@@ -2374,9 +2404,28 @@ fn builtin_index_of(args: Vec<Value>) -> MixResult<Option<Value>> {
                 .unwrap_or(-1.0);
             Ok(Some(Value::Number(pos)))
         }
+        // bytes/buffer: 0-based BYTE offset of the needle subsequence, -1
+        // absent — bytes_find's answer, reachable through the generic name.
+        // Same needle vocabulary and the same empty-needle refusal; for a
+        // resumable scan (`from`) use bytes_find itself.
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let subject = subject_bytes("index_of", &args[0])?;
+            let needle = operand_bytes("index_of", "needle", &args[1])?;
+            if needle.is_empty() {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: "index_of(): needle must not be empty for a bytes/buffer subject"
+                        .to_string(),
+                });
+            }
+            let pos = find_subslice(&subject, &needle, 0)
+                .map(|i| i as f64)
+                .unwrap_or(-1.0);
+            Ok(Some(Value::Number(pos)))
+        }
         _ => Err(MixError::RuntimeError {
             span: None,
-            msg: "index_of() expects a list or string".to_string(),
+            msg: "index_of() expects a list, string, bytes or buffer".to_string(),
         }),
     }
 }
@@ -2587,8 +2636,9 @@ fn builtin_slice(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::list(items[s_idx..e_idx].to_vec())))
 }
 
-/// `take($list, $n)` — first `$n` items. Sugar over `slice(xs, 0, n)`.
-/// Negative `$n` takes from the end: `take(xs, -3)` → last three.
+/// `take($list, $n)` — first `$n` items; `slice(xs, 0, n)` for n >= 0.
+/// Negative `$n` takes from the END: `take(xs, -3)` → last three — which is
+/// `slice(xs, -3)`, NOT `slice(xs, 0, -3)` (that is all-but-the-last-three).
 fn builtin_take(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("take", &args, 2)?;
     let n = args[1].to_number().ok_or_else(|| MixError::RuntimeError {
@@ -2615,15 +2665,33 @@ fn builtin_take(args: Vec<Value>) -> MixResult<Option<Value>> {
             };
             Ok(Some(Value::String(out)))
         }
+        // bytes/buffer: byte-wise, same n rules as the list arm (negative n
+        // takes from the END — not slice's negative-index meaning), into a
+        // new value-semantic `bytes`.
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let buf = subject_bytes("take", &args[0])?;
+            let out = if n >= 0 {
+                let end = (n as usize).min(buf.len());
+                buf[..end].to_vec()
+            } else {
+                let start = buf.len().saturating_sub(neg_index_magnitude(n));
+                buf[start..].to_vec()
+            };
+            Ok(Some(Value::bytes(out)))
+        }
         other => Err(MixError::RuntimeError {
             span: None,
-            msg: format!("take() expects a list or string, got {}", other.type_name()),
+            msg: format!(
+                "take() expects a list, string, bytes or buffer, got {}",
+                other.type_name()
+            ),
         }),
     }
 }
 
-/// `drop($list, $n)` — skip first `$n` items. Sugar over
-/// `slice(xs, n, nil)`. Negative `$n` drops from the end.
+/// `drop($list, $n)` — skip first `$n` items; `slice(xs, n, nil)` for
+/// n >= 0. Negative `$n` drops from the END: `drop(xs, -3)` → all but the
+/// last three — which is `slice(xs, 0, -3)`, NOT `slice(xs, -3)`.
 fn builtin_drop(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("drop", &args, 2)?;
     let n = args[1].to_number().ok_or_else(|| MixError::RuntimeError {
@@ -2650,9 +2718,26 @@ fn builtin_drop(args: Vec<Value>) -> MixResult<Option<Value>> {
             };
             Ok(Some(Value::String(out)))
         }
+        // bytes/buffer: byte-wise, same n rules as the list arm (negative n
+        // drops from the END — not slice's negative-index meaning), into a
+        // new value-semantic `bytes`.
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let buf = subject_bytes("drop", &args[0])?;
+            let out = if n >= 0 {
+                let start = (n as usize).min(buf.len());
+                buf[start..].to_vec()
+            } else {
+                let end = buf.len().saturating_sub(neg_index_magnitude(n));
+                buf[..end].to_vec()
+            };
+            Ok(Some(Value::bytes(out)))
+        }
         other => Err(MixError::RuntimeError {
             span: None,
-            msg: format!("drop() expects a list or string, got {}", other.type_name()),
+            msg: format!(
+                "drop() expects a list, string, bytes or buffer, got {}",
+                other.type_name()
+            ),
         }),
     }
 }
@@ -13868,6 +13953,17 @@ fn builtin_bytes_starts_with(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::Bool(subject.starts_with(&prefix))))
 }
 
+/// `bytes_ends_with($b, suffix)` — bool. An empty suffix is true, as it
+/// is for the string `ends_with`. The trailer twin of `bytes_starts_with`:
+/// framing checks (`\r\n.\r\n`, a trailing NUL, a magic footer) want this
+/// end of the value.
+fn builtin_bytes_ends_with(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_ends_with", &args, 2, 2)?;
+    let subject = subject_bytes("bytes_ends_with", &args[0])?;
+    let suffix = operand_bytes("bytes_ends_with", "suffix", &args[1])?;
+    Ok(Some(Value::Bool(subject.ends_with(&suffix))))
+}
+
 /// `bytes_split($b, sep)` → list of `bytes`.
 ///
 /// Splitting rules are the string `split`'s: a separator that never occurs
@@ -15444,8 +15540,9 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     );
     println!("Network:   http_get http_post http_request dns_lookup");
     println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
-    println!("           bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
-    println!("           (also $b[i], length, slice and `for each` — v0.64.0)");
+    println!("           bytes_ends_with bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
+    println!("           (also $b[i], length, slice, `for each` — v0.64.0 — and take, drop,");
+    println!("           reverse, index_of, contains — v0.70.0)");
     println!("SQL:       sqlopen sqlexec sqlclose");
     println!("URL:       url_parse");
     println!("Mail:      rfc2047_decode rfc2047_encode (header encoded-words, v0.67.0)");
@@ -19812,6 +19909,159 @@ mod bytes_tests {
     }
 
     #[test]
+    fn bytes_ends_with_suffix_forms() {
+        let v = b(b"hello");
+        for (suffix, want) in [
+            (Value::String("llo".into()), true),
+            (Value::String("hell".into()), false),
+            (Value::Number(111.0), true),  // 'o'
+            (Value::Number(104.0), false), // 'h'
+            (b(&[]), true),
+            (buf(b"llo"), true), // buffer suffix exercises operand_bytes' buffer branch
+        ] {
+            assert_eq!(
+                builtin_bytes_ends_with(vec![v.clone(), suffix.clone()]).unwrap(),
+                Some(Value::Bool(want)),
+                "suffix {suffix:?}"
+            );
+        }
+        // A wrong-typed subject raises like the rest of the family.
+        let err = builtin_bytes_ends_with(vec![Value::String("x".into()), b(b"x")]).unwrap_err();
+        assert!(format!("{err}").contains("expected bytes or buffer"), "{err}");
+    }
+
+    // --- generic ops on bytes/buffer (v0.70.0) ---
+
+    fn buf(v: &[u8]) -> Value {
+        Value::Buffer(std::rc::Rc::new(std::cell::RefCell::new(v.to_vec())))
+    }
+
+    #[test]
+    fn take_drop_on_bytes_and_buffer() {
+        for subject in [b(b"hello, world"), buf(b"hello, world")] {
+            assert_eq!(
+                as_bytes(builtin_take(vec![subject.clone(), Value::Number(5.0)]).unwrap()),
+                b"hello"
+            );
+            assert_eq!(
+                as_bytes(builtin_take(vec![subject.clone(), Value::Number(-5.0)]).unwrap()),
+                b"world"
+            );
+            assert_eq!(
+                as_bytes(builtin_take(vec![subject.clone(), Value::Number(99.0)]).unwrap()),
+                b"hello, world"
+            );
+            assert_eq!(
+                as_bytes(builtin_drop(vec![subject.clone(), Value::Number(7.0)]).unwrap()),
+                b"world"
+            );
+            assert_eq!(
+                as_bytes(builtin_drop(vec![subject.clone(), Value::Number(-7.0)]).unwrap()),
+                b"hello"
+            );
+            assert_eq!(
+                as_bytes(builtin_drop(vec![subject.clone(), Value::Number(99.0)]).unwrap()),
+                b""
+            );
+        }
+    }
+
+    /// Pathological-n parity: the bytes arm and the list arm share one `n`
+    /// preamble today, but nothing else enforces that they keep agreeing. A
+    /// future strictness pass on one arm alone (range went strict in v0.59.0)
+    /// would break this test rather than pass silently.
+    #[test]
+    fn take_drop_pathological_n_parity_bytes_vs_list() {
+        let l = Value::list(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
+        let bs = b(b"abc");
+        fn list_len(v: &Option<Value>) -> usize {
+            match v {
+                Some(Value::List(items)) => items.len(),
+                other => panic!("expected list, got {other:?}"),
+            }
+        }
+        for n in [f64::NAN, 1e30, -1e30] {
+            let from_list = list_len(&builtin_take(vec![l.clone(), Value::Number(n)]).unwrap());
+            let from_bytes =
+                as_bytes(builtin_take(vec![bs.clone(), Value::Number(n)]).unwrap()).len();
+            assert_eq!(from_list, from_bytes, "take with n={n}");
+            let from_list = list_len(&builtin_drop(vec![l.clone(), Value::Number(n)]).unwrap());
+            let from_bytes =
+                as_bytes(builtin_drop(vec![bs.clone(), Value::Number(n)]).unwrap()).len();
+            assert_eq!(from_list, from_bytes, "drop with n={n}");
+        }
+    }
+
+    /// One representative pin for io.md's "anything else still refuses bytes
+    /// with a clean error" sentence — a future sort-bytes arm must edit the
+    /// doc, not silently falsify it.
+    #[test]
+    fn sort_still_refuses_bytes() {
+        let err = builtin_sort(vec![b(b"cab")]).unwrap_err();
+        assert!(format!("{err}").contains("expects a list"), "{err}");
+    }
+
+    #[test]
+    fn take_on_buffer_is_a_snapshot() {
+        // Mutating the buffer afterwards must not change the taken bytes.
+        let rc = std::rc::Rc::new(std::cell::RefCell::new(b"abc".to_vec()));
+        let taken = as_bytes(
+            builtin_take(vec![Value::Buffer(rc.clone()), Value::Number(3.0)]).unwrap(),
+        );
+        rc.borrow_mut()[0] = b'X';
+        assert_eq!(taken, b"abc");
+    }
+
+    #[test]
+    fn reverse_on_bytes_and_buffer() {
+        assert_eq!(as_bytes(builtin_reverse(vec![b(b"abc")]).unwrap()), b"cba");
+        assert_eq!(as_bytes(builtin_reverse(vec![buf(b"ab")]).unwrap()), b"ba");
+        assert_eq!(as_bytes(builtin_reverse(vec![b(b"")]).unwrap()), b"");
+    }
+
+    #[test]
+    fn contains_and_index_of_on_bytes() {
+        for subject in [b(b"hello, world"), buf(b"hello, world")] {
+            assert_eq!(
+                builtin_contains(vec![subject.clone(), Value::String("world".into())]).unwrap(),
+                Some(Value::Bool(true))
+            );
+            assert_eq!(
+                builtin_contains(vec![subject.clone(), Value::Number(104.0)]).unwrap(),
+                Some(Value::Bool(true))
+            );
+            assert_eq!(
+                builtin_contains(vec![subject.clone(), Value::String("xyz".into())]).unwrap(),
+                Some(Value::Bool(false))
+            );
+            assert_eq!(
+                builtin_index_of(vec![subject.clone(), Value::String("world".into())]).unwrap(),
+                Some(Value::Number(7.0))
+            );
+            assert_eq!(
+                builtin_index_of(vec![subject.clone(), Value::String("xyz".into())]).unwrap(),
+                Some(Value::Number(-1.0))
+            );
+            // A BUFFER needle exercises operand_bytes' buffer branch, which
+            // no other test in the family reaches.
+            assert_eq!(
+                builtin_index_of(vec![subject.clone(), buf(b"world")]).unwrap(),
+                Some(Value::Number(7.0))
+            );
+            assert_eq!(
+                builtin_contains(vec![subject.clone(), buf(b"world")]).unwrap(),
+                Some(Value::Bool(true))
+            );
+        }
+        // The empty needle raises for a bytes subject, as it does for
+        // bytes_find — never a silent trivially-true/0 answer.
+        let err = builtin_contains(vec![b(b"ab"), Value::String("".into())]).unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+        let err = builtin_index_of(vec![b(b"ab"), b(&[])]).unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[test]
     fn string_to_bytes_utf8() {
         let v = builtin_string_to_bytes(vec![Value::String("héllo".into())]).unwrap();
         // "héllo" is 6 UTF-8 bytes (é = 0xC3 0xA9).
@@ -20923,6 +21173,7 @@ mod char_aware_tests {
             "buffer_push",
             "buffer_set",
             "bytes_concat",
+            "bytes_ends_with",
             "bytes_find",
             "bytes_from",
             "bytes_from_hex",

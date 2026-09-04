@@ -136,6 +136,13 @@ async fn test_bytes_ops() {
     run_test_script("bytes_ops.mix").await;
 }
 
+// Generic ops extended to bytes/buffer (v0.70.0): take, drop, reverse,
+// index_of, contains — plus bytes_ends_with.
+#[tokio::test]
+async fn test_bytes_generic_ops() {
+    run_test_script("bytes_generic_ops.mix").await;
+}
+
 // The byte-exact stdio family (v0.65.0). This harness trims and splits on
 // lines, so it cannot see the missing trailing newline — tests/raw_stdout.rs
 // asserts the bytes and crates/cosmix-mix/tests/stdio_filter.rs the real

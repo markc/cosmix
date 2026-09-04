@@ -1049,15 +1049,34 @@ way in was `bytes_to_string({lossy: true})`, which **destroys the very bytes you
 are inspecting** — a lossy decode replaces every invalid sequence with U+FFFD, so
 a digest taken afterwards is a digest of something that never arrived.
 
-The four generic sequence operations now accept `bytes` **and** `buffer`, in
-byte units:
+The generic sequence operations now accept `bytes` **and** `buffer`, in
+byte units — four since 0.64.0, five more since 0.70.0:
 
 ```
 $b[i]                      the byte at i as a NUMBER 0-255
 length($b) / len($b)       byte count (same answer as bytes_len)
 slice($b, start[, end])    a new value-semantic `bytes`
 for each $x in $b          iterates NUMBERS 0-255
+take($b, n) / drop($b, n)  first n / all-but-first n bytes (negative n from the
+                           end, like the list forms) → a new `bytes` (v0.70.0)
+reverse($b)                byte-wise → a new `bytes` (v0.70.0)
+index_of($b, needle)       0-based BYTE offset, -1 absent — bytes_find's answer
+                           through the generic name (v0.70.0)
+contains($b, needle)       bool (v0.70.0)
 ```
+
+`index_of` and `contains` take their needle in the `bytes_*` family's
+vocabulary — bytes, buffer, string, or a single byte number 0-255 — and, like
+`bytes_find`, **refuse an empty needle** on a bytes/buffer subject (an empty
+needle is almost always an empty variable, and a trivially-true answer for it
+is a silent wrong answer). ⚠ The vocabulary follows the **subject**, not the
+needle: a bytes needle on a *string* subject is stringified to its
+`<bytes:N>` placeholder and searched as that literal text — silently absent.
+Searching a string for raw bytes means converting one side first
+(`string_to_bytes($s)` or `bytes_to_string($needle)`). This is a deliberate divergence from the string
+arms, where `contains($s, "")` remains `true`. That is the complete list of
+generic operations bytes participates in — anything else (`sort`, `unique`,
+`join`, …) still refuses bytes with a clean error.
 
 The boundary rules are the list's, not new ones:
 
@@ -1093,6 +1112,7 @@ print(bytes_to_hex($body))
 ```
 bytes_find(b, needle[, from])   0-based offset, -1 absent; `from` is signed+clamped
 bytes_starts_with(b, prefix)    bool (an empty prefix is true)
+bytes_ends_with(b, suffix)      bool (an empty suffix is true) (v0.70.0)
 bytes_split(b, sep)             -> list of bytes
 bytes_concat(a, b, ...)         1+ bytes/buffer/string -> one new bytes
 bytes_from(list)                int 0-255 / string / bytes / buffer, flat-spliced
@@ -1100,10 +1120,19 @@ bytes_to_hex(b)                 lowercase hex, 2 chars per byte, no separator
 bytes_from_hex(s)               strict decode: even length, [0-9a-fA-F] only
 ```
 
-`needle`, `sep` and `prefix` may each be a `bytes`, a `buffer`, a **string**
-(taken as its own UTF-8) or a **single byte number 0-255** — so
+`needle`, `sep`, `prefix` and `suffix` may each be a `bytes`, a `buffer`, a
+**string** (taken as its own UTF-8) or a **single byte number 0-255** — so
 `bytes_split($b, 0)` splits on NUL, which no string separator could express.
 The **subject** (argument 1) is always strict bytes/buffer.
+
+**Scanning a `buffer` repeatedly? `freeze()` it first.** Every `bytes_*` call
+(and every v0.70.0 generic-op arm) on a *buffer* subject snapshots the whole
+buffer for the duration of the call — correct (the needle may alias the
+subject), and invisible for one-shot calls, but a marching parse
+(`bytes_find($buf, $sep, $cursor)` stepping through a large buffer) copies the
+entire buffer at every step and turns a linear scan into O(n²) of memcpy.
+The same loop over `freeze($buf)`'s value-semantic `bytes` borrows without
+copying (measured ~3× on a 4 MB subject with short scans).
 
 `bytes_find` uses `index_of`'s convention, **not** `pos`'s: 0-based, `-1` when
 absent. ⚠ A bare `bytes_find(...)` in a condition is therefore backwards on both
@@ -1140,7 +1169,7 @@ Two families, one letter apart, and they are **not duplicates**:
 | prefix | subject | argument handling | members |
 |---|---|---|---|
 | `byte_*` | a **string** | coerced via `to_mix_string`, like `pos`/`substr` | `byte_length` `byte_pos` `byte_lastpos` `byte_index_of` |
-| `bytes_*` | a **`bytes`/`buffer` value** | strict — a wrong type raises | `bytes_len` `bytes_to_string` `bytes_find` `bytes_starts_with` `bytes_split` `bytes_concat` `bytes_from` `bytes_to_hex` `bytes_from_hex` |
+| `bytes_*` | a **`bytes`/`buffer` value** | strict — a wrong type raises | `bytes_len` `bytes_to_string` `bytes_find` `bytes_starts_with` `bytes_ends_with` `bytes_split` `bytes_concat` `bytes_from` `bytes_to_hex` `bytes_from_hex` |
 
 `byte_*` answers *"where is this, measured in UTF-8 bytes rather than
 codepoints?"* about **text**. `bytes_*` operates on a **byte sequence**.

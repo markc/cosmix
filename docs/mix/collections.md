@@ -358,7 +358,8 @@ by field: [{p: 22}, {p: 80}]
 ```
 
 `unique` removes duplicates **keeping first-seen order**. `reverse` works on a
-list or a string.
+list, a string, or (since v0.70.0) a bytes/buffer value (byte-wise, returning
+a new value-semantic `bytes`).
 
 ### contains / index_of
 
@@ -376,8 +377,11 @@ false
 -1
 ```
 
-`contains(list, v)` → bool (it also accepts a *string* haystack — but **not** a
-map; use `has_key` for maps). `index_of(list, v)` → 0-based position or `-1`.
+`contains(list, v)` → bool (it also accepts a *string* haystack, and since
+0.70.0 a *bytes/buffer* subject with a byte needle — but **not** a map; use
+`has_key` for maps). `index_of(list, v)` → 0-based position or `-1` (also
+string and, since 0.70.0, bytes/buffer — see [io](io.md) for the byte-unit
+rules).
 
 ### range
 
@@ -466,7 +470,9 @@ codepoints — see [strings](strings.md)) and, since **v0.64.0**, a
 empty in every case: `slice($l, 3, 1)` is `[]`, not a wrap-around.
 
 `take(list, n)` keeps the **first** `n` (negative `n` → **last** `|n|`);
-`drop(list, n)` skips the **first** `n` (negative `n` → drops the **last** `|n|`):
+`drop(list, n)` skips the **first** `n` (negative `n` → drops the **last**
+`|n|`). Both also accept a string (codepoints) and, since **v0.70.0**, a
+bytes/buffer value (bytes → a new value-semantic `bytes`):
 
 ```mix
 $l = [10, 20, 30, 40, 50]
@@ -519,7 +525,7 @@ false
 
 `keys`/`values` return lists in **insertion order**. `has_key(map, key)` is the
 map-membership test — remember `contains` does **not** accept a map and will
-raise `contains() expects a string or list`.
+raise `contains() expects a string, list, bytes or buffer`.
 
 ### merge / delete
 
