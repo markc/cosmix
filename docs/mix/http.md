@@ -433,8 +433,17 @@ is one explicit `host: "0.0.0.0"`. `duration` bounds the run in seconds
 read grace past it, so one slow client cannot hold the server open;
 `requests` stops after N exchanges; `listing`
 opts into directory indexes; `render_md` (markdown feature) serves `.md`
-files as styled HTML — `http_serve("docs/mix", {render_md: true})` is
-this manual in your browser, served by Mix.
+files as styled HTML — `http_serve("docs/mix", {render_md: true})` renders
+the raw manual `.md` files (but not the site's HTML shell, whose assets
+live at the site root — serve the whole `docs/` tree, not a subdirectory,
+if you want the interactive site).
+
+> **Serving a subdirectory of a larger site?** A page that references
+> root-absolute assets (`/web/style.css`) 404s them when the served root
+> is a subdirectory — the assets are above it. Serve the **site root**, or
+> pre-render a self-contained copy (see `docs/build/gen-static-site.mix`
+> for the pattern: each page carries its own inline CSS and needs no
+> external asset, so it works from any root, `curl`, `wget`, or `file://`).
 
 Traversal is the defended edge: the request path is percent-decoded
 *first*, then the resolved file is canonicalised and must remain under

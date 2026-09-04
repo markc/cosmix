@@ -20,3 +20,4 @@ CLAUDE.local.md
 # editors / OS
 *.swp
 .DS_Store
+docs/_static/

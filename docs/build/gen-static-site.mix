@@ -1,0 +1,164 @@
+#!/usr/bin/env mix
+-- gen-static-site.mix — a genuinely static, self-contained mirror of the
+-- docs, the on-demand counterpart to gen-doc-pages.mix's interactive SPA.
+--
+--   mix build/gen-static-site.mix [OUTDIR]     -- default OUTDIR = docs/_static
+--
+-- Where gen-doc-pages.mix ships a JS shell that fetches and renders each
+-- .md in the browser (great on cosmix.dev, fragile the moment a browser
+-- blocks its scripts), THIS renders every .md to real HTML AT BUILD TIME
+-- and wraps it in a page that needs nothing else: inline CSS, no /web
+-- assets, no JavaScript. The result works under http_serve, curl, wget,
+-- a crawler, or file:// — in any browser, shields or not.
+--
+-- Intra-doc links are rewritten .md -> .html (and dir/README.md -> dir/)
+-- so navigation works with plain clean_urls or even direct file opening.
+-- External links, anchors, and asset links pass through untouched.
+--
+-- View it:  mix -c 'http_serve("docs/_static", {clean_urls: true})'
+-- Ship it:  it is a normal static site — any static host serves it as-is.
+
+$repo = trim(run_argv_must(["git", "rev-parse", "--show-toplevel"]))
+$docs = $repo .. "/docs"
+$argv = args()
+$outdir = $docs .. "/_static"
+for each $a in $argv
+  if not starts_with($a, "-") then $outdir = $a end
+end
+
+-- Root-level docs mirror what gen-doc-pages.mix publishes at cosmix.dev/README etc.
+$root_docs = ["README.md", "AGENTS.md", "CLAUDE.md", "VERSIONS.md", "history.md"]
+
+-- The self-contained page: inline CSS (readable doc column, light+dark),
+-- the rendered body, a thin top bar with a Home link. $title and $body
+-- are HTML-safe by construction ($body is markdown() output; $title is
+-- escaped here).
+fn page($title, $body, $home)
+  $css = ("body{max-width:54rem;margin:0 auto;padding:0 1.2rem 4rem;font-family:system-ui,-apple-system,sans-serif;line-height:1.6;color:#1a1a1a;background:#fff}"
+    .. "header{margin:0 -1.2rem 2rem;padding:.6rem 1.2rem;border-bottom:1px solid #0001;font-size:.9rem}"
+    .. "header a{color:#5b4bdb;text-decoration:none}h1,h2,h3{line-height:1.25}"
+    .. "h1{border-bottom:2px solid #0001;padding-bottom:.3rem}a{color:#5b4bdb}"
+    .. "pre{background:#f6f6f8;padding:.8rem 1rem;overflow-x:auto;border-radius:6px}"
+    .. "code{background:#f0f0f4;padding:.12em .35em;border-radius:3px;font-size:.92em}"
+    .. "pre code{background:none;padding:0}"
+    .. "table{border-collapse:collapse;margin:1rem 0}td,th{border:1px solid #0002;padding:.35em .7em;text-align:left}"
+    .. "blockquote{margin:1rem 0;padding:.2rem 1rem;border-left:3px solid #5b4bdb44;color:#444}"
+    .. "img{max-width:100%}"
+    .. "@media(prefers-color-scheme:dark){body{background:#15151a;color:#e6e6ea}"
+    .. "code{background:#ffffff14}pre{background:#ffffff0d}a,header a{color:#a99cff}"
+    .. "td,th{border-color:#ffffff22}h1{border-color:#ffffff1f}}")
+  return ("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+    .. "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    .. "<title>" .. $title .. "</title><style>" .. $css .. "</style></head><body>"
+    .. "<header><a href=\"" .. $home .. "\">CosMix docs</a></header>\n"
+    .. $body .. "\n</body></html>\n")
+end
+
+-- Rewrite intra-doc links in rendered HTML. Only RELATIVE targets are
+-- touched — the first captured char excludes ':' (no scheme), '/' (no
+-- absolute), '#' (no anchor) and '?' — so `https://x/y.md`, `/abs.md`
+-- and `#frag` pass through, while `strings.md`, `../cos/x.md`,
+-- `y.md#sec` and `y.md?q=1` are rewritten. A trailing `?query`/`#frag`
+-- (captured as $2) is preserved. Three passes, README first because a
+-- README maps to its directory's index, not to `README.html`:
+--   A. `dir/README.md` -> `dir/`          (a slash before README)
+--   B. bare `README.md` -> `index.html`   (same-dir link)
+--   C. everything else `X.md` -> `X.html`
+fn rewrite_links($html)
+  $tail = "((?:[?#][^\"]*)?)"
+  $h = re_replace($html, "href=\"([^\":#?][^\":]*/)README\\.md" .. $tail .. "\"", "href=\"$1$2\"")
+  $h = re_replace($h, "href=\"README\\.md" .. $tail .. "\"", "href=\"index.html$1\"")
+  $h = re_replace($h, "href=\"([^\":/#?][^\":]*)\\.md" .. $tail .. "\"", "href=\"$1.html$2\"")
+  return $h
+end
+
+-- Escape a title for the <title> element.
+fn esc($s)
+  $t = replace($s, "&", "&amp;")
+  $t = replace($t, "<", "&lt;")
+  return replace($t, ">", "&gt;")
+end
+
+-- Every tracked markdown doc: the section trees plus the root whitelist.
+$tracked = split(trim(run_argv_must(["git", "ls-files", "--", "bus/", "cos/", "mix/", "bugs/"], {cwd: $docs})), "\n")
+$docs_list = []
+for each $d in $tracked
+  if ends_with($d, ".md") then push($docs_list, $d) end
+end
+for each $d in $root_docs
+  if is_file($docs .. "/" .. $d) then push($docs_list, $d) end
+end
+
+-- Fresh output tree. remove_dir() wipes OUTDIR wholesale, so refuse any
+-- target that is not a dedicated build directory: it must live under docs/
+-- and its basename must start with an underscore (the _static convention,
+-- and the repo's marker for a generated/scratch dir). This makes passing
+-- `.`, the repo root, or `docs/` itself a hard error rather than a wipe.
+-- Canonicalise even when the target does not exist yet: realpath the
+-- PARENT (which must exist) and re-join the basename, so a valid but
+-- not-yet-created relative path like `docs/_site` validates instead of
+-- being rejected for not existing.
+$outreal = $outdir
+if is_dir($outdir) then
+  $outreal = realpath($outdir)
+else
+  $parent = dirname($outdir)
+  if $parent == "" then $parent = "." end
+  if is_dir($parent) then
+    $outreal = realpath($parent) .. "/" .. basename($outdir)
+  end
+end
+if not starts_with($outreal, $docs .. "/") or not starts_with(basename($outreal), "_") then
+  raise("GEN_UNSAFE_OUTDIR", "refusing to build into '" .. $outdir .. "' — OUTDIR must be under docs/ with an underscore-prefixed name (e.g. docs/_static); it is removed wholesale each run")
+end
+if is_dir($outdir) then remove_dir($outdir) end
+mkdir($outdir, {parents: true})
+
+$made = 0
+for each $doc in $docs_list
+  $src = read_file($docs .. "/" .. $doc)
+  $title = ""
+  -- First ATX H1 as the page title, else the path.
+  for each $line in lines($src)
+    if starts_with($line, "# ") then
+      $title = trim(substr($line, 2))
+      break
+    end
+  end
+  if $title == "" then $title = $doc end
+
+  $body = rewrite_links(markdown($src))
+  -- Depth of this doc → relative path back to the site root, for the
+  -- Home link (so file:// opening works too, not just server-rooted).
+  -- Home points at index.html explicitly (not a bare dir) so it works
+  -- identically under http AND file:// — a directory href shows a listing
+  -- under file://, an index.html href opens the page.
+  $depth = len(split($doc, "/")) - 1
+  $home = "index.html"
+  $i = 0
+  while $i < $depth
+    $home = "../" .. $home
+    $i = $i + 1
+  end
+
+  -- Output path: README.md -> its dir's index.html; else page.md -> page.html.
+  $rel = ""
+  if ends_with($doc, "/README.md") then
+    $rel = substr($doc, 0, len($doc) - len("README.md")) .. "index.html"
+  else
+    if $doc == "README.md" then
+      $rel = "index.html"
+    else
+      $rel = substr($doc, 0, len($doc) - 3) .. ".html"
+    end
+  end
+  $target = $outdir .. "/" .. $rel
+  $dir = dirname($target)
+  if not is_dir($dir) then mkdir($dir, {parents: true}) end
+  write_file($target, page(esc($title), $body, $home))
+  $made = $made + 1
+end
+
+print("gen-static-site: " .. $made .. " self-contained pages -> " .. $outdir)
+print("  view:  mix -c 'http_serve(\"" .. $outdir .. "\", {clean_urls: true})'")
+print("  (no JS, no external assets — works via curl, wget, file://, any host)")
