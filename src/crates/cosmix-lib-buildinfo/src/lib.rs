@@ -262,6 +262,7 @@ mod tests {
             pkg: "cosmix-demo",
             version: "1.2.3",
             git_sha: "abc123def456",
+            git_sha_full: "abc123def456abc123def456abc123def456abc1",
             git_dirty: true,
             build_time: "2026-06-01T00:00:00Z",
         };
