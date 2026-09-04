@@ -164,6 +164,6 @@ end
 -- true
 -- over75=0 split=0
 -- true
--- OPTION_INVALID rfc2047_encode(): encoding must be "B" or "Q", got "Z"
--- rfc2047_encode(): unknown option 'enc' (only 'encoding' is accepted)
+-- OPTION_INVALID rfc2047_encode(): encoding must be "B" or "Q", got "Z" (see: mix man strings)
+-- rfc2047_encode(): unknown option 'enc' (only 'encoding' is accepted) (see: mix man strings)
 -- rfc2047_decode(): expected string, bytes or buffer, got list

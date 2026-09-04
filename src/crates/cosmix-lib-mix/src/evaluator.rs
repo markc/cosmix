@@ -5240,7 +5240,20 @@ impl Evaluator {
             parser.parse_program()
         }) {
             Ok(stmts) => {
-                if let Err(e) = self.execute(&stmts).await {
+                // Label the prelude with a synthetic file so its functions
+                // capture `def_file = "<prelude>"`, not `None`. Without this,
+                // an error inside a prelude function under `-c` (whose entry
+                // source is also keyed `None`) would collide: the error-line
+                // footer would match the prelude's line number against the
+                // `-c` body and print an unrelated line. A non-`None` label
+                // makes prelude frames distinguishable, so the footer skips
+                // them. Restored afterwards so the script's own file is set
+                // by the caller as before.
+                let saved_file = self.ctx.current_file.take();
+                self.ctx.current_file = Some(std::rc::Rc::from("<prelude>"));
+                let result = self.execute(&stmts).await;
+                self.ctx.current_file = saved_file;
+                if let Err(e) = result {
                     eprintln!("prelude: {}", e);
                 }
             }
@@ -5381,6 +5394,31 @@ impl Evaluator {
         }
         match e {
             MixError::Structured(mut info) => {
+                // Teach at the point of failure: a builtin's contract
+                // violation / refusal gets a `(see: mix man <topic>)` pointer
+                // to the page that documents it. The gate is the error CODE —
+                // a real diagnostic code (TYPE_MISMATCH, OPTION_INVALID,
+                // VALIDATION_*, SSH_TIMEOUT, …) is a refusal worth teaching;
+                // the legacy `RUNTIME_ERROR` bucket holds arity errors and
+                // bare `raise()`s, which the entry deliberately excludes
+                // ("a pointer on EVERY arity error would be noise"), and
+                // `USER_DIE` is the script's own `die`. A HOF callback that
+                // raised user code already `had_frames` and returned above.
+                // Skip when the message already names a man page (some builtins
+                // hand-write a better-targeted pointer).
+                // CAPABILITY_DENIED is a policy refusal, not the builtin's own
+                // contract — it belongs to the capabilities model (mix man
+                // capabilities), so the builtin's page pointer would misdirect.
+                // (The Knob-D collection-cap refusals are RUNTIME_ERROR already,
+                // so they need no exclusion here.)
+                let coded = info.code != "RUNTIME_ERROR"
+                    && info.code != "USER_DIE"
+                    && info.code != "CAPABILITY_DENIED";
+                if coded && !info.message.contains("mix man") {
+                    if let Some(topic) = crate::builtins::man_topic_for_builtin(name) {
+                        info.message.push_str(&format!(" (see: mix man {topic})"));
+                    }
+                }
                 info.frames.push(Frame {
                     kind: FrameKind::Builtin,
                     function: name.to_string(),
@@ -5458,12 +5496,18 @@ impl Evaluator {
             // SPEC 18 Phase 2 WS3-C.7b — γ-aware lookup so a per-
             // invocation evaluator can still resolve user functions
             // through the shared registry.
-            let func = self.scope.get_function_owned(name).ok_or_else(|| {
-                MixError::structured(
-                    "FUNCTION_UNDEFINED",
-                    format!("undefined function '{}'", name),
-                )
-            })?;
+            let func = match self.scope.get_function_owned(name) {
+                Some(f) => f,
+                None => {
+                    let hint =
+                        crate::analyzer::undefined_function_hint(name, &self.function_names())
+                            .unwrap_or_default();
+                    return Err(MixError::structured(
+                        "FUNCTION_UNDEFINED",
+                        format!("undefined function '{}'{}", name, hint),
+                    ));
+                }
+            };
             self.call_function(&func, &[]).await
         })
     }
@@ -5478,6 +5522,19 @@ impl Evaluator {
             .collect()
     }
 
+    /// Build a NAME_UNDEFINED error enriched with a nearest-in-scope "did you
+    /// mean" suffix when one is close enough. `name` is sigil-stripped (no
+    /// leading `$`), as it arrives from the variable-read sites.
+    fn undefined_variable_error(&self, name: &str) -> MixError {
+        let hint =
+            crate::analyzer::undefined_variable_hint(name, &self.scope.variable_names())
+                .unwrap_or_default();
+        MixError::structured(
+            "NAME_UNDEFINED",
+            format!("undefined variable '${}'{}", name, hint),
+        )
+    }
+
     /// Call a user-defined function by name, binding whitespace-split shell
     /// words as string arguments. Backs bareword dispatch: `sc restart nginx`
     /// invokes `sc("restart", "nginx")`. Missing/short args bind `nil` inside
@@ -5488,12 +5545,18 @@ impl Evaluator {
         args: &'a [String],
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
-            let func = self.scope.get_function_owned(name).ok_or_else(|| {
-                MixError::structured(
-                    "FUNCTION_UNDEFINED",
-                    format!("undefined function '{}'", name),
-                )
-            })?;
+            let func = match self.scope.get_function_owned(name) {
+                Some(f) => f,
+                None => {
+                    let hint =
+                        crate::analyzer::undefined_function_hint(name, &self.function_names())
+                            .unwrap_or_default();
+                    return Err(MixError::structured(
+                        "FUNCTION_UNDEFINED",
+                        format!("undefined function '{}'{}", name, hint),
+                    ));
+                }
+            };
             let values: Vec<Value> = args.iter().map(|s| Value::String(s.clone())).collect();
             self.track_function_attempt(name);
             self.call_function(&func, &values).await
@@ -7890,10 +7953,7 @@ impl Evaluator {
                         if name.chars().all(|c| c.is_ascii_digit()) {
                             Some(Ok(Value::Nil))
                         } else {
-                            Some(Err(MixError::structured(
-                                "NAME_UNDEFINED",
-                                format!("undefined variable '${}'", name),
-                            )))
+                            Some(Err(self.undefined_variable_error(name)))
                         }
                     }
                 }
@@ -7953,10 +8013,7 @@ impl Evaluator {
                             if name.chars().all(|c| c.is_ascii_digit()) {
                                 Some(Self::index_value_clone(&Value::Nil, &idx_val))
                             } else {
-                                Some(Err(MixError::structured(
-                                    "NAME_UNDEFINED",
-                                    format!("undefined variable '${}'", name),
-                                )))
+                                Some(Err(self.undefined_variable_error(name)))
                             }
                         }
                     };
@@ -8242,10 +8299,7 @@ impl Evaluator {
                         if name.chars().all(|c| c.is_ascii_digit()) {
                             None
                         } else {
-                            Some(Err(MixError::structured(
-                                "NAME_UNDEFINED",
-                                format!("undefined variable '${}'", name),
-                            )))
+                            Some(Err(self.undefined_variable_error(name)))
                         }
                     }
                 }
@@ -9993,10 +10047,7 @@ impl Evaluator {
                             if name.chars().all(|c| c.is_ascii_digit()) {
                                 Ok(Value::Nil)
                             } else {
-                                Err(MixError::structured(
-                                    "NAME_UNDEFINED",
-                                    format!("undefined variable '${}'", name),
-                                ))
+                                Err(self.undefined_variable_error(name))
                             }
                         }
                     }
@@ -11264,12 +11315,20 @@ impl Evaluator {
                     // `Rc<MixFunction>` either from the legacy in-frame
                     // map or from the shared function registry after
                     // promotion.
-                    let func = self.scope.get_function_owned(name).ok_or_else(|| {
-                        MixError::structured(
-                            "FUNCTION_UNDEFINED",
-                            format!("undefined function '{}'", name),
-                        )
-                    })?;
+                    let func = match self.scope.get_function_owned(name) {
+                        Some(f) => f,
+                        None => {
+                            let hint = crate::analyzer::undefined_function_hint(
+                                name,
+                                &self.function_names(),
+                            )
+                            .unwrap_or_default();
+                            return Err(MixError::structured(
+                                "FUNCTION_UNDEFINED",
+                                format!("undefined function '{}'{}", name, hint),
+                            ));
+                        }
+                    };
 
                     self.track_function_attempt(name);
                     self.call_function(&func, &eval_args).await
@@ -11513,13 +11572,20 @@ impl Evaluator {
                         return self.address_block_send(field, ufcs_args).await;
                     }
 
-                    // 5. Enriched undefined error.
+                    // 5. Enriched undefined error — with a nearest-name
+                    // suggestion, same as the plain call sites (a method typo
+                    // `$obj.lenght()` is exactly the case this helps).
+                    let hint = crate::analyzer::undefined_function_hint(
+                        field,
+                        &self.function_names(),
+                    )
+                    .unwrap_or_default();
                     Err(MixError::structured(
                         "FUNCTION_UNDEFINED",
                         format!(
                             "undefined function '{}' (and the object has no \
-                             function-valued member '{}')",
-                            field, field
+                             function-valued member '{}'){}",
+                            field, field, hint
                         ),
                     ))
                 }
@@ -12951,12 +13017,20 @@ impl Evaluator {
                     for arg in args {
                         eval_args.push(self.eval_expr(arg).await?);
                     }
-                    let result = builtins::call_builtin(name, eval_args)?.ok_or_else(|| {
-                        MixError::structured(
-                            "FUNCTION_UNDEFINED",
-                            format!("undefined function '{}'", name),
-                        )
-                    })?;
+                    let result = match builtins::call_builtin(name, eval_args)? {
+                        Some(r) => r,
+                        None => {
+                            let hint = crate::analyzer::undefined_function_hint(
+                                name,
+                                &self.function_names(),
+                            )
+                            .unwrap_or_default();
+                            return Err(MixError::structured(
+                                "FUNCTION_UNDEFINED",
+                                format!("undefined function '{}'{}", name, hint),
+                            ));
+                        }
+                    };
                     // Knob D: cap the produced collection.
                     self.check_collection_size(&result)?;
                     return Ok(result);

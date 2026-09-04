@@ -100,13 +100,62 @@ const SCRIPT_RECURSION_LIMIT: usize = 128;
 /// way, so shallow scripts are unaffected.
 static NO_TRACEBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The source the current top-level run is executing, `(path, source)` —
+/// `path` is the script filename (matching the frames' `file`) or `None` for
+/// `-c`/stdin. Set once before execution by [`run_source`]/[`run_command_line`]
+/// so [`print_uncaught`] can show the offending source line under an error.
+/// Held as the exact bytes handed to the evaluator, so the printed line is
+/// always what actually ran — no disk re-read, no staleness, no lie.
+static ENTRY_SOURCE: std::sync::Mutex<Option<(Option<String>, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Remember the top-level source for error-line rendering.
+fn set_entry_source(path: Option<String>, source: &str) {
+    if let Ok(mut guard) = ENTRY_SOURCE.lock() {
+        *guard = Some((path, source.to_string()));
+    }
+}
+
+/// The offending source line to print under an uncaught error, `(line_no,
+/// text)` — but only when the failure site belongs to the top-level source
+/// this process actually executed (a `-c` body, or the main script file).
+/// An error raised inside an imported module (a different `file`) yields
+/// `None` rather than a possibly-stale disk read: better silent than lying.
+fn offending_source_line(e: &cosmix_mix::error::MixError) -> Option<(usize, String)> {
+    let (site_file, line) = e.error_site()?;
+    let guard = ENTRY_SOURCE.lock().ok()?;
+    let (entry_path, source) = guard.as_ref()?;
+    if &site_file != entry_path {
+        return None;
+    }
+    let text = source.lines().nth(line.checked_sub(1)?)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    // Cap a pathological one-liner so the footer stays one terminal line.
+    let shown = if text.chars().count() > 200 {
+        let head: String = text.chars().take(197).collect();
+        format!("{head}...")
+    } else {
+        text.to_string()
+    };
+    Some((line, shown))
+}
+
 /// Print an uncaught top-level error: traceback by default, legacy
-/// single line under `--no-traceback`.
+/// single line under `--no-traceback`. Both forms gain a caret-style
+/// source-line footer when the failure site is in the top-level source.
 fn print_uncaught(e: &cosmix_mix::error::MixError) {
     if NO_TRACEBACK.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("{e}");
     } else {
         eprintln!("{}", e.render_traceback());
+    }
+    // Statements carry line precision only (no column), so there is no caret
+    // to point — show the offending line under a line-number gutter, rustc's
+    // form minus the `^^^` row that a column span would fill.
+    if let Some((line, text)) = offending_source_line(e) {
+        eprintln!("  {line} | {text}");
     }
 }
 
@@ -305,6 +354,9 @@ fn run_source(
     // `args()` reads this. It must be told, not left to guess from the
     // process argv — a flag before the script name shifts that by one.
     cosmix_mix::set_script_argv(script_args.to_vec());
+    // Remember the source (keyed by the same filename the frames carry) so an
+    // uncaught error can show its offending line.
+    set_entry_source(filename.map(str::to_string), source);
     let rt = build_runtime();
 
     // SPEC 18 Phase 2 WS3-C.7d — wrap the whole `block_on` body in a
@@ -417,6 +469,9 @@ fn run_source(
 ///   instead of hunting PATH for a `time` binary that does not exist.
 fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelude: bool) -> i32 {
     cosmix_mix::set_script_argv(script_args.to_vec());
+    // `-c`/stdin has no file, so its frames carry `file: None`; store under
+    // `None` to match, enabling the offending-line footer for `-c` too.
+    set_entry_source(None, code);
     let rt = build_runtime();
     let local = tokio::task::LocalSet::new();
     let (exit_code, stats) = rt.block_on(local.run_until(async {

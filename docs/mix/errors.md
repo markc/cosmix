@@ -131,6 +131,43 @@ One field-name note: `$err.frames[0].function` works — `function` is accepted 
 field position since 0.29.0 (`fn` reads the same field; map-literal and
 strict-data keys still require quoting `"function"`).
 
+### Errors that teach (0.79.0)
+
+Four cheap additions turn a runtime failure from a statement of what is wrong
+into a pointer at the fix. All are display/message enrichments — `$err.code`
+and the traceback shape are unchanged, so catch-based scripts and scrapers see
+the same structure.
+
+- **`FUNCTION_UNDEFINED` suggests a name.** A typo resolves to the nearest
+  builtin or in-scope user function (edit distance ≤ 2, tightening to ≤ 1 for
+  short names): `undefined function 'lenght' — did you mean 'length'?`. The
+  same applies to `NAME_UNDEFINED` for a `$variable` read, suggesting the
+  nearest name in scope.
+- **Deleted builtins name their replacement.** Calling a name removed by a
+  release — the five pattern-first regex/grep names deleted in 0.73.0, and any
+  future removal — reports the rename rather than a bare "undefined":
+  `undefined function 'grep' — deleted in mix 0.73.0; use grep_lines(text, pattern)`.
+  This is the same table that drives the `MIX-D3001`–`D3005` lint notes, so
+  authoring-time and run-time guidance cannot drift.
+- **Builtin refusals point at the manual.** A builtin's *coded* contract
+  violation or refusal (a `TYPE_MISMATCH`, `OPTION_INVALID`, `VALIDATION_*`,
+  … — not an arity error, not a bare `raise`/`die`) ends with a pointer to the
+  page that documents it: `OPTION_INVALID hash_sha256(): unknown option 'rawr'
+  (only 'raw' is accepted) (see: mix man system)`. Read the whole page with
+  `mix man <topic>`.
+- **The offending source line prints under the error.** An uncaught error whose
+  failure site is in the top-level source (a `-c` body or the script file) shows
+  that line beneath it, rustc-style — rendered from the exact bytes that ran, so
+  it is never stale:
+
+  ```text
+  Runtime error at job.mix:2: undefined variable '$y' — did you mean '$x'?
+    2 | print($y)
+  ```
+
+  A failure inside an imported module (a different file) prints no line rather
+  than risk a stale disk read.
+
 ## try … catch — recover from a failure
 
 ```mix

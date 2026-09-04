@@ -414,6 +414,32 @@ impl MixError {
             _ => None,
         }
     }
+
+    /// The `(file, line)` where this error was raised — the failure site an
+    /// error-line display anchors to. Prefers the innermost traceback frame
+    /// (frames are outermost-to-innermost, so the last frame with a line is
+    /// the failure site), falling back to the structured span, then the
+    /// legacy `RuntimeError` span. `file` is `None` for a `-c` body (stdin
+    /// `mix -` is keyed `Some("-")`). Returns `None` when the error carries no
+    /// position at all.
+    pub fn error_site(&self) -> Option<(Option<String>, usize)> {
+        if let Some(info) = self.info() {
+            if let Some(frame) = info.frames.iter().rev().find(|f| f.line.is_some()) {
+                return Some((frame.file.clone(), frame.line.unwrap()));
+            }
+            if let Some(span) = &info.span {
+                return Some((span.file.clone(), span.line));
+            }
+            return None;
+        }
+        if let MixError::RuntimeError {
+            span: Some(span), ..
+        } = self
+        {
+            return Some((span.file.clone(), span.line));
+        }
+        None
+    }
 }
 
 pub fn assignment_chain_parse_message(operator: &str) -> String {

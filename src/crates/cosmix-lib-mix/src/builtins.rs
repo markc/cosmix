@@ -878,6 +878,72 @@ pub fn is_builtin(name: &str) -> bool {
     .contains(name)
 }
 
+/// The `mix man` topic whose page best documents builtin `name`, for the
+/// `(see: mix man <topic>)` pointer the evaluator appends to a builtin's
+/// contract-violation / refusal error. Returns `None` when no page
+/// confidently covers the builtin — a silent error beats a misdirecting
+/// pointer.
+///
+/// Two layers: a name override first, because the two largest registry
+/// categories are catch-alls (`system` holds http/ssh/tcp/udp/ws and the
+/// datetime family; `string` holds the `re_*` regex family), then the
+/// category→page fallback for everything else. The mapping is verified
+/// against the shipped `docs/mix/*.md` set; when a page is renamed or a
+/// category is added, update this alongside it.
+pub fn man_topic_for_builtin(name: &str) -> Option<&'static str> {
+    // `raise`/`panic` don't report a violation of their OWN contract — they
+    // emit the CALLER's error (its code, its message). Annotating that with a
+    // "see: mix man system" pointer would misattribute a user error to the
+    // raise builtin, so these never carry a pointer.
+    if name == "raise" || name == "panic" {
+        return None;
+    }
+    // `format_bytes`/`format_number` sit in the "format" category beside
+    // fmt/sprintf (which strings.md documents) but are themselves documented
+    // only in the generated builtins.md — no prose page covers them, so a
+    // "see: mix man strings" pointer would be dead. Silence beats misdirection.
+    if name == "format_bytes" || name == "format_number" {
+        return None;
+    }
+    // Name overrides — most specific, and they beat the coarse category.
+    const DATETIME: &[&str] = &[
+        "time",
+        "now_iso",
+        "date_format",
+        "date_parse",
+        "duration_format",
+        "relative_time",
+    ];
+    if name.starts_with("http_") {
+        return Some("http");
+    }
+    if name.starts_with("re_") {
+        return Some("regex");
+    }
+    if name.starts_with("ssh_") || name.starts_with("scp_") {
+        return Some("remote");
+    }
+    if DATETIME.contains(&name) {
+        return Some("datetime");
+    }
+    // Category fallback.
+    let cat = BUILTINS.iter().find(|b| b.name == name)?.category;
+    Some(match cat {
+        "system" => "system",
+        "string" => "strings",
+        "io" => "io",
+        "math" => "math",
+        "list" | "map" => "collections",
+        "json" | "jmap" | "db" | "validate" => "data",
+        "format" => "strings",
+        "buffer" => "buffer",
+        "datastar" => "datastar",
+        "bus" => "bus",
+        // `type` (to_number/to_string/is_*) has no single confident page.
+        _ => return None,
+    })
+}
+
 /// Capability classes for the builtin table — the axis a
 /// [`CapabilityPolicy`](crate::evaluator::CapabilityPolicy) gates on.
 ///
@@ -18238,7 +18304,7 @@ fn http_serve_one(
         http_send_file(stream, std::path::Path::new(shell), render_md, head_only);
         true
     };
-    let mut owned = stream;
+    let owned = stream;
     let mut reader = std::io::BufReader::new(&mut *owned);
     let req = match http_srv::read_head(&mut reader, req_deadline) {
         Ok(r) => r,
@@ -26684,5 +26750,65 @@ mod strict_toml_encode_tests {
         assert!(encoded.contains("ports = ["), "{encoded}");
         assert!(encoded.contains("25"), "{encoded}");
         assert!(encoded.contains("143"), "{encoded}");
+    }
+}
+
+#[cfg(test)]
+mod man_topic_tests {
+    use super::man_topic_for_builtin;
+
+    #[test]
+    fn name_overrides_beat_the_coarse_category() {
+        // http_/re_/ssh_ live in the "system"/"string" catch-alls but have
+        // their own page — the override must win.
+        assert_eq!(man_topic_for_builtin("http_get"), Some("http"));
+        assert_eq!(man_topic_for_builtin("re_match"), Some("regex"));
+        assert_eq!(man_topic_for_builtin("ssh_exec"), Some("remote"));
+        assert_eq!(man_topic_for_builtin("date_format"), Some("datetime"));
+    }
+
+    #[test]
+    fn category_fallback_maps_to_a_page() {
+        assert_eq!(man_topic_for_builtin("sqrt"), Some("math"));
+        assert_eq!(man_topic_for_builtin("upper"), Some("strings"));
+        assert_eq!(man_topic_for_builtin("read_file"), Some("io"));
+        // tcp/udp/ws stay in "system" (documented there), no override.
+        assert_eq!(man_topic_for_builtin("tcp_connect"), Some("system"));
+    }
+
+    #[test]
+    fn error_constructors_and_unknowns_get_no_pointer() {
+        // raise/panic emit the CALLER's error, not their own violation.
+        assert_eq!(man_topic_for_builtin("raise"), None);
+        assert_eq!(man_topic_for_builtin("panic"), None);
+        assert_eq!(man_topic_for_builtin("format_bytes"), None);
+        assert_eq!(man_topic_for_builtin("format_number"), None);
+        // A non-builtin name maps to nothing.
+        assert_eq!(man_topic_for_builtin("definitely_not_a_builtin"), None);
+    }
+
+    /// Exhaustive range check: EVERY topic the mapper can emit for EVERY
+    /// builtin (leaf + HOF) must name a real `docs/mix/*.md` page. A code
+    /// typo or a new category that maps to a dead topic is caught here rather
+    /// than shipping a `see: mix man <nothing>` pointer. The page set is
+    /// pinned as data — update it (and the mapping) together when a page is
+    /// added or renamed, exactly the drift this guards.
+    #[test]
+    fn every_emitted_topic_names_a_real_page() {
+        const PAGES: &[&str] = &[
+            "buffer", "bus", "collections", "data", "datastar", "datetime",
+            "http", "io", "math", "regex", "remote", "strings", "system",
+        ];
+        let names = super::BUILTIN_NAMES
+            .iter()
+            .chain(crate::builtins_hof::HOF_NAMES.iter());
+        for name in names {
+            if let Some(topic) = man_topic_for_builtin(name) {
+                assert!(
+                    PAGES.contains(&topic),
+                    "{name} -> '{topic}' is not a known man page",
+                );
+            }
+        }
     }
 }

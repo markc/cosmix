@@ -1385,7 +1385,11 @@ fn check_ssh_escaped_quotes(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis)
 // by the lint_notes CLI tests.
 
 /// Pattern-first regex/grep names → their subject-first 0.63.0 twins.
-const DEPRECATED_REGEX_CALLS: &[(&str, &str, &str)] = &[
+/// ONE table, shared with the runtime: the evaluator's FUNCTION_UNDEFINED
+/// handler reads it too, so a deleted name gets the same "use X instead"
+/// pointer at runtime (where the straggler actually surfaces) that lint
+/// gives at authoring time. (name, D-code, replacement-call).
+pub(crate) const DEPRECATED_REGEX_CALLS: &[(&str, &str, &str)] = &[
     ("regex_match", "MIX-D3001", "re_match(s, pattern)"),
     (
         "regex_find",
@@ -2123,7 +2127,7 @@ fn check_builtin_result_key(
     ));
 }
 
-fn edit_distance(left: &str, right: &str) -> usize {
+pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     let right_chars = right.chars().collect::<Vec<_>>();
     let mut row = (0..=right_chars.len()).collect::<Vec<_>>();
     for (i, lc) in left.chars().enumerate() {
@@ -2138,6 +2142,66 @@ fn edit_distance(left: &str, right: &str) -> usize {
         row = next;
     }
     row[right_chars.len()]
+}
+
+/// Runtime "did you mean" for an undefined function call — the suffix the
+/// evaluator appends to a FUNCTION_UNDEFINED message. Two sources, in order:
+///
+///   1. The shared deleted/renamed table (`DEPRECATED_REGEX_CALLS`, which also
+///      drives lint D3001–D3005). A straggler that survives lint — an
+///      extensionless shebang script, a string built at runtime — hits the
+///      SAME rename pointer here, at the point it actually fails.
+///   2. Nearest live name (builtin or in-scope user function) within an edit
+///      distance that tightens for short names (≤1 for ≤4 chars, else ≤2), so
+///      `lenght`→`length` is caught but two unrelated 3-letter names are not.
+///
+/// Returns `None` when nothing is close enough — a bare `FUNCTION_UNDEFINED`
+/// with no misleading guess is better than a wrong "did you mean".
+pub(crate) fn undefined_function_hint(name: &str, user_fns: &HashSet<String>) -> Option<String> {
+    if let Some((_, _, replacement)) =
+        DEPRECATED_REGEX_CALLS.iter().find(|(n, _, _)| *n == name)
+    {
+        return Some(format!(" — deleted in mix 0.73.0; use {replacement}"));
+    }
+    let threshold = if name.chars().count() <= 4 { 1 } else { 2 };
+    let mut best: Option<(usize, String)> = None;
+    // Candidates: leaf builtins, the HOF registry (map/filter/sort_by/… live in
+    // a separate table, not BUILTIN_NAMES — a `mapp` typo must still resolve),
+    // and in-scope user functions.
+    let candidates = builtins::BUILTIN_NAMES
+        .iter()
+        .copied()
+        .chain(crate::builtins_hof::HOF_NAMES.iter().copied())
+        .chain(user_fns.iter().map(|f| f.as_str()));
+    for cand in candidates {
+        let d = edit_distance(name, cand);
+        if d == 0 || d > threshold {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+            best = Some((d, cand.to_string()));
+        }
+    }
+    best.map(|(_, cand)| format!(" — did you mean '{cand}'?"))
+}
+
+/// Runtime "did you mean" for an undefined `$variable` read — the suffix the
+/// evaluator appends to a NAME_UNDEFINED message. Nearest in-scope name by
+/// the same tightening edit distance as [`undefined_function_hint`]. `$` is
+/// re-added in the suggestion since the name arrives sigil-stripped.
+pub(crate) fn undefined_variable_hint(name: &str, in_scope: &[String]) -> Option<String> {
+    let threshold = if name.chars().count() <= 4 { 1 } else { 2 };
+    let mut best: Option<(usize, &str)> = None;
+    for cand in in_scope {
+        let d = edit_distance(name, cand);
+        if d == 0 || d > threshold {
+            continue;
+        }
+        if best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, cand.as_str()));
+        }
+    }
+    best.map(|(_, cand)| format!(" — did you mean '${cand}'?"))
 }
 
 /// Defence-in-depth for embedders using the public AST + `analyze()` API.
@@ -2456,5 +2520,58 @@ fn collect_expr_caps(expr: &Expr, caps: &mut HashSet<&'static str>) {
         _ => {
             walk_expr_children(expr, &mut |child| collect_expr_caps(child, caps));
         }
+    }
+}
+
+#[cfg(test)]
+mod instructional_error_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn fns(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn deleted_name_pointer_shares_the_lint_table() {
+        // Every deleted regex/grep name resolves to its replacement — the
+        // same DEPRECATED_REGEX_CALLS row lint reads, so the two cannot drift.
+        for (dead, _code, replacement) in DEPRECATED_REGEX_CALLS {
+            let hint = undefined_function_hint(dead, &fns(&[])).unwrap();
+            assert!(hint.contains("deleted in mix 0.73.0"), "{dead}: {hint}");
+            // The replacement call (its name half) must appear.
+            let repl_name = replacement.split('(').next().unwrap();
+            assert!(hint.contains(repl_name), "{dead}: {hint} lacks {repl_name}");
+        }
+    }
+
+    #[test]
+    fn fuzzy_suggests_nearest_builtin_and_user_fn() {
+        // A one-edit typo of a builtin.
+        assert_eq!(
+            undefined_function_hint("lenght", &fns(&[])),
+            Some(" — did you mean 'length'?".to_string())
+        );
+        // A user function beats nothing when it is the nearest.
+        assert_eq!(
+            undefined_function_hint("greeet", &fns(&["greet"])),
+            Some(" — did you mean 'greet'?".to_string())
+        );
+    }
+
+    #[test]
+    fn no_suggestion_when_nothing_is_close() {
+        assert_eq!(undefined_function_hint("xyzzy_qw", &fns(&[])), None);
+        // Short names tighten to distance 1: two unrelated 3-letter names
+        // must not cross-suggest.
+        assert_eq!(undefined_variable_hint("abc", &["xyz".to_string()]), None);
+    }
+
+    #[test]
+    fn variable_hint_re_adds_the_sigil() {
+        assert_eq!(
+            undefined_variable_hint("greetng", &["greeting".to_string()]),
+            Some(" — did you mean '$greeting'?".to_string())
+        );
     }
 }
