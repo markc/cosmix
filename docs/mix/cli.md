@@ -359,6 +359,40 @@ mix watch '*.mix' 'cargo test'
 
 ## Diagnostics — measure and trace
 
+### `mix doctor` — is this install healthy, and what am I talking to?
+
+One command answering both questions, from the OS shell or the REPL. Each line
+is `✓` (fine), `⚠` (a caveat, with the fix), or `✗` (broken, with the fix):
+
+```
+mix doctor
+```
+
+```text
+mix doctor — mix 0.81.0
+
+  ✓ version    0.81.0 · git 1a2b3c4d5e6f · built 2026-09-05T…Z
+  ✓ features   json regex markdown toml serde datetime url crypto http sqlite dkim datastar xml yaml ws
+  ✓ prelude    loaded (2 functions in scope)
+  ✓ manual     33 page(s) readable
+  ✓ stats      writable at /home/you/.local/state/mix
+  ✓ bus        reachable at ws://…/ws
+
+healthy — no ✗ checks
+```
+
+It **exits non-zero if any `✗` check fails**, so it gates: `mix doctor && deploy`.
+The `features` line is the honest set THIS binary was compiled with (a slimmed
+build reports fewer, never claims a capability it lacks); the `bus` line is a
+bounded reachability probe — the whole connect runs on a worker thread capped at
+~600 ms, so even a hostname endpoint with a dead resolver cannot hang it. Set
+`MIX_DOCTOR_SKIP_BUS` to skip the probe entirely (the line then reads `—`), for
+a hermetic run that touches no broker. The checks are deliberately local —
+version/provenance, compiled features, prelude, manual (checkout **or** `mix man`
+cache), stats-dir writability, and Bus — with no fleet awareness; that belongs
+to the hub's tools. Only the `stats` check can fail hard (`✗`); an unreachable
+Bus is a `⚠`, never a `✗`, so `mix doctor` still passes on a standalone box.
+
 These need live REPL state (readline history, the trace flag, the stats
 handle), so they are handled in the REPL loop rather than `meta::dispatch`.
 Apart from `mix stats` — which also runs one-shot from the OS shell against

@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{Read, Write};
+use std::net::ToSocketAddrs;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -374,7 +375,7 @@ Run `mix builtins` for the full remit of all {count} built-in functions
 - Reference    `help`  `builtins`  `what <name>`  `apropos <term>`  `man <topic>`  `keywords`  `syntax`  `operators`
 - Introspect   `vars`  `functions`  `aliases`  `all`  `type`  `config`  `status`
 - Build        `build`  `clean`  `update`  `test`
-- Diagnostics  `stats`  `time`  `check`  `lint`  `trace`  `history`  `reload`
+- Diagnostics  `doctor`  `stats`  `time`  `check`  `lint`  `trace`  `history`  `reload`
 - Ecosystem    `mesh`  `ports`  `ping <svc>`
 - AI-powered   `fix`  `extend`  `review`  `explain`  `evolve`  `dogfood`  `fuzz`  `teach`
 
@@ -535,6 +536,13 @@ pub fn dispatch(args: &[&str], eval: &Evaluator, version: &str) -> Option<String
             }
         }
         "status" => cmd_status(eval, version),
+        // Print the health report and CONTINUE. `dispatch` is shared with the
+        // interactive REPL, so exiting here would kill a live session (losing
+        // its unsaved stats + history). The one-shot CLI gets doctor's exit
+        // code from `run_doctor`, called before dispatch in run_meta_subcommand.
+        "doctor" => {
+            cmd_doctor(eval, version);
+        }
         // `mix --version` / `-V` / `version` at the REPL prints the version line,
         // matching the CLI `mix --version`. Without an explicit arm it fell through
         // to `_ => cmd_help_overview()` and dumped the whole meta-command help
@@ -786,6 +794,203 @@ fn cmd_status(eval: &Evaluator, version: &str) {
     println!("  functions: {}", func_count);
     println!("  scope:     {} frame(s)", scope_depth);
     println!("  trace:     {}", if eval.trace() { "on" } else { "off" });
+}
+
+/// `mix doctor` — a substrate self-check answering "is this mix installation
+/// healthy and what am I talking to". Each line is ✓ (fine), ⚠ (a caveat with
+/// the fix), or ✗ (broken with the fix). Deliberately LOCAL and small: version
+/// + provenance, compiled features, prelude, manual, stats DB, Bus if
+/// configured — no fleet awareness, no config validation beyond its own (those
+/// are the hub's tools). Returns the number of ✗ lines so a caller / CI can key
+/// on the exit status.
+/// One-shot `mix doctor`: run the health check and return its exit code (0
+/// healthy, 1 if any ✗). The CLI path calls this instead of going through
+/// `dispatch`, so the exit status can gate `mix doctor && …` without the
+/// REPL-killing `process::exit` that a shared-dispatch arm would need.
+pub fn run_doctor(eval: &Evaluator, version: &str) -> i32 {
+    cmd_doctor(eval, version)
+}
+
+fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
+    let mut fails = 0;
+    println!("mix doctor — {}\n", version_line(version));
+
+    // 1. Version + build provenance.
+    let bi = cosmix_buildinfo::build_info!();
+    let dirty = if bi.git_dirty { " (dirty tree)" } else { "" };
+    println!("  ✓ version    {} · git {}{} · built {}", bi.version, bi.git_sha, dirty, bi.build_time);
+
+    // 2. Compiled feature set — the honest "what can this binary do".
+    let feats = cosmix_mix::builtins::compiled_features();
+    if feats.is_empty() {
+        println!("  ⚠ features   none — a bare interpreter; network/crypto/data builtins will refuse. Rebuild with the feature set (setup.mix enables all).");
+    } else {
+        println!("  ✓ features   {}", feats.join(" "));
+    }
+
+    // 3. Prelude — the load flag itself (not a name probe), so a user prelude
+    //    override that doesn't define sum/avg still reads as loaded, and
+    //    "--no-prelude" is distinguished from a fault (it is a choice).
+    if eval.prelude_loaded() {
+        let n = eval.scope().function_names().len();
+        println!("  ✓ prelude    loaded ({n} functions in scope)");
+    } else {
+        println!("  ⚠ prelude    not loaded (this session ran with --no-prelude; the prelude is fine)");
+    }
+
+    // 4. Manual — count readable pages across the checkout docs dir and the
+    //    `mix man` cache (a deployed node has only the latter, populated lazily).
+    let mut man_dirs: Vec<PathBuf> = vec![resolve_man_dir()];
+    if let Some(root) = man_cache_root(
+        env::var_os("XDG_CACHE_HOME").map(PathBuf::from).as_deref(),
+        dirs::home_dir().as_deref(),
+    ) {
+        man_dirs.push(root);
+    }
+    let mut man_topics = std::collections::HashSet::new();
+    for dir in &man_dirs {
+        for t in available_man_topics(dir) {
+            man_topics.insert(t);
+        }
+    }
+    if man_topics.is_empty() {
+        println!("  ⚠ manual     no pages found locally — `mix man TOPIC` fetches + caches on first use (needs network once).");
+    } else {
+        println!("  ✓ manual     {} page(s) readable", man_topics.len());
+    }
+
+    // 5. Stats DB — the usage-tracking directory must be creatable + writable.
+    match crate::stats_io::stats_dir() {
+        Some(dir) => match probe_writable_dir(&dir) {
+            Ok(()) => println!("  ✓ stats      writable at {}", dir.display()),
+            Err(e) => {
+                println!("  ✗ stats      {} not writable: {e} — fix its ownership/permissions or set XDG_DATA_HOME", dir.display());
+                fails += 1;
+            }
+        },
+        None => println!("  ⚠ stats      no data dir resolvable (no HOME/XDG_DATA_HOME) — usage tracking is off"),
+    }
+
+    // 6. Bus — only if a noded endpoint is configured/derivable. Bounded probe,
+    //    never a hang: a unix socket is checked for existence + a quick connect;
+    //    a tcp url gets a short connect_timeout.
+    // A test (or any caller wanting a hermetic run) can skip the live probe so
+    // `mix doctor` never touches a real broker — the reachability line is the
+    // one check with an outward side effect.
+    if env::var_os("MIX_DOCTOR_SKIP_BUS").is_some() {
+        println!("  — bus        probe skipped (MIX_DOCTOR_SKIP_BUS set)");
+        return finish_doctor(fails);
+    }
+    let noded = crate::node_config::resolve_noded_url();
+    match probe_bus(&noded) {
+        BusProbe::NotConfigured => {
+            println!("  — bus        not configured (no noded endpoint) — standalone mode");
+        }
+        BusProbe::Reachable => println!("  ✓ bus        reachable at {noded}"),
+        BusProbe::Unreachable(why) => {
+            println!("  ⚠ bus        {noded} unreachable ({why}) — start noded, or ignore if standalone");
+        }
+    }
+
+    finish_doctor(fails)
+}
+
+/// Doctor's summary line + exit code (0 healthy, 1 if any ✗). Shared by the
+/// normal and bus-skipped paths.
+fn finish_doctor(fails: i32) -> i32 {
+    println!();
+    if fails == 0 {
+        println!("healthy — no ✗ checks");
+        0
+    } else {
+        println!("{fails} check(s) failed (✗) — see fixes above");
+        1
+    }
+}
+
+/// Can we actually write into `dir` (creating it if needed)? Writes and
+/// removes a uniquely-named probe file so a read-only or wrong-owner directory
+/// is caught, not just an existence check.
+fn probe_writable_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".doctor-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"ok")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+enum BusProbe {
+    NotConfigured,
+    Reachable,
+    Unreachable(String),
+}
+
+/// A bounded Bus reachability probe — never blocks the caller longer than
+/// ~600 ms whatever the URL shape. The connect work runs on a detached thread:
+/// `connect_timeout` bounds a TCP handshake, but `to_socket_addrs()` for a
+/// HOSTNAME url does a blocking DNS lookup with no timeout of its own, so the
+/// thread + `recv_timeout` is what actually guarantees the ceiling (a hung
+/// resolver just leaves the thread parked and we report a timeout). An IP:port
+/// url — the mesh's normal shape — never hits DNS and returns in well under the
+/// 300 ms connect bound.
+fn probe_bus(url: &str) -> BusProbe {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    let owned = url.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe_bus_blocking(&owned));
+    });
+    match rx.recv_timeout(Duration::from_millis(600)) {
+        Ok(result) => result,
+        Err(_) => BusProbe::Unreachable("probe timed out (DNS or connect > 600ms)".into()),
+    }
+}
+
+/// The blocking connect probe, run only on `probe_bus`'s worker thread.
+fn probe_bus_blocking(url: &str) -> BusProbe {
+    use std::time::Duration;
+    // Per-connect bound kept below the outer 600 ms so trying a couple of
+    // resolved addresses still fits under the overall ceiling.
+    let timeout = Duration::from_millis(200);
+    // Unix socket: `unix:/path` or a bare path.
+    if let Some(path) = url.strip_prefix("unix:").or_else(|| {
+        (url.starts_with('/') || url.starts_with("./")).then_some(url)
+    }) {
+        if !Path::new(path).exists() {
+            return BusProbe::Unreachable("socket path does not exist".into());
+        }
+        return match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => BusProbe::Reachable,
+            Err(e) => BusProbe::Unreachable(e.to_string()),
+        };
+    }
+    // TCP: strip an optional `scheme://` prefix and any `/path` suffix
+    // (`ws://host:4200/ws` → `host:4200`), leaving just host:port for
+    // resolution — a bounded connect to that port is our "is noded listening"
+    // probe (the ws handshake would be more precise but a port connect is
+    // enough for a health line and cannot hang).
+    let after_scheme = url.rsplit_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let hostport = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if hostport.is_empty() {
+        return BusProbe::NotConfigured;
+    }
+    match hostport.to_socket_addrs() {
+        Ok(addrs) => {
+            // Try EVERY resolved address, not just the first: a v6-first
+            // dual-stack resolution with no v6 route would otherwise report a
+            // false ⚠ while v4 is reachable.
+            let mut last = String::from("no address resolved");
+            for addr in addrs {
+                match std::net::TcpStream::connect_timeout(&addr, timeout) {
+                    Ok(_) => return BusProbe::Reachable,
+                    Err(e) => last = e.to_string(),
+                }
+            }
+            BusProbe::Unreachable(last)
+        }
+        Err(e) => BusProbe::Unreachable(format!("cannot resolve: {e}")),
+    }
 }
 
 /// `mix vars`: list all variables
@@ -1322,6 +1527,7 @@ fn cmd_help_overview() {
     println!("  mix FILE [ARGS]  Run a script in a clean child process");
     println!("  mix --version    Print the version line (also: mix -V)");
     println!("  mix status       Detailed status (uptime, memory, scope depth, trace)");
+    println!("  mix doctor       Health self-check (version, features, prelude, manual, stats, bus)");
     println!("  mix vars         List all variables");
     println!("  mix aliases      List all aliases");
     println!("  mix functions    List all user-defined functions");

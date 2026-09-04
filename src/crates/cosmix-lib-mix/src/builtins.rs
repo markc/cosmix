@@ -878,6 +878,40 @@ pub fn is_builtin(name: &str) -> bool {
     .contains(name)
 }
 
+/// The optional cargo features this interpreter was actually built with, in a
+/// stable order — the honest answer to "what can THIS binary do", for
+/// `mix doctor` and capability reporting. `cfg!` evaluates at compile time, so
+/// a slimmed custom build reports fewer here rather than claiming a capability
+/// it lacks (unlike a hand-kept static list, which would drift into a lie).
+/// `tokio-sleep` is omitted: it is an alias-only no-op feature (tokio is
+/// unconditional now), so reporting it would say nothing about the build.
+pub fn compiled_features() -> Vec<&'static str> {
+    let mut f = Vec::new();
+    macro_rules! feat {
+        ($name:literal) => {
+            if cfg!(feature = $name) {
+                f.push($name);
+            }
+        };
+    }
+    feat!("json");
+    feat!("regex");
+    feat!("markdown");
+    feat!("toml");
+    feat!("serde");
+    feat!("datetime");
+    feat!("url");
+    feat!("crypto");
+    feat!("http");
+    feat!("sqlite");
+    feat!("dkim");
+    feat!("datastar");
+    feat!("xml");
+    feat!("yaml");
+    feat!("ws");
+    f
+}
+
 /// The `mix man` topic whose page best documents builtin `name`, for the
 /// `(see: mix man <topic>)` pointer the evaluator appends to a builtin's
 /// contract-violation / refusal error. Returns `None` when no page
@@ -26810,5 +26844,82 @@ mod man_topic_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod compiled_features_tests {
+    use super::compiled_features;
+
+    #[test]
+    fn only_known_features_no_dupes() {
+        // The bare `cargo test -p cosmix-lib-mix` build has default = [], so
+        // this list may be empty — the invariant is that whatever appears is a
+        // real optional feature name and each appears at most once.
+        const KNOWN: &[&str] = &[
+            "json", "regex", "markdown", "toml", "serde", "datetime", "url",
+            "crypto", "http", "sqlite", "dkim", "datastar", "xml", "yaml", "ws",
+        ];
+        let f = compiled_features();
+        for name in &f {
+            assert!(KNOWN.contains(name), "unknown feature reported: {name}");
+        }
+        let mut deduped = f.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), f.len(), "compiled_features has duplicates");
+    }
+
+    /// Guard the hand-kept `feat!` list against `Cargo.toml [features]`: every
+    /// optional feature declared there (except `default` and the alias-only
+    /// `tokio-sleep`) must be one this reporter knows, so a newly added feature
+    /// forgotten in `compiled_features()` is caught here rather than silently
+    /// under-reported. Parses the manifest embedded at compile time.
+    #[test]
+    fn every_cargo_feature_is_reported_or_deliberately_skipped() {
+        const KNOWN: &[&str] = &[
+            "json", "regex", "markdown", "toml", "serde", "datetime", "url",
+            "crypto", "http", "sqlite", "dkim", "datastar", "xml", "yaml", "ws",
+        ];
+        const SKIP: &[&str] = &["default", "tokio-sleep"];
+        let manifest = include_str!("../Cargo.toml");
+        let mut in_features = false;
+        for line in manifest.lines() {
+            let t = line.trim();
+            if t.starts_with('[') {
+                in_features = t == "[features]";
+                continue;
+            }
+            if !in_features || t.starts_with('#') || t.is_empty() {
+                continue;
+            }
+            // `name = [...]` / `name = []`
+            let Some((name, _)) = t.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if SKIP.contains(&name) {
+                continue;
+            }
+            assert!(
+                KNOWN.contains(&name),
+                "Cargo.toml feature '{name}' is not handled by compiled_features()/its test — add it to the feat! macro and KNOWN, or to SKIP",
+            );
+        }
+    }
+
+    // The cfg! wiring: when a feature IS built, it must be reported. These
+    // assertions are no-ops in a build without the feature, active with it
+    // (e.g. `cargo test -p cosmix-lib-mix --features json,regex`).
+    #[test]
+    fn enabled_features_are_reported() {
+        let f = compiled_features();
+        #[cfg(feature = "json")]
+        assert!(f.contains(&"json"), "json built but not reported");
+        #[cfg(feature = "regex")]
+        assert!(f.contains(&"regex"), "regex built but not reported");
+        #[cfg(feature = "ws")]
+        assert!(f.contains(&"ws"), "ws built but not reported");
+        let _ = f;
     }
 }

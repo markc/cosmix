@@ -273,6 +273,12 @@ fn run_meta_subcommand(sub_args: &[String]) -> i32 {
         cosmix_mix::interrupt::init(eval.interrupt_flag());
         eval.load_prelude().await;
 
+        // `mix doctor` one-shot: return its health exit code (0/1) so it can
+        // gate `mix doctor && …`. Handled here rather than in `dispatch`, which
+        // is shared with the REPL where a process::exit would kill the session.
+        if sub_args.first().map(String::as_str) == Some("doctor") {
+            return meta::run_doctor(&eval, VERSION);
+        }
         let args_slice: Vec<&str> = sub_args.iter().map(String::as_str).collect();
         let _exec_hint = meta::dispatch(&args_slice, &eval, VERSION);
         // `dispatch` returns Some(path) only for REPL-exec-chain
@@ -305,6 +311,7 @@ const META_CLI_COMMANDS: &[&str] = &[
     "test",
     "self",
     "status",
+    "doctor",
     // `version` matches the REPL meta-command spelling (`mix version`), so a
     // plumbed REPL line falling through to external execution — and any
     // script/CLI caller — gets the version line instead of "Error reading

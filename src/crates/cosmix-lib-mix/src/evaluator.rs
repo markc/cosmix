@@ -5206,6 +5206,14 @@ impl Evaluator {
         }
     }
 
+    /// Whether [`load_prelude`](Self::load_prelude) has run in this session —
+    /// set unconditionally when it does (independent of WHICH prelude, built-in
+    /// or a user override), so a caller can tell "prelude loaded" from
+    /// "--no-prelude" without probing for specific function names.
+    pub fn prelude_loaded(&self) -> bool {
+        self.globals.borrow().prelude_loaded
+    }
+
     /// Load the standard prelude (utility functions).
     /// Checks the user's config dir for a `prelude.mix` override first —
     /// `$COSMIX_ETC`, else `$COSMIX/etc`, else `~/.config/cosmix` — and
