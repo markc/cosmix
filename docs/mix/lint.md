@@ -78,9 +78,9 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
 - **MIX-E1101** flags a `$name` read only when the name is bound **nowhere in its visible universe** — function bodies see params + their own binders + everything bound anywhere at file level (Mix has no block scoping and no read-before-assign rule, so lexical order is deliberately ignored). `${name}` interpolation is never flagged (it falls back to the process environment), nor are `$1`-style positionals or the runtime-injected `rc` / `result` / `status` / `event` / `_`.
 - **MIX-E1102** resolves bareword calls against builtins, HOFs, evaluator special forms, every `function` definition in the file, the embedded prelude, `--allow-function` names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside `address ... end` blocks are sends and are never flagged; `MethodCall`/`ValueCall` are dynamic dispatch and are skipped.
 - **MIX-E1201** checks calls against the structured contract metadata (`mix builtins --json`), including non-contiguous exact-arity sets — `random(1)` is an error, `random()`/`random(min, max)` are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (`mix --strict-arity` makes the runtime agree).
-- **MIX-E1501** flags a discarded `push`/`pop`/`shift` whose first argument is **not a bare variable** — `push($m["a"], $v)`, `push($m.a, $v)`, `$m["a"].push($v)`. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is **lost in silence**. It is an ERROR, not a warning: the statement does nothing while reading as though it did. Fix by assigning the result back (`$m["a"] = push($m["a"], $v)`) or, for maps of maps, by writing the [nested assignment](collections.md) directly. A by-value **parameter** is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.
+- **MIX-E1501** flags a discarded `push`/`pop`/`shift` whose first argument is **not a bare variable** — `push($m["a"], $v)`, `push($m.a, $v)`, `$m["a"].push($v)`. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is **lost in silence**. It is an ERROR, not a warning: the statement does nothing while reading as though it did. The fix **differs by builtin**: `push` returns the appended list, so assign it back (`$m["a"] = push($m["a"], $v)`); `pop`/`shift` return the **removed element**, not the list, so assigning that back replaces the list with the element (data corruption) — hoist first instead (`$l = $m[$k]; $x = pop($l); $m[$k] = $l`). For maps of maps, write the [nested assignment](collections.md) directly. A by-value **parameter** is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.
 - **MIX-E1502** flags a discarded `delete` / `merge` — both are **pure** (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: `$m = delete($m, "k")`.
-- **MIX-W2201** fires when an operation whose failure signal lives in its RETURN VALUE (`effects.must_use`: `run_rc`, `run_argv`, `ssh_run`, `ssh_mix`, `http_*`, `kill`, `run_stream`) is a bare expression statement — the bug class where a failed remote step silently vanishes. The last statement of a block is exempt (it may be the block's value).
+- **MIX-W2201** fires when an operation whose failure signal lives in its RETURN VALUE (`effects.must_use`: `run_rc`, `run_argv`, `run_pipeline`, `run_parallel`, `ssh_run`, `ssh_exec`, `ssh_mix`, `http_*`, `kill`, `run_stream`) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (`run_argv`→`run_argv_must`, `run_pipeline`→`run_pipeline_must`, `ssh_run`→`ssh_must`). The last statement of a block is exempt (it may be the block's value).
 - **MIX-W2301** warns that `+` coerces lists to strings; it does not append or
   concatenate list values. It fires for a list literal operand, or a variable
   proven by straight-line analysis to hold a directly assigned list literal.
@@ -115,8 +115,10 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
   if index_of("abc", "a") then …   --  0 is FALSY   → found-at-0 reads as absent
   ```
 
-  Use `contains()` for the yes/no question, or compare explicitly
-  (`index_of(..) >= 0`). Their 1-based twins — `pos`, `lastpos`, `byte_pos`,
+  Compare explicitly (`index_of(..) >= 0`), or use `contains()` for the yes/no
+  question — **except for `byte_find`/`bytes_find`**, whose bytes subject
+  `contains()` rejects, so those take the `>= 0` comparison only. Their 1-based
+  twins — `pos`, `lastpos`, `byte_pos`,
   `byte_lastpos` — are **safe** in the same position because their not-found
   sentinel is `0` and therefore falsy; that asymmetry is exactly what makes
   the trap easy to walk into, and why the rule exists. Fires in `if`/`elif`,
@@ -132,6 +134,25 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
 - **MIX-W2401**: one `source`/`include` anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer `require()`: it is isolated, statically resolvable, and E1401/E1402 verify literal-path modules parse.
 - **MIX-W2402** warns when a heredoc literal contains bare `$NAME` and `NAME` is bound somewhere in the same visible universe. Heredocs interpolate `${NAME}`, not `$NAME`, so the bare form often means a generated config was silently corrupted. It does not fire for `${NAME}`, `$(` command substitution, explicitly escaped `\$NAME`, all-digit names such as `$1`, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare `$NAME` still evaluates to literal `$NAME`, and intentional literal output requires no change.
 - **MIX-W2403** (0.74.0) warns at the *definition* of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name (only an extracted function value or an exports-map index still reaches it). The worst shape this produces is a script that keeps running while its own function quietly stops being called — every release that adds a builtin name arms it again for older scripts. Deliberately a warning, never an error: a compat shim written for an older mix that lacks the builtin is legitimate authoring — but on the mix doing the linting it is dead, and the author should know.
+
+## `mix explain MIX-XXXX` — the offline diagnostics explainer
+
+Every human-readable lint run that reports anything ends with one trailer line:
+
+```text
+explain any code with: mix explain MIX-XXXX
+```
+
+`mix explain MIX-W2305` (the `MIX-` prefix is optional, case-insensitive — `mix
+explain w2305` works too) prints the code's full story — what it flags, why the
+rule exists, the shape it catches, and the fix — from a registry embedded in the
+binary, so an agent that hits a code it has never seen gets the whole rationale
+in one call without leaving the terminal or reaching the network. An unknown but
+code-shaped argument lists the known codes rather than failing blankly; a
+non-code argument (`mix explain round`) falls through to the AI builtin
+explainer. The registry is the same prose as this page; a build-time test
+asserts every code the analyzer can emit has a record, so a new diagnostic
+cannot ship without its explanation.
 
 ## Machine output
 

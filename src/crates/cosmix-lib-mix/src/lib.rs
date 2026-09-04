@@ -8,6 +8,7 @@ pub mod error;
 pub mod evaluator;
 pub mod interrupt;
 pub mod lexer;
+pub mod lint_docs;
 mod numeric;
 pub mod parser;
 pub mod scope;

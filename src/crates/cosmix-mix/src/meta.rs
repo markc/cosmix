@@ -637,7 +637,10 @@ pub fn dispatch(args: &[&str], eval: &Evaluator, version: &str) -> Option<String
         ),
         "explain" => {
             if args.len() < 2 {
-                eprintln!("mix explain: requires a builtin name argument");
+                eprintln!("mix explain: requires a lint code (MIX-XXXX) or a builtin name");
+            } else if cosmix_mix::lint_docs::looks_like_code(args[1]) {
+                // A lint code → the offline, rustc-style diagnostics explainer.
+                cmd_explain_code(args[1]);
             } else {
                 cmd_ai(
                     "explain",
@@ -1559,6 +1562,7 @@ fn cmd_help_overview() {
     println!("  mix builtins [X] Full builtin list; X = a name, category, --json, or --names");
     println!("  mix what NAME    One-line description of a builtin or keyword");
     println!("  mix apropos TERM Search builtins, keywords + manual by name/description");
+    println!("  mix explain CODE Full rationale for a lint code (MIX-XXXX); a builtin name uses AI");
     println!("  mix diff LANG    Translation cheatsheet (e.g. mix diff bash)");
     println!("  mix syntax       Shortcut for: mix man variables");
     println!("  mix operators    Shortcut for: mix man operators");
@@ -2763,6 +2767,33 @@ fn cmd_what(name: &str) {
 /// shown in list output.
 fn first_line(desc: &str) -> &str {
     desc.lines().next().unwrap_or(desc).trim()
+}
+
+/// `mix explain MIX-XXXX` — the offline diagnostics explainer. Prints the full
+/// rationale for a lint code (what it flags, why it exists, the fix) from the
+/// embedded registry, no network, no leaving the terminal. An unknown code
+/// lists the shape rather than failing blankly.
+fn cmd_explain_code(code: &str) {
+    match cosmix_mix::lint_docs::explain(code) {
+        Some(doc) => {
+            println!("{} — {}\n", doc.code, doc.summary);
+            println!("{}", doc.detail);
+            println!("\n(see the full rules: mix man lint)");
+        }
+        None => {
+            eprintln!(
+                "mix explain: unknown lint code '{code}'. Codes are MIX-E1xxx (errors), \
+                 MIX-W2xxx (warnings), MIX-D3xxx (deprecation notes)."
+            );
+            eprintln!("Known codes:");
+            let mut codes: Vec<&str> = cosmix_mix::lint_docs::all_codes().collect();
+            codes.sort();
+            for c in codes {
+                eprint!("  {c}");
+            }
+            eprintln!();
+        }
+    }
 }
 
 /// `mix apropos TERM` — one case-folding substring search across builtins

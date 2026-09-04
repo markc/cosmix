@@ -210,6 +210,11 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
                 notes,
                 if denied { " [denied]" } else { "" }
             );
+            // One trailer when anything was reported: an agent that hit a code
+            // it has never seen gets the whole rationale offline in one call.
+            if !all_diags.is_empty() {
+                println!("explain any code with: mix explain MIX-XXXX");
+            }
         }
         Format::Json | Format::Data => {
             let report = report_json(
