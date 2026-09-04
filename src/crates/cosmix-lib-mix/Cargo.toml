@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.73.0"
+version = "0.74.0"
 edition = "2024"
 license = "MIT"
 
@@ -67,6 +67,15 @@ xml = ["dep:quick-xml"]
 # YAML 1.2 implementation (saphyr lineage); no serde bridge needed — the
 # builtins build the Value tree directly, mirroring json_decode/json_encode.
 yaml = ["dep:yaml-rust2"]
+# `ws_connect`/`ws_send`/`ws_recv`/`ws_close` (0.74.0) — a synchronous
+# websocket CLIENT with recv-driven control flow, which is what a stateful
+# request/response protocol (LG SSAP, Home Assistant, Grafana live) needs
+# and what a blind `(cat msgs; sleep) | websocat` pipeline cannot express.
+# tungstenite was already in the workspace lock (the Bus client rides
+# tokio-tungstenite); rustls is pulled directly only for the
+# `{insecure: true}` arm's no-verify TLS config (self-signed device certs
+# — the case that motivated the builtin).
+ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 indexmap = "2"
@@ -87,6 +96,8 @@ tracing = "0.1"
 futures-util = { workspace = true }
 base64 = { version = "0.22", optional = true }
 bcrypt = { version = "0.16", optional = true }
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 blake3 = { version = "1", optional = true }
 yaml-rust2 = { version = "0.12", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
@@ -150,7 +161,7 @@ quick-xml = { version = "0.41.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
-cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml"] }
+cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml", "ws"] }
 # Property-based testing for the lexer/parser (P1 of the mix tokenizer
 # fuzz/property corpus — _doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix
 # hub). Test-only; never linked into the shipped library.

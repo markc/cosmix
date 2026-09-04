@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.73.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.74.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `yaml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`, `xml`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -300,6 +300,10 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   dns_lookup      Resolve a hostname to a list of IP address strings
   udp_send        Send ONE UDP datagram: udp_send(host, port, payload) -> bytes sent. Payload (string/bytes/buffer) goes out verbatim; host is resolved. Not a socket API — nothing to hold or close (v0.71.0)
   udp_recv        Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)
+  ws_connect      Open a websocket (ws:// or wss://): ws_connect(url[, {insecure, headers, timeout}]) -> numeric handle. insecure:true skips TLS cert verification (self-signed device endpoints — the LG SSAP case); headers adds handshake request headers; timeout seconds bounds connect AND handshake (default 30, must be positive). Requires ws feature (v0.74.0)
+  ws_send         Send one websocket frame: text for a string payload, binary for bytes/buffer; flushed before returning. A closed connection raises and retires the handle (v0.74.0)
+  ws_recv         Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet (v0.74.0)
+  ws_close        Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)
   help            Show Mix builtin help in the REPL
   require         Load a Mix module: evaluate the file once in an isolated scope, return its exports (map of top-level fns + $vars, or the file's top-level return value). Cached per canonical path; cycles error (v0.27.0)
 

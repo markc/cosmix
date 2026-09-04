@@ -111,6 +111,41 @@ fn output_orders_error_then_warning_then_note() {
 }
 
 #[test]
+fn builtin_shadowing_definition_warns() {
+    // MIX-W2403 (0.74.0): a function named after a builtin is dead code —
+    // the builtin wins at every call site. Warning severity (a compat
+    // shim for an older mix is legitimate), so it DOES deny under
+    // --deny-warnings; a non-colliding name stays quiet.
+    let src = "function upper($s)\n  return \"no\"\nend\nprint(upper(\"a\"))\n";
+    let path = write_temp("shadow", src);
+    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
+    assert_ne!(code, 0, "shadow definition denies: {out}");
+    assert!(out.contains("MIX-W2403"), "{out}");
+    assert!(out.contains("cannot be called BY NAME"), "{out}");
+    let clean = "function upper_snake($s)\n  return upper($s)\nend\nprint(upper_snake(\"a\"))\n";
+    let path = write_temp("shadow_clean", clean);
+    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "non-colliding name is quiet: {out}");
+}
+
+#[test]
+fn pad_loop_idiom_gets_a_note_not_a_warning() {
+    // MIX-D3013 (0.74.0): the hand-rolled pad loop notes toward
+    // lpad/rpad — and stays a NOTE, so it never denies a deploy gate.
+    let src = "$o = \"x\"\nwhile len($o) < 8\n  $o = $o .. \" \"\nend\nprint($o)\n";
+    let path = write_temp("padloop", src);
+    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "a note never denies: {out}");
+    assert!(out.contains("MIX-D3013 note:"), "{out}");
+    assert!(out.contains("lpad()/rpad()"), "{out}");
+    // A loop that appends a VARIABLE (unknown width) is not the idiom.
+    let other = "$o = \"x\"\n$pad = \" \"\nwhile len($o) < 8\n  $o = $o .. $pad\nend\nprint($o)\n";
+    let path = write_temp("padloop_var", other);
+    let (_, out) = lint(&[path.to_str().unwrap()]);
+    assert!(!out.contains("MIX-D3013"), "variable append stays quiet: {out}");
+}
+
+#[test]
 fn deleted_legacy_name_gets_both_the_error_and_the_pointer() {
     // Release B (0.73.0) deleted the five regex/grep legacy names. A
     // straggler call must co-fire MIX-E1102 (undefined function — the

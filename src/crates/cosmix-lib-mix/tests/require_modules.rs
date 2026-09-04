@@ -454,6 +454,41 @@ async fn address_block_does_not_leak_into_module() {
     assert!(err.contains("totally_unknown_fn"), "{err}");
 }
 
+// 0.74.0 — script-relative resolution follows a SYMLINKED entry script:
+// the launcher pattern (~/.local/bin/x -> repo/_bin/x.mix) must resolve
+// "../_lib/…" against the repo, not against the symlink's directory —
+// before the fix such launchers only worked when CWD happened to be the
+// script's real directory (this bit a live review-arm invocation).
+#[tokio::test]
+async fn require_follows_symlinked_entry_script() {
+    let dir = test_dir("symlink_entry");
+    std::fs::create_dir_all(dir.join("repo/_lib")).unwrap();
+    std::fs::create_dir_all(dir.join("repo/_bin")).unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::write(
+        dir.join("repo/_lib/util.mix"),
+        "function greet()\n  return \"via-real-dir\"\nend\n",
+    )
+    .unwrap();
+    let tool_src = "$m = require(\"../_lib/util.mix\")\nprint($m.greet())\n";
+    std::fs::write(dir.join("repo/_bin/tool.mix"), tool_src).unwrap();
+    std::os::unix::fs::symlink(dir.join("repo/_bin/tool.mix"), dir.join("bin/tool")).unwrap();
+
+    // Evaluate under the SYMLINK's path as current_file, with the test
+    // process CWD nowhere near repo/_bin — the CWD fallback cannot rescue
+    // this; only canonicalising the entry path can.
+    let mut lexer = Lexer::new(tool_src);
+    let tokens = lexer.tokenize().unwrap();
+    let mut parser = Parser::new(tokens, tool_src);
+    let stmts = parser.parse_program().unwrap();
+    let stdout = SharedBuf::new();
+    let stderr = SharedBuf::new();
+    let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(stderr.clone()));
+    eval.set_file(dir.join("bin/tool").to_string_lossy().to_string());
+    eval.execute(&stmts).await.expect("symlinked entry must resolve its siblings");
+    assert_eq!(stdout.to_string_lossy(), "via-real-dir\n");
+}
+
 // T17 — MethodCall parity and pinned precedence.
 #[tokio::test]
 async fn method_call_precedence_pinned() {

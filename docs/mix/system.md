@@ -1198,7 +1198,60 @@ if $got != nil then
 end
 ```
 
-Both are **Network**-class builtins (below), like `http_*` and `dns_lookup` —
+## WebSocket client — `ws_connect`, `ws_send`, `ws_recv`, `ws_close` (v0.74.0)
+
+```
+ws_connect(url[, opts])   -> numeric handle; opts: insecure (skip TLS verify),
+                             headers (map), timeout (secs, default 30, connect+handshake)
+ws_send(h, payload)       -> nil; string -> text frame, bytes/buffer -> binary
+ws_recv(h[, timeout])     -> string | bytes | nil on timeout (default 30, 0 = forever)
+ws_close(h)               -> true when live, false when unknown (never raises for that)
+```
+
+A synchronous client with **recv-driven control flow** — the shape every
+stateful request/response protocol needs: send `register`, wait for the
+`registered` frame, then issue requests and parse each response (an
+`alertId` echoed back in a `closeAlert`, a pairing prompt to wait out).
+A blind `(cat msgs; sleep) | websocat` pipeline only handles
+fire-and-forget; this is the difference that turned the LG SSAP TV driver
+from a bash FIFO coprocess into a plain Mix loop. Home-Assistant-style
+device control and Grafana live are the same shape.
+
+The contracts worth knowing:
+
+- **`insecure: true`** skips TLS certificate verification — for the
+  self-signed device endpoint (`wss://tv:3001/`), never for services with
+  real certificates.
+- **`ws_recv` returns `nil` on timeout** — an ordinary answer; poll
+  again. Ping/pong never surface (answered internally). A **peer close
+  RAISES** (catchable) and retires the handle: "no more frames, ever"
+  must not be confusable with "no frame yet".
+- A closed/raised handle is **retired** — further calls say
+  `unknown ws handle` rather than repeating the close error.
+- Handles are process-global numbers (the `sqlopen` pattern); the kernel
+  reaps the sockets at exit, `ws_close` is the tidy path. One user per
+  handle: a handle is checked out of the registry for the duration of a
+  call, so a concurrent call on the SAME handle answers `unknown ws
+  handle` rather than queueing.
+- `ws_send` writes under the connect timeout: a very large frame on a
+  slow link can raise mid-flush with bytes still buffered — the next send
+  on that handle continues the partial frame (no framing corruption).
+
+```mix
+$h = ws_connect("wss://192.0.2.20:3001/", {insecure: true})
+ws_send($h, json_encode({type: "register", payload: $manifest}))
+loop
+  $frame = ws_recv($h, 5)
+  if $frame == nil then continue end          -- quiet: keep waiting
+  $msg = json_parse($frame)
+  if $msg["type"] == "registered" then break end
+end
+ws_send($h, json_encode({type: "request", uri: "ssap://api/getServiceList"}))
+print(ws_recv($h, 10))
+ws_close($h)
+```
+
+Both UDP builtins above and all four `ws_*` are **Network**-class (below), like `http_*` and `dns_lookup` —
 and like those, the wait happens inline on the evaluator's thread. In a
 `--serve` citizen that means a pending `udp_recv` blocks the whole event pump
 for its duration; **never** pass `{timeout: 0}` there — unlike an HTTP call,

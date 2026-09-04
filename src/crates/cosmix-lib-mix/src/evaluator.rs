@@ -13488,7 +13488,17 @@ impl Evaluator {
             .ctx
             .current_file
             .as_deref()
-            .and_then(|c| std::path::Path::new(c).parent())
+            .map(|c| {
+                // Follow a symlinked ENTRY script to its real location
+                // (0.74.0): the symlinked-launcher pattern
+                // (~/.local/bin/x -> repo/_bin/x.mix) must resolve
+                // "../_lib/…" against the repo the script lives in, not
+                // against the directory the symlink sits in — before this,
+                // every such launcher was silently CWD-dependent.
+                let pb = std::path::Path::new(c);
+                std::fs::canonicalize(pb).unwrap_or_else(|_| pb.to_path_buf())
+            })
+            .and_then(|c| c.parent().map(|d| d.to_path_buf()))
         {
             let candidate = dir.join(path);
             // `is_file` (not `exists`): a same-named *directory* next to the

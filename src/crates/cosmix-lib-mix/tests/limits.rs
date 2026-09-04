@@ -257,6 +257,10 @@ fn sensitive_builtins_stay_categorized() {
         ("dns_lookup", Network),
         ("udp_send", Network),
         ("udp_recv", Network),
+        ("ws_connect", Network),
+        ("ws_send", Network),
+        ("ws_recv", Network),
+        ("ws_close", Network),
         // Process
         ("run", Process),
         ("run_rc", Process),

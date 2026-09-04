@@ -12,6 +12,12 @@ from **isolated** to **splice-into-my-scope**:
 | Parse failure | hard error | hard error | may fall back to per-line shell (`.mixrc`-style) |
 | Capability | `fs-read` | `fs-read` | `fs-read` |
 
+> **Script-relative follows symlinks** (0.74.0): the entry script's path is
+> canonicalised before its directory is taken, so the symlinked-launcher
+> pattern (`~/.local/bin/x -> repo/_bin/x.mix`) resolves `../_lib/…`
+> against the repo the script lives in. Before this, every such launcher
+> silently depended on being run from the right CWD.
+
 `require` is the module loader: it evaluates the file in a **fresh, fully
 isolated scope** and hands back its exports — the caller's variables and
 functions cannot be clobbered, and the module cannot see them. `include` is

@@ -361,6 +361,10 @@ builtin_table! {
     ("dns_lookup", CapabilityClass::Network,      "system",  "Resolve a hostname to a list of IP address strings", contract!((host: string) -> list(string); effects[blocking]; failure[raises])),
     ("udp_send", CapabilityClass::Network,        "system",  "Send ONE UDP datagram: udp_send(host, port, payload) -> bytes sent. Payload (string/bytes/buffer) goes out verbatim; host is resolved. Not a socket API — nothing to hold or close (v0.71.0)", contract!((host: string, port: number, payload: any_of(string, bytes, buffer)) -> number; effects[blocking]; failure[raises])),
     ("udp_recv", CapabilityClass::Network,        "system",  "Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("ws_connect", CapabilityClass::Network,      "system",  "Open a websocket (ws:// or wss://): ws_connect(url[, {insecure, headers, timeout}]) -> numeric handle. insecure:true skips TLS cert verification (self-signed device endpoints — the LG SSAP case); headers adds handshake request headers; timeout seconds bounds connect AND handshake (default 30, must be positive). Requires ws feature (v0.74.0)", contract!((url: string, opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("ws_send", CapabilityClass::Network,         "system",  "Send one websocket frame: text for a string payload, binary for bytes/buffer; flushed before returning. A closed connection raises and retires the handle (v0.74.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> nil; effects[blocking]; failure[raises])),
+    ("ws_recv", CapabilityClass::Network,         "system",  "Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet (v0.74.0)", contract!((handle: number, timeout?: number) -> any; effects[blocking]; failure[raises])),
+    ("ws_close", CapabilityClass::Network,        "system",  "Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)", contract!((handle: number) -> bool; failure[raises])),
     ("help", CapabilityClass::Pure,            "system",  "Show Mix builtin help in the REPL", contract!(() -> nil)),
 
     ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer). For byte-exact C-printf parity (%e %g %x, flags, glibc float rounding) use sprintf()", contract!((tmpl: string, args: ...any) -> string)),
@@ -787,6 +791,21 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "dns_lookup" => builtin_dns_lookup(args),
         "udp_send" => builtin_udp_send(args),
         "udp_recv" => builtin_udp_recv(args),
+        #[cfg(feature = "ws")]
+        "ws_connect" => builtin_ws_connect(args),
+        #[cfg(feature = "ws")]
+        "ws_send" => builtin_ws_send(args),
+        #[cfg(feature = "ws")]
+        "ws_recv" => builtin_ws_recv(args),
+        #[cfg(feature = "ws")]
+        "ws_close" => builtin_ws_close(args),
+        // Registry lists the four unconditionally; a no-ws build refuses
+        // loudly rather than falling through to the silent-nil catch-all.
+        #[cfg(not(feature = "ws"))]
+        name @ ("ws_connect" | "ws_send" | "ws_recv" | "ws_close") => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{name}() requires the `ws` feature (tungstenite)"),
+        }),
         #[cfg(feature = "sqlite")]
         "sqlopen" => builtin_sqlopen(args),
         #[cfg(feature = "sqlite")]
@@ -16692,6 +16711,446 @@ fn builtin_udp_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
+// --- WebSocket client (v0.74.0, `ws` feature) ---
+//
+// A synchronous client with RECV-DRIVEN control flow — send `register`,
+// wait for the `registered` frame, then issue requests and parse each
+// response. That statefulness is exactly what a `(cat msgs; sleep) |
+// websocat` pipeline cannot express, and what drove the LG SSAP audit to
+// a bash FIFO coprocess. Handles follow the sqlopen precedent (numeric
+// id into a process-global registry; the kernel cleans up on exit).
+
+#[cfg(feature = "ws")]
+mod ws_client {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{LazyLock, Mutex};
+    use tungstenite::stream::MaybeTlsStream;
+
+    pub(super) type WsConn = tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>;
+    pub(super) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    pub(super) static MAP: LazyLock<Mutex<HashMap<u64, WsConn>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// The plain TCP stream under a (possibly TLS-wrapped) connection —
+    /// where read timeouts live. MaybeTlsStream is non_exhaustive, so an
+    /// unknown variant is a loud error rather than a silent None.
+    pub(super) fn tcp_of(conn: &WsConn) -> Option<&std::net::TcpStream> {
+        match conn.get_ref() {
+            MaybeTlsStream::Plain(s) => Some(s),
+            MaybeTlsStream::Rustls(t) => Some(t.get_ref()),
+            _ => None,
+        }
+    }
+
+    /// rustls certificate verifier that accepts anything — the
+    /// `{insecure: true}` arm for self-signed device certs (the LG TV's
+    /// wss://…:3001). Explicitly ring-provider-backed so the signature
+    /// scheme list never depends on which default provider some other
+    /// in-process TLS user installed.
+    #[derive(Debug)]
+    pub(super) struct NoVerify(rustls::crypto::CryptoProvider);
+
+    impl NoVerify {
+        pub(super) fn new() -> Self {
+            Self(rustls::crypto::ring::default_provider())
+        }
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+}
+
+#[cfg(feature = "ws")]
+fn ws_err(name: &str, msg: impl std::fmt::Display) -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: format!("{name}: {msg}"),
+    }
+}
+
+#[cfg(feature = "ws")]
+fn ws_handle_arg(name: &str, args: &[Value]) -> MixResult<u64> {
+    let n = number_arg(name, args, 0)?;
+    as_exact_integer(&format!("{name}(): handle"), n, 1, i64::MAX)?
+        .try_into()
+        .map_err(|_| ws_err(name, "invalid handle"))
+}
+
+/// `ws_connect(url[, {insecure, headers, timeout}])` → numeric handle.
+#[cfg(feature = "ws")]
+fn builtin_ws_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use tungstenite::client::IntoClientRequest;
+    expect_args_between("ws_connect", &args, 1, 2)?;
+    let url = args[0].to_mix_string();
+
+    let mut insecure = false;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut timeout_seconds = 30.0;
+    if let Some(opts) = args.get(1) {
+        match opts {
+            Value::Nil => {}
+            Value::Map(m) => {
+                for k in m.keys() {
+                    if !matches!(k.as_str(), "insecure" | "headers" | "timeout") {
+                        return Err(ws_err(
+                            "ws_connect()",
+                            format!("unknown option '{k}' (supported: insecure, headers, timeout)"),
+                        ));
+                    }
+                }
+                if let Some(v) = m.get("insecure") {
+                    match v {
+                        Value::Bool(b) => insecure = *b,
+                        other => {
+                            return Err(ws_err(
+                                "ws_connect()",
+                                format!("option 'insecure' must be a boolean, got {}", other.type_name()),
+                            ));
+                        }
+                    }
+                }
+                if let Some(v) = m.get("headers") {
+                    match v {
+                        Value::Map(h) => {
+                            for (hk, hv) in h.iter() {
+                                headers.push((hk.clone(), hv.to_mix_string()));
+                            }
+                        }
+                        other => {
+                            return Err(ws_err(
+                                "ws_connect()",
+                                format!("option 'headers' must be a map, got {}", other.type_name()),
+                            ));
+                        }
+                    }
+                }
+                if let Some(v) = m.get("timeout") {
+                    timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                        ws_err("ws_connect()", format!("option 'timeout' must be a number, got {}", v.type_name()))
+                    })?;
+                    as_duration("ws_connect(): option 'timeout'", timeout_seconds)?;
+                    if timeout_seconds == 0.0 {
+                        return Err(ws_err("ws_connect()", "option 'timeout' must be positive — an unbounded connect can hang forever"));
+                    }
+                }
+            }
+            other => {
+                return Err(ws_err(
+                    "ws_connect()",
+                    format!("options must be a map or nil, got {}", other.type_name()),
+                ));
+            }
+        }
+    }
+    let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
+
+    let mut request = url
+        .clone()
+        .into_client_request()
+        .map_err(|e| ws_err("ws_connect", e))?;
+    for (k, v) in &headers {
+        let name: tungstenite::http::header::HeaderName =
+            k.parse().map_err(|_| ws_err("ws_connect", format!("invalid header name '{k}'")))?;
+        let value = tungstenite::http::header::HeaderValue::from_str(v)
+            .map_err(|_| ws_err("ws_connect", format!("invalid header value for '{k}'")))?;
+        request.headers_mut().insert(name, value);
+    }
+
+    let uri = request.uri().clone();
+    let is_tls = uri.scheme_str() == Some("wss");
+    let host = uri
+        .host()
+        .ok_or_else(|| ws_err("ws_connect", format!("no host in '{url}'")))?
+        .to_string();
+    let port = uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
+
+    // ONE deadline covers connect + handshake, and gates progress after
+    // the resolve — each stage below gets the REMAINING time, not a fresh
+    // allowance. (getaddrinfo itself is blocking and cannot be preempted
+    // mid-call; nil for the IP-literal device case this builtin exists
+    // for, and the budget applies the moment it returns.)
+    let deadline = std::time::Instant::now() + timeout;
+    let remaining = |what: &str| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            Err(ws_err("ws_connect", format!("{what} timed out")))
+        } else {
+            Ok(left)
+        }
+    };
+
+    use std::net::ToSocketAddrs;
+    // A bracketed IPv6 literal ("ws://[::1]:9001/") keeps its brackets in
+    // uri.host(); to_socket_addrs wants them stripped.
+    let resolve_host = host.trim_start_matches('[').trim_end_matches(']');
+    let addr = (resolve_host, port)
+        .to_socket_addrs()
+        .map_err(|e| ws_err("ws_connect", format!("resolve '{host}': {e}")))?
+        .next()
+        .ok_or_else(|| ws_err("ws_connect", format!("no address for '{host}'")))?;
+    let stream = std::net::TcpStream::connect_timeout(&addr, remaining("connect")?)
+        .map_err(|e| ws_err("ws_connect", format!("'{host}:{port}': {e}")))?;
+    // Short per-read timeout during the HANDSHAKE: tungstenite's mid-
+    // handshake loop only returns control on a read stall, so a server
+    // that trickles one byte per interval would otherwise dodge the
+    // deadline forever. 250 ms keeps the retry loop (and its deadline
+    // check) in charge of the total. ws_send later writes under the
+    // write timeout set here (see the doc note on big frames).
+    let handshake_tick = std::time::Duration::from_millis(250);
+    stream
+        .set_read_timeout(Some(handshake_tick.min(remaining("handshake")?)))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
+        .and_then(|_| stream.set_nodelay(true))
+        .map_err(|e| ws_err("ws_connect", e))?;
+
+    // ALWAYS build the wss connector ourselves, verifying or not:
+    // tungstenite's own default (`connector: None`) calls a bare
+    // rustls::ClientConfig::builder(), which PANICS when the workspace
+    // build unifies two provider features (ring via ureq/this crate,
+    // aws-lc-rs via reqwest's hyper-rustls) and nothing installed a
+    // process default — the exact dodge ureq's rtls.rs documents. Pinning
+    // ring per-connector removes the process-global question entirely.
+    let connector = if is_tls {
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = if insecure {
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| ws_err("ws_connect", e))?
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(ws_client::NoVerify::new()))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| ws_err("ws_connect", e))?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
+        Some(tungstenite::Connector::Rustls(std::sync::Arc::new(cfg)))
+    } else {
+        None
+    };
+
+    // Message/frame caps: a hostile or buggy peer must not make ws_recv
+    // allocate tungstenite's 64 MiB default per message. 16 MiB message /
+    // 4 MiB frame matches the house limits discipline.
+    let ws_config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(16 * 1024 * 1024))
+        .max_frame_size(Some(4 * 1024 * 1024));
+
+    let finish = |conn: ws_client::WsConn| {
+        let id = ws_client::NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ws_client::MAP.lock().unwrap().insert(id, conn);
+        Ok(Some(Value::Number(id as f64)))
+    };
+    let mut pending =
+        match tungstenite::client_tls_with_config(request, stream, Some(ws_config), connector) {
+            Ok((conn, _response)) => return finish(conn),
+            Err(tungstenite::HandshakeError::Interrupted(mid)) => mid,
+            Err(tungstenite::HandshakeError::Failure(e)) => {
+                return Err(ws_err("ws_connect", e));
+            }
+        };
+    loop {
+        remaining("handshake")?;
+        match pending.handshake() {
+            Ok((conn, _response)) => return finish(conn),
+            Err(tungstenite::HandshakeError::Interrupted(mid)) => {
+                pending = mid;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(tungstenite::HandshakeError::Failure(e)) => {
+                return Err(ws_err("ws_connect", e));
+            }
+        }
+    }
+}
+
+/// `ws_send(handle, payload)` — one frame out: text for a string payload,
+/// binary for bytes/buffer. Flushed before returning.
+#[cfg(feature = "ws")]
+fn builtin_ws_send(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("ws_send", &args, 2)?;
+    let id = ws_handle_arg("ws_send", &args)?;
+    let msg = match &args[1] {
+        Value::String(s) => tungstenite::Message::text(s.clone()),
+        Value::Bytes(b) => tungstenite::Message::binary(b.to_vec()),
+        Value::Buffer(b) => tungstenite::Message::binary(b.borrow().clone()),
+        other => {
+            return Err(ws_err(
+                "ws_send()",
+                format!("payload must be a string, bytes or buffer, got {}", other.type_name()),
+            ));
+        }
+    };
+    // Take the connection OUT of the registry for the duration of the
+    // blocking write — the global mutex must never be held across network
+    // I/O (a second evaluator thread's ws_* call on any OTHER handle
+    // would wedge behind it, unboundedly). A concurrent call on the SAME
+    // handle sees "unknown ws handle" while it is out: one-user-per-
+    // handle is the contract, and a loud refusal beats a silent queue.
+    let mut conn = ws_client::MAP
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| ws_err("ws_send", format!("unknown ws handle {id}")))?;
+    match conn.send(msg) {
+        Ok(()) => {
+            ws_client::MAP.lock().unwrap().insert(id, conn);
+            Ok(Some(Value::Nil))
+        }
+        Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+            Err(ws_err("ws_send", "connection closed"))
+        }
+        Err(e) => Err(ws_err("ws_send", e)),
+    }
+}
+
+/// `ws_recv(handle[, timeout])` → the next text frame as a string, the
+/// next binary frame as bytes, or `nil` on timeout (an ordinary answer —
+/// poll again). Ping/pong are handled internally and never surface. A
+/// peer CLOSE raises a catchable error and retires the handle: "no more
+/// frames, ever" must not be confusable with "no frame yet".
+#[cfg(feature = "ws")]
+fn builtin_ws_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("ws_recv", &args, 1, 2)?;
+    let id = ws_handle_arg("ws_recv", &args)?;
+    let mut timeout_seconds = 30.0;
+    if let Some(v) = args.get(1) {
+        if !matches!(v, Value::Nil) {
+            timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                ws_err("ws_recv()", format!("timeout must be a number, got {}", v.type_name()))
+            })?;
+            as_duration("ws_recv(): timeout", timeout_seconds)?;
+        }
+    }
+    // Same take-out/put-back discipline as ws_send: the registry mutex is
+    // never held across the blocking read.
+    let mut conn = ws_client::MAP
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| ws_err("ws_recv", format!("unknown ws handle {id}")))?;
+    let put_back = |conn: ws_client::WsConn| {
+        ws_client::MAP.lock().unwrap().insert(id, conn);
+    };
+    // The timeout bounds the wait for the next DATA frame overall — a
+    // peer pinging every few seconds must not reset it (each control
+    // frame continues the loop under the same deadline, with the read
+    // timeout shrunk to what is left).
+    let deadline = (timeout_seconds > 0.0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_seconds));
+    loop {
+        let dur = match deadline {
+            None => None, // wait forever, like udp_recv's 0
+            Some(d) => {
+                let left = d.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    put_back(conn);
+                    return Ok(Some(Value::Nil));
+                }
+                Some(left)
+            }
+        };
+        match ws_client::tcp_of(&conn) {
+            Some(tcp) => {
+                if let Err(e) = tcp.set_read_timeout(dur) {
+                    put_back(conn);
+                    return Err(ws_err("ws_recv", e));
+                }
+            }
+            None => {
+                put_back(conn);
+                return Err(ws_err("ws_recv", "unsupported stream type for timeout control"));
+            }
+        }
+        match conn.read() {
+            Ok(tungstenite::Message::Text(t)) => {
+                put_back(conn);
+                return Ok(Some(Value::String(t.to_string())));
+            }
+            Ok(tungstenite::Message::Binary(b)) => {
+                let v = Value::bytes(b.to_vec());
+                put_back(conn);
+                return Ok(Some(v));
+            }
+            // Control frames: tungstenite queues the pong reply itself;
+            // keep waiting for a data frame under the SAME deadline.
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                put_back(conn);
+                return Ok(Some(Value::Nil));
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Err(ws_err("ws_recv", "connection closed by peer"));
+            }
+            Err(e) => {
+                return Err(ws_err("ws_recv", e));
+            }
+        }
+    }
+}
+
+/// `ws_close(handle)` → true when a live handle was closed, false when
+/// the handle was unknown (already closed/retired). Never raises for the
+/// not-held case, mirroring funlock.
+#[cfg(feature = "ws")]
+fn builtin_ws_close(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("ws_close", &args, 1)?;
+    let id = ws_handle_arg("ws_close", &args)?;
+    let conn = ws_client::MAP.lock().unwrap().remove(&id);
+    match conn {
+        Some(mut conn) => {
+            // Best-effort clean close: send the Close frame, then drop —
+            // the peer's reply (if any) dies with the socket, which is
+            // fine for a client going away.
+            let _ = conn.close(None);
+            let _ = conn.flush();
+            Ok(Some(Value::Bool(true)))
+        }
+        None => Ok(Some(Value::Bool(false))),
+    }
+}
+
 // --- Help ---
 
 fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -16731,6 +17190,7 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     );
     println!("Network:   http_get http_post http_request dns_lookup");
     println!("           udp_send udp_recv (one datagram each way — v0.71.0)");
+    println!("           ws_connect ws_send ws_recv ws_close (websocket client — v0.74.0)");
     println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
     println!("           bytes_ends_with bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
     println!("           (also $b[i], length, slice, `for each` — v0.64.0 — and take, drop,");
@@ -21647,6 +22107,100 @@ mod bytes_tests {
             builtin_udp_recv(vec![Value::Number(port2 as f64), Value::map(opts)]).unwrap(),
             Some(Value::Nil)
         );
+    }
+
+    // --- websocket client (v0.74.0) ---
+
+    /// Full round trip against a local tungstenite echo server: text and
+    /// binary frames echo back typed correctly, a quiet interval returns
+    /// nil (timeout — poll again), and close retires the handle. TLS and
+    /// the insecure arm are not exercised here (no cert fixture); the
+    /// connect/handshake plumbing they share with ws:// is.
+    #[cfg(feature = "ws")]
+    #[test]
+    fn ws_round_trip_against_local_echo_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            loop {
+                match ws.read() {
+                    Ok(msg @ (tungstenite::Message::Text(_) | tungstenite::Message::Binary(_))) => {
+                        ws.send(msg).unwrap();
+                    }
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let h = builtin_ws_connect(vec![Value::String(format!("ws://127.0.0.1:{port}/echo"))])
+            .unwrap()
+            .unwrap();
+        let Value::Number(id) = h else { panic!("{h:?}") };
+
+        // Text frame echoes as a string.
+        builtin_ws_send(vec![Value::Number(id), Value::String("ping-π".into())]).unwrap();
+        let got = builtin_ws_recv(vec![Value::Number(id), Value::Number(5.0)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, Value::String("ping-π".into()));
+
+        // Binary frame echoes as bytes.
+        builtin_ws_send(vec![Value::Number(id), Value::bytes(vec![0, 159, 146, 150])]).unwrap();
+        let got = builtin_ws_recv(vec![Value::Number(id), Value::Number(5.0)])
+            .unwrap()
+            .unwrap();
+        match &got {
+            Value::Bytes(b) => assert_eq!(b.as_slice(), &[0, 159, 146, 150]),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+
+        // Quiet interval: nil, and the handle stays live.
+        assert_eq!(
+            builtin_ws_recv(vec![Value::Number(id), Value::Number(0.2)]).unwrap(),
+            Some(Value::Nil)
+        );
+
+        // Close: true once, false after; further sends raise unknown-handle.
+        assert_eq!(builtin_ws_close(vec![Value::Number(id)]).unwrap(), Some(Value::Bool(true)));
+        assert_eq!(builtin_ws_close(vec![Value::Number(id)]).unwrap(), Some(Value::Bool(false)));
+        let err = builtin_ws_send(vec![Value::Number(id), Value::String("x".into())]).unwrap_err();
+        assert!(format!("{err}").contains("unknown ws handle"), "{err}");
+
+        server.join().unwrap();
+    }
+
+    /// A peer that closes must RAISE out of ws_recv (and retire the
+    /// handle) — never return the nil that means "quiet, poll again".
+    #[cfg(feature = "ws")]
+    #[test]
+    fn ws_peer_close_raises_not_nil() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            ws.close(None).ok();
+            // Drive the close handshake until the peer answers or errors.
+            loop {
+                match ws.read() {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let h = builtin_ws_connect(vec![Value::String(format!("ws://127.0.0.1:{port}/"))])
+            .unwrap()
+            .unwrap();
+        let Value::Number(id) = h else { panic!("{h:?}") };
+        let err = builtin_ws_recv(vec![Value::Number(id), Value::Number(5.0)]).unwrap_err();
+        assert!(format!("{err}").contains("closed"), "{err}");
+        // Retired: a second recv is unknown-handle, not another close error.
+        let err = builtin_ws_recv(vec![Value::Number(id), Value::Number(5.0)]).unwrap_err();
+        assert!(format!("{err}").contains("unknown ws handle"), "{err}");
+        server.join().unwrap();
     }
 
     /// One representative pin for io.md's "anything else still refuses bytes

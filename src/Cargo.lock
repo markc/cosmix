@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.73.0"
+version = "0.74.0"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1454,6 +1454,7 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "rusqlite",
+ "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -1463,6 +1464,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tungstenite 0.26.2",
  "unicode-segmentation",
  "unicode-width",
  "ureq",
@@ -1737,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.73.0"
+version = "0.74.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -7339,9 +7341,12 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.20",
  "utf-8",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

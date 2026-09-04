@@ -369,6 +369,8 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
     }
 
     check_duplicates_and_arity_defs(stmts, &ctx, &mut a);
+    check_builtin_shadowing(stmts, &ctx, &mut a);
+    check_pad_loop_idiom(stmts, &ctx, &mut a);
     check_unreachable(stmts, &ctx, &mut a);
     check_requires(stmts, &ctx, &mut a);
     check_scope(
@@ -635,6 +637,101 @@ fn check_unreachable(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
 }
 
 // ── E1401 / E1402 require() ──────────────────────────────────────────
+
+/// MIX-D3013 (0.74.0, note): the hand-rolled padding loop —
+///
+/// ```text
+/// while len($o) < $n
+///   $o = $o .. " "
+/// end
+/// ```
+///
+/// — written across four separate sessions in this hub while `lpad`/`rpad`
+/// (and the display-cell `_w` twins) sat in the binary since 0.54.0. A
+/// builtin four independent authors fail to find is a discoverability
+/// defect; this note is the fix that reaches the author at the moment of
+/// writing. Narrow on purpose (the analyzer's false-positives-near-zero
+/// bias): only a `while` whose condition compares `len($v)`/`length($v)`
+/// with `<`/`<=` and whose body self-appends a STRING LITERAL to the same
+/// `$v` is flagged.
+fn check_pad_loop_idiom(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    walk_stmts(stmts, &mut |stmt| {
+        let StmtKind::While { condition, body, .. } = &stmt.kind else {
+            return;
+        };
+        // Condition: len($v) < … or len($v) <= …
+        let Expr::BinaryOp { left, op, .. } = condition else {
+            return;
+        };
+        if !matches!(op, BinOp::Lt | BinOp::LtEq) {
+            return;
+        }
+        let Expr::FunctionCall { name, args } = left.as_ref() else {
+            return;
+        };
+        if name != "len" && name != "length" {
+            return;
+        }
+        let Some(Expr::Variable(v)) = args.first() else {
+            return;
+        };
+        // Body: $v = $v .. <string literal> at any depth.
+        let mut hit = false;
+        walk_stmts(body, &mut |inner| {
+            if let StmtKind::Assignment { name, value } = &inner.kind
+                && name == v
+                && let Expr::BinaryOp { left, op: BinOp::Concat, right } = value
+                && matches!(left.as_ref(), Expr::Variable(lv) if lv == v)
+                && matches!(right.as_ref(), Expr::StringLiteral(_))
+            {
+                hit = true;
+            }
+        });
+        if hit {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-D3013",
+                Severity::Note,
+                stmt.line,
+                format!(
+                    "hand-rolled padding loop over `${v}` — lpad()/rpad() (and the display-cell lpad_w/rpad_w) do this in one call"
+                ),
+                Some("see `mix man strings` § Trim, pad, repeat".to_string()),
+            ));
+        }
+    });
+}
+
+/// MIX-W2403 (0.74.0): a user function named after a builtin is silently
+/// dead code — the builtin wins at every call site (and a builtin-named
+/// dot-call even desugars at parse time), so the definition can never be
+/// called. The worst shape of failure this produces is a script that keeps
+/// running while its own function quietly stops being called — every
+/// release that adds a builtin name arms it again (print_raw, bytes_find,
+/// sprintf… were all plausible names for older scripts to have defined).
+/// Deliberately a WARNING, never an error: a compat shim written for an
+/// older mix that lacks the builtin is a legitimate authoring pattern —
+/// but on THIS mix it is dead, and the author should know.
+fn check_builtin_shadowing(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    walk_stmts(stmts, &mut |stmt| {
+        if let StmtKind::FunctionDef { name, .. } = &stmt.kind
+            && crate::builtins::is_builtin(name)
+        {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-W2403",
+                Severity::Warning,
+                stmt.line,
+                format!(
+                    "function '{name}' shadows the builtin of the same name and cannot be called BY NAME — the builtin wins at every call site"
+                ),
+                Some(
+                    "rename it; only an extracted function value (or a module exports map indexed as $m[\"name\"]) can still reach it, and a compat shim for an older mix is dead code on this one".to_string(),
+                ),
+            ));
+        }
+    });
+}
 
 fn check_requires(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     let base_dir = ctx
