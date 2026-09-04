@@ -197,7 +197,7 @@ A guided tour — read in roughly this order, or jump straight to what you need.
 - [running commands](system.md) — `run` / `run_rc` / `run_stream`, structured returns, wall-clock timeouts, the shell-dispatch vs Mix-statement split, `$(...)` and brace expansion.
 - [files & I/O](io.md) — `read_file`/`write_file`, `glob`, `stat`/`chmod`/ `chown`, path helpers.
 - [data & serialization](data.md) — `json_parse`/`jq`, `data_encode`, TOML, strict-data `.*.mix`.
-- [regular expressions](regex.md) — `regex_match`/`find`/`replace`/`split`.
+- [regular expressions](regex.md) — `re_match`/`re_find`/`re_replace`/`re_split`/`grep_lines` (subject first).
 - [dates & time](datetime.md) — timestamps as plain numbers, formatting, parsing, durations.
 - [http](http.md) — `http_get`/`http_post`/`http_request`, the 30-second default deadline.
 - [datastar](datastar.md) — the `ds_*` Datastar SSE event-framing builtins.

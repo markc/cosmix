@@ -1345,7 +1345,7 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
                     line,
                     format!("`{name}` is pattern-first legacy: use `{repl}` (subject first)"),
                     Some(
-                        "the five regex/grep legacy names are deleted in a later release; \
+                        "the five regex/grep legacy names were DELETED in release B (0.73.0) — this call now fails at runtime; \
                          see `mix man regex`"
                             .to_string(),
                     ),

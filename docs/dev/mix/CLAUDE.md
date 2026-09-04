@@ -99,7 +99,7 @@ The interpreter is feature-gated for opt-in capabilities so embedders can pull o
 | Feature | Adds |
 |---|---|
 | `json` | `json_*` builtins + jq-style jaq evaluator |
-| `regex` | `regex_match`, `regex_find`, `regex_replace`, `regex_split` builtins (plain `replace`/`split` are always present) |
+| `regex` | `re_match`, `re_find`, `re_replace`, `re_split` builtins — subject first; the pattern-first regex_* names were deleted in 0.73.0 (plain `replace`/`split` are always present) |
 | `toml` | TOML parse/serialize |
 | `datetime` | `chrono`-backed date/time |
 | `url` | URL parsing |

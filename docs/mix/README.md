@@ -39,7 +39,7 @@ there. The same files render everywhere:
 - **[processes & system](system.md)** — `run`/`run_rc`/`run_stream`/`spawn`/`env`/`exit`/…
 - **[data & serialization](data.md)** — JSON, TOML, `jq`, `data_encode`, strict-data `.mix`.
 - **[byte buffers](buffer.md)** — `buffer`/`buffer_push`/`freeze`, the one reference-semantic type.
-- **[regular expressions](regex.md)** — `regex_match`/`find`/`replace`/`split`.
+- **[regular expressions](regex.md)** — `re_match`/`re_find`/`re_replace`/`re_split`/`grep_lines` (subject first).
 - **[dates & time](datetime.md)** — `time`/`date_format`/`now_iso`/`duration_format`.
 - **[http](http.md)** — `http_get`/`http_post`/`http_request`, deadlines.
 - **[datastar](datastar.md)** — `ds_*` SSE event framing.

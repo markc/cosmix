@@ -30,7 +30,7 @@ There are **nine** classes, no more — `Bus` is the newest, added in 0.20.3 for
 | Class | Meaning | Representative builtins |
 |---|---|---|
 | **Pure** | No host authority — pure functions over their arguments. **Always allowed.** | `length` `upper` `split` `join` `replace` `round` `sqrt` `json_parse` `markdown` `html_escape` `time` `uuid` `random_password` `sleep` `hash_sha256` and all the `map`/`filter`/`reduce` HOFs |
-| **FsRead** | Reads the filesystem. | `read_file` `read_file_bytes` `read_lines` `read_json` `read_jsonl` `load_data` `exists` `is_file` `is_dir` `ls` `glob` `walk` `stat` `grep` `line_count` |
+| **FsRead** | Reads the filesystem. | `read_file` `read_file_bytes` `read_lines` `read_json` `read_jsonl` `load_data` `exists` `is_file` `is_dir` `ls` `glob` `walk` `stat` `line_count` |
 | **FsWrite** | Mutates the filesystem. | `write_file` `write_new` `append_file` `mkdir` `flock` `funlock` `chmod` `chown` `sqlopen` `sqlexec` `sqlclose` |
 | **Network** | Talks to the network (arbitrary outbound). | `http_get` `http_post` `http_request` `dns_lookup` `ssh_run` `ssh_must` `ssh_mix` |
 | **Process** | Controls other processes / process lifecycle. | `run` `run_rc` `run_stream` `spawn` `kill` `process_alive` `chdir` `exit` `panic` |
@@ -42,7 +42,6 @@ There are **nine** classes, no more — `Bus` is the newest, added in 0.20.3 for
 A few classifications are deliberate and worth knowing:
 
 - **`panic` is `Process`,** not `Pure`. It is a real Rust `panic!`, **uncatchable** by Mix `try`/`catch` — a termination primitive a sandbox must be able to deny, exactly like `exit`. (In `--serve` mode the SPEC 18 §3.4 handler boundary isolates a panicking handler from the rest of the citizen.)
-- **`grep` is `FsRead`** even though it operates on an in-memory string — a deliberately conservative classification (the exact class of every sensitive builtin is pinned by `sensitive_builtins_stay_categorized` in `tests/limits.rs`).
 - **`chdir` is `Process`** (it mutates the process's working directory), not `FsRead`.
 
 ### Why `Db`, `Jmap`, and `Bus` are separate from `FsWrite` / `Network`

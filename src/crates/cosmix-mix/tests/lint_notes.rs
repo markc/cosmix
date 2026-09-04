@@ -28,7 +28,7 @@ fn lint(args: &[&str]) -> (i32, String) {
 
 /// A file whose ONLY diagnostics are notes (one of each D-code family).
 const NOTES_ONLY: &str = "$t = \"a b\"\n\
-    print(regex_match(\"^a\", $t))\n\
+    print(lastpos(\"a\", $t))\n\
     print(pos(\"b\", $t))\n\
     for each $i, $x in [1, 2]\n  print($i .. $x)\nend\n\
     $m = {a: 1}\n\
@@ -49,7 +49,10 @@ fn notes_render_and_count_separately() {
     let path = write_temp("plain", NOTES_ONLY);
     let (code, out) = lint(&[path.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("MIX-D3001 note:"), "{out}");
+    // D3009/D3008 (lastpos/pos) carry the note flag now: the D3001-5
+    // fixtures left with release B — a deleted name adds an E1102 error,
+    // which is exactly what a notes-only fixture must not contain.
+    assert!(out.contains("MIX-D3009 note:"), "{out}");
     assert!(out.contains("MIX-D3008 note:"), "{out}");
     // RETIRED in 0.68.0 when their A.1 flips landed. Asserted ABSENT rather
     // than just dropped from the count: a watch note that outlives its flip
@@ -108,16 +111,38 @@ fn output_orders_error_then_warning_then_note() {
 }
 
 #[test]
+fn deleted_legacy_name_gets_both_the_error_and_the_pointer() {
+    // Release B (0.73.0) deleted the five regex/grep legacy names. A
+    // straggler call must co-fire MIX-E1102 (undefined function — the
+    // deletion is real) AND the retained MIX-D3001 note (the pointer to
+    // the replacement, with the hint saying the deletion happened). This
+    // is the pin that stops a future cleanup pruning the D3001-5 rows as
+    // dead code — lint.md promises the pointer stays.
+    let src = "print(regex_match(\"^a\", \"abc\"))\n";
+    let path = write_temp("deleted_cofire", src);
+    let (code, out) = lint(&[path.to_str().unwrap()]);
+    assert_ne!(code, 0, "a deleted name is an error: {out}");
+    assert!(out.contains("MIX-E1102"), "undefined function: {out}");
+    assert!(out.contains("MIX-D3001"), "pointer note retained: {out}");
+    assert!(
+        out.contains("DELETED in release B"),
+        "hint says it is gone, not merely deprecated: {out}"
+    );
+}
+
+#[test]
 fn ufcs_spelling_is_noted_too() {
-    // `$s.regex_match(..)` desugars to a FunctionCall at PARSE time
+    // `$s.pos(..)` desugars to a FunctionCall at PARSE time
     // (method_desugars_to_ufcs covers every builtin name), so the
     // deprecation notes see member-call spellings as well — there is no
     // UFCS blind spot for builtin-named calls. Pinned so a parser
-    // change that widened MethodCall would surface here.
-    let src = "$s = \"abc\"\nprint($s.regex_match(\"^a\"))\n";
+    // change that widened MethodCall would surface here. (This pin rode
+    // on regex_match until release B deleted it — a deleted name no
+    // longer desugars, so the surviving pos family carries it.)
+    let src = "$s = \"abc\"\nprint($s.pos(\"a\"))\n";
     let path = write_temp("ufcs", src);
     let (_, out) = lint(&[path.to_str().unwrap()]);
-    assert!(out.contains("MIX-D3001"), "UFCS spelling noted: {out}");
+    assert!(out.contains("MIX-D3008"), "UFCS spelling noted: {out}");
 }
 
 #[test]
@@ -132,11 +157,14 @@ fn advisory_pass_sees_wrapped_and_expression_shapes() {
     // INSIDE the piped loop's body — which is the stronger shape anyway: it
     // proves the walker descends into the body, not merely that it saw the
     // loop header.
+    // (Lines 4 and 5 rode on regex_match/grep until release B deleted
+    // them — a deleted name now adds MIX-E1102, so the surviving
+    // pos-family notes carry the same walker-geometry pins.)
     let src = "for each $i, $x in [1] print(pos(\"a\", \"ab\")) end | cat\n\
         send noded noded.ping && print(pos(\"a\", \"ab\"))\n\
         $y = if pos(\"b\", \"abc\") > 0 then 1 else 2 end\n\
-        $f = fn($a = pos(\"c\", \"c\")) = regex_match(\"^x\", $a)\n\
-        fn g() = grep(\"z\", \"z\")\n\
+        $f = fn($a = pos(\"c\", \"c\")) = lastpos(\"x\", $a)\n\
+        fn g() = byte_pos(\"z\", \"z\")\n\
         $r = substr(\"abc\", 1 + substr(\"abc\", pos(\"b\", \"abc\"), 1), 1)\n";
     let path = write_temp("blind_shapes", src);
     let (code, out) = lint(&[path.to_str().unwrap()]);
@@ -145,8 +173,8 @@ fn advisory_pass_sees_wrapped_and_expression_shapes() {
     assert!(out.contains("blind_shapes.mix:2: MIX-D3008"), "chained: {out}");
     assert!(out.contains("blind_shapes.mix:3: MIX-D3008"), "if-expr cond: {out}");
     assert!(out.contains("blind_shapes.mix:4: MIX-D3008"), "lambda default: {out}");
-    assert!(out.contains("blind_shapes.mix:4: MIX-D3001"), "lambda expr body: {out}");
-    assert!(out.contains("blind_shapes.mix:5: MIX-D3005"), "fn expr body: {out}");
+    assert!(out.contains("blind_shapes.mix:4: MIX-D3009"), "lambda expr body: {out}");
+    assert!(out.contains("blind_shapes.mix:5: MIX-D3010"), "fn expr body: {out}");
     // Exactly one composed note for the nested substr — not two.
     assert_eq!(
         out.matches("composes a 1-based position").count(),

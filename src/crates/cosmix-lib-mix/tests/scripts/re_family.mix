@@ -1,7 +1,6 @@
 -- re_family.mix: subject-first regex family (0.63.0) — re_match /
--- re_replace / re_split / grep_lines, and re_find's CODEPOINT offsets
--- (legacy regex_find keeps byte offsets until release B — both pinned
--- here on the same input).
+-- re_replace / re_split / grep_lines, and re_find's CODEPOINT offsets.
+-- (The pattern-first regex_* names were deleted in release B, 0.73.0.)
 -- Expected output:
 -- true
 -- false
@@ -15,7 +14,6 @@
 -- 9-14
 -- caféy
 -- re-find-absent-empty
--- 2
 -- 2:Alpha,Apex
 -- 0
 -- re-bad-pattern-raises
@@ -37,8 +35,6 @@ print($mm[0].start .. "-" .. $mm[0].end .. ":" .. $mm[0].match .. ":" .. $mm[0].
 print($mm[1].start .. "-" .. $mm[1].end)
 print(substr("caféx et caféy", $mm[1].start, 5))
 if len(re_find("abc", "z")) == 0 then print "re-find-absent-empty" end
--- legacy regex_find on the same input still returns BYTE offsets (until B)
-print(regex_find("x", "éx")[0].start)
 -- grep_lines: subject first
 $hits = grep_lines("Alpha\nbeta\nApex", "^A")
 print(len($hits) .. ":" .. $hits[0] .. "," .. $hits[1])

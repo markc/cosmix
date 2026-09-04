@@ -101,7 +101,6 @@ builtin_table! {
     ("reverse", CapabilityClass::Pure,         "string",  "Reverse a string (by codepoint; splits emoji — see grapheme_reverse), list, or bytes/buffer (byte-wise → a new value-semantic bytes, v0.70.0)", contract!((v: any_of(string, list, bytes, buffer)) -> any_of(string, list, bytes))),
     ("words", CapabilityClass::Pure,           "string",  "Count whitespace-delimited words in string", contract!((s: string) -> number)),
     ("word", CapabilityClass::Pure,            "string",  "Extract Nth word from string (1-based)", contract!((s: string, n: number) -> any_of(string, nil); failure[raises])),
-    ("grep", CapabilityClass::Pure,            "string",  "Return lines from text matching pattern (regex when enabled)", contract!((pattern: string, text: string) -> list(string))),
     // --- Subject-first string helpers (0.63.0). Tier 1 (delimiter family):
     // absent delimiter/marker -> nil, "" is a REAL result (delimiter at the
     // edge), empty delimiter raises — nil and "" never blur. Tier 2
@@ -132,18 +131,14 @@ builtin_table! {
     ("markdown", CapabilityClass::Pure,        "string",  "Render CommonMark + GFM markdown (tables, strikethrough, task lists, footnotes) to HTML; raw HTML is escaped and unsafe URL schemes neutralised (requires markdown feature)", contract!((s: string) -> string)),
     ("html_escape", CapabilityClass::Pure,     "string",  "Escape & < > \" ' for HTML element text + quoted attribute values (not JS/CSS/URL/srcdoc contexts)", contract!((s: string) -> string)),
     ("sanitize", CapabilityClass::Pure,        "string",  "Make untrusted bytes safe for one-line diagnostics: collapse line breaks (incl. U+2028/9) to spaces, replace C0/C1 controls and Trojan-Source bidi/zero-width chars with '?'", contract!((s: string) -> string)),
-    ("regex_match", CapabilityClass::Pure,     "string",  "Test if pattern matches string (requires regex feature)", contract!((pattern: string, s: string) -> bool)),
-    ("regex_find", CapabilityClass::Pure,      "string",  "Return ALL regex matches as a list of {match, start, end[, groups]} maps (empty list if none)", contract!((pattern: string, text: string) -> list(map))),
-    ("regex_replace", CapabilityClass::Pure,   "string",  "Replace regex matches with replacement text", contract!((pattern: string, text: string, replacement: string) -> string)),
-    ("regex_split", CapabilityClass::Pure,     "string",  "Split string by regex pattern", contract!((pattern: string, s: string) -> list(string))),
-    // --- Subject-first regex family (0.63.0): same engine as regex_*, args
-    // the consistent way round (subject first, like every literal-string
-    // builtin). The legacy pattern-first names stay until release B.
+    // --- Subject-first regex family (0.63.0): args the consistent way round
+    // (subject first, like every literal-string builtin). The legacy
+    // pattern-first regex_*/grep names were DELETED in release B (0.73.0).
     ("re_match", CapabilityClass::Pure,        "string",  "Subject-first regex test: re_match(s, pattern) -> bool, true if pattern matches anywhere in s", contract!((s: string, pattern: string) -> bool; failure[raises])),
-    ("re_find", CapabilityClass::Pure,         "string",  "All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; legacy regex_find returns UTF-8 BYTE offsets). [] when none", contract!((s: string, pattern: string) -> list(map); failure[raises])),
+    ("re_find", CapabilityClass::Pure,         "string",  "All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; the deleted legacy regex_find answered in UTF-8 BYTE offsets). [] when none", contract!((s: string, pattern: string) -> list(map); failure[raises])),
     ("re_replace", CapabilityClass::Pure,      "string",  "Replace ALL matches: re_replace(s, pattern, replacement) — subject FIRST; $1/${name} backrefs in replacement", contract!((s: string, pattern: string, replacement: string) -> string; failure[raises])),
     ("re_split", CapabilityClass::Pure,        "string",  "Split s on each match of pattern (subject first)", contract!((s: string, pattern: string) -> list(string); failure[raises])),
-    ("grep_lines", CapabilityClass::Pure,      "string",  "Lines of text matching pattern (subject first; regex when enabled, else substring) — grep() with the args the consistent way round", contract!((text: string, pattern: string) -> list(string); failure[raises])),
+    ("grep_lines", CapabilityClass::Pure,      "string",  "Lines of text matching pattern (subject first; regex when enabled, else substring) — the line filter (its pattern-first predecessor grep() was deleted in release B)", contract!((text: string, pattern: string) -> list(string); failure[raises])),
     ("csv_parse", CapabilityClass::Pure,       "string",  "Parse CSV string into a list of header-keyed row maps", contract!((s: string, delim?: string) -> list(map))),
     ("ini_parse", CapabilityClass::Pure,       "string",  "Parse INI string into nested map of sections", contract!((s: string) -> map)),
     ("xml_parse", CapabilityClass::Pure,       "string",  "Parse a strict-XML string (or bytes, e.g. an HTTP body) into a Value tree (requires xml feature). Default simple mode is the SOAP/RSS consumer shape: {RootName: …} with namespace prefixes stripped, attributes as @name keys, repeated sibling elements collapsed to a list, a leaf element's text as its value, mixed text under #text, xmlns declarations dropped. Pass {mode:\"tree\"} for full fidelity: nodes are {name, attrs, children} with prefixes + xmlns preserved and text children as plain strings. Strict XML only — real-world HTML is tag soup and will NOT parse.", contract!((s: any_of(string, bytes), opts?: map) -> map)),
@@ -524,7 +519,6 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "run_argv_must" => builtin_run_argv_must(args),
         "run_pipeline" => builtin_run_pipeline(args),
         "run_pipeline_must" => builtin_run_pipeline_must(args),
-        "grep" => builtin_grep(args),
         "before" => builtin_before(args),
         "after" => builtin_after(args),
         "before_last" => builtin_before_last(args),
@@ -593,14 +587,6 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         #[cfg(feature = "json")]
         "jq_all" => builtin_jq_all(args),
         #[cfg(feature = "regex")]
-        "regex_match" => builtin_regex_match(args),
-        #[cfg(feature = "regex")]
-        "regex_find" => builtin_regex_find(args),
-        #[cfg(feature = "regex")]
-        "regex_replace" => builtin_regex_replace(args),
-        #[cfg(feature = "regex")]
-        "regex_split" => builtin_regex_split(args),
-        #[cfg(feature = "regex")]
         "re_match" => builtin_re_match(args),
         #[cfg(feature = "regex")]
         "re_find" => builtin_re_find(args),
@@ -613,11 +599,10 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         // no-regex build must refuse LOUDLY here — without these arms the
         // call falls through to a misleading FUNCTION_UNDEFINED (the
         // markdown/ds_*/xml_parse precedent; GLM review of 4caec4e1,
-        // MAJOR 1 — which also flagged the same pre-existing hole for
-        // the four legacy regex_* names, closed below).
+        // MAJOR 1). The legacy regex_* names this arm once covered were
+        // deleted outright in release B (0.73.0).
         #[cfg(not(feature = "regex"))]
-        "re_match" | "re_find" | "re_replace" | "re_split" | "regex_match" | "regex_find"
-        | "regex_replace" | "regex_split" => Err(MixError::RuntimeError {
+        "re_match" | "re_find" | "re_replace" | "re_split" => Err(MixError::RuntimeError {
             span: None,
             msg: format!("{name}() requires the `regex` feature"),
         }),
@@ -9392,18 +9377,12 @@ fn quote_mix_string(s: &str) -> String {
     out
 }
 
-/// grep_lines(text, pattern) — grep() with the args the consistent
-/// (subject-first) way round; the 0.63.0 twin that survives release B.
+/// grep_lines(text, pattern) — subject-first line filter. The pattern-first
+/// `grep()` it replaced was deleted in release B (0.73.0) once the fleet
+/// inventory read zero.
 fn builtin_grep_lines(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("grep_lines", &args, 2)?;
     grep_impl(&args[1].to_mix_string(), &args[0].to_mix_string())
-}
-
-/// grep(pattern, text) — return lines from text matching pattern.
-/// Uses regex when the regex feature is enabled, otherwise substring match.
-fn builtin_grep(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("grep", &args, 2)?;
-    grep_impl(&args[0].to_mix_string(), &args[1].to_mix_string())
 }
 
 fn grep_impl(pattern: &str, text: &str) -> MixResult<Option<Value>> {
@@ -11437,9 +11416,9 @@ fn compile_regex(pattern: &str) -> MixResult<regex::Regex> {
                 .unwrap_or("regex parse error");
             format!(
                 "invalid regex '{head}…' ({} chars, truncated): {last}\n  \
-                 (argument 1 is the PATTERN — the subject string comes after \
-                 it; a swapped argument order is the usual cause of a huge \
-                 pattern: see mix man regex)",
+                 (in the re_* family the SUBJECT comes first and the PATTERN \
+                 second — a swapped argument order is the usual cause of a \
+                 huge pattern: see mix man regex)",
                 pattern.chars().count()
             )
         } else {
@@ -11449,61 +11428,12 @@ fn compile_regex(pattern: &str) -> MixResult<regex::Regex> {
     })
 }
 
-/// regex_match(pattern, text) — test if text matches pattern (anywhere in text).
-#[cfg(feature = "regex")]
-fn builtin_regex_match(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("regex_match", &args, 2)?;
-    let re = compile_regex(&args[0].to_mix_string())?;
-    Ok(Some(Value::Bool(re.is_match(&args[1].to_mix_string()))))
-}
-
-/// regex_find(pattern, text) — return list of all matches.
-/// Each match is a map with {match, start, end} (or {match, start, end, groups: [...]}).
-#[cfg(feature = "regex")]
-fn builtin_regex_find(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("regex_find", &args, 2)?;
-    let re = compile_regex(&args[0].to_mix_string())?;
-    let text = args[1].to_mix_string();
-    let mut results = Vec::new();
-    for caps in re.captures_iter(&text) {
-        let m = caps.get(0).unwrap();
-        let mut entry = indexmap::IndexMap::new();
-        entry.insert("match".into(), Value::String(m.as_str().to_string()));
-        entry.insert("start".into(), Value::Number(m.start() as f64));
-        entry.insert("end".into(), Value::Number(m.end() as f64));
-        // Include capture groups if any (beyond group 0)
-        if caps.len() > 1 {
-            let groups: Vec<Value> = (1..caps.len())
-                .map(|i| match caps.get(i) {
-                    Some(g) => Value::String(g.as_str().to_string()),
-                    None => Value::Nil,
-                })
-                .collect();
-            entry.insert("groups".into(), Value::list(groups));
-        }
-        results.push(Value::map(entry));
-    }
-    Ok(Some(Value::list(results)))
-}
-
-/// regex_replace(pattern, text, replacement) — replace all matches.
-/// Supports $1, $2 backreferences in replacement string.
-#[cfg(feature = "regex")]
-fn builtin_regex_replace(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("regex_replace", &args, 3)?;
-    let re = compile_regex(&args[0].to_mix_string())?;
-    let text = args[1].to_mix_string();
-    let replacement = args[2].to_mix_string();
-    Ok(Some(Value::String(
-        re.replace_all(&text, replacement.as_str()).into_owned(),
-    )))
-}
-
-// --- Subject-first regex family (0.63.0). Same engine as the legacy
-// pattern-first regex_* names; the argument order matches every literal-
-// string builtin (subject first). re_find additionally returns CODEPOINT
-// offsets so its start/end compose with substr/slice/index_of — the
-// legacy regex_find keeps raw UTF-8 byte offsets until it is deleted.
+// --- Subject-first regex family (0.63.0). The legacy pattern-first
+// regex_* names (and grep) were DELETED in release B (0.73.0) after the
+// fleet-wide caller inventory read zero; the argument order here matches
+// every literal-string builtin (subject first), and re_find returns
+// CODEPOINT offsets so its start/end compose with substr/slice/index_of
+// (the deleted regex_find answered in raw UTF-8 byte offsets).
 
 /// re_match(s, pattern) — subject-first regex test.
 #[cfg(feature = "regex")]
@@ -11570,19 +11500,6 @@ fn builtin_re_split(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("re_split", &args, 2)?;
     let text = args[0].to_mix_string();
     let re = compile_regex(&args[1].to_mix_string())?;
-    let parts: Vec<Value> = re
-        .split(&text)
-        .map(|s| Value::String(s.to_string()))
-        .collect();
-    Ok(Some(Value::list(parts)))
-}
-
-/// regex_split(pattern, text) — split text on regex pattern.
-#[cfg(feature = "regex")]
-fn builtin_regex_split(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("regex_split", &args, 2)?;
-    let re = compile_regex(&args[0].to_mix_string())?;
-    let text = args[1].to_mix_string();
     let parts: Vec<Value> = re
         .split(&text)
         .map(|s| Value::String(s.to_string()))
@@ -16794,7 +16711,7 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("System:    env time pid args exit sleep run run_rc hostname");
     println!("           cwd chdir platform which");
     println!("Process:   spawn kill process_alive");
-    println!("Text:      grep line_count head tail template word_wrap markdown_escape");
+    println!("Text:      grep_lines line_count head tail template word_wrap markdown_escape");
     println!("Format:    format_bytes format_number duration_format fmt");
     println!("           sprintf (C-compatible printf, glibc float parity — v0.71.0)");
     println!("Path:      basename dirname extname path_join");
@@ -16804,7 +16721,8 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     );
     println!("JSON:      json_parse json_encode jq jq_all");
     println!("YAML:      yaml_parse yaml_encode (v0.71.0)");
-    println!("Regex:     regex_match regex_find regex_replace regex_split");
+    println!("Regex:     re_match re_find re_replace re_split grep_lines (subject first;");
+    println!("           the pattern-first regex_*/grep names were deleted in 0.73.0)");
     println!(
         "Crypto:    hash_blake3 hash_sha256 hmac_sha256 constant_time_eq hash_file base64_encode base64_decode uuid\n\
          \x20          password_hash password_verify (bcrypt — v0.71.0)\n\
@@ -22950,7 +22868,6 @@ mod char_aware_tests {
             "grapheme_count",
             "grapheme_reverse",
             "grapheme_substr",
-            "grep",
             // Subject-first string helpers + regex family + deep_eq (0.63.0)
             "before",
             "after",
@@ -23026,16 +22943,12 @@ mod char_aware_tests {
             "raise",
             "random_password",
             "range",
-            "regex_find",
-            "regex_match",
             // Validation family (0.29.0) — pure boundary checks.
             "require_key",
             "expect_type",
             "nonblank",
             "get_or",
             "validate",
-            "regex_replace",
-            "regex_split",
             "relative_time",
             "repeat",
             "replace",

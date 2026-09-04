@@ -188,7 +188,7 @@ fires on any double-quoted literal, including one you meant as a search needle.
 silently matches nothing against file text that says `~/.gh/x` — no error, no
 change. The same applies to `contains`, `starts_with`, `split`, `index`, and to
 `"~" .. "/x"` (the bare `"~"` already expanded). For literal-tilde text use single
-quotes, and `grep` the result after a rewrite:
+quotes, and `grep_lines` the result after a rewrite:
 
 ```mix
 $s = "see ~/.gh/x"
@@ -757,7 +757,7 @@ changes are pinned by tests.
 
 - [numbers](numbers.md) — the f64 numeric type, `+`/`%`/`**`, radix literals
 - [operators](operators.md) — `..` concat, `==`/`<` ordering, `??` nil-coalesce
-- [regex](regex.md) — `regex_match`/`regex_find`/`regex_replace`/`regex_split`
+- [regex](regex.md) — `re_match`/`re_find`/`re_replace`/`re_split`/`grep_lines`
 - [syntax](syntax.md) — the lexer, comments, and the shell/Mix classifier
 - [functions](functions.md) — lambdas and HOFs for transforming string lists
 - [builtins index](builtins.md) — the full string/byte/grapheme/`_w` builtin set

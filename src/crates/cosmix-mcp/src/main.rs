@@ -1744,7 +1744,7 @@ impl CosmixMcp {
     // ---- Mix execution tool ----
 
     /// Execute a Mix script inline and return its output.
-    /// Mix has 115 builtins including JSON, regex, TOML, datetime, crypto, URL parsing.
+    /// Mix has ~300 builtins including JSON, YAML, regex (subject-first re_*), TOML, datetime, crypto, URL parsing.
     /// The script runs with Bus connectivity — `send`/`emit`/`port_exists` route to the broker.
     #[tool]
     async fn mix_execute(&self, Parameters(p): Parameters<MixExecuteParams>) -> String {

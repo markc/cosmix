@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.72.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.73.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `yaml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`, `xml`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -50,7 +50,6 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   reverse         Reverse a string (by codepoint; splits emoji — see grapheme_reverse), list, or bytes/buffer (byte-wise → a new value-semantic bytes, v0.70.0)
   words           Count whitespace-delimited words in string
   word            Extract Nth word from string (1-based)
-  grep            Return lines from text matching pattern (regex when enabled)
   before          Text before the FIRST delim: before(s, delim) -> string | nil (nil when delim absent; "" is a real result — delim at the start). Empty delim raises
   after           Text after the FIRST delim: after(s, delim) -> string | nil (nil when delim absent; "" when delim at the end). Empty delim raises. Want a default? `after($s, "=") or ""`
   before_last     Text before the LAST delim -> string | nil (nil when absent). Empty delim raises
@@ -75,15 +74,11 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   markdown        Render CommonMark + GFM markdown (tables, strikethrough, task lists, footnotes) to HTML; raw HTML is escaped and unsafe URL schemes neutralised (requires markdown feature)
   html_escape     Escape & < > " ' for HTML element text + quoted attribute values (not JS/CSS/URL/srcdoc contexts)
   sanitize        Make untrusted bytes safe for one-line diagnostics: collapse line breaks (incl. U+2028/9) to spaces, replace C0/C1 controls and Trojan-Source bidi/zero-width chars with '?'
-  regex_match     Test if pattern matches string (requires regex feature)
-  regex_find      Return ALL regex matches as a list of {match, start, end[, groups]} maps (empty list if none)
-  regex_replace   Replace regex matches with replacement text
-  regex_split     Split string by regex pattern
   re_match        Subject-first regex test: re_match(s, pattern) -> bool, true if pattern matches anywhere in s
-  re_find         All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; legacy regex_find returns UTF-8 BYTE offsets). [] when none
+  re_find         All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; the deleted legacy regex_find answered in UTF-8 BYTE offsets). [] when none
   re_replace      Replace ALL matches: re_replace(s, pattern, replacement) — subject FIRST; $1/${name} backrefs in replacement
   re_split        Split s on each match of pattern (subject first)
-  grep_lines      Lines of text matching pattern (subject first; regex when enabled, else substring) — grep() with the args the consistent way round
+  grep_lines      Lines of text matching pattern (subject first; regex when enabled, else substring) — the line filter (its pattern-first predecessor grep() was deleted in release B)
   csv_parse       Parse CSV string into a list of header-keyed row maps
   ini_parse       Parse INI string into nested map of sections
   xml_parse       Parse a strict-XML string (or bytes, e.g. an HTTP body) into a Value tree (requires xml feature). Default simple mode is the SOAP/RSS consumer shape: {RootName: …} with namespace prefixes stripped, attributes as @name keys, repeated sibling elements collapsed to a list, a leaf element's text as its value, mixed text under #text, xmlns declarations dropped. Pass {mode:"tree"} for full fidelity: nodes are {name, attrs, children} with prefixes + xmlns preserved and text children as plain strings. Strict XML only — real-world HTML is tag soup and will NOT parse.

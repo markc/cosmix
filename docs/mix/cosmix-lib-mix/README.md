@@ -132,7 +132,7 @@ The default feature set is empty. Tokio remains an unconditional dependency beca
 |---|---|
 | `default` | No optional features. |
 | `json` | JSON conversion, JSON and JSONL builtins, jq filtering, and JSON-backed stats helpers. |
-| `regex` | `regex_match`, `regex_find`, `regex_replace`, and `regex_split`. |
+| `regex` | `re_match`, `re_find`, `re_replace`, and `re_split` (subject first); without it `grep_lines` falls back to a per-line substring test. The pattern-first regex_* names were deleted in 0.73.0. |
 | `markdown` | Safe CommonMark and GFM rendering through `markdown`; raw HTML is escaped and dangerous URL schemes are neutralised. |
 | `toml` | `toml_parse` and `toml_encode`. |
 | `serde` | Serde `Deserializer` and `Serializer` bridges for `Value` and strict `.conf.mix` text. |

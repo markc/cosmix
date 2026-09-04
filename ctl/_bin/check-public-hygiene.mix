@@ -33,7 +33,7 @@
 --            An ANNOTATED TAG carries a message that no commit scan can see:
 --            re-tagging an already-published commit selects zero commits, so
 --            --range would report clean while the push publishes the message.
---            Applies the same rules in-process via regex_match (no blob).
+--            Applies the same rules in-process via re_match (no blob).
 --   --object-chain walk tags and scan their bodies plus a terminal blob or
 --            terminal commit tree; terminal trees are refused. Shared by
 --            --all and pre-push.
