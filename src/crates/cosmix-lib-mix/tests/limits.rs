@@ -274,6 +274,7 @@ fn sensitive_builtins_stay_categorized() {
         ("run_stream", Process),
         ("run_argv", Process),
         ("run_argv_must", Process),
+        ("run_parallel", Process),
         ("run_pipeline", Process),
         ("run_pipeline_must", Process),
         ("spawn", Process),

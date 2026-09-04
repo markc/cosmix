@@ -30,6 +30,7 @@ run_argv_must(argv [, opts])       -> stdout STRING (untrimmed); RAISES PROCESS_
 run_pipeline(stages [, opts])      -> distinct pipeline_result map with per-stage outcomes; argv direct (NO shell); NEVER raises on ordinary pipeline failure
 run_pipeline_must(stages [, opts]) -> final stdout STRING (untrimmed); RAISES PIPELINE_* with the pipeline_result in $err.details.result
 run_stream(argv [, {env, clear_env, cwd}]) -> exit-code NUMBER; inherited stdio (live stream, no /bin/sh); opts v0.51.0
+run_parallel(jobs [, {max, timeout}]) -> LIST of process_result maps in input order; runs many run_argv jobs concurrently with a bounded pool; one job's failure is DATA, never a raise (v0.82.0)
 ```
 
 Pick by intent: **`run_argv` is the default for operational code** — injection-inert
@@ -524,6 +525,46 @@ but that is the platform's fallback, not a guarantee.) Pass an absolute
 *relative* `argv[0]` is resolved in a directory the OS deliberately leaves
 platform-specific, so `run_stream(["./build.sh"], {cwd: "/srv/app"})` is not
 portable; spell it `/srv/app/build.sh`.
+
+### run_parallel — process-level fan-out (v0.82.0)
+
+`run_parallel(jobs [, {max, timeout}])` runs many `run_argv` jobs at once through
+a bounded worker pool and returns a **list of `process_result` maps in input
+order** — each map is exactly what the same `run_argv` call would return, so
+existing result-handling code ports unchanged. One job's ordinary failure
+(nonzero exit, timeout, a spawn error) is **data in its map, never a raise**.
+
+```mix
+-- Fan a health check across a fleet; collect every result.
+$hosts = ["alpha", "beta", "gamma"]
+$jobs = map($hosts, fn($h) = ["ssh", $h, "uptime"])
+$results = run_parallel($jobs, {max: 8, timeout: 10})
+for each $i in range(0, len($hosts))
+  $r = $results[$i]
+  print($hosts[$i] .. ": " .. ($r.ok ? trim($r.stdout) : "DOWN (" .. $r.exit_code .. ")"))
+end
+```
+
+A job is either an **argv list** (`["ssh", $h, "uptime"]`) or a **`{argv, …}`
+map** carrying the same per-job options `run_argv` accepts (`stdin`, `cwd`,
+`env`, `clear_env`, `stdout`, `stderr`, `max_output`, `timeout`). `max` bounds
+concurrency (default 8, **hard-capped at 256** live workers — a larger `max`
+still runs every job, just no more than 256 at once); a top-level `timeout`
+(seconds) overrides every job's own. A job may **not** disable its deadline
+(`timeout: 0` is refused): one never-exiting job would park a worker forever and,
+because the call waits for all workers, hostage the whole batch. A parse error in
+**any** job fails the whole call before a single process spawns, exactly as
+`run_argv` validates before spawning.
+
+**This is PROCESS-level fan-out, not in-language concurrency.** The evaluator is
+single-threaded by construction and Mix `Value`s are never shared across
+threads: `run_parallel` parses every job to plain owned data first, and the
+worker threads touch only process plumbing (argv, pipes, exit codes), marshalling
+results back on the caller's thread. There is deliberately **no** `parallel(list,
+fn)` that runs Mix functions concurrently — that would mean rebuilding the value
+model, and it is not planned. The killer use is `ssh_mix` fan-out: a fleet sweep
+that walked N nodes serially becomes one `run_parallel` of N ssh jobs. A job's
+`stream` flag is ignored (a parallel live tee would interleave into garbage).
 
 ### Which runner?
 

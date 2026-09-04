@@ -295,6 +295,7 @@ builtin_table! {
     ("run_rc", CapabilityClass::Process,          "system",  "Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true", contract!((cmd: string, opts?: map) -> map("run_rc_result", {rc: number, stdout: string, stderr: string, timed_out: bool, interrupted: bool}); effects[must_use, blocking, shell]; failure[returns_result])),
     ("run_stream", CapabilityClass::Process,      "system",  "Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an `env` prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing", contract!((argv: list(string), opts?: map("run_stream_options", {env: map, clear_env: bool, cwd: any_of(string, nil)})) -> number; effects[must_use, blocking]; failure[returns_result])),
     ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
     ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
     ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool}))}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
@@ -529,6 +530,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "run_rc" => builtin_run_rc(args),
         "run_stream" => builtin_run_stream(args),
         "run_argv" => builtin_run_argv(args),
+        "run_parallel" => builtin_run_parallel(args),
         "run_argv_must" => builtin_run_argv_must(args),
         "run_pipeline" => builtin_run_pipeline(args),
         "run_pipeline_must" => builtin_run_pipeline_must(args),
@@ -5290,51 +5292,29 @@ fn builtin_run_argv_impl(caller: &str, args: &[Value]) -> MixResult<Value> {
     }
     let argv = parse_run_argv_argv(caller, &args[0])?;
     let opts = parse_run_argv_opts(caller, args.get(1))?;
-    let stdin = match &opts.stdin {
-        RunArgvStdin::Null => ProcStdin::Null,
-        RunArgvStdin::Data(data) => ProcStdin::Data(data),
-        RunArgvStdin::File(path) => ProcStdin::File(path),
-    };
-    let stdout = match &opts.stdout {
-        RunArgvOutput::Capture => ProcOutput::Capture,
-        RunArgvOutput::Inherit => ProcOutput::Inherit,
-        RunArgvOutput::Null => ProcOutput::Null,
-        RunArgvOutput::File(file) => ProcOutput::File(file),
-    };
-    let stderr = match &opts.stderr {
-        RunArgvStderr::Capture => ProcStderr::Capture,
-        RunArgvStderr::Inherit => ProcStderr::Inherit,
-        RunArgvStderr::Null => ProcStderr::Null,
-        RunArgvStderr::Stdout => ProcStderr::Stdout,
-        RunArgvStderr::File(file) => ProcStderr::File(file),
-    };
-    let outcome = run_process(&ProcSpec {
-        argv: &argv,
-        stdin,
-        stdout,
-        stderr,
-        timeout_ms: opts.timeout_ms,
-        caller,
-        cwd: opts.cwd.as_deref(),
-        env: &opts.env,
-        clear_env: opts.clear_env,
-        max_output: opts.max_output,
-        stream: opts.stream,
-    });
+    let outcome = run_process(&proc_spec_from(&argv, &opts, caller));
     match outcome {
         Ok(o) => Ok(run_argv_result_map(&o)),
         // Spawn/lifecycle failures come back as PROCESS_* structured
         // errors from the engine — encode them in the result value.
-        Err(MixError::Structured(info))
-            if matches!(
-                info.code.as_str(),
-                "PROCESS_SPAWN" | "PROCESS_STDIO" | "PROCESS_IO" | "PROCESS_INTERNAL"
-            ) =>
-        {
+        Err(MixError::Structured(info)) if is_process_data_error(&info.code) => {
             Ok(run_argv_error_map(&info.code, &info.message))
         }
         Err(other) => Err(other),
     }
+}
+
+/// The engine (`run_process`) error codes that `run_argv`/`run_parallel` encode
+/// as DATA in a `process_result` map rather than raising. This is the CLOSED
+/// set every `run_process` setup/lifecycle failure uses; a new engine code must
+/// be added here (and carry no `details`, since the flatten in `run_parallel`
+/// keeps only code+message). Ordinary command outcomes — nonzero exit, timeout,
+/// signal, interrupt — are NOT here: they return as `Ok` outcomes with flags.
+fn is_process_data_error(code: &str) -> bool {
+    matches!(
+        code,
+        "PROCESS_SPAWN" | "PROCESS_STDIO" | "PROCESS_IO" | "PROCESS_INTERNAL"
+    )
 }
 
 fn builtin_run_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -5432,6 +5412,266 @@ struct PipelineOpts {
 struct PipelineStage {
     argv: Vec<String>,
     opts: RunArgvOpts,
+}
+
+/// Borrow an owned [`RunArgvOpts`] + argv as a [`ProcSpec`] for [`run_process`].
+/// The single construction site shared by `run_argv` and `run_parallel`, so a
+/// parallel job behaves EXACTLY like the same `run_argv` call.
+fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str) -> ProcSpec<'a> {
+    ProcSpec {
+        argv,
+        stdin: match &opts.stdin {
+            RunArgvStdin::Null => ProcStdin::Null,
+            RunArgvStdin::Data(data) => ProcStdin::Data(data),
+            RunArgvStdin::File(path) => ProcStdin::File(path),
+        },
+        stdout: match &opts.stdout {
+            RunArgvOutput::Capture => ProcOutput::Capture,
+            RunArgvOutput::Inherit => ProcOutput::Inherit,
+            RunArgvOutput::Null => ProcOutput::Null,
+            RunArgvOutput::File(file) => ProcOutput::File(file),
+        },
+        stderr: match &opts.stderr {
+            RunArgvStderr::Capture => ProcStderr::Capture,
+            RunArgvStderr::Inherit => ProcStderr::Inherit,
+            RunArgvStderr::Null => ProcStderr::Null,
+            RunArgvStderr::Stdout => ProcStderr::Stdout,
+            RunArgvStderr::File(file) => ProcStderr::File(file),
+        },
+        timeout_ms: opts.timeout_ms,
+        caller,
+        cwd: opts.cwd.as_deref(),
+        env: &opts.env,
+        clear_env: opts.clear_env,
+        max_output: opts.max_output,
+        stream: opts.stream,
+    }
+}
+
+/// Top-level options for `run_parallel`: `max` concurrency and a per-job
+/// `timeout` (seconds) that overrides each job's own when given.
+struct RunParallelOpts {
+    max: usize,
+    timeout_ms: Option<u64>,
+}
+
+fn parse_run_parallel_opts(caller: &str, value: Option<&Value>) -> MixResult<RunParallelOpts> {
+    let mut out = RunParallelOpts {
+        max: 8,
+        timeout_ms: None,
+    };
+    let map = match value {
+        None | Some(Value::Nil) => return Ok(out),
+        Some(Value::Map(m)) => m,
+        Some(other) => {
+            return Err(opt_invalid(
+                caller,
+                format!("options must be a map, got {}", other.type_name()),
+            ));
+        }
+    };
+    for (k, val) in map.iter() {
+        match k.as_str() {
+            "max" => {
+                let n = extract_number(val, InputPolicy::NumberOnly).ok_or_else(|| {
+                    opt_invalid(caller, format!("max must be a number, got {}", val.type_name()))
+                })?;
+                if !(n.is_finite() && n >= 1.0 && n.fract() == 0.0) {
+                    return Err(opt_invalid(
+                        caller,
+                        format!("max must be a finite integer >= 1, got {n}"),
+                    ));
+                }
+                out.max = n as usize;
+            }
+            "timeout" => {
+                let t = extract_number(val, InputPolicy::NumberOnly).ok_or_else(|| {
+                    opt_invalid(
+                        caller,
+                        format!("timeout must be a number of seconds, got {}", val.type_name()),
+                    )
+                })?;
+                // > 0 and not absurd: 0 disables the deadline (refused — a
+                // batch cannot afford a job that opts out), and a value that
+                // would overflow the millisecond deadline is an error, not a
+                // silent saturation to u64::MAX.
+                if !(t.is_finite() && t > 0.0 && t <= 1e9) {
+                    return Err(opt_invalid(
+                        caller,
+                        format!("timeout must be a finite number of seconds in (0, 1e9], got {t}"),
+                    ));
+                }
+                out.timeout_ms = Some(((t * 1000.0).round() as u64).max(1));
+            }
+            other => {
+                return Err(opt_invalid(
+                    caller,
+                    format!("unknown option '{}' (supported: max, timeout)", sanitize_for_diag(other)),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A job parsed to owned data (nothing borrows a `Value`), so it can cross a
+/// thread boundary — the reason `run_parallel` can parallelise at all despite
+/// `Value` being `!Send`.
+struct ParsedJob {
+    argv: Vec<String>,
+    opts: RunArgvOpts,
+}
+
+/// Parse one `run_parallel` job — an argv list, or a `{argv, …}` map mirroring
+/// run_argv's options — into owned config.
+fn parse_run_parallel_job(caller: &str, job: &Value) -> MixResult<ParsedJob> {
+    match job {
+        Value::List(_) => Ok(ParsedJob {
+            argv: parse_run_argv_argv(caller, job)?,
+            opts: parse_run_argv_opts(caller, None)?,
+        }),
+        Value::Map(m) => {
+            let argv_val = m.get("argv").ok_or_else(|| {
+                MixError::structured(
+                    "TYPE_MISMATCH",
+                    format!("{caller}: a job map needs an 'argv' key"),
+                )
+            })?;
+            let argv = parse_run_argv_argv(caller, argv_val)?;
+            // parse_run_argv_opts rejects unknown keys, so hand it the map
+            // without `argv`. Also strip `stream`: parallel + live tee would
+            // interleave, so a job's stream flag is ignored — and stripping it
+            // here (rather than forcing it false after parse) means a
+            // `{stream: true, stdout: "inherit"}` job is genuinely ignored
+            // instead of hitting parse's stream/inherit rejection and failing
+            // the whole call.
+            let mut cleaned = (**m).clone();
+            cleaned.shift_remove("argv");
+            cleaned.shift_remove("stream");
+            let opts = parse_run_argv_opts(caller, Some(&Value::map(cleaned)))?;
+            Ok(ParsedJob { argv, opts })
+        }
+        other => Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!(
+                "{caller}: each job must be an argv list or a map, got {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let caller = "run_parallel";
+    if args.is_empty() || args.len() > 2 {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!("{caller}: expected 1 or 2 args (jobs, [opts]), got {}", args.len()),
+        ));
+    }
+    let jobs = match &args[0] {
+        Value::List(l) => l,
+        other => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!("{caller}: jobs must be a list, got {}", other.type_name()),
+            ));
+        }
+    };
+    let popts = parse_run_parallel_opts(caller, args.get(1))?;
+
+    // Parse EVERY job to owned config on this (the caller's) thread — a parse
+    // error in any job fails the whole call before a single process spawns,
+    // exactly like run_argv validates before spawning.
+    let mut parsed: Vec<ParsedJob> = Vec::with_capacity(jobs.len());
+    for job in jobs.iter() {
+        let mut p = parse_run_parallel_job(caller, job)?;
+        if let Some(t) = popts.timeout_ms {
+            p.opts.timeout_ms = t;
+        }
+        // A disabled deadline (timeout: 0) is refused: one never-exiting job
+        // would loop its worker forever and — because `thread::scope` waits for
+        // all workers — hostage the WHOLE batch, withholding every completed
+        // result. Serial run_argv with timeout:0 hangs only itself; a batch
+        // cannot afford that, so every job needs a real bound.
+        if p.opts.timeout_ms == 0 {
+            return Err(opt_invalid(
+                caller,
+                "a job may not disable its timeout (timeout: 0) — one hung job would park the whole batch",
+            ));
+        }
+        // Belt-and-suspenders: `stream` is already stripped from job maps, and
+        // a list-form job never sets it, so this stays false.
+        p.opts.stream = false;
+        parsed.push(p);
+    }
+
+    let n = parsed.len();
+    if n == 0 {
+        return Ok(Some(Value::list(Vec::new())));
+    }
+
+    // Bounded worker pool: `max` workers pull the next index atomically and
+    // write their outcome into a per-index slot, so results stay in input
+    // order and each `ProcOutcome` (owned primitives) marshals back on this
+    // thread. `scope` lets the workers borrow `parsed` without 'static.
+    //
+    // A `MixError` carries a `Value` details field, so it is `!Send` and cannot
+    // cross the thread boundary; the worker flattens any error to owned
+    // `(code, message)` strings, which the caller thread turns back into either
+    // a process_result error map (DATA) or a re-raised error.
+    let slots: Vec<Mutex<Option<Result<ProcOutcome, (String, String)>>>> =
+        (0..n).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    // Cap the live thread count regardless of `max`: 256 concurrent children
+    // already covers any realistic fleet fan-out, and it stops
+    // `run_parallel(huge, {max: 100000})` from trying to spawn 100000 OS
+    // threads. Excess jobs still run — the workers drain them by index.
+    const MAX_WORKERS: usize = 256;
+    let workers = popts.max.min(n).min(MAX_WORKERS);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let p = &parsed[i];
+                let outcome = run_process(&proc_spec_from(&p.argv, &p.opts, caller)).map_err(|e| {
+                    match e {
+                        MixError::Structured(info) => (info.code.clone(), info.message.clone()),
+                        other => ("RUNTIME_ERROR".to_string(), other.to_string()),
+                    }
+                });
+                *slots[i].lock().expect("run_parallel slot poisoned") = Some(outcome);
+            });
+        }
+    });
+
+    // Marshal in input order. A job's ordinary failure (spawn/stdio/lifecycle)
+    // is DATA — encoded in its result map exactly as run_argv does — never a
+    // raise. (Nonzero exits, timeouts, and interrupts come back as Ok outcomes
+    // with the flags set, NOT as errors; only the setup/lifecycle codes below
+    // arrive as Err.) Any other error would be re-raised, but no engine helper
+    // emits one today — see `is_process_data_error`.
+    let mut results = Vec::with_capacity(n);
+    for slot in slots {
+        let outcome = slot
+            .into_inner()
+            .expect("run_parallel slot poisoned")
+            .expect("every job index is assigned exactly once");
+        let val = match outcome {
+            Ok(o) => run_argv_result_map(&o),
+            Err((code, message)) if is_process_data_error(&code) => {
+                run_argv_error_map(&code, &message)
+            }
+            Err((code, message)) => return Err(MixError::structured(&code, message)),
+        };
+        results.push(val);
+    }
+    Ok(Some(Value::list(results)))
 }
 
 const RUN_PIPELINE_OPT_KEYS: &[&str] = &["timeout", "max_output", "allow_signal"];
@@ -8366,10 +8606,15 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     //   1. Linux delivers PDEATHSIG when the *cloning thread* exits,
     //      not the parent process. Today Mix evaluates a single script
     //      on its calling thread, so "thread exit" == "process exit"
-    //      for our purposes. If a future evaluator runs `ssh_run` on
-    //      a worker thread that can be joined while the script keeps
-    //      executing, the SIGKILL will land on a still-needed child.
-    //      Revisit this comment if Mix's threading model changes.
+    //      for our purposes. `run_parallel` (0.82.0) is the first case
+    //      that runs `run_process` on WORKER threads — and it is safe
+    //      precisely because every `run_process` return path reaps or
+    //      kills its direct child BEFORE returning, so a worker thread
+    //      never exits while its child is still alive on the normal
+    //      path; on the panic path the worker's exit fires PDEATHSIG,
+    //      SIGKILLing the orphaned child, which is the desired backstop.
+    //      A future evaluator that could JOIN a worker while its child
+    //      is deliberately still running would break this — revisit then.
     //   2. PDEATHSIG only protects the direct child. Grandchildren
     //      spawned by the ssh client (or any descendant that detaches
     //      via setsid + double-fork) are unaffected — see the
@@ -26921,5 +27166,124 @@ mod compiled_features_tests {
         #[cfg(feature = "ws")]
         assert!(f.contains(&"ws"), "ws built but not reported");
         let _ = f;
+    }
+}
+
+#[cfg(test)]
+mod run_parallel_tests {
+    use super::call_builtin;
+    use crate::value::Value;
+
+    fn argv(words: &[&str]) -> Value {
+        Value::list(words.iter().map(|w| Value::String((*w).to_string())).collect())
+    }
+
+    fn run(jobs: Vec<Value>, opts: Option<Value>) -> Vec<Value> {
+        let mut args = vec![Value::list(jobs)];
+        if let Some(o) = opts {
+            args.push(o);
+        }
+        match &call_builtin("run_parallel", args) {
+            Ok(Some(Value::List(l))) => l.iter().cloned().collect(),
+            other => panic!("run_parallel returned {other:?}"),
+        }
+    }
+
+    fn field<'a>(m: &'a Value, k: &str) -> &'a Value {
+        match m {
+            Value::Map(map) => map.get(k).unwrap_or_else(|| panic!("field '{k}' missing")),
+            _ => panic!("not a map"),
+        }
+    }
+
+    #[test]
+    fn results_are_in_input_order() {
+        let r = run(vec![argv(&["echo", "a"]), argv(&["echo", "b"]), argv(&["echo", "c"])], None);
+        assert_eq!(r.len(), 3);
+        for (i, want) in ["a", "b", "c"].iter().enumerate() {
+            match field(&r[i], "stdout") {
+                Value::String(s) => assert_eq!(s.trim(), *want, "job {i}"),
+                other => panic!("stdout not a string: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_job_is_data_not_a_raise() {
+        // `false` exits 1; a bogus command is a PROCESS_SPAWN encoded in the
+        // map. Neither aborts the batch; the good job still succeeds.
+        let r = run(
+            vec![argv(&["false"]), argv(&["echo", "ok"]), argv(&["definitely_no_such_cmd_zzz"])],
+            None,
+        );
+        assert_eq!(r.len(), 3);
+        assert_eq!(field(&r[0], "ok"), &Value::Bool(false));
+        assert_eq!(field(&r[1], "ok"), &Value::Bool(true));
+        assert_eq!(field(&r[2], "ok"), &Value::Bool(false));
+        assert_eq!(field(&r[2], "error_code"), &Value::String("PROCESS_SPAWN".to_string()));
+    }
+
+    #[test]
+    fn empty_job_list_is_an_empty_result_list() {
+        assert!(run(vec![], None).is_empty());
+    }
+
+    #[test]
+    fn job_map_form_carries_per_job_stdin() {
+        let mut m = indexmap::IndexMap::new();
+        m.insert("argv".to_string(), argv(&["cat"]));
+        m.insert("stdin".to_string(), Value::String("piped".to_string()));
+        let r = run(vec![Value::map(m)], None);
+        assert_eq!(r.len(), 1);
+        match field(&r[0], "stdout") {
+            Value::String(s) => assert_eq!(s.trim(), "piped"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_job_may_not_disable_its_deadline() {
+        // timeout:0 (deadline disabled) is refused — one hung job would park
+        // the whole batch. This is stricter than serial run_argv on purpose.
+        let mut m = indexmap::IndexMap::new();
+        m.insert("argv".to_string(), argv(&["echo", "x"]));
+        m.insert("timeout".to_string(), Value::Number(0.0));
+        match call_builtin("run_parallel", vec![Value::list(vec![Value::map(m)])]) {
+            Err(e) => {
+                assert_eq!(e.info().map(|i| i.code.as_str()), Some("OPTION_INVALID"));
+                assert!(e.to_string().contains("timeout: 0"), "{e}");
+            }
+            other => panic!("expected OPTION_INVALID, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_jobs_stream_flag_is_ignored_not_a_whole_call_error() {
+        // {stream:true, stdout:"inherit"} would fail parse in run_argv, but
+        // run_parallel strips stream, so the job runs (inheriting stdout).
+        let mut m = indexmap::IndexMap::new();
+        m.insert("argv".to_string(), argv(&["true"]));
+        m.insert("stream".to_string(), Value::Bool(true));
+        m.insert("stdout".to_string(), Value::String("inherit".to_string()));
+        let r = run(vec![Value::map(m)], None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(field(&r[0], "ok"), &Value::Bool(true));
+    }
+
+    #[test]
+    fn runs_concurrently_under_the_max_bound() {
+        // Four ~0.4s sleeps with max=4 must finish well under the 1.6s serial
+        // sum — a lenient bound that still proves parallelism, not a race.
+        let jobs: Vec<Value> = (0..4).map(|_| argv(&["sleep", "0.4"])).collect();
+        let mut opts = indexmap::IndexMap::new();
+        opts.insert("max".to_string(), Value::Number(4.0));
+        let start = std::time::Instant::now();
+        let r = run(jobs, Some(Value::map(opts)));
+        let elapsed = start.elapsed();
+        assert_eq!(r.len(), 4);
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "4x0.4s with max=4 took {elapsed:?} — not parallel",
+        );
     }
 }
