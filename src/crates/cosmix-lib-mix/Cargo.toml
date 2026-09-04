@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.70.0"
+version = "0.71.0"
 edition = "2024"
 license = "MIT"
 
@@ -25,7 +25,10 @@ toml = ["dep:toml"]
 serde = ["dep:serde"]
 datetime = ["dep:chrono"]
 url = ["dep:url"]
-crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid"]
+# `bcrypt` joined 0.71.0 for password_hash()/password_verify() — client-side
+# bcrypt for maild.accounts.password writes over the Bus (a raw props.set
+# stores the field verbatim; only the CLI hashed before this existed).
+crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt"]
 http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile"]
 sqlite = ["dep:rusqlite"]
 # `tokio-sleep` is an alias-only feature kept for backwards
@@ -58,6 +61,12 @@ datastar = ["dep:datastar", "json"]
 # SOAP/RSS consumer shape; {mode:"tree"} is full fidelity. NOT an HTML
 # parser — tag-soup HTML needs an html5 parser (separate builtin if ever).
 xml = ["dep:quick-xml"]
+# `yaml_parse()` / `yaml_encode()` builtins (0.71.0) — the provisioned-YAML
+# surface (Grafana alerting/dashboards/datasources, Prometheus, Alloy) that
+# deploy scripts must generate, edit and GATE on. yaml-rust2 is the pure-Rust
+# YAML 1.2 implementation (saphyr lineage); no serde bridge needed — the
+# builtins build the Value tree directly, mirroring json_decode/json_encode.
+yaml = ["dep:yaml-rust2"]
 
 [dependencies]
 indexmap = "2"
@@ -77,7 +86,9 @@ tracing = "0.1"
 # crate (like indexmap/libc/rand), not a Cosmix-internal dependency.
 futures-util = { workspace = true }
 base64 = { version = "0.22", optional = true }
+bcrypt = { version = "0.16", optional = true }
 blake3 = { version = "1", optional = true }
+yaml-rust2 = { version = "0.12", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 regex = { version = "1", optional = true }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"], optional = true }
@@ -139,7 +150,7 @@ quick-xml = { version = "0.41.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
-cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml"] }
+cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml"] }
 # Property-based testing for the lexer/parser (P1 of the mix tokenizer
 # fuzz/property corpus — _doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix
 # hub). Test-only; never linked into the shipped library.

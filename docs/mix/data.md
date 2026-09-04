@@ -14,6 +14,7 @@ List the category live with `mix builtins json`; one-line help for any name with
 |---|---|---|---|
 | JSON | `json_parse` | `json_encode` | `read_json`, `read_jsonl` |
 | TOML | `toml_parse` | `toml_encode` | — (use `read_file` + `toml_parse`) |
+| YAML | `yaml_parse` | `yaml_encode` | — (use `read_file` + `yaml_parse`) |
 | strict-data `.mix` | `data_parse` | `data_encode` | `load_data` |
 | CSV | `csv_parse` | — | — |
 | INI | `ini_parse` | — | — |
@@ -22,8 +23,8 @@ List the category live with `mix builtins json`; one-line help for any name with
 | numeric coercion | `to_number` | — | — |
 
 `json_parse`/`json_encode`, `jq`/`jq_all`, `read_json`/`read_jsonl` are gated
-behind the `json` feature, `toml_parse`/`toml_encode` behind `toml`, and
-`xml_parse` behind `xml`; the shipped `mix` binary turns them all on.
+behind the `json` feature, `toml_parse`/`toml_encode` behind `toml`,
+`yaml_parse`/`yaml_encode` behind `yaml`, and `xml_parse` behind `xml`; the shipped `mix` binary turns them all on.
 `data_parse`/`data_encode`, `load_data`, `csv_parse`, `ini_parse`, `to_number`,
 and `template` are core — always present, no feature gate.
 
@@ -325,6 +326,50 @@ Runtime error at line 2: jq(): cannot parse filter ".a |": Parse([(Term, "")])
 > "{b: .b, a: .a}")` keep the written order. The alphabetical look in JSON examples
 > above comes from `json_parse`/`json_encode`, not from jq. For canonical,
 > order-stable serialization reach for `data_encode`.
+
+## YAML (v0.71.0)
+
+`yaml_parse(string[, {docs: true}])` → value; `yaml_encode(value)` → a YAML
+string. This is the surface the provisioned-YAML fleet runs on — Grafana
+alerting/dashboards/datasources, Prometheus and Alloy config that deploy
+scripts generate, edit, and **gate on**: a deploy script that cannot parse
+what it deploys cannot validate it either (this used to shell out to
+`ruby -ryaml`).
+
+```mix
+$y = yaml_parse(read_file("rules.yaml"))
+for each $g in $y["groups"]
+  print($g["name"] .. ": " .. len($g["rules"]) .. " rule(s)")
+end
+write_file("rules.yaml", yaml_encode($y))
+```
+
+The mapping mirrors JSON's: scalars → nil/bool/number/string, sequences →
+lists, mappings → maps in document order. The details that differ from a
+naive reading:
+
+- **Documents.** By default the input must hold at most one document —
+  none is `nil`, more than one **raises** (naming the fix). Pass
+  `{docs: true}` for a list of every document in the stream.
+- **Keys.** Mix maps are string-keyed: scalar YAML keys keep their natural
+  text (`25:` becomes `"25"`); a sequence or mapping used as a key raises.
+- **Anchors and aliases** are resolved during parsing; tags are not
+  preserved. **Merge keys are NOT resolved**: yaml-rust2 has no `<<`
+  handling, so `<<: *defaults` parses as a literal `"<<"` entry whose
+  inherited fields are *not* flattened into the map — a gating script
+  must flatten them itself or avoid `<<` in files it validates.
+  `.inf`/`.nan`-style reals that Rust cannot parse keep their text as
+  strings rather than being guessed at.
+- **Encoding** emits no leading `---` marker, guarantees a trailing
+  newline, writes whole numbers as integers, and quotes only what YAML
+  requires — including keys like `on`/`yes` that YAML 1.1 would read as
+  booleans. `nil`/bool/number/string/list/map only; bytes, buffer or
+  function values raise — and so does a **non-finite number** (bare
+  `inf`/`NaN` would read back as *strings*; `json_encode` and
+  `toml_encode` refuse the same way).
+- **Nesting is capped at 256 levels** in both directions (a hostile
+  deep-nesting input raises a catchable error, like `serde_json`'s 128).
+- Round trip holds: `yaml_parse(yaml_encode($v))` rebuilds the same value.
 
 ## TOML
 

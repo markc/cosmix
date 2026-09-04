@@ -236,6 +236,8 @@ fn sensitive_builtins_stay_categorized() {
         ("hash_file", FsRead),
         // FsWrite
         ("write_file", FsWrite),
+        ("fcntl_lock", FsWrite),
+        ("fcntl_unlock", FsWrite),
         ("write_new", FsWrite),
         ("append_file", FsWrite),
         ("mkdir", FsWrite),
@@ -253,6 +255,8 @@ fn sensitive_builtins_stay_categorized() {
         ("ssh_mix", Network),
         ("ssh_exec", Network),
         ("dns_lookup", Network),
+        ("udp_send", Network),
+        ("udp_recv", Network),
         // Process
         ("run", Process),
         ("run_rc", Process),

@@ -143,6 +143,13 @@ async fn test_bytes_generic_ops() {
     run_test_script("bytes_generic_ops.mix").await;
 }
 
+// v0.71.0 builtins through the evaluator: sprintf, yaml_parse/yaml_encode,
+// password_hash/password_verify (fcntl_* and udp_* are Rust unit tests).
+#[tokio::test]
+async fn test_builtins_v071() {
+    run_test_script("builtins_v071.mix").await;
+}
+
 // The byte-exact stdio family (v0.65.0). This harness trims and splits on
 // lines, so it cannot see the missing trailing newline — tests/raw_stdout.rs
 // asserts the bytes and crates/cosmix-mix/tests/stdio_filter.rs the real

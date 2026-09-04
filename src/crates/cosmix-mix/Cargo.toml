@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-mix"
-version = "0.70.0"
+version = "0.71.0"
 edition = "2024"
 
 [[bin]]
@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 # cosmix-lib-mix is a sibling crate within the mix repo — relative
 # path stays one level up.
-cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "dkim", "serde", "markdown", "datastar", "xml"] }
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "dkim", "serde", "markdown", "datastar", "xml", "yaml"] }
 # Bus-family deps live in the sibling bus repo at `~/.bus/`. Path is
 # FOUR `..` to climb out of `crates/cosmix-mix/` to `$HOME`, then
 # into `.bus/src/crates/<crate>`. These path-deps flip to

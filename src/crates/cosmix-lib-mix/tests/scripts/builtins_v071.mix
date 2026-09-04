@@ -1,0 +1,53 @@
+-- v0.71.0 builtins through the evaluator: sprintf, yaml, password_hash.
+-- (fcntl_lock and udp_* have Rust unit tests — a blocking recv or a lock
+-- registry does not belong in the async script harness.)
+--
+-- Trailing-space-sensitive outputs are wrapped in |…| because the harness
+-- trims each line before comparing.
+
+print(sprintf("%05lld|%+d|%8.3f", 42, 7, 3.14159))
+print("|" .. sprintf("%-8s", "hé") .. "|")
+print(sprintf("%e %g %G", 12345.6789, 0.00001, 1.5e-10))
+print(sprintf("%#llx %#llo %llu", 255, 8, 255))
+print(sprintf("%.*f=%*d", 2, 2.5, 5, 9))
+
+$y = yaml_parse("groups:\n  - name: memory\n    threshold: 0.85\n    enabled: true\n")
+$g = $y["groups"][0]
+print($g["name"] .. " " .. $g["threshold"] .. " " .. $g["enabled"])
+$out = yaml_encode({name: "x", items: [1, "two"], on: false})
+-- (trim: the guaranteed trailing newline would print as a blank line the
+-- harness's expected-block cannot express; the quoted "on" is the emitter
+-- protecting a YAML-1.1 boolean-like token, and parses back as the key.)
+print(trim($out))
+$back = yaml_parse($out)
+print($back["items"][1] .. " " .. type($back["on"]))
+try
+  yaml_parse("a: 1\n---\nb: 2\n")
+catch $msg, $err
+  print("multi-doc raises")
+end
+
+$h = password_hash("s3cret", 4)
+print(left($h, 3) .. " " .. password_verify("s3cret", $h) .. " " .. password_verify("nope", $h))
+try
+  password_verify("x", "not-a-hash")
+catch $msg, $err
+  print("bad hash raises")
+end
+
+-- Expected output:
+-- 00042|+7|   3.142
+-- |hé      |
+-- 1.234568e+04 1e-05 1.5E-10
+-- 0xff 010 255
+-- 2.50=    9
+-- memory 0.85 true
+-- name: x
+-- items:
+--   - 1
+--   - two
+-- "on": false
+-- two bool
+-- multi-doc raises
+-- $2b true false
+-- bad hash raises

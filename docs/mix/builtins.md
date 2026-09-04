@@ -1,8 +1,8 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.70.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.71.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
-Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`) so embedders can pull only what they need — the `mix` binary turns them all on.
+Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `yaml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`, `xml`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
 ## Machine-readable discovery (metadata_schema 1)
 
@@ -200,6 +200,8 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   mkdir           Create directory: mkdir(path[, {parents}]). parents defaults to true (create_dir_all). {parents: false} creates only the final component and fails if the parent is missing — the form to use when the parent was placed deliberately and re-creating it would hide its removal (v0.42.0)
   flock           Take a process-held advisory file lock: flock(path[, {shared, wait}]) -> bool. Exclusive and non-blocking by default; contention returns false, genuine filesystem errors raise. wait is seconds (0 = do not wait). Repeated acquisition of the same canonical path by this process is idempotent-true (v0.43.0)
   funlock         Release and close this process's advisory lock for path. Returns true when held, false when not held (v0.43.0)
+  fcntl_lock      Take a POSIX record lock over the whole file: fcntl_lock(path[, {shared, wait}]) -> bool — the fcntl(2) lock namespace C daemons use for pidfiles/lockfiles, which flock(2) locks never see (Linux keeps the two families separate). Contract-identical to flock: exclusive + non-blocking default, contention false, real errors raise, per-process idempotent-true by canonical path. Implemented as open-file-description locks (F_OFD_SETLK): they conflict with other processes' traditional fcntl records, and survive this process opening/closing the same path elsewhere — a read_file of the locked path cannot drop them (v0.71.0)
+  fcntl_unlock    Release and close this process's POSIX record lock for path. true when held, false when not (v0.71.0)
   copy            Copy a single file: copy(src, dst). Overwrites dst; preserves the source permission bits. Use copy_tree for a directory (v0.22.0).
   copy_tree       Recursively copy a directory: copy_tree(src, dst). Creates dst, copies files (perms preserved) and symlinks (as symlinks); merges into an existing dst (v0.22.0).
   symlink         Create a symbolic link: symlink(target, linkpath) — symlink(2), arguments in symlink(2) order (target first, the link to create second). `target` is stored verbatim and is NOT resolved or validated: a relative target resolves against the link's own directory, and creating a dangling link is legal. Raises EEXIST if linkpath already exists. Read the other way with read_link() (v0.38.0).
@@ -280,6 +282,8 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   hash_md5        MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)
   hash_sha1       SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)
   hmac_sha256     HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)
+  password_hash   bcrypt-hash a password: password_hash(plaintext[, cost]) → $2b$… string; cost 4-31, default 12; input over 72 bytes raises (bcrypt's own truncation limit, surfaced instead of silently applied). For client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0)
+  password_verify Check a plaintext password against a bcrypt hash from password_hash() (any $2a$/$2b$/$2y$ form) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0)
   constant_time_eq Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer
   hash_file       Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, "md5"|"sha1"|"sha256"|"blake3"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)
   uuid            Generate a new random UUID v4 string
@@ -299,12 +303,15 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   bytes_to_hex    Lowercase hex of a bytes/buffer value, two chars per byte, no separator (v0.64.0)
   bytes_from_hex  Decode a hex string to bytes — strict: even length, [0-9a-fA-F] only, no separators or whitespace. Exact inverse of bytes_to_hex (v0.64.0)
   dns_lookup      Resolve a hostname to a list of IP address strings
+  udp_send        Send ONE UDP datagram: udp_send(host, port, payload) -> bytes sent. Payload (string/bytes/buffer) goes out verbatim; host is resolved. Not a socket API — nothing to hold or close (v0.71.0)
+  udp_recv        Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)
   help            Show Mix builtin help in the REPL
   require         Load a Mix module: evaluate the file once in an isolated scope, return its exports (map of top-level fns + $vars, or the file's top-level return value). Cached per canonical path; cycles error (v0.27.0)
 
 ## format  — see [strings](strings.md)
 
-  fmt             printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,"0") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer)
+  fmt             printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,"0") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer). For byte-exact C-printf parity (%e %g %x, flags, glibc float rounding) use sprintf()
+  sprintf         C-compatible printf: sprintf(fmt, ...) → string. Conversions %d %i %u %o %x %X %f %F %e %E %g %G %s %c %%; flags - + 0 # and space; width/precision incl. *; length modifiers parsed and ignored (integer conversions are 64-bit, so a negative %u/%x prints its 64-bit two's-complement). Float output matches glibc printf byte-for-byte (fixture-tested) — for emitting numbers a C/Rust consumer compares exactly. Divergences: %s pads by codepoints and %.Ns truncates to ≤N bytes without splitting a codepoint; %c takes a Unicode scalar (v0.71.0)
   printf          Formatted write to stdout (no trailing newline — include \n explicitly) (v0.2.0)
   eprintf         Formatted write to stderr (v0.2.0)
   format_bytes    Format byte count as human-readable size (e.g. "1.5 MB"); a non-numeric argument raises (strict since v0.55.0)
@@ -318,6 +325,8 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   jq_all          Run a jq filter, collect ALL outputs as a list (the stream case). jq_all(value, filter)
   read_json       Read a single-record JSON file directly into a Mix value (v0.2.3)
   read_jsonl      Read a JSON-lines file — list of records, strict by default, {skip_errors: true} for lenient (v0.2.3)
+  yaml_parse      Parse a YAML string into a Mix value (requires yaml feature; v0.71.0). Single document by default (0 docs → nil, >1 raises); pass {docs:true} for a list of every document. Anchors/aliases resolved; scalar mapping keys become string keys; a non-scalar key raises
+  yaml_encode     Encode a Mix value as YAML (requires yaml feature; v0.71.0). No leading --- marker, trailing newline guaranteed; whole numbers emit as integers; nil/bool/number/string/list/map only — bytes, buffer or function values raise
   toml_parse      Parse TOML string into Mix map
   toml_encode     Encode Mix value as TOML. Raises TOML_UNREPRESENTABLE with {path,type} details for nil, function, bytes, or buffer values instead of silently replacing them with empty strings (strict since v0.55.0)
   data_parse      Parse a strict-data `.conf.mix` string into a Mix value (inverse of data_encode) (v0.3.2)

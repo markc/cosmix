@@ -496,7 +496,9 @@ stays open after `flock` returns and the kernel releases it automatically when
 the process exits — including signal death. Calling `flock` again for the same
 canonical path in the same process returns `true` without opening a second
 retained fd. The first acquisition fixes shared versus exclusive mode until
-`funlock`; a repeated call is idempotent, not an upgrade or downgrade.
+`funlock`; a repeated call is idempotent, not an upgrade or downgrade — so
+`flock(p)` followed by `flock(p, {shared: true})` answers `true` while the
+held lock stays exclusive (the same rule applies to `fcntl_lock` below).
 
 `funlock` returns `true` when it released a held fd and `false` when this process
 held no lock for that path. The not-held case never raises.
@@ -506,6 +508,36 @@ same file. Do not remove, rename, or replace a live lock file. A path can then
 name a new inode while an older process still holds the old inode locked, letting
 both processes proceed. Leave the lock file in place permanently; only acquire
 and release its kernel lock.
+
+### POSIX record locks — `fcntl_lock`, `fcntl_unlock` (v0.71.0)
+
+```
+fcntl_lock(path)                         exclusive, non-blocking
+fcntl_lock(path, {shared: true, wait: 2.5})
+fcntl_unlock(path)                       release this process's record lock
+```
+
+Linux keeps **two separate advisory-lock families** that never see each
+other: `flock(2)` locks (above) and POSIX `fcntl(2)` record locks — the
+family C/Rust daemons use for pidfiles and lock files (`F_SETLK`/`F_SETLKW`).
+A Mix `flock()` cannot contend with a daemon's fcntl lock; `fcntl_lock()`
+can. **Pick the family the other side of the coordination uses**; for
+Mix-to-Mix locking either works, and `flock` is the established default.
+
+The caller contract is identical to `flock`/`funlock` in every respect:
+exclusive + non-blocking by default, contention returns `false`, real errors
+raise, repeated acquisition in one process is idempotent-`true` by canonical
+path, the fd lives in a process-global registry and the kernel cleans up on
+exit, and the do-not-delete-a-live-lock-file rule applies unchanged. The
+lock always covers the **whole file**.
+
+One implementation detail worth knowing: these are *open-file-description*
+locks (`F_OFD_SETLK`). They conflict with other processes' traditional
+record locks exactly as required — but unlike traditional records they are
+**not** dropped when this process opens and closes the same path elsewhere.
+A traditional fcntl lock would be silently released by a mere `read_file`
+of the locked path (POSIX drops a process's record locks when *any* fd for
+the file closes); the OFD form removes that footgun.
 
 ## Copying & removing — `copy`, `copy_tree`, `remove`, `remove_dir`
 

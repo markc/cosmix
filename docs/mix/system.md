@@ -996,7 +996,20 @@ hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
                        (all of the above: lowercase hex, or bytes with raw:true)
 base64_encode(v)       base64 of a string or bytes buffer
 base64_decode(s)       decode base64 -> a bytes buffer
+password_hash(pw[, cost])   bcrypt "$2b$…" hash; cost 4-31, default 12 (v0.71.0)
+password_verify(pw, hash)   check against a bcrypt hash -> bool (v0.71.0)
 ```
+
+`password_hash`/`password_verify` exist for **account passwords written over
+the Bus**: a raw `props.set` of `maild.accounts.password` stores the field
+verbatim (only the `account add` CLI hashed it), so the bcrypt has to happen
+client-side — which used to mean shelling out to PHP. Three deliberate
+edges: input over **72 bytes raises** (bcrypt's own truncation limit,
+surfaced instead of silently applied — hash a digest of longer secrets);
+a **malformed hash raises** in `password_verify` rather than answering
+`false` (a corrupt stored hash is a config fault, and "wrong password"
+would misdirect the operator); and the general-purpose digests above are
+**not** password hashes — `hash_sha256` has no work factor.
 
 Every `hash_*` call takes the same trailing options map, and the only option is
 **`{raw: true}`** (v0.66.0): return the digest as raw `bytes` instead of
@@ -1153,6 +1166,44 @@ hello mix
 
 These (and `base64_*`, `uuid`) are behind the `crypto` feature, which the `mix`
 binary always enables.
+
+## UDP datagrams — `udp_send`, `udp_recv` (v0.71.0)
+
+```
+udp_send(host, port, payload)   -> bytes sent; payload string/bytes/buffer, verbatim
+udp_recv(port[, opts])          -> {bytes, text, from_host, from_port} | nil on timeout
+                                   opts: timeout (secs, default 30, 0 = forever),
+                                         host (bind addr, default "0.0.0.0"),
+                                         max  (read cap, default 65535)
+```
+
+One datagram in, one out — deliberately **not** a socket API: there is no
+handle to hold, leak, or close. Before these, a unicast SSDP NOTIFY meant
+`run_argv(["nc", "-u", …], {stdin: $pkt})`. `udp_send` resolves the host and
+reports the byte count the kernel accepted (UDP being UDP, that is *sent*,
+never *delivered*). `udp_recv` binds, waits for **one** datagram, and
+returns `nil` on timeout — an ordinary answer for a datagram wait, not an
+error. `text` is the payload decoded as UTF-8 or `nil`; `bytes` always
+carries the truth. A datagram longer than `max` is truncated to it —
+`recvfrom(2)`'s own contract — and the default `max` of 65535 can never
+truncate, because no UDP payload exceeds it.
+
+```mix
+$notify = "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\r\n"
+udp_send("192.168.1.20", 1900, $notify)     -- unicast SSDP to the TV
+
+$got = udp_recv(9999, {timeout: 5})
+if $got != nil then
+  print("from " .. $got["from_host"] .. ": " .. ($got["text"] or "<binary>"))
+end
+```
+
+Both are **Network**-class builtins (below), like `http_*` and `dns_lookup` —
+and like those, the wait happens inline on the evaluator's thread. In a
+`--serve` citizen that means a pending `udp_recv` blocks the whole event pump
+for its duration; **never** pass `{timeout: 0}` there — unlike an HTTP call,
+where the wait rides an in-flight request, a datagram wait with no sender is
+unbounded and nothing can interrupt it.
 
 ## Capability classes
 

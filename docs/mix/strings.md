@@ -568,6 +568,49 @@ print(substr("abcdef", "2x"))
 TYPE_MISMATCH: substr(): argument 2 must be a number, got "2x" (string)
 ```
 
+## sprintf — C-compatible formatting (v0.71.0)
+
+`fmt()` is the Mix-native formatter for everyday alignment; **`sprintf()`**
+exists for the byte-exact cases: generating fixtures, protocol fields, or
+log lines that a C/Rust program will compare byte-for-byte.
+
+```
+sprintf(fmt, ...args) -> string
+```
+
+- **Conversions:** `%d %i %u %o %x %X %f %F %e %E %g %G %s %c %%`.
+- **Flags** `- + 0 #` and space; **width** and **precision**, both taking
+  `*` (from the next argument; a negative `*` width left-justifies, a
+  negative `*` precision is treated as omitted — C's rules).
+- **Length modifiers** (`hh h l ll L q j z t`) are parsed and **ignored**:
+  Mix numbers are one type, and the integer conversions behave as the
+  64-bit (`ll`) forms — `sprintf("%u", -1)` is `18446744073709551615`, the
+  64-bit two's-complement, and a C reference must use `%llu` to match.
+- **Float output matches glibc `printf` byte-for-byte** (fixture-tested:
+  `%.0f` of `2.5` is `2` and of `3.5` is `4` — both round the exact binary
+  value ties-to-even; `%g` picks its style from the *rounded* value, so
+  `%.3g` of `999999.5` is `1e+06`). `inf`/`nan` come out as glibc prints
+  them: lowercase for `%f %e %g`, upper for `%F %E %G`, space-padded even
+  under the `0` flag.
+- Integer conversions require a **whole number** in the exact-integer
+  range (±2⁵³−1 — Mix numbers are f64, so a positive value C could print
+  as a full u64 is unreachable above that); anything else raises rather
+  than truncating. Unknown conversions and missing arguments raise too,
+  and POSIX positional arguments (`%1$d`) are not supported — the `$`
+  surfaces as an unknown-conversion error.
+
+Two documented divergences, both about Unicode: `%s` pads by **codepoints**
+(C pads by bytes — identical for the ASCII output of numeric conversions,
+which is what the parity claim covers), and `%.Ns` truncates to at most N
+**bytes without splitting a codepoint**, so the result is always valid
+UTF-8. `%c` takes a Unicode scalar value, not a C `int` cast to a byte.
+
+```mix
+print(sprintf("%08.3f|%+d|%#llx", 3.14159, 42, 255))   -- 0003.142|+42|0xff
+print(sprintf("%e", 12345.6789))                       -- 1.234568e+04
+print(sprintf("%.*f", 2, 2.5))                         -- 2.50
+```
+
 ## Templates and wrapping
 
 `template` substitutes single-brace `{key}` placeholders from a map (distinct from

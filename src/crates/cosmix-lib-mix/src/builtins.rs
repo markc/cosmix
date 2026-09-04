@@ -252,6 +252,8 @@ builtin_table! {
     ("mkdir", CapabilityClass::FsWrite,           "io",      "Create directory: mkdir(path[, {parents}]). parents defaults to true (create_dir_all). {parents: false} creates only the final component and fails if the parent is missing — the form to use when the parent was placed deliberately and re-creating it would hide its removal (v0.42.0)", contract!((path: string, opts?: map) -> nil; failure[raises])),
     ("flock", CapabilityClass::FsWrite,           "io",      "Take a process-held advisory file lock: flock(path[, {shared, wait}]) -> bool. Exclusive and non-blocking by default; contention returns false, genuine filesystem errors raise. wait is seconds (0 = do not wait). Repeated acquisition of the same canonical path by this process is idempotent-true (v0.43.0)", contract!((path: string, opts?: map) -> bool; failure[raises])),
     ("funlock", CapabilityClass::FsWrite,         "io",      "Release and close this process's advisory lock for path. Returns true when held, false when not held (v0.43.0)", contract!((path: string) -> bool; failure[raises])),
+    ("fcntl_lock", CapabilityClass::FsWrite,      "io",      "Take a POSIX record lock over the whole file: fcntl_lock(path[, {shared, wait}]) -> bool — the fcntl(2) lock namespace C daemons use for pidfiles/lockfiles, which flock(2) locks never see (Linux keeps the two families separate). Contract-identical to flock: exclusive + non-blocking default, contention false, real errors raise, per-process idempotent-true by canonical path. Implemented as open-file-description locks (F_OFD_SETLK): they conflict with other processes' traditional fcntl records, and survive this process opening/closing the same path elsewhere — a read_file of the locked path cannot drop them (v0.71.0)", contract!((path: string, opts?: map) -> bool; failure[raises])),
+    ("fcntl_unlock", CapabilityClass::FsWrite,    "io",      "Release and close this process's POSIX record lock for path. true when held, false when not (v0.71.0)", contract!((path: string) -> bool; failure[raises])),
     ("copy", CapabilityClass::FsWrite,            "io",      "Copy a single file: copy(src, dst). Overwrites dst; preserves the source permission bits. Use copy_tree for a directory (v0.22.0).", contract!((src: string, dst: string) -> nil; failure[raises])),
     ("copy_tree", CapabilityClass::FsWrite,       "io",      "Recursively copy a directory: copy_tree(src, dst). Creates dst, copies files (perms preserved) and symlinks (as symlinks); merges into an existing dst (v0.22.0).", contract!((src: string, dst: string) -> nil; failure[raises])),
     ("symlink", CapabilityClass::FsWrite,         "io",      "Create a symbolic link: symlink(target, linkpath) — symlink(2), arguments in symlink(2) order (target first, the link to create second). `target` is stored verbatim and is NOT resolved or validated: a relative target resolves against the link's own directory, and creating a dangling link is legal. Raises EEXIST if linkpath already exists. Read the other way with read_link() (v0.38.0).", contract!((target: string, linkpath: string) -> nil; failure[raises])),
@@ -336,6 +338,8 @@ builtin_table! {
     ("hash_md5", CapabilityClass::Pure,        "system",  "MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
     ("hash_sha1", CapabilityClass::Pure,       "system",  "SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
     ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
+    ("password_hash", CapabilityClass::Pure,   "system",  "bcrypt-hash a password: password_hash(plaintext[, cost]) → $2b$… string; cost 4-31, default 12; input over 72 bytes raises (bcrypt's own truncation limit, surfaced instead of silently applied). For client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0)", contract!((plaintext: string, cost?: number) -> string; failure[raises])),
+    ("password_verify", CapabilityClass::Pure, "system",  "Check a plaintext password against a bcrypt hash from password_hash() (any $2a$/$2b$/$2y$ form) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0)", contract!((plaintext: string, hash: string) -> bool; failure[raises])),
     ("constant_time_eq", CapabilityClass::Pure, "system",  "Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer", contract!((a: any_of(string, bytes, buffer), b: any_of(string, bytes, buffer)) -> bool)),
     ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, \"md5\"|\"sha1\"|\"sha256\"|\"blake3\"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)", contract!((path: string, algo?: string, opts?: map) -> any_of(string, bytes); failure[raises])),
     ("uuid", CapabilityClass::Pure,            "system",  "Generate a new random UUID v4 string", contract!(() -> string)),
@@ -360,9 +364,12 @@ builtin_table! {
     ("buffer_set", CapabilityClass::Pure,      "buffer",  "Write byte (0-255) at 0-based index i, in place; errors if i is out of range — grow with buffer_push first (v0.26.0)", contract!((buf: buffer, i: number, byte: number) -> nil; effects[mutates_args])),
     ("freeze", CapabilityClass::Pure,          "buffer",  "Snapshot a buffer to a value-semantic bytes (a copy of the current content) — the bridge into write_file/hash/base64/http (v0.26.0)", contract!((buf: buffer) -> bytes)),
     ("dns_lookup", CapabilityClass::Network,      "system",  "Resolve a hostname to a list of IP address strings", contract!((host: string) -> list(string); effects[blocking]; failure[raises])),
+    ("udp_send", CapabilityClass::Network,        "system",  "Send ONE UDP datagram: udp_send(host, port, payload) -> bytes sent. Payload (string/bytes/buffer) goes out verbatim; host is resolved. Not a socket API — nothing to hold or close (v0.71.0)", contract!((host: string, port: number, payload: any_of(string, bytes, buffer)) -> number; effects[blocking]; failure[raises])),
+    ("udp_recv", CapabilityClass::Network,        "system",  "Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -> {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
     ("help", CapabilityClass::Pure,            "system",  "Show Mix builtin help in the REPL", contract!(() -> nil)),
 
-    ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer)", contract!((tmpl: string, args: ...any) -> string)),
+    ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer). For byte-exact C-printf parity (%e %g %x, flags, glibc float rounding) use sprintf()", contract!((tmpl: string, args: ...any) -> string)),
+    ("sprintf", CapabilityClass::Pure,         "format",  "C-compatible printf: sprintf(fmt, ...) → string. Conversions %d %i %u %o %x %X %f %F %e %E %g %G %s %c %%; flags - + 0 # and space; width/precision incl. *; length modifiers parsed and ignored (integer conversions are 64-bit, so a negative %u/%x prints its 64-bit two's-complement). Float output matches glibc printf byte-for-byte (fixture-tested) — for emitting numbers a C/Rust consumer compares exactly. Divergences: %s pads by codepoints and %.Ns truncates to ≤N bytes without splitting a codepoint; %c takes a Unicode scalar (v0.71.0)", contract!((tmpl: string, args: ...any) -> string; failure[raises])),
     ("printf", CapabilityClass::Pure,          "format",  "Formatted write to stdout (no trailing newline — include \\n explicitly) (v0.2.0)", contract!((tmpl: string, args: ...any) -> nil)),
     ("eprintf", CapabilityClass::Pure,         "format",  "Formatted write to stderr (v0.2.0)", contract!((tmpl: string, args: ...any) -> nil)),
     ("write_stdout", CapabilityClass::Pure,    "io",      "Write values to fd 1 AS THEY ARE — no trailing newline, no separator, flushed. bytes/buffer go out verbatim; every other value renders exactly as print() renders it. Never re-opens a path, so it works when fd 1 belongs to another user (the sieve-filter case). A failed write RAISES (catchable): IO_BROKEN_PIPE when the consumer went away, else IO_WRITE_FAILED — unlike print, which swallows it (v0.65.0)", contract!((v: any, rest: ...any) -> nil; failure[raises])),
@@ -378,6 +385,8 @@ builtin_table! {
     ("jq_all", CapabilityClass::Pure,          "json",    "Run a jq filter, collect ALL outputs as a list (the stream case). jq_all(value, filter)", contract!((v: any, filter: string) -> list)),
     ("read_json", CapabilityClass::FsRead,       "json",    "Read a single-record JSON file directly into a Mix value (v0.2.3)", contract!((path: string) -> any; failure[raises])),
     ("read_jsonl", CapabilityClass::FsRead,      "json",    "Read a JSON-lines file — list of records, strict by default, {skip_errors: true} for lenient (v0.2.3)", contract!((path: string, opts?: map) -> list; failure[raises])),
+    ("yaml_parse", CapabilityClass::Pure,      "json",    "Parse a YAML string into a Mix value (requires yaml feature; v0.71.0). Single document by default (0 docs → nil, >1 raises); pass {docs:true} for a list of every document. Anchors/aliases resolved; scalar mapping keys become string keys; a non-scalar key raises", contract!((s: string, opts?: map) -> any; failure[raises])),
+    ("yaml_encode", CapabilityClass::Pure,     "json",    "Encode a Mix value as YAML (requires yaml feature; v0.71.0). No leading --- marker, trailing newline guaranteed; whole numbers emit as integers; nil/bool/number/string/list/map only — bytes, buffer or function values raise", contract!((v: any) -> string; failure[raises])),
     ("toml_parse", CapabilityClass::Pure,      "json",    "Parse TOML string into Mix map", contract!((s: string) -> map)),
     ("toml_encode", CapabilityClass::Pure,     "json",    "Encode Mix value as TOML. Raises TOML_UNREPRESENTABLE with {path,type} details for nil, function, bytes, or buffer values instead of silently replacing them with empty strings (strict since v0.55.0)", contract!((v: any) -> string; failure[raises])),
     ("data_parse", CapabilityClass::Pure,      "json",    "Parse a strict-data `.conf.mix` string into a Mix value (inverse of data_encode) (v0.3.2)", contract!((s: string) -> any)),
@@ -555,6 +564,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "mkdir" => builtin_mkdir(args),
         "flock" => builtin_flock(args),
         "funlock" => builtin_funlock(args),
+        "fcntl_lock" => builtin_fcntl_lock(args),
+        "fcntl_unlock" => builtin_fcntl_unlock(args),
         "copy" => builtin_copy(args),
         "copy_tree" => builtin_copy_tree(args),
         "rename" => builtin_rename(args),
@@ -614,6 +625,17 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "toml_parse" => builtin_toml_parse(args),
         #[cfg(feature = "toml")]
         "toml_encode" => builtin_toml_encode(args),
+        #[cfg(feature = "yaml")]
+        "yaml_parse" => builtin_yaml_parse(args),
+        #[cfg(feature = "yaml")]
+        "yaml_encode" => builtin_yaml_encode(args),
+        // Registry lists both unconditionally; without the feature, fail
+        // loudly rather than fall through to the silent-nil catch-all.
+        #[cfg(not(feature = "yaml"))]
+        name @ ("yaml_parse" | "yaml_encode") => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{name}() requires the `yaml` feature (yaml-rust2)"),
+        }),
         #[cfg(feature = "datetime")]
         "date_format" => builtin_date_format(args),
         #[cfg(feature = "datetime")]
@@ -639,6 +661,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "format_number" => builtin_format_number(args),
         "template" => builtin_template(args),
         "fmt" => builtin_fmt(args),
+        "sprintf" => builtin_sprintf(args),
         // printf / eprintf are handled inline in the evaluator
         // (evaluator.rs FunctionCall arm) because they need access
         // to self.globals.stdout / self.globals.stderr — the test
@@ -727,6 +750,15 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "hash_sha1" => builtin_hash_sha1(args),
         #[cfg(feature = "crypto")]
         "hmac_sha256" => builtin_hmac_sha256(args),
+        #[cfg(feature = "crypto")]
+        "password_hash" => builtin_password_hash(args),
+        #[cfg(feature = "crypto")]
+        "password_verify" => builtin_password_verify(args),
+        #[cfg(not(feature = "crypto"))]
+        name @ ("password_hash" | "password_verify") => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{name}() requires the `crypto` feature (bcrypt)"),
+        }),
         #[cfg(not(feature = "crypto"))]
         "hmac_sha256" => Err(MixError::RuntimeError {
             span: None,
@@ -768,6 +800,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "buffer_set" => builtin_buffer_set(args),
         "freeze" => builtin_freeze(args),
         "dns_lookup" => builtin_dns_lookup(args),
+        "udp_send" => builtin_udp_send(args),
+        "udp_recv" => builtin_udp_recv(args),
         #[cfg(feature = "sqlite")]
         "sqlopen" => builtin_sqlopen(args),
         #[cfg(feature = "sqlite")]
@@ -10340,10 +10374,10 @@ fn flock_runtime_error(msg: impl Into<String>) -> MixError {
     }
 }
 
-fn parse_flock_options(args: &[Value]) -> MixResult<(bool, std::time::Duration)> {
+fn parse_flock_options(name: &str, args: &[Value]) -> MixResult<(bool, std::time::Duration)> {
     if args.is_empty() || args.len() > 2 {
         return Err(flock_runtime_error(format!(
-            "flock() expects 1 or 2 args, got {}",
+            "{name}() expects 1 or 2 args, got {}",
             args.len()
         )));
     }
@@ -10357,7 +10391,7 @@ fn parse_flock_options(args: &[Value]) -> MixResult<(bool, std::time::Duration)>
                 for k in m.keys() {
                     if k.as_str() != "shared" && k.as_str() != "wait" {
                         return Err(flock_runtime_error(format!(
-                            "flock(): unknown option '{k}' (supported: shared, wait)"
+                            "{name}(): unknown option '{k}' (supported: shared, wait)"
                         )));
                     }
                 }
@@ -10366,7 +10400,7 @@ fn parse_flock_options(args: &[Value]) -> MixResult<(bool, std::time::Duration)>
                         Value::Bool(b) => shared = *b,
                         other => {
                             return Err(flock_runtime_error(format!(
-                                "flock(): option 'shared' must be a boolean, got {}",
+                                "{name}(): option 'shared' must be a boolean, got {}",
                                 other.type_name()
                             )));
                         }
@@ -10377,22 +10411,22 @@ fn parse_flock_options(args: &[Value]) -> MixResult<(bool, std::time::Duration)>
                         Some(n) => n,
                         None => {
                             return Err(flock_runtime_error(format!(
-                                "flock(): option 'wait' must be a number, got {}",
+                                "{name}(): option 'wait' must be a number, got {}",
                                 v.type_name()
                             )));
                         }
                     };
                     // flock errors keep their established uniform shape.
-                    as_duration("flock(): option 'wait'", wait_seconds).map_err(|_| {
+                    as_duration(&format!("{name}(): option 'wait'"), wait_seconds).map_err(|_| {
                         flock_runtime_error(format!(
-                            "flock(): option 'wait' must be a finite non-negative number, got {wait_seconds}"
+                            "{name}(): option 'wait' must be a finite non-negative number, got {wait_seconds}"
                         ))
                     })?;
                 }
             }
             other => {
                 return Err(flock_runtime_error(format!(
-                    "flock(): options must be a map or nil, got {}",
+                    "{name}(): options must be a map or nil, got {}",
                     other.type_name()
                 )));
             }
@@ -10402,9 +10436,9 @@ fn parse_flock_options(args: &[Value]) -> MixResult<(bool, std::time::Duration)>
     // Defensive re-map: the identical value was already validated above with
     // flock's uniform error shape, so this arm is unreachable today -- the
     // map_err keeps the shape robust if the two sites are ever reordered.
-    let wait = as_duration("flock(): option 'wait'", wait_seconds).map_err(|_| {
+    let wait = as_duration(&format!("{name}(): option 'wait'"), wait_seconds).map_err(|_| {
         flock_runtime_error(format!(
-            "flock(): option 'wait' must be a finite non-negative number, got {wait_seconds}"
+            "{name}(): option 'wait' must be a finite non-negative number, got {wait_seconds}"
         ))
     })?;
     Ok((shared, wait))
@@ -10455,7 +10489,7 @@ fn try_flock_fd(
 fn builtin_flock(args: Vec<Value>) -> MixResult<Option<Value>> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let (shared, wait) = parse_flock_options(&args)?;
+    let (shared, wait) = parse_flock_options("flock", &args)?;
     let path = args[0].to_mix_string();
     let deadline = std::time::Instant::now()
         .checked_add(wait)
@@ -10576,6 +10610,192 @@ fn builtin_funlock(args: Vec<Value>) -> MixResult<Option<Value>> {
         let e = std::io::Error::last_os_error();
         return Err(flock_runtime_error(format!("funlock '{}': {}", path, e)));
     }
+    Ok(Some(Value::Bool(true)))
+}
+
+// --- POSIX record locks (fcntl_lock / fcntl_unlock, v0.71.0) ---
+//
+// The OTHER advisory-lock family. Linux keeps flock(2) locks and fcntl(2)
+// record locks entirely separate: a C daemon guarding its pidfile with
+// F_SETLKW never sees a flock() lock and vice versa, so before these
+// builtins a Mix script could not coordinate with such a program at all.
+//
+// These take OPEN-FILE-DESCRIPTION locks (F_OFD_SETLK) over the WHOLE file,
+// not traditional process-associated records, deliberately:
+//   - OFD locks conflict with other processes' traditional fcntl records —
+//     which is the entire point (interop with C/Rust daemons);
+//   - traditional records are dropped when the process closes ANY fd for
+//     that file — so a mere `read_file` of the locked path would silently
+//     release the lock. OFD locks belong to the held fd in the registry and
+//     survive unrelated open/close cycles.
+// Same registry architecture and caller contract as flock/funlock.
+
+#[derive(Default)]
+struct FcntlRegistry {
+    held: std::collections::HashMap<std::path::PathBuf, std::fs::File>,
+    acquiring: std::collections::HashSet<std::path::PathBuf>,
+}
+
+static FCNTL_REGISTRY: std::sync::LazyLock<(std::sync::Mutex<FcntlRegistry>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| {
+        (
+            std::sync::Mutex::new(FcntlRegistry::default()),
+            std::sync::Condvar::new(),
+        )
+    });
+
+/// Non-blocking whole-file OFD lock attempt with the same deadline-retry
+/// shape as [`try_flock_fd`]. A conflicting lock reports `EAGAIN` or
+/// `EACCES` (POSIX allows either); both mean "held elsewhere, retry".
+fn try_fcntl_fd(
+    file: &std::fs::File,
+    shared: bool,
+    wait: std::time::Duration,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let deadline = std::time::Instant::now().checked_add(wait).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "wait is too large")
+    })?;
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = if shared { libc::F_RDLCK } else { libc::F_WRLCK } as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    fl.l_start = 0;
+    fl.l_len = 0; // 0 = to EOF and beyond: the whole file, whatever its size
+    fl.l_pid = 0; // required 0 for OFD locks
+
+    loop {
+        // SAFETY: `file` owns a live fd for the duration of this call and
+        // `fl` is a fully-initialised struct flock on this stack frame.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &fl) } == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        let conflict = matches!(
+            err.raw_os_error(),
+            Some(libc::EAGAIN) | Some(libc::EACCES)
+        );
+        if !conflict {
+            return Err(err);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        // fcntl has a blocking form (F_OFD_SETLKW) but no timed one, and a
+        // worker blocked past the deadline could acquire a lock nobody
+        // registered — the same reasoning as try_flock_fd's retry loop.
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(std::time::Duration::from_millis(10)),
+        );
+    }
+}
+
+/// `fcntl_lock(path[, {shared, wait}])` — contract-identical to `flock`
+/// (exclusive + non-blocking default, contention `false`, real errors
+/// raise, idempotent-true per canonical path within this process), but in
+/// the fcntl record-lock namespace that C daemons actually use.
+fn builtin_fcntl_lock(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let (shared, wait) = parse_flock_options("fcntl_lock", &args)?;
+    let path = args[0].to_mix_string();
+    let deadline = std::time::Instant::now()
+        .checked_add(wait)
+        .ok_or_else(|| flock_runtime_error("fcntl_lock(): option 'wait' is too large"))?;
+
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        let registry = FCNTL_REGISTRY
+            .0
+            .lock()
+            .map_err(|_| flock_runtime_error("fcntl_lock(): lock registry is poisoned"))?;
+        if registry.held.contains_key(&canonical) {
+            return Ok(Some(Value::Bool(true)));
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .open(&path)
+        .map_err(|e| flock_runtime_error(format!("fcntl_lock '{}': {}", path, e)))?;
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| flock_runtime_error(format!("fcntl_lock '{}': {}", path, e)))?;
+
+    let (registry_mutex, changed) = &*FCNTL_REGISTRY;
+    let mut registry = registry_mutex
+        .lock()
+        .map_err(|_| flock_runtime_error("fcntl_lock(): lock registry is poisoned"))?;
+    loop {
+        if registry.held.contains_key(&canonical) {
+            return Ok(Some(Value::Bool(true)));
+        }
+        if registry.acquiring.insert(canonical.clone()) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(Some(Value::Bool(false)));
+        }
+        let (next_registry, timed_out) = changed
+            .wait_timeout(registry, remaining)
+            .map_err(|_| flock_runtime_error("fcntl_lock(): lock registry is poisoned"))?;
+        registry = next_registry;
+        if timed_out.timed_out() && !registry.held.contains_key(&canonical) {
+            return Ok(Some(Value::Bool(false)));
+        }
+    }
+    drop(registry);
+
+    let result = try_fcntl_fd(
+        &file,
+        shared,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    );
+    let mut registry = registry_mutex
+        .lock()
+        .map_err(|_| flock_runtime_error("fcntl_lock(): lock registry is poisoned"))?;
+    registry.acquiring.remove(&canonical);
+    if matches!(result, Ok(true)) {
+        registry.held.insert(canonical, file);
+    }
+    changed.notify_all();
+    drop(registry);
+    match result {
+        Ok(acquired) => Ok(Some(Value::Bool(acquired))),
+        Err(e) => Err(flock_runtime_error(format!("fcntl_lock '{}': {}", path, e))),
+    }
+}
+
+/// `fcntl_unlock(path)` — release and close this process's record lock.
+/// `true` when held, `false` when not; mirrors `funlock` exactly
+/// (including the unlinked-lock-file key recovery).
+fn builtin_fcntl_unlock(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("fcntl_unlock", &args, 1, 1)?;
+    let path = args[0].to_mix_string();
+    let Some(canonical) = canonical_path_for_funlock(std::path::Path::new(&path)) else {
+        return Ok(Some(Value::Bool(false)));
+    };
+
+    let (registry_mutex, _) = &*FCNTL_REGISTRY;
+    let file = registry_mutex
+        .lock()
+        .map_err(|_| flock_runtime_error("fcntl_unlock(): lock registry is poisoned"))?
+        .held
+        .remove(&canonical);
+    let Some(file) = file else {
+        return Ok(Some(Value::Bool(false)));
+    };
+
+    // Dropping the fd releases every OFD lock on that open file description
+    // — the kernel's own cleanup path, so no explicit F_UNLCK is needed and
+    // there is no error case to misreport.
+    drop(file);
     Ok(Some(Value::Bool(true)))
 }
 
@@ -11370,7 +11590,372 @@ fn builtin_regex_split(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::list(parts)))
 }
 
-// --- TOML builtins (feature-gated) ---
+// --- YAML (v0.71.0) ---
+//
+// The provisioned-YAML surface (Grafana alerting/dashboards/datasources,
+// Prometheus, Alloy) that deploy scripts generate, edit and gate on — a
+// deploy script that cannot parse what it deploys cannot validate it
+// either; this used to shell out to `ruby -ryaml`. Mirrors
+// json_decode/json_encode: yaml_parse(s[, {docs:true}]) and
+// yaml_encode(v). Anchors/aliases are resolved by the loader; MERGE KEYS
+// (`<<: *defaults`) are NOT — yaml-rust2 has no `<<` handling, so a merge
+// key parses as a literal "<<" entry (documented in data.md); tags are not
+// preserved.
+
+/// Nesting cap for the YAML↔Value bridges. yaml-rust2's scanner caps FLOW
+/// nesting at 255, but its event parser RECURSES on BLOCK nesting (probed:
+/// `- ` × 10,000 overflows inside load_from_str itself), and Rust's drop
+/// glue for a deep `Yaml` tree recurses per level too — hence the pre-load
+/// source guard below, this post-load cap for the recursive converters,
+/// and the iterative dismantler. serde_json guards the same shape at 128.
+#[cfg(feature = "yaml")]
+const YAML_MAX_DEPTH: usize = 256;
+
+/// Pre-LOAD source guard: yaml-rust2's event parser itself recurses on
+/// block nesting (probed 2026-09-04: a `- ` × 10,000 line overflows inside
+/// `load_from_str`, before any caller code runs; ~800 levels survive a
+/// 2 MiB debug stack, 1,600 do not), so no post-load check can catch the
+/// bomb — the input has to be refused from its TEXT. Every block nesting
+/// level costs at least one column of indentation or one `- ` group on
+/// some line, so capping the per-line structural budget
+/// (indent + 2·dash-groups ≤ 2·YAML_MAX_DEPTH = 512 chars) bounds block
+/// depth at ~½ the probed-safe level; flow nesting (`[[[[…`) is already
+/// capped at 255 by the scanner itself. Lines inside literal/folded block
+/// scalars are content, not structure — a >512-column indented line in a
+/// `|` block is refused too, which is accepted collateral for provisioning
+/// YAML (none has half-kilobyte indentation).
+#[cfg(feature = "yaml")]
+fn yaml_source_depth_guard(s: &str) -> MixResult<()> {
+    // Split on BOTH break characters: the scanner's is_break treats a lone
+    // `\r` as a line break (char_traits.rs), so a `\r`-separated dash
+    // ladder is thousands of lines to the loader while `str::lines` would
+    // have called it one. Double-counting a `\r\n` pair as an extra empty
+    // line is harmless for a budget check.
+    for line in s.split(['\r', '\n']) {
+        let rest = line.trim_start_matches(' ');
+        let indent = line.len() - rest.len();
+        let mut dashes = 0usize;
+        let mut r = rest;
+        while let Some(next) = r.strip_prefix("- ") {
+            dashes += 1;
+            r = next;
+        }
+        if r == "-" {
+            dashes += 1;
+        }
+        if indent + dashes * 2 > YAML_MAX_DEPTH * 2 {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "yaml_parse: a line's indentation/nesting exceeds the supported depth (~{YAML_MAX_DEPTH} levels)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Iterative (explicit-stack) depth check over parsed documents — run
+/// BEFORE any recursive walk, so a hostile `- - - - …` block chain can
+/// never drive `yaml_to_mix_at` (or anything else recursive) to the real
+/// stack limit.
+#[cfg(feature = "yaml")]
+fn yaml_depth_exceeds(docs: &[yaml_rust2::Yaml], cap: usize) -> bool {
+    use yaml_rust2::Yaml;
+    let mut stack: Vec<(&Yaml, usize)> = docs.iter().map(|d| (d, 0usize)).collect();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > cap {
+            return true;
+        }
+        match node {
+            Yaml::Array(items) => stack.extend(items.iter().map(|i| (i, depth + 1))),
+            Yaml::Hash(h) => {
+                for (k, v) in h {
+                    stack.push((k, depth + 1));
+                    stack.push((v, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Iteratively deconstruct a too-deep document set so its DROP never
+/// recurses: every container is drained onto a flat worklist before the
+/// node itself is dropped. Without this, merely letting a 10k-deep parsed
+/// tree fall out of scope overflows the stack in drop glue — an
+/// uncatchable abort, which is exactly what the depth cap exists to
+/// prevent.
+#[cfg(feature = "yaml")]
+fn yaml_drop_iteratively(docs: Vec<yaml_rust2::Yaml>) {
+    use yaml_rust2::Yaml;
+    let mut work: Vec<Yaml> = docs;
+    while let Some(node) = work.pop() {
+        match node {
+            Yaml::Array(items) => work.extend(items),
+            Yaml::Hash(h) => {
+                for (k, v) in h {
+                    work.push(k);
+                    work.push(v);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One parsed YAML document → Mix value.
+#[cfg(feature = "yaml")]
+fn yaml_to_mix(doc: &yaml_rust2::Yaml) -> MixResult<Value> {
+    yaml_to_mix_at(doc, 0)
+}
+
+#[cfg(feature = "yaml")]
+fn yaml_to_mix_at(doc: &yaml_rust2::Yaml, depth: usize) -> MixResult<Value> {
+    use yaml_rust2::Yaml;
+    if depth > YAML_MAX_DEPTH {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("yaml_parse: nesting deeper than {YAML_MAX_DEPTH} levels"),
+        });
+    }
+    Ok(match doc {
+        Yaml::Null => Value::Nil,
+        Yaml::Boolean(b) => Value::Bool(*b),
+        Yaml::Integer(n) => Value::Number(*n as f64),
+        Yaml::Real(s) => match s.parse::<f64>() {
+            Ok(f) => Value::Number(f),
+            // ".inf" / ".nan" spellings and anything the scanner tagged Real
+            // but Rust cannot parse keep their text rather than guessing.
+            Err(_) => Value::String(s.clone()),
+        },
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(yaml_to_mix_at(item, depth + 1)?);
+            }
+            Value::list(out)
+        }
+        Yaml::Hash(h) => {
+            let mut m = indexmap::IndexMap::new();
+            for (k, v) in h {
+                // Mix maps are string-keyed. YAML scalar keys keep their
+                // natural text; a sequence/mapping key has no Mix spelling
+                // and raises rather than being stringified into mush.
+                let key = match k {
+                    Yaml::String(s) => s.clone(),
+                    Yaml::Integer(n) => n.to_string(),
+                    Yaml::Real(s) => s.clone(),
+                    Yaml::Boolean(b) => b.to_string(),
+                    Yaml::Null => "~".to_string(),
+                    other => {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: format!(
+                                "yaml_parse: unsupported non-scalar mapping key {other:?} — Mix maps are string-keyed"
+                            ),
+                        });
+                    }
+                };
+                // The loader already raises on exact duplicates; this
+                // catches CROSS-TYPE collisions the stringification
+                // introduces (`1:` and `"1":` both become "1") — silent
+                // last-wins would hide one of two live config entries.
+                if m.insert(key.clone(), yaml_to_mix_at(v, depth + 1)?).is_some() {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "yaml_parse: mapping keys collide as the string {key:?} (e.g. `1:` vs `\"1\":`)"
+                        ),
+                    });
+                }
+            }
+            Value::map(m)
+        }
+        Yaml::Alias(_) | Yaml::BadValue => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: "yaml_parse: unresolvable alias or invalid node in document".to_string(),
+            });
+        }
+    })
+}
+
+#[cfg(feature = "yaml")]
+fn mix_to_yaml(v: &Value, path: &str) -> MixResult<yaml_rust2::Yaml> {
+    mix_to_yaml_at(v, path, 0)
+}
+
+#[cfg(feature = "yaml")]
+fn mix_to_yaml_at(v: &Value, path: &str, depth: usize) -> MixResult<yaml_rust2::Yaml> {
+    use yaml_rust2::Yaml;
+    if depth > YAML_MAX_DEPTH {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("yaml_encode: nesting deeper than {YAML_MAX_DEPTH} levels at {path}"),
+        });
+    }
+    Ok(match v {
+        Value::Nil => Yaml::Null,
+        Value::Bool(b) => Yaml::Boolean(*b),
+        Value::Number(n) => {
+            // Non-finite raises like json_encode/toml_encode: the emitter
+            // would write bare `inf`/`NaN`, which yaml_parse reads back as
+            // STRINGS — a silently type-changed round trip is worse than a
+            // refusal.
+            if !n.is_finite() {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "yaml_encode: non-finite number {n} at {path} has no YAML representation"
+                    ),
+                });
+            }
+            if n.fract() == 0.0 && n.abs() <= MAX_SAFE_INTEGER {
+                Yaml::Integer(*n as i64)
+            } else {
+                // yaml-rust2 emits Real from its string form; format like
+                // Mix prints so the round trip reads back the same number.
+                Yaml::Real(format!("{n}"))
+            }
+        }
+        Value::String(s) => Yaml::String(s.clone()),
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                out.push(mix_to_yaml_at(item, &format!("{path}[{i}]"), depth + 1)?);
+            }
+            Yaml::Array(out)
+        }
+        Value::Map(m) => {
+            let mut h = yaml_rust2::yaml::Hash::new();
+            for (k, val) in m.iter() {
+                h.insert(
+                    Yaml::String(k.clone()),
+                    mix_to_yaml_at(val, &format!("{path}.{k}"), depth + 1)?,
+                );
+            }
+            Yaml::Hash(h)
+        }
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "yaml_encode: cannot encode {} at {path}",
+                    other.type_name()
+                ),
+            });
+        }
+    })
+}
+
+/// `yaml_parse(s[, {docs: true}])` → value (or list of documents).
+#[cfg(feature = "yaml")]
+fn builtin_yaml_parse(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("yaml_parse", &args, 1, 2)?;
+    let s = args[0].to_mix_string();
+    let mut want_docs = false;
+    if let Some(opts) = args.get(1) {
+        match opts {
+            Value::Nil => {}
+            Value::Map(m) => {
+                for k in m.keys() {
+                    if k.as_str() != "docs" {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: format!("yaml_parse(): unknown option '{k}' (supported: docs)"),
+                        });
+                    }
+                }
+                if let Some(v) = m.get("docs") {
+                    match v {
+                        Value::Bool(b) => want_docs = *b,
+                        other => {
+                            return Err(MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "yaml_parse(): option 'docs' must be a boolean, got {}",
+                                    other.type_name()
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "yaml_parse(): options must be a map or nil, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+        }
+    }
+    // The loader ITSELF recurses on block nesting, so the depth bomb has
+    // to be refused from the source text, before load_from_str runs.
+    yaml_source_depth_guard(&s)?;
+    let docs = yaml_rust2::YamlLoader::load_from_str(&s).map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("yaml_parse: {e}"),
+    })?;
+    // Depth-gate BEFORE any recursive walk, and dismantle the offending
+    // tree iteratively — dropping it normally would recurse per level.
+    if yaml_depth_exceeds(&docs, YAML_MAX_DEPTH) {
+        yaml_drop_iteratively(docs);
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("yaml_parse: nesting deeper than {YAML_MAX_DEPTH} levels"),
+        });
+    }
+    if want_docs {
+        let mut out = Vec::with_capacity(docs.len());
+        for d in &docs {
+            out.push(yaml_to_mix(d)?);
+        }
+        return Ok(Some(Value::list(out)));
+    }
+    match docs.len() {
+        0 => Ok(Some(Value::Nil)),
+        1 => Ok(Some(yaml_to_mix(&docs[0])?)),
+        n => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "yaml_parse: input holds {n} documents — pass {{docs: true}} for a list of all of them"
+            ),
+        }),
+    }
+}
+
+/// `yaml_encode(v)` → YAML string (no leading `---`, trailing newline).
+#[cfg(feature = "yaml")]
+fn builtin_yaml_encode(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("yaml_encode", &args, 1)?;
+    let doc = mix_to_yaml(&args[0], "$")?;
+    let mut out = String::new();
+    {
+        let mut emitter = yaml_rust2::YamlEmitter::new(&mut out);
+        emitter.dump(&doc).map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("yaml_encode: {e}"),
+        })?;
+    }
+    // The emitter opens with a "---" document marker; provisioning files
+    // conventionally omit it, and yaml_parse accepts both. Strip it and
+    // guarantee a trailing newline so the output drops into a file as-is.
+    // (A scalar document emits as "--- 42" on one line, a collection as
+    // "---\n…" — top-level block content never starts at a space, so
+    // trimming spaces/newlines after the marker is safe for both shapes.)
+    let body = out.strip_prefix("---").unwrap_or(&out);
+    let mut body = body.trim_start_matches([' ', '\n']).to_string();
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    Ok(Some(Value::String(body)))
+}
 
 #[cfg(feature = "toml")]
 fn builtin_toml_parse(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -12262,6 +12847,423 @@ fn mix_format(name: &str, tmpl: &str, args: &[Value]) -> MixResult<String> {
     }
 
     Ok(out)
+}
+
+// --- sprintf (v0.71.0): C-compatible formatting ---
+//
+// `fmt()` is the Mix-native formatter; `sprintf()` exists for the byte-exact
+// cases — fixture generation, protocol fields, log lines diffed against a
+// C/Rust implementation. Numeric conversions are fixture-tested against
+// glibc printf output (both Rust and glibc round the exact binary value to
+// decimal with ties-to-even, which is what makes the parity hold).
+//
+// Supported: %d %i %u %o %x %X %f %F %e %E %g %G %s %c %%; flags `- + 0 #`
+// and space; width and precision including `*`; length modifiers
+// (hh h l ll L q j z t) are parsed and ignored — Mix numbers are one type,
+// and integer conversions behave as the 64-bit (`ll`) forms, so a negative
+// value under %u/%x/%o prints its 64-bit two's-complement.
+// Deliberate divergences, documented in strings.md: %s pads by codepoints
+// (not bytes) and %.Ns truncates to at most N bytes WITHOUT splitting a
+// codepoint; %c takes a Unicode scalar value.
+
+#[derive(Clone, Copy)]
+struct SprintfSpec {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    alt: bool,
+    width: usize,
+    precision: Option<usize>,
+}
+
+fn sprintf_error(msg: impl Into<String>) -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: msg.into(),
+    }
+}
+
+/// Pull the next argument or raise the uniform too-few-arguments error.
+fn sprintf_next<'a>(
+    args: &'a [Value],
+    idx: &mut usize,
+    conv: char,
+) -> MixResult<&'a Value> {
+    let v = args.get(*idx).ok_or_else(|| {
+        sprintf_error(format!(
+            "sprintf: too few arguments (format needs another for %{conv})"
+        ))
+    })?;
+    *idx += 1;
+    Ok(v)
+}
+
+fn sprintf_number(v: &Value, conv: char) -> MixResult<f64> {
+    extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+        sprintf_error(format!(
+            "sprintf: %{conv} needs a number, got {}",
+            v.type_name()
+        ))
+    })
+}
+
+fn sprintf_integer(v: &Value, conv: char) -> MixResult<i64> {
+    let n = sprintf_number(v, conv)?;
+    if !n.is_finite() || n.fract() != 0.0 || n.abs() > MAX_SAFE_INTEGER {
+        return Err(sprintf_error(format!(
+            "sprintf: %{conv} needs a whole number in -{MAX_SAFE_INTEGER}..={MAX_SAFE_INTEGER} (2^53-1, the f64 exact-integer range), got {n}"
+        )));
+    }
+    Ok(n as i64)
+}
+
+/// Apply sign/prefix, zero-padding and width to a finished digit string.
+fn sprintf_pad(spec: &SprintfSpec, sign: &str, prefix: &str, body: String) -> String {
+    let content_len = sign.chars().count() + prefix.chars().count() + body.chars().count();
+    if spec.width > content_len {
+        let pad = spec.width - content_len;
+        if spec.minus {
+            format!("{sign}{prefix}{body}{}", " ".repeat(pad))
+        } else if spec.zero {
+            // Zeros go between the sign/prefix and the digits, per C.
+            format!("{sign}{prefix}{}{body}", "0".repeat(pad))
+        } else {
+            format!("{}{sign}{prefix}{body}", " ".repeat(pad))
+        }
+    } else {
+        format!("{sign}{prefix}{body}")
+    }
+}
+
+fn sprintf_sign(spec: &SprintfSpec, negative: bool) -> &'static str {
+    if negative {
+        "-"
+    } else if spec.plus {
+        "+"
+    } else if spec.space {
+        " "
+    } else {
+        ""
+    }
+}
+
+/// inf/nan for the float conversions: glibc prints inf/nan (lowercase
+/// conversions) or INF/NAN, never zero-pads them, and honours sign flags.
+fn sprintf_nonfinite(spec: &SprintfSpec, n: f64, upper: bool) -> String {
+    let body = match (n.is_nan(), upper) {
+        (true, false) => "nan",
+        (true, true) => "NAN",
+        (false, false) => "inf",
+        (false, true) => "INF",
+    };
+    let sign = sprintf_sign(spec, n.is_sign_negative() && !n.is_nan());
+    let no_zero = SprintfSpec { zero: false, ..*spec };
+    sprintf_pad(&no_zero, sign, "", body.to_string())
+}
+
+/// %e/%E body for a non-negative finite value: "d.dddde+XX".
+fn sprintf_exp_body(abs: f64, prec: usize, alt: bool, upper: bool) -> String {
+    let s = format!("{:.*e}", prec, abs);
+    let (mant, exp) = s.split_once('e').expect("float exp format always has e");
+    let exp: i32 = exp.parse().expect("exponent is an integer");
+    let mut mant = mant.to_string();
+    if alt && prec == 0 && !mant.contains('.') {
+        mant.push('.');
+    }
+    let e = if upper { 'E' } else { 'e' };
+    format!("{mant}{e}{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+}
+
+fn sprintf_convert(
+    spec: &SprintfSpec,
+    conv: char,
+    args: &[Value],
+    idx: &mut usize,
+) -> MixResult<String> {
+    match conv {
+        'd' | 'i' => {
+            let n = sprintf_integer(sprintf_next(args, idx, conv)?, conv)?;
+            let mut body = n.unsigned_abs().to_string();
+            if let Some(p) = spec.precision {
+                if n == 0 && p == 0 {
+                    body = String::new();
+                } else if body.len() < p {
+                    body = format!("{}{body}", "0".repeat(p - body.len()));
+                }
+            }
+            let zero_ok = spec.precision.is_none();
+            let spec = SprintfSpec {
+                zero: spec.zero && zero_ok,
+                ..*spec
+            };
+            Ok(sprintf_pad(&spec, sprintf_sign(&spec, n < 0), "", body))
+        }
+        'u' | 'o' | 'x' | 'X' => {
+            let n = sprintf_integer(sprintf_next(args, idx, conv)?, conv)? as u64;
+            let mut body = match conv {
+                'u' => n.to_string(),
+                'o' => format!("{n:o}"),
+                'x' => format!("{n:x}"),
+                _ => format!("{n:X}"),
+            };
+            if let Some(p) = spec.precision {
+                if n == 0 && p == 0 {
+                    body = String::new();
+                } else if body.len() < p {
+                    body = format!("{}{body}", "0".repeat(p - body.len()));
+                }
+            }
+            let mut prefix = "";
+            if spec.alt {
+                match conv {
+                    // `#` on octal forces a leading 0 even for value 0 with
+                    // precision 0 (C11 7.21.6.1: "if the value and precision
+                    // are both 0, a single zero is printed") — glibc-probed.
+                    'o' if !body.starts_with('0') => body = format!("0{body}"),
+                    // The hex prefix, by contrast, appears only for nonzero.
+                    'x' if n != 0 => prefix = "0x",
+                    'X' if n != 0 => prefix = "0X",
+                    _ => {}
+                }
+            }
+            let zero_ok = spec.precision.is_none();
+            let spec = SprintfSpec {
+                zero: spec.zero && zero_ok,
+                ..*spec
+            };
+            Ok(sprintf_pad(&spec, "", prefix, body))
+        }
+        'f' | 'F' => {
+            let n = sprintf_number(sprintf_next(args, idx, conv)?, conv)?;
+            if !n.is_finite() {
+                return Ok(sprintf_nonfinite(spec, n, conv == 'F'));
+            }
+            let p = spec.precision.unwrap_or(6);
+            let mut body = format!("{:.*}", p, n.abs());
+            if spec.alt && p == 0 {
+                body.push('.');
+            }
+            Ok(sprintf_pad(
+                spec,
+                sprintf_sign(spec, n.is_sign_negative()),
+                "",
+                body,
+            ))
+        }
+        'e' | 'E' => {
+            let n = sprintf_number(sprintf_next(args, idx, conv)?, conv)?;
+            if !n.is_finite() {
+                return Ok(sprintf_nonfinite(spec, n, conv == 'E'));
+            }
+            let p = spec.precision.unwrap_or(6);
+            let body = sprintf_exp_body(n.abs(), p, spec.alt, conv == 'E');
+            Ok(sprintf_pad(
+                spec,
+                sprintf_sign(spec, n.is_sign_negative()),
+                "",
+                body,
+            ))
+        }
+        'g' | 'G' => {
+            let n = sprintf_number(sprintf_next(args, idx, conv)?, conv)?;
+            if !n.is_finite() {
+                return Ok(sprintf_nonfinite(spec, n, conv == 'G'));
+            }
+            let p = spec.precision.unwrap_or(6).max(1);
+            let abs = n.abs();
+            // Decimal exponent AFTER rounding to P significant digits — the
+            // C rule chooses the style from the rounded value, so 999999.5
+            // at P=6 is 1e+06, not 999999.5-as-%f.
+            let x: i32 = if abs == 0.0 {
+                0
+            } else {
+                let probe = format!("{:.*e}", p - 1, abs);
+                probe
+                    .split_once('e')
+                    .expect("float exp format always has e")
+                    .1
+                    .parse()
+                    .expect("exponent is an integer")
+            };
+            let mut body = if x >= -4 && x < p as i32 {
+                format!("{:.*}", (p as i32 - 1 - x).max(0) as usize, abs)
+            } else {
+                // alt reaches the exponent style too: %#.1g of 100 is
+                // "1.e+02" in glibc (the point survives), probed.
+                sprintf_exp_body(abs, p - 1, spec.alt, conv == 'G')
+            };
+            if !spec.alt {
+                // Strip trailing zeros (and a bare point) from the fraction —
+                // in the mantissa when an exponent is present.
+                let (mant, exp) = match body.find(['e', 'E']) {
+                    Some(i) => {
+                        let (m, e) = body.split_at(i);
+                        (m.to_string(), e.to_string())
+                    }
+                    None => (body.clone(), String::new()),
+                };
+                let mant = if mant.contains('.') {
+                    mant.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    mant
+                };
+                body = format!("{mant}{exp}");
+            } else if !body.contains('.') && !body.contains(['e', 'E']) {
+                body.push('.');
+            }
+            Ok(sprintf_pad(
+                spec,
+                sprintf_sign(spec, n.is_sign_negative()),
+                "",
+                body,
+            ))
+        }
+        's' => {
+            let s = sprintf_next(args, idx, conv)?.to_mix_string();
+            let body = match spec.precision {
+                Some(p) => {
+                    // At most p BYTES, never splitting a codepoint (glibc
+                    // counts bytes here; rounding down to a char boundary is
+                    // the divergence that keeps the result valid UTF-8).
+                    let mut end = p.min(s.len());
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    s[..end].to_string()
+                }
+                None => s,
+            };
+            let spec = SprintfSpec {
+                zero: false,
+                ..*spec
+            };
+            Ok(sprintf_pad(&spec, "", "", body))
+        }
+        'c' => {
+            let n = sprintf_integer(sprintf_next(args, idx, conv)?, conv)?;
+            let c = u32::try_from(n)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| {
+                    sprintf_error(format!(
+                        "sprintf: %c needs a Unicode scalar value, got {n}"
+                    ))
+                })?;
+            let spec = SprintfSpec {
+                zero: false,
+                ..*spec
+            };
+            Ok(sprintf_pad(&spec, "", "", c.to_string()))
+        }
+        other => Err(sprintf_error(format!(
+            "sprintf: unknown conversion %{other} (supported: d i u o x X f F e E g G s c %)"
+        ))),
+    }
+}
+
+fn sprintf_format(tmpl: &str, args: &[Value]) -> MixResult<String> {
+    let mut out = String::new();
+    let mut chars = tmpl.chars().peekable();
+    let mut idx = 0usize;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+        let mut spec = SprintfSpec {
+            minus: false,
+            plus: false,
+            space: false,
+            zero: false,
+            alt: false,
+            width: 0,
+            precision: None,
+        };
+        // Flags.
+        loop {
+            match chars.peek() {
+                Some('-') => spec.minus = true,
+                Some('+') => spec.plus = true,
+                Some(' ') => spec.space = true,
+                Some('0') => spec.zero = true,
+                Some('#') => spec.alt = true,
+                _ => break,
+            }
+            chars.next();
+        }
+        // Width (digits or *; a negative * width means left-justify, per C).
+        if chars.peek() == Some(&'*') {
+            chars.next();
+            let w = sprintf_integer(sprintf_next(args, &mut idx, '*')?, '*')?;
+            if w < 0 {
+                spec.minus = true;
+            }
+            spec.width = usize::try_from(w.unsigned_abs())
+                .map_err(|_| sprintf_error("sprintf: * width is too large"))?;
+        } else {
+            while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                spec.width = spec
+                    .width
+                    .checked_mul(10)
+                    .and_then(|w| w.checked_add(d as usize))
+                    .ok_or_else(|| sprintf_error("sprintf: width is too large"))?;
+                chars.next();
+            }
+        }
+        // Precision ("." alone = 0; ".*" negative = as if omitted, per C).
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                let p = sprintf_integer(sprintf_next(args, &mut idx, '*')?, '*')?;
+                spec.precision = if p < 0 { None } else { Some(p as usize) };
+            } else {
+                let mut p = 0usize;
+                while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                    p = p
+                        .checked_mul(10)
+                        .and_then(|p| p.checked_add(d as usize))
+                        .ok_or_else(|| sprintf_error("sprintf: precision is too large"))?;
+                    chars.next();
+                }
+                spec.precision = Some(p);
+            }
+        }
+        // Length modifiers: parsed and ignored (64-bit semantics throughout).
+        while matches!(
+            chars.peek(),
+            Some('h') | Some('l') | Some('L') | Some('q') | Some('j') | Some('z') | Some('t')
+        ) {
+            chars.next();
+        }
+        let conv = chars
+            .next()
+            .ok_or_else(|| sprintf_error("sprintf: format string ends inside a % conversion"))?;
+        out.push_str(&sprintf_convert(&spec, conv, args, &mut idx)?);
+    }
+    Ok(out)
+}
+
+fn builtin_sprintf(args: Vec<Value>) -> MixResult<Option<Value>> {
+    if args.is_empty() {
+        return Err(sprintf_error("sprintf() expects at least a format string"));
+    }
+    let tmpl = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(sprintf_error(format!(
+                "sprintf(): format must be a string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(Some(Value::String(sprintf_format(&tmpl, &args[1..])?)))
 }
 
 fn builtin_fmt(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -14528,6 +15530,108 @@ fn hash_value(name: &str, algo: DigestAlgo, args: Vec<Value>) -> MixResult<Optio
     hash_output(name, algo.digest(buf.as_ref()), args.get(1))
 }
 
+/// `password_hash(plaintext[, cost])` → bcrypt `$2b$…` string (v0.71.0).
+///
+/// The write-side primitive for account passwords set over the Bus: a raw
+/// `props.set` of `maild.accounts.password` stores the field verbatim, so
+/// the hashing has to happen client-side — which used to mean shelling out
+/// to PHP. Cost defaults to bcrypt's 12; the valid range 4-31 is validated
+/// here so the error names the bound rather than echoing the crate's.
+#[cfg(feature = "crypto")]
+fn builtin_password_hash(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("password_hash", &args, 1, 2)?;
+    let plaintext = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "password_hash(): plaintext must be a string, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+    };
+    let cost = match args.get(1) {
+        None | Some(Value::Nil) => bcrypt::DEFAULT_COST,
+        Some(v) => {
+            let n = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "password_hash(): cost must be a number, got {}",
+                        v.type_name()
+                    ),
+                }
+            })?;
+            as_exact_integer("password_hash(): cost", n, 4, 31)? as u32
+        }
+    };
+    // bcrypt truncates input at 72 bytes SILENTLY in most implementations;
+    // the crate raises instead. Surface that contract in our own words.
+    if plaintext.len() > 72 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "password_hash(): bcrypt reads at most 72 bytes of input, got {} — hash a digest of longer secrets instead",
+                plaintext.len()
+            ),
+        });
+    }
+    match bcrypt::hash(&plaintext, cost) {
+        Ok(h) => Ok(Some(Value::String(h))),
+        Err(e) => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("password_hash(): {e}"),
+        }),
+    }
+}
+
+/// `password_verify(plaintext, hash)` → bool (v0.71.0).
+///
+/// A malformed hash RAISES rather than answering `false`: a corrupt or
+/// truncated stored hash is a configuration fault, and reporting it as
+/// "wrong password" would misdirect the operator at exactly the moment the
+/// stored value needs looking at.
+#[cfg(feature = "crypto")]
+fn builtin_password_verify(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("password_verify", &args, 2)?;
+    // Strict, like the hash side: a non-string plaintext is a type fault
+    // and must raise — stringifying it would answer "wrong password" for
+    // what is actually a caller bug.
+    let plaintext = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "password_verify(): plaintext must be a string, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+    };
+    let hash = match &args[1] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "password_verify(): hash must be a string, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+    };
+    match bcrypt::verify(&plaintext, &hash) {
+        Ok(ok) => Ok(Some(Value::Bool(ok))),
+        Err(e) => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("password_verify(): invalid bcrypt hash: {e}"),
+        }),
+    }
+}
+
 /// `hmac_sha256(key, msg)` — RFC 2104 HMAC over the existing sha2 dep (no
 /// extra crate for one construction): K' = pad-or-hash key to the 64-byte
 /// block, then H((K'⊕opad) ‖ H((K'⊕ipad) ‖ msg)). Primary consumer: webhook
@@ -15505,6 +16609,172 @@ fn builtin_dns_lookup(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
+// --- UDP (v0.71.0) ---
+//
+// Mix had no UDP primitives at all; unicast SSDP NOTIFYs and similar
+// datagram jobs shelled out to `nc -u`. One datagram in, one out — this is
+// deliberately not a socket API (no handles to leak, nothing to close).
+
+/// `udp_send(host, port, payload)` → bytes sent. The payload (string,
+/// bytes, or buffer) goes out verbatim as ONE datagram.
+fn builtin_udp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("udp_send", &args, 3)?;
+    let host = args[0].to_mix_string();
+    let port = as_exact_integer("udp_send(): port", number_arg("udp_send", &args, 1)?, 1, 65535)?;
+    let payload: std::borrow::Cow<[u8]> = match &args[2] {
+        Value::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
+        Value::Buffer(b) => std::borrow::Cow::Owned(b.borrow().clone()),
+        Value::String(s) => std::borrow::Cow::Borrowed(s.as_bytes()),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "udp_send(): payload must be a string, bytes or buffer, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+    };
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("udp_send: bind: {e}"),
+        })?;
+    let sent = sock
+        .send_to(&payload, format!("{host}:{port}"))
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("udp_send '{host}:{port}': {e}"),
+        })?;
+    Ok(Some(Value::Number(sent as f64)))
+}
+
+/// `udp_recv(port[, {timeout, host, max}])` → one datagram as
+/// `{bytes, text, from_host, from_port}`, or `nil` on timeout.
+///
+/// `timeout` seconds (default 30; 0 = wait forever, like http_get's 0);
+/// `host` is the bind address (default "0.0.0.0"); `max` caps the datagram
+/// read (default 65535 — a UDP payload cannot exceed that, so the default
+/// never truncates; a datagram longer than `max` is truncated to it, which
+/// is recvfrom(2)'s own contract). `text` is the payload decoded as UTF-8,
+/// or nil when it is not valid UTF-8 (`bytes` always carries the truth).
+fn builtin_udp_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("udp_recv", &args, 1, 2)?;
+    // Port 0 would bind an ephemeral port the caller can never learn from
+    // the result map — a guaranteed silent timeout, so it is refused.
+    let port = as_exact_integer("udp_recv(): port", number_arg("udp_recv", &args, 0)?, 1, 65535)?;
+    let mut timeout_seconds = 30.0;
+    let mut bind_host = "0.0.0.0".to_string();
+    let mut max: usize = 65535;
+    if let Some(opts) = args.get(1) {
+        match opts {
+            Value::Nil => {}
+            Value::Map(m) => {
+                for k in m.keys() {
+                    if !matches!(k.as_str(), "timeout" | "host" | "max") {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: format!(
+                                "udp_recv(): unknown option '{k}' (supported: timeout, host, max)"
+                            ),
+                        });
+                    }
+                }
+                if let Some(v) = m.get("timeout") {
+                    timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                        MixError::RuntimeError {
+                            span: None,
+                            msg: format!(
+                                "udp_recv(): option 'timeout' must be a number, got {}",
+                                v.type_name()
+                            ),
+                        }
+                    })?;
+                    as_duration("udp_recv(): option 'timeout'", timeout_seconds)?;
+                }
+                if let Some(v) = m.get("host") {
+                    match v {
+                        Value::String(s) => bind_host = s.to_string(),
+                        other => {
+                            return Err(MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "udp_recv(): option 'host' must be a string, got {}",
+                                    other.type_name()
+                                ),
+                            });
+                        }
+                    }
+                }
+                if let Some(v) = m.get("max") {
+                    let n = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                        MixError::RuntimeError {
+                            span: None,
+                            msg: format!(
+                                "udp_recv(): option 'max' must be a number, got {}",
+                                v.type_name()
+                            ),
+                        }
+                    })?;
+                    max = as_exact_integer("udp_recv(): option 'max'", n, 1, 65535)? as usize;
+                }
+            }
+            other => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "udp_recv(): options must be a map or nil, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+        }
+    }
+
+    let sock = std::net::UdpSocket::bind(format!("{bind_host}:{port}")).map_err(|e| {
+        MixError::RuntimeError {
+            span: None,
+            msg: format!("udp_recv: bind '{bind_host}:{port}': {e}"),
+        }
+    })?;
+    if timeout_seconds > 0.0 {
+        sock.set_read_timeout(Some(std::time::Duration::from_secs_f64(timeout_seconds)))
+            .map_err(|e| MixError::RuntimeError {
+                span: None,
+                msg: format!("udp_recv: set timeout: {e}"),
+            })?;
+    }
+    let mut buf = vec![0u8; max];
+    match sock.recv_from(&mut buf) {
+        Ok((n, from)) => {
+            buf.truncate(n);
+            let text = match std::str::from_utf8(&buf) {
+                Ok(s) => Value::String(s.to_string()),
+                Err(_) => Value::Nil,
+            };
+            let mut m = indexmap::IndexMap::new();
+            m.insert("bytes".to_string(), Value::bytes(buf));
+            m.insert("text".to_string(), text);
+            m.insert("from_host".to_string(), Value::String(from.ip().to_string()));
+            m.insert("from_port".to_string(), Value::Number(from.port() as f64));
+            Ok(Some(Value::map(m)))
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            // Timeout is an ordinary answer for a datagram wait, not a fault.
+            Ok(Some(Value::Nil))
+        }
+        Err(e) => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("udp_recv: {e}"),
+        }),
+    }
+}
+
 // --- Help ---
 
 fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -15525,20 +16795,24 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("           cwd chdir platform which");
     println!("Process:   spawn kill process_alive");
     println!("Text:      grep line_count head tail template word_wrap markdown_escape");
-    println!("Format:    format_bytes format_number duration_format");
+    println!("Format:    format_bytes format_number duration_format fmt");
+    println!("           sprintf (C-compatible printf, glibc float parity — v0.71.0)");
     println!("Path:      basename dirname extname path_join");
     println!("Date:      date_format date_parse now_iso relative_time");
     println!(
         "Parse:     csv_parse ini_parse xml_parse toml_parse toml_encode data_parse data_encode"
     );
     println!("JSON:      json_parse json_encode jq jq_all");
+    println!("YAML:      yaml_parse yaml_encode (v0.71.0)");
     println!("Regex:     regex_match regex_find regex_replace regex_split");
     println!(
         "Crypto:    hash_blake3 hash_sha256 hmac_sha256 constant_time_eq hash_file base64_encode base64_decode uuid\n\
+         \x20          password_hash password_verify (bcrypt — v0.71.0)\n\
          \x20          hash_md5 hash_sha1 (BROKEN hashes — legacy interop only)\n\
          \x20          all hash_* take {{raw:true}} for the digest as bytes (v0.66.0)"
     );
     println!("Network:   http_get http_post http_request dns_lookup");
+    println!("           udp_send udp_recv (one datagram each way — v0.71.0)");
     println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
     println!("           bytes_ends_with bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
     println!("           (also $b[i], length, slice, `for each` — v0.64.0 — and take, drop,");
@@ -19992,6 +21266,471 @@ mod bytes_tests {
         }
     }
 
+    // --- sprintf (v0.71.0): glibc parity fixture ---
+    //
+    // Expected strings were generated by compiling and running a C program
+    // against glibc 2.4x on 2026-09-04 (the format strings verbatim,
+    // integers passed as long long / unsigned long long, floats as double).
+    // Both Rust and glibc round the exact binary value ties-to-even, which
+    // is what makes byte parity hold. Length modifiers are parsed and
+    // ignored by sprintf, so the %ll* spellings run unchanged.
+    #[test]
+    fn sprintf_glibc_integer_fixture() {
+        let n = |v: f64| Value::Number(v);
+        for (fmt, arg, want) in [
+            ("%lld", 42.0, "42"),
+            ("%lld", -42.0, "-42"),
+            ("%5lld", 42.0, "   42"),
+            ("%-5lld", -42.0, "-42  "),
+            ("%05lld", 42.0, "00042"),
+            ("%+lld", 42.0, "+42"),
+            ("% lld", 42.0, " 42"),
+            ("%.5lld", 42.0, "00042"),
+            ("%8.5lld", -42.0, "  -00042"),
+            ("%08lld", -42.0, "-0000042"),
+            ("%.0lld", 0.0, ""),
+            ("%llu", -1.0, "18446744073709551615"),
+            ("%llx", 255.0, "ff"),
+            ("%#llx", 255.0, "0xff"),
+            ("%#llX", 255.0, "0XFF"),
+            ("%#llo", 8.0, "010"),
+            ("%#llo", 0.0, "0"),
+            ("%#llx", 0.0, "0"),
+            ("%08llx", 255.0, "000000ff"),
+        ] {
+            assert_eq!(
+                sprintf_format(fmt, &[n(arg)]).unwrap(),
+                want,
+                "fmt {fmt} arg {arg}"
+            );
+        }
+    }
+
+    #[test]
+    // The pi-like literals are fixture INPUTS, fed verbatim to the C
+    // reference program — substituting f64::consts::PI would change the
+    // value the expected strings were generated from.
+    #[allow(clippy::approx_constant)]
+    fn sprintf_glibc_float_fixture() {
+        let n = |v: f64| Value::Number(v);
+        for (fmt, arg, want) in [
+            ("%f", 3.14159265358979, "3.141593"),
+            ("%.0f", 2.5, "2"),
+            ("%.0f", 3.5, "4"),
+            ("%.2f", 0.125, "0.12"),
+            ("%.2f", 0.135, "0.14"),
+            ("%f", -0.0, "-0.000000"),
+            ("%+f", 3.5, "+3.500000"),
+            ("% f", 3.5, " 3.500000"),
+            ("%10.3f", 3.14159, "     3.142"),
+            ("%-10.3f", 3.14159, "3.142     "),
+            ("%010.3f", -3.14159, "-00003.142"),
+            ("%#.0f", 3.0, "3."),
+            ("%.0f", 3.0, "3"),
+            ("%e", 12345.6789, "1.234568e+04"),
+            ("%E", 12345.6789, "1.234568E+04"),
+            ("%.2e", 0.000123456, "1.23e-04"),
+            ("%e", 0.0, "0.000000e+00"),
+            ("%.0e", 5.5, "6e+00"),
+            ("%#.0e", 5.5, "6.e+00"),
+            ("%e", 1e100, "1.000000e+100"),
+            ("%e", -2.5e-8, "-2.500000e-08"),
+            ("%12.4e", -12345.6789, " -1.2346e+04"),
+            ("%-12.2E", 12345.6789, "1.23E+04    "),
+            ("%012.4e", 12345.6789, "001.2346e+04"),
+            ("%g", 12345.6789, "12345.7"),
+            ("%g", 0.000123456, "0.000123456"),
+            ("%g", 123456789.0, "1.23457e+08"),
+            ("%g", 100.0, "100"),
+            ("%g", 0.0001, "0.0001"),
+            ("%g", 0.00001, "1e-05"),
+            ("%.3g", 999999.5, "1e+06"),
+            ("%.10g", 3.14159265358979, "3.141592654"),
+            ("%g", 0.0, "0"),
+            ("%G", 1.5e-10, "1.5E-10"),
+            ("%#g", 100.0, "100.000"),
+            ("%.0g", 5.5, "6"),
+            ("%g", 1e6, "1e+06"),
+            ("%g", 999999.0, "999999"),
+            ("%g", 9999995.0, "1e+07"),
+            // Alt-flag corners found by the GLM review arm, then probed
+            // against glibc before fixing (genfix2.c, 2026-09-04).
+            ("%#.0llo", 0.0, "0"),
+            ("%#.1g", 100.0, "1.e+02"),
+            ("%#.3g", 12345.678, "1.23e+04"),
+            ("%#.0g", 100.0, "1.e+02"),
+            ("%f", f64::INFINITY, "inf"),
+            ("%F", f64::NEG_INFINITY, "-INF"),
+            ("%e", f64::NAN, "nan"),
+            ("%+f", f64::INFINITY, "+inf"),
+            ("%08f", f64::INFINITY, "     inf"),
+            ("%10f", f64::INFINITY, "       inf"),
+        ] {
+            assert_eq!(
+                sprintf_format(fmt, &[n(arg)]).unwrap(),
+                want,
+                "fmt {fmt} arg {arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sprintf_strings_stars_and_errors() {
+        // %s pads by codepoints; %.Ns truncates to <=N bytes at a char
+        // boundary ("é" is 2 bytes, so %.3s of "héllo" keeps "hé").
+        assert_eq!(
+            sprintf_format("%8s|", &[Value::String("héllo".into())]).unwrap(),
+            "   héllo|"
+        );
+        assert_eq!(
+            sprintf_format("%.3s", &[Value::String("héllo".into())]).unwrap(),
+            "hé"
+        );
+        // * width and .* precision; a negative * width left-justifies.
+        assert_eq!(
+            sprintf_format(
+                "%*lld|",
+                &[Value::Number(6.0), Value::Number(42.0)]
+            )
+            .unwrap(),
+            "    42|"
+        );
+        assert_eq!(
+            sprintf_format(
+                "%*lld|",
+                &[Value::Number(-6.0), Value::Number(42.0)]
+            )
+            .unwrap(),
+            "42    |"
+        );
+        assert_eq!(
+            sprintf_format(
+                "%.*f",
+                &[Value::Number(2.0), Value::Number(2.5)]
+            )
+            .unwrap(),
+            "2.50"
+        );
+        // %c takes a Unicode scalar; %% is literal.
+        assert_eq!(
+            sprintf_format("%c%%", &[Value::Number(233.0)]).unwrap(),
+            "é%"
+        );
+        // Errors: unknown conversion, too few args, non-number for %d.
+        let err = sprintf_format("%y", &[]).unwrap_err();
+        assert!(format!("{err}").contains("unknown conversion"), "{err}");
+        let err = sprintf_format("%d", &[]).unwrap_err();
+        assert!(format!("{err}").contains("too few arguments"), "{err}");
+        let err = sprintf_format("%d", &[Value::String("5".into())]).unwrap_err();
+        assert!(format!("{err}").contains("needs a number"), "{err}");
+        let err = sprintf_format("%d", &[Value::Number(1.5)]).unwrap_err();
+        assert!(format!("{err}").contains("whole number"), "{err}");
+    }
+
+    // --- yaml_parse / yaml_encode (v0.71.0) ---
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parse_provisioning_shape() {
+        let src = "groups:\n  - name: memory\n    interval: 5m\n    rules:\n      - alert: pressure\n        enabled: true\n        threshold: 0.85\n";
+        let v = builtin_yaml_parse(vec![Value::String(src.into())])
+            .unwrap()
+            .unwrap();
+        let Value::Map(top) = &v else { panic!("expected map, got {v:?}") };
+        let Some(Value::List(groups)) = top.get("groups") else {
+            panic!("groups missing")
+        };
+        let Value::Map(g) = &groups[0] else { panic!() };
+        assert_eq!(g.get("name"), Some(&Value::String("memory".into())));
+        assert_eq!(g.get("interval"), Some(&Value::String("5m".into())));
+        let Some(Value::List(rules)) = g.get("rules") else { panic!() };
+        let Value::Map(r) = &rules[0] else { panic!() };
+        assert_eq!(r.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(r.get("threshold"), Some(&Value::Number(0.85)));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_round_trip_and_docs() {
+        let mut m = indexmap::IndexMap::new();
+        m.insert("name".to_string(), Value::String("x".into()));
+        m.insert("count".to_string(), Value::Number(3.0));
+        m.insert("ratio".to_string(), Value::Number(0.5));
+        m.insert("on".to_string(), Value::Bool(false));
+        m.insert(
+            "items".to_string(),
+            Value::list(vec![Value::Number(1.0), Value::String("two".into())]),
+        );
+        let orig = Value::map(m);
+        let encoded = builtin_yaml_encode(vec![orig.clone()]).unwrap().unwrap();
+        let s = match &encoded {
+            Value::String(s) => s.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(!s.starts_with("---"), "no doc marker: {s:?}");
+        assert!(s.ends_with('\n'), "trailing newline: {s:?}");
+        let back = builtin_yaml_parse(vec![Value::String(s)]).unwrap().unwrap();
+        // Value's PartialEq answers false for any two collections, so the
+        // round trip is proven by re-encoding: same value ⇒ same YAML.
+        let reencoded = builtin_yaml_encode(vec![back.clone()]).unwrap().unwrap();
+        assert_eq!(encoded, reencoded);
+        let (Value::Map(a), Value::Map(b)) = (&orig, &back) else { panic!() };
+        assert_eq!(a.len(), b.len());
+        assert_eq!(b.get("name"), Some(&Value::String("x".into())));
+        assert_eq!(b.get("count"), Some(&Value::Number(3.0)));
+        assert_eq!(b.get("ratio"), Some(&Value::Number(0.5)));
+        assert_eq!(b.get("on"), Some(&Value::Bool(false)));
+        // Multi-document input: raises by default, {docs:true} lists all.
+        let multi = "a: 1\n---\nb: 2\n";
+        let err = builtin_yaml_parse(vec![Value::String(multi.into())]).unwrap_err();
+        assert!(format!("{err}").contains("docs: true"), "{err}");
+        let mut opts = indexmap::IndexMap::new();
+        opts.insert("docs".to_string(), Value::Bool(true));
+        let v = builtin_yaml_parse(vec![Value::String(multi.into()), Value::map(opts)])
+            .unwrap()
+            .unwrap();
+        let Value::List(docs) = &v else { panic!("{v:?}") };
+        assert_eq!(docs.len(), 2);
+        // Empty input is nil; bytes value in encode raises.
+        assert_eq!(
+            builtin_yaml_parse(vec![Value::String("".into())]).unwrap(),
+            Some(Value::Nil)
+        );
+        let err = builtin_yaml_encode(vec![Value::bytes(vec![1])]).unwrap_err();
+        assert!(format!("{err}").contains("cannot encode"), "{err}");
+        // Non-finite numbers raise like json_encode/toml_encode — bare
+        // inf/NaN would round-trip back as STRINGS.
+        let err = builtin_yaml_encode(vec![Value::Number(f64::INFINITY)]).unwrap_err();
+        assert!(format!("{err}").contains("non-finite"), "{err}");
+        // Cross-type key collision (`1:` vs `"1":`) raises rather than
+        // silently last-wins after stringification.
+        let err =
+            builtin_yaml_parse(vec![Value::String("1: a\n\"1\": b\n".into())]).unwrap_err();
+        assert!(format!("{err}").contains("collide"), "{err}");
+    }
+
+    /// The depth cap must produce a CATCHABLE raise for both nesting
+    /// styles — and the process must survive dropping the deep tree
+    /// (drop glue recurses per level; yaml_drop_iteratively is what
+    /// keeps a 10k-deep block chain from aborting in the destructor).
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_depth_cap_is_catchable_for_both_styles() {
+        // Block style: "- - - - … x" — the LOADER recurses on this (no cap
+        // of its own), so the refusal must come from the pre-load source
+        // guard, before load_from_str ever sees the input.
+        let deep_block = format!("{}x", "- ".repeat(10_000));
+        let err = builtin_yaml_parse(vec![Value::String(deep_block)]).unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds the supported depth"),
+            "{err}"
+        );
+        // Indentation-driven nesting hits the same guard.
+        let deep_indent = format!("{}k: 1", " ".repeat(4000));
+        let err = builtin_yaml_parse(vec![Value::String(deep_indent)]).unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds the supported depth"),
+            "{err}"
+        );
+        // Lone-\r line breaks: the scanner treats a bare CR as a break, so
+        // a CR-separated indent ladder must be refused too — str::lines
+        // would have seen it as ONE line (the re-review's catch).
+        let cr_ladder: String = (0..2000)
+            .map(|i| format!("{}- ", " ".repeat(i)))
+            .collect::<Vec<_>>()
+            .join("\r")
+            + "x";
+        let err = builtin_yaml_parse(vec![Value::String(cr_ladder)]).unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds the supported depth"),
+            "{err}"
+        );
+        // Flow style: the yaml-rust2 scanner caps flow_level itself.
+        let deep_flow = format!("{}{}", "[".repeat(300), "]".repeat(300));
+        let err = builtin_yaml_parse(vec![Value::String(deep_flow)]).unwrap_err();
+        assert!(
+            format!("{err}").contains("yaml_parse"),
+            "flow depth must error, not abort: {err}"
+        );
+        // Depth just under the cap parses fine.
+        let ok_block = format!("{}x", "- ".repeat(200));
+        assert!(builtin_yaml_parse(vec![Value::String(ok_block)]).is_ok());
+    }
+
+    // --- password_hash / password_verify (v0.71.0) ---
+
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn password_hash_and_verify_round_trip() {
+        // Cost 4 (the bcrypt minimum) keeps the test fast; the default 12
+        // is a release-binary concern, not a unit-test one.
+        let hashed = builtin_password_hash(vec![
+            Value::String("s3cret".into()),
+            Value::Number(4.0),
+        ])
+        .unwrap()
+        .unwrap();
+        let h = match &hashed {
+            Value::String(h) => h.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(h.starts_with("$2"), "bcrypt marker: {h}");
+        assert_eq!(
+            builtin_password_verify(vec![Value::String("s3cret".into()), Value::String(h.clone())])
+                .unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            builtin_password_verify(vec![Value::String("wrong".into()), Value::String(h)])
+                .unwrap(),
+            Some(Value::Bool(false))
+        );
+        // A malformed hash raises — never "wrong password".
+        let err = builtin_password_verify(vec![
+            Value::String("x".into()),
+            Value::String("not-a-hash".into()),
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("invalid bcrypt hash"), "{err}");
+        // Cost bounds are named; >72-byte input is refused, not truncated.
+        let err = builtin_password_hash(vec![Value::String("x".into()), Value::Number(3.0)])
+            .unwrap_err();
+        assert!(format!("{err}").contains("4..=31"), "{err}");
+        let err = builtin_password_hash(vec![Value::String("x".repeat(73))]).unwrap_err();
+        assert!(format!("{err}").contains("72 bytes"), "{err}");
+    }
+
+    // --- fcntl_lock / fcntl_unlock (v0.71.0) ---
+
+    #[test]
+    fn fcntl_lock_contract_and_interop() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("mix-fcntl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let p = || Value::String(path.to_string_lossy().to_string());
+
+        assert_eq!(builtin_fcntl_lock(vec![p()]).unwrap(), Some(Value::Bool(true)));
+        // Idempotent within the process.
+        assert_eq!(builtin_fcntl_lock(vec![p()]).unwrap(), Some(Value::Bool(true)));
+
+        // The lock must be visible in the fcntl record-lock namespace: a
+        // traditional F_GETLK probe from a separate open sees a write lock.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = libc::F_WRLCK as libc::c_short;
+        fl.l_whence = libc::SEEK_SET as libc::c_short;
+        assert_eq!(
+            unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETLK, &mut fl) },
+            0
+        );
+        assert_ne!(
+            fl.l_type as i32,
+            libc::F_UNLCK,
+            "OFD lock invisible to a traditional F_GETLK probe"
+        );
+        // fcntl(2): F_GETLK reports l_pid == -1 for a conflicting OFD lock
+        // — pinning it documents the OFD/traditional interplay this test
+        // exists for.
+        assert_eq!(fl.l_pid, -1, "OFD conflicts report l_pid -1");
+
+        // Opening and closing the path elsewhere must NOT drop it (the OFD
+        // property this builtin exists for) — probe again after the probe fd
+        // above is joined by a plain read-open/close cycle.
+        drop(std::fs::File::open(&path).unwrap());
+        let mut fl2: libc::flock = unsafe { std::mem::zeroed() };
+        fl2.l_type = libc::F_WRLCK as libc::c_short;
+        fl2.l_whence = libc::SEEK_SET as libc::c_short;
+        assert_eq!(
+            unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETLK, &mut fl2) },
+            0
+        );
+        assert_ne!(fl2.l_type as i32, libc::F_UNLCK, "lock lost after open/close");
+
+        assert_eq!(
+            builtin_fcntl_unlock(vec![p()]).unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            builtin_fcntl_unlock(vec![p()]).unwrap(),
+            Some(Value::Bool(false))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- udp_send / udp_recv (v0.71.0) ---
+
+    #[test]
+    fn udp_loopback_and_timeout() {
+        // Find a free port, release it, and race to rebind — acceptable in
+        // a test; the datagram goes over loopback only.
+        let port = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap().port()
+        };
+        // Value is Rc-based (not Send), so the sender thread builds its own
+        // argument Values from Copy/'static inputs. It RETRIES for the whole
+        // window: under a parallel workspace test run the receiver may bind
+        // arbitrarily late, and a datagram sent before the bind is silently
+        // dropped — one timed send is a flake, a resend loop is not. The
+        // receiver reads exactly one datagram; extras evaporate with the
+        // socket.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_tx = stop.clone();
+        let sender = std::thread::spawn(move || {
+            let mut first: Option<usize> = None;
+            for _ in 0..100 {
+                if stop_tx.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let sent = builtin_udp_send(vec![
+                    Value::String("127.0.0.1".into()),
+                    Value::Number(port as f64),
+                    Value::String("ping-π".into()),
+                ]);
+                match sent {
+                    Ok(Some(Value::Number(n))) => first.get_or_insert(n as usize),
+                    other => return Err(format!("{other:?}")),
+                };
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            first.ok_or_else(|| "sender never ran".to_string())
+        });
+        let mut opts = indexmap::IndexMap::new();
+        opts.insert("timeout".to_string(), Value::Number(5.0));
+        opts.insert("host".to_string(), Value::String("127.0.0.1".into()));
+        let got = builtin_udp_recv(vec![Value::Number(port as f64), Value::map(opts)])
+            .unwrap()
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sent = sender.join().unwrap().unwrap();
+        assert_eq!(sent, "ping-π".len());
+        let Value::Map(m) = &got else { panic!("{got:?}") };
+        assert_eq!(m.get("text"), Some(&Value::String("ping-π".into())));
+        assert_eq!(m.get("from_host"), Some(&Value::String("127.0.0.1".into())));
+        match m.get("bytes") {
+            Some(Value::Bytes(b)) => assert_eq!(b.as_slice(), "ping-π".as_bytes()),
+            other => panic!("{other:?}"),
+        }
+
+        // Timeout returns nil, not an error.
+        let port2 = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap().port()
+        };
+        let mut opts = indexmap::IndexMap::new();
+        opts.insert("timeout".to_string(), Value::Number(0.1));
+        opts.insert("host".to_string(), Value::String("127.0.0.1".into()));
+        assert_eq!(
+            builtin_udp_recv(vec![Value::Number(port2 as f64), Value::map(opts)]).unwrap(),
+            Some(Value::Nil)
+        );
+    }
+
     /// One representative pin for io.md's "anything else still refuses bytes
     /// with a clean error" sentence — a future sort-bytes arm must edit the
     /// doc, not silently falsify it.
@@ -21270,6 +23009,8 @@ mod char_aware_tests {
             "now_iso",
             "parse_form",
             "parse_query",
+            "password_hash",
+            "password_verify",
             "path_join",
             "path_parts",
             "pop",
@@ -21314,6 +23055,7 @@ mod char_aware_tests {
             "slice",
             "sort",
             "split",
+            "sprintf",
             "sql_quote",
             "starts_with",
             "string_to_bytes",
@@ -21342,6 +23084,8 @@ mod char_aware_tests {
             "write_stderr",
             "write_stdout",
             "xml_parse",
+            "yaml_encode",
+            "yaml_parse",
             "zip",
             // Math (v0.19.0) — pure f64 numerics, no host authority.
             "abs",
