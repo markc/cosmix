@@ -451,7 +451,7 @@ function app_icon_relatives($icon_root, $declared, $require_declared)
       fail("icon asset must be a regular file, not a symlink: " .. $source)
     end
     $relative = substr($source, length($icon_root) + 1)
-    if not regex_match("^(scalable|[0-9]+x[0-9]+)/(apps|status)/[A-Za-z0-9._-]+\\.(svg|png)$", $relative) then
+    if not re_match($relative, "^(scalable|[0-9]+x[0-9]+)/(apps|status)/[A-Za-z0-9._-]+\\.(svg|png)$") then
       fail("unsupported hicolor icon path: " .. $source)
     end
     -- Subsumes the old square-size check: a non-square size directory is never

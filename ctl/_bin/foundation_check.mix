@@ -104,10 +104,10 @@ end
 for each $path in $HANDLERS
   $src = read_file($path)
   $uses_datatable = contains($src, "dt_admin_opts(")
-  if len(regex_find("dt_opts *\\(", $src)) > 0 then
+  if len(re_find($src, "dt_opts *\\(")) > 0 then
     $uses_datatable = true
   end
-  if len(regex_find("dt_render *\\(", $src)) > 0 then
+  if len(re_find($src, "dt_render *\\(")) > 0 then
     $uses_datatable = true
   end
   $base = basename($path)
@@ -121,7 +121,7 @@ end
 
 -- Tree-wide browser-confirm sweep, including unregistered handlers.
 for each $path in $ALLMIX
-  if len(regex_find("onsubmit=.return confirm", read_file($path))) > 0 then
+  if len(re_find(read_file($path), "onsubmit=.return confirm")) > 0 then
     probe_fail($path,
       "raw browser confirm() — use data-confirm (shell dialog gate)")
     $fail = $fail + 1

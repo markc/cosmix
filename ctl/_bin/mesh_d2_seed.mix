@@ -366,7 +366,7 @@ for each $node in $nodes
     $d.die_if($gid["exit_code"] != 0,
       $node .. " has no cosmix-noded group")
     $fields = split(trim($gid["stdout"]), ":")
-    $d.die_if(len($fields) < 3 or not regex_match("^[0-9]+$", $fields[2]),
+    $d.die_if(len($fields) < 3 or not re_match($fields[2], "^[0-9]+$"),
       $node .. " returned an unparseable cosmix-noded group record")
     $GIDS[$node] = $fields[2]
     $BEFORE[$node] = current_local_hash($DEST)
@@ -385,7 +385,7 @@ for each $node in $nodes
     $REMOTE[$node] = $remote
     $probe = ssh_mix($remote, '
 $gid_text = trim(run("id -g cosmix-noded"))
-if $rc != 0 or not regex_match("^[0-9]+$", $gid_text) then
+if $rc != 0 or not re_match($gid_text, "^[0-9]+$") then
   eprint("cosmix-noded group is absent or unparseable")
   exit(7)
 end
@@ -496,7 +496,7 @@ if not is_file($staged) or hash_file($staged, "sha256") != $expected then
   fail("transferred seed is not byte-identical to the secrets DB snapshot", 9)
 end
 $gid_text = trim(run("id -g cosmix-noded"))
-if $rc != 0 or not regex_match("^[0-9]+$", $gid_text) then
+if $rc != 0 or not re_match($gid_text, "^[0-9]+$") then
   fail("cosmix-noded group disappeared after preflight", 10)
 end
 mkdir(dirname($dest), {parents: true})

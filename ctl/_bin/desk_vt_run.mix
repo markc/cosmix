@@ -46,10 +46,10 @@ catch $error
   exit(2)
 end
 
-if not regex_match("^[0-9]+$", $CONF["vt"]) then
+if not re_match($CONF["vt"], "^[0-9]+$") then
   config_error("desk_vt_run.vt must contain decimal digits only")
 end
-if not regex_match("^[0-9]+$", $CONF["restore_vt_fallback"]) then
+if not re_match($CONF["restore_vt_fallback"], "^[0-9]+$") then
   config_error("desk_vt_run.restore_vt_fallback must contain decimal digits only")
 end
 
@@ -67,11 +67,11 @@ $STYLES = ["mac", "win11", "cosmix", "none"]
 $SCALES = ["1.0", "2.5"]
 
 for each $path in [$LOGDIR, $DEVICE, $LOCK]
-  if not starts_with($path, "/") or not regex_match("^[A-Za-z0-9/._-]+$", $path) then
+  if not starts_with($path, "/") or not re_match($path, "^[A-Za-z0-9/._-]+$") then
     config_error("paths must be absolute and contain only [A-Za-z0-9/._-]: " .. $path)
   end
 end
-if not regex_match("^[A-Za-z0-9/._:-]+$", $DATASET) then
+if not re_match($DATASET, "^[A-Za-z0-9/._:-]+$") then
   config_error("desk_vt_run.dataset contains unsupported characters")
 end
 
@@ -136,7 +136,7 @@ end
 if not contains($SCALES, $scale) then
   usage("scale must be 1.0 or 2.5, got: " .. $scale)
 end
-if not regex_match("^[A-Za-z0-9/._-]+$", $LOGDIR) then
+if not re_match($LOGDIR, "^[A-Za-z0-9/._-]+$") then
   usage("DESK_VT_LOG_DIR contains characters outside [A-Za-z0-9/._-]: " .. $LOGDIR)
 end
 
@@ -195,7 +195,7 @@ $d.die_if(not contains($probe["stdout"], "PGREP_RC=1"),
   "could not prove that no compositor is running inside " .. $CT)
 
 $restore_vt = trim(must_run(["fgconsole"]))
-$d.die_if(not regex_match("^[0-9]+$", $restore_vt),
+$d.die_if(not re_match($restore_vt, "^[0-9]+$"),
   "fgconsole returned '" .. $restore_vt .. "' — cannot record a VT to restore")
 if $restore_vt == $VT then
   print("  NOTE: display is already on tty" .. $VT .. "; using configured fallback tty" ..
@@ -414,7 +414,7 @@ try
   else
     $count = 0
     for each $line in split(read_file($log), "\n")
-      if contains($line, " ERROR ") or regex_match("panicked|[Dd]evice ?[Ll]ost", $line) then
+      if contains($line, " ERROR ") or re_match($line, "panicked|[Dd]evice ?[Ll]ost") then
         $count = $count + 1
       end
     end

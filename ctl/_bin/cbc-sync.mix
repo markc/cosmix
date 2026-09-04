@@ -47,12 +47,12 @@ $REPOSITORY_URL = $CONF["repository_url"]
 -- These values are concatenated only inside remote run() calls. Restrict them
 -- to shell-inert absolute-path and credential-free HTTPS URL grammars before
 -- any SSH connection or remote filesystem mutation.
-if not regex_match("^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$", $CHECKOUT) or contains($CHECKOUT, "..") or contains($CHECKOUT, "/./") then
+if not re_match($CHECKOUT, "^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$") or contains($CHECKOUT, "..") or contains($CHECKOUT, "/./") then
   print("  ERROR: " .. $CONF_PATH ..
     ": cbc_sync.worker_checkout must be an absolute shell-inert path without '..'")
   exit(2)
 end
-if not regex_match("^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)+[.]git$", $REPOSITORY_URL) then
+if not re_match($REPOSITORY_URL, "^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)+[.]git$") then
   print("  ERROR: " .. $CONF_PATH ..
     ": cbc_sync.repository_url must be a credential-free HTTPS .git URL")
   exit(2)
@@ -106,7 +106,7 @@ $head = run_argv(["git", "-C", $SOURCE, "rev-parse", "HEAD"], {timeout: 60})
 $d.die_if($head["exit_code"] != 0,
   "cannot read the CosMix HEAD at " .. $SOURCE .. ": " .. trim($head["stderr"]))
 $PIN = trim($head["stdout"])
-$d.die_if(not regex_match("^[0-9a-f]{40}([0-9a-f]{24})?$", $PIN),
+$d.die_if(not re_match($PIN, "^[0-9a-f]{40}([0-9a-f]{24})?$"),
   "local Git HEAD is not a full 40- or 64-hex object id: " .. $PIN)
 print("pin cosmix = " .. slice($PIN, 0, 12))
 

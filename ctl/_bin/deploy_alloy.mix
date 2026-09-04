@@ -45,7 +45,7 @@ end
 validate_url("mesh_loki_push_url", $CONF["mesh_loki_push_url"], true)
 validate_url("foreign_loki_push_url", $CONF["foreign_loki_push_url"], true)
 validate_url("loki_query_url", $CONF["loki_query_url"], false)
-$LOKI_QUERY = regex_replace("/+$", $CONF["loki_query_url"], "")
+$LOKI_QUERY = re_replace($CONF["loki_query_url"], "/+$", "")
 
 $ROSTER = $d.roster()
 $parsed = $d.parse_nodes($ROSTER, args(), ["--config-only", "--allow-downgrade"])
@@ -113,9 +113,9 @@ $LOCAL_SEMVER = ""
 -- presentation detail, then leave ordering and downgrade policy to deploy_lib.
 fn alloy_semver($line)
   for each $token in split(trim($line), " ")
-    $candidate = regex_replace("^[^0-9]*", $token, "")
-    $candidate = regex_replace("[^0-9.].*$", $candidate, "")
-    if regex_match("^[0-9]+([.][0-9]+)+$", $candidate) then
+    $candidate = re_replace($token, "^[^0-9]*", "")
+    $candidate = re_replace($candidate, "[^0-9.].*$", "")
+    if re_match($candidate, "^[0-9]+([.][0-9]+)+$") then
       return $candidate
     end
   end

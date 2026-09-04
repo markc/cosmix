@@ -65,8 +65,8 @@ fn assert_fqdn($fqdn)
     conf_error("fqdn must contain at least two labels")
   end
   for each $label in $labels
-    $one = regex_match("^[a-z0-9]$", $label)
-    $many = regex_match("^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$", $label)
+    $one = re_match($label, "^[a-z0-9]$")
+    $many = re_match($label, "^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$")
     if not $one and not $many then
       conf_error("fqdn contains an invalid DNS label: '" .. $label .. "'")
     end
@@ -172,7 +172,7 @@ if length($group_parts) != 4 or $group_parts[0] != "cosmix-webd" then
   raise("group cosmix-webd is unavailable")
 end
 $gid_text = $group_parts[2]
-if not regex_match("^[0-9]+$", $gid_text) then
+if not re_match($gid_text, "^[0-9]+$") then
   raise("group cosmix-webd returned a non-numeric gid")
 end
 print(data_encode({reach: "reach-ok", uid: $root["uid"], gid: to_number($gid_text)}))', {

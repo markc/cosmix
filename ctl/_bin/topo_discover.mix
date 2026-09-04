@@ -54,7 +54,7 @@ for each $glob_char in ["*", "?", "["]
     config_error("topo_discover.ssh_hosts_dir must not contain glob metacharacters")
   end
 end
-if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $CONF["hub_wg_iface"]) then
+if not re_match($CONF["hub_wg_iface"], "^[A-Za-z0-9][A-Za-z0-9_.-]*$") then
   config_error("has an unsafe topo_discover.hub_wg_iface")
 end
 if type($CONF["networks"]) != "list" or len($CONF["networks"]) == 0 then

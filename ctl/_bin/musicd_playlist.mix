@@ -66,7 +66,7 @@ end
 $PLAYLIST = $CONF["playlist"]
 for each $song in $PLAYLIST
   $slug = $song["slug"]
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $slug) then
+  if not re_match($slug, "^[A-Za-z0-9][A-Za-z0-9._-]*$") then
     print("  ERROR: " .. $CONF_PATH .. ": playlist slug '" .. $slug ..
       "' must contain only letters, digits, dot, underscore, or hyphen")
     exit(2)

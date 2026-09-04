@@ -65,7 +65,7 @@ $CAP = 33554432
 -- `rev-list` on a bad object; the same literal gated the unknown-destination
 -- fallback. Match the shape, not one hash function's width.
 fn is_null_oid($sha)
-  return $sha != "" and regex_match("^0+$", $sha)
+  return $sha != "" and re_match($sha, "^0+$")
 end
 
 fn refuse($code, $msg)

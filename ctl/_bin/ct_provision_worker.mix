@@ -98,14 +98,14 @@ fn safe_path($key, $path)
       config_error($key .. " must not contain . or .. components")
     end
   end
-  if not regex_match("^/[A-Za-z0-9._/-]+$", $path) then
+  if not re_match($path, "^/[A-Za-z0-9._/-]+$") then
     config_error($key .. " contains an unsafe path character")
   end
   return $path
 end
 
 fn safe_token($key, $value)
-  if not regex_match("^[A-Za-z0-9_.,:=@%+/-]+$", $value) then
+  if not re_match($value, "^[A-Za-z0-9_.,:=@%+/-]+$") then
     config_error($key .. " contains a character unsafe for a remote command token")
   end
   return $value
@@ -115,7 +115,7 @@ fn valid_ipv4($address)
   $parts = split($address, ".")
   if len($parts) != 4 then return false end
   for each $part in $parts
-    if not regex_match("^[0-9]{1,3}$", $part) then return false end
+    if not re_match($part, "^[0-9]{1,3}$") then return false end
     $octet = to_number($part)
     if $octet < 0 or $octet > 255 or ("" .. $octet) != $part then
       return false
@@ -125,9 +125,7 @@ fn valid_ipv4($address)
 end
 
 fn valid_domain($domain)
-  return len($domain) <= 245 and regex_match(
-    "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
-    $domain)
+  return len($domain) <= 245 and re_match($domain, "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 end
 
 if not starts_with($CONF["default_base_url"], "http://") and not starts_with($CONF["default_base_url"], "https://") then
@@ -138,7 +136,7 @@ if contains($CONF["default_base_url"], "\n") or contains($CONF["default_base_url
 end
 for each $key in ["default_relid", "preseed_node_min_relid"]
   $value = $CONF[$key]
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $value) or contains($value, "..") then
+  if not re_match($value, "^[A-Za-z0-9][A-Za-z0-9._-]*$") or contains($value, "..") then
     config_error($key .. " must be a slug without '..'")
   end
 end
@@ -170,7 +168,7 @@ for each $domain in $CONF["allowed_domains"]
   end
 end
 for each $range in $CONF["provision_ip_pool"]
-  $bad_prefix = not regex_match("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.$", $range["prefix"])
+  $bad_prefix = not re_match($range["prefix"], "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.$")
   $bad_prefix = $bad_prefix or not valid_ipv4($range["prefix"] .. "0")
   if $bad_prefix then
     config_error("provision_ip_pool prefix must be a canonical IPv4 /24 prefix")
@@ -183,7 +181,7 @@ end
 $ROSTER = $d.roster()
 $seen_pve = []
 for each $host in $CONF["pve_hosts"]
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $host) then
+  if not re_match($host, "^[A-Za-z0-9][A-Za-z0-9_.-]*$") then
     config_error("PVE host is not a safe roster/SSH name: " .. $host)
   end
   if has_item($seen_pve, $host) then
@@ -195,7 +193,7 @@ for each $host in $CONF["pve_hosts"]
     config_error("PVE host '" .. $host .. "' must be foreign in the fleet roster")
   end
 end
-if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $CONF["dns_node"]) then
+if not re_match($CONF["dns_node"], "^[A-Za-z0-9][A-Za-z0-9_.-]*$") then
   config_error("dns_node is not a safe roster/SSH name")
 end
 $d.assert_node($ROSTER, $CONF["dns_node"])
@@ -231,7 +229,7 @@ end
 $RELID = env("CT_RELID")
 if $RELID == "" then $RELID = $CONF["default_relid"] end
 if $g["opts"]["relid"] != nil then $RELID = "" .. $g["opts"]["relid"] end
-if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $RELID) or contains($RELID, "..") then
+if not re_match($RELID, "^[A-Za-z0-9][A-Za-z0-9._-]*$") or contains($RELID, "..") then
   print("--relid/CT_RELID must be a slug without '..': '" .. $RELID .. "'")
   exit(2)
 end
@@ -325,7 +323,7 @@ $FQDN = ""
 fn remote_exec($host, $argv, $timeout)
   return ssh_mix($host, '
 for each $arg in $argv
-  if not regex_match("^[A-Za-z0-9_./,:=@%+~-]+$", $arg) then
+  if not re_match($arg, "^[A-Za-z0-9_./,:=@%+~-]+$") then
     eprint("unsafe remote command token refused")
     exit(125)
   end
@@ -433,7 +431,7 @@ fn remote_write($host, $dest, $bytes, $mode_text, $mode_value, $owner, $group,
     $step)
   $result = ssh_mix($host, '
 for each $token in [$dest, $mode_text, $owner, $group]
-  if not regex_match("^[A-Za-z0-9_./:-]+$", $token) then
+  if not re_match($token, "^[A-Za-z0-9_./:-]+$") then
     eprint("unsafe remote-write token refused")
     exit(125)
   end
@@ -469,7 +467,7 @@ print("write-ok")
 end
 
 fn shortname($mac)
-  if not regex_match("^[0-9A-Fa-f:]{17}$", $mac) then
+  if not re_match($mac, "^[0-9A-Fa-f:]{17}$") then
     fail_job("cloning", "bad MAC shape: '" .. $mac .. "'")
   end
   $hex = replace(lower($mac), ":", "")
@@ -558,7 +556,7 @@ fn ip_is_allowed($address)
   for each $range in $CONF["provision_ip_pool"]
     if starts_with($address, $range["prefix"]) then
       $suffix = substr($address, len($range["prefix"]), len($address))
-      if regex_match("^[0-9]{1,3}$", $suffix) then
+      if re_match($suffix, "^[0-9]{1,3}$") then
         $octet = to_number($suffix)
         if ("" .. $octet) == $suffix and $octet >= $range["first"] and $octet <= $range["last"] then
           return true
@@ -588,8 +586,7 @@ if $NODE_NAME != "" and $RELID < $CONF["preseed_node_min_relid"] then
     " because explicit names require release >= " ..
     $CONF["preseed_node_min_relid"] .. ". Got: '" .. $NODE_NAME .. "'")
 end
-if $NODE_NAME != "" and not regex_match(
-    "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", $NODE_NAME) then
+if $NODE_NAME != "" and not re_match($NODE_NAME, "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$") then
   fail_job("cloning", "node_name is not a DNS label: '" .. $NODE_NAME .. "'")
 end
 if $NODE_NAME != "" and len($NODE_NAME .. "." .. $DOMAIN) > 253 then
@@ -708,7 +705,7 @@ for each $host in $CONF["pve_hosts"]
       $scan_heartbeat = time() + $HEARTBEAT_SECS
     end
     $candidate_vmid = split(trim($line), " ")[0]
-    if regex_match("^[0-9]+$", $candidate_vmid) then
+    if re_match($candidate_vmid, "^[0-9]+$") then
       $candidate = remote_exec($host,
         ["pct", "config", $candidate_vmid], 15)
       if not $candidate["ok"] then
@@ -730,7 +727,7 @@ end
 
 $VMID = remote_must($PVE_REMOTE,
   ["pvesh", "get", "/cluster/nextid"], "cloning", 30)
-if not regex_match("^[0-9]+$", $VMID) then
+if not re_match($VMID, "^[0-9]+$") then
   fail_job("cloning", "pvesh nextid returned an invalid VMID: '" .. $VMID .. "'")
 end
 remote_must($PVE_REMOTE, [
@@ -812,11 +809,11 @@ fn fail($message)
 end
 
 for each $path in [$dropin, $main_config, $conf_dir, $lease_file]
-  if not regex_match("^/[A-Za-z0-9._/-]+$", $path) then
+  if not re_match($path, "^/[A-Za-z0-9._/-]+$") then
     fail("unsafe configured dnsmasq path")
   end
 end
-if not regex_match("^[A-Za-z0-9_.@-]+$", $service) then
+if not re_match($service, "^[A-Za-z0-9_.@-]+$") then
   fail("unsafe configured dnsmasq service")
 end
 

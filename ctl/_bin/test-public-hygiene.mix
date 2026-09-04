@@ -134,7 +134,7 @@ fn static_fixture($cfg, $wanted, $branch)
     $pick = $branch < len($branches) ? $branch : 0
     $sample = $branches[$pick]
     $sample = replace($sample, "[.]", ".")
-    if $sample != "" and regex_match($rule["pattern"], $sample) then
+    if $sample != "" and re_match($sample, $rule["pattern"]) then
       return {id: $rule["id"], pattern: $rule["pattern"], sample: $sample}
     end
   end
@@ -996,7 +996,7 @@ $g = gate(["--tree", $r, "--print-fingerprints"])
 $f = $f + ok("T5a  binary content is a violation", $g["code"] == 1, $g["out"])
 $fps5 = fingerprints($g["out"])
 $f = $f + ok("T5b  --print-fingerprints gives the fixture's independent sha256",
-  len($fps5) == 1 and regex_match("^[0-9a-f]{64}$", $fps5[0])
+  len($fps5) == 1 and re_match($fps5[0], "^[0-9a-f]{64}$")
     and $fps5[0] == $sha5
     and contains($g["out"],
       "sha256 of full contents (verify: sha256sum " .. $blob5 .. ")"),
@@ -1497,7 +1497,7 @@ for each $s in $statics
   $line = "x " .. sample_from_pattern($s["pattern"]) .. " x"
   -- Self-check the extractor: a sample that does not match the rule it was
   -- derived from would make this probe assert nothing at all.
-  if regex_match("(?i)" .. $s["pattern"], $line) == false then
+  if re_match($line, "(?i)" .. $s["pattern"]) == false then
     push($badsample, $s["id"])
   end
   push($corpus, $line)

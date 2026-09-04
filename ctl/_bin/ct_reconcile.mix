@@ -73,7 +73,7 @@ fn valid_ipv4($address)
     return false
   end
   for each $part in $parts
-    if not regex_match("^[0-9]{1,3}$", $part) then
+    if not re_match($part, "^[0-9]{1,3}$") then
       return false
     end
     $octet = to_number($part)
@@ -251,7 +251,7 @@ fn find_cts($job_id)
     end
     for each $line in split($listed["stdout"], "\n")
       $vmid = split(trim($line), " ")[0]
-      if regex_match("^[0-9]+$", $vmid) then
+      if re_match($vmid, "^[0-9]+$") then
         if time() > $DEADLINE then
           return {uncertain: true, host: "deadline", hits: []}
         end

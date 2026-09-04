@@ -62,7 +62,7 @@ fn require_safe_path($key, $path)
       config_error("'" .. $key .. "' must not contain . or .. components")
     end
   end
-  if not regex_match("^/[A-Za-z0-9._/-]+$", $path) then
+  if not re_match($path, "^/[A-Za-z0-9._/-]+$") then
     config_error("'" .. $key .. "' contains an unsafe path character")
   end
   return $path
@@ -83,17 +83,17 @@ fn worker_config($name)
 end
 
 for each $worker in $WORKERS
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $worker["name"]) then
+  if not re_match($worker["name"], "^[A-Za-z0-9][A-Za-z0-9_.-]*$") then
     config_error("worker name '" .. $worker["name"] .. "' is not safe")
   end
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._@:-]*$", $worker["ssh_host"]) then
+  if not re_match($worker["ssh_host"], "^[A-Za-z0-9][A-Za-z0-9._@:-]*$") then
     config_error("workers." .. $worker["name"] .. ".ssh_host is not a safe SSH alias or address")
   end
   $_worker = worker_config($worker["name"])
 end
 
 $RUST_VERSION = $CONF["rust_version"]
-if not regex_match("^[0-9]+[.][0-9]+[.][0-9]+$", $RUST_VERSION) then
+if not re_match($RUST_VERSION, "^[0-9]+[.][0-9]+[.][0-9]+$") then
   config_error("'rust_version' must be a three-part dotted version")
 end
 $CACHE_DIR = require_safe_path("cache_dir", $CONF["cache_dir"])
@@ -102,13 +102,13 @@ $BUILD_DIR = require_safe_path("build_dir", $CONF["build_dir"])
 $GIT_BRANCH = $CONF["git_default_branch"]
 $GIT_NAME = $CONF["git_user_name"]
 $GIT_EMAIL = $CONF["git_user_email"]
-if not regex_match("^[A-Za-z0-9._/-]+$", $GIT_BRANCH) then
+if not re_match($GIT_BRANCH, "^[A-Za-z0-9._/-]+$") then
   config_error("'git_default_branch' contains an unsafe character")
 end
-if not regex_match("^[A-Za-z0-9 ._-]+$", $GIT_NAME) then
+if not re_match($GIT_NAME, "^[A-Za-z0-9 ._-]+$") then
   config_error("'git_user_name' contains an unsafe character")
 end
-if not regex_match("^[A-Za-z0-9._+@-]+$", $GIT_EMAIL) then
+if not re_match($GIT_EMAIL, "^[A-Za-z0-9._+@-]+$") then
   config_error("'git_user_email' contains an unsafe character")
 end
 

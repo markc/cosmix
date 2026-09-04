@@ -73,7 +73,7 @@ end
 
 for each $repo in $CONF["repositories"]
   $name = $repo["name"]
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $name) then
+  if not re_match($name, "^[A-Za-z0-9][A-Za-z0-9._-]*$") then
     config_error("repository name '" .. $name .. "' is not a safe home-directory basename")
   end
   find_repo($CONF["repositories"], $name)

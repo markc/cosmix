@@ -58,13 +58,13 @@ for each $client in $CLIENTS
   $binary = $client["binary"]
   $unit = $client["unit"]
   $service = $client["service"]
-  if not regex_match("^cosmix-[a-z0-9-]+$", $binary) then
+  if not re_match($binary, "^cosmix-[a-z0-9-]+$") then
     config_error($CONF_PATH .. " has invalid client binary: " .. $binary)
   end
-  if not regex_match("^cosmix-[a-z0-9-]+$", $unit) then
+  if not re_match($unit, "^cosmix-[a-z0-9-]+$") then
     config_error($CONF_PATH .. " has invalid client unit: " .. $unit)
   end
-  if not regex_match("^[a-z0-9-]+$", $service) then
+  if not re_match($service, "^[a-z0-9-]+$") then
     config_error($CONF_PATH .. " has invalid registered service: " .. $service)
   end
   if $binary == "cosmix-noded" or $unit == "cosmix-noded" or $service == "noded" then

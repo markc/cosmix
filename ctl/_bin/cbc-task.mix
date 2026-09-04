@@ -74,7 +74,7 @@ fn worker_config($name)
 end
 
 for each $worker in $CONF["workers"]
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.@:-]*$", $worker["ssh_host"]) then
+  if not re_match($worker["ssh_host"], "^[A-Za-z0-9][A-Za-z0-9_.@:-]*$") then
     config_error("workers." .. $worker["name"] .. ".ssh_host is not a safe SSH host or alias")
   end
   validate_absolute("workers." .. $worker["name"] .. ".source_root", $worker["source_root"])
@@ -163,7 +163,7 @@ $td = ""
 $slot = 0
 if $action != "slots" then
   $task = need_opt($g["opts"], "task")
-  if not regex_match("^[0-9]+$", $task) then
+  if not re_match($task, "^[0-9]+$") then
     print("task id must be a non-negative integer")
     exit(2)
   end
@@ -174,7 +174,7 @@ end
 $commit = ""
 if $action == "prepare" then
   $commit = need_opt($g["opts"], "commit")
-  if not regex_match("^[0-9a-f]{40}([0-9a-f]{24})?$", $commit) then
+  if not re_match($commit, "^[0-9a-f]{40}([0-9a-f]{24})?$") then
     print("commit must be a full 40- or 64-hex Git object id")
     exit(2)
   end

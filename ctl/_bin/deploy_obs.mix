@@ -390,7 +390,7 @@ $active = run("systemctl is-active cosmix-grafana.service")
 $active_rc = $rc
 $after = trim(run("systemctl show cosmix-grafana.service -p InvocationID --value"))
 $after_rc = $rc
-$safe_id = regex_match("^[0-9a-f]+$", $after)
+$safe_id = re_match($after, "^[0-9a-f]+$")
 $logs = ""
 $logs_rc = 1
 if $safe_id then

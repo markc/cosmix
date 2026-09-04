@@ -282,7 +282,7 @@ if len($argv) > 0 and $argv[0] == "--discard-proposal" then
     exit(2)
   end
   $discard = $argv[1]
-  if not regex_match("^[0-9a-f]{64}$", $discard) then
+  if not re_match($discard, "^[0-9a-f]{64}$") then
     print("  ERROR: --discard-proposal requires exactly 64 lowercase hexadecimal characters")
     exit(2)
   end

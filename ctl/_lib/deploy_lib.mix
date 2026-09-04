@@ -160,8 +160,8 @@ fn ver_tuple($s)
   $v = ""
   for each $tok in split(trim($s), " ")
     -- a leading v ("alloy v1.2.3") is tolerated
-    if $v == "" and regex_match("^v?[0-9]+([.][0-9]+)+$", $tok) then
-      $v = regex_replace("^v", $tok, "")
+    if $v == "" and re_match($tok, "^v?[0-9]+([.][0-9]+)+$") then
+      $v = re_replace($tok, "^v", "")
     end
   end
   if $v == "" then

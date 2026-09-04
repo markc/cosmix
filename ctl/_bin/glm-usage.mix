@@ -115,7 +115,7 @@ if type($CFG.reset_units) != "map" or len(keys($CFG.reset_units)) == 0 then
     config_error($CONF_PATH .. " needs a non-empty glm_usage.reset_units map")
 end
 for each $unit in keys($CFG.reset_units)
-    if not regex_match("^[0-9]+$", $unit) or type($CFG.reset_units[$unit]) != "string" or trim($CFG.reset_units[$unit]) == "" then
+    if not re_match($unit, "^[0-9]+$") or type($CFG.reset_units[$unit]) != "string" or trim($CFG.reset_units[$unit]) == "" then
         config_error($CONF_PATH .. " glm_usage.reset_units needs numeric-string keys and non-empty string values")
     end
 end

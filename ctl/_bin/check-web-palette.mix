@@ -319,13 +319,13 @@ function exact_set($got, $want)
 end
 
 function norm_selector($s)
-    return trim(regex_replace("\\s+", $s, " "))
+    return trim(re_replace($s, "\\s+", " "))
 end
 
 -- Opaque OKLCH means exactly three components and a closing parenthesis. Alpha,
 -- a fourth component, or any trailing text makes this parser return nil.
 function parse_oklch($value)
-    $m = regex_find("^oklch\\(\\s*([0-9.]+)%\\s+([0-9.]+)\\s+([0-9.]+)\\s*\\)$", trim($value))
+    $m = re_find(trim($value), "^oklch\\(\\s*([0-9.]+)%\\s+([0-9.]+)\\s+([0-9.]+)\\s*\\)$")
     if length($m) != 1 then
         return nil
     end
@@ -342,7 +342,7 @@ end
 -- Glow is the one explicitly alpha-bearing family. It has its own fully anchored
 -- grammar rather than weakening parse_oklch's opaque contract.
 function parse_oklch_alpha($value)
-    $m = regex_find("^oklch\\(\\s*([0-9.]+)%\\s+([0-9.]+)\\s+([0-9.]+)\\s*/\\s*([0-9.]+)\\s*\\)$", trim($value))
+    $m = re_find(trim($value), "^oklch\\(\\s*([0-9.]+)%\\s+([0-9.]+)\\s+([0-9.]+)\\s*/\\s*([0-9.]+)\\s*\\)$")
     if length($m) != 1 then
         return nil
     end
@@ -537,12 +537,12 @@ end
 -- ------------------------------------------------- ctk side (the oracle)
 
 function enum_variants($src, $name)
-    $blocks = regex_find("pub enum " .. $name .. "\\s*\\{([^}]*)\\}", $src)
+    $blocks = re_find($src, "pub enum " .. $name .. "\\s*\\{([^}]*)\\}")
     if length($blocks) != 1 then
         return nil
     end
     $out = []
-    $hits = regex_find("(?m)^\\s*([A-Z][A-Za-z0-9_]*)\\s*,\\s*$", $blocks[0].groups[0])
+    $hits = re_find($blocks[0].groups[0], "(?m)^\\s*([A-Z][A-Za-z0-9_]*)\\s*,\\s*$")
     for each $variant_hit in $hits
         push($out, $variant_hit.groups[0])
     end
@@ -565,8 +565,8 @@ function parse_ctk($path)
     if count_text($src, $ok_helper) != 1 then
         stop_gate("ok() helper changed or is unparseable; literal Oklch passthrough is required")
     end
-    $ok_functions = regex_find("(?m)^\\s*(?:const\\s+)?fn\\s+ok\\s*\\(", $src)
-    $ok_bindings = regex_find("(?m)^\\s*(?:(?:let|static|const)\\s+(?:mut\\s+)?ok\\b|use\\s+[^;\\n]*\\bok\\b)", $src)
+    $ok_functions = re_find($src, "(?m)^\\s*(?:const\\s+)?fn\\s+ok\\s*\\(")
+    $ok_bindings = re_find($src, "(?m)^\\s*(?:(?:let|static|const)\\s+(?:mut\\s+)?ok\\b|use\\s+[^;\\n]*\\bok\\b)")
     if length($ok_functions) != 1 or length($ok_bindings) != 0 then
         stop_gate("ok() is shadowed or redefined; oracle calls cannot be proven to use the pinned helper")
     end
@@ -580,7 +580,7 @@ function parse_ctk($path)
         stop_gate("Mode enum changed or is unparseable; expected " .. join($MODE_RUST, ", "))
     end
 
-    $role_blocks = regex_find("struct Roles\\s*\\{([^}]*)\\}", $src)
+    $role_blocks = re_find($src, "struct Roles\\s*\\{([^}]*)\\}")
     if length($role_blocks) != 1 then
         stop_gate("expected exactly one struct Roles field list")
     end
@@ -588,7 +588,7 @@ function parse_ctk($path)
     for each $role_line_raw in split($role_blocks[0].groups[0], "\n")
         $role_line = trim($role_line_raw)
         if $role_line != "" then
-            $role_line_hit = regex_find("^(?:pub(?:\\([^)]*\\))?\\s+)?(\\w+)\\s*:\\s*Oklch\\s*,\\s*$", $role_line)
+            $role_line_hit = re_find($role_line, "^(?:pub(?:\\([^)]*\\))?\\s+)?(\\w+)\\s*:\\s*Oklch\\s*,\\s*$")
             if length($role_line_hit) != 1 then
                 stop_gate("unparseable struct Roles field line '" .. $role_line .. "'")
             end
@@ -628,11 +628,11 @@ function parse_ctk($path)
     end
     $web_src = substr($src, $web_start - 1, $status_start - $web_start)
 
-    $all_role_arms = regex_find("=>\\s*Roles\\s*\\{", $web_src)
-    $all_web_arms = regex_find("=>", $web_src)
-    $all_role_constructors = regex_find("\\bRoles\\s*\\{", $web_src)
-    $web_ok_calls = regex_find("\\bok\\b", $web_src)
-    $guarded_role_arms = regex_find("(?m)^\\s*\\([^\\n]*\\)\\s+if\\s+[^\\n]*=>\\s*Roles\\s*\\{", $web_src)
+    $all_role_arms = re_find($web_src, "=>\\s*Roles\\s*\\{")
+    $all_web_arms = re_find($web_src, "=>")
+    $all_role_constructors = re_find($web_src, "\\bRoles\\s*\\{")
+    $web_ok_calls = re_find($web_src, "\\bok\\b")
+    $guarded_role_arms = re_find($web_src, "(?m)^\\s*\\([^\\n]*\\)\\s+if\\s+[^\\n]*=>\\s*Roles\\s*\\{")
     if length($guarded_role_arms) > 0 then
         stop_gate("web_roles contains a guarded Roles arm; executable precedence cannot be inferred")
     end
@@ -641,7 +641,7 @@ function parse_ctk($path)
     end
 
     $out = {}
-    $arms = regex_find("\\((\\w+), (\\w+)\\) => Roles \\{([^}]*)\\}", $web_src)
+    $arms = re_find($web_src, "\\((\\w+), (\\w+)\\) => Roles \\{([^}]*)\\}")
     for each $role_arm in $arms
         $arm_groups = $role_arm.groups
         if not contains($SCHEME_RUST, $arm_groups[0]) then
@@ -655,7 +655,7 @@ function parse_ctk($path)
             stop_gate("web_roles contains duplicate arm " .. $key)
         end
         $fields = {}
-        $field_hits = regex_find("(\\w+)\\s*:\\s*ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\)", $arm_groups[2])
+        $field_hits = re_find($arm_groups[2], "(\\w+)\\s*:\\s*ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\)")
         for each $field_hit in $field_hits
             $field_groups = $field_hit.groups
             if not contains($role_fields, $field_groups[0]) then
@@ -696,11 +696,11 @@ function parse_ctk($path)
         stop_gate("status() function boundary is unparseable")
     end
     $status_src = substr($src, $status_start - 1, $after_status - $status_start)
-    if length(regex_find("=>", $status_src)) > 2 or length(regex_find("\\bok\\b", $status_src)) > $EXPECTED_STATUS_OK_CALLS then
+    if length(re_find($status_src, "=>")) > 2 or length(re_find($status_src, "\\bok\\b")) > $EXPECTED_STATUS_OK_CALLS then
         stop_gate("status() contains executable structure outside the two literal tuple arms")
     end
     $st = {}
-    $status_arms = regex_find("Mode::(\\w+) => \\(ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\), ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\), ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\)\\)", $status_src)
+    $status_arms = re_find($status_src, "Mode::(\\w+) => \\(ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\), ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\), ok\\(\\s*([0-9.]+),\\s*([0-9.]+),\\s*([0-9.]+)\\s*\\)\\)")
     for each $status_arm in $status_arms
         $status_groups = $status_arm.groups
         if not contains($MODE_RUST, $status_groups[0]) then
@@ -809,9 +809,9 @@ function parse_site($path)
                             $property = trim(substr($piece, 0, $colon - 1))
                             $value = trim(substr($piece, $colon))
                             if starts_with($property, "--") then
-                                $important_hit = regex_find("(?i)\\s*!important\\s*$", $value)
+                                $important_hit = re_find($value, "(?i)\\s*!important\\s*$")
                                 $important = length($important_hit) == 1
-                                if $important then $value = trim(regex_replace("(?i)\\s*!important\\s*$", $value, "")) end
+                                if $important then $value = trim(re_replace($value, "(?i)\\s*!important\\s*$", "")) end
                                 if length($stack) == 0 then
                                     if is_watched($property) then return { declarations: $declarations, fatal: "watched declaration outside any CSS block" } end
                                 else
@@ -860,7 +860,7 @@ function media_condition($declaration)
     for each $context_frame in $declaration.context
         if starts_with($context_frame.prelude, "@media") then
             if $condition != "" then return "<nested-media>" end
-            $condition = trim(regex_replace("\\s+", substr($context_frame.prelude, 6), " "))
+            $condition = trim(re_replace(substr($context_frame.prelude, 6), "\\s+", " "))
         end
     end
     return $condition
@@ -923,7 +923,7 @@ end
 
 function data_scheme_values($text)
     $out = []
-    $attribute_hits = regex_find("(?i)\\bdata-scheme\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", $text)
+    $attribute_hits = re_find($text, "(?i)\\bdata-scheme\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))")
     for each $attribute_hit in $attribute_hits
         $attribute_value = $attribute_hit.groups[0]
         if $attribute_value == "" then $attribute_value = $attribute_hit.groups[1] end
@@ -958,10 +958,10 @@ function check_site($name, $path, $ctk)
     $layer_groups = {}
 
     for each $selector_block in $parsed.blocks
-        if length(regex_find("data-card-scheme\\s*=", $selector_block.sel)) > 0 then
+        if length(re_find($selector_block.sel, "data-card-scheme\\s*=")) > 0 then
             $service_surface_seen = true
-            $known_light_row = regex_find("^\\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$", $selector_block.sel)
-            $known_dark_row = regex_find("^html\\.dark \\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$", $selector_block.sel)
+            $known_light_row = re_find($selector_block.sel, "^\\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$")
+            $known_dark_row = re_find($selector_block.sel, "^html\\.dark \\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$")
             if length($known_light_row) != 1 and length($known_dark_row) != 1 then
                 push($problems, { kind: "service-card-selector", ctx: "-", sel: $selector_block.sel, detail: "unrecognised service-card palette row" })
             else
@@ -1020,8 +1020,8 @@ function check_site($name, $path, $ctk)
                         if $site_decl.sel == ".service-card[data-card-scheme]" then
                             push($known_service_consumer, $site_decl)
                         else
-                            $light_row = regex_find("^\\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$", $site_decl.sel)
-                            $dark_row = regex_find("^html\\.dark \\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$", $site_decl.sel)
+                            $light_row = re_find($site_decl.sel, "^\\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$")
+                            $dark_row = re_find($site_decl.sel, "^html\\.dark \\.service-card\\[data-card-scheme=\"([a-z]+)\"\\]$")
                             if length($light_row) == 1 or length($dark_row) == 1 then
                                 $row_scheme = length($light_row) == 1 ? $light_row[0].groups[0] : $dark_row[0].groups[0]
                                 $row_mode = length($light_row) == 1 ? "light" : "dark"
@@ -1313,7 +1313,7 @@ function check_swatches($name, $path, $ctk)
     $compared = 0
     $found = {}
     $button_scheme_count = 0
-    for each $button_hit in regex_find("(?s)<button\\b([^>]*)>(.*?)</button>", $src)
+    for each $button_hit in re_find($src, "(?s)<button\\b([^>]*)>(.*?)</button>")
         $button_attrs = $button_hit.groups[0]
         $button_body = $button_hit.groups[1]
         $scheme_attrs = data_scheme_values($button_attrs)
@@ -1329,17 +1329,17 @@ function check_swatches($name, $path, $ctk)
             else
                 $found[$scheme] = get_or($found, $scheme, 0) + 1
                 $dot_tags = []
-                for each $span_tag in regex_find("<span\\b[^>]*>", $button_body)
-                    $span_class = regex_find("\\bclass=\"([^\"]*)\"", $span_tag.match)
-                    if length($span_class) == 1 and contains(split(regex_replace("\\s+", trim($span_class[0].groups[0]), " "), " "), "scheme-dot") then
+                for each $span_tag in re_find($button_body, "<span\\b[^>]*>")
+                    $span_class = re_find($span_tag.match, "\\bclass=\"([^\"]*)\"")
+                    if length($span_class) == 1 and contains(split(re_replace(trim($span_class[0].groups[0]), "\\s+", " "), " "), "scheme-dot") then
                         push($dot_tags, $span_tag)
                     end
                 end
                 $got = nil
                 if length($dot_tags) == 1 then
-                    $dot_style = regex_find("\\bstyle=\"([^\"]*)\"", $dot_tags[0].match)
+                    $dot_style = re_find($dot_tags[0].match, "\\bstyle=\"([^\"]*)\"")
                     if length($dot_style) == 1 then
-                        $dot_backgrounds = regex_find("(?:^|;)\\s*background\\s*:\\s*([^;]+)", $dot_style[0].groups[0])
+                        $dot_backgrounds = re_find($dot_style[0].groups[0], "(?:^|;)\\s*background\\s*:\\s*([^;]+)")
                         if length($dot_backgrounds) == 1 then
                             $got = parse_oklch(trim($dot_backgrounds[0].groups[0]))
                         end

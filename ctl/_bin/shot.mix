@@ -47,8 +47,8 @@ while $i < len($argv)
           usage_error("--size needs WxH")
         end
         $parts = split($argv[$i], "x")
-        if (len($parts) != 2 or not regex_match("^[0-9]+$", $parts[0]) or
-            not regex_match("^[0-9]+$", $parts[1])) then
+        if (len($parts) != 2 or not re_match($parts[0], "^[0-9]+$") or
+            not re_match($parts[1], "^[0-9]+$")) then
           usage_error("invalid --size '" .. $argv[$i] .. "' (expected WxH)")
         end
         $width = $parts[0]

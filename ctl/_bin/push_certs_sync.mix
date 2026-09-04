@@ -44,7 +44,7 @@ end
 -- A word that is safe to hand to a plain-sh host unquoted: no whitespace,
 -- no shell metacharacters. Everything that reaches an "sh" target passes it.
 fn plain_word($key, $s)
-  if not regex_match("^[A-Za-z0-9_./:@%+-]+$", $s) then
+  if not re_match($s, "^[A-Za-z0-9_./:@%+-]+$") then
     config_error($key .. " must be a plain word (got " .. $s .. ")")
   end
   return $s

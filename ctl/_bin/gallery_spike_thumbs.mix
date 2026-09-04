@@ -27,7 +27,7 @@ end
 
 $LIMIT = 0
 if len($cli) == 2 then
-  if not regex_match("^[0-9]+$", $cli[1]) then
+  if not re_match($cli[1], "^[0-9]+$") then
     print("  ERROR: limit must be a non-negative integer (0 means all)")
     exit(2)
   end

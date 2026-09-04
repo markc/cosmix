@@ -44,7 +44,7 @@ fn config_error($message)
 end
 
 fn is_numeric_version($version)
-  return regex_match("^[0-9]+([.][0-9]+)+$", $version)
+  return re_match($version, "^[0-9]+([.][0-9]+)+$")
 end
 
 if not starts_with($CONF["config_file"], "/") then

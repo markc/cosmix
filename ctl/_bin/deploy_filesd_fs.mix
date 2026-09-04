@@ -79,7 +79,7 @@ fn fs_path_ok($path)
   if not starts_with($path, "/") or $path == "/" or contains($path, "..") then
     return false
   end
-  return regex_match("^/[A-Za-z0-9/_.-]+$", $path)
+  return re_match($path, "^/[A-Za-z0-9/_.-]+$")
 end
 
 fn field_text_ok($value)
@@ -91,17 +91,17 @@ fn pattern_ok($pattern)
     return false
   end
   for each $segment in split($pattern, "/")
-    if $segment == "" or $segment == "." or $segment == ".." or not regex_match("^[A-Za-z0-9._*-]+$", $segment) then
+    if $segment == "" or $segment == "." or $segment == ".." or not re_match($segment, "^[A-Za-z0-9._*-]+$") then
       return false
     end
   end
   return true
 end
 
-if not regex_match("^[a-z_][a-z0-9_-]*$", $CONF["service_user"]) then
+if not re_match($CONF["service_user"], "^[a-z_][a-z0-9_-]*$") then
   config_error("service_user is not a safe system account name")
 end
-if not regex_match("^[a-z_][a-z0-9_-]*$", $CONF["service_group"]) then
+if not re_match($CONF["service_group"], "^[a-z_][a-z0-9_-]*$") then
   config_error("service_group is not a safe system group name")
 end
 if not fs_path_ok($CONF["service_home"]) then
@@ -112,11 +112,11 @@ if not fs_path_ok($CONF["working_directory"]) then
 end
 
 $FS = $CONF["fs_config"]
-if not regex_match("^[a-z][a-z0-9-]{1,30}$", $FS["bus_service"]) then
+if not re_match($FS["bus_service"], "^[a-z][a-z0-9-]{1,30}$") then
   config_error("fs_config.bus_service is not a valid Bus service name")
 end
 for each $peer in $FS["delegated_peers"]
-  if not regex_match("^[a-z][a-z0-9-]{1,30}$", $peer) then
+  if not re_match($peer, "^[a-z][a-z0-9-]{1,30}$") then
     config_error("invalid delegated peer: " .. $peer)
   end
 end
@@ -128,7 +128,7 @@ $rw = []
 $ro = []
 $place_ids = []
 for each $place in $FS["places"]
-  if not regex_match("^[A-Za-z0-9_.-]+$", $place["id"]) then
+  if not re_match($place["id"], "^[A-Za-z0-9_.-]+$") then
     config_error("invalid place id: " .. $place["id"])
   end
   if contains_item($place_ids, $place["id"]) then
@@ -138,10 +138,10 @@ for each $place in $FS["places"]
   if not field_text_ok($place["label"]) then
     config_error("place label contains a forbidden separator or newline: " .. $place["id"])
   end
-  if not regex_match("^[A-Za-z0-9_.-]+$", $place["group"]) then
+  if not re_match($place["group"], "^[A-Za-z0-9_.-]+$") then
     config_error("invalid place group: " .. $place["id"])
   end
-  if not regex_match("^[A-Za-z0-9_.-]+$", $place["icon"]) then
+  if not re_match($place["icon"], "^[A-Za-z0-9_.-]+$") then
     config_error("invalid place icon: " .. $place["id"])
   end
   if not fs_path_ok($place["root"]) then

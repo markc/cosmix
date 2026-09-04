@@ -65,7 +65,7 @@ fn assert_unique($items, $field)
 end
 
 $DEPLOY_VERSION = $CONF["deploy_version"]
-if not regex_match("^[0-9]+([.][0-9]+)+$", $DEPLOY_VERSION) then
+if not re_match($DEPLOY_VERSION, "^[0-9]+([.][0-9]+)+$") then
   config_error("deploy_version must be dotted numeric, for example 1.0.0")
 end
 assert_unique($CONF["target_nodes"], "target")
@@ -253,7 +253,7 @@ fn deploy_node($node)
 if is_file($marker) then
   $lines = read_lines($marker)
   if len($lines) < 2 or trim($lines[0]) == "" or
-      not regex_match("^[0-9]+([.][0-9]+)+$", trim($lines[0])) then
+      not re_match(trim($lines[0]), "^[0-9]+([.][0-9]+)+$") then
     eprint("installed shared-tree marker is malformed")
     exit(7)
   end
@@ -348,7 +348,7 @@ if $rc != 0 then
 end
 $group = trim(run("/usr/bin/getent group cosmix-webd"))
 $parts = split($group, ":")
-if $rc != 0 or len($parts) < 3 or not regex_match("^[0-9]+$", $parts[2]) then
+if $rc != 0 or len($parts) < 3 or not re_match($parts[2], "^[0-9]+$") then
   eprint("could not resolve cosmix-webd gid")
   exit(10)
 end

@@ -222,7 +222,7 @@ $resolved = run_argv([
 $d.die_if($resolved["exit_code"] != 0,
   "cannot resolve commit '" .. $requested_commit .. "' in " .. $LOCAL_ROOT .. ": " .. trim($resolved["stderr"]))
 $commit = trim($resolved["stdout"])
-$d.die_if(not regex_match("^[0-9a-fA-F]{40,64}$", $commit),
+$d.die_if(not re_match($commit, "^[0-9a-fA-F]{40,64}$"),
   "local git returned an invalid full commit id: " .. $commit)
 print("commit: " .. slice($commit, 0, 12) .. " (" .. $repo_name .. ")")
 

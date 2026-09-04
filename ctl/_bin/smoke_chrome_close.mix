@@ -113,10 +113,10 @@ end
 if not starts_with($DEVICE, "/dev/dri/") then
   config_error("smoke_chrome_close.drm_device must be an absolute /dev/dri path")
 end
-if not regex_match("^[A-Za-z0-9_.-]+$", $CONNECTOR) then
+if not re_match($CONNECTOR, "^[A-Za-z0-9_.-]+$") then
   config_error("smoke_chrome_close.drm_connector contains unsafe characters")
 end
-if not regex_match("^[A-Za-z0-9_.-]+$", $WAYLAND_SOCKET) then
+if not re_match($WAYLAND_SOCKET, "^[A-Za-z0-9_.-]+$") then
   config_error("smoke_chrome_close.wayland_socket contains unsafe characters")
 end
 assert_unique_strings($STYLES, "smoke_chrome_close.styles")
@@ -197,7 +197,7 @@ end
 -- Tracing colourises field names and equals signs, so strip ANSI before
 -- matching. Add a newline so a cleanly written final field can be anchored.
 fn log_text($path)
-  return regex_replace("\u{1b}\\[[0-9;]*m", read_file($path), "") .. "\n"
+  return re_replace(read_file($path), "\u{1b}\\[[0-9;]*m", "") .. "\n"
 end
 
 -- pos is needle-first. Keeping the wrapper prevents a reversed call from

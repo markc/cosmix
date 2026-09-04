@@ -21,7 +21,7 @@ fn conf_error($path, $message)
 end
 
 fn valid_email($value)
-  return regex_match("^[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+$", $value)
+  return re_match($value, "^[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+$")
 end
 
 -- Refuse before loading private state or making any network connection.

@@ -208,7 +208,7 @@ if not contains(["start", "status", "logs", "wait", "clean"], $action) then
 end
 $worker = need_opt($g["opts"], "worker")
 $job = need_opt($g["opts"], "job")
-if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $job) then
+if not re_match($job, "^[A-Za-z0-9][A-Za-z0-9_.-]*$") then
   print("invalid --job: use letters, digits, dot, underscore or hyphen")
   exit(2)
 end
@@ -233,14 +233,14 @@ end
 
 -- Resolve and validate every local/config input before contacting the worker.
 $repo = get_or($g["opts"], "repo", $CONF["default_repo"])
-if not regex_match("^[A-Za-z0-9._-]+$", $repo) then
+if not re_match($repo, "^[A-Za-z0-9._-]+$") then
   print("invalid --repo: use one relative directory name")
   exit(2)
 end
 $worktree = get_or($g["opts"], "worktree", "")
 $slot_text = get_or($g["opts"], "slot", "1")
 $slot = to_number($slot_text)
-if $slot == nil or $slot < 1 or $slot > $worker_conf["slots"] or not regex_match("^[0-9]+$", $slot_text) then
+if $slot == nil or $slot < 1 or $slot > $worker_conf["slots"] or not re_match($slot_text, "^[0-9]+$") then
   print("invalid --slot: " .. $worker .. " has slots 1.." .. $worker_conf["slots"])
   exit(2)
 end
@@ -273,7 +273,7 @@ $from = 0
 if $action == "logs" then
   $from_text = get_or($g["opts"], "from", "0")
   $from = to_number($from_text)
-  if $from == nil or $from < 0 or not regex_match("^[0-9]+$", $from_text) then
+  if $from == nil or $from < 0 or not re_match($from_text, "^[0-9]+$") then
     print("invalid --from: expected a non-negative line number")
     exit(2)
   end

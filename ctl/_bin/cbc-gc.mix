@@ -177,7 +177,7 @@ fn used_pct($build_root)
     fail("cannot parse df output for " .. $build_root)
   end
   $raw = trim($lines[length($lines) - 1])
-  if not regex_match("^[0-9]+%$", $raw) then
+  if not re_match($raw, "^[0-9]+%$") then
     fail("cannot parse df percentage for " .. $build_root .. ": " .. $raw)
   end
   $value = to_number(replace($raw, "%", ""))

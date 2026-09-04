@@ -36,7 +36,7 @@ catch $config_error
 end
 
 for each $unit in $CONF["daemons"]
-  if not regex_match("^[A-Za-z0-9_.@-]+$", $unit) then
+  if not re_match($unit, "^[A-Za-z0-9_.@-]+$") then
     print("  ERROR: invalid systemd unit name in audit_mesh.daemons: '" .. $unit .. "'")
     exit(2)
   end

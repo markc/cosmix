@@ -94,7 +94,7 @@ $RUNTIME = "/run/cosmix-desk"
 $SOCKET = "cosmix-0"
 $FIRST_FRAME_DEADLINE = 60
 
-if not regex_match("^[A-Za-z0-9/._-]+$", $LOGDIR) then
+if not re_match($LOGDIR, "^[A-Za-z0-9/._-]+$") then
   usage("log_dir contains characters outside [A-Za-z0-9/._-]: " .. $LOGDIR)
 end
 
@@ -231,7 +231,7 @@ gate($rt_mkdir["exit_code"] == 0 and $rt_chmod["exit_code"] == 0 and $rt_test["e
 
 $fg = run_argv(["fgconsole"])
 $restore_vt = trim($fg["stdout"])
-gate($fg["exit_code"] == 0 and regex_match("^[0-9]+$", $restore_vt),
+gate($fg["exit_code"] == 0 and re_match($restore_vt, "^[0-9]+$"),
   "fgconsole answers (" .. $restore_vt .. ") — the VT to restore to")
 if $restore_vt == $VT then
   $restore_vt = $FALLBACK_RESTORE_VT

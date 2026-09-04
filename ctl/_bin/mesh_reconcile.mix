@@ -39,7 +39,7 @@ if type($RECON["expected_mesh"]) != "string" or trim($RECON["expected_mesh"]) ==
   print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_reconcile.expected_mesh")
   exit(2)
 end
-if type($RECON["wg_interface"]) != "string" or not regex_match("^[A-Za-z0-9_.-]{1,15}$", $RECON["wg_interface"]) then
+if type($RECON["wg_interface"]) != "string" or not re_match($RECON["wg_interface"], "^[A-Za-z0-9_.-]{1,15}$") then
   print("  ERROR: " .. $CONF_PATH .. " needs mesh_reconcile.wg_interface as a 1-15 character interface name")
   exit(2)
 end

@@ -35,7 +35,7 @@ end
 
 -- First package version in a Cargo manifest.
 fn toml_version($path)
-  $m = regex_find("(?m)^version = \"([0-9]+\\.[0-9]+\\.[0-9]+)\"", read_file($path))
+  $m = re_find(read_file($path), "(?m)^version = \"([0-9]+\\.[0-9]+\\.[0-9]+)\"")
   $d.die_if(len($m) == 0, "no package version line in " .. $path)
   return $m[0]["groups"][0]
 end
@@ -47,22 +47,20 @@ end
 
 fn set_toml_version($path, $new_version)
   $source = read_file($path)
-  $updated = regex_replace("(?m)^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"",
-    $source, "version = \"" .. $new_version .. "\"")
+  $updated = re_replace($source, "(?m)^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"", "version = \"" .. $new_version .. "\"")
   $d.die_if($updated == $source, "version rewrite changed nothing in " .. $path)
   write_file($path, $updated)
 end
 
 fn pinned_rev()
-  $m = regex_find("spamlite = \\{[^}]*rev = \"([0-9a-f]{7,40})\"", read_file($BAYES_TOML))
+  $m = re_find(read_file($BAYES_TOML), "spamlite = \\{[^}]*rev = \"([0-9a-f]{7,40})\"")
   $d.die_if(len($m) == 0, "no spamlite git pin with a rev in " .. $BAYES_TOML)
   return $m[0]["groups"][0]
 end
 
 fn set_pinned_rev($new_rev)
   $source = read_file($BAYES_TOML)
-  $updated = regex_replace("rev = \"[0-9a-f]{7,40}\"", $source,
-    "rev = \"" .. $new_rev .. "\"")
+  $updated = re_replace($source, "rev = \"[0-9a-f]{7,40}\"", "rev = \"" .. $new_rev .. "\"")
   $d.die_if($updated == $source, "revision rewrite changed nothing in " .. $BAYES_TOML)
   write_file($BAYES_TOML, $updated)
 end
@@ -121,7 +119,7 @@ fn parity($bin, $expected)
   $d.die_if($r["exit_code"] != 0,
     "parity harness failed (exit " .. $r["exit_code"] .. "): " ..
     trim($r["stdout"]) .. " " .. trim($r["stderr"]))
-  $matches = regex_find("scores_sha256=([0-9a-f]{64})", $r["stdout"])
+  $matches = re_find($r["stdout"], "scores_sha256=([0-9a-f]{64})")
   $d.die_if(len($matches) == 0,
     "parity harness printed no scores_sha256 line:\n" .. $r["stdout"])
   $actual = $matches[0]["groups"][0]
@@ -269,7 +267,7 @@ fn engine_lag()
   $dependency_change = false
   for each $line in split($manifest_diff, "\n")
     if (starts_with($line, "+") or starts_with($line, "-")) and not starts_with($line, "+++") and not starts_with($line, "---") then
-      if not regex_match("^[+-]version = ", $line) and trim(substr($line, 1, len($line) - 1)) != "" then
+      if not re_match($line, "^[+-]version = ") and trim(substr($line, 1, len($line) - 1)) != "" then
         $dependency_change = true
       end
     end
@@ -382,7 +380,7 @@ $CONF = validate($CONF_DOC["deploy_spamlite"], {
   target_nodes: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
   parity_baseline_sha256: {type: "string", nonblank: true}
 })
-$d.die_if(not regex_match("^[0-9a-f]{64}$", $CONF["parity_baseline_sha256"]),
+$d.die_if(not re_match($CONF["parity_baseline_sha256"], "^[0-9a-f]{64}$"),
   "invalid " .. $CONF_PATH .. ": parity_baseline_sha256 must be 64 lowercase hex characters")
 $d.die_if($CONF["parity_baseline_sha256"] == "0000000000000000000000000000000000000000000000000000000000000000",
   "invalid " .. $CONF_PATH .. ": replace the parity_baseline_sha256 placeholder")
@@ -448,7 +446,7 @@ while $i < len($argv)
       exit(2)
     end
     $expected = $argv[$i + 1]
-    $d.die_if(not regex_match("^[0-9a-f]{64}$", $expected),
+    $d.die_if(not re_match($expected, "^[0-9a-f]{64}$"),
       "--accept-parity must be 64 lowercase hex characters")
     $i = $i + 1
   else

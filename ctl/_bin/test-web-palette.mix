@@ -56,7 +56,7 @@ if $CONF["named_vhosts"][0] == $CONF["named_vhosts"][1] then
     config_error($CONF_PATH .. " named_vhosts must contain two distinct names")
 end
 for each $vhost in $CONF["named_vhosts"]
-    if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $vhost) then
+    if not re_match($vhost, "^[A-Za-z0-9][A-Za-z0-9._-]*$") then
         config_error($CONF_PATH .. " contains an unsafe vhost name '" .. $vhost .. "'")
     end
 end

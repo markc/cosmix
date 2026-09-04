@@ -78,7 +78,7 @@ end
 if not starts_with($CKPT, "/") then
   refuse($CONF_PATH .. ": checkpoint_path must be absolute")
 end
-if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $STATUS_TOPIC) then
+if not re_match($STATUS_TOPIC, "^[A-Za-z0-9][A-Za-z0-9._-]*$") then
   refuse($CONF_PATH .. ": status_topic must be a Bus-safe topic name")
 end
 

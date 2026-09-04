@@ -62,7 +62,7 @@ end
 $expected_vt = to_string($CONF["default_vt"])
 if len($argv) > 1 then
   $expected_vt = $argv[1]
-  if not regex_match("^[0-9]+$", $expected_vt) then
+  if not re_match($expected_vt, "^[0-9]+$") then
     usage("expected-vt must be numeric")
   end
 end

@@ -95,7 +95,7 @@ $comp_unit = $unit_prefix .. "-comp.service"
 -- be split by escapes and evade plain substring tests.
 fn log_text($path)
   if not exists($path) then return "" end
-  return regex_replace("\u{1b}\\[[0-9;]*m", read_file($path), "") .. "\n"
+  return re_replace(read_file($path), "\u{1b}\\[[0-9;]*m", "") .. "\n"
 end
 
 -- pos() is needle-first.
@@ -107,9 +107,9 @@ end
 -- markers are required; tracing field order is deliberately not assumed.
 fn mapped_ids($text)
   $ids = {}
-  for each $line in grep("first surface buffer committed", $text)
+  for each $line in grep_lines($text, "first surface buffer committed")
     if has("role=\"toplevel\"", $line) then
-      $found = regex_find("surface_id=([0-9]+)", $line)
+      $found = re_find($line, "surface_id=([0-9]+)")
       if len($found) > 0 then
         $ids[$found[0]["groups"][0]] = true
       end
@@ -247,16 +247,16 @@ end
 -- These values become argv, systemd properties, a process-match regex or
 -- local paths. Preserve the narrow old grammar and reject traversal.
 for each $path in [$comp, $filemgr, $quoin, $foot, $log_dir, $runtime_dir ?? ""]
-  if not regex_match("^/[A-Za-z0-9/._-]+$", $path) or has("..", $path) then
+  if not re_match($path, "^/[A-Za-z0-9/._-]+$") or has("..", $path) then
     config_error("SMOKE_BAD_PATH: '" .. $path ..
       "' (need absolute, charset [A-Za-z0-9/._-], no '..')")
   end
 end
-if not regex_match("^[A-Za-z0-9_,:=.*-]+$", $log_filter) then
+if not re_match($log_filter, "^[A-Za-z0-9_,:=.*-]+$") then
   config_error("SMOKE_BAD_RUST_LOG: '" .. $log_filter ..
     "' (charset [A-Za-z0-9_,:=.*-])")
 end
-if not regex_match("^cosmix-[A-Za-z0-9-]+$", $sock) then
+if not re_match($sock, "^cosmix-[A-Za-z0-9-]+$") then
   config_error("SMOKE_BAD_SOCKET: '" .. $sock ..
     "' (must match ^cosmix-[A-Za-z0-9-]+$ and must not name the live session socket)")
 end
@@ -408,12 +408,12 @@ try
   -- would allow a different client to create a false green result.
   $text = log_text($comp_log)
   $foot_acked = false
-  for each $line in grep("acknowledged_decoration=Some\\(ServerSide\\)", $text)
+  for each $line in grep_lines($text, "acknowledged_decoration=Some\\(ServerSide\\)")
     if has("surface_id=" .. $foot_id .. " ", $line) then $foot_acked = true end
   end
   gate($foot_acked, "foot's surface (id=" .. $foot_id .. ") acked ServerSide")
   print("  note: ServerSide ack lines seen: " ..
-    to_string(len(grep("acknowledged_decoration=Some\\(ServerSide\\)", $text))) ..
+    to_string(len(grep_lines($text, "acknowledged_decoration=Some\\(ServerSide\\)"))) ..
     " (foot is gated; the other clients may keep client-side decoration)")
 finally
   -- Clients leave first so the compositor observes clean disconnects. Their

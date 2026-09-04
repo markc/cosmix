@@ -93,7 +93,7 @@ $DEVICE = $CONF["drm_device"]
 $CONN = $CONF["drm_connector"]
 $CAPTURE_DIR = $CONF["capture_dir"]
 
-if not regex_match("^[A-Za-z0-9_.-]+$", $CT) then
+if not re_match($CT, "^[A-Za-z0-9_.-]+$") then
   config_error("desk_atomic_gate.container_name contains unsafe characters")
 end
 for each $path in [$TTY, $CT_ROOT, $CT_COMP, $DEVICE, $CAPTURE_DIR]
@@ -152,7 +152,7 @@ end
 fn count_matching($text, $pattern)
   $count = 0
   for each $line in split($text, "\n")
-    if regex_match($pattern, $line) then
+    if re_match($line, $pattern) then
       $count = $count + 1
     end
   end
@@ -162,7 +162,7 @@ end
 fn matching_tail($text, $pattern, $limit)
   $matches = []
   for each $line in split($text, "\n")
-    if regex_match($pattern, $line) then
+    if re_match($line, $pattern) then
       push($matches, $line)
     end
   end
@@ -211,7 +211,7 @@ fn container_path_count($container, $path)
 end
 
 fn process_sample($container, $pid)
-  if not regex_match("^[0-9]+$", $pid) then
+  if not re_match($pid, "^[0-9]+$") then
     return {fds: "?", threads: "?"}
   end
   return {
@@ -314,7 +314,7 @@ $d.die_if($existing["exit_code"] != 1, "could not probe for a running compositor
 $foreground = run_argv(["fgconsole"])
 $d.die_if($foreground["exit_code"] != 0, "fgconsole failed: " .. trim($foreground["stderr"]))
 $restore_vt = trim($foreground["stdout"])
-$d.die_if(not regex_match("^[0-9]+$", $restore_vt), "fgconsole returned '" .. $restore_vt .. "'")
+$d.die_if(not re_match($restore_vt, "^[0-9]+$"), "fgconsole returned '" .. $restore_vt .. "'")
 if $restore_vt == $VT then
   print("  NOTE: display already on tty" .. $VT .. "; will restore to tty" .. $RESTORE_FALLBACK_VT)
   $restore_vt = $RESTORE_FALLBACK_VT
@@ -484,7 +484,7 @@ try
       if $ARM_STACK == "1" and not $stack_done and $cycle_dwell >= 30 then
         $host_process = run_argv(["pgrep", "-f", $CT_COMP])
         $host_pid = trim($host_process["stdout"])
-        if $host_process["exit_code"] == 0 and regex_match("^[0-9]+$", $host_pid) then
+        if $host_process["exit_code"] == 0 and re_match($host_pid, "^[0-9]+$") then
           $stack_path = $LOGDIR .. "/" .. $tag .. "-paused-stacks.txt"
           $stack_result = run_argv([
             "gdb", "-p", $host_pid, "-batch", "-ex", "set pagination off",

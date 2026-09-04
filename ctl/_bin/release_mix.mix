@@ -29,7 +29,7 @@ if $RELEASE["schema_version"] != 1 then
   exit(2)
 end
 $REPOSITORY = $RELEASE["github_repository"]
-if type($REPOSITORY) != "string" or not regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", $REPOSITORY) then
+if type($REPOSITORY) != "string" or not re_match($REPOSITORY, "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") then
   print("  ERROR: " .. $CONF_PATH .. " needs release_mix.github_repository as owner/repository")
   exit(2)
 end
@@ -52,7 +52,7 @@ if starts_with($tag, "v") then
   $version = substr($tag, 1)
 end
 -- Refuse a tag that is not a version before any network or build step.
-if not regex_match("^[0-9]+([.][0-9]+)+$", $version) then
+if not re_match($version, "^[0-9]+([.][0-9]+)+$") then
   print("  ERROR: tag '" .. $tag .. "' is not a version tag (expected vX.Y.Z or X.Y.Z)")
   exit(2)
 end

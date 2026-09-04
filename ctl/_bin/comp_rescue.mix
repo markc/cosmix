@@ -62,7 +62,7 @@ $EVIDENCE_DIR = $CONF["evidence_dir"]
 if not starts_with($EVIDENCE_DIR, "/") then
   config_error("comp_rescue.evidence_dir must be absolute")
 end
-if not regex_match("^[A-Za-z0-9/._-]+$", $EVIDENCE_DIR) then
+if not re_match($EVIDENCE_DIR, "^[A-Za-z0-9/._-]+$") then
   config_error("comp_rescue.evidence_dir must use only [A-Za-z0-9/._-]")
 end
 
@@ -80,7 +80,7 @@ end
 $vt = to_string($CONF["default_vt"])
 if len($argv) == 1 then
   $vt = $argv[0]
-  if not regex_match("^[0-9]+$", $vt) then
+  if not re_match($vt, "^[0-9]+$") then
     usage("vt must contain decimal digits only")
   end
   $vt_number = to_number($vt)

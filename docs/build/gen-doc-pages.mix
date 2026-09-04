@@ -78,13 +78,13 @@ for each $doc in split(trim(run_argv_must(["git", "ls-files"], {cwd: $root})), "
 end
 for each $doc in split(trim($tracked), "\n")
     if ends_with($doc, ".md") then
-        if not regex_match("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$", $doc) or pos("/../", "/" .. $doc .. "/") > 0 then
+        if not re_match($doc, "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$") or pos("/../", "/" .. $doc .. "/") > 0 then
             raise("GEN_UNSAFE_NAME", "doc name outside the safe URL grammar: " .. $doc)
         end
         -- an all-dots stem ('.md', '..md') would collapse to /sec/ or /sec/.
         -- once urlFor strips the extension — another page's URL, so refuse
         $parts = split($doc, "/")
-        if regex_match("^[.]*[.]md$", $parts[len($parts) - 1]) then
+        if re_match($parts[len($parts) - 1], "^[.]*[.]md$") then
             raise("GEN_UNSAFE_NAME", "doc stem empty or dots-only: " .. $doc)
         end
         if ends_with($doc, "/README.md") then

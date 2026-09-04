@@ -36,7 +36,7 @@ catch $error
 end
 
 $LOG_DIR = $CONF["evidence_dir"]
-if not starts_with($LOG_DIR, "/") or not regex_match("^[A-Za-z0-9/._-]+$", $LOG_DIR) then
+if not starts_with($LOG_DIR, "/") or not re_match($LOG_DIR, "^[A-Za-z0-9/._-]+$") then
   print("  ERROR: " .. $CONF_PATH ..
     ": smoke_chrome_shaders.evidence_dir must be an absolute path containing only [A-Za-z0-9/._-]")
   exit(2)
@@ -163,7 +163,7 @@ fn smoke($style)
 
   -- tracing colours field names and separators independently; strip ANSI
   -- sequences before looking for exact positive evidence.
-  $text = regex_replace("\u{1b}\\[[0-9;]*m", read_file($log), "")
+  $text = re_replace(read_file($log), "\u{1b}\\[[0-9;]*m", "")
 
   -- Positive gate 1: without an acknowledged server-side decoration there is
   -- no chrome entity, so an otherwise quiet log proves nothing.

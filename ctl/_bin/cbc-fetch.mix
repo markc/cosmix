@@ -49,7 +49,7 @@ fn contains_item($items, $wanted)
 end
 
 fn safe_component($value)
-  return type($value) == "string" and regex_match("^[A-Za-z0-9._-]+$", $value) and $value != "." and $value != ".."
+  return type($value) == "string" and re_match($value, "^[A-Za-z0-9._-]+$") and $value != "." and $value != ".."
 end
 
 fn safe_relative_path($value)
@@ -165,7 +165,7 @@ if $sha_result["exit_code"] != 0 then
   exit(3)
 end
 $sha = split(trim($sha_result["stdout"]), " ")[0]
-if not regex_match("^[0-9a-f]{64}$", $sha) then
+if not re_match($sha, "^[0-9a-f]{64}$") then
   eprint("invalid sha256sum output for " .. $artifact)
   exit(3)
 end
@@ -175,7 +175,7 @@ if $size_result["exit_code"] != 0 then
   exit(3)
 end
 $size = trim($size_result["stdout"])
-if not regex_match("^[0-9]+$", $size) then
+if not re_match($size, "^[0-9]+$") then
   eprint("invalid stat size for " .. $artifact)
   exit(3)
 end

@@ -65,7 +65,7 @@ end
 if not starts_with($CONF["drain_home"], "/") then
   config_error("drain_home must be absolute")
 end
-if not regex_match("^[a-z_][a-z0-9_-]*$", $CONF["drain_user"]) then
+if not re_match($CONF["drain_user"], "^[a-z_][a-z0-9_-]*$") then
   config_error("drain_user must be a local POSIX account name")
 end
 

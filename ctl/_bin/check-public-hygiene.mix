@@ -727,7 +727,7 @@ fn binary_blob_sha256($repo, $object, $path, $call_no)
   -- stat() exposes size as Mix's exact-integer number type. Beyond 2^53 the
   -- comparison could bless two rounded, DIFFERENT sizes, which would turn the
   -- short-write check into theatre; refuse that unrepresentable answer.
-  if regex_match("^(0|[1-9][0-9]*)$", $size_text) == false or $expected == nil \
+  if re_match($size_text, "^(0|[1-9][0-9]*)$") == false or $expected == nil \
       or $expected > 9007199254740991 then
     bail(2, "git returned an unusable blob size `" .. sanitize($size_text)
       .. "` for " .. $oid .. " in " .. $repo .. "; refusing")
@@ -1570,7 +1570,7 @@ end
 -- junk (a zero-width char, a different extension) is genuinely a different
 -- name, and chasing it ends with the gate refusing kernel-device lookalikes.
 fn underscore_doc_violation($path)
-  if regex_match("(?i)[.]md\\s*$", $path) == false then
+  if re_match($path, "(?i)[.]md\\s*$") == false then
     return false
   end
   $segs = split($path, "/")
@@ -1634,7 +1634,7 @@ fn scan_pathnames($rules, $known, $label)
     if $p != "" then
       for each $rule in $rules
         -- (?i) to match `git grep -E -i`, which is what scans the bodies.
-        if regex_match("(?i)" .. $rule["pattern"], $p) then
+        if re_match($p, "(?i)" .. $rule["pattern"]) then
           push($hits, {
             rule: $rule["id"], note: $rule["note"] .. " — in the PATHNAME itself",
             rel: $p, disp: $label .. $p, line_no: 0, line: $p,
@@ -1748,7 +1748,7 @@ end
 fn validate_rules($rules)
   for each $rule in $rules
     try
-      regex_match("(?i)" .. $rule["pattern"], "")
+      re_match("", "(?i)" .. $rule["pattern"])
     catch $m, $e
       bail(2, "rule " .. $rule["id"] .. " is not usable for text scanning: " .. $m)
     end
@@ -1810,7 +1810,7 @@ fn scan_text($rules, $text, $rel, $disp, $pardonable, $unit)
   for each $l in split($text, "\n")
     $n = $n + 1
     for each $rule in $rules
-      if regex_match("(?i)" .. $rule["pattern"], $l) then
+      if re_match($l, "(?i)" .. $rule["pattern"]) then
         push($hits, {
           rule: $rule["id"], note: $rule["note"] .. " — in " .. $rel,
           rel: $rel, disp: $disp, line_no: $n, line: $l, binary: false,
@@ -2697,7 +2697,7 @@ $binary_dupes = []
 $binary_exceptions = get_or($allow, "binary_exceptions", [])
 for each $e in $binary_exceptions
   $sha = "" .. $e["sha256"]
-  if regex_match("^[0-9a-f]{64}$", $sha) == false then
+  if re_match($sha, "^[0-9a-f]{64}$") == false then
     bail(2, $ALLOW .. " has invalid binary_exceptions sha256 `"
       .. sanitize($sha) .. "` — expected exactly 64 lowercase hex characters")
   end

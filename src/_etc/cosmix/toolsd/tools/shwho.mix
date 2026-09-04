@@ -88,7 +88,7 @@ $w = run_argv([$WHOIS, $dom], {timeout: 30})
 if $w.timed_out then
   eprintf("WARN: whois %s timed out\n", $dom)
 end
-for each $line in grep("^(Registrar:|Registrar Name:|Name Server:|DNSSEC:)", $w.stdout)
+for each $line in grep_lines($w.stdout, "^(Registrar:|Registrar Name:|Name Server:|DNSSEC:)")
   print(trim($line))
 end
 
