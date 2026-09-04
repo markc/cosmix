@@ -371,7 +371,7 @@ Run `mix builtins` for the full remit of all {count} built-in functions
 - `--strict-arity`    Wrong-arity calls raise ARITY_MISMATCH (default: missing->nil, extra ignored)
 
 ## Subcommands
-- Reference    `help`  `builtins`  `what <name>`  `man <topic>`  `keywords`  `syntax`  `operators`
+- Reference    `help`  `builtins`  `what <name>`  `apropos <term>`  `man <topic>`  `keywords`  `syntax`  `operators`
 - Introspect   `vars`  `functions`  `aliases`  `all`  `type`  `config`  `status`
 - Build        `build`  `clean`  `update`  `test`
 - Diagnostics  `stats`  `time`  `check`  `lint`  `trace`  `history`  `reload`
@@ -574,6 +574,13 @@ pub fn dispatch(args: &[&str], eval: &Evaluator, version: &str) -> Option<String
                 eprintln!("mix what: requires a name argument");
             } else {
                 cmd_what(args[1]);
+            }
+        }
+        "apropos" => {
+            if args.len() < 2 {
+                eprintln!("mix apropos: requires a search term");
+            } else {
+                cmd_apropos(&args[1..].join(" "));
             }
         }
         "syntax" => cmd_man(Some("variables")),
@@ -1345,6 +1352,7 @@ fn cmd_help_overview() {
     println!("  mix keywords     List all reserved words");
     println!("  mix builtins [X] Full builtin list; X = a name, category, --json, or --names");
     println!("  mix what NAME    One-line description of a builtin or keyword");
+    println!("  mix apropos TERM Search builtins, keywords + manual by name/description");
     println!("  mix diff LANG    Translation cheatsheet (e.g. mix diff bash)");
     println!("  mix syntax       Shortcut for: mix man variables");
     println!("  mix operators    Shortcut for: mix man operators");
@@ -2534,7 +2542,130 @@ fn cmd_what(name: &str) {
         }
     }
 
-    println!("{}: unknown", name);
+    // Not an exact name — fall through to a substring search rather than the
+    // old bare "unknown" (the apropos-when-not-exact behaviour the discovery
+    // backlog asked for: `mix what pad` now finds lpad/rpad/…). An
+    // empty/whitespace name skips the preamble and lets apropos emit its own
+    // one-line error, so a `mix what ""` typo yields one message, not two.
+    if !name.trim().is_empty() {
+        println!("'{name}' is not an exact builtin/keyword name — searching…\n");
+    }
+    cmd_apropos(name);
+}
+
+/// First line of a (possibly multi-line) description, trimmed — the one-liner
+/// shown in list output.
+fn first_line(desc: &str) -> &str {
+    desc.lines().next().unwrap_or(desc).trim()
+}
+
+/// `mix apropos TERM` — one case-folding substring search across builtins
+/// (name OR description), keywords, and the manual's section headings. The
+/// discovery win the backlog framed as "the lpad lesson made structural":
+/// finding a capability no longer requires already knowing its exact name or
+/// the right file to grep. Prints where to read more for each hit.
+fn cmd_apropos(term: &str) {
+    let needle = term.trim().to_lowercase();
+    if needle.is_empty() {
+        eprintln!("mix apropos: empty search term");
+        return;
+    }
+    let mut hits = 0;
+
+    // 1. Builtins — name or description.
+    let mut builtin_matches: Vec<(&str, &str, &str)> = all_builtin_entries()
+        .filter(|(name, _cat, desc)| {
+            name.to_lowercase().contains(&needle) || desc.to_lowercase().contains(&needle)
+        })
+        .collect();
+    builtin_matches.sort_by_key(|(name, _, _)| *name);
+    if !builtin_matches.is_empty() {
+        println!("BUILTINS");
+        for (name, cat, desc) in &builtin_matches {
+            println!("  {name}  ({cat})  — {}", first_line(desc));
+            hits += 1;
+        }
+    }
+
+    // 2. Keywords — name or description.
+    let kw_matches: Vec<&(&str, &str)> = KEYWORD_DESCRIPTIONS
+        .iter()
+        .filter(|(name, desc)| {
+            name.to_lowercase().contains(&needle) || desc.to_lowercase().contains(&needle)
+        })
+        .collect();
+    if !kw_matches.is_empty() {
+        println!("\nKEYWORDS");
+        for (name, desc) in kw_matches {
+            println!("  {name}  — {}", first_line(desc));
+            hits += 1;
+        }
+    }
+
+    // 3. Manual section headings — read each local page and match its `#`
+    //    headings. Best-effort: if no docs are present the section arm is
+    //    simply empty (builtins/keywords still work). Scan BOTH the checkout
+    //    docs dir AND the `mix man` cache (`~/.cache/cosmix/man`, default-URL
+    //    layout): a deployed node has no checkout but accumulates cached pages,
+    //    so without the cache the manual arm would be dead on the whole fleet.
+    //    Dedup by topic — a checkout copy wins over a cached one.
+    let mut scan_dirs: Vec<PathBuf> = vec![resolve_man_dir()];
+    if let Some(root) = man_cache_root(
+        env::var_os("XDG_CACHE_HOME").map(PathBuf::from).as_deref(),
+        dirs::home_dir().as_deref(),
+    ) {
+        scan_dirs.push(root);
+    }
+    let mut seen_topics = std::collections::HashSet::new();
+    let mut section_hits: Vec<(String, String)> = Vec::new();
+    for dir in &scan_dirs {
+        for topic in available_man_topics(dir) {
+            if !seen_topics.insert(topic.clone()) {
+                continue;
+            }
+            let path = dir.join(format!("{topic}.md"));
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut in_fence = false;
+            for line in content.lines() {
+                let trimmed = line.trim_start();
+                // A ``` / ~~~ line toggles a fenced code block. Its `# comment`
+                // lines are NOT headings — without this, a bash example inside a
+                // page produces phantom "section" hits.
+                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                    in_fence = !in_fence;
+                    continue;
+                }
+                if in_fence {
+                    continue;
+                }
+                // ATX heading only: one-or-more '#' then a SPACE (so `#!/…`,
+                // `#include`, `#foo` are not mistaken for headings).
+                let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+                if hashes == 0 || trimmed.chars().nth(hashes) != Some(' ') {
+                    continue;
+                }
+                let heading = trimmed[hashes..].trim();
+                if !heading.is_empty() && heading.to_lowercase().contains(&needle) {
+                    section_hits.push((topic.clone(), heading.to_string()));
+                }
+            }
+        }
+    }
+    if !section_hits.is_empty() {
+        println!("\nMANUAL SECTIONS");
+        for (topic, heading) in &section_hits {
+            println!("  mix man {topic}  § {heading}");
+            hits += 1;
+        }
+    }
+
+    if hits == 0 {
+        println!("no builtins, keywords, or manual sections match '{term}'");
+    } else {
+        println!("\n{hits} match(es). Read more: mix what NAME · mix man TOPIC");
+    }
 }
 
 /// `mix tutorial`: guided walkthrough of Mix basics
@@ -2738,7 +2869,10 @@ mod man_resolver_tests {
     fn local_candidates_are_keyed_off_the_root() {
         // a known root is the only candidate — no dot-dir fallbacks
         assert_eq!(
-            man_dir_candidates(Some(Path::new("/home/tester")), Some(Path::new("/srv/cosmix"))),
+            man_dir_candidates(
+                Some(Path::new("/home/tester")),
+                Some(Path::new("/srv/cosmix"))
+            ),
             vec![PathBuf::from("/srv/cosmix/docs/mix")]
         );
         // no root: the documented default clone location

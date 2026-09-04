@@ -322,6 +322,7 @@ const META_CLI_COMMANDS: &[&str] = &[
     "keywords",
     "builtins",
     "what",
+    "apropos",
     "syntax",
     "operators",
     "fix",

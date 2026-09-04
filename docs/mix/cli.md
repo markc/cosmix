@@ -178,6 +178,29 @@ send: Send message to Bus port: send PORT "msg"
 map: Return new list of transform(item) results (v0.2.0)
 ```
 
+`mix apropos TERM` is the search when you *don't* know the name yet — one
+case-folding substring pass across builtin names AND descriptions, keyword
+names AND descriptions, and the manual's section headings, each hit saying
+where to read more. It is the answer to "I need to pad a string but I don't
+know it's called `lpad`":
+
+```mix
+mix apropos pad
+```
+
+```text
+BUILTINS
+  lpad  (string)  — Left-pad string to width (codepoint count; …) (v0.54.0)
+  rpad  (string)  — Right-pad string to width (codepoint count; …) (v0.54.0)
+  …
+MANUAL SECTIONS
+  mix man strings  § Padding with something other than a space
+```
+
+`mix what NAME` also falls through to this search when `NAME` is not an exact
+builtin or keyword, so a near-miss surfaces the candidates instead of printing
+`unknown` (v0.80.0).
+
 `mix keywords` is the canonical reserved-word list — the names you cannot use
 as function or variable *names* (`function step(...)` is an error). Since 0.21
 a keyword IS accepted anywhere it is unambiguously a name — bare map keys
