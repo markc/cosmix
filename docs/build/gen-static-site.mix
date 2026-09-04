@@ -61,12 +61,15 @@ end
 -- `y.md#sec` and `y.md?q=1` are rewritten. A trailing `?query`/`#frag`
 -- (captured as $2) is preserved. Three passes, README first because a
 -- README maps to its directory's index, not to `README.html`:
---   A. `dir/README.md` -> `dir/`          (a slash before README)
---   B. bare `README.md` -> `index.html`   (same-dir link)
+--   A. `dir/README.md` -> `dir/index.html`  (a slash before README)
+--   B. bare `README.md`  -> `index.html`     (same-dir link)
 --   C. everything else `X.md` -> `X.html`
+-- README targets point at `index.html` explicitly, never a bare `dir/`:
+-- a directory href opens a listing under file://, and the whole point of
+-- this generator is a mirror that works there too.
 fn rewrite_links($html)
   $tail = "((?:[?#][^\"]*)?)"
-  $h = re_replace($html, "href=\"([^\":#?][^\":]*/)README\\.md" .. $tail .. "\"", "href=\"$1$2\"")
+  $h = re_replace($html, "href=\"([^\":#?][^\":]*/)README\\.md" .. $tail .. "\"", "href=\"$1index.html$2\"")
   $h = re_replace($h, "href=\"README\\.md" .. $tail .. "\"", "href=\"index.html$1\"")
   $h = re_replace($h, "href=\"([^\":/#?][^\":]*)\\.md" .. $tail .. "\"", "href=\"$1.html$2\"")
   return $h
@@ -119,9 +122,14 @@ for each $doc in $docs_list
   $src = read_file($docs .. "/" .. $doc)
   $title = ""
   -- First ATX H1 as the page title, else the path.
+  -- Title = the first ATX H1's text, with markdown backticks stripped so
+  -- an H1 like "# cli — the `mix` meta-command" doesn't render literal
+  -- backticks in the browser tab. (A `# ` line inside a fenced code block
+  -- before the real H1 would mislead this, but every tracked doc opens
+  -- with its H1 — accepted, not guarded.)
   for each $line in lines($src)
     if starts_with($line, "# ") then
-      $title = trim(substr($line, 2))
+      $title = replace(trim(substr($line, 2)), "`", "")
       break
     end
   end
