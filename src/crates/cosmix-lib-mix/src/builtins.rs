@@ -17478,6 +17478,15 @@ fn http_accept_next(
     deadline: Option<std::time::Instant>,
 ) -> MixResult<Option<(std::net::TcpStream, std::net::SocketAddr)>> {
     loop {
+        // Ctrl-C ends a blocking server cleanly (the flag is set by the
+        // evaluator's SIGINT handler). Without this the non-blocking
+        // accept loop spins forever and ^C does nothing — a server you
+        // cannot stop. `None` here means "loop over", so the caller
+        // returns the count served so far, exactly like a duration
+        // expiry, and the interpreter then raises the interrupt itself.
+        if crate::interrupt::is_interrupted() {
+            return Ok(None);
+        }
         match listener.accept() {
             Ok((stream, peer)) => {
                 stream.set_nonblocking(false).ok();
@@ -23441,6 +23450,12 @@ mod bytes_tests {
         assert!(format!("{err}").contains("spa shell"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // Ctrl-C ending a blocking http_serve is proven end-to-end by a
+    // SUBPROCESS test (crates/cosmix-mix/tests/http_serve_signal.rs): the
+    // interrupt flag is process-global, so arming it inside this test
+    // binary would poison every other interrupt-aware test running in
+    // parallel. The in-loop check itself is in http_accept_next.
 
     #[test]
     fn http_serve_head_has_headers_but_no_body() {

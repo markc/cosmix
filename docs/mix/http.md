@@ -487,6 +487,11 @@ if $r == nil then die "no redirect within 2 minutes" end
 $code = parse_query($r["query"])["code"]
 ```
 
+`http_serve` blocks until `duration`/`requests` ends it, or until
+**Ctrl-C** — SIGINT stops the accept loop cleanly and the call returns
+the count served so far, so an interactive `http_serve(dir)` is a normal
+"serve until I stop it" command.
+
 Both are sequential, `Connection: close`, one exchange per connection —
 a browser and a script, not a load. The moment the words "certificate",
 "virtual host", or "route this to a function" appear, the answer is webd.
