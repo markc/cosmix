@@ -365,7 +365,7 @@ builtin_table! {
     ("ws_send", CapabilityClass::Network,         "system",  "Send one websocket frame: text for a string payload, binary for bytes/buffer; flushed before returning. A closed connection raises and retires the handle (v0.74.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> nil; effects[blocking]; failure[raises])),
     ("ws_recv", CapabilityClass::Network,         "system",  "Wait for the next DATA frame: ws_recv(handle[, timeout]) -> string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet (v0.74.0)", contract!((handle: number, timeout?: number) -> any; effects[blocking]; failure[raises])),
     ("ws_close", CapabilityClass::Network,        "system",  "Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)", contract!((handle: number) -> bool; failure[raises])),
-    ("http_serve", CapabilityClass::Network,      "system",  "BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass \"0.0.0.0\" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature). Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)", contract!((root: string, opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("http_serve", CapabilityClass::Network,      "system",  "BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass \"0.0.0.0\" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)", contract!((root: string, opts?: map) -> number; effects[blocking]; failure[raises])),
     ("http_recv", CapabilityClass::Network,       "system",  "Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -> {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 \"ok\"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
     ("help", CapabilityClass::Pure,            "system",  "Show Mix builtin help in the REPL", contract!(() -> nil)),
 
@@ -17534,6 +17534,8 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
     let mut listing = false;
     let mut render_md = false;
     let mut requests_cap: u64 = 0;
+    let mut spa: Option<String> = None;
+    let mut clean_urls = false;
     if let Some(opts) = args.get(1) {
         match opts {
             Value::Nil => {}
@@ -17542,12 +17544,12 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                     if !matches!(
                         k.as_str(),
                         "port" | "host" | "duration" | "index" | "listing" | "render_md"
-                            | "requests"
+                            | "requests" | "spa" | "clean_urls"
                     ) {
                         return Err(MixError::RuntimeError {
                             span: None,
                             msg: format!(
-                                "http_serve(): unknown option '{k}' (supported: port, host, duration, index, listing, render_md, requests)"
+                                "http_serve(): unknown option '{k}' (supported: port, host, duration, index, listing, render_md, requests, spa, clean_urls)"
                             ),
                         });
                     }
@@ -17584,6 +17586,51 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                         0,
                         i64::MAX,
                     )? as u64;
+                }
+                if let Some(v) = m.get("spa") {
+                    // The single-page-app fallback: a GET for a path with no
+                    // matching file is answered with this shell file (200)
+                    // instead of a 404, so a client-side router boots on every
+                    // deep URL. `spa: true` means index.html; `spa: "404.html"`
+                    // names another shell. Static frontend only — this serves
+                    // the app, never its API. Resolved and prefix-checked once
+                    // here so a bad shell path fails at startup, not per-404.
+                    let shell_name = match v {
+                        Value::Bool(true) => index.clone(),
+                        // Every other option here treats nil/false as
+                        // "off" — spa must too, rather than looking for a
+                        // shell literally named "nil"/"0".
+                        Value::Bool(false) | Value::Nil => String::new(),
+                        Value::Number(_) => {
+                            return Err(MixError::RuntimeError {
+                                span: None,
+                                msg: "http_serve(): option 'spa' must be true or a shell filename".to_string(),
+                            });
+                        }
+                        other => other.to_mix_string(),
+                    };
+                    if !shell_name.is_empty() {
+                        let shell = root.join(&shell_name);
+                        let canon =
+                            std::fs::canonicalize(&shell).map_err(|e| MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "http_serve(): spa shell '{shell_name}' not found under root: {e}"
+                                ),
+                            })?;
+                        if !canon.starts_with(&root) || !canon.is_file() {
+                            return Err(MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "http_serve(): spa shell '{shell_name}' must be a file under the served root"
+                                ),
+                            });
+                        }
+                        spa = Some(canon.to_string_lossy().into_owned());
+                    }
+                }
+                if let Some(v) = m.get("clean_urls") {
+                    clean_urls = v.is_truthy();
                 }
             }
             other => {
@@ -17646,7 +17693,16 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
         if let Some(d) = deadline {
             req_deadline = req_deadline.min(d + std::time::Duration::from_secs(10));
         }
-        http_serve_one(&mut stream, &root, &index, listing, render_md, req_deadline);
+        http_serve_one(
+            &mut stream,
+            &root,
+            &index,
+            listing,
+            render_md,
+            spa.as_deref(),
+            clean_urls,
+            req_deadline,
+        );
         served += 1;
         if requests_cap > 0 && served >= requests_cap {
             break;
@@ -17663,8 +17719,48 @@ fn http_serve_one(
     index: &str,
     listing: bool,
     render_md: bool,
+    spa: Option<&str>,
+    clean_urls: bool,
     req_deadline: std::time::Instant,
 ) {
+    // clean_urls (GitHub Pages parity): for an EXTENSIONLESS path with no
+    // file of its own, serve `<path>.html` when it exists — through the
+    // same canonicalize+prefix gate as any request path. Returns true if
+    // it served. Shared by the not-found arm AND the directory branch (a
+    // `bus.html` section page sits beside a `bus/` children dir — Pages
+    // resolves `/bus` to that page when there is no `bus/index.html`).
+    let try_clean_url =
+        |stream: &mut std::net::TcpStream, rel: &str, head_only: bool| -> bool {
+            if !clean_urls || rel.is_empty() {
+                return false;
+            }
+            if rel.rsplit('/').next().unwrap_or("").contains('.') {
+                return false;
+            }
+            if let Ok(html) = std::fs::canonicalize(root.join(format!("{rel}.html")))
+                && html.starts_with(root)
+                && html.is_file()
+            {
+                http_send_file(stream, &html, render_md, head_only);
+                return true;
+            }
+            false
+        };
+    // The SPA fallback: a would-be 404 on a path with NO extension serves
+    // the shell (200) so a client-side router boots. Only extensionless
+    // paths fall back — a missing /app.js or /style.css must stay a real
+    // 404, or a broken asset silently becomes the HTML shell and the app
+    // fails in a far more confusing way. render_md is threaded through so
+    // an .md shell renders consistently with the same file served as index.
+    let spa_fallback = |stream: &mut std::net::TcpStream, path: &str, head_only: bool| -> bool {
+        let Some(shell) = spa else { return false };
+        let last = path.rsplit('/').next().unwrap_or("");
+        if last.contains('.') {
+            return false;
+        }
+        http_send_file(stream, std::path::Path::new(shell), render_md, head_only);
+        true
+    };
     let mut owned = stream;
     let mut reader = std::io::BufReader::new(&mut *owned);
     let req = match http_srv::read_head(&mut reader, req_deadline) {
@@ -17709,7 +17805,18 @@ fn http_serve_one(
     // inside the root pointing outside it lands here too.
     let canon = match std::fs::canonicalize(&joined) {
         Ok(c) => c,
-        Err(_) => return http_srv::write_error(stream, 404, "not found"),
+        Err(_) => {
+            // No file of this exact name: clean-URL (/foo → /foo.html)
+            // first — a specific page beats the generic shell — then the
+            // SPA fallback, else a real 404.
+            if try_clean_url(stream, rel, head_only) {
+                return;
+            }
+            if spa_fallback(stream, &decoded, head_only) {
+                return;
+            }
+            return http_srv::write_error(stream, 404, "not found");
+        }
     };
     if !canon.starts_with(root) {
         return http_srv::write_error(stream, 403, "outside the served root");
@@ -17727,6 +17834,17 @@ fn http_serve_one(
             return http_send_file(stream, &idx_canon, render_md, head_only);
         }
         if !listing {
+            // A directory with no index: a sibling `<dir>.html` (a section
+            // page beside its children dir) resolves first — Pages parity —
+            // then the SPA shell, before we refuse. `/bus/` (trailing slash)
+            // is a dir request, not a `/bus` page request, so clean_urls is
+            // skipped for it; only the extensionless no-slash form matches.
+            if !decoded.ends_with('/') && try_clean_url(stream, rel, head_only) {
+                return;
+            }
+            if spa_fallback(stream, &decoded, head_only) {
+                return;
+            }
             return http_srv::write_error(stream, 403, "directory listing disabled");
         }
         let mut names: Vec<(String, bool)> = match std::fs::read_dir(&canon) {
@@ -23182,6 +23300,146 @@ mod bytes_tests {
         assert_eq!(server.join().unwrap().unwrap(), 7);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&outside).ok();
+    }
+
+    #[test]
+    fn http_serve_spa_fallback() {
+        let dir = std::env::temp_dir().join(format!("mix-http-spa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html><div id=app></div>").unwrap();
+        std::fs::write(dir.join("app.js"), "console.log('router')").unwrap();
+        let port = free_port();
+        let root = dir.to_string_lossy().to_string();
+        let server = std::thread::spawn(move || {
+            let mut opts = indexmap::IndexMap::new();
+            opts.insert("port".to_string(), Value::Number(port as f64));
+            opts.insert("requests".to_string(), Value::Number(5.0));
+            opts.insert("spa".to_string(), Value::Bool(true));
+            builtin_http_serve(vec![Value::String(root), Value::map(opts)])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // 1. A real asset still serves as itself.
+        let r = http_raw(port, "GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("router"), "{r}");
+        // 2. A deep extensionless route the router owns → the shell, 200.
+        let r = http_raw(port, "GET /bus/props-core HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("id=app"), "deep route → shell: {r}");
+        // 3. A MISSING ASSET must stay a real 404, never the shell (else a
+        //    broken /main.css silently becomes HTML and the app breaks
+        //    confusingly).
+        let r = http_raw(port, "GET /missing.css HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 404"), "missing asset stays 404: {r}");
+        assert!(!r.contains("id=app"), "{r}");
+        // 4. A traversal attempt decodes to an extensionless path
+        //    (`../etc`), so it DOES receive the shell (200) — but the shell
+        //    is a startup-vetted constant inside the root, so no file
+        //    outside the root is ever read. That is the safety property:
+        //    the fallback serves one known file, never a request-derived
+        //    path. The traversal gate itself (proven in the main test) is
+        //    untouched; this just confirms the shell can't leak.
+        let r = http_raw(port, "GET /%2e%2e%2fetc HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("id=app"), "{r}");
+        assert!(!r.contains("root:") && !r.contains("SECRET"), "{r}");
+        // 5. The root still serves index directly.
+        let r = http_raw(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("id=app"), "{r}");
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// clean_urls (GitHub Pages parity): /foo serves /foo.html when the
+    /// pre-rendered page exists — the fix for a stub/page-per-route site
+    /// like cosmix.dev, distinct from and tried before the SPA shell.
+    #[test]
+    fn http_serve_clean_urls_resolves_dot_html() {
+        let dir = std::env::temp_dir().join(format!("mix-http-clean-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bus")).unwrap();
+        std::fs::write(dir.join("bus/props-core.html"), "<h1>props-core page</h1>").unwrap();
+        std::fs::write(dir.join("plain.txt"), "text").unwrap();
+        let port = free_port();
+        let root = dir.to_string_lossy().to_string();
+        let server = std::thread::spawn(move || {
+            let mut opts = indexmap::IndexMap::new();
+            opts.insert("port".to_string(), Value::Number(port as f64));
+            opts.insert("requests".to_string(), Value::Number(4.0));
+            opts.insert("clean_urls".to_string(), Value::Bool(true));
+            builtin_http_serve(vec![Value::String(root), Value::map(opts)])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Clean URL → the .html page, styled/served as HTML.
+        let r = http_raw(port, "GET /bus/props-core HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("props-core page") && r.contains("text/html"),
+            "{r}"
+        );
+        // The explicit .html still works.
+        let r = http_raw(port, "GET /bus/props-core.html HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // A path WITH an extension is never .html-appended (no /plain.txt.html).
+        let r = http_raw(port, "GET /plain.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/plain"), "{r}");
+        // A genuinely missing clean URL is still a 404 (no shell configured).
+        let r = http_raw(port, "GET /bus/nope HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The MAJOR the review caught: a section PAGE (`bus.html`) sitting
+    /// beside its children DIRECTORY (`bus/`) — `GET /bus` must resolve to
+    /// the page, not 403 because the directory exists with no index. Pages
+    /// parity for the natural page-per-route layout.
+    #[test]
+    fn http_serve_clean_urls_sibling_page_beside_dir() {
+        let dir = std::env::temp_dir().join(format!("mix-http-sibling-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bus")).unwrap();
+        std::fs::write(dir.join("bus.html"), "<h1>bus section</h1>").unwrap();
+        std::fs::write(dir.join("bus/props.html"), "<h1>child</h1>").unwrap();
+        let port = free_port();
+        let root = dir.to_string_lossy().to_string();
+        let server = std::thread::spawn(move || {
+            let mut opts = indexmap::IndexMap::new();
+            opts.insert("port".to_string(), Value::Number(port as f64));
+            opts.insert("requests".to_string(), Value::Number(3.0));
+            opts.insert("clean_urls".to_string(), Value::Bool(true));
+            builtin_http_serve(vec![Value::String(root), Value::map(opts)])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // /bus (the dir exists, no index) resolves to the sibling bus.html.
+        let r = http_raw(port, "GET /bus HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("bus section"),
+            "sibling page beside dir: {r}"
+        );
+        // /bus/props still resolves to the child.
+        let r = http_raw(port, "GET /bus/props HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("child"), "{r}");
+        // /bus/ (trailing slash) is a directory request → 403 (no index,
+        // no listing), NOT the sibling page.
+        let r = http_raw(port, "GET /bus/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 403"), "trailing slash is a dir request: {r}");
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_serve_spa_bad_shell_fails_at_startup() {
+        let dir = std::env::temp_dir().join(format!("mix-http-spa-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = indexmap::IndexMap::new();
+        opts.insert("port".to_string(), Value::Number(free_port() as f64));
+        opts.insert("spa".to_string(), Value::String("nope.html".into()));
+        let err =
+            builtin_http_serve(vec![Value::String(dir.to_string_lossy().into_owned()), Value::map(opts)])
+                .unwrap_err();
+        assert!(format!("{err}").contains("spa shell"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

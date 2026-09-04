@@ -416,7 +416,8 @@ dispatch to code are [webd]'s job and serve-mode citizens' job. What
 lives here is the pair of shapes an agent keeps needing locally:
 
 ```
-http_serve(root[, {port, host, duration, index, listing, render_md, requests}])
+http_serve(root[, {port, host, duration, index, listing, render_md,
+                   requests, spa, clean_urls}])
     -> requests served (BLOCKING)
 http_recv(port[, {timeout, host, max, respond}])
     -> {method, path, query, headers, body, bytes, from_host, from_port} | nil
@@ -441,6 +442,34 @@ the canonicalised root — `../`, `%2e%2e%2f`, and symlinks inside the
 root pointing out all answer 403/404, and the tests prove each one
 against raw sockets (a polite HTTP client normalizes `../` away; an
 attacker's socket does not).
+
+**Serving a site with clean URLs, two shapes.** A static server maps
+`/bus/props-core` to a file of that exact name and 404s when there isn't
+one — but real sites use extensionless URLs. Two options cover the two
+site shapes, and they compose (clean_urls is tried first — a specific
+page beats a generic fallback):
+
+- **`clean_urls: true`** — a would-be 404 on an extensionless path serves
+  `<path>.html` when it exists (`/bus/props-core` → `/bus/props-core.html`).
+  This mirrors GitHub Pages' pretty-URL behaviour, and is the fix for a
+  **pre-rendered page-per-route site** — a real page or a router stub at
+  every clean URL. A section page (`bus.html`) sitting beside its
+  children directory (`bus/`) resolves too: `/bus` serves the page,
+  `/bus/props-core` its child, and `/bus/` (trailing slash) stays a
+  directory request. `http_serve("docs", {clean_urls: true})` serves the
+  cosmix.dev docs tree locally, fully styled, as Pages does.
+- **`spa: true`** (or `spa: "shell.html"`) — a would-be 404 on an
+  extensionless path serves ONE shell, so a **single-shell SPA**'s
+  client-side router boots on every deep URL (`/users/42/settings` →
+  the shell → the router renders). Point it at any Vite/React build.
+  The shell path is checked at startup, not per request.
+
+Both are frontend-only, and the boundary is exact: a **static SPA** —
+assets from root, data from static files or a *separate* API — works
+completely; `http_serve` serves the app, never runs its backend. A path
+**with** an extension (`/main.css`, `/logo.png`) is never rewritten by
+either option, so a genuinely missing asset stays an honest 404 instead
+of silently becoming the HTML shell.
 
 **`http_recv` catches ONE request and answers it** — the OAuth
 localhost-redirect wait, the webhook test, the "curl me when the job is
