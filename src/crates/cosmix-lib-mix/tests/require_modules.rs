@@ -111,14 +111,16 @@ async fn caller_scope_and_registry_are_untouched() {
     .await
     .unwrap();
     // Pinned semantics:
-    // - `$m.ident()` UFCS-dispatches to the CALLER's `ident` (global
-    //   beats member — probe P3/P7); the index form forces the member.
+    // - `$m.ident()` reaches the MODULE's export (member beats a caller
+    //   function of the same name — the v0.72.0 flip; before it, UFCS won
+    //   and dot-call silently ran the caller's fn on the map). The index
+    //   form is equivalent.
     // - A module-fn free name that is NOT a module top-level resolves
     //   against the requiring program's globals at call time (named
     //   functions see globals live) — documented in the man page.
     assert_eq!(
         out,
-        "caller\ncaller-fn\nmodule\ncaller-fn\nmodule-fn\nnumber\n"
+        "caller\ncaller-fn\nmodule\nmodule-fn\nmodule-fn\nnumber\n"
     );
 }
 
@@ -456,17 +458,22 @@ async fn address_block_does_not_leak_into_module() {
 #[tokio::test]
 async fn method_call_precedence_pinned() {
     let dir = test_dir("precedence");
-    // (a) UFCS still wins over a member of the same name (probe P3/P7).
+    // (a) A function-valued MEMBER wins over a user function of the same
+    // name (v0.72.0 flip — before that UFCS won and the member was
+    // silently unreachable via dot-call). UFCS still serves names the
+    // map does not define.
     let out = run_in_dir(
         &dir,
         "function f($self, $x)\n  return \"global\" .. $x\nend\n\
          $m = { f: function($x) return \"member\" .. $x end }\n\
          print($m.f(1))\n\
-         print($m[\"f\"](1))\n",
+         print($m[\"f\"](1))\n\
+         $plain = { v: 1 }\n\
+         print($plain.f(2))\n",
     )
     .await
     .unwrap();
-    assert_eq!(out, "global1\nmember1\n");
+    assert_eq!(out, "member1\nmember1\nglobal2\n");
     // (b) builtins keep the UFCS desugar even against a same-named member.
     let out = run_in_dir(
         &dir,
@@ -674,19 +681,18 @@ async fn module_fn_shadowing_prelude_name_still_exports() {
     // The hoist runs AFTER the prelude-identity snapshot, so a module fn
     // redefining a prelude name is a fresh Rc and must still auto-export.
     // Uses `sum` (prelude-only; a native builtin name would outrank the
-    // module fn at its own call sites). Called via INDEX access: the
-    // pinned MethodCall precedence puts registry functions (UFCS) before
-    // map members, so `$m.sum(..)` would dispatch to the prelude with $m
-    // as the subject — index access is how a shadowing export is reached.
+    // module fn at its own call sites). Since the v0.72.0 member-wins
+    // flip, `$m.sum(..)` reaches the module's export directly; index
+    // access remains equivalent and both are pinned here.
     let dir = test_dir("hoist_prelude_shadow");
     write_module(&dir, "mod.mix", "fn sum($xs)\n  return -1\nend\n");
     let out = run_in_dir_with(
         &dir,
-        "$m = require(\"mod.mix\")\nprint(keys($m))\n$f = $m[\"sum\"]\nprint($f([1, 2]))\n",
+        "$m = require(\"mod.mix\")\nprint(keys($m))\n$f = $m[\"sum\"]\nprint($f([1, 2]))\nprint($m.sum([1, 2]))\n",
         true,
         |_| {},
     )
     .await
     .unwrap();
-    assert_eq!(out, "[sum]\n-1\n");
+    assert_eq!(out, "[sum]\n-1\n-1\n");
 }

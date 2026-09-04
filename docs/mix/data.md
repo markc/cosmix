@@ -517,6 +517,12 @@ Strict-data does **not** accept executable Mix's `;` statement separator — use
 newlines or commas. `data_parse("a: 1; b: 2")` raises a line-numbered
 strict-data violation rather than quietly widening the configuration format.
 
+A **missing comma** inside a braced map or list is named as exactly that
+(0.72.0): ``missing `,` after this map entry``, anchored at the line of the
+entry that lacks it. (It used to surface as `expected RBrace, got
+String("b")` at the line *after* the omission — the parser's state, not the
+author's mistake, and 20 lines away in a real config.)
+
 …and **rejects every executable construct** with a line-numbered error — that
 rejection is the whole point:
 

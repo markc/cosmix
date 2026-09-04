@@ -196,6 +196,17 @@ impl Parser {
         self.tokens.get(self.pos).map(|t| t.line).unwrap_or(0)
     }
 
+    /// Line of the most recently consumed token — the anchor for "something
+    /// is missing AFTER this" diagnostics (a missing separator is a defect
+    /// of the entry that lacks it, not of whatever happens to follow).
+    fn previous_line(&self) -> usize {
+        self.pos
+            .checked_sub(1)
+            .and_then(|i| self.tokens.get(i))
+            .map(|t| t.line)
+            .unwrap_or(0)
+    }
+
     /// Whether the current token is a double-quoted source literal containing
     /// an escaped quote. The lexer necessarily decodes `\"` to `"`; retain
     /// this one source fact for the ssh nested-quoting lint.
@@ -2234,6 +2245,19 @@ impl Parser {
                     return Err(self.strict_data_semicolon_error());
                 }
                 if !self.match_token(&Token::Comma) {
+                    // Same missing-separator diagnostic as parse_data_map:
+                    // anchor at the item that lacks its comma, not at
+                    // whatever token follows it.
+                    if !self.check(&Token::RBracket) && !self.is_at_end() {
+                        return Err(MixError::StrictDataViolation {
+                            construct: format!(
+                                "missing `,` after this list item (next token: {:?})",
+                                self.peek()
+                            ),
+                            line: self.previous_line(),
+                            hint: "separate `[ ]` list items with commas; a trailing comma before `]` is fine".into(),
+                        });
+                    }
                     break;
                 }
                 self.skip_newlines();
@@ -2272,6 +2296,22 @@ impl Parser {
                     return Err(self.strict_data_semicolon_error());
                 }
                 if !self.match_token(&Token::Comma) {
+                    // No comma and not the closing brace: the entry that
+                    // just ended is missing its separator. Say so, anchored
+                    // at that entry's END — the generic expect(RBrace) below
+                    // would name the NEXT entry's position and describe the
+                    // parser's state ("expected RBrace, got String") rather
+                    // than the author's mistake.
+                    if !self.check(&Token::RBrace) && !self.is_at_end() {
+                        return Err(MixError::StrictDataViolation {
+                            construct: format!(
+                                "missing `,` after this map entry (next token: {:?})",
+                                self.peek()
+                            ),
+                            line: self.previous_line(),
+                            hint: "separate `{ }` map entries with commas; a trailing comma before `}` is fine".into(),
+                        });
+                    }
                     break;
                 }
                 if self.check(&Token::RBrace) {

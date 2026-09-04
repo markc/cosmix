@@ -510,3 +510,46 @@ fn assert_value_eq(a: &Value, b: &Value) {
         (x, y) => panic!("type mismatch: {x:?} vs {y:?}"),
     }
 }
+
+// --- Missing-separator diagnostics (v0.72.0) ----------------------------------
+//
+// A missing comma used to be reported as `expected RBrace, got String("b")`
+// at the line AFTER the omission — the parser's wreckage, not the author's
+// mistake. The diagnostic now names the comma and anchors at the END of the
+// entry that lacks it.
+
+#[test]
+fn missing_map_comma_names_the_comma_and_the_right_line() {
+    let err = rejects("top: {\n  a: 1\n  b: 2\n}\n");
+    assert_violation(&err, "missing `,` after this map entry");
+    match &err {
+        MixError::StrictDataViolation { line, .. } => {
+            assert_eq!(*line, 2, "anchored at the entry missing its comma");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn missing_list_comma_names_the_comma() {
+    let err = rejects("xs: [1\n2]\n");
+    assert_violation(&err, "missing `,` after this list item");
+}
+
+#[test]
+fn unterminated_map_still_reports_expected_rbrace() {
+    // At EOF the missing thing really is the closing brace — the comma
+    // diagnostic must not hijack that case.
+    let err = rejects("top: {\n  a: 1\n");
+    assert!(
+        !format!("{err}").contains("missing `,`"),
+        "EOF is an unterminated map, not a missing comma: {err}"
+    );
+}
+
+#[test]
+fn trailing_commas_still_accepted() {
+    let v = p("m: {a: 1, b: 2,}\nxs: [1, 2,]\n");
+    let Value::Map(m) = &v else { panic!() };
+    assert!(m.contains_key("m") && m.contains_key("xs"));
+}

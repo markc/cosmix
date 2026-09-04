@@ -57,15 +57,18 @@ print($f("A B"))                     -- a-b
 
 ## Calling exports — precedence
 
-`$m.foo(args)` in expression position dispatches **name-first** for
-compatibility: a builtin, HOF, extension, or *your own* function named `foo`
-wins (the object becomes its first argument — the method-call sugar you
-already use as `$list.map($f)` or `$s.upper()`). Only when no such name
-exists is the map member called. Three consequences:
+`$m.foo(args)` dispatches **member-first** since 0.72.0: when `$m` has a
+**function-valued** member `foo`, that member is called (the flip that made
+exports named `sum`/`lines` reachable via dot-call — from 0.27.0 to 0.71 a
+free/prelude name won instead and the prelude ran on the stringified map).
+When no such member exists, the call is the usual UFCS sugar (`$list.map($f)`,
+`$s.upper()`), then an address-block send. Two collisions survive the flip:
 
-- An export whose name collides with a builtin or one of your functions must be called via the index form: `$m["map"](...)`, `$m["sum"](...)`.
-- In statement position a leading `$m.foo(1)` calls the **member** directly (this pre-dates require and is unchanged); the two positions only disagree when a member name collides with a global name — prefer the index form on any collision.
-- Inside an `address` block an unknown `$m.foo(...)` is still an implicit send; use `$m["foo"](...)` there.
+- An export named after a **builtin** must still be called via the index form (`$m["keys"](...)`) — a builtin-named dot-call desugars at parse time, before the member can be seen.
+- Serve-mode **extension** verbs outrank members by design — a citizen's map can never fake an injected `props.*` verb.
+
+The index form `$m["foo"](...)` calls the member unconditionally and remains
+the collision-proof spelling.
 
 `$m.foo` (no call) extracts the function value; `$f = $m.foo` then `$f(x)`
 always calls the member, collisions or not.

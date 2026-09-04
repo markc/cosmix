@@ -11481,25 +11481,36 @@ impl Evaluator {
                         return self.await_with_class_c_yield(fut).await?;
                     }
 
-                    // 2. User functions (UFCS).
-                    if let Some(func) = self.scope.get_function_owned(field) {
-                        self.track_function_attempt(field);
-                        return self.call_function(&func, &ufcs_args).await;
-                    }
-
-                    // 3. Address block: bit-for-bit with the old desugar —
-                    // the object rides along as `_0`.
-                    if !self.ctx.address_stack.is_empty() {
-                        return self.address_block_send(field, ufcs_args).await;
-                    }
-
-                    // 4. Map member holding a Function.
+                    // 2. Map member holding a Function — the OBJECT's own
+                    // function beats a registry (user/prelude) function of
+                    // the same name (v0.72.0; before that UFCS won, which
+                    // made a module export named `sum` or `lines` silently
+                    // unreachable via dot-call — the prelude function ran
+                    // on the stringified map instead). Extensions stay
+                    // ABOVE members on purpose: serve-mode injects reserved
+                    // verbs (props.*) as extensions, and a citizen's map
+                    // must never fake those. Builtin-named members remain
+                    // unreachable via dot-call — `.name(` where name is a
+                    // builtin desugars to a plain FunctionCall at PARSE
+                    // time; index access is still the spelling for those.
                     if let Value::Map(map) = &ufcs_args[0]
                         && let Some(Value::Function(rc)) = map.get(field)
                     {
                         let func = Rc::clone(rc);
                         self.track_function_attempt(field);
                         return self.call_function(&func, &ufcs_args[1..]).await;
+                    }
+
+                    // 3. User functions (UFCS).
+                    if let Some(func) = self.scope.get_function_owned(field) {
+                        self.track_function_attempt(field);
+                        return self.call_function(&func, &ufcs_args).await;
+                    }
+
+                    // 4. Address block: bit-for-bit with the old desugar —
+                    // the object rides along as `_0`.
+                    if !self.ctx.address_stack.is_empty() {
+                        return self.address_block_send(field, ufcs_args).await;
                     }
 
                     // 5. Enriched undefined error.

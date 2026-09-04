@@ -481,7 +481,7 @@ print($math["cube"](3))
 27
 ```
 
-**Dot-call works — with name-first precedence** (0.27.0+). `$math.square(5)` calls the member when no builtin/HOF/free function named `square` exists; if one does, the *free* name wins and the member is skipped (the same UFCS sugar that makes `$list.map($f)` work). `$math["square"](5)` always calls the member, collisions or not — use the index form for any name that might collide:
+**Dot-call works — member-first for function members** (0.72.0; 0.27.0–0.71 dispatched name-first). `$math.square(5)` calls the map's own `square` whenever the member exists **and holds a function** — even when a free/prelude function of the same name also exists (before 0.72.0 the free name won, which made a module export named `sum` or `lines` silently unreachable via dot-call). When the map has no function-valued member of that name, the call is ordinary UFCS sugar (`$list.map($f)`, `$s.upper()` — unchanged). Two residual collisions to know: a member named after a **builtin** is still unreachable via dot (the desugar happens at parse time), and serve-mode **extension** verbs still outrank members by design. `$math["square"](5)` calls the member unconditionally — the index form remains the collision-proof spelling:
 
 ```mix
 $math = { square: function($x) return $x * $x end }
