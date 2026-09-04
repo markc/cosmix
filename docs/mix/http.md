@@ -408,6 +408,60 @@ end
 - **Headers and methods are validated** to block request-line / header injection: a non-token method and a `bytes` header value are both rejected in-band (the former as `{status: 0, error}`, the latter as a runtime error).
 - **Don't confuse Mix-string `$(...)` with the URL.** In a double-quoted Mix string, `${name}` interpolates but `$(...)` is literal text — build URLs with `..` concat or `${...}`, e.g. `"https://example.com/api/" .. $id`. See [strings](strings.md).
 
+## Serving — `http_serve`, `http_recv` (v0.75.0)
+
+The other direction, deliberately minimal. **The boundary first**: no TLS
+ever, and no dynamic handlers — certificates, vhosts, and request
+dispatch to code are [webd]'s job and serve-mode citizens' job. What
+lives here is the pair of shapes an agent keeps needing locally:
+
+```
+http_serve(root[, {port, host, duration, index, listing, render_md, requests}])
+    -> requests served (BLOCKING)
+http_recv(port[, {timeout, host, max, respond}])
+    -> {method, path, query, headers, body, bytes, from_host, from_port} | nil
+```
+
+**`http_serve` is the `python -m http.server` slot**: serve a directory
+to a browser — docs preview, a build artifact, a report. GET and HEAD
+only; anything else answers 405. `port: 0` (the default) binds an
+ephemeral port and **prints the URL** before serving, so the caller
+always learns where. `host` defaults to `127.0.0.1`; exposing to the LAN
+is one explicit `host: "0.0.0.0"`. `duration` bounds the run in seconds
+(0 = until interrupted) — an in-flight request gets at most a 10-second
+read grace past it, so one slow client cannot hold the server open;
+`requests` stops after N exchanges; `listing`
+opts into directory indexes; `render_md` (markdown feature) serves `.md`
+files as styled HTML — `http_serve("docs/mix", {render_md: true})` is
+this manual in your browser, served by Mix.
+
+Traversal is the defended edge: the request path is percent-decoded
+*first*, then the resolved file is canonicalised and must remain under
+the canonicalised root — `../`, `%2e%2e%2f`, and symlinks inside the
+root pointing out all answer 403/404, and the tests prove each one
+against raw sockets (a polite HTTP client normalizes `../` away; an
+attacker's socket does not).
+
+**`http_recv` catches ONE request and answers it** — the OAuth
+localhost-redirect wait, the webhook test, the "curl me when the job is
+done" rendezvous. It blocks up to `timeout` seconds (default 30, 0 =
+forever), returns `nil` on timeout (an ordinary answer — poll again),
+and hands back the full request: `body` as UTF-8 or nil, `bytes` always
+the truth, headers lowercase-keyed. `respond` shapes the reply
+(`{status, body, content_type, headers}`, default `200 ok`); `max` caps
+the request body (default 1 MiB, refused with 413 beyond it).
+
+```mix
+-- wait for an OAuth redirect, answer the browser, extract the code
+$r = http_recv(8910, {timeout: 120, respond: {body: "You can close this tab.\n"}})
+if $r == nil then die "no redirect within 2 minutes" end
+$code = parse_query($r["query"])["code"]
+```
+
+Both are sequential, `Connection: close`, one exchange per connection —
+a browser and a script, not a load. The moment the words "certificate",
+"virtual host", or "route this to a function" appear, the answer is webd.
+
 ## See also
 
 - [data](data.md) — `json_parse`, `jq`, `data_encode`, `bytes_to_string` for parsing and serializing HTTP payloads

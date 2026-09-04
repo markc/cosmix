@@ -261,6 +261,8 @@ fn sensitive_builtins_stay_categorized() {
         ("ws_send", Network),
         ("ws_recv", Network),
         ("ws_close", Network),
+        ("http_serve", Network),
+        ("http_recv", Network),
         // Process
         ("run", Process),
         ("run_rc", Process),
