@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.77.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.78.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `yaml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`, `xml`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -106,6 +106,8 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   to_string       Convert value to its string representation
   is_number       Test if value is numeric or a numeric string
   is_empty        Test if string/list/map is empty, or value is nil ("0" is NOT empty)
+  has_builtin     Does THIS mix have the named builtin? has_builtin(name) -> bool. `mix builtins NAME` exits 0 for any name and cannot answer this; use for feature gates and compat shims: `if not has_builtin("ws_connect") then die "needs mix >= 0.74" end`. A feature-gated name absent from this build still reads true (the binary knows it, and calling raises 'requires the X feature') (v0.78.0)
+  mix_version     The language runtime version as structured data: {major, minor, patch, string} — so a version gate never parses --version text (v0.78.0)
 
 ## math  — see [math](math.md)
 
@@ -306,6 +308,11 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   ws_close        Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)
   http_serve      BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass "0.0.0.0" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)
   http_recv       Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -> {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 "ok"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)
+  tcp_connect     Open a raw TCP connection: tcp_connect(host, port[, {timeout, tls, insecure}]) -> numeric handle. tls:true wraps in TLS (ring-pinned, webpki roots); insecure:true skips cert verification. The stream-socket primitive for a line/binary protocol (SMTP/redis/memcached probe, banner grab) UDP/WS/HTTP don't cover (v0.78.0)
+  tcp_send        Send bytes on a TCP handle: tcp_send(h, payload) -> bytes sent (string/bytes/buffer, verbatim; flushed) (v0.78.0)
+  tcp_recv        Read available bytes: tcp_recv(h[, {timeout, max}]) -> bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever, wedges a serve pump), max default 64 KiB (v0.78.0)
+  tcp_recv_line   Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -> string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if `max` bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \r\n scanner (v0.78.0)
+  tcp_close       Close a TCP handle: true when live, false when unknown/already closed (never raises for that, like funlock) (v0.78.0)
   help            Show Mix builtin help in the REPL
   require         Load a Mix module: evaluate the file once in an isolated scope, return its exports (map of top-level fns + $vars, or the file's top-level return value). Cached per canonical path; cycles error (v0.27.0)
 

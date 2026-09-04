@@ -711,9 +711,27 @@ cwd()           current working directory
 chdir(path)     change the working directory (raises on failure)
 platform()      {os, arch} map
 which("cmd")    the PATH entry joined with cmd if EXECUTABLE, else nil
+has_builtin(n)  does THIS mix have the named builtin? -> bool (v0.78.0)
+mix_version()   {major, minor, patch, string} — the runtime version (v0.78.0)
 exit([code])    unwind finally, then terminate with status code (default 0)
 sleep(secs)     suspend for secs seconds (fractional ok; async-aware)
 ```
+
+`has_builtin(name)` and `mix_version()` are the **portability pair** — for
+a script that must run across a mixed-version fleet, or a compat shim.
+`mix builtins NAME` exits 0 for *any* name and cannot tell you whether a
+builtin exists, so `has_builtin` is the real yes/no:
+
+```mix
+if not has_builtin("ws_connect") then die("this needs mix >= 0.74") end
+$v = mix_version()
+if $v.major == 0 and $v.minor < 78 then die("needs mix >= 0.78.0") end
+```
+
+A feature-gated builtin missing from *this* build still reads `true` from
+`has_builtin` (the binary knows the name — calling it raises "requires the
+X feature"); that is the honest answer, distinct from a name the binary
+has never heard of.
 
 `env` reads an environment variable, returning `""` (not nil, no raise) when
 unset — distinct from the string-interpolation `${NAME}` form, which walks
@@ -1251,7 +1269,51 @@ print(ws_recv($h, 10))
 ws_close($h)
 ```
 
-Both UDP builtins above and all four `ws_*` are **Network**-class (below), like `http_*` and `dns_lookup` —
+## Raw TCP client — `tcp_connect`, `tcp_send`, `tcp_recv`, `tcp_recv_line`, `tcp_close` (v0.78.0)
+
+```
+tcp_connect(host, port[, {timeout, tls, insecure}]) -> handle
+tcp_send(h, payload)                    -> bytes sent (string/bytes/buffer)
+tcp_recv(h[, {timeout, max}])           -> bytes | nil on timeout
+tcp_recv_line(h[, {timeout, max}])      -> string (LF+CR stripped) | nil
+tcp_close(h)                            -> bool
+```
+
+The stream-socket primitive for a line-or-binary protocol that UDP, WS
+and HTTP don't cover — an SMTP/IMAP probe, a redis `PING`, memcached
+stats, a banner grab. `tls: true` wraps the connection (ring-pinned
+rustls, webpki roots); `insecure: true` skips certificate verification
+for a self-signed endpoint. Handles are process-global numbers like
+`sqlopen`/`ws_*`, one user per handle, reaped by the kernel on drop.
+
+`tcp_recv` returns whatever bytes are available (up to `max`, buffered
+bytes first) — **bytes, not a string**, because a stream has no message
+boundary; `nil` on timeout is an ordinary answer (poll again), and a peer
+**close RAISES** and retires the handle. `tcp_recv_line` is the
+line-protocol form: it buffers across reads and returns one line with its
+`\n` (and a trailing `\r`) stripped, so a caller speaking SMTP or redis
+never hand-rolls a `\r\n` scanner over accumulated bytes. `max` caps the
+line length (refused past it, so a peer that never sends a newline can't
+grow the buffer without bound).
+
+```mix
+$h = tcp_connect("mx.example.com", 25, {timeout: 10})
+print(tcp_recv_line($h, {timeout: 10}))          -- 220 banner
+tcp_send($h, "EHLO probe.local\r\n")
+loop
+  $line = tcp_recv_line($h, {timeout: 5})
+  if $line == nil then break end
+  print($line)
+  if not starts_with($line, "250-") then break end -- 250<space> = last line
+end
+tcp_close($h)
+```
+
+Same inline-blocking caveat as the others (below): a pending `tcp_recv`
+holds the evaluator's thread, so `{timeout: 0}` in a `--serve` citizen
+can wedge the pump.
+
+Both UDP builtins above, all four `ws_*`, and the five `tcp_*` are **Network**-class (below), like `http_*` and `dns_lookup` —
 and like those, the wait happens inline on the evaluator's thread. In a
 `--serve` citizen that means a pending `udp_recv` blocks the whole event pump
 for its duration; **never** pass `{timeout: 0}` there — unlike an HTTP call,

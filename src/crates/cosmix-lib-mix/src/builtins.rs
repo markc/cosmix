@@ -320,6 +320,8 @@ builtin_table! {
     ("cwd", CapabilityClass::Env,             "system",  "Return current working directory", contract!(() -> string)),
     ("chdir", CapabilityClass::Process,           "system",  "Change current working directory", contract!((path: string) -> nil; failure[raises])),
     ("platform", CapabilityClass::Env,        "system",  "Return OS platform string (linux, macos, windows, etc.)", contract!(() -> map("platform"))),
+    ("has_builtin", CapabilityClass::Pure,    "type",    "Does THIS mix have the named builtin? has_builtin(name) -> bool. `mix builtins NAME` exits 0 for any name and cannot answer this; use for feature gates and compat shims: `if not has_builtin(\"ws_connect\") then die \"needs mix >= 0.74\" end`. A feature-gated name absent from this build still reads true (the binary knows it, and calling raises 'requires the X feature') (v0.78.0)", contract!((name: string) -> bool)),
+    ("mix_version", CapabilityClass::Pure,    "type",    "The language runtime version as structured data: {major, minor, patch, string} — so a version gate never parses --version text (v0.78.0)", contract!(() -> map("mix_version"))),
     ("which", CapabilityClass::Env,           "system",  "Locate an EXECUTABLE in PATH: a PATH entry is returned only if it is a regular file the kernel says this process may execute (faccessat2 X_OK, so POSIX ACLs count), never merely a file that exists, and never a directory. cmd must be a string and is not coerced. Returns nil when nothing on PATH is runnable under that name (executability enforced since v0.52.0)", contract!((cmd: string) -> any_of(string, nil); failure[raises])),
     ("date_format", CapabilityClass::Pure,     "system",  "Format Unix timestamp with strftime pattern", contract!((ts: number, fmt?: string) -> string; failure[raises])),
     ("date_parse", CapabilityClass::Pure,      "system",  "Parse date string with strftime pattern into Unix timestamp", contract!((s: string) -> number)),
@@ -367,6 +369,11 @@ builtin_table! {
     ("ws_close", CapabilityClass::Network,        "system",  "Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)", contract!((handle: number) -> bool; failure[raises])),
     ("http_serve", CapabilityClass::Network,      "system",  "BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -> requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass \"0.0.0.0\" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)", contract!((root: string, opts?: map) -> number; effects[blocking]; failure[raises])),
     ("http_recv", CapabilityClass::Network,       "system",  "Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -> {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 \"ok\"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)", contract!((port: number, opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("tcp_connect", CapabilityClass::Network,     "system",  "Open a raw TCP connection: tcp_connect(host, port[, {timeout, tls, insecure}]) -> numeric handle. tls:true wraps in TLS (ring-pinned, webpki roots); insecure:true skips cert verification. The stream-socket primitive for a line/binary protocol (SMTP/redis/memcached probe, banner grab) UDP/WS/HTTP don't cover (v0.78.0)", contract!((host: string, port: number, opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("tcp_send", CapabilityClass::Network,        "system",  "Send bytes on a TCP handle: tcp_send(h, payload) -> bytes sent (string/bytes/buffer, verbatim; flushed) (v0.78.0)", contract!((handle: number, payload: any_of(string, bytes, buffer)) -> number; effects[blocking]; failure[raises])),
+    ("tcp_recv", CapabilityClass::Network,        "system",  "Read available bytes: tcp_recv(h[, {timeout, max}]) -> bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever, wedges a serve pump), max default 64 KiB (v0.78.0)", contract!((handle: number, opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("tcp_recv_line", CapabilityClass::Network,   "system",  "Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -> string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if `max` bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \\r\\n scanner (v0.78.0)", contract!((handle: number, opts?: map) -> any; effects[blocking]; failure[raises])),
+    ("tcp_close", CapabilityClass::Network,       "system",  "Close a TCP handle: true when live, false when unknown/already closed (never raises for that, like funlock) (v0.78.0)", contract!((handle: number) -> bool; failure[raises])),
     ("help", CapabilityClass::Pure,            "system",  "Show Mix builtin help in the REPL", contract!(() -> nil)),
 
     ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer). For byte-exact C-printf parity (%e %g %x, flags, glibc float rounding) use sprintf()", contract!((tmpl: string, args: ...any) -> string)),
@@ -647,6 +654,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "cwd" => builtin_cwd(args),
         "chdir" => builtin_chdir(args),
         "platform" => builtin_platform(args),
+        "has_builtin" => builtin_has_builtin(args),
+        "mix_version" => builtin_mix_version(args),
         "which" => builtin_which(args),
         "format_bytes" => builtin_format_bytes(args),
         "format_number" => builtin_format_number(args),
@@ -803,12 +812,24 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "ws_recv" => builtin_ws_recv(args),
         #[cfg(feature = "ws")]
         "ws_close" => builtin_ws_close(args),
-        // Registry lists the four unconditionally; a no-ws build refuses
+        #[cfg(feature = "ws")]
+        "tcp_connect" => builtin_tcp_connect(args),
+        #[cfg(feature = "ws")]
+        "tcp_send" => builtin_tcp_send(args),
+        #[cfg(feature = "ws")]
+        "tcp_recv" => builtin_tcp_recv(args),
+        #[cfg(feature = "ws")]
+        "tcp_recv_line" => builtin_tcp_recv_line(args),
+        #[cfg(feature = "ws")]
+        "tcp_close" => builtin_tcp_close(args),
+        // Registry lists these unconditionally; a no-ws build refuses
         // loudly rather than falling through to the silent-nil catch-all.
+        // (tcp_* share the ws feature's tungstenite/rustls stack.)
         #[cfg(not(feature = "ws"))]
-        name @ ("ws_connect" | "ws_send" | "ws_recv" | "ws_close") => Err(MixError::RuntimeError {
+        name @ ("ws_connect" | "ws_send" | "ws_recv" | "ws_close" | "tcp_connect" | "tcp_send"
+            | "tcp_recv" | "tcp_recv_line" | "tcp_close") => Err(MixError::RuntimeError {
             span: None,
-            msg: format!("{name}() requires the `ws` feature (tungstenite)"),
+            msg: format!("{name}() requires the `ws` feature (tungstenite/rustls)"),
         }),
         #[cfg(feature = "sqlite")]
         "sqlopen" => builtin_sqlopen(args),
@@ -12382,6 +12403,46 @@ fn builtin_platform(_args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::map(map)))
 }
 
+/// `has_builtin(name)` → bool — does THIS mix have the named builtin?
+/// `mix builtins NAME` exits 0 for any name, so it cannot answer this; a
+/// script gating on a feature (`if not has_builtin("ws_connect") then …`)
+/// or writing a compat shim needs a real yes/no. Reports the registry
+/// membership; a feature-gated builtin absent from THIS build still reads
+/// true (it is a known name that raises "requires the X feature"), which
+/// is the honest answer — the binary knows the name.
+fn builtin_has_builtin(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("has_builtin", &args, 1)?;
+    // BUILTIN_NAMES, NOT is_builtin(): is_builtin is the dispatch GATE and
+    // excludes the evaluator-special names (printf, read_stdin, …) that are
+    // nonetheless callable in every build. has_builtin must answer "is this
+    // a callable name", so it checks the full registry.
+    let name = args[0].to_mix_string();
+    Ok(Some(Value::Bool(BUILTIN_NAMES.contains(&name.as_str()))))
+}
+
+/// `mix_version()` → {major, minor, patch, string} — the language runtime
+/// version as structured data, so a version gate never parses `--version`
+/// text. This is the cosmix-lib-mix crate version (the interpreter), kept
+/// in lockstep with the `mix` binary's.
+fn builtin_mix_version(_args: Vec<Value>) -> MixResult<Option<Value>> {
+    let mut map = indexmap::IndexMap::new();
+    // Cargo supplies these split at compile time; parse-free and exact.
+    map.insert(
+        "major".into(),
+        Value::Number(env!("CARGO_PKG_VERSION_MAJOR").parse::<f64>().unwrap_or(0.0)),
+    );
+    map.insert(
+        "minor".into(),
+        Value::Number(env!("CARGO_PKG_VERSION_MINOR").parse::<f64>().unwrap_or(0.0)),
+    );
+    map.insert(
+        "patch".into(),
+        Value::Number(env!("CARGO_PKG_VERSION_PATCH").parse::<f64>().unwrap_or(0.0)),
+    );
+    map.insert("string".into(), Value::String(env!("CARGO_PKG_VERSION").into()));
+    Ok(Some(Value::map(map)))
+}
+
 /// `which` answers "can I run this?", so it must ask the kernel the same
 /// question `access()` does — not `is_file()`, which said yes to any regular
 /// file on PATH whether or not a single execute bit was set. A caller that
@@ -17155,6 +17216,413 @@ fn builtin_ws_close(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
+// --- Raw TCP client (v0.78.0, `ws` feature — shares its rustls stack) ---
+//
+// The last network shell-out class: a plain stream socket for an odd
+// line-or-binary protocol (SMTP/IMAP probe, redis PING, memcached stats,
+// a banner grab) that UDP/WS/HTTP don't cover. Handle registry + take-
+// out/put-back around I/O, exactly like ws_*; `tls:true` reuses ws's
+// ring-pinned connector. tcp_recv_line buffers per handle so a
+// line-protocol caller need not hand-roll a \r\n scanner over accumulated
+// bytes (the false-terminator class the rfc2047 work documented).
+
+#[cfg(feature = "ws")]
+mod tcp_client {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{LazyLock, Mutex};
+
+    pub(super) enum Stream {
+        Plain(std::net::TcpStream),
+        Tls(Box<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>),
+    }
+
+    /// One connection: the stream plus a read-ahead buffer that
+    /// tcp_recv_line owns (a line read may pull past the newline; those
+    /// bytes belong to the next read, not lost).
+    pub(super) struct Conn {
+        pub stream: Stream,
+        pub buf: Vec<u8>,
+    }
+
+    pub(super) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    pub(super) static MAP: LazyLock<Mutex<HashMap<u64, Conn>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    impl Conn {
+        /// The underlying TcpStream — where read/write timeouts live.
+        pub(super) fn tcp(&self) -> &std::net::TcpStream {
+            match &self.stream {
+                Stream::Plain(s) => s,
+                Stream::Tls(t) => t.get_ref(),
+            }
+        }
+        pub(super) fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match &mut self.stream {
+                Stream::Plain(s) => s.read(buf),
+                Stream::Tls(t) => t.read(buf),
+            }
+        }
+        pub(super) fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+            match &mut self.stream {
+                Stream::Plain(s) => s.write_all(buf).and_then(|_| s.flush()),
+                Stream::Tls(t) => t.write_all(buf).and_then(|_| t.flush()),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ws")]
+fn tcp_err(name: &str, msg: impl std::fmt::Display) -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: format!("{name}: {msg}"),
+    }
+}
+
+#[cfg(feature = "ws")]
+fn tcp_handle(name: &str, args: &[Value]) -> MixResult<u64> {
+    let n = number_arg(name, args, 0)?;
+    as_exact_integer(&format!("{name}(): handle"), n, 1, i64::MAX)?
+        .try_into()
+        .map_err(|_| tcp_err(name, "invalid handle"))
+}
+
+/// `tcp_connect(host, port[, {timeout, tls, insecure}])` → numeric handle.
+#[cfg(feature = "ws")]
+fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("tcp_connect", &args, 2, 3)?;
+    let host = args[0].to_mix_string();
+    let port = as_exact_integer("tcp_connect(): port", number_arg("tcp_connect", &args, 1)?, 1, 65535)? as u16;
+    let mut timeout_seconds = 30.0;
+    let mut tls = false;
+    let mut insecure = false;
+    if let Some(opts) = args.get(2) {
+        match opts {
+            Value::Nil => {}
+            Value::Map(m) => {
+                for k in m.keys() {
+                    if !matches!(k.as_str(), "timeout" | "tls" | "insecure") {
+                        return Err(tcp_err("tcp_connect()", format!("unknown option '{k}' (supported: timeout, tls, insecure)")));
+                    }
+                }
+                if let Some(v) = m.get("timeout") {
+                    timeout_seconds = extract_number(v, InputPolicy::NumberOnly)
+                        .ok_or_else(|| tcp_err("tcp_connect()", format!("option 'timeout' must be a number, got {}", v.type_name())))?;
+                    as_duration("tcp_connect(): option 'timeout'", timeout_seconds)?;
+                    if timeout_seconds == 0.0 {
+                        return Err(tcp_err("tcp_connect()", "option 'timeout' must be positive"));
+                    }
+                }
+                // Strict booleans (like ws_connect): a typo'd `{tls: "no"}`
+                // must not silently TLS-wrap, and `{insecure: "false"}`
+                // must not silently skip verification — the dangerous
+                // direction.
+                if let Some(v) = m.get("tls") {
+                    match v {
+                        Value::Bool(b) => tls = *b,
+                        other => return Err(tcp_err("tcp_connect()", format!("option 'tls' must be a boolean, got {}", other.type_name()))),
+                    }
+                }
+                if let Some(v) = m.get("insecure") {
+                    match v {
+                        Value::Bool(b) => insecure = *b,
+                        other => return Err(tcp_err("tcp_connect()", format!("option 'insecure' must be a boolean, got {}", other.type_name()))),
+                    }
+                }
+            }
+            other => return Err(tcp_err("tcp_connect()", format!("options must be a map or nil, got {}", other.type_name()))),
+        }
+    }
+    if insecure && !tls {
+        return Err(tcp_err("tcp_connect()", "option 'insecure' has no meaning without tls: true"));
+    }
+    let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
+
+    use std::net::ToSocketAddrs;
+    let resolve_host = host.trim_start_matches('[').trim_end_matches(']');
+    let addr = (resolve_host, port)
+        .to_socket_addrs()
+        .map_err(|e| tcp_err("tcp_connect", format!("resolve '{host}': {e}")))?
+        .next()
+        .ok_or_else(|| tcp_err("tcp_connect", format!("no address for '{host}'")))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let sock = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| tcp_err("tcp_connect", format!("'{host}:{port}': {e}")))?;
+    sock.set_nodelay(true).ok();
+    // Bound both directions from `{timeout}` at connect — otherwise a
+    // tcp_send blocks with no timeout at all (the ws_connect discipline).
+    // The read timeout is (re)set per recv; this seeds it and, crucially,
+    // bounds the TLS handshake driven just below.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(tcp_err("tcp_connect", "connect deadline exceeded"));
+    }
+    sock.set_read_timeout(Some(remaining)).ok();
+    sock.set_write_timeout(Some(remaining)).ok();
+
+    let stream = if tls {
+        // Build our own ring-pinned connector — a bare rustls builder
+        // PANICS under workspace feature unification (the two-provider
+        // trap the ws work documented). Verifying arm uses webpki roots;
+        // insecure arm uses the shared NoVerify.
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = if insecure {
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| tcp_err("tcp_connect", e))?
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(ws_client::NoVerify::new()))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| tcp_err("tcp_connect", e))?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
+        let server_name = rustls::pki_types::ServerName::try_from(resolve_host.to_string())
+            .map_err(|_| tcp_err("tcp_connect", format!("invalid TLS server name '{resolve_host}'")))?;
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), server_name)
+            .map_err(|e| tcp_err("tcp_connect", e))?;
+        let mut tls_stream = rustls::StreamOwned::new(conn, sock);
+        // Drive the handshake NOW, under the connect deadline (the socket
+        // still carries the remaining-time read/write timeouts). rustls is
+        // lazy — without this a cert failure would surface on the first
+        // tcp_send/recv, and the connect `{timeout}` would cover neither.
+        // flush() completes the pending handshake I/O.
+        use std::io::Write;
+        tls_stream
+            .flush()
+            .map_err(|e| tcp_err("tcp_connect", format!("TLS handshake: {e}")))?;
+        // Reset both timeouts to a benign 30s default. read=30s (not None)
+        // matters for the flush() early-Ok corner: if the handshake is
+        // still finishing lazily, the first tcp_send that drives it reads
+        // under a bound, not indefinitely. Each tcp_recv sets its own read
+        // timeout anyway, so this never shortens a later recv.
+        tls_stream.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        tls_stream.get_ref().set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        tcp_client::Stream::Tls(Box::new(tls_stream))
+    } else {
+        // Plain socket: benign 30s defaults (each recv overrides read).
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        sock.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        tcp_client::Stream::Plain(sock)
+    };
+
+    let id = tcp_client::NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tcp_client::MAP.lock().unwrap().insert(id, tcp_client::Conn { stream, buf: Vec::new() });
+    Ok(Some(Value::Number(id as f64)))
+}
+
+/// `tcp_send(h, payload)` → bytes sent (string/bytes/buffer, verbatim).
+#[cfg(feature = "ws")]
+fn builtin_tcp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("tcp_send", &args, 2)?;
+    let id = tcp_handle("tcp_send", &args)?;
+    let payload: Vec<u8> = match &args[1] {
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Bytes(b) => b.to_vec(),
+        Value::Buffer(b) => b.borrow().clone(),
+        other => return Err(tcp_err("tcp_send()", format!("payload must be a string, bytes or buffer, got {}", other.type_name()))),
+    };
+    let mut conn = tcp_client::MAP
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| tcp_err("tcp_send", format!("unknown tcp handle {id}")))?;
+    match conn.write_all(&payload) {
+        Ok(()) => {
+            let n = payload.len();
+            tcp_client::MAP.lock().unwrap().insert(id, conn);
+            Ok(Some(Value::Number(n as f64)))
+        }
+        Err(e) => Err(tcp_err("tcp_send", e)),
+    }
+}
+
+/// Shared read helper: pull one chunk under `timeout` (None = forever).
+/// Returns Ok(true) if bytes were read into conn.buf, Ok(false) on
+/// timeout, Err on a real error or peer close.
+#[cfg(feature = "ws")]
+fn tcp_fill(name: &str, conn: &mut tcp_client::Conn, timeout_seconds: f64, max: usize) -> MixResult<bool> {
+    let dur = if timeout_seconds == 0.0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs_f64(timeout_seconds))
+    };
+    conn.tcp().set_read_timeout(dur).map_err(|e| tcp_err(name, e))?;
+    // Read buffer sized to `max` but capped at 256 KiB per syscall — a
+    // single read returns at most this many bytes regardless, which is
+    // fine: tcp_recv serves buffered bytes first and the caller polls
+    // again, and tcp_recv_line loops. `max` bounds the RETURN/line size,
+    // not a single kernel read.
+    let mut tmp = vec![0u8; max.min(256 * 1024).max(1)];
+    // Bound the EINTR retry loop: in the mix CLI only SIGINT is handled
+    // (and it sets the interrupt flag, caught below), but an embedder that
+    // installs a periodic signal handler without the flag could otherwise
+    // livelock here. A generous cap converts that into a clean error.
+    let mut eintr = 0u32;
+    loop {
+        match conn.read(&mut tmp) {
+            Ok(0) => return Err(tcp_err(name, "connection closed by peer")),
+            Ok(n) => {
+                conn.buf.extend_from_slice(&tmp[..n]);
+                return Ok(true);
+            }
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            {
+                return Ok(false);
+            }
+            // A signal (Ctrl-C is the common one — signal-hook registers
+            // without SA_RESTART) interrupts the read; retrying keeps a
+            // healthy connection alive rather than retiring it on EINTR.
+            // But if it was Ctrl-C, stop retrying and let the timeout
+            // (or the interpreter's interrupt) take over.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if crate::interrupt::is_interrupted() {
+                    return Ok(false);
+                }
+                eintr += 1;
+                if eintr > 10_000 {
+                    return Err(tcp_err(name, "read interrupted repeatedly (a signal storm?)"));
+                }
+                continue;
+            }
+            Err(e) => return Err(tcp_err(name, e)),
+        }
+    }
+}
+
+/// `tcp_recv(h[, {timeout, max}])` → bytes (up to `max`, buffered bytes
+/// first) | nil on timeout. Bytes, not string: a stream has no frame
+/// boundary. A peer close RAISES + retires the handle (never the nil that
+/// means "quiet, poll again").
+#[cfg(feature = "ws")]
+fn builtin_tcp_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("tcp_recv", &args, 1, 2)?;
+    let id = tcp_handle("tcp_recv", &args)?;
+    let (timeout_seconds, max) = tcp_recv_opts("tcp_recv", args.get(1), 65536)?;
+    let mut conn = tcp_client::MAP
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| tcp_err("tcp_recv", format!("unknown tcp handle {id}")))?;
+    // Serve buffered bytes without a syscall if any are waiting.
+    if conn.buf.is_empty() {
+        match tcp_fill("tcp_recv", &mut conn, timeout_seconds, max) {
+            Ok(true) => {}
+            Ok(false) => {
+                tcp_client::MAP.lock().unwrap().insert(id, conn);
+                return Ok(Some(Value::Nil));
+            }
+            Err(e) => return Err(e), // close/error: handle already removed
+        }
+    }
+    let take = conn.buf.len().min(max);
+    let out: Vec<u8> = conn.buf.drain(..take).collect();
+    tcp_client::MAP.lock().unwrap().insert(id, conn);
+    Ok(Some(Value::bytes(out)))
+}
+
+/// `tcp_recv_line(h[, {timeout, max}])` → the next line as a string (LF
+/// terminator stripped, one trailing CR too) | nil on timeout. Buffers
+/// across reads; `max` caps the line length (refused past it). The
+/// line-protocol form — SMTP/redis speak lines, and hand-rolling a
+/// \r\n scanner over tcp_recv bytes rebuilds the false-terminator trap.
+#[cfg(feature = "ws")]
+fn builtin_tcp_recv_line(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("tcp_recv_line", &args, 1, 2)?;
+    let id = tcp_handle("tcp_recv_line", &args)?;
+    let (timeout_seconds, max) = tcp_recv_opts("tcp_recv_line", args.get(1), 65536)?;
+    let mut conn = tcp_client::MAP
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| tcp_err("tcp_recv_line", format!("unknown tcp handle {id}")))?;
+    let deadline = (timeout_seconds > 0.0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_seconds));
+    loop {
+        if let Some(nl) = conn.buf.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = conn.buf.drain(..=nl).collect();
+            line.pop(); // \n
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let s = String::from_utf8_lossy(&line).into_owned();
+            tcp_client::MAP.lock().unwrap().insert(id, conn);
+            return Ok(Some(Value::String(s)));
+        }
+        if conn.buf.len() > max {
+            return Err(tcp_err("tcp_recv_line", format!("line exceeds max ({max} bytes) with no newline")));
+        }
+        let left = match deadline {
+            None => 0.0, // forever
+            Some(d) => {
+                let l = d.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
+                if l <= 0.0 {
+                    tcp_client::MAP.lock().unwrap().insert(id, conn);
+                    return Ok(Some(Value::Nil));
+                }
+                l
+            }
+        };
+        match tcp_fill("tcp_recv_line", &mut conn, left, 65536) {
+            Ok(true) => continue,
+            Ok(false) => {
+                tcp_client::MAP.lock().unwrap().insert(id, conn);
+                return Ok(Some(Value::Nil));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(feature = "ws")]
+fn tcp_recv_opts(name: &str, opts: Option<&Value>, default_max: usize) -> MixResult<(f64, usize)> {
+    let mut timeout_seconds = 30.0;
+    let mut max = default_max;
+    if let Some(v) = opts {
+        match v {
+            Value::Nil => {}
+            Value::Map(m) => {
+                for k in m.keys() {
+                    if !matches!(k.as_str(), "timeout" | "max") {
+                        return Err(tcp_err(name, format!("unknown option '{k}' (supported: timeout, max)")));
+                    }
+                }
+                if let Some(t) = m.get("timeout") {
+                    timeout_seconds = extract_number(t, InputPolicy::NumberOnly)
+                        .ok_or_else(|| tcp_err(name, format!("option 'timeout' must be a number, got {}", t.type_name())))?;
+                    as_duration(&format!("{name}(): option 'timeout'"), timeout_seconds)?;
+                }
+                if let Some(x) = m.get("max") {
+                    let n = extract_number(x, InputPolicy::NumberOnly)
+                        .ok_or_else(|| tcp_err(name, format!("option 'max' must be a number, got {}", x.type_name())))?;
+                    max = as_exact_integer(&format!("{name}(): option 'max'"), n, 1, 64 * 1024 * 1024)? as usize;
+                }
+            }
+            other => return Err(tcp_err(name, format!("options must be a map or nil, got {}", other.type_name()))),
+        }
+    }
+    Ok((timeout_seconds, max))
+}
+
+/// `tcp_close(h)` → bool (true when live, false when unknown — funlock
+/// semantics; the kernel reaps the socket on drop).
+#[cfg(feature = "ws")]
+fn builtin_tcp_close(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("tcp_close", &args, 1)?;
+    let id = tcp_handle("tcp_close", &args)?;
+    Ok(Some(Value::Bool(
+        tcp_client::MAP.lock().unwrap().remove(&id).is_some(),
+    )))
+}
+
 // --- Minimal HTTP server primitives (v0.75.0) ---
 //
 // The python -m http.server slot, boundary-first (TODO-mix entry): NO
@@ -18210,6 +18678,7 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("           udp_send udp_recv (one datagram each way — v0.71.0)");
     println!("           ws_connect ws_send ws_recv ws_close (websocket client — v0.74.0)");
     println!("           http_serve http_recv (static server + one-shot catch — v0.75.0)");
+    println!("           tcp_connect tcp_send tcp_recv tcp_recv_line tcp_close (raw TCP client — v0.78.0)");
     println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
     println!("           bytes_ends_with bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
     println!("           (also $b[i], length, slice, `for each` — v0.64.0 — and take, drop,");
@@ -23451,6 +23920,98 @@ mod bytes_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // --- raw TCP client (v0.78.0) ---
+
+    /// Plain-TCP round trip against a local echo server: send bytes, read
+    /// them back (bytes, not string), read a line off a second exchange,
+    /// peer close raises + retires the handle.
+    #[cfg(feature = "ws")]
+    #[test]
+    fn tcp_client_round_trip_and_lines() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(&buf[..n]).unwrap();
+            s.flush().unwrap();
+            // Gap so the client's first recv sees ONLY the echo — TCP is a
+            // stream, and without the pause the lines below coalesce into
+            // that same read.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            s.write_all(b"+OK first\r\nsecond line\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(s);
+        });
+        let h = builtin_tcp_connect(vec![
+            Value::String("127.0.0.1".into()),
+            Value::Number(port as f64),
+        ])
+        .unwrap()
+        .unwrap();
+        let Value::Number(id) = h else { panic!("{h:?}") };
+        let opts = || {
+            let mut o = indexmap::IndexMap::new();
+            o.insert("timeout".to_string(), Value::Number(5.0));
+            Value::map(o)
+        };
+        builtin_tcp_send(vec![Value::Number(id), Value::String("ping".into())]).unwrap();
+        let got = builtin_tcp_recv(vec![Value::Number(id), opts()]).unwrap().unwrap();
+        match &got {
+            Value::Bytes(b) => assert_eq!(b.as_slice(), b"ping"),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+        assert_eq!(
+            builtin_tcp_recv_line(vec![Value::Number(id), opts()]).unwrap(),
+            Some(Value::String("+OK first".into()))
+        );
+        assert_eq!(
+            builtin_tcp_recv_line(vec![Value::Number(id), opts()]).unwrap(),
+            Some(Value::String("second line".into()))
+        );
+        let err = loop {
+            match builtin_tcp_recv(vec![Value::Number(id), opts()]) {
+                Ok(Some(Value::Nil)) => continue,
+                Ok(other) => panic!("expected close, got {other:?}"),
+                Err(e) => break e,
+            }
+        };
+        assert!(format!("{err}").contains("closed"), "{err}");
+        let err = builtin_tcp_recv(vec![Value::Number(id), opts()]).unwrap_err();
+        assert!(format!("{err}").contains("unknown tcp handle"), "retired: {err}");
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn tcp_recv_line_caps_a_runaway_line() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.write_all(&vec![b'x'; 5000]);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        let h = builtin_tcp_connect(vec![
+            Value::String("127.0.0.1".into()),
+            Value::Number(port as f64),
+        ])
+        .unwrap()
+        .unwrap();
+        let Value::Number(id) = h else { panic!() };
+        let mut o = indexmap::IndexMap::new();
+        o.insert("timeout".to_string(), Value::Number(5.0));
+        o.insert("max".to_string(), Value::Number(1000.0));
+        let err = builtin_tcp_recv_line(vec![Value::Number(id), Value::map(o)]).unwrap_err();
+        assert!(format!("{err}").contains("exceeds max"), "{err}");
+        builtin_tcp_close(vec![Value::Number(id)]).unwrap();
+        server.join().unwrap();
+    }
+
     // Ctrl-C ending a blocking http_serve is proven end-to-end by a
     // SUBPROCESS test (crates/cosmix-mix/tests/http_serve_signal.rs): the
     // interrupt flag is process-global, so arming it inside this test
@@ -23587,6 +24148,52 @@ mod bytes_tests {
     /// One representative pin for io.md's "anything else still refuses bytes
     /// with a clean error" sentence — a future sort-bytes arm must edit the
     /// doc, not silently falsify it.
+    #[test]
+    fn has_builtin_and_mix_version() {
+        // A real name, a feature-gated name (known → true), and a nonsense
+        // name (false).
+        assert_eq!(
+            builtin_has_builtin(vec![Value::String("substr".into())]).unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            builtin_has_builtin(vec![Value::String("ws_connect".into())]).unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            builtin_has_builtin(vec![Value::String("definitely_not_a_builtin_xyz".into())]).unwrap(),
+            Some(Value::Bool(false))
+        );
+        // The m1 fix: eval-special names (printf, read_stdin, …) are
+        // callable in every build, so has_builtin must report TRUE even
+        // though is_builtin (the dispatch gate) excludes them.
+        for evalspecial in ["printf", "read_stdin", "write_stdout", "readline"] {
+            assert!(
+                !is_builtin(evalspecial),
+                "{evalspecial} is an eval-special (gate excludes it)"
+            );
+            assert_eq!(
+                builtin_has_builtin(vec![Value::String(evalspecial.into())]).unwrap(),
+                Some(Value::Bool(true)),
+                "has_builtin({evalspecial}) must be true — it is callable"
+            );
+        }
+        // mix_version reports the same version the crate is built at, as
+        // parts and string, consistent with each other.
+        let v = builtin_mix_version(vec![]).unwrap().unwrap();
+        let Value::Map(m) = &v else { panic!("{v:?}") };
+        let Some(Value::String(s)) = m.get("string") else { panic!() };
+        assert_eq!(s, env!("CARGO_PKG_VERSION"));
+        let parts: Vec<String> = ["major", "minor", "patch"]
+            .iter()
+            .map(|k| match m.get(*k) {
+                Some(Value::Number(n)) => (*n as u64).to_string(),
+                other => panic!("{k}: {other:?}"),
+            })
+            .collect();
+        assert_eq!(parts.join("."), *s);
+    }
+
     #[test]
     fn sort_still_refuses_bytes() {
         let err = builtin_sort(vec![b(b"cab")]).unwrap_err();
@@ -24832,6 +25439,7 @@ mod char_aware_tests {
             // capability sense — they touch no host authority. "Pure" is not
             // "safe"; the warning lives in the description, not the class.
             "hash_md5",
+            "has_builtin",
             "hash_sha1",
             "hash_sha256",
             "has_key",
@@ -24858,6 +25466,7 @@ mod char_aware_tests {
             "markdown",
             "markdown_escape",
             "merge",
+            "mix_version",
             "now_iso",
             "parse_form",
             "parse_query",
