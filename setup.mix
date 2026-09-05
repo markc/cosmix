@@ -187,6 +187,24 @@ if $want_desktop then
     end
   end
   print(">> installed " .. $dn .. " desktop binaries into " .. $bin)
+  -- Desktop launchers use the same installed binary, with no restart sleep.
+  $data_home = env("XDG_DATA_HOME")
+  if $data_home == "" then
+    $data_home = env("HOME") .. "/.local/share"
+  end
+  $applications = $data_home .. "/applications"
+  mkdir($applications)
+  $qexec = replace($bin .. "/" .. $qship.bin, "\\", "\\\\\\\\")
+  $qexec = replace($qexec, "\"", "\\\\\"")
+  $qexec = replace($qexec, "`", "\\\\`")
+  $qexec = replace($qexec, "$", "\\\\$")
+  $qexec = replace($qexec, "%", "%%")
+  $entry = read_file($desktop .. "/apps/quoin/dev.cosmix.quoin.desktop")
+  $entry = replace($entry, "Exec=cosmix-quoin", "Exec=\"" .. $qexec .. "\"")
+  $entry_path = $applications .. "/dev.cosmix.quoin.desktop"
+  write_file($entry_path .. ".new", $entry)
+  rename($entry_path .. ".new", $entry_path)
+  print(">> installed " .. $entry_path)
 end
 
 -- 4. optional system install (sudo). Binaries only — see the header.

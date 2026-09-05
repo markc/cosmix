@@ -585,6 +585,8 @@ pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
 
 fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
     match kind {
+        ShellCommandKind::Quit => "quit",
+        ShellCommandKind::Resize { .. } => "resize",
         ShellCommandKind::Geometry(_) => "geometry",
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",
@@ -612,11 +614,74 @@ fn flush_staged_shell_commands(
 
 #[derive(Default)]
 pub(crate) struct PointerBridge {
+    resize: Option<ResizeSession>,
     focus: Option<Focus>,
     pressed: Vec<MouseButton>,
     axis_active: bool,
     diagnostics: u64,
     last_output_position: Option<Vec2>,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeSession {
+    edge: Edge,
+    button: MouseButton,
+    press_origin: Vec2,
+    starting_thickness: f32,
+    starting_extent: f32,
+    left_surface: bool,
+}
+
+impl ResizeSession {
+    fn thickness(self, raw: Vec2, configured_extent: f32) -> f32 {
+        // Equivalent to the emulation's grip-local, press-relative delta on
+        // each event. Left/top have a fixed surface origin; right/bottom move
+        // with the configured extent. Never add a delta to the last request:
+        // repeated events before configure must not compound the resize.
+        let (delta, origin_shift) = match self.edge {
+            Edge::Left => (raw.x - self.press_origin.x, 0.0),
+            Edge::Top => (raw.y - self.press_origin.y, 0.0),
+            Edge::Right => (
+                self.press_origin.x - raw.x,
+                configured_extent - self.starting_extent,
+            ),
+            Edge::Bottom => (
+                self.press_origin.y - raw.y,
+                configured_extent - self.starting_extent,
+            ),
+        };
+        let range = cosmix_shell::core::RESIZE_THICKNESS_RANGE;
+        (self.starting_thickness + origin_shift + delta.round()).clamp(*range.start(), *range.end())
+    }
+}
+
+fn configured_extent(app: &App, window: Entity, edge: Edge) -> Option<f32> {
+    let window = app.world().get::<Window>(window)?;
+    Some(match edge {
+        Edge::Left | Edge::Right => window.width(),
+        Edge::Top | Edge::Bottom => window.height(),
+    })
+}
+
+fn grip_contains(app: &mut App, edge: Edge, window: Entity, raw: Vec2) -> bool {
+    use bevy::ui::{ComputedNode, ComputedUiRenderTargetInfo, UiGlobalTransform};
+    use cosmix_shell::chrome::QuoinResizeGrip;
+    let Some(window) = app.world().get::<Window>(window) else {
+        return false;
+    };
+    if raw.x < 0.0 || raw.y < 0.0 || raw.x > window.width() || raw.y > window.height() {
+        return false;
+    }
+    let world = app.world_mut();
+    let mut grips = world.query::<(
+        &QuoinResizeGrip,
+        &ComputedNode,
+        &UiGlobalTransform,
+        &ComputedUiRenderTargetInfo,
+    )>();
+    grips.iter(world).any(|(grip, node, transform, target)| {
+        grip.0 == edge && node.contains_point(*transform, raw * target.scale_factor())
+    })
 }
 
 impl PointerBridge {
@@ -658,6 +723,9 @@ impl PointerBridge {
                         ),
                         (position, output_position(target, position)),
                     );
+                    if let Some(resize) = self.resize.as_mut() {
+                        resize.left_surface = false;
+                    }
                     handled = true;
                 }
                 PointerEventKind::Leave { .. } => {
@@ -678,6 +746,46 @@ impl PointerBridge {
                         .as_ref()
                         .is_none_or(|focus| focus.surface_id != event.surface.id().protocol_id())
                     {
+                        continue;
+                    }
+                    if self.resize.is_some() {
+                        if matches!(event.kind, PointerEventKind::Motion { .. })
+                            && let Some(raw) = raw_position(event.position)
+                        {
+                            self.resize_motion(app, output, target.window, raw);
+                        }
+                        if let PointerEventKind::Release { button, .. } = event.kind
+                            && let Some(button) = translate_button(button)
+                        {
+                            self.complete_resize(app, output, button);
+                        }
+                        handled = true;
+                        continue;
+                    }
+                    let Some(raw) = raw_position(event.position) else {
+                        self.reject("invalid-gesture-position");
+                        continue;
+                    };
+                    if let PointerEventKind::Press { button, .. } = event.kind
+                        && translate_button(button) == Some(MouseButton::Left)
+                        && self.pressed.is_empty()
+                        && grip_contains(app, target.edge, target.window, raw)
+                        && let Some(frame) = app
+                            .world()
+                            .get_resource::<cosmix_shell::runtime::ShellFrameState>()
+                        && frame.0.panel(target.edge).mapped
+                        && let Some(extent) = configured_extent(app, target.window, target.edge)
+                    {
+                        self.resize = Some(ResizeSession {
+                            edge: target.edge,
+                            button: MouseButton::Left,
+                            press_origin: raw,
+                            starting_thickness: frame.0.panel(target.edge).thickness_px,
+                            starting_extent: extent,
+                            left_surface: false,
+                        });
+                        semantic(app, output, target.edge, PanelInput::ResizeStarted);
+                        handled = true;
                         continue;
                     }
                     let Some(position) = valid_position(app, target.window, event.position) else {
@@ -790,6 +898,9 @@ impl PointerBridge {
         let Some(focus) = self.focus.clone() else {
             return false;
         };
+        if let Some(resize) = self.resize.take() {
+            semantic(app, output, resize.edge, PanelInput::ResizeCancelled);
+        }
         self.motion(app, focus.window, focus.position);
         if !self.pressed.is_empty() {
             cancel_picking_press(app);
@@ -797,6 +908,33 @@ impl PointerBridge {
         self.release_state(app, focus.window);
         self.leave(app, output);
         true
+    }
+
+    fn resize_motion(&self, app: &mut App, output: &OutputKey, window: Entity, raw: Vec2) {
+        if let Some(resize) = self.resize
+            && let Some(extent) = configured_extent(app, window, resize.edge)
+        {
+            stage_shell_command(
+                app,
+                output.clone(),
+                ShellCommandKind::Resize {
+                    edge: resize.edge,
+                    thickness_px: resize.thickness(raw, extent),
+                },
+            );
+        }
+    }
+
+    fn complete_resize(&mut self, app: &mut App, output: &OutputKey, button: MouseButton) {
+        if let Some(resize) = self.resize
+            && resize.button == button
+        {
+            self.resize = None;
+            semantic(app, output, resize.edge, PanelInput::ResizeCompleted);
+            if resize.left_surface {
+                self.leave(app, output);
+            }
+        }
     }
 
     fn release_state(&mut self, app: &mut App, window: Entity) {
@@ -858,6 +996,11 @@ impl PointerBridge {
     }
 
     fn leave(&mut self, app: &mut App, output: &OutputKey) {
+        if let Some(resize) = self.resize.as_mut() {
+            resize.left_surface = true;
+            semantic(app, output, resize.edge, PanelInput::PointerLeft);
+            return;
+        }
         let Some(focus) = self.focus.take() else {
             return;
         };
@@ -957,7 +1100,7 @@ fn cancel_picking_press(app: &mut App) {
     }
 }
 
-fn valid_position(app: &App, window: Entity, position: (f64, f64)) -> Option<Vec2> {
+fn raw_position(position: (f64, f64)) -> Option<Vec2> {
     if !position.0.is_finite() || !position.1.is_finite() {
         return None;
     }
@@ -965,6 +1108,11 @@ fn valid_position(app: &App, window: Entity, position: (f64, f64)) -> Option<Vec
     if !position.is_finite() {
         return None;
     }
+    Some(position)
+}
+
+fn valid_position(app: &App, window: Entity, position: (f64, f64)) -> Option<Vec2> {
+    let position = raw_position(position)?;
     let window = app.world().get::<Window>(window)?;
     Some(Vec2::new(
         position.x.clamp(0.0, window.width()),
@@ -1074,6 +1222,125 @@ mod tests {
             })
             .id();
         (app, window, OutputKey::new("DP-1").unwrap())
+    }
+
+    fn resize_session(edge: Edge) -> ResizeSession {
+        ResizeSession {
+            edge,
+            button: MouseButton::Left,
+            press_origin: Vec2::splat(3.0),
+            starting_thickness: 200.0,
+            starting_extent: 200.0,
+            left_surface: false,
+        }
+    }
+
+    #[test]
+    fn raw_resize_delta_handles_all_edges_configure_lag_and_clamps() {
+        for edge in Edge::ALL {
+            let session = resize_session(edge);
+            let sign = if matches!(edge, Edge::Left | Edge::Top) {
+                1.0
+            } else {
+                -1.0
+            };
+            let outward = Vec2::splat(3.0 + sign * 50.0);
+            for _ in 0..4 {
+                assert_eq!(session.thickness(outward, 200.0), 250.0);
+            }
+            let landed = if sign > 0.0 {
+                outward
+            } else {
+                Vec2::splat(3.0)
+            };
+            assert_eq!(session.thickness(landed, 250.0), 250.0);
+            assert_eq!(
+                session.thickness(Vec2::splat(3.0 - sign * 50.0), 200.0),
+                150.0
+            );
+            assert_eq!(session.thickness(Vec2::splat(sign * 1000.0), 200.0), 500.0);
+            assert_eq!(session.thickness(Vec2::splat(-sign * 1000.0), 200.0), 120.0);
+        }
+        assert_eq!(raw_position((-40.0, 600.0)), Some(Vec2::new(-40.0, 600.0)));
+        assert_eq!(raw_position((f64::MAX, 0.0)), None);
+        assert_eq!(raw_position((f64::NAN, 0.0)), None);
+    }
+
+    #[test]
+    fn resize_native_leave_retains_session_and_matching_release_completes_once() {
+        let (mut app, window, output) = pointer_app();
+        let mut bridge = PointerBridge::default();
+        bridge.enter(
+            &mut app,
+            &output,
+            (1, window, Edge::Left),
+            (Vec2::ZERO, Vec2::ZERO),
+        );
+        bridge.resize = Some(resize_session(Edge::Left));
+        bridge.leave(&mut app, &output);
+        assert!(bridge.focus.is_some());
+        assert!(bridge.resize.unwrap().left_surface);
+        bridge.complete_resize(&mut app, &output, MouseButton::Right);
+        assert!(bridge.resize.is_some());
+        bridge.complete_resize(&mut app, &output, MouseButton::Left);
+        bridge.complete_resize(&mut app, &output, MouseButton::Left);
+        assert!(bridge.focus.is_none());
+        let staged = &app.world().resource::<StagedShellCommands>().0;
+        assert_eq!(
+            staged
+                .iter()
+                .filter(|(_, kind)| matches!(
+                    kind,
+                    ShellCommandKind::Panel {
+                        input: PanelInput::ResizeCompleted,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.world().resource::<Messages<MouseButtonInput>>().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn resize_cleanup_after_leave_cancels_without_synthetic_completion() {
+        let (mut app, window, output) = pointer_app();
+        let mut bridge = PointerBridge::default();
+        bridge.enter(
+            &mut app,
+            &output,
+            (1, window, Edge::Right),
+            (Vec2::ZERO, Vec2::ZERO),
+        );
+        bridge.resize = Some(resize_session(Edge::Right));
+        bridge.leave(&mut app, &output);
+        assert!(bridge.cleanup(&mut app, &output, Some(window)));
+        bridge.complete_resize(&mut app, &output, MouseButton::Left);
+        assert!(bridge.resize.is_none());
+        let staged = &app.world().resource::<StagedShellCommands>().0;
+        assert_eq!(
+            staged
+                .iter()
+                .filter(|(_, kind)| matches!(
+                    kind,
+                    ShellCommandKind::Panel {
+                        input: PanelInput::ResizeCancelled,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!staged.iter().any(|(_, kind)| matches!(
+            kind,
+            ShellCommandKind::Panel {
+                input: PanelInput::ResizeCompleted,
+                ..
+            }
+        )));
     }
 
     #[derive(Resource, Default)]

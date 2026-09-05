@@ -24,7 +24,7 @@ use bevy::prelude::*;
 use bevy::ui::{InteractionDisabled, UiRect, Val2, percent, px};
 use bevy::ui_widgets::Activate;
 use bevy::window::RequestRedraw;
-use ctk::theme::tokens;
+use ctk::theme::{Mode, Scheme, ThemeSpec, ThemeState, tokens};
 
 use crate::core::{Carousel, CarouselError, Edge, Orientation, PanelInput, PanelMode};
 use crate::runtime::{
@@ -330,6 +330,13 @@ pub struct QuoinChromeProps {
 #[derive(Component)]
 pub struct QuoinClock;
 
+/// Native host hit-tests this rendered strip before dispatching ordinary buttons.
+/// Its computed transform includes the committed-motion chrome translation.
+#[derive(Component)]
+pub struct QuoinResizeGrip(pub Edge);
+
+const RESIZE_GRIP_PX: f32 = 6.0;
+
 #[derive(Component)]
 struct QuoinPanelChrome {
     edge: Edge,
@@ -371,8 +378,14 @@ struct QuoinControl {
     action: QuoinAction,
 }
 
+#[derive(Component)]
+struct QuoinControlPage(String);
+
 #[derive(Clone)]
 enum QuoinAction {
+    Scheme(Scheme),
+    Intent,
+    Quit,
     TogglePin,
     Previous,
     Next,
@@ -385,6 +398,7 @@ pub struct QuoinChromePlugin;
 impl Plugin for QuoinChromePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<InputFocus>()
+            .add_message::<QuoinSchemeSelected>()
             .add_observer(on_activate)
             .add_systems(
                 Update,
@@ -394,9 +408,19 @@ impl Plugin for QuoinChromePlugin {
             )
             .add_systems(
                 Update,
-                (present_panels, present_content)
+                (
+                    present_panels,
+                    present_page_controls,
+                    present_content,
+                    present_navlinks,
+                    present_resize_grips,
+                )
                     .chain()
                     .in_set(ShellRuntimeSet::Presentation),
+            )
+            .add_systems(
+                PostUpdate,
+                present_scheme_dots.before(bevy::ui::UiSystems::Layout),
             );
     }
 }
@@ -569,7 +593,59 @@ fn spawn_panel(
         ))
         .add_children(&[header, page_host])
         .id();
+    let grip = commands
+        .spawn((
+            QuoinResizeGrip(edge),
+            Node {
+                position_type: PositionType::Absolute,
+                left: if edge == Edge::Left { Val::Auto } else { px(0) },
+                right: if edge == Edge::Right {
+                    Val::Auto
+                } else {
+                    px(0)
+                },
+                top: if edge == Edge::Top { Val::Auto } else { px(0) },
+                bottom: if edge == Edge::Bottom {
+                    Val::Auto
+                } else {
+                    px(0)
+                },
+                width: if horizontal {
+                    Val::Auto
+                } else {
+                    px(RESIZE_GRIP_PX)
+                },
+                height: if horizontal {
+                    px(RESIZE_GRIP_PX)
+                } else {
+                    Val::Auto
+                },
+                ..default()
+            },
+            Pickable::default(),
+            Hovered::default(),
+            BackgroundColor(Color::NONE),
+            ZIndex(10),
+        ))
+        .id();
+    commands.entity(root).add_child(grip);
     commands.entity(mount).add_child(root);
+}
+
+fn present_resize_grips(
+    frame: Res<ShellFrameState>,
+    mut grips: Query<(&QuoinResizeGrip, &Hovered, &mut BackgroundColor)>,
+) {
+    for (grip, hovered, mut colour) in &mut grips {
+        let alpha = if frame.0.panel(grip.0).resize_active {
+            0.8
+        } else if hovered.0 {
+            0.5
+        } else {
+            0.0
+        };
+        colour.0 = Color::srgba(0.3, 0.65, 1.0, alpha);
+    }
 }
 
 fn panel_border(edge: Edge) -> UiRect {
@@ -579,6 +655,16 @@ fn panel_border(edge: Edge) -> UiRect {
         Edge::Right => UiRect::left(px(1)),
         Edge::Top => UiRect::bottom(px(1)),
     }
+}
+
+/// A quit control follows the same semantic command path as Bus quit.
+pub fn quoin_quit_button(commands: &mut Commands, edge: Edge, page: &str) -> Entity {
+    let label = text(commands, "Quit Quoin", 14.0, false);
+    let entity = button(commands, edge, QuoinAction::Quit, label, "Quit Quoin");
+    commands
+        .entity(entity)
+        .insert(QuoinControlPage(page.to_owned()));
+    entity
 }
 
 fn button(
@@ -616,6 +702,187 @@ fn button(
         .id()
 }
 
+/// A page target must be a valid carousel identity; places may defer their action.
+#[derive(Clone)]
+pub enum NavLinkTarget {
+    Page(String),
+    Intent,
+}
+
+/// One active row per page-local intent group; page links follow the model.
+#[derive(Component)]
+pub struct NavLink {
+    icon: Entity,
+    label: Entity,
+    active: bool,
+}
+
+/// Labels collapse below rail thickness without changing the accessible name.
+pub fn navlink(
+    commands: &mut Commands,
+    edge: Edge,
+    page: &str,
+    icon: &str,
+    label: &str,
+    target: NavLinkTarget,
+) -> Result<Entity, CarouselError> {
+    Carousel::new([page])?;
+    let action = match target {
+        NavLinkTarget::Page(id) => {
+            Carousel::new([id.as_str()])?;
+            QuoinAction::Select(id)
+        }
+        NavLinkTarget::Intent => QuoinAction::Intent,
+    };
+    let glyph = text(commands, icon, 15.0, true);
+    let caption = text(commands, label, 14.0, true);
+    let entity = button(commands, edge, action, glyph, label);
+    commands.entity(entity).add_child(caption).insert((
+        Node {
+            width: percent(100),
+            min_height: px(28),
+            flex_shrink: 0.0,
+            padding: UiRect::axes(px(8), px(4)),
+            column_gap: px(8),
+            align_items: AlignItems::Center,
+            border_radius: BorderRadius::all(px(6)),
+            ..default()
+        },
+        QuoinControlPage(page.to_owned()),
+        NavLink {
+            icon: glyph,
+            label: caption,
+            active: false,
+        },
+    ));
+    Ok(entity)
+}
+
+fn navlink_tokens(
+    active: bool,
+    hovered: bool,
+) -> (
+    bevy::feathers::theme::ThemeToken,
+    bevy::feathers::theme::ThemeToken,
+) {
+    (
+        if active || hovered {
+            tokens::ROW_HOVER
+        } else {
+            tokens::PANEL
+        },
+        if active {
+            tokens::CONTROL_ACTIVE
+        } else {
+            tokens::TEXT_DIM
+        },
+    )
+}
+
+fn present_navlinks(
+    mut commands: Commands,
+    frame: Res<ShellFrameState>,
+    links: Query<(
+        Entity,
+        &QuoinControl,
+        &NavLink,
+        &Hovered,
+        &bevy::feathers::theme::ThemeBackgroundColor,
+    )>,
+    mut labels: Query<(&mut Node, &bevy::feathers::theme::ThemeTextColor), Without<NavLink>>,
+) {
+    for (entity, control, link, hovered, background) in &links {
+        let panel = frame.0.panel(control.edge);
+        let active = match &control.action {
+            QuoinAction::Select(id) => panel.active_page_id.as_deref() == Some(id),
+            _ => link.active,
+        };
+        let (bg, fg) = navlink_tokens(active, hovered.0 && panel.mapped);
+        if background.0 != bg {
+            commands
+                .entity(entity)
+                .insert(bevy::feathers::theme::ThemeBackgroundColor(bg));
+        }
+        for entity in [link.icon, link.label] {
+            if let Ok((mut node, color)) = labels.get_mut(entity) {
+                if color.0 != fg {
+                    commands
+                        .entity(entity)
+                        .insert(bevy::feathers::theme::ThemeTextColor(fg.clone()));
+                }
+                node.display = if entity == link.label && panel.thickness_px < 110.0 {
+                    Display::None
+                } else {
+                    Display::Flex
+                };
+            }
+        }
+    }
+}
+
+/// Only an enabled, visible scheme control emits a selection.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct QuoinSchemeSelected(pub Scheme);
+
+#[derive(Component)]
+struct SchemeDot(Scheme);
+
+/// Preview colours are independent of the currently applied palette.
+pub fn scheme_dot(
+    commands: &mut Commands,
+    edge: Edge,
+    page: &str,
+    scheme: Scheme,
+) -> Result<Entity, CarouselError> {
+    Carousel::new([page])?;
+    let label = text(commands, "", 1.0, true);
+    let entity = button(
+        commands,
+        edge,
+        QuoinAction::Scheme(scheme),
+        label,
+        scheme.name(),
+    );
+    commands
+        .entity(entity)
+        .remove::<bevy::feathers::theme::ThemeBackgroundColor>()
+        .insert((
+            Node {
+                width: px(26),
+                height: px(26),
+                flex_shrink: 0.0,
+                border: UiRect::all(px(2)),
+                border_radius: BorderRadius::MAX,
+                ..default()
+            },
+            BackgroundColor(
+                ThemeSpec::from_scheme(scheme, Mode::Dark)
+                    .colors
+                    .control_active,
+            ),
+            BorderColor::all(Color::NONE),
+            SchemeDot(scheme),
+            QuoinControlPage(page.to_owned()),
+        ));
+    Ok(entity)
+}
+
+fn present_scheme_dots(
+    theme: Option<Res<ThemeState>>,
+    mut dots: Query<(&SchemeDot, &mut BorderColor)>,
+) {
+    let Some(theme) = theme else {
+        return;
+    };
+    for (dot, mut border) in &mut dots {
+        *border = BorderColor::all(if dot.0 == theme.scheme {
+            Color::WHITE
+        } else {
+            Color::NONE
+        });
+    }
+}
+
 fn text(commands: &mut Commands, value: &str, size: f32, dim: bool) -> Entity {
     commands
         .spawn((
@@ -631,21 +898,55 @@ fn text(commands: &mut Commands, value: &str, size: f32, dim: bool) -> Entity {
         .id()
 }
 
+#[derive(SystemParam)]
+struct ChromeRequests<'w> {
+    commands: MessageWriter<'w, ShellCommand>,
+    redraw: MessageWriter<'w, RequestRedraw>,
+    schemes: MessageWriter<'w, QuoinSchemeSelected>,
+}
+
 fn on_activate(
     activated: On<Activate>,
-    controls: Query<(&QuoinControl, Has<InteractionDisabled>)>,
+    controls: Query<(
+        &QuoinControl,
+        Has<InteractionDisabled>,
+        Option<&QuoinControlPage>,
+    )>,
     frame: Res<ShellFrameState>,
     time: Res<Time<Real>>,
-    mut commands: MessageWriter<ShellCommand>,
-    mut redraw: MessageWriter<RequestRedraw>,
+    mut requests: ChromeRequests,
+    mut links: Query<(Entity, &QuoinControl, &QuoinControlPage, &mut NavLink)>,
 ) {
-    let Ok((control, disabled)) = controls.get(activated.entity) else {
+    let Ok((control, disabled, page)) = controls.get(activated.entity) else {
         return;
     };
-    if disabled || !frame.0.panel(control.edge).mapped {
+    if disabled
+        || !frame.0.panel(control.edge).mapped
+        || page.is_some_and(|page| {
+            frame.0.panel(control.edge).active_page_id.as_deref() != Some(page.0.as_str())
+        })
+    {
         return;
     }
     let kind = match &control.action {
+        QuoinAction::Scheme(scheme) => {
+            requests.schemes.write(QuoinSchemeSelected(*scheme));
+            requests.redraw.write(RequestRedraw);
+            return;
+        }
+        QuoinAction::Intent => {
+            for (entity, other, other_page, mut link) in &mut links {
+                if other.edge == control.edge
+                    && page.is_some_and(|page| page.0 == other_page.0)
+                    && matches!(other.action, QuoinAction::Intent)
+                {
+                    link.active = entity == activated.entity;
+                }
+            }
+            requests.redraw.write(RequestRedraw);
+            return;
+        }
+        QuoinAction::Quit => ShellCommandKind::Quit,
         QuoinAction::TogglePin => ShellCommandKind::Panel {
             edge: control.edge,
             input: if frame.0.panel(control.edge).mode == PanelMode::Pinned {
@@ -667,14 +968,14 @@ fn on_activate(
             input: CarouselInput::SelectId(id.clone()),
         },
     };
-    commands.write(ShellCommand {
+    requests.commands.write(ShellCommand {
         output: frame.0.geometry.output.clone(),
         at: time.elapsed(),
         kind,
     });
     // Activate is produced by the widget layer during Update and may occur
     // after the model set. Guarantee one follow-up pass in reactive mode.
-    redraw.write(RequestRedraw);
+    requests.redraw.write(RequestRedraw);
 }
 
 fn panel_hover(
@@ -807,6 +1108,33 @@ fn present_panels(
                     "○".to_owned()
                 };
             }
+        }
+    }
+}
+
+fn present_page_controls(
+    mut commands: Commands,
+    frame: Res<ShellFrameState>,
+    mut focus: ResMut<InputFocus>,
+    mut controls: Query<(
+        Entity,
+        &QuoinControl,
+        &QuoinControlPage,
+        &mut TabIndex,
+        Has<InteractionDisabled>,
+    )>,
+) {
+    for (entity, control, page, mut tab, disabled) in &mut controls {
+        let panel = frame.0.panel(control.edge);
+        let enabled = panel.mapped && panel.active_page_id.as_deref() == Some(page.0.as_str());
+        tab.0 = if enabled { 0 } else { -1 };
+        if enabled && disabled {
+            commands.entity(entity).remove::<InteractionDisabled>();
+        } else if !enabled && !disabled {
+            commands.entity(entity).insert(InteractionDisabled);
+        }
+        if !enabled && focus.get() == Some(entity) {
+            focus.clear();
         }
     }
 }
@@ -1015,6 +1343,120 @@ mod tests {
             .next()
             .expect("pointer click activates the chrome control")
             .kind
+    }
+
+    #[test]
+    fn navlink_active_and_hover_resolve_independently() {
+        assert_eq!(
+            navlink_tokens(false, false),
+            (tokens::PANEL, tokens::TEXT_DIM)
+        );
+        assert_eq!(
+            navlink_tokens(false, true),
+            (tokens::ROW_HOVER, tokens::TEXT_DIM)
+        );
+        for hovered in [false, true] {
+            assert_eq!(
+                navlink_tokens(true, hovered),
+                (tokens::ROW_HOVER, tokens::CONTROL_ACTIVE)
+            );
+        }
+    }
+
+    #[test]
+    fn navlink_label_tracks_panel_thickness_and_active_theme_binding() {
+        let registry = QuoinPageRegistry::new(
+            vec![spec("nav")],
+            vec![spec("launcher")],
+            vec![spec("monitor")],
+            vec![spec("status")],
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.insert_resource(ShellFrameState(frame_for(&registry)));
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let entity = navlink(
+            &mut Commands::new(&mut queue, app.world()),
+            Edge::Left,
+            "nav",
+            "⊞",
+            "Apps",
+            NavLinkTarget::Page("nav".into()),
+        )
+        .unwrap();
+        queue.apply(app.world_mut());
+        let label = app.world().get::<NavLink>(entity).unwrap().label;
+        for (thickness, display) in [(109.0, Display::None), (110.0, Display::Flex)] {
+            app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Left.index()]
+                .thickness_px = thickness;
+            app.world_mut().run_system_once(present_navlinks).unwrap();
+            assert_eq!(app.world().get::<Node>(label).unwrap().display, display);
+            assert_eq!(
+                app.world()
+                    .get::<bevy::feathers::theme::ThemeTextColor>(label)
+                    .unwrap()
+                    .0,
+                tokens::CONTROL_ACTIVE
+            );
+        }
+    }
+
+    #[test]
+    fn quit_button_only_activates_on_its_visible_page() {
+        let registry = QuoinPageRegistry::new(
+            vec![spec("nav")],
+            vec![spec("launcher"), spec("power")],
+            vec![spec("monitor"), spec("agents")],
+            vec![spec("status")],
+        )
+        .unwrap();
+        let mut frame = frame_for(&registry);
+        frame.panels[Edge::Right.index()].mapped = true;
+        let mut app = App::new();
+        app.insert_resource(ShellFrameState(frame))
+            .insert_resource(Time::<Real>::default())
+            .init_resource::<InputFocus>()
+            .add_message::<ShellCommand>()
+            .add_message::<RequestRedraw>()
+            .add_message::<QuoinSchemeSelected>()
+            .add_observer(on_activate);
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let entity = quoin_quit_button(
+            &mut Commands::new(&mut queue, app.world()),
+            Edge::Right,
+            "monitor",
+        );
+        queue.apply(app.world_mut());
+        app.world_mut()
+            .run_system_once(present_page_controls)
+            .unwrap();
+        assert!(!app.world().entity(entity).contains::<InteractionDisabled>());
+        app.world_mut().trigger(Activate { entity });
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<ShellCommand>>()
+                .drain()
+                .next()
+                .unwrap()
+                .kind,
+            ShellCommandKind::Quit
+        );
+        app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Right.index()]
+            .active_page_id = Some("agents".into());
+        app.world_mut()
+            .run_system_once(present_page_controls)
+            .unwrap();
+        assert!(app.world().entity(entity).contains::<InteractionDisabled>());
+        app.world_mut().trigger(Activate { entity });
+        assert!(app.world().resource::<Messages<ShellCommand>>().is_empty());
+    }
+
+    #[test]
+    fn pointer_click_quit_uses_semantic_command() {
+        assert_eq!(
+            pointer_click_command(QuoinAction::Quit),
+            ShellCommandKind::Quit
+        );
     }
 
     #[test]

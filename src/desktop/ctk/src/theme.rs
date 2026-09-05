@@ -248,7 +248,9 @@ impl Default for CtkTypography {
 ///
 /// It is the only supported way to keep a bespoke `FontSource` on a text
 /// entity: CTK owns the font of everything else it can see, and will restore
-/// its own source to any managed entity that has been reassigned.
+/// its own source to any managed entity that has been reassigned. (An entity
+/// that merely wants the generic monospace face should stay managed and carry
+/// [`CtkMonospace`] instead.)
 ///
 /// Removing the marker does not itself re-enrol the entity — CTK looks at a
 /// text entity when its `TextFont` changes, and dropping a marker is not such a
@@ -262,6 +264,22 @@ impl Default for CtkTypography {
 /// become the new authored size. Write a different value, or opt out.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct CtkTypographyOptOut;
+
+/// Assigns one text entity to CTK's monospace role.
+///
+/// The entity stays fully size-managed — its authored size scales with the
+/// configured body size exactly like every other managed entity — but CTK
+/// stamps and restores [`FontSource::Monospace`] instead of
+/// [`FontSource::SansSerif`], so the platform's generic monospace mapping
+/// supplies the face. Clocks, meters and tabular readouts want this: a
+/// proportional face makes their digits jitter.
+///
+/// Add it in the same spawn operation as the `TextFont`. Stamping shares the
+/// sans mapping gate: until CTK holds a font mapping it touches no source,
+/// mono or otherwise. An entity also carrying [`CtkTypographyOptOut`] is not
+/// managed at all — the opt-out wins over the role.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct CtkMonospace;
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct ManagedTypography {
@@ -298,6 +316,7 @@ type TypographyTextQueryData = (
     &'static mut TextFont,
     Option<&'static mut ManagedTypography>,
     Has<CtkTypographyOptOut>,
+    Has<CtkMonospace>,
 );
 // `Changed` rather than `Added`: an entity CTK declined to manage on sight —
 // one spawned with a size it cannot derive from — must get another look when
@@ -1248,7 +1267,7 @@ fn apply_ctk_typography(
         typography.body_px = body_px;
     }
 
-    for (entity, mut font, managed, opted_out) in &mut text_fonts {
+    for (entity, mut font, managed, opted_out, monospace) in &mut text_fonts {
         if opted_out {
             continue;
         }
@@ -1279,15 +1298,21 @@ fn apply_ctk_typography(
         // when the mapping was last good.
         let effective = scale_authored_font_size(record.authored_size, body_px);
         // Only the *source* is gated on actually owning the generic mapping:
-        // stamping `SansSerif` without it would hand text to whatever
+        // stamping a generic without it would hand text to whatever
         // fontconfig picks rather than Bevy's embedded font. A source already
         // stamped is never reverted, though — the embedded fallback is an
         // ASCII-only subset, so unwinding to it on a lost mapping would trade
-        // a working face for tofu.
-        let source_drift = mapping_available && !matches!(font.font, FontSource::SansSerif);
+        // a working face for tofu. The [`CtkMonospace`] role selects which
+        // generic CTK owns for this entity; size management is role-blind.
+        let desired_source = if monospace {
+            FontSource::Monospace
+        } else {
+            FontSource::SansSerif
+        };
+        let source_drift = mapping_available && font.font != desired_source;
         if font.font_size != effective || source_drift {
             if mapping_available {
-                font.font = FontSource::SansSerif;
+                font.font = desired_source;
             }
             font.font_size = effective;
             font.set_changed();
@@ -4127,6 +4152,64 @@ mod tests {
                 "CTK restores its own source to a managed entity"
             );
         }
+    }
+
+    #[test]
+    fn monospace_role_is_stamped_and_stays_size_managed() {
+        let mut app = App::new();
+        app.add_plugins(CtkThemePlugin::default());
+        {
+            let mut typography = app.world_mut().resource_mut::<CtkTypography>();
+            typography.effective_family = Some("test-sans".to_string());
+            typography.body_px = 26.0; // exactly 2x the authoring baseline
+        }
+        let text = app
+            .world_mut()
+            .spawn((TextFont::from_font_size(10.0), CtkMonospace))
+            .id();
+        app.update();
+        let font = app.world().get::<TextFont>(text).unwrap();
+        assert_eq!(
+            font.font_size,
+            FontSize::Px(20.0),
+            "the role must not exempt the entity from size management"
+        );
+        assert_eq!(font.font, FontSource::Monospace);
+
+        // Somebody reassigns the source; the role's generic is restored and
+        // the size is untouched — the same restore law as the sans path.
+        app.world_mut().get_mut::<TextFont>(text).unwrap().font = FontSource::SansSerif;
+        app.update();
+        let font = app.world().get::<TextFont>(text).unwrap();
+        assert_eq!(font.font, FontSource::Monospace);
+        assert_eq!(font.font_size, FontSize::Px(20.0));
+    }
+
+    #[test]
+    fn opt_out_wins_over_the_monospace_role() {
+        let mut app = App::new();
+        app.add_plugins(CtkThemePlugin::default());
+        {
+            let mut typography = app.world_mut().resource_mut::<CtkTypography>();
+            typography.effective_family = Some("test-sans".to_string());
+            typography.body_px = 26.0;
+        }
+        let text = app
+            .world_mut()
+            .spawn((
+                TextFont::from_font_size(10.0),
+                CtkMonospace,
+                CtkTypographyOptOut,
+            ))
+            .id();
+        app.update();
+        let font = app.world().get::<TextFont>(text).unwrap();
+        assert_eq!(font.font_size, FontSize::Px(10.0), "opted out: no scaling");
+        assert_eq!(
+            font.font,
+            TextFont::from_font_size(10.0).font,
+            "opted out: no source stamp"
+        );
     }
 
     #[test]

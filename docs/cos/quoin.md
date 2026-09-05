@@ -131,11 +131,39 @@ discovery. Live panel state is read through the uniform
 `shell.props.{get,list,describe}` surface under
 `panels.<edge>.{visible,pinned,width_px,page,pages,output}`.
 
-The ephemeral semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin}`
-and `shell.panel.page.{next,prev,set}`. They require a broker-stamped local,
+The semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin}`,
+`shell.panel.page.{next,prev,set}` and `shell.quit`. They require a broker-stamped local,
 registered caller and are translated to the same `ShellCommand` ingress used
-by Quoin's controls. There is no resize, arrangement, persistence, geometry or
+by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
+persistence. `shell.quit` and the right Monitoring page's Quit Quoin button
+request a successful Bevy exit through the normal render and surface drain
+(`QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit`). There is no resize, arrangement, geometry or
 synthetic pointer/corner verb in this slice.
+
+### Launch state and lifecycle
+
+Quoin loads strict-data `$COSMIX_VAR/quoin.state.mix` before constructing its
+initial model, using the shared path resolver (including its XDG fallback).
+The root map contains `scheme` and `left`, `bottom`, `right`, `top` maps with
+`thickness_px`, `pinned` and stable `page` IDs. Thickness must be finite and
+positive; missing or invalid files use defaults with one diagnostic line.
+Unknown page IDs use the edge's default page. Scheme is retained unchanged
+until theme controls are implemented.
+
+Accepted pin and page changes save the current state after the Model stage,
+using a temporary file and atomic rename. Output migration carries live
+pin, page and thickness state; it never reloads disk state. Both smoke modes
+skip restore, saving and the intro pulse.
+
+A normal cold start reveals unpinned panels for two seconds, then releases
+a temporary startup hold into normal 800 ms grace. This discovery pulse is
+an explicit exception to compositor-only corner reveal. Real corner and
+pointer membership remain independent and can keep panels revealed after
+the pulse expires. Restored pins remain pinned.
+
+`setup.mix --desktop` installs `dev.cosmix.quoin.desktop` into the user's XDG
+applications directory, pointing at the installed checkout binary. Quit
+completes the existing render/surface drain; the launcher adds no settle sleep.
 
 The bottom carousel places `power` immediately after the clock-bearing
 launcher page. It subscribes to `power.props.changed` before reading

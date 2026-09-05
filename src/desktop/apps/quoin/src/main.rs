@@ -1,7 +1,9 @@
 //! Cosmix Quoin's real SCTK layer-shell host.
 
 mod bus_service;
+mod desktop_font;
 mod power;
+mod state;
 
 use std::time::Duration;
 
@@ -19,7 +21,10 @@ use cosmix_shell_host::{LayerHostConfig, LayerHostWake, LayerPanelMounts, config
 use ctk::bus::{
     BusBridgeConfig, BusBridgePlugin, BusWorkerWake, provenance_from_build, resolve_noded_url,
 };
-use ctk::theme::{CtkThemePlugin, ThemeSpec, ThemeState, apply_theme, tokens};
+use ctk::theme::{
+    CtkMonospace, CtkThemePlugin, Mode, Scheme, ThemeSpec, ThemeState, TypographySpec, apply_theme,
+    tokens,
+};
 
 const USAGE: &str =
     "usage: cosmix-quoin [--output NAME] [--comp-service NAME] [--smoke-all-panels|--smoke-hidden]";
@@ -71,6 +76,8 @@ fn main() -> AppExit {
         }
     };
     let registry = page_registry();
+    let state_store = state::StateStore::startup(cli.smoke_all_panels || cli.smoke_hidden);
+    let restored = state_store.snapshot();
     let model_registry = registry.clone();
     let smoke_all_panels = cli.smoke_all_panels;
     let smoke_hidden = cli.smoke_hidden;
@@ -91,6 +98,10 @@ fn main() -> AppExit {
                     .expect("static smoke input is monotonic");
             }
         }
+        if !smoke_all_panels && !smoke_hidden {
+            restored.restore(&mut model);
+            model.start_intro(Duration::from_secs(2));
+        }
         model
     })
     .with_comp_service(cli.comp_service);
@@ -104,6 +115,7 @@ fn main() -> AppExit {
     bus.inbound_prefixes.push("shell.".to_owned());
     bus.worker_wake = Some(BusWorkerWake::new(wake));
     app.insert_resource(registry)
+        .insert_resource(state_store)
         .insert_resource(SmokeState {
             all_panels: smoke_all_panels,
             hidden: smoke_hidden,
@@ -117,7 +129,11 @@ fn main() -> AppExit {
             ShellBusPlugin,
         ))
         .add_systems(Startup, setup)
-        .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host));
+        .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host))
+        .add_systems(
+            Update,
+            state::persist_transitions.in_set(ShellRuntimeSet::Host),
+        );
     app.run()
 }
 
@@ -191,6 +207,7 @@ fn log_transitions(
     for effect in &effects.0 {
         let edge = edge_name(effect.edge);
         match effect.effect {
+            PanelEffect::ResizeCompleted => println!("QUOIN_RESIZE_COMPLETED edge={edge}"),
             PanelEffect::Reveal {
                 trigger: RevealTrigger::Corner,
             } => println!("QUOIN_REVEAL edge={edge} trigger=corner"),
@@ -231,9 +248,27 @@ fn setup(
     mut theme_state: ResMut<ThemeState>,
     registry: Res<QuoinPageRegistry>,
     frame: Res<ShellFrameState>,
+    state_store: Res<state::StateStore>,
 ) {
+    // Furniture reads as furniture in dark mode against a desktop; the shipped
+    // default is Ocean/Dark, overridden by a persisted scheme when present.
+    let scheme = state_store
+        .scheme()
+        .and_then(Scheme::from_name)
+        .unwrap_or(Scheme::Ocean);
+    let mut spec = ThemeSpec::from_scheme(scheme, Mode::Dark);
+    // Match the host desktop's UI font where it can be read; otherwise CTK's
+    // built-in typography stands (a machine with no KDE config still looks
+    // right). Point sizes are converted to logical px; output scale is applied
+    // downstream, so this stays scale-free.
+    if let Some(font) = desktop_font::detect() {
+        spec.typography = TypographySpec {
+            family: font.family,
+            body_px: font.body_px,
+        };
+    }
     *theme = UiTheme(create_dark_theme());
-    apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
+    apply_theme(&mut theme, &mut theme_state, &spec);
 
     let mut bindings = QuoinContentBindings::default();
     bindings.set(
@@ -255,38 +290,15 @@ fn setup(
     bindings.set(
         Edge::Left,
         vec![
-            QuoinPageContent::new(
-                "nav",
-                placeholder(
-                    &mut commands,
-                    "Navigation",
-                    "Home\nApps\nFiles\nSettings",
-                    false,
-                ),
-            ),
-            QuoinPageContent::new(
-                "places",
-                placeholder(
-                    &mut commands,
-                    "Places",
-                    "Desktop\nProjects\nDownloads",
-                    false,
-                ),
-            ),
+            QuoinPageContent::new("nav", left_page(&mut commands, "nav")),
+            QuoinPageContent::new("places", left_page(&mut commands, "places")),
+            QuoinPageContent::new("info", left_page(&mut commands, "info")),
         ],
     );
     bindings.set(
         Edge::Right,
         vec![
-            QuoinPageContent::new(
-                "monitor",
-                placeholder(
-                    &mut commands,
-                    "Monitoring",
-                    "CPU  12%\nMemory  8.4 GiB\nMesh  healthy",
-                    false,
-                ),
-            ),
+            QuoinPageContent::new("monitor", system_page(&mut commands)),
             QuoinPageContent::new(
                 "agents",
                 placeholder(&mut commands, "Agents", "No active jobs", false),
@@ -325,16 +337,104 @@ fn page_registry() -> QuoinPageRegistry {
             .collect()
     };
     QuoinPageRegistry::new(
-        pages(&[("nav", "Navigation"), ("places", "Places")]),
+        pages(&[("nav", "Apps"), ("places", "Places"), ("info", "Info")]),
         pages(&[
             ("launcher", "Launcher"),
             ("power", "Power"),
             ("tasks", "Tasks"),
         ]),
-        pages(&[("monitor", "Monitoring"), ("agents", "Agents")]),
+        pages(&[("monitor", "System"), ("agents", "Agents")]),
         pages(&[("status", "Status"), ("spaces", "Spaces")]),
     )
     .expect("static page registry is valid")
+}
+
+fn system_page(commands: &mut Commands) -> Entity {
+    let root = placeholder(commands, "System", "Colour scheme", false);
+    let quit = cosmix_shell::chrome::quoin_quit_button(commands, Edge::Right, "monitor");
+    let dots = commands
+        .spawn(Node {
+            flex_wrap: FlexWrap::Wrap,
+            column_gap: px(8),
+            row_gap: px(8),
+            ..default()
+        })
+        .id();
+    for scheme in Scheme::ALL {
+        let dot = cosmix_shell::chrome::scheme_dot(commands, Edge::Right, "monitor", scheme)
+            .expect("static system page ID is valid");
+        commands.entity(dots).add_child(dot);
+    }
+    commands.entity(root).add_children(&[dots, quit]);
+    root
+}
+
+fn left_page(commands: &mut Commands, page: &str) -> Entity {
+    use cosmix_shell::chrome::{NavLinkTarget, navlink};
+    let root = commands
+        .spawn(Node {
+            width: percent(100),
+            min_width: px(0),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(px(6)),
+            row_gap: px(4),
+            ..default()
+        })
+        .id();
+    for (icon, label, target) in [
+        ("⊞", "Apps", "nav"),
+        ("⌂", "Places", "places"),
+        ("ℹ", "Info", "info"),
+    ] {
+        let link = navlink(
+            commands,
+            Edge::Left,
+            page,
+            icon,
+            label,
+            NavLinkTarget::Page(target.into()),
+        )
+        .expect("static navigation IDs are valid");
+        commands.entity(root).add_child(link);
+    }
+    if page == "places" {
+        for (icon, label) in [
+            ("⌂", "Home"),
+            ("🗀", "Projects"),
+            ("↓", "Downloads"),
+            ("⚙", "Quoin cfg"),
+        ] {
+            let link = navlink(
+                commands,
+                Edge::Left,
+                page,
+                icon,
+                label,
+                NavLinkTarget::Intent,
+            )
+            .expect("static places ID is valid");
+            commands.entity(root).add_child(link);
+        }
+    } else {
+        let body = if page == "info" {
+            concat!(
+                "Quoin ",
+                env!("CARGO_PKG_VERSION"),
+                "\nFour-edge desktop shell"
+            )
+        } else {
+            "Konsole\nFirefox\nDolphin\nKate"
+        };
+        let copy = commands
+            .spawn((
+                Text::new(body),
+                TextFont::from_font_size(12.0),
+                bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
+            ))
+            .id();
+        commands.entity(root).add_child(copy);
+    }
+    root
 }
 
 fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: bool) -> Entity {
@@ -377,7 +477,7 @@ fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: boo
 fn bottom_launcher(commands: &mut Commands) -> Entity {
     let apps = commands
         .spawn((
-            Text::new("⌘  Launcher    Studio    Mail    Files    Terminal"),
+            Text::new("Konsole  ·  Firefox  ·  Dolphin  ·  Kate"),
             TextFont::from_font_size(13.0),
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
         ))
@@ -387,6 +487,10 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
             Text::new("--:--:-- UTC"),
             TextFont::from_font_size(13.0),
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
+            // A proportional face makes clock digits jitter each second; the
+            // monospace role keeps them on a fixed advance while staying
+            // size-managed by CTK.
+            CtkMonospace,
             QuoinClock,
         ))
         .id();

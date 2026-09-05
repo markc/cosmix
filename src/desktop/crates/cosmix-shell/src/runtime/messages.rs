@@ -25,7 +25,9 @@ pub struct ShellCommand {
 /// Semantic shell actions; no transport is implied.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ShellCommandKind {
+    Quit,
     Geometry(LogicalSize),
+    Resize { edge: Edge, thickness_px: f32 },
     Corner(CornerEvent),
     Panel { edge: Edge, input: PanelInput },
     Carousel { edge: Edge, input: CarouselInput },
@@ -61,6 +63,8 @@ pub struct PanelPresentation {
     pub mapped: bool,
     pub visible_fraction: f32,
     pub thickness_px: f32,
+    pub resize_active: bool,
+    pub settled_thickness_px: f32,
     pub exclusive_zone_px: f32,
     pub keyboard_interactivity: KeyboardInteractivity,
     pub page_ids: Arc<[String]>,
@@ -96,6 +100,8 @@ impl ShellFrame {
                 mapped: panel.mapped,
                 visible_fraction: panel.visible_fraction,
                 thickness_px: panel.thickness_px,
+                resize_active: panel.resize_active,
+                settled_thickness_px: panel.settled_thickness_px,
                 exclusive_zone_px: panel.exclusive_zone_px,
                 keyboard_interactivity: if panel.mapped {
                     KeyboardInteractivity::OnDemand
