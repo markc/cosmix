@@ -590,6 +590,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Geometry(_) => "geometry",
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",
+        ShellCommandKind::Corner(CornerEvent::Clicked { .. }) => "corner-clicked",
         ShellCommandKind::Panel { .. } => "panel",
         ShellCommandKind::Carousel { .. } => "carousel",
     }

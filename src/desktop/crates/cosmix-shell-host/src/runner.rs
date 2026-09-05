@@ -2362,6 +2362,7 @@ impl RunnerState {
                 kind = match event {
                     cosmix_shell::core::CornerEvent::Entered { .. } => "entered",
                     cosmix_shell::core::CornerEvent::Left { .. } => "left",
+                    cosmix_shell::core::CornerEvent::Clicked { .. } => "clicked",
                 },
                 output = output.as_str(),
                 epoch
@@ -2493,6 +2494,8 @@ pub(crate) fn apply_corner_ingress_to_app(
             let changed = match event {
                 cosmix_shell::core::CornerEvent::Entered { .. } => corner_engaged.insert(corner),
                 cosmix_shell::core::CornerEvent::Left { .. } => corner_engaged.remove(&corner),
+                // Clicks are impulses: admit every click without changing holds.
+                cosmix_shell::core::CornerEvent::Clicked { .. } => true,
             };
             changed.then_some(event).into_iter().collect::<Vec<_>>()
         }
@@ -3407,6 +3410,73 @@ mod tests {
         );
         assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 5);
         assert!(executor.operations[0].1.contains(&ProtocolOp::Unmap));
+    }
+
+    #[test]
+    fn clicked_ingress_toggles_clockwise_pin_without_changing_holds() {
+        for (corner, edge) in [
+            (Corner::TopLeft, Edge::Left),
+            (Corner::BottomLeft, Edge::Bottom),
+            (Corner::BottomRight, Edge::Right),
+            (Corner::TopRight, Edge::Top),
+        ] {
+            let output = OutputKey::new("DP-1").unwrap();
+            let model = ShellModel::new(
+                output.clone(),
+                LogicalSize::new(1_000.0, 800.0).unwrap(),
+                Duration::ZERO,
+                Duration::from_millis(800),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+            let mut app = App::new();
+            configure_ingress(&mut app);
+            app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+            app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+            let mut engaged = BTreeSet::new();
+            for expected in [PanelMode::Pinned, PanelMode::Revealed] {
+                assert!(apply_corner_ingress_to_app(
+                    &mut app,
+                    Some(&output),
+                    &mut engaged,
+                    CornerIngress::Event {
+                        output: output.clone(),
+                        epoch: 0,
+                        event: CornerEvent::Clicked { corner }
+                    },
+                ));
+                assert!(engaged.is_empty());
+                app.update();
+                let frame = &app.world().resource::<ShellFrameState>().0;
+                assert_eq!(frame.panel(edge).mode, expected);
+                for other in [Edge::Left, Edge::Bottom, Edge::Right, Edge::Top] {
+                    if other != edge {
+                        assert_eq!(frame.panel(other).mode, PanelMode::Hidden);
+                    }
+                }
+            }
+            // Two clicks in one drain must resolve in the model, not from
+            // the same revealed frame snapshot. Existing membership survives.
+            engaged.insert(corner);
+            for _ in 0..2 {
+                assert!(apply_corner_ingress_to_app(
+                    &mut app,
+                    Some(&output),
+                    &mut engaged,
+                    CornerIngress::Event {
+                        output: output.clone(),
+                        epoch: 0,
+                        event: CornerEvent::Clicked { corner }
+                    },
+                ));
+            }
+            app.update();
+            assert_eq!(engaged, BTreeSet::from([corner]));
+            assert_eq!(
+                app.world().resource::<ShellFrameState>().0.panel(edge).mode,
+                PanelMode::Revealed
+            );
+        }
     }
 
     #[test]

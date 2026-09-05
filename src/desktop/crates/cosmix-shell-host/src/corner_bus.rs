@@ -164,6 +164,7 @@ pub(crate) fn start(comp_service: String, selected: OutputKey) -> CornerBusStart
 struct Topics {
     entered: String,
     left: String,
+    clicked: String,
     output: String,
 }
 
@@ -172,6 +173,7 @@ impl Topics {
         Self {
             entered: format!("{service}.corner.entered"),
             left: format!("{service}.corner.left"),
+            clicked: format!("{service}.corner.clicked"),
             output: format!("{service}.output.changed"),
         }
     }
@@ -181,6 +183,8 @@ impl Topics {
             Some("corner.entered")
         } else if topic == self.left {
             Some("corner.left")
+        } else if topic == self.clicked {
+            Some("corner.clicked")
         } else if topic == self.output {
             Some("output.changed")
         } else {
@@ -188,8 +192,8 @@ impl Topics {
         }
     }
 
-    fn subscriptions(&self) -> [&str; 3] {
-        [&self.entered, &self.left, &self.output]
+    fn subscriptions(&self) -> [&str; 4] {
+        [&self.entered, &self.left, &self.clicked, &self.output]
     }
 }
 
@@ -451,7 +455,7 @@ impl WorkerState {
             .and_then(|map| map.get(&event.output))
             .cloned()
         else {
-            if !event.entered {
+            if event.kind == CornerKind::Left {
                 self.warn_rejected("left-output-unmapped");
             }
             return;
@@ -459,19 +463,31 @@ impl WorkerState {
         if output != self.selected {
             return;
         }
+        if event.kind == CornerKind::Clicked {
+            // An impulse neither changes membership nor needs recovery when
+            // dropped. Only lost membership events invalidate the host epoch.
+            let _ = sender.try_send(CornerIngress::Event {
+                output,
+                epoch: self.epoch,
+                event: CornerEvent::Clicked {
+                    corner: event.corner,
+                },
+            });
+            return;
+        }
         let key = (event.output, event.corner);
-        let changed = if event.entered {
+        let changed = if event.kind == CornerKind::Entered {
             self.engaged.insert(key)
         } else {
             self.engaged.remove(&key)
         };
         if !changed {
-            if !event.entered {
+            if event.kind == CornerKind::Left {
                 self.warn_rejected("left-without-matching-engagement");
             }
             return;
         }
-        let event = if event.entered {
+        let event = if event.kind == CornerKind::Entered {
             CornerEvent::Entered {
                 corner: event.corner,
                 dwell: Duration::from_millis(event.dwell_ms),
@@ -1206,11 +1222,18 @@ fn send(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum CornerKind {
+    Entered,
+    Left,
+    Clicked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DecodedCorner {
     output: String,
     corner: Corner,
     dwell_ms: u64,
-    entered: bool,
+    kind: CornerKind,
 }
 
 enum Decoded {
@@ -1320,7 +1343,12 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
         output: body.output,
         corner,
         dwell_ms: body.dwell_ms,
-        entered: expected == "corner.entered",
+        kind: match expected {
+            "corner.entered" => CornerKind::Entered,
+            "corner.left" => CornerKind::Left,
+            "corner.clicked" => CornerKind::Clicked,
+            _ => return Err("unexpected corner command".to_owned()),
+        },
     }))
 }
 
@@ -1614,6 +1642,7 @@ mod tests {
             [
                 "subscribe:comp-nested.corner.entered",
                 "subscribe:comp-nested.corner.left",
+                "subscribe:comp-nested.corner.clicked",
                 "subscribe:comp-nested.output.changed",
                 "read:comp-nested",
             ]
@@ -1655,6 +1684,144 @@ mod tests {
     }
 
     #[test]
+    fn clicked_decodes_and_emits_each_impulse_without_changing_engagement() {
+        let (sender, channel) = sync_channel(8);
+        let overflow = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let output = OutputKey::new("DP-1").unwrap();
+        let mut state = WorkerState::new("comp", output.clone());
+        state.install_outputs(
+            BTreeMap::from([("o_dp_1".to_owned(), output.clone())]),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        let body = r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":9}"#;
+        let click = incoming("comp.corner.clicked", "corner.clicked", body);
+        assert!(matches!(
+            decode(&state.topics, &click),
+            Ok(Decoded::Corner(DecodedCorner {
+                kind: CornerKind::Clicked,
+                ..
+            }))
+        ));
+        for engaged in [false, true] {
+            if engaged {
+                state.decode_and_apply(
+                    incoming("comp.corner.entered", "corner.entered", body),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Event {
+                        event: CornerEvent::Entered { .. },
+                        ..
+                    })
+                ));
+            }
+            let before = state.engaged.clone();
+            for _ in 0..2 {
+                state.decode_and_apply(
+                    incoming("comp.corner.clicked", "corner.clicked", body),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                assert_eq!(state.engaged, before);
+                assert!(matches!(channel.try_recv(), Ok(CornerIngress::Event {
+                    output: received, epoch: received_epoch,
+                    event: CornerEvent::Clicked { corner: Corner::TopLeft },
+                }) if received == output && received_epoch == state.epoch));
+            }
+        }
+        state.decode_and_apply(
+            incoming("comp.corner.left", "corner.left", body),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        assert!(state.engaged.is_empty());
+        assert!(matches!(
+            channel.try_recv(),
+            Ok(CornerIngress::Event {
+                event: CornerEvent::Left { .. },
+                ..
+            })
+        ));
+        assert!(channel.try_recv().is_err());
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn clicked_on_unselected_or_unmapped_output_is_dropped_quietly() {
+        let (sender, channel) = sync_channel(8);
+        let overflow = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+        state.install_outputs(
+            BTreeMap::from([("o_hdmi_a_1".to_owned(), OutputKey::new("HDMI-A-1").unwrap())]),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        for output in ["o_hdmi_a_1", "o_missing"] {
+            let body = json!({"output": output, "corner": "tl", "dwell_ms": 200, "event_seq": 1});
+            state.decode_and_apply(
+                incoming("comp.corner.clicked", "corner.clicked", &body.to_string()),
+                &sender,
+                &overflow,
+                &epoch,
+            );
+        }
+        assert!(channel.try_recv().is_err());
+        assert!(state.engaged.is_empty());
+        assert_eq!(state.diagnostics, 0);
+    }
+
+    #[test]
+    fn lost_clicked_impulse_preserves_engagement_and_epoch() {
+        let (sender, channel) = sync_channel(1);
+        let overflow = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+        state.install_outputs(
+            BTreeMap::from([("o_dp_1".to_owned(), OutputKey::new("DP-1").unwrap())]),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        let body = r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":9}"#;
+        state.decode_and_apply(
+            incoming("comp.corner.entered", "corner.entered", body),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        let before = state.engaged.clone();
+        let before_epoch = state.epoch;
+        state.decode_and_apply(
+            incoming("comp.corner.clicked", "corner.clicked", body),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        assert_eq!(state.engaged, before);
+        assert_eq!(state.epoch, before_epoch);
+        assert_eq!(epoch.load(Ordering::Acquire), before_epoch);
+        assert!(!overflow.load(Ordering::Acquire));
+        assert!(matches!(
+            channel.try_recv(),
+            Ok(CornerIngress::Event {
+                event: CornerEvent::Entered { .. },
+                ..
+            })
+        ));
+        assert!(channel.try_recv().is_err());
+    }
+
+    #[test]
     fn selected_raw_output_only_and_duplicates_are_noops() {
         let (sender, channel) = sync_channel(8);
         let overflow = AtomicBool::new(false);
@@ -1673,7 +1840,7 @@ mod tests {
             output: "o_hdmi_a_1".to_owned(),
             corner: Corner::TopLeft,
             dwell_ms: 10,
-            entered: true,
+            kind: CornerKind::Entered,
         };
         state.apply_corner(foreign, &sender, &overflow, &epoch);
         assert!(channel.try_recv().is_err());
@@ -1681,7 +1848,7 @@ mod tests {
             output: "o_dp_1".to_owned(),
             corner: Corner::TopLeft,
             dwell_ms: 10,
-            entered: true,
+            kind: CornerKind::Entered,
         };
         state.apply_corner(selected.clone(), &sender, &overflow, &epoch);
         state.apply_corner(selected, &sender, &overflow, &epoch);
@@ -1705,7 +1872,7 @@ mod tests {
             output: "o_dp_1".to_owned(),
             corner: Corner::TopLeft,
             dwell_ms: 20,
-            entered: true,
+            kind: CornerKind::Entered,
         });
         assert!(channel.try_recv().is_err());
         state.install_outputs(
@@ -1754,7 +1921,7 @@ mod tests {
                 output: "o_dp_1".to_owned(),
                 corner: Corner::TopLeft,
                 dwell_ms: 20,
-                entered: true,
+                kind: CornerKind::Entered,
             },
             &sender,
             &overflow,

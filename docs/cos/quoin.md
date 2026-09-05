@@ -186,7 +186,11 @@ registered compositor instance (default `comp`), giving topic headers
 `<service>.output.changed`. Their inner commands remain the unprefixed
 `corner.entered`, `corner.left`, `corner.clicked` and `output.changed`.
 The compositor emits `corner.clicked` on a left-button press on an engaged
-corner; the client maps it to a pin toggle for that edge's panel.
+corner; the client toggles the clockwise edge's panel pin (TL→left, BL→bottom,
+BR→right, TR→top). Each click is an impulse, independent of corner membership;
+the model resolves the toggle from its current pin state and persists the
+change. Unpinning leaves the panel revealed and arms grace when no hold remains.
+The visible header pin control remains available as a fallback.
 
 Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed `comp.props.get` request verb at `outputs`. It maps the topic's
@@ -205,6 +209,8 @@ commands. The socket reader never waits for capacity; a full lane drops the new
 frame and surfaces an overflow marker. Quoin treats that marker exactly like a
 disconnect: synthesize left for all engagements, invalidate the slug map, and
 refresh it before accepting mapped corner state again.
+A lost click is a missed toggle and is never replayed or synthetically recovered.
+If only a click is dropped at the host-to-runner queue, existing holds are retained.
 
 A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native

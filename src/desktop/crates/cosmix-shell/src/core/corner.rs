@@ -96,7 +96,7 @@ pub enum CornerTrigger {
     Compositor,
 }
 
-/// Observable corner engagement transitions.
+/// Observable corner engagement transitions and click impulses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CornerEvent {
     Entered {
@@ -107,12 +107,17 @@ pub enum CornerEvent {
     Left {
         corner: Corner,
     },
+    Clicked {
+        corner: Corner,
+    },
 }
 
 impl CornerEvent {
     pub const fn corner(self) -> Corner {
         match self {
-            Self::Entered { corner, .. } | Self::Left { corner } => corner,
+            Self::Entered { corner, .. } | Self::Left { corner } | Self::Clicked { corner } => {
+                corner
+            }
         }
     }
 }

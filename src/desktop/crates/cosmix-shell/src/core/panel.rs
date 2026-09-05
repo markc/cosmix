@@ -40,6 +40,9 @@ pub enum PanelInput {
     Escape,
     Pin,
     Unpin,
+    /// Toggle pinning against the model's current mode, emitting the same
+    /// effects as Pin/Unpin so persistence observes both directions.
+    PinToggle,
     PointerEntered,
     PointerLeft,
     ResizeStarted,
@@ -257,7 +260,14 @@ impl PanelStateMachine {
                     self.motion.conceal();
                 }
             }
-            PanelInput::Pin => {
+            PanelInput::Unpin | PanelInput::PinToggle if self.mode == PanelMode::Pinned => {
+                self.mode = PanelMode::Revealed;
+                effect = effect.or(Some(PanelEffect::Pin { pinned: false }));
+                if !self.pointer_inside && !self.corner_inside && self.intro_until.is_none() {
+                    self.arm_deadline(at, ConcealReason::Grace);
+                }
+            }
+            PanelInput::Pin | PanelInput::PinToggle => {
                 self.intro_until = None;
                 if self.mode != PanelMode::Pinned {
                     effect = Some(PanelEffect::Pin { pinned: true });
@@ -266,15 +276,7 @@ impl PanelStateMachine {
                 self.clear_deadline();
                 self.motion.reveal();
             }
-            PanelInput::Unpin => {
-                if self.mode == PanelMode::Pinned {
-                    self.mode = PanelMode::Revealed;
-                    effect = effect.or(Some(PanelEffect::Pin { pinned: false }));
-                    if !self.pointer_inside && !self.corner_inside && self.intro_until.is_none() {
-                        self.arm_deadline(at, ConcealReason::Grace);
-                    }
-                }
-            }
+            PanelInput::Unpin => {}
             PanelInput::PointerEntered => {
                 if self.pointer_inside {
                     return Ok(self.update_since(before, effect));
@@ -504,6 +506,29 @@ mod intro_tests {
             Duration::ZERO,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pin_toggle_flips_both_ways_with_pin_effects_and_unpin_grace() {
+        let mut panel = panel();
+        for held in [false, true] {
+            if held {
+                panel
+                    .apply(Duration::ZERO, PanelInput::CornerEntered)
+                    .unwrap();
+            }
+            let pinned = panel.apply(Duration::ZERO, PanelInput::PinToggle).unwrap();
+            assert_eq!(panel.snapshot().mode, PanelMode::Pinned);
+            assert_eq!(panel.snapshot().hide_at, None);
+            assert_eq!(pinned.effect, Some(PanelEffect::Pin { pinned: true }));
+            let unpinned = panel.apply(Duration::ZERO, PanelInput::PinToggle).unwrap();
+            assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+            assert_eq!(unpinned.effect, Some(PanelEffect::Pin { pinned: false }));
+            assert_eq!(
+                panel.snapshot().hide_at,
+                (!held).then_some(Duration::from_millis(800))
+            );
+        }
     }
 
     #[test]

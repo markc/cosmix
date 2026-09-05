@@ -126,7 +126,7 @@ impl ShellModel {
         Ok(update)
     }
 
-    /// Apply compositor corner containment to the mapped clockwise edge.
+    /// Apply compositor corner containment or clicks to the mapped clockwise edge.
     pub fn corner_event(
         &mut self,
         at: Duration,
@@ -138,6 +138,9 @@ impl ShellModel {
                 .map(Some),
             CornerEvent::Left { corner } => self
                 .panel_input(corner.summoned_edge(), at, PanelInput::CornerLeft)
+                .map(Some),
+            CornerEvent::Clicked { corner } => self
+                .panel_input(corner.summoned_edge(), at, PanelInput::PinToggle)
                 .map(Some),
         }
     }
