@@ -371,8 +371,12 @@ struct QuoinControl {
     action: QuoinAction,
 }
 
+#[derive(Component)]
+struct QuoinControlPage(String);
+
 #[derive(Clone)]
 enum QuoinAction {
+    Quit,
     TogglePin,
     Previous,
     Next,
@@ -394,7 +398,7 @@ impl Plugin for QuoinChromePlugin {
             )
             .add_systems(
                 Update,
-                (present_panels, present_content)
+                (present_panels, present_page_controls, present_content)
                     .chain()
                     .in_set(ShellRuntimeSet::Presentation),
             );
@@ -581,6 +585,16 @@ fn panel_border(edge: Edge) -> UiRect {
     }
 }
 
+/// A quit control follows the same semantic command path as Bus quit.
+pub fn quoin_quit_button(commands: &mut Commands, edge: Edge, page: &str) -> Entity {
+    let label = text(commands, "Quit Quoin", 14.0, false);
+    let entity = button(commands, edge, QuoinAction::Quit, label, "Quit Quoin");
+    commands
+        .entity(entity)
+        .insert(QuoinControlPage(page.to_owned()));
+    entity
+}
+
 fn button(
     commands: &mut Commands,
     edge: Edge,
@@ -633,19 +647,29 @@ fn text(commands: &mut Commands, value: &str, size: f32, dim: bool) -> Entity {
 
 fn on_activate(
     activated: On<Activate>,
-    controls: Query<(&QuoinControl, Has<InteractionDisabled>)>,
+    controls: Query<(
+        &QuoinControl,
+        Has<InteractionDisabled>,
+        Option<&QuoinControlPage>,
+    )>,
     frame: Res<ShellFrameState>,
     time: Res<Time<Real>>,
     mut commands: MessageWriter<ShellCommand>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    let Ok((control, disabled)) = controls.get(activated.entity) else {
+    let Ok((control, disabled, page)) = controls.get(activated.entity) else {
         return;
     };
-    if disabled || !frame.0.panel(control.edge).mapped {
+    if disabled
+        || !frame.0.panel(control.edge).mapped
+        || page.is_some_and(|page| {
+            frame.0.panel(control.edge).active_page_id.as_deref() != Some(page.0.as_str())
+        })
+    {
         return;
     }
     let kind = match &control.action {
+        QuoinAction::Quit => ShellCommandKind::Quit,
         QuoinAction::TogglePin => ShellCommandKind::Panel {
             edge: control.edge,
             input: if frame.0.panel(control.edge).mode == PanelMode::Pinned {
@@ -807,6 +831,33 @@ fn present_panels(
                     "○".to_owned()
                 };
             }
+        }
+    }
+}
+
+fn present_page_controls(
+    mut commands: Commands,
+    frame: Res<ShellFrameState>,
+    mut focus: ResMut<InputFocus>,
+    mut controls: Query<(
+        Entity,
+        &QuoinControl,
+        &QuoinControlPage,
+        &mut TabIndex,
+        Has<InteractionDisabled>,
+    )>,
+) {
+    for (entity, control, page, mut tab, disabled) in &mut controls {
+        let panel = frame.0.panel(control.edge);
+        let enabled = panel.mapped && panel.active_page_id.as_deref() == Some(page.0.as_str());
+        tab.0 = if enabled { 0 } else { -1 };
+        if enabled && disabled {
+            commands.entity(entity).remove::<InteractionDisabled>();
+        } else if !enabled && !disabled {
+            commands.entity(entity).insert(InteractionDisabled);
+        }
+        if !enabled && focus.get() == Some(entity) {
+            focus.clear();
         }
     }
 }
@@ -1015,6 +1066,63 @@ mod tests {
             .next()
             .expect("pointer click activates the chrome control")
             .kind
+    }
+
+    #[test]
+    fn quit_button_only_activates_on_its_visible_page() {
+        let registry = QuoinPageRegistry::new(
+            vec![spec("nav")],
+            vec![spec("launcher"), spec("power")],
+            vec![spec("monitor"), spec("agents")],
+            vec![spec("status")],
+        )
+        .unwrap();
+        let mut frame = frame_for(&registry);
+        frame.panels[Edge::Right.index()].mapped = true;
+        let mut app = App::new();
+        app.insert_resource(ShellFrameState(frame))
+            .insert_resource(Time::<Real>::default())
+            .init_resource::<InputFocus>()
+            .add_message::<ShellCommand>()
+            .add_message::<RequestRedraw>()
+            .add_observer(on_activate);
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let entity = quoin_quit_button(
+            &mut Commands::new(&mut queue, app.world()),
+            Edge::Right,
+            "monitor",
+        );
+        queue.apply(app.world_mut());
+        app.world_mut()
+            .run_system_once(present_page_controls)
+            .unwrap();
+        assert!(!app.world().entity(entity).contains::<InteractionDisabled>());
+        app.world_mut().trigger(Activate { entity });
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<ShellCommand>>()
+                .drain()
+                .next()
+                .unwrap()
+                .kind,
+            ShellCommandKind::Quit
+        );
+        app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Right.index()]
+            .active_page_id = Some("agents".into());
+        app.world_mut()
+            .run_system_once(present_page_controls)
+            .unwrap();
+        assert!(app.world().entity(entity).contains::<InteractionDisabled>());
+        app.world_mut().trigger(Activate { entity });
+        assert!(app.world().resource::<Messages<ShellCommand>>().is_empty());
+    }
+
+    #[test]
+    fn pointer_click_quit_uses_semantic_command() {
+        assert_eq!(
+            pointer_click_command(QuoinAction::Quit),
+            ShellCommandKind::Quit
+        );
     }
 
     #[test]

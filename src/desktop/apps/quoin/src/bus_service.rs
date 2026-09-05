@@ -7,8 +7,8 @@ use cosmix_props_core::tree::build_snapshot;
 use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 use cosmix_shell::core::{Edge, PanelMode};
 use cosmix_shell::runtime::{
-    ShellCommand, ShellFrame, ShellFrameState, ShellRuntimeSet, ShellSemanticVerb,
-    semantic_shell_command,
+    ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
+    ShellSemanticVerb, semantic_shell_command,
 };
 use ctk::app_control::authorize_local_caller;
 use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, InboundRequest};
@@ -46,7 +46,7 @@ struct ShellBusState {
     /// Replies that hit a full outbound channel, retried before new inbound
     /// work. Losing a reply outright would leave the peer hanging until its
     /// own timeout — worse than answering late.
-    pending_replies: Vec<(InboundRequest, u8, String)>,
+    pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
 }
 
 impl Default for ShellBusState {
@@ -109,7 +109,13 @@ fn service_bus(
                 // Replies stashed under the epoch that just ended: the worker
                 // drops a response stamped with a stale generation anyway, so
                 // retrying them only re-fires dead sends.
-                state.pending_replies.clear();
+                for (_, _, _, command) in state.pending_replies.drain(..) {
+                    // Preserve accepted commands even when their reply can
+                    // no longer be delivered, including shutdown requests.
+                    if let Some(command) = command {
+                        shell_commands.write(command);
+                    }
+                }
                 power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
@@ -155,16 +161,32 @@ fn service_bus(
     // Retry stashed replies before answering new work so a recovered channel
     // drains in arrival order.
     let pending = std::mem::take(&mut state.pending_replies);
-    for (request, rc, body) in pending {
-        stash_or_respond(&bridge, &mut state, request, rc, body);
+    let mut dispatch = |command| {
+        shell_commands.write(command);
+    };
+    for (request, rc, body, command) in pending {
+        stash_or_respond(
+            &bridge,
+            &mut state,
+            request,
+            rc,
+            body,
+            command,
+            &mut dispatch,
+        );
     }
 
     for request in bridge.drain_inbound() {
         let (rc, body, command) = dispatch_shell_request(&request, &frame.0, time.elapsed());
-        if let Some(command) = command {
-            shell_commands.write(command);
-        }
-        stash_or_respond(&bridge, &mut state, request, rc, body);
+        stash_or_respond(
+            &bridge,
+            &mut state,
+            request,
+            rc,
+            body,
+            command,
+            &mut dispatch,
+        );
     }
 }
 
@@ -177,12 +199,16 @@ fn service_bus(
 /// can arrive to clear the stash either, so a stashed reply would re-fire a
 /// dead `try_send` every frame for the life of the process. Drop it loudly
 /// instead; the peer's own timeout is the honest outcome.
+/// Defer the command until its reply is queued, unless the worker is gone:
+/// then dispatch despite the lost reply so shutdown can still complete.
 fn stash_or_respond(
     bridge: &BusBridge,
     state: &mut ShellBusState,
     request: InboundRequest,
     rc: u8,
     body: String,
+    command: Option<ShellCommand>,
+    dispatch: &mut impl FnMut(ShellCommand),
 ) {
     if let Err(error) = bridge.try_respond(&request, rc, body.clone()) {
         if bridge.worker_is_gone() {
@@ -190,6 +216,9 @@ fn stash_or_respond(
                 command = request.command.as_str(),
                 "shell Bus worker has stopped; dropping reply ({error})"
             );
+            if let Some(command) = command {
+                dispatch(command);
+            }
             return;
         }
         if state.pending_replies.len() >= MAX_PENDING_REPLIES {
@@ -200,7 +229,9 @@ fn stash_or_respond(
             );
         }
         bevy::log::warn!("shell Bus response deferred: {error}");
-        state.pending_replies.push((request, rc, body));
+        state.pending_replies.push((request, rc, body, command));
+    } else if let Some(command) = command {
+        dispatch(command);
     }
 }
 
@@ -252,7 +283,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.page.next","panel.page.prev","panel.page.set"]
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.page.next","panel.page.prev","panel.page.set"]
         }).to_string(), None);
     }
     // The transport admits `app.*`/`action.*` on every inbound port; this
@@ -277,6 +308,24 @@ fn dispatch_shell_request(
             response.rc.clamp(0, u8::MAX as i32) as u8,
             response.body,
             None,
+        );
+    }
+    if request.command == "shell.quit" {
+        if let Err(error) = authorize_local_caller(request) {
+            return (
+                10,
+                json!({"error":format!("local registered caller required: {error:?}")}).to_string(),
+                None,
+            );
+        }
+        return (
+            0,
+            json!({"accepted":true}).to_string(),
+            Some(ShellCommand {
+                output: frame.geometry.output.clone(),
+                at,
+                kind: ShellCommandKind::Quit,
+            }),
         );
     }
     if request.command == "shell.panel.page.set" && argument(request, "id").is_none() {
@@ -526,6 +575,32 @@ mod tests {
             .headers
             .insert("broker_origin".to_owned(), "local".to_owned());
         request
+    }
+
+    #[test]
+    fn quit_requires_broker_stamped_local_and_only_enqueues() {
+        let frame = test_frame();
+        let (rc, _, command) =
+            dispatch_shell_request(&request("shell.quit"), &frame, std::time::Duration::ZERO);
+        assert_eq!(rc, 10);
+        assert!(command.is_none());
+        let mut request = local("shell.quit");
+        request.body = "{}".into();
+        let (rc, body, command) =
+            dispatch_shell_request(&request, &frame, std::time::Duration::ZERO);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"accepted":true})
+        );
+        assert_eq!(command.unwrap().kind, ShellCommandKind::Quit);
+        request
+            .headers
+            .insert("broker_origin".into(), "mesh".into());
+        assert_eq!(
+            dispatch_shell_request(&request, &frame, std::time::Duration::ZERO).0,
+            10
+        );
     }
 
     /// A request shaped the way the LIVE wire delivers one: caller arguments
@@ -880,6 +955,139 @@ mod tests {
             4,
             "a full channel is retryable — the replies must be stashed"
         );
+    }
+
+    fn fill_outbound(peer: &ctk::bus::TestBusPeer) {
+        for generation in 1..=16 {
+            peer.deliver_event(BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation,
+            });
+        }
+    }
+
+    fn drain_commands(app: &mut App) -> Vec<ShellCommand> {
+        app.world_mut()
+            .resource_mut::<bevy::ecs::message::Messages<ShellCommand>>()
+            .drain()
+            .collect()
+    }
+
+    #[test]
+    fn a_full_channel_defers_reply_and_command_until_drain_exactly_once() {
+        for verb in ["shell.quit", "shell.panel.toggle"] {
+            let (bridge, peer) = test_bridge("quoin");
+            let mut app = bus_app(bridge);
+            fill_outbound(&peer);
+            let request = local(verb);
+            let expected = dispatch_shell_request(&request, &test_frame(), Default::default())
+                .2
+                .unwrap();
+            peer.send(request);
+            app.update();
+            app.update(); // A retry while still full must not dispatch either.
+            assert!(drain_commands(&mut app).is_empty());
+            let state = app.world().resource::<ShellBusState>();
+            assert_eq!(state.pending_replies.len(), 1);
+            assert!(state.pending_replies[0].3.is_some());
+            assert!(peer.drain_responses().is_empty()); // Free the full queue.
+
+            app.update();
+            let responses = peer.drain_responses();
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].command, verb);
+            assert_eq!(responses[0].rc, 0);
+            let commands = drain_commands(&mut app);
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].kind, expected.kind);
+            assert!(
+                app.world()
+                    .resource::<ShellBusState>()
+                    .pending_replies
+                    .is_empty()
+            );
+
+            app.update();
+            assert!(peer.drain_responses().is_empty());
+            assert!(drain_commands(&mut app).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_command_is_dispatched_only_after_its_reply_is_queued() {
+        let (bridge, peer) = test_bridge("quoin");
+        let request = local("shell.quit");
+        let (rc, body, command) =
+            dispatch_shell_request(&request, &test_frame(), Default::default());
+        let mut state = ShellBusState::default();
+        let mut dispatched = 0;
+        stash_or_respond(
+            &bridge,
+            &mut state,
+            request,
+            rc,
+            body,
+            command,
+            &mut |command| {
+                // Inspect the actual outbound queue at the instant of dispatch.
+                let responses = peer.drain_responses();
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0].command, "shell.quit");
+                assert_eq!(responses[0].rc, 0);
+                assert_eq!(command.kind, ShellCommandKind::Quit);
+                dispatched += 1;
+            },
+        );
+        assert_eq!(dispatched, 1);
+        assert!(state.pending_replies.is_empty());
+    }
+
+    #[test]
+    fn a_dead_worker_dispatches_the_command_while_dropping_the_reply() {
+        let (bridge, peer) = test_bridge("quoin");
+        peer.send(local("shell.quit"));
+        drop(peer);
+        let mut app = bus_app(bridge);
+        app.update();
+        let commands = drain_commands(&mut app);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, ShellCommandKind::Quit);
+        assert!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_replies
+                .is_empty()
+        );
+        app.update();
+        assert!(drain_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_stashed_command_survives_worker_loss_with_or_without_a_fatal_event() {
+        for fatal_event in [false, true] {
+            let (bridge, peer) = test_bridge("quoin");
+            let mut app = bus_app(bridge);
+            fill_outbound(&peer);
+            peer.send(local("shell.quit"));
+            app.update();
+            assert!(drain_commands(&mut app).is_empty());
+            if fatal_event {
+                peer.deliver_event(BusBridgeEvent::Fatal("worker stopped".into()));
+            }
+            drop(peer);
+            app.update();
+            let commands = drain_commands(&mut app);
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].kind, ShellCommandKind::Quit);
+            assert!(
+                app.world()
+                    .resource::<ShellBusState>()
+                    .pending_replies
+                    .is_empty()
+            );
+            app.update();
+            assert!(drain_commands(&mut app).is_empty());
+        }
     }
 
     fn test_model() -> cosmix_shell::core::ShellModel {

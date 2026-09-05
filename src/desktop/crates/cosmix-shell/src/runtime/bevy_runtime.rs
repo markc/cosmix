@@ -4,8 +4,8 @@
 //! mutates [`ShellModel`]. Presentation and hosts consume [`ShellFrameState`]
 //! and therefore cannot reach back into model or window state.
 
-use bevy::app::{App, Plugin, Update};
-use bevy::ecs::message::MessageReader;
+use bevy::app::{App, AppExit, Plugin, Update};
+use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy::prelude::{Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
@@ -29,8 +29,10 @@ struct ShellRuntime {
 pub struct ShellFrameState(pub ShellFrame);
 
 /// Semantic effects emitted during the current model update only.
+/// The first list records panel transitions; the second records edges whose
+/// active page changed. Rejected and no-op page selections emit nothing.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct ShellEffects(pub Vec<ShellEffect>);
+pub struct ShellEffects(pub Vec<ShellEffect>, pub Vec<Edge>);
 
 /// Ordering seam used by chrome and hosts without exposing model internals.
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -77,9 +79,11 @@ impl Plugin for ShellRuntimePlugin {
 
 /// Replace the singleton v1 model after its selected output disappears.
 ///
+/// Live pins, pages and dimensions win over the replacement factory's seeds.
 /// The layer host drains and destroys the old surfaces first, then calls this
 /// before mapping fresh surfaces on the replacement output.
-pub fn replace_shell_model(world: &mut World, model: ShellModel) {
+pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
+    model.carry_live_state(&world.resource::<ShellRuntime>().model);
     let frame = ShellFrame::from_model(&model);
     *world.resource_mut::<ShellRuntime>() = ShellRuntime {
         model,
@@ -98,15 +102,20 @@ fn update_model(
     mut runtime: ResMut<ShellRuntime>,
     mut frame: ResMut<ShellFrameState>,
     mut effects: ResMut<ShellEffects>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let now = time.elapsed();
     effects.0.clear();
+    effects.1.clear();
     for command in commands.read() {
         if command.output != *runtime.model.output() {
             continue;
         }
         let at = command.at.clamp(runtime.model.last_update(), now);
         match &command.kind {
+            ShellCommandKind::Quit => {
+                exit.write(AppExit::Success);
+            }
             ShellCommandKind::Geometry(size) => runtime.model.set_geometry(*size),
             ShellCommandKind::Corner(event) => {
                 if let Ok(Some(update)) = runtime.model.corner_event(at, *event)
@@ -130,6 +139,7 @@ fn update_model(
             }
             ShellCommandKind::Carousel { edge, input } => {
                 let carousel = runtime.model.carousel_mut(*edge);
+                let before = carousel.active_index();
                 match input {
                     CarouselInput::Next => {
                         carousel.next_page();
@@ -140,6 +150,9 @@ fn update_model(
                     CarouselInput::SelectId(id) => {
                         carousel.select_id(id);
                     }
+                }
+                if carousel.active_index() != before {
+                    effects.1.push(*edge);
                 }
             }
         }
@@ -282,6 +295,87 @@ mod tests {
                 .get(Edge::Left),
             PanelMode::Hidden
         );
+    }
+
+    #[test]
+    fn output_migration_carries_live_pin_page_and_thickness() {
+        let mut app = app();
+        {
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            runtime.model.restore_thickness(Edge::Left, 137.0).unwrap();
+            runtime.model.set_carousel(
+                Edge::Left,
+                crate::core::Carousel::new(["nav", "places"]).unwrap(),
+            );
+            runtime.model.carousel_mut(Edge::Left).select_id("places");
+            runtime
+                .model
+                .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Pin)
+                .unwrap();
+        }
+        let mut replacement = ShellModel::new(
+            OutputKey::new("HDMI-A-1").unwrap(),
+            LogicalSize::new(1920.0, 1080.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        replacement.start_intro(Duration::from_secs(2));
+        replace_shell_model(app.world_mut(), replacement);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "HDMI-A-1");
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Pinned);
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 137.0);
+        assert_eq!(
+            frame.panel(Edge::Left).active_page_id.as_deref(),
+            Some("places")
+        );
+        assert_eq!(frame.panel(Edge::Right).mode, PanelMode::Hidden);
+    }
+
+    #[test]
+    fn only_changed_pages_emit_persistence_effects() {
+        let mut app = app();
+        app.world_mut()
+            .resource_mut::<ShellRuntime>()
+            .model
+            .set_carousel(
+                Edge::Left,
+                crate::core::Carousel::new(["nav", "places"]).unwrap(),
+            );
+        for (id, changed) in [
+            ("unknown", false),
+            ("nav", false),
+            ("places", true),
+            ("places", false),
+        ] {
+            app.world_mut().write_message(semantic_shell_command(
+                OutputKey::new("DP-1").unwrap(),
+                Duration::ZERO,
+                Edge::Left,
+                ShellSemanticVerb::PageSet(id.into()),
+            ));
+            app.update();
+            assert_eq!(
+                !app.world().resource::<ShellEffects>().1.is_empty(),
+                changed
+            );
+        }
+    }
+
+    #[test]
+    fn quit_command_emits_success_only_for_selected_output() {
+        let mut app = app();
+        for (output, expected) in [("foreign", None), ("DP-1", Some(AppExit::Success))] {
+            app.world_mut().write_message(ShellCommand {
+                output: OutputKey::new(output).unwrap(),
+                at: Duration::ZERO,
+                kind: ShellCommandKind::Quit,
+            });
+            app.update();
+            assert_eq!(app.should_exit(), expected);
+        }
     }
 
     #[test]

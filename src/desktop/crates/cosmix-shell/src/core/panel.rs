@@ -142,6 +142,7 @@ pub struct PanelStateMachine {
     motion: PanelMotion,
     pointer_inside: bool,
     corner_inside: bool,
+    intro_until: Option<Duration>,
     hide_at: Option<Duration>,
     conceal_reason: Option<ConcealReason>,
     last_update: Duration,
@@ -155,6 +156,7 @@ impl PanelStateMachine {
             motion: PanelMotion::new(config.motion_time).map_err(PanelConfigError::Motion)?,
             pointer_inside: false,
             corner_inside: false,
+            intro_until: None,
             hide_at: None,
             conceal_reason: None,
             last_update: start_at,
@@ -209,7 +211,10 @@ impl PanelStateMachine {
                     return Ok(self.update_since(before, effect));
                 }
                 self.corner_inside = false;
-                if self.mode == PanelMode::Revealed && !self.pointer_inside {
+                if self.mode == PanelMode::Revealed
+                    && !self.pointer_inside
+                    && self.intro_until.is_none()
+                {
                     self.arm_deadline(at, ConcealReason::CornerLeft);
                 }
             }
@@ -221,6 +226,7 @@ impl PanelStateMachine {
                 }
             }
             PanelInput::Pin => {
+                self.intro_until = None;
                 if self.mode != PanelMode::Pinned {
                     effect = Some(PanelEffect::Pin { pinned: true });
                 }
@@ -232,7 +238,7 @@ impl PanelStateMachine {
                 if self.mode == PanelMode::Pinned {
                     self.mode = PanelMode::Revealed;
                     effect = effect.or(Some(PanelEffect::Pin { pinned: false }));
-                    if !self.pointer_inside && !self.corner_inside {
+                    if !self.pointer_inside && !self.corner_inside && self.intro_until.is_none() {
                         self.arm_deadline(at, ConcealReason::Grace);
                     }
                 }
@@ -253,7 +259,10 @@ impl PanelStateMachine {
                     return Ok(self.update_since(before, effect));
                 }
                 self.pointer_inside = false;
-                if self.mode == PanelMode::Revealed && !self.corner_inside {
+                if self.mode == PanelMode::Revealed
+                    && !self.corner_inside
+                    && self.intro_until.is_none()
+                {
                     self.arm_deadline(at, ConcealReason::Grace);
                 }
             }
@@ -265,6 +274,32 @@ impl PanelStateMachine {
         let before = self.snapshot();
         let effect = self.advance_to(at)?;
         Ok(self.update_since(before, effect))
+    }
+
+    /// A startup hold never claims real corner or pointer membership.
+    pub fn start_intro(&mut self, duration: Duration) {
+        if self.mode != PanelMode::Pinned {
+            self.intro_until = Some(self.last_update + duration);
+            self.mode = PanelMode::Revealed;
+            self.clear_deadline();
+            self.motion.reveal();
+        }
+    }
+
+    /// Stored dimensions obey the same law as initial configuration.
+    pub fn restore_thickness(&mut self, thickness_px: f32) -> Result<(), PanelConfigError> {
+        self.config = PanelConfig::new(thickness_px, self.config.grace, self.config.motion_time)?;
+        Ok(())
+    }
+
+    /// Membership of a retired output cannot hold its replacement open.
+    pub(super) fn leave_output(&mut self) {
+        let held = self.corner_inside || self.pointer_inside;
+        self.corner_inside = false;
+        self.pointer_inside = false;
+        if held && self.mode == PanelMode::Revealed && self.intro_until.is_none() {
+            self.arm_deadline(self.last_update, ConcealReason::Grace);
+        }
     }
 
     pub fn snapshot(&self) -> PanelSnapshot {
@@ -291,15 +326,15 @@ impl PanelStateMachine {
     pub fn wake(&self) -> PanelWake {
         if self.motion.is_animating() {
             PanelWake::Animate
-        } else if let Some(deadline) = self.hide_at {
+        } else if let Some(deadline) = self.next_deadline() {
             PanelWake::WakeAt(deadline)
         } else {
             PanelWake::Idle
         }
     }
 
-    pub const fn next_deadline(&self) -> Option<Duration> {
-        self.hide_at
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.hide_at.into_iter().chain(self.intro_until).min()
     }
 
     fn advance_to(&mut self, at: Duration) -> Result<Option<PanelEffect>, PanelTimeError> {
@@ -310,6 +345,14 @@ impl PanelStateMachine {
             });
         }
 
+        if let Some(deadline) = self.intro_until
+            && deadline <= at
+        {
+            self.intro_until = None;
+            if self.mode == PanelMode::Revealed && !self.pointer_inside && !self.corner_inside {
+                self.arm_deadline(deadline, ConcealReason::Grace);
+            }
+        }
         let mut effect = None;
         if let Some(deadline) = self.hide_at
             && deadline <= at
@@ -395,3 +438,85 @@ impl Display for PanelTimeError {
 }
 
 impl Error for PanelTimeError {}
+
+#[cfg(test)]
+mod intro_tests {
+    use super::*;
+
+    fn panel() -> PanelStateMachine {
+        PanelStateMachine::new(
+            PanelConfig::new(
+                100.0,
+                Duration::from_millis(800),
+                Duration::from_millis(200),
+            )
+            .unwrap(),
+            Duration::ZERO,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn intro_expires_into_normal_grace_without_corner_membership() {
+        let mut panel = panel();
+        panel.start_intro(Duration::from_secs(2));
+        assert!(!panel.snapshot().corner_inside);
+        panel.tick(Duration::from_secs(1)).unwrap();
+        assert_eq!(panel.wake(), PanelWake::WakeAt(Duration::from_secs(2)));
+        panel.tick(Duration::from_secs(2)).unwrap();
+        assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(2800)));
+        let update = panel.tick(Duration::from_secs(3)).unwrap();
+        assert_eq!(update.snapshot.mode, PanelMode::Hidden);
+        assert_eq!(
+            update.effect,
+            Some(PanelEffect::Conceal {
+                reason: ConcealReason::Grace
+            })
+        );
+        assert_eq!(panel.next_deadline(), None);
+    }
+
+    #[test]
+    fn real_corner_enter_during_intro_survives_expiry() {
+        let mut panel = panel();
+        panel.start_intro(Duration::from_secs(2));
+        panel
+            .apply(Duration::from_secs(1), PanelInput::CornerEntered)
+            .unwrap();
+        panel.tick(Duration::from_secs(3)).unwrap();
+        assert!(panel.snapshot().corner_inside);
+        assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+        assert_eq!(panel.next_deadline(), None);
+        panel
+            .apply(Duration::from_secs(3), PanelInput::CornerLeft)
+            .unwrap();
+        assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(3800)));
+    }
+
+    #[test]
+    fn corner_and_pointer_leaves_cannot_end_intro_early() {
+        let mut panel = panel();
+        panel.start_intro(Duration::from_secs(2));
+        for input in [
+            PanelInput::CornerEntered,
+            PanelInput::PointerEntered,
+            PanelInput::CornerLeft,
+            PanelInput::PointerLeft,
+        ] {
+            panel.apply(Duration::from_millis(100), input).unwrap();
+        }
+        panel.tick(Duration::from_millis(1900)).unwrap();
+        assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+        assert_eq!(panel.snapshot().hide_at, None);
+    }
+
+    #[test]
+    fn intro_does_not_change_restored_pins() {
+        let mut panel = panel();
+        panel.apply(Duration::ZERO, PanelInput::Pin).unwrap();
+        panel.start_intro(Duration::from_secs(2));
+        panel.tick(Duration::from_secs(3)).unwrap();
+        assert_eq!(panel.snapshot().mode, PanelMode::Pinned);
+        assert_eq!(panel.next_deadline(), None);
+    }
+}

@@ -179,7 +179,7 @@ pub mod prelude {
         ModalCaptureSystems, ModalCaptureToken,
     };
     pub use crate::theme::{
-        apply_theme, ApplyTheme, CtkThemeMetrics, CtkThemePlugin, CtkTypography,
+        apply_theme, ApplyTheme, CtkMonospace, CtkThemeMetrics, CtkThemePlugin, CtkTypography,
         CtkTypographyOptOut, Mode, Oklch, RadiusScale, Scheme, ThemeColors, ThemeSpec, ThemeState,
         TypographyFallback, TypographyProvenance, TypographySpec,
     };

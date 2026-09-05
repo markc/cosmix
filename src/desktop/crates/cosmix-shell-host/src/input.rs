@@ -585,6 +585,7 @@ pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
 
 fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
     match kind {
+        ShellCommandKind::Quit => "quit",
         ShellCommandKind::Geometry(_) => "geometry",
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",

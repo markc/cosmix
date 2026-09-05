@@ -84,6 +84,32 @@ impl ShellModel {
         self.carousels[edge.index()] = carousel;
     }
 
+    /// Restored thickness has the same validation as a newly constructed panel.
+    pub fn restore_thickness(
+        &mut self,
+        edge: Edge,
+        thickness: f32,
+    ) -> Result<(), PanelConfigError> {
+        self.panels[edge.index()].restore_thickness(thickness)
+    }
+
+    /// Cold-start discovery is independent of compositor corner membership.
+    pub fn start_intro(&mut self, duration: Duration) {
+        for panel in &mut self.panels {
+            panel.start_intro(duration);
+        }
+    }
+
+    /// Output migration preserves live panel state, including stored sizes and pages.
+    pub fn carry_live_state(&mut self, outgoing: &Self) {
+        self.panels = outgoing.panels.clone();
+        for panel in &mut self.panels {
+            panel.leave_output();
+        }
+        self.carousels = outgoing.carousels.clone();
+        self.last_update = outgoing.last_update;
+    }
+
     pub fn panel_input(
         &mut self,
         edge: Edge,

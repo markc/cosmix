@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell-host"
-version = "0.4.0"
+version = "0.4.1"
 description = "SCTK layer-shell renderer host for Cosmix Quoin"
 edition = "2024"
 rust-version = "1.95"

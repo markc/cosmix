@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Quoin
+Comment=Cosmix four-edge desktop panels
+Exec=cosmix-quoin
+Icon=preferences-desktop
+Terminal=false
+Categories=System;
+StartupNotify=false

@@ -2,6 +2,7 @@
 
 mod bus_service;
 mod power;
+mod state;
 
 use std::time::Duration;
 
@@ -71,6 +72,8 @@ fn main() -> AppExit {
         }
     };
     let registry = page_registry();
+    let state_store = state::StateStore::startup(cli.smoke_all_panels || cli.smoke_hidden);
+    let restored = state_store.snapshot();
     let model_registry = registry.clone();
     let smoke_all_panels = cli.smoke_all_panels;
     let smoke_hidden = cli.smoke_hidden;
@@ -91,6 +94,10 @@ fn main() -> AppExit {
                     .expect("static smoke input is monotonic");
             }
         }
+        if !smoke_all_panels && !smoke_hidden {
+            restored.restore(&mut model);
+            model.start_intro(Duration::from_secs(2));
+        }
         model
     })
     .with_comp_service(cli.comp_service);
@@ -104,6 +111,7 @@ fn main() -> AppExit {
     bus.inbound_prefixes.push("shell.".to_owned());
     bus.worker_wake = Some(BusWorkerWake::new(wake));
     app.insert_resource(registry)
+        .insert_resource(state_store)
         .insert_resource(SmokeState {
             all_panels: smoke_all_panels,
             hidden: smoke_hidden,
@@ -117,7 +125,10 @@ fn main() -> AppExit {
             ShellBusPlugin,
         ))
         .add_systems(Startup, setup)
-        .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host));
+        .add_systems(
+            Update,
+            (log_transitions, state::persist_transitions).in_set(ShellRuntimeSet::Host),
+        );
     app.run()
 }
 
@@ -278,15 +289,7 @@ fn setup(
     bindings.set(
         Edge::Right,
         vec![
-            QuoinPageContent::new(
-                "monitor",
-                placeholder(
-                    &mut commands,
-                    "Monitoring",
-                    "CPU  12%\nMemory  8.4 GiB\nMesh  healthy",
-                    false,
-                ),
-            ),
+            QuoinPageContent::new("monitor", system_page(&mut commands)),
             QuoinPageContent::new(
                 "agents",
                 placeholder(&mut commands, "Agents", "No active jobs", false),
@@ -335,6 +338,18 @@ fn page_registry() -> QuoinPageRegistry {
         pages(&[("status", "Status"), ("spaces", "Spaces")]),
     )
     .expect("static page registry is valid")
+}
+
+fn system_page(commands: &mut Commands) -> Entity {
+    let root = placeholder(
+        commands,
+        "Monitoring",
+        "CPU  12%\nMemory  8.4 GiB\nMesh  healthy",
+        false,
+    );
+    let quit = cosmix_shell::chrome::quoin_quit_button(commands, Edge::Right, "monitor");
+    commands.entity(root).add_child(quit);
+    root
 }
 
 fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: bool) -> Entity {

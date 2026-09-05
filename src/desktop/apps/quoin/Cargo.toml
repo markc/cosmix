@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-quoin"
-version = "0.5.0"
+version = "0.6.0"
 description = "Cosmix Quoin four-edge layer-shell furniture"
 edition = "2024"
 rust-version = "1.95"
@@ -47,6 +47,8 @@ cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/c
 cosmix-props-core = { package = "cosmix-lib-props-core", path = "../../../crates/cosmix-lib-props-core", features = ["bus"] }
 ctk = { path = "../../ctk", default-features = false, features = ["bus"] }
 serde_json = "1"
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config" }
+tempfile = "3"
 
 [dev-dependencies]
 # The driverless bridge + peer used by `bus_service`'s App-level tests. Only
