@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-noded"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1854,6 +1854,7 @@ dependencies = [
  "rand 0.8.7",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tokio",
  "tokio-tungstenite 0.26.2",

@@ -260,6 +260,7 @@ struct AppState {
     /// Resolved `_spec/` directory; `None` if not located at startup —
     /// `spec.get` returns an error, `world.specs.*` topics aren't seeded.
     spec_dir: Option<Arc<PathBuf>>,
+    spec_release: Option<Arc<crate::spec_release::SpecRelease>>,
     /// SPEC 07 §3 props change bus: cached snapshot + per-path emit caps.
     change_bus: Arc<crate::props::ChangeBus>,
     /// SPEC 13 authority + D1.4 routing plane. Posture and the route table are
@@ -395,6 +396,14 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         admission_mode,
         observe_allowed_services,
     } = config;
+    // Validate before listener/readiness or background work. A configured but
+    // invalid public release must never fall back to legacy directory discovery.
+    let spec_release = crate::spec_release::SpecRelease::from_env()?.map(Arc::new);
+    let spec_dir = if spec_release.is_some() {
+        None
+    } else {
+        spec_dir
+    };
     let mut mesh_config = if let Some(ref path) = mesh_config_path {
         MeshConfig::load(path)?
     } else {
@@ -685,6 +694,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         started_at: started_at.clone(),
         started,
         spec_dir: spec_dir_arc.clone(),
+        spec_release,
         change_bus: change_bus.clone(),
         authority: authority.clone(),
         etc_roster,
@@ -3820,7 +3830,7 @@ async fn handle_noded_command(
         }
 
         // SPEC 07 §5.1 — spec distribution.
-        "spec.get" => {
+        "spec.get" | "spec.v2.get" => {
             let args_json = crate::props::parse_args(msg.get("args")).or_else(|| {
                 if msg.body.is_empty() {
                     None
@@ -3829,9 +3839,14 @@ async fn handle_noded_command(
                 }
             });
             let dir = state.spec_dir.as_deref().map(|p| p.as_path());
-            let result = crate::spec::dispatch_spec_get(dir, args_json.as_ref());
+            let result = match (state.spec_release.as_deref(), command) {
+                (Some(release), "spec.v2.get") => release.get_v2(args_json.as_ref()),
+                (Some(release), _) => release.get_legacy(args_json.as_ref()),
+                (None, "spec.v2.get") => crate::spec_release::error("release_unavailable"),
+                (None, _) => crate::spec::dispatch_spec_get(dir, args_json.as_ref()),
+            };
             let mut resp = respond(&result.rc.to_string());
-            resp.set("command", "spec.get");
+            resp.set("command", command);
             for (k, v) in &result.headers {
                 resp.set(k, v);
             }
@@ -4582,6 +4597,7 @@ mod tests {
             started_at: chrono::Utc::now().to_rfc3339(),
             started,
             spec_dir: None,
+            spec_release: None,
             change_bus: crate::props::ChangeBus::new(broker),
             authority: Arc::new(ArcSwap::from_pointee(authority_value)),
             etc_roster: Arc::new(etc_roster),
@@ -4592,6 +4608,54 @@ mod tests {
             wg_bound: true,
             challenge_table: Arc::new(crate::admission::ChallengeTable::new()),
             live_sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn spec_release_dispatch_preserves_wire_correlation() {
+        let ip = "127.0.0.1".parse().unwrap();
+        let mut state = reload_test_state(
+            reload_posture(1, vec![active_route("alpha", ip, DEFAULT_NODED_PORT)]),
+            vec![],
+        )
+        .await;
+        let fixture = crate::spec_release::tests::Fixture::new();
+        state.spec_release = Some(Arc::new(fixture.load().unwrap()));
+        for (command, args, rc) in [
+            ("spec.get", serde_json::json!({"name":"04-wire"}), "0"),
+            ("spec.get", serde_json::json!({"chapter":1.9}), "10"),
+            ("spec.v2.get", serde_json::json!({"document":"wire"}), "0"),
+        ] {
+            let mut request = BusMessage::new()
+                .with_header("command", command)
+                .with_header("id", "request-123");
+            request.body = args.to_string();
+            let (tx, mut rx) = mpsc::channel(1);
+            let mut service = None;
+            let mut outcome = super::ObserveOutcome::BrokerHandled;
+            super::handle_noded_command(
+                &request,
+                &tx,
+                &state,
+                &mut service,
+                "anon",
+                ip,
+                &mut outcome,
+            )
+            .await;
+            let wire = rx.recv().await.unwrap();
+            let response = cosmix_bus::bus::parse(&wire).unwrap();
+            assert_eq!(response.get("id"), Some("request-123"));
+            assert_eq!(response.get("type"), Some("response"));
+            assert_eq!(response.get("from"), Some("noded"));
+            assert_eq!(response.get("command"), Some(command));
+            assert_eq!(response.get("rc"), Some(rc));
+            if command == "spec.get" && rc == "0" {
+                assert!(wire.ends_with("---\n# Wire\n"));
+                // Existing Bus parsing trims trailing prose whitespace. V2
+                // protects the original bytes inside a JSON string instead.
+                assert_eq!(response.body, "# Wire");
+            }
         }
     }
 

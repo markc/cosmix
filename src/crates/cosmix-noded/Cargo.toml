@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-noded"
-version = "0.13.1"
+version = "0.14.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -26,6 +26,7 @@ cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
 cosmix_mesh_trust = { package = "cosmix-lib-mesh-trust", path = "../cosmix-lib-mesh-trust", default-features = false }
 base64.workspace = true
 blake3.workspace = true
+sha2.workspace = true
 
 # Monitor
 sysinfo = "0.35"

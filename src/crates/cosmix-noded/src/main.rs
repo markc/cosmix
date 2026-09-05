@@ -21,6 +21,7 @@ mod props;
 mod props_reservation;
 mod routing;
 mod spec;
+mod spec_release;
 mod subscription;
 
 /// `--version` line including git sha + build time (build-provenance
