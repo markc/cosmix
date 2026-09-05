@@ -12,7 +12,7 @@ use bevy::time::Real;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::chrome::QuoinCommittedMotionModes;
-use crate::core::{Edge, ShellModel};
+use crate::core::{Edge, PanelInput, ShellModel};
 use crate::runtime::{
     CarouselInput, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, WakePolicy,
 };
@@ -115,6 +115,34 @@ fn update_model(
         match &command.kind {
             ShellCommandKind::Resize { edge, thickness_px } => {
                 let _ = runtime.model.resize_thickness(*edge, *thickness_px);
+            }
+            ShellCommandKind::ResizeCommit { edge, thickness_px } => {
+                // Atomic scripted resize: start records the pre-resize
+                // thickness (so settled_thickness_px is correct if the apply
+                // is rejected), apply, then complete — which settles the new
+                // value and emits ResizeCompleted so persistence writes once,
+                // exactly as the grip gesture does on release.
+                let _ = runtime
+                    .model
+                    .panel_input(*edge, at, PanelInput::ResizeStarted);
+                if runtime.model.resize_thickness(*edge, *thickness_px).is_ok()
+                    && let Ok(update) =
+                        runtime
+                            .model
+                            .panel_input(*edge, at, PanelInput::ResizeCompleted)
+                    && let Some(effect) = update.effect
+                {
+                    effects.0.push(ShellEffect {
+                        edge: *edge,
+                        effect,
+                    });
+                } else {
+                    // Rejected size: cancel so the recorded start is dropped
+                    // and no stale resize_start lingers.
+                    let _ = runtime
+                        .model
+                        .panel_input(*edge, at, PanelInput::ResizeCancelled);
+                }
             }
             ShellCommandKind::Quit => {
                 exit.write(AppExit::Success);
@@ -232,6 +260,64 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
         app
+    }
+
+    #[test]
+    fn resize_commit_settles_the_new_thickness_and_emits_the_persist_effect() {
+        let mut app = app();
+        let output = OutputKey::new("DP-1").unwrap();
+        app.world_mut().write_message(ShellCommand {
+            output: output.clone(),
+            at: Duration::ZERO,
+            kind: ShellCommandKind::ResizeCommit {
+                edge: Edge::Left,
+                thickness_px: 260.0,
+            },
+        });
+        app.update();
+        let panel = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .clone();
+        // Atomic commit settles the NEW value (not the pre-resize one), which
+        // is what persistence records.
+        assert_eq!(panel.settled_thickness_px, 260.0);
+        assert!(!panel.resize_active, "no gesture is left open");
+        // The ResizeCompleted effect fired, so persist_transitions writes once.
+        assert!(
+            app.world()
+                .resource::<ShellEffects>()
+                .0
+                .iter()
+                .any(|e| { e.edge == Edge::Left && e.effect == PanelEffect::ResizeCompleted })
+        );
+
+        // An out-of-range commit leaves the settled size and opens no gesture.
+        app.world_mut().write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::ResizeCommit {
+                edge: Edge::Left,
+                thickness_px: 9_000.0,
+            },
+        });
+        app.update();
+        let panel = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .clone();
+        assert_eq!(
+            panel.settled_thickness_px, 260.0,
+            "rejected size is a no-op"
+        );
+        assert!(
+            !panel.resize_active,
+            "a rejected commit leaves no open gesture"
+        );
     }
 
     #[test]

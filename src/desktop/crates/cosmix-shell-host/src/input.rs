@@ -587,6 +587,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
     match kind {
         ShellCommandKind::Quit => "quit",
         ShellCommandKind::Resize { .. } => "resize",
+        ShellCommandKind::ResizeCommit { .. } => "resize-commit",
         ShellCommandKind::Geometry(_) => "geometry",
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",

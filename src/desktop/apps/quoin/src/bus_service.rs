@@ -283,7 +283,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.page.next","panel.page.prev","panel.page.set"]
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set"]
         }).to_string(), None);
     }
     // The transport admits `app.*`/`action.*` on every inbound port; this
@@ -325,6 +325,41 @@ fn dispatch_shell_request(
                 output: frame.geometry.output.clone(),
                 at,
                 kind: ShellCommandKind::Quit,
+            }),
+        );
+    }
+    if request.command == "shell.panel.resize" {
+        if let Err(error) = authorize_local_caller(request) {
+            return (
+                10,
+                json!({"error":format!("local registered caller required: {error:?}")}).to_string(),
+                None,
+            );
+        }
+        let Some(edge) = argument(request, "edge").and_then(parse_edge) else {
+            return (
+                10,
+                json!({"error":"edge must be left, bottom, right or top"}).to_string(),
+                None,
+            );
+        };
+        let Some(thickness_px) = number_argument(request, "thickness_px")
+            .map(|value| value as f32)
+            .filter(|value| cosmix_shell::core::RESIZE_THICKNESS_RANGE.contains(value))
+        else {
+            return (
+                10,
+                json!({"error":"thickness_px must be a number in 120..=500"}).to_string(),
+                None,
+            );
+        };
+        return (
+            0,
+            json!({"accepted":true}).to_string(),
+            Some(ShellCommand {
+                output: frame.geometry.output.clone(),
+                at,
+                kind: ShellCommandKind::ResizeCommit { edge, thickness_px },
             }),
         );
     }
@@ -458,6 +493,18 @@ fn argument(request: &InboundRequest, name: &str) -> Option<String> {
         return Some(value.clone());
     }
     parse_args(request)?.get(name)?.as_str().map(str::to_owned)
+}
+
+/// Read a finite numeric argument, accepting both a JSON number
+/// (`thickness_px=240`) and a numeric string (`thickness_px="240"`) — Mix's
+/// `send … k=v` may deliver either shape.
+fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
+    let value = parse_args(request)?;
+    let field = value.get(name)?;
+    let number = field
+        .as_f64()
+        .or_else(|| field.as_str().and_then(|text| text.parse::<f64>().ok()))?;
+    number.is_finite().then_some(number)
 }
 
 fn parse_edge(value: String) -> Option<Edge> {
@@ -601,6 +648,47 @@ mod tests {
             dispatch_shell_request(&request, &frame, std::time::Duration::ZERO).0,
             10
         );
+    }
+
+    #[test]
+    fn resize_requires_local_and_validates_range() {
+        let frame = test_frame();
+        // Unregistered caller is refused before any argument parsing.
+        let mut anon = request("shell.panel.resize");
+        anon.body = r#"{"edge":"left","thickness_px":240}"#.into();
+        assert_eq!(
+            dispatch_shell_request(&anon, &frame, std::time::Duration::ZERO).0,
+            10
+        );
+        // A valid in-range resize returns a ResizeCommit for that edge.
+        let mut ok = local("shell.panel.resize");
+        ok.body = r#"{"edge":"left","thickness_px":240}"#.into();
+        let (rc, body, command) = dispatch_shell_request(&ok, &frame, std::time::Duration::ZERO);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"accepted":true})
+        );
+        assert_eq!(
+            command.unwrap().kind,
+            ShellCommandKind::ResizeCommit {
+                edge: cosmix_shell::core::Edge::Left,
+                thickness_px: 240.0
+            }
+        );
+        // Out-of-range and non-numeric thickness are refused with no command.
+        for bad in [
+            r#"{"edge":"left","thickness_px":40}"#,
+            r#"{"edge":"left","thickness_px":9000}"#,
+            r#"{"edge":"left","thickness_px":"wide"}"#,
+            r#"{"edge":"nowhere","thickness_px":240}"#,
+        ] {
+            let mut req = local("shell.panel.resize");
+            req.body = bad.into();
+            let (rc, _, command) = dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
+            assert_eq!(rc, 10, "rejected: {bad}");
+            assert!(command.is_none(), "no command for: {bad}");
+        }
     }
 
     /// A request shaped the way the LIVE wire delivers one: caller arguments

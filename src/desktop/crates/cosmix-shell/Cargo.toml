@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell"
-version = "0.8.1"
+version = "0.8.2"
 description = "Pure core and host seams for the Cosmix Quoin desktop shell"
 edition = "2024"
 rust-version = "1.95"

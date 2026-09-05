@@ -27,10 +27,26 @@ pub struct ShellCommand {
 pub enum ShellCommandKind {
     Quit,
     Geometry(LogicalSize),
-    Resize { edge: Edge, thickness_px: f32 },
+    Resize {
+        edge: Edge,
+        thickness_px: f32,
+    },
+    /// A scripted, atomic resize that settles and persists in one command —
+    /// the Bus/config path, distinct from the grip gesture's per-motion
+    /// [`ShellCommandKind::Resize`] (which never persists on its own).
+    ResizeCommit {
+        edge: Edge,
+        thickness_px: f32,
+    },
     Corner(CornerEvent),
-    Panel { edge: Edge, input: PanelInput },
-    Carousel { edge: Edge, input: CarouselInput },
+    Panel {
+        edge: Edge,
+        input: PanelInput,
+    },
+    Carousel {
+        edge: Edge,
+        input: CarouselInput,
+    },
 }
 
 /// One edge-attributed semantic transition from the current model update.
