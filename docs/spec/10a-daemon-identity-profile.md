@@ -1,7 +1,7 @@
 ---
 title: Managed Daemon Identity Profile — Retained Contract
 chapter: 10a
-version: 0.1.1
+version: 0.2.0
 status: draft
 date: 2026-09-05
 ---
@@ -16,13 +16,17 @@ Examples and verification pseudocode are descriptive legacy material, not script
 
 ## 1. Introduction
 
-**Registry drift — do not allocate or regenerate from this historical table.**
-The retained registry is version 1.4.4 and lacks the normative 1.4.5/1.4.6
-amendments. The [committed sysusers projection](https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/_etc/sysusers/cosmix.conf)
-labels itself 1.4.6 and assigns 519 to powerd and 520 to mprisd. Appendix A's
-“next free 519” comments are historical, not allocation authority. Recover and
-reconcile the registry amendments before generating accounts or passing a registry
-equality gate; this refactor neither frees those IDs nor ratifies new allocations.
+**Registry reconciliation — version 1.4.6.** The
+[accepted authority handover](authority-handover.md) reconciles the missing
+1.4.5/1.4.6 rows against the
+[committed sysusers projection](https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/_etc/sysusers/cosmix.conf).
+Commits `52482560` and `6c4d56df` introduced powerd 519 and mprisd 520.
+Their Bus names are explicit R6 exceptions, `power` and `mpris`, as defined by
+`BUS_SERVICE` in each crate's `src/citizen.rs`. Both committed
+`src/_etc/systemd-user/` units run as the session user; the fixed rows reserve
+daemon/namespace identities, not a claim of runtime UID 519/520. The next
+unassigned daemon/shared number is 521, subject to collision checks and host
+preflight. Source reconciliation does not certify a generator or live accounts.
 
 **Retained observability obligations (legacy Appendix D 1.4.0/1.4.1).**
 The six observability identities require identity-profile L2 from first install,
@@ -167,6 +171,8 @@ Appendix A. As a summary:
 | 515 | `cosmix-wgd` | `wgd` | WireGuard mesh control plane (SPEC-13 D0) (v1.4.2) |
 | 517 | `cosmix-interactd` | `interact` | Reserved interaction namespace/props identity; desktop sink runs in-session (§7.3) (v1.4.3, explicit R6 override) |
 | 518 | `cosmix-nspawnd` | `nspawnd` | nspawn host executor: generation-fenced CT lifecycle (nspawn cluster-lite C1) (v1.4.4) |
+| 519 | `cosmix-powerd` | `power` | Reserved power identity; session-user runtime (v1.4.5, explicit R6 exception) |
+| 520 | `cosmix-mprisd` | `mpris` | Reserved media identity; session-user runtime (v1.4.6, explicit R6 exception) |
 | 600 | `cosmix-statecache` | `statecache` | Citizen-identity: SPEC-18 reference citizen (§2.5) |
 
 `cosmix-noded` registers under the ABP service name `noded`,
@@ -766,9 +772,10 @@ include the following directives in `[Service]`:
 A registry entry MAY be classified by an amendment as a **registered
 systemd-user daemon** when its live service must inherit resources belonging to
 the logged-in session and cannot truthfully run under its reserved POSIX row.
-Version 1.4.3 classifies only `cosmix-interactd` this way (§7.3). This is a
-closed class: placing a unit under the user manager does not implicitly earn
-the exception.
+The closed class is `cosmix-interactd` (1.4.3), `cosmix-powerd` (1.4.5)
+and `cosmix-mprisd` (1.4.6), reconciled by the
+[accepted handover](authority-handover.md) and §7.3. Placing another unit under
+the user manager does not implicitly earn the exception.
 
 A registered systemd-user daemon's unit SHALL:
 
@@ -1165,7 +1172,8 @@ SPEC.
 
 ### 7.1 Test for inclusion
 
-A Cosmix process belongs in the daemon registry (§2) if and only if it
+Except for the explicitly registered session reservations in §7.3,
+a Cosmix process belongs in the daemon registry (§2) if and only if it
 runs **as a system service** with persistent identity across user
 logins. A process is **session-scoped** and excluded from the registry
 if any of the following hold:
@@ -1197,10 +1205,16 @@ inclusion. (`cosmix-menu` was previously listed here; the crate was
 removed when its assumptions — XDG-tray launcher for a desktop full
 of Dioxus apps — no longer matched the post-pivot Cosmix surface.)
 
-### 7.3 `cosmix-interactd` reserved identity and session runtime
+### 7.3 Registered session reservations
 
-`cosmix-interactd` is the narrow exception to §7.1's “no registry entry”
-rule. UID/GID **517** reserves a stable POSIX identity for the interaction
+`cosmix-interactd`, `cosmix-powerd` and `cosmix-mprisd` are the closed exceptions
+to §7.1's “no registry entry” rule. All run under the logged-in user and conform
+to §5.1.2. UID/GID **519** reserves power identity (Bus `power`); **520** reserves
+media identity (Bus `mpris`). Neither grants access to a system-owned daemon leaf
+or makes the reserved UID the live process identity. A future system-owned helper
+requires its own specified trust boundary. These are explicit R6 name exceptions.
+
+For `cosmix-interactd`, UID/GID **517** reserves a stable POSIX identity for the interaction
 namespace and any future system-owned persisted props projection, but the
 current notify.v1 implementation is memory-backed and its freedesktop sink
 requires the logged-in user's session D-Bus. The shipped process therefore
@@ -1292,12 +1306,12 @@ comment lines (§4.3) and SHALL NOT emit a `u` line.
 
 ```sysusers
 # /usr/lib/sysusers.d/cosmix.conf
-# Generated from Appendix A of cosmix-daemon-identity v1.4.4.
+# Generated from Appendix A of cosmix-daemon-identity v1.4.6.
 # DO NOT EDIT — regenerate from the canonical Markdown registry.
 
 # --- Daemon-identity entries (POSIX user + same-numbered group) ---
 #Type Name              ID   GECOS                                Home           Shell
-u     cosmix-noded      500  "Cosmix node daemon (ABP broker)"    /nonexistent   /usr/sbin/nologin
+u     cosmix-noded      500  "Cosmix node daemon (Bus broker)"    /nonexistent   /usr/sbin/nologin
 u     cosmix-maild      501  "Cosmix mail daemon"                 /nonexistent   /usr/sbin/nologin
 u     cosmix-webd       502  "Cosmix web daemon"                  /nonexistent   /usr/sbin/nologin
 u     cosmix-indexd     503  "Cosmix knowledge daemon"            /nonexistent   /usr/sbin/nologin
@@ -1314,6 +1328,8 @@ u     cosmix-nodeexport 514  "Cosmix node_exporter (obs tier)"    /nonexistent  
 u     cosmix-wgd        515  "Cosmix WireGuard mesh control plane" /nonexistent   /usr/sbin/nologin
 u     cosmix-interactd  517  "Cosmix interaction broker"          /nonexistent   /usr/sbin/nologin
 u     cosmix-nspawnd    518  "Cosmix nspawn host executor"        /nonexistent   /usr/sbin/nologin
+u     cosmix-powerd     519  "Cosmix battery and power daemon"    /nonexistent   /usr/sbin/nologin
+u     cosmix-mprisd     520  "Cosmix MPRIS media-player daemon"   /nonexistent   /usr/sbin/nologin
 
 # --- Shared-credential groups (group only; no associated user) ---
 # cosmix-tls mediates read access to TLS keypairs shared by ≥2 daemons
@@ -1623,11 +1639,11 @@ Notes on the ABP-emit branch:
 
 ---
 
-## Appendix A. Initial UID/GID Registry (1.4.4)
+## Appendix A. UID/GID Registry (1.4.6)
 
 ```
-# Cosmix daemon identity registry — version 1.4.4
-# Date: 2026-08-08
+# Cosmix daemon identity registry — version 1.4.6
+# Reconciled: 2026-09-05 (existing allocations, no account migration)
 # Daemon/shared window: 500-599 (preferred fixed-ID window; see §2.1)
 # Citizen window:        600-699 (citizen-identity stream, v1.2.0; §2.1, R7)
 # Daemon/shared allocation rule: append-only, no reuse (R1, R2, R2.a)
@@ -1649,7 +1665,7 @@ Notes on the ABP-emit branch:
 # --- Daemon-identity entries (POSIX user + same-numbered group) ---
 uid  name              bus     gecos                                  tier         tombstoned
 ---  ----------------  ------  -------------------------------------  -----------  ----------
-500  cosmix-noded      -       "Cosmix node daemon (ABP broker)"      substrate    -
+500  cosmix-noded      -       "Cosmix node daemon (Bus broker)"      substrate    -
 501  cosmix-maild      -       "Cosmix mail daemon"                   application  -
 502  cosmix-webd       -       "Cosmix web daemon"                    application  -
 503  cosmix-indexd     -       "Cosmix knowledge daemon"              substrate    -
@@ -1666,6 +1682,8 @@ uid  name              bus     gecos                                  tier      
 515  cosmix-wgd        -       "Cosmix WireGuard mesh control plane"  substrate    -
 517  cosmix-interactd  interact "Cosmix interaction broker"            session-reserved -
 518  cosmix-nspawnd    -       "Cosmix nspawn host executor"          substrate    -
+519  cosmix-powerd     power   "Cosmix battery and power daemon"      session-reserved -
+520  cosmix-mprisd     mpris   "Cosmix MPRIS media-player daemon"     session-reserved -
 
 # --- Shared-credential group entries (group only; no associated user) ---
 gid  name        purpose                                                   tombstoned
@@ -1710,7 +1728,7 @@ cid  name               bus  gecos                               tier     retire
 # group, `cosmix-mesh` (GID 516, signed-inventory read access §3.3); the
 # daemon stream skips 516 to preserve non-collision. Future shared-
 # credential groups continue from the next free GID that does not collide
-# with the daemon-identity frontier (519 as of v1.4.4, after nspawnd 518).
+# with the daemon-identity frontier (521 as of v1.4.6, after mprisd 520).
 #
 # The citizen-identity block lives in its own 600–699 window (§2.1),
 # disjoint from 500–599, so citizen numbering never collides with
@@ -1738,11 +1756,14 @@ cid  name               bus  gecos                               tier     retire
 # no new gap. R6 default ABP/Bus service name `nspawnd`.
 # The two-stream non-collision rule (§2.2) is preserved.
 #
-# Next free daemon UID: 519 (516 is held by the deployed `cosmix-mesh` shared-
-#   credential group; 517 is `cosmix-interactd`, 518 is `cosmix-nspawnd`).
-# Next free shared-credential GID: 519 (the shared-cred stream holds 510
+# v1.4.5 adds powerd 519; v1.4.6 adds mprisd 520. Both reserve fixed
+# identities with session-user runtime; explicit R6 names are power/mpris.
+# No reuse, renumbering or reclamation is introduced by reconciliation.
+# Next free daemon UID: 521 (516 is held by the `cosmix-mesh` shared-
+#   credential group; 517–520 are already assigned).
+# Next free shared-credential GID: 521 (the shared-cred stream holds 510
 #   `cosmix-tls` and 516 `cosmix-mesh`; the daemon stream now also holds
-#   517 and 518).
+#   517 through 520).
 # Next free citizen UID: 601 (lowest-free in 600–699; reclaimed UIDs
 #   re-enter this pool only after R8 — §2.3 R7/R8, §2.5).
 # Tombstones (kept for audit; SHALL NOT be reused per R2): none.

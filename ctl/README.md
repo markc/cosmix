@@ -6,6 +6,11 @@ against, your plans and journals, your deploy scripts, your machine
 inventory, and the gate that keeps private values out of anything you
 publish. This folder is the public **starter** for that hub.
 
+Architecture and development contracts now live in the
+[canonical public specification suite](../docs/spec/README.md), also at
+[cosmix.dev/spec/](https://cosmix.dev/spec/). Private hubs hold deployment policy
+and evidence; their old spec copies are historical, not competing authority.
+
 ## Get your own
 
 ```sh
@@ -26,7 +31,7 @@ it locates the hub from its own path, so the copy works wherever you put it.
 |---|---|---|
 | `CLAUDE.md`, `CODEX.md` | the project mandate and working map an agent reads first | edit; add your mesh-private addendum under `_doc/` and `@`-import it |
 | `_doc/` | the working method (ultracode workflows, convergence review) | extend |
-| `_spec/` | the specification suite (21 of 28 chapters — see below) | read; propose changes upstream |
+| `_spec/` | historical starter spec snapshot (see below) | consult for provenance; edit current contracts in `docs/spec/` upstream |
 | `_decisions/` | architecture decision records (38 of 45) | read; add your own |
 | `_plan/`, `_journal/` | empty; date-prefixed `YYYY-MM-DD-title.md` files go here | fill |
 | `_lib/deploy_lib.mix` | the shared half of every deploy script: hub + `$COSMIX` locators, roster, inventory lookups (`mesh_ip`, hubs-last `rollout_order`), snapshot, version compare + downgrade refusal, `shipped()` asset resolution | require it; never re-implement it |

@@ -442,13 +442,15 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="spec/README.md"><div class="prose"><h1 id="cosmix-specifications">Cosmix specifications</h1>
-<p>This is the replacement specification candidate, audited against source commit
+<p>This is the canonical pre-GA development specification suite, audited against source commit
 <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. It is not a claim that every
-requirement is implemented, tested, deployed or accepted. Publication does not
+requirement is implemented, tested or deployed through this acceptance. Publication does not
 resolve the discrepancies recorded in individual chapters.</p>
 <p>The <a href="/spec/compatibility-profile">security and delivery compatibility amendment</a>
-is accepted: its listed guarantees now match the implementation. The suite as a
-whole remains draft; other conflicts and publication gates remain open.</p>
+is accepted: its listed guarantees now match the implementation. The suite's
+authority transfer and its limits are recorded in the
+<a href="/spec/authority-handover">accepted handover</a>. Technical discrepancies remain open;
+acceptance is not implementation or deployment certification.</p>
 <p>The complete 47-file delta through commit
 <code>4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac</code> has also been reconciled.
 Chapters 03, 06, 07 and 08 describe the changed boundaries; unchanged modules
@@ -480,9 +482,9 @@ Existing historical identifiers and encoded data must not be mechanically rename
 <p>The chapter prefixes are reading order only. They do <strong>not</strong> replace legacy
 <code>SPEC 07</code>, <code>SPEC 12</code>, <code>spec.get</code> numeric IDs, or <code>world.specs.NN</code> keys. Runtime
 distribution needs an explicit compatibility plan before switching directories.</p>
-<p>The intended public home is <code>docs/spec/</code> in <code>markc/cosmix</code>, served under <code>/spec/</code>.
+<p>The canonical public home is <code>docs/spec/</code> in <code>markc/cosmix</code>, served under <code>/spec/</code>.
 Private audit notes, original snapshots, deployment details and review transcripts
-stay private. While this candidate remains draft, do not treat its unresolved
+stay private. Chapter drafts evolve within this accepted baseline; do not treat unresolved
 conflicts as permission to weaken an existing safety requirement.</p>
 <p>Before v1.0 GA, expect revisions and occasional reorganisation. Stable requirement
 IDs, source revisions, explicit dispositions and migration notes—not filenames—

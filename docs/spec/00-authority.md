@@ -1,7 +1,7 @@
 ---
 title: Authority, evidence and change
 chapter: 0
-version: 0.1.1
+version: 0.2.0
 status: draft
 date: 2026-09-05
 ---
@@ -39,6 +39,11 @@ previously accepted requirements quoted within it. Mark Constable is the accepta
 authority for this pre-GA refactor. Acceptance must explicitly disposition changes
 to those requirements; drafting and reviewing agents cannot ratify their own
 normative amendments.
+
+Suite 0.3.0 is now accepted as the canonical pre-GA baseline. The
+[authority handover](authority-handover.md) records the constitutional dispositions,
+protected-target mapping and limits. It controls over historical procedures copied
+into retained profiles; technical evidence labels remain unchanged.
 
 ## Authority and change control
 

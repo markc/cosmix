@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — spec/00-authority</title>
+    <title>CosMix — spec/authority-handover</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,82 +441,70 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="spec/00-authority.md"><div class="prose"><h1 id="authority-evidence-and-change">Authority, evidence and change</h1>
-<h2 id="what-this-suite-means">What this suite means</h2>
-<p><strong>GOV-001 — Separate intent from evidence.</strong> A requirement states intended
-behaviour. An implementation note states observed source behaviour at a named
-revision. Tests demonstrate only their exercised cases. Deployment needs separate
-evidence. None of these may stand in for the others.</p>
-<p>The baseline for this edition is commit
-<code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code> of <code>markc/cosmix</code>. The source
-audit did not execute the Rust test suites or inspect production installations.
-The complete 47-file committed delta through
-<code>4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac</code> was subsequently reconciled.
-Unchanged source references retain their original pin; changed behaviour names
-the newer revision. Uncommitted work is excluded. This is source coverage, not
-a fresh correctness proof or test/deployment attestation.</p>
-<table><thead><tr><th>Label</th><th>Meaning</th></tr></thead><tbody>
-<tr><td>Implemented / source-backed</td><td>Relevant code exists at the cited revision; no fresh execution implied</td></tr>
-<tr><td>Tested</td><td>A named command/test, revision, environment and result are recorded</td></tr>
-<tr><td>Partial</td><td>Some specified behaviour exists; the missing portion is identified</td></tr>
-<tr><td>Proposed / deferred</td><td>Intended future work, not a current capability</td></tr>
-<tr><td>Conflict / discrepancy</td><td>Source and an existing requirement disagree; neither is silently discarded</td></tr>
-<tr><td>Historical / superseded</td><td>Retained for traceability, not an instruction to recreate abandoned architecture</td></tr>
-<tr><td>Unverified</td><td>Available evidence is insufficient</td></tr>
+        <div id="content-doc" data-prerendered="spec/authority-handover.md"><div class="prose"><h1 id="accepted-pre-ga-authority-handover">Accepted pre-GA authority handover</h1>
+<p>Mark Constable authorised proceeding with the outstanding authority decisions on
+2026-09-05. This records that operator decision; the document and commit are
+agent-prepared, not represented as human-authored constitutional amendments.</p>
+<p><strong>HANDOVER-001 — Canonical home.</strong> <code>docs/spec/</code> is now the canonical public
+architecture and development specification suite. The private dated originals
+and frozen refactor snapshot are historical evidence, not competing specifications.
+They remain intact. Public requirement IDs and the explicit dispositions below
+govern new work; reading-order numbers do not reassign legacy runtime IDs.</p>
+<p><strong>HANDOVER-002 — Acceptance is not certification.</strong> Suite 0.3.0 is accepted as
+the pre-GA development baseline, with its existing source pins and evidence labels.
+Chapter <code>draft</code> labels continue to identify evolving detail. Proposed, deferred,
+partial and unverified features do not become implemented, tested or deployed
+through acceptance. Unresolved technical discrepancies remain conformance work,
+not implicit permission to weaken a requirement. The
+<a href="/spec/compatibility-profile">compatibility profile</a> remains the explicit accepted
+exception for its six security/delivery guarantees.</p>
+<h2 id="constitutional-disposition">Constitutional disposition</h2>
+<p>This table replaces the historical constitution's role as the project's current
+specification-level authority. It does not edit or claim procedural compliance
+with that document's human-authored-commit requirement. Current task instructions
+and repository working agreements govern agent actions; no specification grants
+permission to publish secrets or perform unrelated destructive work.</p>
+<table><thead><tr><th>Historical article</th><th>Accepted disposition</th></tr></thead><tbody>
+<tr><td>I — ownership/data</td><td>Retain operator-controlled canonical state and explicit authority for external replication and credential operations under FOUND-001/002 and GOV-007. Configuration syntax is deployment-specific, not necessarily TOML. This handover grants no credential or federation action.</td></tr>
+<tr><td>II — code/dependencies</td><td>Retain Rust/Mix stack language intent, open-source provenance and reviewed dependency obligations under FOUND-005/007 and composition. Historical repository paths are logical scope references. Dependency pinning discrepancies remain visible compliance work; no new dependency or runtime language is approved here.</td></tr>
+<tr><td>III — mesh/trust</td><td>Use the mesh chapter and accepted compatibility profile for actual admission, routing and trust guarantees. Subnet shape is deployment configuration, not proof of authentication. Retain explicit authorisation for public exposure and operator-controlled scheduling; no network or scheduler change follows.</td></tr>
+<tr><td>IV — autonomy/consent</td><td>Current operator instructions and repository working agreements replace the historical mandatory branch/tier matrix for interactive agent work. Preserve scoped authorisation, withdrawal of consent, honest authorship and auditable changes. Old harness tiers, trailers and drift breakers are retained design material, not claimed active controls or newly enabled autonomy.</td></tr>
+<tr><td>V — reversibility/audit</td><td>FOUND-009/011 and the persistence chapter control: verify the affected boundary, preserve unrelated work, and plan recovery for external effects. Git revert is not universal rollback. Historical crisis automation and LKG mechanisms remain proposed unless separately evidenced; do not claim they are deployed.</td></tr>
+<tr><td>VI — protected targets</td><td>Public policy successors are authority, foundations, this handover, the compatibility profile and the repair/improvement profile. The legacy constitution, declaration and changelog remain preserved historical targets. Core daemons, dependencies, service units and autonomy configuration retain sensitive scope: explicit task authority is required, never inferred from a document rename. This approval covers the documentation handover, not unrestricted future changes to those targets.</td></tr>
+<tr><td>VII — amendments</td><td>GOV-002/003/008 replace the old human-authored-only commit ceremony: operator decisions may be recorded and implemented by agents with honest attribution, explicit dispositions, version/prior-version references and a change record. Agents cannot ratify their own normative changes. Federation of amendment authority is not approved.</td></tr>
 </tbody></table>
-<p>Chapter <code>status: draft</code> applies to the replacement document. It does not invalidate
-previously accepted requirements quoted within it. Mark Constable is the acceptance
-authority for this pre-GA refactor. Acceptance must explicitly disposition changes
-to those requirements; drafting and reviewing agents cannot ratify their own
-normative amendments.</p>
-<p>Suite 0.3.0 is now accepted as the canonical pre-GA baseline. The
-<a href="/spec/authority-handover">authority handover</a> records the constitutional dispositions,
-protected-target mapping and limits. It controls over historical procedures copied
-into retained profiles; technical evidence labels remain unchanged.</p>
-<h2 id="authority-and-change-control">Authority and change control</h2>
-<p><strong>GOV-002 — No silent normative changes.</strong> Every changed MUST, wire value,
-identity rule, trust assumption, persistence guarantee or lifecycle transition
-needs an explicit retained/clarified/changed/deferred/superseded disposition and
-compatibility analysis. Editing prose is not evidence that a discrepancy is fixed.</p>
-<p><strong>GOV-003 — Stable references.</strong> Requirement IDs survive file moves. Removed IDs
-remain tombstoned in the change record and are never reassigned. Chapter numbers
-are editorial; legacy runtime identifiers require their own versioned registry.</p>
-<p><strong>GOV-004 — One canonical suite after acceptance.</strong> Public-safe architecture and
-contracts belong in <code>markc/cosmix/docs/spec/</code>, served at <code>/spec/</code> on cosmix.dev.
-Private overlays may configure a deployment,
-record private decisions or restrict actions, but must link to—not fork—the
-public contract. Private archives preserve historical evidence without competing
-for current authority.</p>
-<p>Current authorised task instructions and repository working agreements govern
-what an implementation agent may do. A historical specification is not authority
-to destroy unrelated working-tree changes, reveal secrets or expand task scope.
-Conflicting project mandates must be surfaced rather than silently reconciled.</p>
-<h2 id="names">Names</h2>
-<p><strong>GOV-005 — Naming is not protocol migration.</strong> Use Cosmix for the project,
-Bus for the family, ABP for Agent Bus Protocol, and Mix for the language/shell.
-The August 2026 AMP-to-Bus crate/path rename and ABP expansion correction are
-separate changes. The prose correction alone changed no wire encoding/version.
-Historical quotations, old commit paths and genuine identifiers retain their names.</p>
-<h2 id="evidence-and-publication-gates">Evidence and publication gates</h2>
-<p><strong>GOV-006 — Reviewable evidence.</strong> Every substantive current-state claim names
-the relevant source module and baseline. Claims of tests passing must include the
-actual run, not copy a previous session's report. Unknowns remain visible.</p>
-<p><strong>GOV-007 — Public sanitisation.</strong> Public material must exclude credentials,
-private host/address/domain mappings, operator home paths, deployment overlays,
-private review transcripts and operational logs. Use synthetic examples. A public
-copy must be independently screened; moving a private document is not sanitisation.</p>
-<p><strong>GOV-008 — Bounded review, explicit residuals.</strong> Review the complete candidate
-once independently. Apply one consolidated substantive-fix round. Verify only the
-specific fixes in the final check. An unresolved blocker stays a blocker; the
-review limit is not permission to publish a known-bad normative contract.</p>
-<h2 id="pre-ga-maintenance">Pre-GA maintenance</h2>
-<p>The suite version governs publication; chapter versions identify changed documents
-within it. Neither substitutes for crate, wire or storage versions.
-Use patch revisions for corrections without behavioural change; explain any
-contract change and its compatibility impact explicitly, regardless of version
-number. Before GA, a minor revision can reorganise chapters, but must preserve ID
-mapping and accepted guarantees. Review drift when affected code changes; perform
-a whole-suite checkpoint before release milestones or another broad refactor.</p></div></div>
+<p>Where retained profiles reproduce contradictory historical tier gates or amendment
+procedures, this table takes precedence. Their technical recovery, integrity and
+identity requirements are not discarded merely because the old governance
+machinery is no longer the working agreement.</p>
+<h2 id="identity-registry-disposition">Identity registry disposition</h2>
+<p><strong>HANDOVER-003 — Preserve existing assignments.</strong> The identity profile's summary,
+Appendix A and projection example now reconcile the already committed registry
+1.4.6: powerd 519 (introduced in <code>52482560</code>) and mprisd 520 (<code>6c4d56df</code>).
+They are session services, with reserved fixed identities; their user units do
+not prove execution under those numeric accounts. Existing interaction service
+name <code>interact</code> remains an explicit exception; the added Bus names are <code>power</code>
+and <code>mpris</code>, not inferred <code>powerd</code> and <code>mprisd</code>.</p>
+<p>The next unassigned daemon/shared number is 521, subject to both streams'
+non-collision rules and host preflight. No account is created, removed, renumbered
+or reclaimed. Observability service identities remain reserved despite retirement
+of a deployment node. Generator availability and full live account equality are
+not certified by reconciling the source tables.</p>
+<h2 id="runtime-and-publication-are-separate-versions">Runtime and publication are separate versions</h2>
+<p><strong>HANDOVER-004 — No silent runtime promotion.</strong> The immutable runtime candidate
+<code>spec-candidate-1245b44b-v1</code> remains pinned to its original 20 documents and
+preparation-only manifest. It does not contain this handover or the corrected
+registry. Web/Git readers use the canonical suite; runtime readers must inspect
+their release identity and must not mistake that old candidate for suite 0.3.0.
+A new manifest and explicit deployment are required to update runtime retrieval.
+No legacy numeric alias, retained topic or fleet configuration changes here.</p>
+<h2 id="change-record">Change record</h2>
+<ul>
+<li>0.3.0, amending suite 0.2.1: operator-approved authority transfer; constitutional
+dispositions recorded; existing UID assignments reconciled. No crate, wire,
+storage or installed release version is changed.</li>
+<li>The earlier six-row compatibility amendment remains in force without expansion.</li>
+</ul></div></div>
     </div>
 
 </main>

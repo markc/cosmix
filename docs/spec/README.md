@@ -1,20 +1,22 @@
 ---
 title: Cosmix specification suite
-version: 0.2.1
-status: draft
+version: 0.3.0
+status: accepted
 date: 2026-09-05
 ---
 
 # Cosmix specifications
 
-This is the replacement specification candidate, audited against source commit
+This is the canonical pre-GA development specification suite, audited against source commit
 `96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be`. It is not a claim that every
-requirement is implemented, tested, deployed or accepted. Publication does not
+requirement is implemented, tested or deployed through this acceptance. Publication does not
 resolve the discrepancies recorded in individual chapters.
 
 The [security and delivery compatibility amendment](compatibility-profile.md)
-is accepted: its listed guarantees now match the implementation. The suite as a
-whole remains draft; other conflicts and publication gates remain open.
+is accepted: its listed guarantees now match the implementation. The suite's
+authority transfer and its limits are recorded in the
+[accepted handover](authority-handover.md). Technical discrepancies remain open;
+acceptance is not implementation or deployment certification.
 
 The complete 47-file delta through commit
 `4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac` has also been reconciled.
@@ -54,9 +56,9 @@ The chapter prefixes are reading order only. They do **not** replace legacy
 `SPEC 07`, `SPEC 12`, `spec.get` numeric IDs, or `world.specs.NN` keys. Runtime
 distribution needs an explicit compatibility plan before switching directories.
 
-The intended public home is `docs/spec/` in `markc/cosmix`, served under `/spec/`.
+The canonical public home is `docs/spec/` in `markc/cosmix`, served under `/spec/`.
 Private audit notes, original snapshots, deployment details and review transcripts
-stay private. While this candidate remains draft, do not treat its unresolved
+stay private. Chapter drafts evolve within this accepted baseline; do not treat unresolved
 conflicts as permission to weaken an existing safety requirement.
 
 Before v1.0 GA, expect revisions and occasional reorganisation. Stable requirement

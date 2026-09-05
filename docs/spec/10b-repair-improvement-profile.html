@@ -443,7 +443,7 @@
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="spec/10b-repair-improvement-profile.md"><div class="prose"><h1 id="repair-and-improvement--retained-mechanism-profile">Repair and Improvement — Retained Mechanism Profile</h1>
 <p><strong>DAEMON-REPAIR-001 — Retained mechanisms.</strong> Parts A and B preserve the original repair and improvement requirements, numerical defaults, event shapes, trust gradient and conformance levels. Section numbers restart in each part; a reference to repair §6 means Part A §6, while improvement §6 means Part B §6. Legacy chapter IDs 08 and 09 remain provenance identifiers, not new distribution IDs.</p>
-<p>This profile retains intent during refactoring. It is not ratified by publication, does not override <a href="/spec/00-authority">authority</a> or <a href="/spec/01-foundations">foundations</a>, and does not establish runtime conformance at baseline <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. The <a href="/spec/10-daemon-agent-operation">daemon chapter</a> identifies the narrower implementation evidence. Original files remain in place during candidate review.</p>
+<p>This profile retains intent during refactoring. The <a href="/spec/authority-handover">accepted handover</a> governs its policy status and takes precedence over historical constitutional procedures reproduced below. It does not override <a href="/spec/00-authority">authority</a> or <a href="/spec/01-foundations">foundations</a>, or establish runtime conformance at baseline <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. The <a href="/spec/10-daemon-agent-operation">daemon chapter</a> identifies the narrower implementation evidence. Original files remain preserved historical records.</p>
 <p>Known discrepancies remain explicit: Part A's user-service-only statement conflicts with the later <a href="/spec/10a-daemon-identity-profile">identity profile</a>, which distinguishes system and user services; a daemon cannot enforce <code>Restart=no</code> simply by exiting; the whole cross-process escalation/DLQ system and Part B proposal/approval pipeline have not been established as implemented. Part B's atomic multi-artifact transaction and backward-compatible reversal requirements require a concrete coordinator and schema recovery design. No implication of automatic authority follows from this retained text. The quorum rule is conditional and dormant under its stated trigger.</p>
 <p>Other legacy references map by subject: self-awareness/property read surfaces → <a href="/spec/06-properties">properties</a>; topic delivery → <a href="/spec/05-broker-topics">broker/topics</a>; persistent recovery → <a href="/spec/07-persistence-recovery">persistence/recovery</a>; mesh trust → <a href="/spec/08-mesh-trust">mesh</a>; Mix language → <a href="/spec/09-mix-integration">Mix integration</a>. Constitution article numbers remain historical clause references pending the suite's complete claim mapping; they are not silently renumbered.</p>
 <p>Paths under <code>deployment-tools/</code> stand for the deployment profile's legacy helper artifacts, not a claimed public directory or executable command recipe. Private operational-reference paths have been replaced by descriptive provenance labels. Numerical rules and safety obligations are otherwise retained. Dated worked examples and source-presence statements are historical evidence, not current test results.</p>
@@ -1308,15 +1308,13 @@ mapping:</p>
 <tr><td><strong>VI forbidden targets</strong></td><td>triage rejects with cause = forbidden_target regardless of class</td></tr>
 <tr><td><strong>VII amendment process</strong></td><td>constitution edits are L4 by definition; require operator-authored commit per VII.1</td></tr>
 </tbody></table>
-<p><strong>Constitution amendments are L4 with extra constraints.</strong> A proposal to
-edit the still-authoritative legacy <code>_spec/2026-04-20-00-constitution.md</code>
-MUST: (a) carry an Article VII amends
-field, (b) have a corresponding CHANGELOG entry, (c) be operator-authored
-in the commit step. This SPEC does not relax VII.1; the proposal mechanism
-prepares the diff but does not commit it.</p>
-<p>The candidate authority/foundations split is not a ratified replacement target.
-Authority cutover must explicitly map the protected constitution and its Article
-VII procedure; renaming a document cannot bypass or silently redirect that gate.</p>
+<p><strong>Historical amendment mechanism — superseded procedure.</strong> The old constitution
+required a human-authored commit, a prior-version reference and a private changelog
+entry, while prohibiting autonomous proposals. The proposal mechanism above did
+not reconcile that prohibition. The <a href="/spec/authority-handover">accepted handover</a>
+now maps the protected targets and procedure: operator-authorised changes can be
+agent-prepared and honestly attributed; agents cannot accept their own amendments.
+The original constitution is preserved, not edited or renamed to bypass a gate.</p>
 <hr />
 <h2 id="9-required-topics-and-capabilities">9. Required Topics and Capabilities</h2>
 <p><strong>Topics (retained snapshots per SPEC 03).</strong></p>

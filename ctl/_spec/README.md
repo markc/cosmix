@@ -18,6 +18,13 @@ date: 2026-05-16
 
 # Cosmix Specification Suite
 
+> **Historical starter snapshot.** Current architecture and development authority
+> is the [public specification suite](../../docs/spec/README.md), governed by its
+> [accepted handover](../../docs/spec/authority-handover.md). The older text and
+> copies below are retained for provenance, not an independently maintained suite.
+> When this starter is copied outside the checkout, use
+> [cosmix.dev/spec/](https://cosmix.dev/spec/) as the canonical entry point.
+
 Reading guide for the Cosmix protocol and design specifications. Chapters are
 ordered bottom-to-top through the stack — start at Chapter 01 (the wire
 protocol that everything speaks) and work up to Chapter 19 (the design system

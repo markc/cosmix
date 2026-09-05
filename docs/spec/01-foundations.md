@@ -1,7 +1,7 @@
 ---
 title: Foundational principles
 chapter: 1
-version: 0.1.0
+version: 0.2.0
 status: draft
 date: 2026-09-05
 ---
@@ -72,10 +72,12 @@ be advertised as active protections without corresponding configuration, code an
 execution evidence. Their policy status requires reconciliation with current
 working agreements before adoption.
 
-## Retained policy questions
+## Policy disposition
 
 The old constitution prescribed exact dependency versions, a fixed mesh subnet,
 specific external-action prohibitions and human-only amendment paths. Current
 source and operating agreements differ in places. This edition preserves their
 sovereignty/safety intent but does not quietly ratify replacements for those exact
-rules. Their detailed disposition remains an acceptance gate in the private audit.
+rules. Their detailed disposition is now recorded in the accepted
+[authority handover](authority-handover.md). Acceptance of the development baseline
+does not certify dependency compliance or enable historical harness machinery.

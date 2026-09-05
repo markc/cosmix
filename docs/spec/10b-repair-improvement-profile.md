@@ -1,7 +1,7 @@
 ---
 title: Repair and Improvement — Retained Mechanism Profile
 chapter: 10b
-version: 0.1.1
+version: 0.2.0
 status: draft
 date: 2026-09-05
 ---
@@ -10,7 +10,7 @@ date: 2026-09-05
 
 **DAEMON-REPAIR-001 — Retained mechanisms.** Parts A and B preserve the original repair and improvement requirements, numerical defaults, event shapes, trust gradient and conformance levels. Section numbers restart in each part; a reference to repair §6 means Part A §6, while improvement §6 means Part B §6. Legacy chapter IDs 08 and 09 remain provenance identifiers, not new distribution IDs.
 
-This profile retains intent during refactoring. It is not ratified by publication, does not override [authority](00-authority.md) or [foundations](01-foundations.md), and does not establish runtime conformance at baseline `96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be`. The [daemon chapter](10-daemon-agent-operation.md) identifies the narrower implementation evidence. Original files remain in place during candidate review.
+This profile retains intent during refactoring. The [accepted handover](authority-handover.md) governs its policy status and takes precedence over historical constitutional procedures reproduced below. It does not override [authority](00-authority.md) or [foundations](01-foundations.md), or establish runtime conformance at baseline `96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be`. The [daemon chapter](10-daemon-agent-operation.md) identifies the narrower implementation evidence. Original files remain preserved historical records.
 
 Known discrepancies remain explicit: Part A's user-service-only statement conflicts with the later [identity profile](10a-daemon-identity-profile.md), which distinguishes system and user services; a daemon cannot enforce `Restart=no` simply by exiting; the whole cross-process escalation/DLQ system and Part B proposal/approval pipeline have not been established as implemented. Part B's atomic multi-artifact transaction and backward-compatible reversal requirements require a concrete coordinator and schema recovery design. No implication of automatic authority follows from this retained text. The quorum rule is conditional and dormant under its stated trigger.
 
@@ -1068,16 +1068,13 @@ mapping:
 | **VI forbidden targets** | triage rejects with cause = forbidden_target regardless of class |
 | **VII amendment process** | constitution edits are L4 by definition; require operator-authored commit per VII.1 |
 
-**Constitution amendments are L4 with extra constraints.** A proposal to
-edit the still-authoritative legacy `_spec/2026-04-20-00-constitution.md`
-MUST: (a) carry an Article VII amends
-field, (b) have a corresponding CHANGELOG entry, (c) be operator-authored
-in the commit step. This SPEC does not relax VII.1; the proposal mechanism
-prepares the diff but does not commit it.
-
-The candidate authority/foundations split is not a ratified replacement target.
-Authority cutover must explicitly map the protected constitution and its Article
-VII procedure; renaming a document cannot bypass or silently redirect that gate.
+**Historical amendment mechanism — superseded procedure.** The old constitution
+required a human-authored commit, a prior-version reference and a private changelog
+entry, while prohibiting autonomous proposals. The proposal mechanism above did
+not reconcile that prohibition. The [accepted handover](authority-handover.md)
+now maps the protected targets and procedure: operator-authorised changes can be
+agent-prepared and honestly attributed; agents cannot accept their own amendments.
+The original constitution is preserved, not edited or renamed to bypass a gate.
 
 ---
 
