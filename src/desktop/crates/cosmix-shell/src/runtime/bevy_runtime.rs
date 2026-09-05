@@ -113,6 +113,9 @@ fn update_model(
         }
         let at = command.at.clamp(runtime.model.last_update(), now);
         match &command.kind {
+            ShellCommandKind::Resize { edge, thickness_px } => {
+                let _ = runtime.model.resize_thickness(*edge, *thickness_px);
+            }
             ShellCommandKind::Quit => {
                 exit.write(AppExit::Success);
             }

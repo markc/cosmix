@@ -207,6 +207,7 @@ fn log_transitions(
     for effect in &effects.0 {
         let edge = edge_name(effect.edge);
         match effect.effect {
+            PanelEffect::ResizeCompleted => println!("QUOIN_RESIZE_COMPLETED edge={edge}"),
             PanelEffect::Reveal {
                 trigger: RevealTrigger::Corner,
             } => println!("QUOIN_REVEAL edge={edge} trigger=corner"),

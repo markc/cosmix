@@ -330,6 +330,13 @@ pub struct QuoinChromeProps {
 #[derive(Component)]
 pub struct QuoinClock;
 
+/// Native host hit-tests this rendered strip before dispatching ordinary buttons.
+/// Its computed transform includes the committed-motion chrome translation.
+#[derive(Component)]
+pub struct QuoinResizeGrip(pub Edge);
+
+const RESIZE_GRIP_PX: f32 = 6.0;
+
 #[derive(Component)]
 struct QuoinPanelChrome {
     edge: Edge,
@@ -406,6 +413,7 @@ impl Plugin for QuoinChromePlugin {
                     present_page_controls,
                     present_content,
                     present_navlinks,
+                    present_resize_grips,
                 )
                     .chain()
                     .in_set(ShellRuntimeSet::Presentation),
@@ -585,7 +593,59 @@ fn spawn_panel(
         ))
         .add_children(&[header, page_host])
         .id();
+    let grip = commands
+        .spawn((
+            QuoinResizeGrip(edge),
+            Node {
+                position_type: PositionType::Absolute,
+                left: if edge == Edge::Left { Val::Auto } else { px(0) },
+                right: if edge == Edge::Right {
+                    Val::Auto
+                } else {
+                    px(0)
+                },
+                top: if edge == Edge::Top { Val::Auto } else { px(0) },
+                bottom: if edge == Edge::Bottom {
+                    Val::Auto
+                } else {
+                    px(0)
+                },
+                width: if horizontal {
+                    Val::Auto
+                } else {
+                    px(RESIZE_GRIP_PX)
+                },
+                height: if horizontal {
+                    px(RESIZE_GRIP_PX)
+                } else {
+                    Val::Auto
+                },
+                ..default()
+            },
+            Pickable::default(),
+            Hovered::default(),
+            BackgroundColor(Color::NONE),
+            ZIndex(10),
+        ))
+        .id();
+    commands.entity(root).add_child(grip);
     commands.entity(mount).add_child(root);
+}
+
+fn present_resize_grips(
+    frame: Res<ShellFrameState>,
+    mut grips: Query<(&QuoinResizeGrip, &Hovered, &mut BackgroundColor)>,
+) {
+    for (grip, hovered, mut colour) in &mut grips {
+        let alpha = if frame.0.panel(grip.0).resize_active {
+            0.8
+        } else if hovered.0 {
+            0.5
+        } else {
+            0.0
+        };
+        colour.0 = Color::srgba(0.3, 0.65, 1.0, alpha);
+    }
 }
 
 fn panel_border(edge: Edge) -> UiRect {

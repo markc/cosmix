@@ -93,6 +93,10 @@ impl ShellModel {
         self.panels[edge.index()].restore_thickness(thickness)
     }
 
+    pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
+        self.panels[edge.index()].resize_thickness(thickness)
+    }
+
     /// Cold-start discovery is independent of compositor corner membership.
     pub fn start_intro(&mut self, duration: Duration) {
         for panel in &mut self.panels {

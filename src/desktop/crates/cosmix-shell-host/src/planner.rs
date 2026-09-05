@@ -326,6 +326,8 @@ mod tests {
             mapped,
             visible_fraction: fraction,
             thickness_px: 101.0,
+            resize_active: false,
+            settled_thickness_px: 101.0,
             exclusive_zone_px: if mode == PanelMode::Pinned {
                 101.0
             } else {

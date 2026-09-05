@@ -154,6 +154,8 @@ impl SavedState {
 pub(crate) struct StateStore {
     path: Option<PathBuf>,
     saved: SavedState,
+    #[cfg(test)]
+    write_count: usize,
 }
 
 impl StateStore {
@@ -178,7 +180,12 @@ impl StateStore {
                 }
             },
         };
-        Self { path, saved }
+        Self {
+            path,
+            saved,
+            #[cfg(test)]
+            write_count: 0,
+        }
     }
 
     pub(crate) fn snapshot(&self) -> SavedState {
@@ -234,10 +241,12 @@ pub(crate) fn persist_transitions(
     }
     if store.path.is_none()
         || (selection.is_none()
-            && !effects
-                .0
-                .iter()
-                .any(|effect| matches!(effect.effect, PanelEffect::Pin { .. }))
+            && !effects.0.iter().any(|effect| {
+                matches!(
+                    effect.effect,
+                    PanelEffect::Pin { .. } | PanelEffect::ResizeCompleted
+                )
+            })
             && effects.1.is_empty())
     {
         return;
@@ -248,15 +257,21 @@ pub(crate) fn persist_transitions(
     for edge in Edge::ALL {
         let panel = frame.0.panel(edge);
         store.saved.edges[edge.index()] = EdgeState {
-            thickness_px: Some(panel.thickness_px),
+            thickness_px: Some(panel.settled_thickness_px),
             pinned: panel.mode == PanelMode::Pinned,
             page: panel.active_page_id.clone().unwrap_or_default(),
         };
     }
-    if let Some(path) = &store.path
-        && let Err(error) = atomic_save(path, &store.saved)
-    {
-        bevy::log::warn!("Quoin state save failed: {error}");
+    if let Some(path) = &store.path {
+        match atomic_save(path, &store.saved) {
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    store.write_count += 1;
+                }
+            }
+            Err(error) => bevy::log::warn!("Quoin state save failed: {error}"),
+        }
     }
 }
 
@@ -267,6 +282,117 @@ mod tests {
     use cosmix_shell::runtime::{
         CarouselInput, ShellCommand, ShellCommandKind, ShellRuntimePlugin, ShellRuntimeSet,
     };
+
+    fn resize_app(path: &Path) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model())))
+            .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
+            .add_message::<ctk::theme::ApplyTheme>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .insert_resource(StateStore::load(Some(path.to_owned())))
+            .add_systems(Update, persist_transitions.in_set(ShellRuntimeSet::Host));
+        app
+    }
+
+    fn resize_command(app: &mut App, kind: ShellCommandKind) {
+        app.world_mut().write_message(ShellCommand {
+            output: OutputKey::new("DP-1").unwrap(),
+            at: Duration::ZERO,
+            kind,
+        });
+        app.update();
+    }
+
+    fn resize_input(app: &mut App, input: PanelInput) {
+        resize_command(
+            app,
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input,
+            },
+        );
+    }
+
+    #[test]
+    fn resize_gesture_writes_once_on_completion_not_motion_or_duplicate_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app(&path);
+        resize_input(&mut app, PanelInput::ResizeStarted);
+        for thickness_px in [150.0, 200.0, 300.0] {
+            resize_command(
+                &mut app,
+                ShellCommandKind::Resize {
+                    edge: Edge::Left,
+                    thickness_px,
+                },
+            );
+            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert!(!path.exists());
+        }
+        resize_input(&mut app, PanelInput::ResizeCompleted);
+        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        assert_eq!(
+            StateStore::load(Some(path)).snapshot().edges[0].thickness_px,
+            Some(300.0)
+        );
+        resize_input(&mut app, PanelInput::ResizeCompleted);
+        app.update();
+        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+    }
+
+    #[test]
+    fn cancelled_resize_never_saves_and_other_transitions_keep_starting_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app(&path);
+        let starting = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .thickness_px;
+        resize_input(&mut app, PanelInput::ResizeStarted);
+        resize_command(
+            &mut app,
+            ShellCommandKind::Resize {
+                edge: Edge::Left,
+                thickness_px: 333.0,
+            },
+        );
+        resize_input(&mut app, PanelInput::ResizeCancelled);
+        resize_input(&mut app, PanelInput::ResizeCompleted);
+        assert!(!path.exists());
+        assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .thickness_px,
+            starting
+        );
+
+        resize_input(&mut app, PanelInput::ResizeStarted);
+        resize_command(
+            &mut app,
+            ShellCommandKind::Resize {
+                edge: Edge::Left,
+                thickness_px: 333.0,
+            },
+        );
+        resize_input(&mut app, PanelInput::Pin);
+        assert_eq!(
+            StateStore::load(Some(path.clone())).snapshot().edges[0].thickness_px,
+            Some(starting)
+        );
+        resize_input(&mut app, PanelInput::ResizeCancelled);
+        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        assert_eq!(
+            StateStore::load(Some(path)).snapshot().edges[0].thickness_px,
+            Some(starting)
+        );
+    }
 
     fn model() -> ShellModel {
         let mut model = ShellModel::new(
