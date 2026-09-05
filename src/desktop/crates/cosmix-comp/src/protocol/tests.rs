@@ -27421,6 +27421,69 @@ fn port_observation_reports_nested_resize_once_with_final_geometry() {
 
 #[cfg(feature = "bus")]
 #[test]
+fn port_corner_clicked_requires_engaged_left_press() {
+    use port_observation::ObservationRecord;
+
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(drain_observations(&observations).is_empty());
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    harness.server.state.pointer_moved(5.0, 5.0, 1);
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .expect("corner deadline dispatches");
+    let (output, corner, dwell_ms, entered_seq) = drain_observations(&observations)
+        .into_iter()
+        .find_map(|record| match record {
+            ObservationRecord::CornerEntered {
+                output,
+                corner,
+                dwell_ms,
+                event_seq,
+            } => Some((output, corner, dwell_ms, event_seq)),
+            _ => None,
+        })
+        .expect("corner engaged");
+    assert_eq!(corner, corner::Corner::TopLeft);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 1, "exactly one click observation");
+    assert_eq!(
+        records[0],
+        ObservationRecord::CornerClicked {
+            output,
+            corner,
+            dwell_ms,
+            event_seq: entered_seq + 1,
+        }
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(
+        drain_observations(&observations).is_empty(),
+        "release emits nothing"
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Pressed,
+    );
+    assert!(
+        drain_observations(&observations).is_empty(),
+        "right press emits nothing"
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Released,
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
 fn port_corner_timer_routes_once_and_geometry_and_lock_teardown_leave() {
     let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
     port_observation::service_observations(&mut harness.server.state);

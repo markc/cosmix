@@ -101,6 +101,14 @@ impl CornerDetector {
         }
     }
 
+    pub(crate) fn engaged_corner(&self) -> Option<Corner> {
+        self.engaged.map(|e| e.corner)
+    }
+
+    pub(crate) fn engaged_dwell_ms(&self) -> Option<u64> {
+        self.engaged.map(|e| e.dwell_ms)
+    }
+
     pub(crate) fn next_deadline_ms(&self) -> Option<u64> {
         let candidate = self.candidate?;
         candidate.velocity_eligible_since_ms.map_or_else(

@@ -11145,6 +11145,10 @@ impl WaylandState {
     }
 
     fn pointer_button(&mut self, button: u32, state: HostButtonState, time: u32) {
+        #[cfg(feature = "bus")]
+        if state == HostButtonState::Pressed && button == PRIMARY_POINTER_BUTTON {
+            self.observe_corner_click();
+        }
         if self
             .titlebar_click_candidate
             .as_ref()

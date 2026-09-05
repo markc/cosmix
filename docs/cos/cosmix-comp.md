@@ -119,6 +119,11 @@ below, so handlers do not depend on the instance name.
 | `<service>.output.changed` | `output.changed` | `{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}` |
 | `<service>.corner.entered` | `corner.entered` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.left` | `corner.left` | `{output,corner,dwell_ms,event_seq}` |
+| `<service>.corner.clicked` | `corner.clicked` | `{output,corner,dwell_ms,event_seq}` |
+
+`corner.clicked` observes a left-button press while a corner is engaged, carrying
+the same engagement dwell as entered/left. It does not consume the button event;
+clients can map it to a panel pin toggle.
 
 For a reliable property bootstrap: subscribe to the instance topic (for
 example `comp.props.changed` on the seat or `comp-nested.props.changed` when

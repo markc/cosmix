@@ -41,6 +41,7 @@ pub(crate) const FOCUS_TOPIC_SUFFIX: &str = "focus.changed";
 pub(crate) const OUTPUT_TOPIC_SUFFIX: &str = "output.changed";
 pub(crate) const CORNER_ENTERED_TOPIC_SUFFIX: &str = "corner.entered";
 pub(crate) const CORNER_LEFT_TOPIC_SUFFIX: &str = "corner.left";
+pub(crate) const CORNER_CLICKED_TOPIC_SUFFIX: &str = "corner.clicked";
 
 pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
     format!("{service}.{suffix}")
@@ -142,6 +143,12 @@ pub(crate) enum ObservationRecord {
         dwell_ms: u64,
         event_seq: u64,
     },
+    CornerClicked {
+        output: String,
+        corner: Corner,
+        dwell_ms: u64,
+        event_seq: u64,
+    },
 }
 
 impl ObservationRecord {
@@ -153,6 +160,7 @@ impl ObservationRecord {
             | Self::FocusChanged { event_seq, .. }
             | Self::OutputChanged { event_seq, .. }
             | Self::CornerEntered { event_seq, .. }
+            | Self::CornerClicked { event_seq, .. }
             | Self::CornerLeft { event_seq, .. } => *event_seq,
         }
     }
@@ -166,6 +174,7 @@ impl ObservationRecord {
             Self::OutputChanged { .. } => OUTPUT_TOPIC_SUFFIX,
             Self::CornerEntered { .. } => CORNER_ENTERED_TOPIC_SUFFIX,
             Self::CornerLeft { .. } => CORNER_LEFT_TOPIC_SUFFIX,
+            Self::CornerClicked { .. } => CORNER_CLICKED_TOPIC_SUFFIX,
         }
     }
 
@@ -257,6 +266,12 @@ impl ObservationRecord {
                 corner,
                 dwell_ms,
                 event_seq,
+            }
+            | Self::CornerClicked {
+                output,
+                corner,
+                dwell_ms,
+                event_seq,
             } => json!({
                 "output": output,
                 "corner": corner.name(),
@@ -269,7 +284,7 @@ impl ObservationRecord {
     }
 }
 
-const TOPIC_SUFFIXES: [&str; 7] = [
+const TOPIC_SUFFIXES: [&str; 8] = [
     PROPS_TOPIC_SUFFIX,
     SURFACE_MAPPED_TOPIC_SUFFIX,
     SURFACE_UNMAPPED_TOPIC_SUFFIX,
@@ -277,6 +292,7 @@ const TOPIC_SUFFIXES: [&str; 7] = [
     OUTPUT_TOPIC_SUFFIX,
     CORNER_ENTERED_TOPIC_SUFFIX,
     CORNER_LEFT_TOPIC_SUFFIX,
+    CORNER_CLICKED_TOPIC_SUFFIX,
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -287,7 +303,7 @@ impl AffectedTopics {
         TOPIC_SUFFIXES
             .iter()
             .position(|candidate| *candidate == suffix)
-            .expect("every observation has one of the seven fixed topic suffixes")
+            .expect("every observation has one of the eight fixed topic suffixes")
     }
 
     pub(crate) fn insert(&mut self, suffix: &str) {
@@ -751,6 +767,29 @@ impl WaylandState {
     pub(crate) fn emit_corner_entered(&mut self, output: String, corner: Corner, dwell_ms: u64) {
         self.observations
             .offer(|event_seq| ObservationRecord::CornerEntered {
+                output,
+                corner,
+                dwell_ms,
+                event_seq,
+            });
+    }
+
+    pub(crate) fn observe_corner_click(&mut self) {
+        if let Some(output) = self
+            .observations
+            .corner_output
+            .and_then(|index| self.observations.corner_output_keys.get(index))
+            .cloned()
+            && let Some(corner) = self.observations.corner_detector.engaged_corner()
+            && let Some(dwell_ms) = self.observations.corner_detector.engaged_dwell_ms()
+        {
+            self.emit_corner_clicked(output, corner, dwell_ms);
+        }
+    }
+
+    pub(crate) fn emit_corner_clicked(&mut self, output: String, corner: Corner, dwell_ms: u64) {
+        self.observations
+            .offer(|event_seq| ObservationRecord::CornerClicked {
                 output,
                 corner,
                 dwell_ms,
@@ -2484,6 +2523,61 @@ mod tests {
     }
 
     #[test]
+    fn corner_clicked_wire_matches_entered_and_left() {
+        let clicked = ObservationRecord::CornerClicked {
+            output: "o_nested".into(),
+            corner: Corner::BottomRight,
+            dwell_ms: 217,
+            event_seq: 42,
+        };
+        let wire = clicked.wire();
+        assert_eq!(wire.get("command"), Some("corner.clicked"));
+        assert_eq!(wire.get("event_seq"), Some("42"));
+        let body = serde_json::from_str::<Value>(&wire.body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "output": "o_nested", "corner": "br", "dwell_ms": 217, "event_seq": 42,
+            })
+        );
+        for record in [
+            ObservationRecord::CornerEntered {
+                output: "o_nested".into(),
+                corner: Corner::BottomRight,
+                dwell_ms: 217,
+                event_seq: 42,
+            },
+            ObservationRecord::CornerLeft {
+                output: "o_nested".into(),
+                corner: Corner::BottomRight,
+                dwell_ms: 217,
+                event_seq: 42,
+            },
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Value>(&record.wire().body).unwrap(),
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn affected_topics_supports_all_eight_bits() {
+        let mut topics = AffectedTopics::default();
+        for suffix in TOPIC_SUFFIXES {
+            topics.insert(suffix);
+        }
+        assert_eq!(topics.0, u8::MAX);
+        assert_eq!(topics.iter().collect::<Vec<_>>(), TOPIC_SUFFIXES);
+        topics.remove(CORNER_CLICKED_TOPIC_SUFFIX);
+        assert!(!topics.contains(CORNER_CLICKED_TOPIC_SUFFIX));
+        let mut clicked = AffectedTopics::default();
+        clicked.insert(CORNER_CLICKED_TOPIC_SUFFIX);
+        topics.merge(clicked);
+        assert_eq!(topics.0, u8::MAX);
+    }
+
+    #[test]
     fn every_topic_uses_the_registered_service_and_an_unprefixed_command() {
         let records = [
             ObservationRecord::PropsChanged {
@@ -2544,6 +2638,12 @@ mod tests {
                 dwell_ms: 200,
                 event_seq: 7,
             },
+            ObservationRecord::CornerClicked {
+                output: "o_nested".into(),
+                corner: Corner::TopLeft,
+                dwell_ms: 200,
+                event_seq: 8,
+            },
         ];
         let suffixes = [
             "props.changed",
@@ -2553,6 +2653,7 @@ mod tests {
             "output.changed",
             "corner.entered",
             "corner.left",
+            "corner.clicked",
         ];
         for (record, suffix) in records.iter().zip(suffixes) {
             assert_eq!(record.topic_suffix(), suffix);

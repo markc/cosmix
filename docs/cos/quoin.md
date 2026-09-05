@@ -182,11 +182,13 @@ never rendered as zero.
 Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. `--comp-service NAME` selects the
 registered compositor instance (default `comp`), giving topic headers
-`<service>.corner.entered`, `<service>.corner.left` and
+`<service>.corner.entered`, `<service>.corner.left`, `<service>.corner.clicked` and
 `<service>.output.changed`. Their inner commands remain the unprefixed
-`corner.entered`, `corner.left` and `output.changed`.
+`corner.entered`, `corner.left`, `corner.clicked` and `output.changed`.
+The compositor emits `corner.clicked` on a left-button press on an engaged
+corner; the client maps it to a pin toggle for that edge's panel.
 
-Quoin subscribes to all three topics before addressing the selected service
+Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed `comp.props.get` request verb at `outputs`. It maps the topic's
 stable `o_<slug>` output key through the public
 row's raw `name` and accepts only the exact SCTK-selected output. Output-change
