@@ -52,8 +52,12 @@ defaults. Never hardcode an install path.
 - Scripts are Mix. No Python; sh only for `bootstrap`.
 - Docs for a behaviour change go in the same commit, in `docs/`.
 - Version-bump a crate when a consumer would observe the change.
-- Operational docs (`_doc/`, `_plan/`, journals, specs, decisions) do not
-  belong here — the maintainer keeps them in a private control repo.
+- Public-safe architecture specifications belong in `docs/spec/`. Read their
+  status and evidence labels: draft publication is not normative acceptance.
+  Chapter ordering does not reassign legacy runtime specification IDs.
+- Operational docs (`_doc/`, `_plan/`, journals, private specs and decisions)
+  remain in the maintainer's private control repo. Never copy them wholesale
+  into the public suite. Update accepted public contracts with affected code.
 
 ## History
 

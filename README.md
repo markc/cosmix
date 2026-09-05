@@ -91,6 +91,7 @@ it describes land in the same commit.
 | **[cosmix.dev/mix/](https://cosmix.dev/mix/)** | Mix language manual — syntax, builtins, man pages, per-crate references |
 | **[cosmix.dev/cos/](https://cosmix.dev/cos/)** | Daemon family + foundation libraries, per-crate references |
 | **[cosmix.dev/bugs/](https://cosmix.dev/bugs/)** | Public bug reports — upstream defects found and root-caused during CosMix development |
+| **[cosmix.dev/spec/](https://cosmix.dev/spec/)** | Draft architecture specifications — evidence-labelled contracts, limitations and conformance gates; publication is not authority cutover |
 | **[cosmix.dev/history](https://cosmix.dev/history)** | The story so far — six months of decisions, reversals and what stuck, in one sitting |
 
 Every doc has a clean URL — `cosmix.dev/<section>/<page>` — served by a
@@ -135,9 +136,13 @@ the system's own language is the one that exists to build that language.
 This repository is public and contains no operator-specific state: no real
 host names, addresses, domains, keys or deploy targets (a hygiene gate on the
 maintainer's side refuses commits that carry them). Operational
-command-and-control — deploy scripts, mesh inventory, journals, specs and
+command-and-control — deploy scripts, mesh inventory, journals, private specs and
 decision records — lives in a private control repo the maintainer keeps
 beside this one. Contributions go through pull requests here.
+
+The sanitised replacement specification candidate lives in `docs/spec/`.
+Its draft publication does not replace the existing authoritative suite or
+reassign runtime specification IDs; see its authority and conformance chapters.
 
 ## Status
 

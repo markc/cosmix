@@ -119,6 +119,7 @@
                         <a data-doc-path="bus/README.md"><i data-lucide="share-2"></i> bus — protocol docs</a>
                         <a data-doc-path="cos/README.md"><i data-lucide="server"></i> cos — daemon docs</a>
                         <a data-doc-path="mix/README.md"><i data-lucide="terminal"></i> mix — language manual</a>
+                        <a data-doc-path="spec/README.md"><i data-lucide="book-open"></i> specifications — draft suite</a>
                     </nav>
                 </div>
             </div>
@@ -612,7 +613,7 @@
            root docs, so the two can't drift silently. */
         var r = pathname.match(/^\/(README|AGENTS|CLAUDE|VERSIONS|history)$/);
         if (r) return r[1] + '.md';
-        var m = pathname.match(/^\/(bus|cos|mix|bugs)(?:\/(.*))?$/);
+        var m = pathname.match(/^\/(bus|cos|mix|bugs|spec)(?:\/(.*))?$/);
         if (!m) return null;
         var rest = m[2] || '';
         if (rest === '' || rest.slice(-1) === '/') rest += 'README.md';

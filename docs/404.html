@@ -19,7 +19,7 @@
             location.replace('/#' + r[1] + '.md' + (location.hash || ''));
             return;
         }
-        var m = location.pathname.match(/^\/(bus|cos|mix|bugs)(?:\/(.*))?$/);
+        var m = location.pathname.match(/^\/(bus|cos|mix|bugs|spec)(?:\/(.*))?$/);
         if (m) {
             var sec = m[1];
             var rest = m[2] || '';

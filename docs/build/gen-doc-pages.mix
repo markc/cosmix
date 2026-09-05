@@ -1,6 +1,6 @@
 -- gen-doc-pages.mix — clean-URL HTML stubs for every doc page.
 --
--- Each tracked bus/ cos/ mix/ bugs/ markdown doc gets a byte-identical HTML shell
+-- Each tracked bus/ cos/ mix/ bugs/ spec/ markdown doc gets a byte-identical HTML shell
 -- beside it (page.md -> page.html; README.md -> index.html in its directory)
 -- so GitHub Pages serves /sec/page and /sec/dir/ as real 200s without the
 -- hash router. The shell is index.html minus the brochure, with root-relative
@@ -45,7 +45,7 @@ $tpl = replace($tpl, "href=\"#", "href=\"/#")
 -- 2. Prune every stub a previous run generated. Root depth included: the
 --    marker check keeps hand-written index.html / 404.html safe.
 $found = run_argv_must(["find", ".", "-maxdepth", "1", "-name", "*.html"], {cwd: $root})
-$found = $found .. run_argv_must(["find", "bus", "cos", "mix", "bugs", "-name", "*.html"], {cwd: $root})
+$found = $found .. run_argv_must(["find", "bus", "cos", "mix", "bugs", "spec", "-name", "*.html"], {cwd: $root})
 $pruned = 0
 for each $old in split(trim($found), "\n")
     if $old != "" then
@@ -60,7 +60,7 @@ end
 -- 3. One stub per tracked markdown doc. Doc names must fit the reader's
 --    safePath() grammar (plain ASCII word/dot/dash path segments) or the
 --    clean URL would be unroutable — refuse rather than emit a dead stub.
-$tracked = run_argv_must(["git", "ls-files", "--", "bus/", "cos/", "mix/", "bugs/"], {cwd: $root})
+$tracked = run_argv_must(["git", "ls-files", "--", "bus/", "cos/", "mix/", "bugs/", "spec/"], {cwd: $root})
 $made = 0
 
 -- 3a. Root-level docs (cosmix.dev/README etc.). Fixed whitelist mirroring

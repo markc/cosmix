@@ -15,8 +15,10 @@ Two rules that outrank anything below:
   lives; go through `cosmix-lib-config::paths` / `cosmix_paths`.
 
 Per-area guidance from the former repositories is in `docs/dev/{bus,mix,cos}/`.
-Operational state, journals, specs and decision records belong in the
-maintainer's private control repo, never here.
+Public-safe architecture specifications belong in `docs/spec/`; their explicit
+draft/acceptance status and source evidence govern how they may be used.
+Operational state, journals, private specs and decision records remain in the
+maintainer's private control repo. Never publish those wholesale.
 
 The section below is maintained by the cosmix-mcp skill-learning loop
 (`skills_graduate`): proven cosmix-domain skills get promoted here as
