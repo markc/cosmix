@@ -37533,7 +37533,9 @@ mod x11 {
         commit_dmabuf(&mut harness, surface_id, 64, 48);
         let origin_before = harness.server.state.surfaces[&object].window_origin;
         // The client asks to jump to (0,0) at an absurd size: position is
-        // refused after first placement, size is clamped to the usable output.
+        // refused after first placement; growth is limited by the remaining
+        // usable extent at that origin, including SSD. A whole-output width
+        // bound alone let mapped windows grow underneath reserved panels.
         harness.server.state.x11_configure_request(
             window.clone(),
             Some(0),
@@ -37548,10 +37550,13 @@ mod x11 {
             "client x/y is ignored after first placement"
         );
         let usable = harness.server.state.usable_output_rect();
+        let extents = DecoExtents::of(&harness.server.state.decoration.theme);
         assert!(
-            record.configured_size.0 <= usable.width as i32
-                && record.configured_size.1 <= usable.height as i32,
-            "granted size is clamped to the usable output, got {:?}",
+            record.window_origin.0 + record.configured_size.0 as f32 + extents.right
+                <= usable.x + usable.width
+                && record.window_origin.1 + record.configured_size.1 as f32 + extents.bottom
+                    <= usable.y + usable.height,
+            "granted frame is clamped to the remaining usable extent, got {:?}",
             record.configured_size
         );
     }
@@ -38440,7 +38445,16 @@ mod x11 {
         let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 82);
         commit_dmabuf(&mut harness, sid_a, 32, 24);
         // The user resizes the window: a post-map ConfigureRequest grants a
-        // new size, which becomes position memory.
+        // new size, which becomes position memory. The panel-safe resize
+        // contract limits growth by remaining content room at this origin,
+        // not the whole output; it is that actual grant the swap must retain.
+        let origin = harness.server.state.surfaces[&object_a].window_origin;
+        let usable = harness.server.state.usable_output_rect();
+        let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+        let expected_size = (
+            320.min((usable.x + usable.width - origin.0 - extents.right) as i32),
+            240.min((usable.y + usable.height - origin.1 - extents.bottom) as i32),
+        );
         harness.server.state.x11_configure_request(
             window.clone(),
             None,
@@ -38455,8 +38469,8 @@ mod x11 {
         let moved = role.granted_geometry;
         assert_eq!(
             (moved.size.w, moved.size.h),
-            (320, 240),
-            "precondition: the granted rect reflects the user's resize"
+            expected_size,
+            "precondition: the granted rect reflects the panel-safe resize"
         );
         // The client unmaps (clears `map_requested`; the record and its
         // grant deliberately survive for the remap)...

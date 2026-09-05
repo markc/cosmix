@@ -2428,6 +2428,22 @@ impl WaylandState {
                 (x.is_some() || y.is_some()).then_some((x.unwrap_or(raw.x), y.unwrap_or(raw.y)));
             self.choose_initial_x11_geometry_with_origin(&window, requested_origin)
         });
+        let state_controls_size = self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .is_some_and(|record| {
+                record.committed_maximized || record.role.x11().is_some_and(|role| role.fullscreen)
+            });
+        let base = if !state_controls_size && (w.is_some() || h.is_some()) {
+            // Recover an off-screen existing frame BEFORE computing remaining
+            // space. Measuring from beyond the right/bottom edge collapses
+            // both axes to one pixel and cannot be repaired by moving later.
+            self.clamp_x11_normal_geometry(&window, base)
+        } else {
+            base
+        };
         let usable = self.usable_output_rect();
         let origin = base.loc;
         let already_mapped = self
@@ -2439,34 +2455,23 @@ impl WaylandState {
         let extents = DecoExtents::of(&self.decoration.theme);
         let server_side =
             self.x11_decoration_mode(&window, false) == SceneDecorationMode::ServerSide;
-        let usable_size = if already_mapped {
-            // Preserve the established resize contract for placed windows;
-            // a user may deliberately position part of a window off-screen.
-            (usable.width.max(1.0) as i32, usable.height.max(1.0) as i32)
-        } else {
-            (
-                (usable.x + usable.width
-                    - origin.x as f32
-                    - if server_side { extents.right } else { 0.0 })
-                .max(1.0) as i32,
-                (usable.y + usable.height
-                    - origin.y as f32
-                    - if server_side { extents.bottom } else { 0.0 })
-                .max(1.0) as i32,
-            )
-        };
+        // Client-driven growth must fit at the compositor's current origin,
+        // not merely be smaller than the whole usable output. Otherwise a
+        // mapped browser can grow underneath a reserved right/bottom panel.
+        let usable_size = (
+            (usable.x + usable.width
+                - origin.x as f32
+                - if server_side { extents.right } else { 0.0 })
+            .max(1.0) as i32,
+            (usable.y + usable.height
+                - origin.y as f32
+                - if server_side { extents.bottom } else { 0.0 })
+            .max(1.0) as i32,
+        );
         let requested = (
             w.map_or(base.size.w, |w| w.min(i32::MAX as u32) as i32),
             h.map_or(base.size.h, |h| h.min(i32::MAX as u32) as i32),
         );
-        let state_controls_size = self
-            .xwayland
-            .surfaces_by_xid
-            .get(&xid)
-            .and_then(|object| self.surfaces.get(object))
-            .is_some_and(|record| {
-                record.committed_maximized || record.role.x11().is_some_and(|role| role.fullscreen)
-            });
         let size = if current.is_some() && (state_controls_size || (w.is_none() && h.is_none())) {
             // Restacking is not a resize. Maximized/fullscreen geometry is
             // controlled by compositor state, not ConfigureRequest hints.
@@ -2481,7 +2486,9 @@ impl WaylandState {
             )
         };
         let granted = Rectangle::new(origin, size.into());
-        let granted = if !already_mapped && !state_controls_size {
+        let granted = if !state_controls_size && (!already_mapped || w.is_some() || h.is_some()) {
+            // Preserve a valid origin, but recover an off-screen frame on an
+            // actual resize. Stack-only requests never reposition a window.
             self.clamp_x11_normal_geometry(&window, granted)
         } else {
             granted

@@ -12,6 +12,172 @@ fn reserve_left(harness: &mut KeybindingHarness) {
     assert_eq!(harness.server.state.usable_output_rect().x, 240.0);
 }
 
+#[test]
+fn x11_mapped_resize_keeps_committed_content_and_ssd_clear_of_right_panel() {
+    for server_side in [false, true] {
+        let mut harness = KeybindingHarness::new(true);
+        harness.server.state.resize_output(960, 640);
+        map_test_layer_surface(
+            &mut harness,
+            0,
+            TestLayerSpec {
+                size: (240, 0),
+                anchor: 1 | 2 | 8,
+                exclusive_zone: 240,
+                ..TestLayerSpec::default()
+            },
+        );
+        let usable = harness.server.state.usable_output_rect();
+        assert_eq!(usable.x + usable.width, 720.0);
+        let (sid, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(
+            208,
+            false,
+            Rectangle::new((468, 290).into(), (252, 286).into()),
+        );
+        if !server_side {
+            window.set_motif_hints_offline([2, 0, 0, 0, 0]);
+        }
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness.server.state.x11_new_window(window.clone());
+        harness.server.state.x11_map_window_request(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        let object = surface.id();
+        // Initial placement reserves an extra cascade margin. Seed the actual
+        // mapped grant observed after the browser's earlier configure traffic;
+        // this regression concerns subsequent mapped growth, not that margin.
+        let right = if server_side {
+            DecoExtents::of(&harness.server.state.decoration.theme).right as i32
+        } else {
+            0
+        };
+        harness.server.state.apply_x11_geometry(
+            208,
+            Rectangle::new((468, 290).into(), (252 - right, 286).into()),
+        );
+        let before = harness.server.state.surfaces[&object]
+            .role
+            .x11()
+            .unwrap()
+            .granted_geometry;
+        commit_dmabuf(
+            &mut harness,
+            sid,
+            before.size.w as u32,
+            before.size.h as u32,
+        );
+        assert!(harness.server.state.surfaces[&object].mapped);
+        assert_eq!(before.loc, (468, 290).into());
+        assert_eq!(before.size.h, 286);
+        if !server_side {
+            assert_eq!(before.size.w, 252);
+        }
+        // Exactly the live browser failure: width grows after first mapping;
+        // the unchanged height and valid origin must stay intact.
+        harness.server.state.x11_configure_request(
+            window.clone(),
+            None,
+            None,
+            Some(480),
+            None,
+            None,
+        );
+        let granted = harness.server.state.surfaces[&object]
+            .role
+            .x11()
+            .unwrap()
+            .granted_geometry;
+        assert_eq!(granted, before);
+        commit_dmabuf(
+            &mut harness,
+            sid,
+            granted.size.w as u32,
+            granted.size.h as u32,
+        );
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            record.buffer_dimensions,
+            Some((granted.size.w as u32, granted.size.h as u32))
+        );
+        assert_eq!(record.layout.x, 468.0);
+        assert_eq!(record.layout.y, 290.0);
+        assert_eq!(record.layout.width, granted.size.w as f32);
+        assert_eq!(record.layout.height, 286.0);
+        assert_outer_inside(&harness, &object);
+        let right = if server_side {
+            DecoExtents::of(&harness.server.state.decoration.theme).right
+        } else {
+            0.0
+        };
+        assert_eq!(record.layout.x + record.layout.width + right, 720.0);
+        // The same bound applies to bottom growth, without changing width.
+        harness
+            .server
+            .state
+            .x11_configure_request(window, None, None, None, Some(640), None);
+        let granted = harness.server.state.surfaces[&object]
+            .role
+            .x11()
+            .unwrap()
+            .granted_geometry;
+        commit_dmabuf(
+            &mut harness,
+            sid,
+            granted.size.w as u32,
+            granted.size.h as u32,
+        );
+        assert_eq!(granted.loc, before.loc);
+        assert_eq!(granted.size.w, before.size.w);
+        assert_outer_inside(&harness, &object);
+    }
+}
+
+#[test]
+fn x11_mapped_resize_recovers_offscreen_base_without_collapsing_to_one_pixel() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.server.state.resize_output(960, 640);
+    let (sid, _, window, object) = associate_normal_window(&mut harness, 209);
+    commit_dmabuf(&mut harness, sid, 200, 150);
+    let offscreen = Rectangle::new((1200, 900).into(), (200, 150).into());
+    harness.server.state.apply_x11_geometry(209, offscreen);
+    // A pure stack request must not undo a deliberate compositor move.
+    harness.server.state.x11_configure_request(
+        window.clone(),
+        None,
+        None,
+        None,
+        None,
+        Some(smithay::xwayland::xwm::Reorder::Top),
+    );
+    assert_eq!(
+        harness.server.state.surfaces[&object]
+            .role
+            .x11()
+            .unwrap()
+            .granted_geometry,
+        offscreen
+    );
+    harness
+        .server
+        .state
+        .x11_configure_request(window, None, None, Some(320), Some(240), None);
+    let granted = harness.server.state.surfaces[&object]
+        .role
+        .x11()
+        .unwrap()
+        .granted_geometry;
+    assert_eq!(
+        granted.size,
+        (200, 150).into(),
+        "recover existing frame before measuring growth room"
+    );
+    commit_dmabuf(&mut harness, sid, 200, 150);
+    assert_outer_inside(&harness, &object);
+}
+
 fn assert_outer_inside(harness: &KeybindingHarness, object: &ObjectId) {
     let record = &harness.server.state.surfaces[object];
     let usable = harness.server.state.usable_output_rect();
