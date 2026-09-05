@@ -456,7 +456,9 @@ Cargo graph alone does not prove every architectural dependency is appropriate.
 Do not make pure property types depend on their storage or daemon adapters.</p>
 <p><code>cosmix-lib-props-core</code> supplies read-side pure types, with optional Bus integration
 and revisioned-write support. <code>cosmix-lib-props-store</code> owns namespace registration,
-storage, mutation routing, hooks, authorisation and audit integration. These are
+storage, mutation routing, hooks, authorisation and audit integration
+(<code>src/crates/cosmix-lib-props-core</code>, <code>src/crates/cosmix-lib-props-store</code> at the
+audited baseline <code>96d12fdf</code>; boundaries detailed in chapters 03 and 06). These are
 separate responsibility boundaries, not duplicate implementations.</p>
 <p><strong>COMP-002 — Keep daemon adapters thin.</strong> Reusable domain invariants belong in
 libraries. Daemon adapters supply authenticated context, persistence and transport.

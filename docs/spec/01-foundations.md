@@ -1,7 +1,7 @@
 ---
 title: Foundational principles
 chapter: 1
-version: 0.2.0
+version: 0.2.1
 status: draft
 date: 2026-09-05
 ---

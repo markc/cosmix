@@ -1,7 +1,7 @@
 ---
 title: Conformance and delivery gates
 chapter: 13
-version: 0.1.1
+version: 0.1.2
 status: draft
 date: 2026-09-05
 ---
@@ -29,7 +29,7 @@ amendment or verified implementation closes them. A broad label such as “L4”
 | P0 | Independent review and one fix round | No unresolved blocker presented as an accepted guarantee; targeted fix verification recorded |
 | P1 | Public website integration, initially draft-only | Links/routes generated and tested; old references remain traceable; no authority change from publication alone |
 | P1 | Runtime spec-distribution migration | Explicit legacy ID registry; compatibility test; configured directory and publication lifecycle verified—no silent numeric reassignment |
-| P1 | Authority cutover, accepted by Mark | Prior runtime identity gate passed or old runtime suite explicitly labelled historical for every consumer; baseline-to-HEAD changes dispositioned; private suite becomes archive/pointer only |
+| P1 | Authority cutover, accepted by Mark — the documentation half was accepted 2026-09-05 ([authority handover](authority-handover.md)); the runtime-identity work in this row remains per HANDOVER-004 | Prior runtime identity gate passed or old runtime suite explicitly labelled historical for every consumer; baseline-to-HEAD changes dispositioned; private suite becomes archive/pointer only |
 | P1 | Security/correctness discrepancy work | Lexical Actor/Capability change reconciled at 0.3.0; provenance, owner policy, supported-operation rejection and contextual/race tests remain; cursorless replay discrepancy explicitly dispositioned |
 | P2 | Reliability and breadth | Accepted secrets/queue/delivery/audit limitations accurately exposed; malformed-history recovery, daemon adoption and desktop context gaps reconciled |
 | Pre-GA | Release conformance matrix | Main and desktop gates, supported deployment probes, compatibility/migration evidence and whole-suite review |

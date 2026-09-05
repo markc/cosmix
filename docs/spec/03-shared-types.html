@@ -499,8 +499,12 @@ and <a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e70
 shows fallible construction and manual validating deserialisation. Capability
 enforces non-empty only; it deliberately remains an opaque vocabulary, not a
 fixed-alphabet or authorisation proof. Actor validates its supported token forms.
-The unchecked-construction finding at the original baseline is historical. All
-47 changed files were reconciled against the candidate; no Rust tests were rerun.</p>
+The unchecked-construction finding at the original baseline is historical. The
+changed files in commit <code>4d2f1ebb</code> were reconciled against the candidate; no
+Rust tests were rerun. One read-path consequence follows from that commit:
+persisted event rows whose actor string predates the validating grammar fail
+event decoding on replay and surface as rc 20 <code>storage_error</code>, not the
+write-time <code>validation_error</code> (see chapter 06 and STORE-010 in chapter 07).</p>
 <table><thead><tr><th>Type</th><th>Current accepted form and entry points</th><th>Not established by acceptance</th></tr></thead><tbody>
 <tr><td><code>Actor(String)</code></td><td>Private field; fallible <code>new</code>, <code>from_token</code>, <code>service</code>, <code>operator</code>, <code>daemon_complete</code>, <code>FromStr</code> and manual Serde; <code>reconciliation()</code> returns a fixed checked token</td><td>Caller authentication or actor category merely from the helper name</td></tr>
 <tr><td><code>Capability(String)</code></td><td>Private field; non-empty string through <code>new</code>, <code>TryFrom&lt;&amp;str/String&gt;</code>, <code>FromStr</code> and manual Serde</td><td>Alphabet, authority or recognised grant vocabulary</td></tr>

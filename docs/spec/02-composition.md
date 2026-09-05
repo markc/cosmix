@@ -1,7 +1,7 @@
 ---
 title: Composition and installation
 chapter: 2
-version: 0.1.0
+version: 0.1.1
 status: draft
 date: 2026-09-05
 ---
@@ -26,7 +26,9 @@ Do not make pure property types depend on their storage or daemon adapters.
 
 `cosmix-lib-props-core` supplies read-side pure types, with optional Bus integration
 and revisioned-write support. `cosmix-lib-props-store` owns namespace registration,
-storage, mutation routing, hooks, authorisation and audit integration. These are
+storage, mutation routing, hooks, authorisation and audit integration
+(`src/crates/cosmix-lib-props-core`, `src/crates/cosmix-lib-props-store` at the
+audited baseline `96d12fdf`; boundaries detailed in chapters 03 and 06). These are
 separate responsibility boundaries, not duplicate implementations.
 
 **COMP-002 — Keep daemon adapters thin.** Reusable domain invariants belong in

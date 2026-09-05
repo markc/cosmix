@@ -1,7 +1,7 @@
 ---
 title: Managed Daemon Identity Profile — Retained Contract
 chapter: 10a
-version: 0.2.0
+version: 0.2.1
 status: draft
 date: 2026-09-05
 ---
@@ -1483,6 +1483,11 @@ semantics (§6.5) and emits diagnostics matching §6.3.
 #                       row) (§2.5, §6.2).
 # Each class verifies under its own rule set; failures from any
 # halt installation under §6.5 fail-closed semantics.
+#
+# FROZEN ILLUSTRATIVE SNAPSHOT at registry 1.4.4: this array (and the
+# "1.4.4" version strings emitted below) predate the 1.4.6 additions of
+# 519 cosmix-powerd and 520 cosmix-mprisd. The normative set is §2.2 and
+# Appendix A; do not lift this array as a current verification list.
 
 DAEMON_IDENTITY = [
   (500, "cosmix-noded"),      (501, "cosmix-maild"),    (502, "cosmix-webd"),

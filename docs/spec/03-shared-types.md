@@ -1,7 +1,7 @@
 ---
 title: Shared types and validation boundaries
 chapter: 3
-version: 0.1.1
+version: 0.1.2
 status: draft
 date: 2026-09-05
 ---
@@ -77,8 +77,12 @@ and [Actor changes](https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb
 shows fallible construction and manual validating deserialisation. Capability
 enforces non-empty only; it deliberately remains an opaque vocabulary, not a
 fixed-alphabet or authorisation proof. Actor validates its supported token forms.
-The unchecked-construction finding at the original baseline is historical. All
-47 changed files were reconciled against the candidate; no Rust tests were rerun.
+The unchecked-construction finding at the original baseline is historical. The
+changed files in commit `4d2f1ebb` were reconciled against the candidate; no
+Rust tests were rerun. One read-path consequence follows from that commit:
+persisted event rows whose actor string predates the validating grammar fail
+event decoding on replay and surface as rc 20 `storage_error`, not the
+write-time `validation_error` (see chapter 06 and STORE-010 in chapter 07).
 
 | Type | Current accepted form and entry points | Not established by acceptance |
 | --- | --- | --- |

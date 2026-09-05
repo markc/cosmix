@@ -1,7 +1,7 @@
 ---
 title: Authority, evidence and change
 chapter: 0
-version: 0.2.0
+version: 0.2.1
 status: draft
 date: 2026-09-05
 ---
@@ -95,7 +95,12 @@ review limit is not permission to publish a known-bad normative contract.
 ## Pre-GA maintenance
 
 The suite version governs publication; chapter versions identify changed documents
-within it. Neither substitutes for crate, wire or storage versions.
+within it: any committed content change to a chapter bumps that chapter's
+version in the same suite revision, and the suite change record in the README
+names every chapter that moved (accepted meta-documents carry their own
+records). Neither substitutes for crate, wire or storage versions.
+(0.2.1 records this chapter's suite-0.3.0 acceptance edits, whose bump was
+applied late — at suite 0.3.1 — and acknowledged there.)
 Use patch revisions for corrections without behavioural change; explain any
 contract change and its compatibility impact explicitly, regardless of version
 number. Before GA, a minor revision can reorganise chapters, but must preserve ID

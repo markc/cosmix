@@ -1,7 +1,7 @@
 ---
 title: Package Installation — Retained NS4 Profile
 chapter: 10c
-version: 0.1.1
+version: 0.1.2
 spec11_version: 1.0.0-rc.1
 status: draft
 date: 2026-09-05
@@ -15,7 +15,7 @@ This is retained intended detail, not the current universal installation workflo
 
 The [identity profile](10a-daemon-identity-profile.md) retains the referenced identity/verification rules. [Repair and improvement](10b-repair-improvement-profile.md) retains the recovery intent. [Mesh trust](08-mesh-trust.md) describes the present trust boundary. The suite's [authority rules](00-authority.md) apply: publication neither resolves conflicts by fiat nor grants deployment permission.
 
-Known conflicts are retained for explicit disposition: the legacy tarball manifest still names `usr/local/bin`, while current production binaries use `/opt/cosmix/bin`; the exact staged-installer lifecycle differs from current bootstrap; distro and runtime prerequisites need fresh fixtures. These discrepancies must be resolved before claiming this installer profile conformant. They are not instructions to introduce parallel installs or execute old examples.
+Known conflicts are retained for explicit disposition: the legacy tarball manifest still names `usr/local/bin`, while current production binaries use `/opt/cosmix/bin`; additionally, the installer contract's own staged source paths (§5.7 promotes from `<staging>/opt/cosmix/bin/`, and §12.1 places the interpreter at `$STAGING/opt/cosmix/bin/mix`) presume a staging layout that the §3.2 tarball definition and Appendix A (`usr/local/bin/…`) never produce — a third position this disposition must also resolve; the exact staged-installer lifecycle differs from current bootstrap; distro and runtime prerequisites need fresh fixtures. These discrepancies must be resolved before claiming this installer profile conformant. They are not instructions to introduce parallel installs or execute old examples. The [accepted authority handover](authority-handover.md) takes precedence over any historical governance machinery reproduced in retained sections, as it does for the sibling profiles.
 
 For public readability, former private source paths are represented as `deployment-tools/` and `deployment-config/` logical artifact roots. They identify helper/template names, not verified public filesystem paths. Private operational references are descriptive historical labels and host examples use placeholder identities. Preserve all required manifest checks, phase boundaries, authority and rollback conditions when adapting the profile to an implemented installer; convenience is not a waiver.
 

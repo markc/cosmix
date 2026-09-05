@@ -1,15 +1,19 @@
 ---
 title: Accepted pre-GA security and delivery compatibility profile
-version: 0.2.0
+version: 0.2.1
+amends: compat-0.2.0
 status: accepted
 date: 2026-09-05
 ---
 
-# Accepted compatibility amendment
+# Accepted pre-GA security and delivery compatibility profile
 
 Mark Constable authorised weakening the disputed security and delivery guarantees
 to match current code on 2026-09-05. This is a scoped normative amendment to the
-replacement candidate, not acceptance of the entire suite or a deployment change.
+replacement candidate, not by itself acceptance of the entire suite or a
+deployment change. (The whole suite was subsequently accepted the same day by
+the [authority handover](authority-handover.md); this profile remains its
+explicit accepted exception set, unexpanded.)
 
 | Contract | Accepted guarantee | Superseded stronger guarantee |
 | --- | --- | --- |
@@ -44,3 +48,12 @@ assume them: choose an appropriate additional mechanism or wait for an explicitl
 specified stronger profile. In particular, a lost final event can remain unnoticed
 without reconciliation, privileged read payloads can contain secrets, and an audit
 digest alone cannot prove complete or untampered event history.
+
+## Change record
+
+- 0.2.1, amending compat-0.2.0: title/heading aligned; framing updated to note
+  the same-day whole-suite acceptance by the authority handover. The six
+  guarantees are unchanged and unexpanded.
+- 0.2.0: first public publication (commit `3eadff30`) of the operator-accepted
+  six-guarantee amendment; prior candidate lineage is recorded in the private
+  audit ledger.

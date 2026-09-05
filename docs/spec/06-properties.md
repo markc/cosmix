@@ -1,7 +1,7 @@
 ---
 title: Property model, validation and mutation
 chapter: 6
-version: 0.2.1
+version: 0.2.2
 status: draft
 date: 2026-09-05
 ---
@@ -35,7 +35,8 @@ flat `get` path means root; an empty string is not a valid `PropPath`.
 dot-separated segments containing ASCII lowercase letters, digits or underscore;
 digits and underscore may start a segment. `NamespaceName` instead requires an
 ASCII lowercase first character in every segment. Both reject empty segments;
-concrete paths reject wildcards. Both constructors and Serde deserialisers enforce
+`PropPath` rejects wildcards (`*` is reserved; no wildcard-accepting path type
+exists). Both constructors and Serde deserialisers enforce
 their grammar, including through nested `PropDescribe` and `RecordKey` values.
 This corrects old prose that assigned the namespace grammar to both types.
 
@@ -174,6 +175,12 @@ diagnostics; consumers ignore unknown diagnostic fields. Operational rc 10 cover
 The baseline also returns rc 10 `grant_failed` when live subscription installation
 fails; the old closed taxonomy omits this token, a further contract drift requiring
 recorded amendment. No replay-only success is returned on that grant failure.
+Since the 0.3.0 store, malformed peer attribution is refused with rc 10
+`validation_error` before any write, while a persisted event row whose actor
+string fails the validating grammar (a pre-0.3.0 or hand-edited row) fails
+decoding on the read path — replay, watch and audit surfaces return rc 20
+`storage_error` for it, and event dispatch for that namespace stalls at the
+offending row until repaired (see STORE-010 in chapter 07).
 Only an explicit contract amendment adds taxonomy tokens. Flat mutation and
 unsupported selectors must fail visibly rather than silently changing meaning.
 

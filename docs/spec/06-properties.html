@@ -465,7 +465,8 @@ flat <code>get</code> path means root; an empty string is not a valid <code>Prop
 dot-separated segments containing ASCII lowercase letters, digits or underscore;
 digits and underscore may start a segment. <code>NamespaceName</code> instead requires an
 ASCII lowercase first character in every segment. Both reject empty segments;
-concrete paths reject wildcards. Both constructors and Serde deserialisers enforce
+<code>PropPath</code> rejects wildcards (<code>*</code> is reserved; no wildcard-accepting path type
+exists). Both constructors and Serde deserialisers enforce
 their grammar, including through nested <code>PropDescribe</code> and <code>RecordKey</code> values.
 This corrects old prose that assigned the namespace grammar to both types.</p>
 <p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-core/src/path.rs">PropPath</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/namespace.rs">NamespaceName and registration types</a>.</p>
@@ -583,6 +584,12 @@ diagnostics; consumers ignore unknown diagnostic fields. Operational rc 10 cover
 The baseline also returns rc 10 <code>grant_failed</code> when live subscription installation
 fails; the old closed taxonomy omits this token, a further contract drift requiring
 recorded amendment. No replay-only success is returned on that grant failure.
+Since the 0.3.0 store, malformed peer attribution is refused with rc 10
+<code>validation_error</code> before any write, while a persisted event row whose actor
+string fails the validating grammar (a pre-0.3.0 or hand-edited row) fails
+decoding on the read path — replay, watch and audit surfaces return rc 20
+<code>storage_error</code> for it, and event dispatch for that namespace stalls at the
+offending row until repaired (see STORE-010 in chapter 07).
 Only an explicit contract amendment adds taxonomy tokens. Flat mutation and
 unsupported selectors must fail visibly rather than silently changing meaning.</p>
 <h2 id="6-changes-snapshots-and-replay">6. Changes, snapshots and replay</h2>
