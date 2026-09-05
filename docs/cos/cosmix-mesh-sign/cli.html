@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-mesh-sign/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,115 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-mesh-sign/cli.md"><div class="prose"><h1 id="cosmix-mesh-sign-cli">cosmix-mesh-sign CLI</h1>
+<h2 id="name">Name</h2>
+<p><code>cosmix-mesh-sign</code> — create mesh trust keys, sign an inventory, and verify a signed inventory.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-mesh-sign [--secrets-db &lt;PATH&gt;] [--mesh &lt;FQDN&gt;] &lt;COMMAND&gt;
+</code></pre>
+<p>Global options may be used with every command.</p>
+<h2 id="global-options">Global options</h2>
+<h3 id="--secrets-db-path"><code>--secrets-db &lt;PATH&gt;</code></h3>
+<p>Select the SQLite database containing operator keys.</p>
+<p>A value beginning with <code>~/</code> expands against the <code>HOME</code> environment variable. Other paths are used as supplied.</p>
+<h3 id="--mesh-fqdn"><code>--mesh &lt;FQDN&gt;</code></h3>
+<p>Select the mesh identifier. The value forms the database <code>domain</code> component of key lookups.</p>
+<p>Examples use <code>mesh.example.com</code>.</p>
+<h2 id="genesis"><code>genesis</code></h2>
+<p>Generate a mesh-wide Ed25519 genesis keypair and store the private seed.</p>
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] genesis [--force]
+</code></pre>
+<p>On success, the command prints the public key and the database record identity. The public key is base64.</p>
+<p>The command creates the <code>secrets</code> table and unique index when they do not exist.</p>
+<p>Without <code>--force</code>, insertion is atomic and fails when the genesis record already exists.</p>
+<p>With <code>--force</code>, the command updates an existing record or inserts a new one. Replacing genesis invalidates all signatures made by the previous key and requires separate provisioning of the new public key.</p>
+<h2 id="sign"><code>sign</code></h2>
+<p>Sign an authored strict-data inventory and self-verify the emitted artifact.</p>
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] sign \
+  &lt;INVENTORY&gt; \
+  --out &lt;PATH&gt; \
+  [--valid-days &lt;DAYS&gt;] \
+  [--recovery &lt;GENERATION&gt;]
+</code></pre>
+<p>Arguments and options:</p>
+<table><thead><tr><th>Surface</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>&lt;INVENTORY&gt;</code></td><td>Path to the authored <code>inventory.mix</code>.</td></tr>
+<tr><td><code>-o</code>, <code>--out &lt;PATH&gt;</code></td><td>Required output path for the signed artifact.</td></tr>
+<tr><td><code>--valid-days &lt;DAYS&gt;</code></td><td>Set <code>valid_until</code> to this many days after signing. Defaults to <code>90</code>.</td></tr>
+<tr><td><code>--recovery &lt;GENERATION&gt;</code></td><td>Emit a recovery inventory with the supplied generation.</td></tr>
+</tbody></table>
+<p>Example:</p>
+<pre><code class="language-text">cosmix-mesh-sign \
+  --secrets-db ./secrets.db \
+  --mesh mesh.example.com \
+  sign inventory.mix \
+  --out inventory.signed \
+  --valid-days 90
+</code></pre>
+<p>The input must contain a top-level <code>inventory</code> map with <code>unsigned: true</code>. It must not already contain signing or recovery fields.</p>
+<p>The command adds:</p>
+<ul>
+<li><code>canonical_encoding</code>;</li>
+<li><code>signed_at</code>;</li>
+<li><code>valid_until</code>;</li>
+<li><code>verify_keys</code>;</li>
+<li><code>recovery</code> and <code>recovery_generation</code> when requested.</li>
+</ul>
+<p>The output contains one Ed25519 signature identified by the genesis key ID.</p>
+<p>Before writing, the command serialises, reparses, and verifies the exact output text through <code>SignedInventory</code>. Failure leaves no newly written output from this invocation.</p>
+<p>The self-check uses an epoch and recovery-generation baseline of zero. It proves cryptographic and structural validity, but does not prove freshness relative to a node's stored state.</p>
+<h2 id="verify"><code>verify</code></h2>
+<p>Verify a signed inventory against the genesis public key derived from the stored signing key.</p>
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] verify &lt;SIGNED&gt;
+</code></pre>
+<p><code>&lt;SIGNED&gt;</code> is the path to a signed JSON inventory.</p>
+<p>The command parses the artifact with <code>SignedInventory::parse</code> and verifies it against a trust state containing the active genesis key. Success prints the accepted epoch, recovery status, and verifying key identifiers.</p>
+<h2 id="pubkey"><code>pubkey</code></h2>
+<p>Print the genesis public verify key.</p>
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] pubkey
+</code></pre>
+<p>The command reads the private seed, derives the Ed25519 public key, and writes bare base64 to standard output. It emits no descriptive text on the output line.</p>
+<h2 id="d2-gen"><code>d2-gen</code></h2>
+<p>Generate a node-specific Ed25519 d2 admission keypair.</p>
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] d2-gen &lt;NODE&gt; [--force]
+</code></pre>
+<p><code>&lt;NODE&gt;</code> is the node name used as the database <code>vnode</code> value:</p>
+<pre><code class="language-text">cosmix-mesh-sign \
+  --secrets-db ./secrets.db \
+  --mesh mesh.example.com \
+  d2-gen alpha
+</code></pre>
+<p>The private seed is stored under the node. The command prints the public key for use in that node's inventory <code>credentials</code> entry.</p>
+<p>Without <code>--force</code>, the command atomically refuses an existing record. With <code>--force</code>, it replaces the existing node key. Replacement invalidates admission proofs made with the previous key.</p>
+<h2 id="d2-pubkey"><code>d2-pubkey</code></h2>
+<p>Print a node's stored d2 public key.</p>
+<pre><code class="language-text">cosmix-mesh-sign [GLOBAL OPTIONS] d2-pubkey &lt;NODE&gt;
+</code></pre>
+<p>The command looks up the node-specific private seed, derives the public key, and writes bare base64 to standard output.</p>
+<p>It fails if the node has no stored d2 key, if the seed is not valid base64, or if the decoded seed is not 32 bytes.</p>
+<h2 id="database-records">Database records</h2>
+<p>The key identity is the full SQLite tuple:</p>
+<pre><code class="language-text">(vnode, domain, service, username)
+</code></pre>
+<p>Genesis uses a mesh-wide vnode and the <code>genesis</code> key identity. D2 keys use the node name as vnode and the <code>d2</code> credential identity.</p>
+<p>Private seeds are stored in the <code>password</code> column as base64. Public keys are derived when printed.</p>
+<h2 id="exit-behaviour">Exit behaviour</h2>
+<p>The process exits successfully only when the requested operation completes.</p>
+<p>Common errors include:</p>
+<ul>
+<li>the selected key does not exist;</li>
+<li>a key exists and replacement was not authorised with <code>--force</code>;</li>
+<li>the database cannot be opened or updated;</li>
+<li>an input or output file cannot be read or written;</li>
+<li>the authored inventory is not strict-data or is not marked unsigned;</li>
+<li>a signer-owned field is present in the authored inventory;</li>
+<li>numeric conversion would lose information;</li>
+<li>the signed payload does not match the typed inventory shape;</li>
+<li>signature verification fails.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<p><a href="/cos/cosmix-mesh-sign/">cosmix-mesh-sign</a></p></div></div>
     </div>
 
 </main>
@@ -620,6 +727,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +781,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +910,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

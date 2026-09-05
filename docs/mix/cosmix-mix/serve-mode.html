@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/cosmix-mix/serve-mode</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,143 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/cosmix-mix/serve-mode.md"><div class="prose"><h1 id="serve-mode">Serve mode</h1>
+<p><code>mix --serve</code> runs a Mix script as a long-lived, supervised Bus citizen. The
+runtime registers one service identity, executes the script's initialisation
+body, and then runs an unconditional event pump for author-defined <code>on</code>
+handlers and runtime-reserved verbs.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">mix [--no-prelude] [--strict-arity] \
+  --serve citizen.mix [--name alpha] [--no-prelude]
+</code></pre>
+<p>After the script path, serve mode accepts only <code>--name SERVICE</code> and
+<code>--no-prelude</code>. It does not pass positional arguments to a served script.
+<code>$0</code> is set to the script path.</p>
+<h2 id="service-identity">Service identity</h2>
+<p><code>--name</code> takes precedence. Without it, the service name is the script's file
+stem:</p>
+<pre><code class="language-text">citizen.mix        -&gt; citizen
+alpha.worker.mix   -&gt; alpha.worker
+</code></pre>
+<p>A leading <code>cosmix-</code> prefix is removed from either the explicit name or derived
+file stem. Empty names and names beginning with <code>.</code> are rejected before the
+broker connection. The broker performs the remaining identifier validation.</p>
+<p>The registered provenance contains the <code>mix</code> package, version, repository
+revision, dirty state, build time, and a current RFC 3339 timestamp.</p>
+<h2 id="startup">Startup</h2>
+<p>Serve mode performs these operations in order:</p>
+<ol>
+<li>Initialises structured logging.</li>
+<li>Reads, lexes, and parses the script.</li>
+<li>Resolves the broker URL.</li>
+<li>Establishes a supervised connection and registers the service name.</li>
+<li>Constructs an evaluator with the serve Bus handler and reserved runtime.</li>
+<li>Loads the prelude unless disabled.</li>
+<li>Executes the initialisation body and enters the event pump.</li>
+</ol>
+<p>An unreadable script, lexer or parser failure, logging failure, runtime creation
+failure, exhausted initial connection budget, or initialisation error exits
+non-zero. Initial broker connection failure is fatal; it does not enter a
+background retry loop before the first registration succeeds.</p>
+<h2 id="supervision">Supervision</h2>
+<p><code>MixServeHandler</code> wraps one <code>SupervisedClient</code>. All requests, emits, replies,
+registrations, and topic operations use that connection. Serve mode does not
+route simple names through the transient local-port shortcut.</p>
+<p>After registration, a broker interruption is treated as transient. The client
+reconnects, re-registers the service, and replays its topic-subscription
+registry. Its incoming receiver survives those reconnects. A terminal receiver
+close ends the event pump.</p>
+<p>Calling <code>bus_reconnect()</code> is unnecessary in serve mode; the supervised client
+owns recovery.</p>
+<h2 id="runtime-reserved-verbs">Runtime-reserved verbs</h2>
+<p>The runtime checks reserved verbs before author handlers. A script cannot
+shadow them.</p>
+<table><thead><tr><th>Command</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>HELP</code></td><td>None</td><td>JSON array of accepted commands.</td></tr>
+<tr><td><code>INFO</code></td><td>None</td><td>JSON object containing <code>name</code>, <code>version</code>, and <code>description</code>.</td></tr>
+<tr><td><code>QUIT</code></td><td>None</td><td>Replies with status 0 and <code>{}</code>, then starts graceful shutdown.</td></tr>
+<tr><td><code>SERVICE.props.get</code></td><td>Optional <code>path</code></td><td>Returns the root property snapshot or one value.</td></tr>
+<tr><td><code>SERVICE.props.list</code></td><td>None</td><td>Returns all defined lifecycle leaf paths.</td></tr>
+<tr><td><code>SERVICE.props.describe</code></td><td>Required <code>path</code></td><td>Returns type and property metadata for one path.</td></tr>
+</tbody></table>
+<p>Replace <code>SERVICE</code> with the registered name. For example:</p>
+<pre><code class="language-text">alpha.props.get
+alpha.props.list
+alpha.props.describe
+</code></pre>
+<p><code>HELP</code> lists the six runtime commands first. It then appends sorted,
+deduplicated author-handler command names. Author handlers that collide with a
+reserved name are omitted because they are unreachable.</p>
+<p><code>INFO.version</code> is the <code>mix</code> runtime version. A served script does not provide a
+separate executable version.</p>
+<p>For property commands, a successfully parsed Bus <code>args</code> header takes
+precedence. When the header is absent or cannot be parsed, the runtime parses
+the request body as JSON. An empty request selects the root snapshot.</p>
+<h2 id="lifecycle-properties">Lifecycle properties</h2>
+<p>The property tree is read-only and reports L1 conformance.</p>
+<table><thead><tr><th>Path</th><th>Type</th><th>Value</th></tr></thead><tbody>
+<tr><td><code>lifecycle.started_at</code></td><td>string</td><td>RFC 3339 process start time.</td></tr>
+<tr><td><code>lifecycle.uptime_s</code></td><td>number</td><td>Live seconds since process start; marked transient.</td></tr>
+<tr><td><code>lifecycle.mode</code></td><td>string</td><td><code>serving</code>.</td></tr>
+<tr><td><code>lifecycle.health</code></td><td>string</td><td><code>ok</code>.</td></tr>
+<tr><td><code>lifecycle.props_level</code></td><td>string</td><td><code>L1</code>.</td></tr>
+</tbody></table>
+<p>The runtime uses the shared Bus property encoder with sensitive-value redaction
+enabled.</p>
+<p><code>props.watch</code>, <code>props.set</code>, and <code>props.delete</code> are not runtime-reserved. The
+runtime does not provide L2 watches, property mutation, or world aggregation.
+An author may define handlers with those names as domain behaviour.</p>
+<h2 id="author-handlers">Author handlers</h2>
+<p>The script defines domain commands with Mix <code>on</code> handlers. The event pump
+receives the Bus command, headers, and body through the supervised connection.
+The evaluator supplies replies through the same connection and preserves
+application return codes separately from transport failures.</p>
+<p>Request-style sends await a reply. Map arguments use Bus header/body routing
+when a <code>body</code> key is present or the command is a property command. Emits are
+fire-and-forget and use header/body routing for map arguments.</p>
+<p>Application error return codes remain application results. A transport failure
+raises a mesh-unavailable runtime error.</p>
+<h2 id="broker-configuration">Broker configuration</h2>
+<p>The broker URL is resolved from the first applicable source:</p>
+<ol>
+<li>The file named by <code>COSMIX_NODE_CONFIG</code>.</li>
+<li><code>node.conf.mix</code> under the resolved Cosmix configuration directory.</li>
+<li>The system <code>node.conf.mix</code>, unless <code>COSMIX_ETC</code> explicitly isolates the
+configuration directory.</li>
+</ol>
+<p>The reader consumes only these strict-data fields:</p>
+<pre><code class="language-text">wg_ip: "192.0.2.5"
+noded: { port: 4200 }
+</code></pre>
+<p>Unknown fields and sections are ignored. An absent <code>wg_ip</code> uses loopback. An
+absent <code>noded.port</code> uses 4200. When no file exists, or the selected file cannot
+be read or parsed, the URL falls back to the loopback broker on port 4200.</p>
+<p>The first existing file is authoritative. A parse failure does not continue to
+a later candidate. The resolver never writes or migrates node configuration,
+and it does not read a legacy TOML format.</p>
+<h2 id="logging">Logging</h2>
+<p>Serve mode uses the shared logging core with a journald-first preset. It enables
+standard error when no journal socket is available and also for a foreground
+run attached to a terminal. Structured entries carry the registered service
+name. <code>RUST_LOG</code> overrides the default filter.</p>
+<p>There is no live property-backed log-filter mutation in this package. Change
+<code>RUST_LOG</code> and restart the citizen to change filtering.</p>
+<h2 id="shutdown">Shutdown</h2>
+<p>SIGTERM, Ctrl-C, <code>QUIT</code>, and a terminal event-pump close converge on one
+shutdown path:</p>
+<ol>
+<li>Stop accepting new inbound work.</li>
+<li>Deregister from the broker with a five-second bound.</li>
+<li>Drain in-flight asynchronous handler tasks.</li>
+<li>Abort remaining tasks and synthesise shutdown replies when the connection
+can still deliver them.</li>
+<li>Exit.</li>
+</ol>
+<p>A clean interrupt, <code>QUIT</code>, or clean pump end returns status 0 when
+deregistration succeeds or the connection is already gone. Script failure,
+deregistration failure, or expiration of the deregistration bound returns a
+non-zero status.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +755,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +809,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +938,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

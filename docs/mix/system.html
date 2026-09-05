@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/system</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,1121 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/system.md"><div class="prose"><h1 id="system--processes-environment--system-primitives">system — processes, environment &amp; system primitives</h1>
+<p>The <code>system</code> builtin category — run external commands, inspect and mutate the
+process/OS environment, and produce the small security/identity primitives
+(quoting, hashing, UUIDs, passwords) that glue scripting to the outside world.
+List them live with <code>mix builtins system</code>; one-line help for any single name
+with <code>mix what NAME</code>.</p>
+<p>Mix is an <a href="/mix/bus">Bus-native shell</a>: for <strong>mesh</strong> work prefer <code>send</code> / <code>emit</code>
+over shelling out, and for <strong>remote</strong> work prefer <a href="/mix/remote"><code>ssh_run</code> / <code>ssh_must</code> /
+<code>ssh_mix</code></a> over hand-built <code>ssh</code> command strings. In particular,
+use the <a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + heredoc headline idiom</a>
+for multi-line remote Mix or anything with nested quotes. This page covers
+the <em>local</em> surface — launching processes and reading the machine. The category
+listing also shows families documented on their own pages: the <code>ssh_*</code> builtins
+(<a href="/mix/remote">remote</a>), <code>http_*</code> (<a href="/mix/http">http</a>), the date/time helpers
+(<a href="/mix/datetime">datetime</a>), <code>dns_lookup</code> (<a href="/mix/builtins">builtins index</a>), and
+<code>panic</code> (<a href="/mix/errors">errors</a>).</p>
+<h2 id="the-structured-return-win">The structured-return win</h2>
+<p>The headline difference from bash: a command's result is <strong>structured data</strong>, not
+<code>$?</code>-soup you re-parse. The local runners have explicit contracts:</p>
+<pre><code>run("cmd" [, {timeout: s}])        -&gt; stdout STRING (trailing whitespace stripped); RAISES a catchable die on non-zero exit; /bin/sh
+run_rc("cmd" [, {timeout: s}])     -&gt; map {rc, stdout, stderr, timed_out, interrupted}; NEVER raises — branch on .rc; /bin/sh
+run_argv(argv [, opts])            -&gt; full process_result map; argv direct (NO shell), structured stdio routing, captured streams bounded, optional live tee; NEVER raises on command failure (v0.29.0; stream v0.47.0)
+run_argv_must(argv [, opts])       -&gt; stdout STRING (untrimmed); RAISES PROCESS_* structured errors with the result map in $err.details.result (v0.29.0)
+run_pipeline(stages [, opts])      -&gt; distinct pipeline_result map with per-stage outcomes; argv direct (NO shell); NEVER raises on ordinary pipeline failure
+run_pipeline_must(stages [, opts]) -&gt; final stdout STRING (untrimmed); RAISES PIPELINE_* with the pipeline_result in $err.details.result
+run_stream(argv [, {env, clear_env, cwd}]) -&gt; exit-code NUMBER; inherited stdio (live stream, no /bin/sh); opts v0.51.0
+run_parallel(jobs [, {max, timeout}]) -&gt; LIST of process_result maps in input order; runs many run_argv jobs concurrently with a bounded pool; one job's failure is DATA, never a raise (v0.82.0)
+</code></pre>
+<p>Pick by intent: <strong><code>run_argv</code> is the default for operational code</strong> — injection-inert
+argv, captured output, a real deadline, and one consistent result shape;
+<code>run_argv_must</code> for a must-succeed step in argv form; <code>run</code>/<code>run_rc</code> when you
+genuinely want <code>/bin/sh</code> semantics (pipes, globs) in the command string;
+<code>run_stream</code> when the child must own the terminal (live progress, an interactive
+prompt); <code>run_argv(..., {stream: true})</code> when output must be both visible live and
+captured for the result. The capturing runners give the child <code>/dev/null</code>-style
+stdin by default — a child that prompts gets instant EOF, so an interactive
+command needs <code>run_stream</code> (or <code>run_argv</code>'s <code>stdin:</code> option for pre-supplied
+input). Tee mode does not give the child a terminal or inherited stdin.</p>
+<h3 id="run_argv--structured-argv-execution-v0290">run_argv — structured argv execution (v0.29.0)</h3>
+<p><code>run_argv(argv, [opts])</code> runs an argv <strong>list</strong> directly (no shell anywhere),
+routes stdin/stdout/stderr explicitly, enforces a deadline, and returns one
+consistent map:</p>
+<pre><code class="language-mix">$r = run_argv(["pct", "start", "" .. $vmid], {timeout: 60})
+if not $r.ok then
+  eprint("start failed (exit " .. $r.exit_code .. "): " .. $r.stderr)
+end
+</code></pre>
+<p>The result map always contains, in order: <code>ok</code> (true only for exit 0 with no
+timeout/interrupt/signal/spawn error), <code>exit_code</code> (number, or <code>nil</code> when the
+child didn't exit normally), <code>stdout</code>, <code>stderr</code> (lossy UTF-8, <strong>untrimmed</strong>),
+<code>timed_out</code>, <code>interrupted</code>, <code>signal</code> (number or <code>nil</code>), <code>duration_ms</code>,
+<code>stdout_truncated</code>, <code>stderr_truncated</code>, <code>utf8_lossy</code>, <code>error_code</code>, <code>error</code>
+(both <code>nil</code> unless process setup/lifecycle itself failed — <code>PROCESS_STDIO</code> /
+<code>PROCESS_SPAWN</code> / <code>PROCESS_IO</code> / <code>PROCESS_INTERNAL</code>; an ordinary non-zero exit is NOT an error
+here and never raises).</p>
+<p>Options (unknown keys are a hard <code>OPTION_INVALID</code> error):</p>
+<ul>
+<li><code>timeout</code>: seconds, default <strong>30</strong>, <code>0</code> disables, fractional ok. The clock
+starts before file routes are opened, so it bounds setup as well as the child
+and capture drains. With <code>timeout: 0</code>, Mix waits for every captured stream to
+reach EOF; it does not abandon a reader merely because the direct child has
+exited. Note <code>run</code>/<code>run_rc</code> default to no deadline.</li>
+<li><code>stdin</code>: <code>nil</code> or <code>{null: true}</code> closes stdin; string/bytes/buffer supplies
+those bytes; <code>{file: path}</code> opens a local file for the child to read. There is
+deliberately no <code>stdin: "inherit"</code> route: run_argv puts its child in a new
+process group, so it is not the terminal's foreground group and a terminal
+read can receive <code>SIGTTIN</code>. The string <code>"inherit"</code> is ordinary stdin data.
+Use <code>run_stream</code> when a child must own the terminal and inherited stdin. With
+<code>timeout: 0</code>, Mix also waits for a stdin-data writer to finish after the
+direct child exits. A descendant which retains the read end without consuming
+the data can therefore make the call wait indefinitely; that is the explicit
+no-deadline contract, and the writer is not detached as a leaked thread.</li>
+<li><code>stdout</code>: <code>"capture"</code> (default), <code>"inherit"</code>, <code>"null"</code>, or
+<code>{file: path, append?: bool, mode?: number}</code>.</li>
+<li><code>stderr</code>: <code>"capture"</code> (default), <code>"inherit"</code>, <code>"null"</code>, <code>"stdout"</code>
+(the <code>2&gt;&amp;1</code> merge), or the same file map.</li>
+<li><code>cwd</code>, <code>env</code> (map overlaid on the inherited environment; keys
+<code>[A-Za-z_][A-Za-z0-9_]*</code>, values string/number/bool), and <code>clear_env</code> (bool —
+start from an empty environment) retain their existing meanings.</li>
+<li><code>max_output</code>: bytes <strong>per captured stream</strong>, default 8 MiB, <code>0</code> disables.
+Excess is drained and discarded — the child is never blocked or killed by the
+cap, and the captured stream's truncation flag is set. The same flag is true
+when a deadline forces Mix to abandon a capture before EOF; in that case the
+returned bytes are the partial prefix received before abandonment.</li>
+<li><code>stream</code>: bool, default <code>false</code>; when true, captured stdout chunks are also
+written to the parent's stdout and captured stderr chunks to the parent's
+stderr as they arrive, with a flush after each chunk. Streaming continues
+after <code>max_output</code> truncates capture. <code>stream: true</code> with
+<code>stdout: "inherit"</code> is rejected as <code>OPTION_INVALID</code>: the child already owns
+that stream, so teeing it is meaningless.</li>
+</ul>
+<p>File output defaults to mode <code>0o600</code>, <code>append: false</code>, and therefore truncates an
+existing file. <code>mode</code> is the creation mode (subject to the process umask). All
+local file routes are opened <strong>before</strong> the child is spawned. An open/create
+failure returns the normal failure-shaped process_result with <code>ok: false</code>,
+<code>exit_code: nil</code>, and <code>error_code: "PROCESS_STDIO"</code>; it never raises from
+<code>run_argv</code>, and the child is not run.</p>
+<p>On Unix, an output FIFO is opened non-blocking during setup and restored to
+blocking mode for the child. With no reader its open fails immediately with
+<code>ENXIO</code>, reported as <code>PROCESS_STDIO</code> (not <code>timed_out</code>). An input FIFO retains
+normal wait-for-writer open semantics, but that wait is performed by a bounded
+worker. Mix anchors the FIFO inode with a descriptor before starting the worker;
+reaching the call deadline wakes that same inode and reaps the worker even if
+the pathname was concurrently renamed, unlinked, or replaced, then returns
+<code>PROCESS_STDIO</code> with no child spawned. The wake open is non-blocking. Repeated
+no-writer deadlines therefore do not accumulate blocked FIFO-open threads.
+Pipeline routes use the same rules and return <code>PIPELINE_STDIO</code>.</p>
+<p>Every route is opened first and a non-append route is truncated only once the
+whole set has opened, so a bad <code>stderr</code> path cannot leave the <code>stdout</code> path's
+existing file emptied on the way to reporting <code>PROCESS_STDIO</code>. (The guarantee
+is "nothing is truncated until everything has opened", not a transaction: if the
+truncation of one route then fails — an immutable file opens but will not
+shorten — an already-truncated earlier route stays truncated.) A route pointing
+at a symlink is followed, as <code>&gt;</code> would; a route pointing at a non-regular target
+(<code>/dev/null</code>, a character device) is written to, never truncated.</p>
+<p>A non-captured stdout/stderr route always leaves that result field as <code>""</code> and
+its <code>*_truncated</code> flag false. <code>max_output</code> does not apply to inherited, null, or
+file-routed streams; Mix never silently caps them. With <code>stderr: "stdout"</code>, both
+child streams go to the selected stdout destination, the combined bytes count
+against stdout's cap when stdout is captured, and result <code>.stderr</code> stays <code>""</code>
+with <code>stderr_truncated: false</code>.</p>
+<p>With <code>stream: true</code>, a non-consuming parent stdout or stderr can block its drain
+worker and delay return past <code>timeout</code>; the child is still killed at the
+deadline. The tee-enabled check and parent-stream write are one critical
+section. Before abandoning a reader Mix disables teeing under that same lock,
+so an in-flight write finishes before return and later chunks from an escaped
+descendant are suppressed. The captured prefix is returned with its truncation
+flag set.</p>
+<p>Kill discipline matches the whole family: the child runs in its own process
+group; a timeout SIGKILLs the group immediately; Ctrl-C sends SIGTERM, waits up
+to 2s, then SIGKILLs.</p>
+<p><code>run_argv_must(argv, [opts])</code> accepts the same options and routing rules, and
+returns <code>$r.stdout</code> unchanged when <code>ok</code> and
+neither stream was truncated; otherwise it raises a structured error
+(<code>PROCESS_EXIT_NONZERO</code>, <code>PROCESS_TIMEOUT</code>, <code>PROCESS_SIGNAL</code>,
+<code>PROCESS_INTERRUPTED</code>, <code>PROCESS_OUTPUT_LIMIT</code>, or the setup/lifecycle code,
+including <code>PROCESS_STDIO</code>)
+carrying the complete result map in <code>$err.details.result</code> — catch with
+<code>catch $msg, $err</code> (see <a href="/mix/errors">errors</a>).</p>
+<h3 id="run_pipeline--structured-shell-free-pipelines">run_pipeline — structured shell-free pipelines</h3>
+<p><code>run_pipeline(stages, [opts])</code> runs one or more argv stages directly and connects
+stage <code>i</code> stdout to stage <code>i + 1</code> stdin. It does not invoke <code>/bin/sh</code>, parse a
+command string, or reinterpret argv characters:</p>
+<pre><code class="language-mix">$r = run_pipeline([
+  ["sha256sum", "/srv/image.raw"],
+  ["cut", "-d ", "-f1"]
+], {timeout: 60})
+if $r.ok then
+  print(trim($r.stdout))
+else
+  eprint("pipeline failed: " .. $r.stderr)
+end
+</code></pre>
+<p>A stage is either an argv list or a map:</p>
+<pre><code class="language-mix">[
+  {argv: ["producer"], cwd: "/srv/input", env: {MODE: "raw"}, stdin: {file: "/srv/request"}},
+  {argv: ["filter"], clear_env: true, env: {LANG: "C"}, stderr: "inherit"},
+  {argv: ["consumer"], stdout: {file: "/srv/result", mode: 0o600}}
+]
+</code></pre>
+<p>Every stage map requires <code>argv</code>. All stages accept <code>cwd</code>, <code>env</code>, <code>clear_env</code>, and
+<code>stderr</code>. Only the first accepts <code>stdin</code>; only the last accepts <code>stdout</code> (a
+one-stage pipeline is both first and last). These values use the exact
+<a href="/mix/system#run_argv--structured-argv-execution-v0290"><code>run_argv</code></a> grammar and validation:
+stdin data/null/file, stdout capture/inherit/null/file, and stderr
+capture/inherit/null/stdout/file. A misplaced route, unknown key, or invalid
+option raises <code>OPTION_INVALID</code> before spawning; malformed stages/argv raise
+<code>TYPE_MISMATCH</code>. An empty pipeline is invalid. A one-stage pipeline has the same
+execution and familiar result fields as <code>run_argv</code>, plus its one-element
+<code>.stages</code> list.</p>
+<p>The distinct <code>pipeline_result</code> map always contains, in order:
+<code>ok</code>, <code>exit_code</code>, <code>stdout</code>, <code>stderr</code>, <code>timed_out</code>, <code>interrupted</code>, <code>signal</code>,
+<code>duration_ms</code>, <code>stdout_truncated</code>, <code>stderr_truncated</code>, <code>utf8_lossy</code>,
+<code>error_code</code>, <code>error</code>, <code>stages</code>.</p>
+<ul>
+<li><code>exit_code</code> and <code>signal</code> describe the <strong>last</strong> stage. They do not alone decide
+overall success: a middle-stage failure makes <code>.ok</code> false even when the last
+stage exits 0.</li>
+<li><code>stdout</code> is the last stage's captured stdout, untrimmed. It is <code>""</code> when the
+last stage routes stdout elsewhere.</li>
+<li><code>stderr</code> concatenates captured stage stderr in stage order. Routed/merged
+stderr is absent from this aggregate.</li>
+<li><code>stderr_truncated</code> and <code>utf8_lossy</code> are aggregate flags. <code>stdout_truncated</code>
+applies to final stdout. A truncation flag also records a capture abandoned
+at the deadline before EOF, not only bytes discarded by <code>max_output</code>.</li>
+<li><code>error_code</code> / <code>error</code> are normally <code>nil</code>. Setup/lifecycle failures use
+<code>PIPELINE_STDIO</code>, <code>PIPELINE_SPAWN</code>, <code>PIPELINE_IO</code>, or <code>PIPELINE_INTERNAL</code> and
+are returned as <code>ok: false</code>; ordinary non-zero exits and signals remain data.
+A later-stage <code>PIPELINE_SPAWN</code> is the unavoidable partial-run case:
+<code>.stages</code> contains only stages already started and reaped. Their captured
+stderr is abandoned during emergency cleanup and marked truncated.</li>
+</ul>
+<p>Each <code>.stages[i]</code> map contains, in order: <code>index</code>, <code>argv</code>, <code>ok</code>, <code>exit_code</code>,
+<code>signal</code>, <code>duration_ms</code>, <code>stderr</code>, <code>stderr_truncated</code>, <code>utf8_lossy</code>,
+<code>accepted_signal</code>. Stage stderr is untrimmed. <code>accepted_signal</code> records the
+SIGPIPE policy below; it is false for ordinary exits and rejected signals.</p>
+<p>Pipeline options (unknown keys raise <code>OPTION_INVALID</code>):</p>
+<ul>
+<li>
+<p><code>timeout</code>: one wall-clock deadline in seconds for the <strong>whole pipeline</strong>,
+starting before route and pipe setup; default 30, <code>0</code> disables, fractional
+values are accepted. A route open that reaches the deadline returns
+<code>PIPELINE_STDIO</code> before any stage runs. Process enforcement polls
+at 50 ms, exactly as <code>run_argv</code> does, so a pipeline that finishes inside the
+first poll of an unreachably short deadline is reported as a normal
+completion, not a timeout. A deadline bounds a wedge; it is not a stopwatch.</p>
+</li>
+<li>
+<p><code>max_output</code>: bytes per captured stream, default 8 MiB, <code>0</code> disables. It caps
+final stdout and each captured stage stderr independently; excess is drained
+and flagged, not allowed to block a child.</p>
+</li>
+<li>
+<p><code>allow_signal</code>: bool, <strong>default <code>false</code></strong>. By default every stage must exit
+normally with code 0, so any signal death — SIGPIPE included — makes <code>.ok</code>
+false. Set <code>allow_signal: true</code> to accept a <strong>non-final</strong> stage killed by
+SIGPIPE when every downstream stage succeeded, which is what the ordinary
+early-reader idiom needs:</p>
+<pre><code class="language-mix">$r = run_pipeline([["yes"], ["head", "-1"]], {allow_signal: true})
+</code></pre>
+<p>The default is <code>false</code> because <strong>the signal is all Mix can see</strong>. A stage that
+kills itself with SIGPIPE for a fatal reason of its own is indistinguishable
+from one whose reader simply closed early, so accepting it by default reports
+this as success:</p>
+<pre><code class="language-mix">run_pipeline([["yes"], ["sh", "-c", "printf fatal &gt;&amp;2; kill -PIPE $$"], ["true"]])
+</code></pre>
+<p>The middle stage announced a fatal condition and killed itself, every
+downstream stage exited 0, and <code>.ok</code> would have been <code>true</code>. Reporting that as
+success is the silent-wrong-answer class this surface exists to remove, so the
+honest answer is the default and the ergonomic one is opt-in. This matches
+<code>set -o pipefail</code>, which likewise reports 141 for <code>yes | head -1</code>.</p>
+<p>Per-stage <code>.accepted_signal</code> records where an acceptance was applied.</p>
+</li>
+</ul>
+<p>Every stage's file routes and every inter-stage/data/capture pipe are prepared
+before <strong>any</strong> stage is spawned. Non-append routes are truncated only after the
+full set has opened. A later open or pipe-creation failure therefore returns
+<code>PIPELINE_STDIO</code> with no stage run; the truncation pass itself is not a
+transaction if one truncation succeeds and a later one fails.</p>
+<p>Every stage leads its own process group. The pipeline owns one deadline: expiry
+SIGKILLs every stage group, including descendants, and sets <code>timed_out: true</code>.
+Ctrl-C sends SIGTERM to every group, allows the same two-second grace as
+<code>run_argv</code>, then SIGKILLs survivors. A descendant that deliberately escapes its
+stage group can retain a captured descriptor; Mix waits only a short bounded
+drain window, then returns the captured prefix with the relevant truncation
+flag true rather than waiting indefinitely for EOF. When <code>timeout: 0</code> disables
+the deadline, capture instead waits for EOF and is never abandoned merely
+because every direct stage has exited. A supplied stdin-data writer is likewise
+joined: a descendant which holds its read end without consuming can make an
+explicit no-deadline pipeline wait indefinitely, but cannot leave a detached
+native writer thread behind.</p>
+<p><code>run_pipeline_must(stages, [opts])</code> accepts the same forms. It returns final
+stdout unchanged only when the aggregate <code>.ok</code> is true and no captured stream
+was truncated. Otherwise it raises <code>PIPELINE_EXIT_NONZERO</code>, <code>PIPELINE_TIMEOUT</code>,
+<code>PIPELINE_SIGNAL</code>, <code>PIPELINE_INTERRUPTED</code>, <code>PIPELINE_OUTPUT_LIMIT</code>, or the
+setup/lifecycle code above. The complete pipeline_result is always available as
+<code>$err.details.result</code>.</p>
+<h3 id="run--stdout-string-fail-fast">run — stdout string, fail-fast</h3>
+<p><code>run(cmd)</code> runs <code>cmd</code> through <code>/bin/sh -c</code>, returns its stdout as a string with
+<strong>trailing</strong> whitespace stripped (leading whitespace is preserved), and on a
+non-zero exit (or signal kill) <strong>raises a catchable <code>die</code></strong> carrying the
+command excerpt, the exit status, and a tail of stderr.</p>
+<pre><code class="language-mix">$out = run("echo hello world")
+print($out)
+print("len: " .. length($out))
+</code></pre>
+<pre><code class="language-text">hello world
+len: 11
+</code></pre>
+<p>The die on failure — wrap a must-succeed step in <a href="/mix/errors"><code>try</code>/<code>catch</code></a>:</p>
+<pre><code class="language-mix">try
+  run("false")
+catch $e
+  print("caught: " .. ("" .. $e))
+end
+</code></pre>
+<pre><code class="language-text">caught: run: 'false' failed (rc=1)
+</code></pre>
+<p>The die message includes a stderr tail when there is one (<code>run: 'cmd' failed (rc=2): &lt;stderr tail&gt;</code>, last 200 characters). A signal-killed child reports the
+shell convention <code>rc = 128 + signo</code> — SIGTERM shows as <code>failed (rc=143)</code>, not a
+separate <code>signal=N</code> form. The excerpt and tail are run through
+<a href="/mix/system#sanitize"><code>sanitize</code></a> so a hostile command/stderr can't smuggle control
+characters into your logs.</p>
+<h3 id="run_rc--the-rc-stdout-stderr-timed_out-interrupted-map">run_rc — the {rc, stdout, stderr, timed_out, interrupted} map</h3>
+<p><code>run_rc(cmd)</code> runs the same way but <strong>never raises</strong> — it returns a map so you
+branch on the exit code yourself. <code>stdout</code> and <code>stderr</code> are both stripped of
+trailing whitespace. The <code>timed_out</code> / <code>interrupted</code> bools are always present
+(<code>false</code> on a normal exit) — see <a href="/mix/system#timeouts">Timeouts</a> below.</p>
+<pre><code class="language-mix">$r = run_rc("ls /nonexistent-xyz")
+print("rc=" .. $r.rc)
+print("stderr=" .. $r.stderr)
+</code></pre>
+<pre><code class="language-text">rc=2
+stderr=ls: cannot access '/nonexistent-xyz': No such file or directory
+</code></pre>
+<p>The idiomatic exit-code branch — the structured-return payoff:</p>
+<pre><code class="language-mix">$r = run_rc("systemctl is-active some-service")
+if $r.rc != 0 then
+  print("not running")
+else
+  print("active: " .. $r.stdout)
+end
+</code></pre>
+<p><code>rc</code> is the real exit code as a number. A signal-killed child reports
+<code>128 + signo</code> (SIGTERM → <code>143</code>); <code>-1</code> means the <code>timeout</code> deadline fired and
+<code>-2</code> means Ctrl-C interrupted the wait (see below) — never confuse those with a
+child's own exit code. Trailing newlines are stripped, so a one-line tool's
+<code>stdout</code> is clean to compare or concatenate:</p>
+<pre><code class="language-mix">$r = run_rc("printf 'a\nb\n\n'")
+print("[" .. $r.stdout .. "]")
+</code></pre>
+<pre><code class="language-text">[a
+b]
+</code></pre>
+<h3 id="timeouts">Timeouts</h3>
+<p><code>run</code> and <code>run_rc</code> take an optional second argument — an opts map with a single
+<code>timeout</code> key, in <strong>whole seconds</strong> (every ssh/run timeout in Mix is seconds; the
+Bus <code>send … timeout=2000</code> form is the only millisecond surface). The default is
+<code>0</code> = <strong>no deadline</strong> — the historic contract, so a long build never gets cut
+off by surprise. With a deadline set, a hung child can never wedge the shell:</p>
+<pre><code class="language-mix">$r = run_rc("sleep 5", {timeout: 1})
+print("rc=" .. $r.rc .. " timed_out=" .. ("" .. $r.timed_out))
+</code></pre>
+<pre><code class="language-text">rc=-1 timed_out=true
+</code></pre>
+<pre><code class="language-mix">try
+  run("sleep 5", {timeout: 1})
+catch $e
+  print("caught: " .. ("" .. $e))
+end
+</code></pre>
+<pre><code class="language-text">caught: run: 'sleep 5' timed out after 1s
+</code></pre>
+<p>The full status contract:</p>
+<table><thead><tr><th>Outcome</th><th><code>run</code></th><th><code>run_rc</code></th></tr></thead><tbody>
+<tr><td>normal exit</td><td>stdout string / die on non-zero</td><td><code>rc</code> = exit code</td></tr>
+<tr><td>deadline fired</td><td>dies (catchable): <code>timed out after Ns</code></td><td><code>rc: -1, timed_out: true</code></td></tr>
+<tr><td>Ctrl-C during the wait</td><td>raises <code>run: interrupted</code></td><td><code>rc: -2, interrupted: true</code></td></tr>
+<tr><td>child signal-killed</td><td>dies: <code>failed (rc=128+sig)</code></td><td><code>rc</code> = <code>128 + signo</code> (SIGTERM → 143)</td></tr>
+</tbody></table>
+<p>Kill mechanics (the same machinery as <a href="/mix/remote"><code>ssh_run</code></a>): the child is
+spawned in its <strong>own process group</strong>, so the kill reaches every descendant — an
+<code>ssh</code> helper or forked worker can't keep the pipes open past the deadline. A
+timeout SIGKILLs the group immediately; a Ctrl-C sends SIGTERM, waits a 2-second
+grace, then SIGKILLs. An interrupt that lands on the same poll as the deadline
+wins the tie — it's reported as the cause.</p>
+<p>The opts map is validated <strong>loudly</strong> — a mistake can't silently leave a call
+unbounded:</p>
+<pre><code class="language-text">run_rc("echo hi", {bogus: 1})       -&gt; Runtime error: run_rc: unknown opt "bogus" (supported: timeout)
+run_rc("echo", {timeout: 1.5})      -&gt; Runtime error: run_rc: timeout must be a non-negative integer, got 1.5
+run_rc("echo", "notamap")           -&gt; Runtime error: run_rc: opts must be a map like {timeout: 30}, got string
+run_rc("echo", {timeout: 1}, "x")   -&gt; Runtime error: run_rc() expects at most 2 argument(s), got 3
+</code></pre>
+<p><code>run_stream</code> takes <strong>no</strong> timeout opt; it blocks until the child exits, which is
+the point of handing it the terminal. Since v0.51.0 it <em>has</em> an options map, so
+<code>{timeout: 5}</code> is no longer a silently-ignored surplus argument — it raises
+<code>OPTION_INVALID</code> naming <code>run_argv</code> as the runner that honours a deadline (as do
+<code>stdin</code>, <code>stdout</code>, <code>stderr</code>, <code>max_output</code> and <code>stream</code>). <code>spawn</code> doesn't need one — it returns
+immediately and you <code>kill()</code> the PID yourself. The <code>http_*</code> builtins have their
+own deadline (default 30 s) — see <a href="/mix/http">http</a>.</p>
+<h3 id="run_stream--live-stdio-argv-list-no-shell">run_stream — live stdio, argv list, no shell</h3>
+<p><code>run_stream(argv_list)</code> runs an <strong>argv list directly</strong> — no <code>/bin/sh</code>, so no
+word-splitting, globbing, quoting, or operator interpretation. Each list element
+is one argument verbatim, which makes user values <strong>injection-inert by
+construction</strong>. It inherits the parent's stdin/stdout/stderr (output streams live
+as it happens) and returns the <strong>exit code</strong> as a number.</p>
+<pre><code class="language-mix">$code = run_stream(["echo", "streamed", "live"])
+print("exit code: " .. $code)
+</code></pre>
+<pre><code class="language-text">streamed live
+exit code: 0
+</code></pre>
+<p>Use it for a foreground one-shot where the child should own the terminal — live
+progress (a build, a long copy) or an interactive prompt (a password, an <code>apt</code>
+confirmation) — <em>provided the command allocates a pty itself</em>, e.g.
+<code>run_stream(["ssh", "-t", $host, $cmd])</code>. A signal-killed child reports
+<code>128 + signo</code> (the shell convention).</p>
+<p>It is strict about its argument: a non-list, an empty list, or a non-string
+element all raise rather than silently stringifying:</p>
+<pre><code class="language-mix">try
+  run_stream("ls")
+catch $e
+  print("caught: " .. ("" .. $e))
+end
+</code></pre>
+<pre><code class="language-text">caught: run_stream: argument must be a list of strings, got string
+</code></pre>
+<p>Because it blocks the evaluator until the child exits, keep it out of a hot
+<code>on … async</code> <a href="/mix/bus">event handler</a> — there it stalls dispatch like <code>run</code>/<code>run_rc</code>
+would, and there's no terminal for interactivity anyway.</p>
+<h4 id="run_stream-options--env-clear_env-cwd-v0510">run_stream options — env, clear_env, cwd (v0.51.0)</h4>
+<p>The optional second argument is <code>{env, clear_env, cwd}</code>, with <strong>exactly</strong> the
+semantics <a href="/mix/system#run_argv--structured-argv-execution-v0290"><code>run_argv</code></a> gives those
+three keys — same name validation (<code>[A-Za-z_][A-Za-z0-9_]*</code>), same NUL
+rejection, same <code>OPTION_INVALID</code> code, all checked <em>before</em> the child is
+spawned. The order is clear-then-layer, so <code>{clear_env: true, env: {…}}</code> means
+"exactly these":</p>
+<pre><code class="language-mix">$code = run_stream(["npm", "install"], {
+  cwd: "/srv/app",
+  env: {NODE_ENV: "production", CI: "1"}
+})
+</code></pre>
+<p>Values reach the child through <code>execve</code>, not a shell — spaces, globs and a
+literal <code>$HOME</code> in a value survive verbatim.</p>
+<p>Use it instead of prefixing the argv with coreutils <code>env</code>. That old workaround
+still runs, but it puts every value in the child's <code>ps</code> argv, where any user on
+the box can read it — the option does not, which makes it the route for a token
+or password handed to an interactive child. The <code>export</code> statement keeps a
+value out of argv as well — it is the mechanism behind <a href="/mix/remote"><code>ssh_run</code></a>'s
+default <code>mix</code> env transport and <code>ssh_mix</code> — but it mutates this process's
+environment: the variable stays set for the rest of the run, and every child
+spawned after it inherits the value unless that child clears or overrides it.
+The option is scoped to the single call.</p>
+<p>⚠️ On a mix older than 0.51.0 the map is <strong>not</strong> an error — default compatible
+arity silently ignores a surplus argument, so the child runs with the inherited
+environment, the inherited cwd, and no sign that anything was dropped. That is
+a fail-<em>open</em> version boundary. A caller that may meet a mixed-version fleet
+should install the new binary everywhere before the caller, run under
+<code>--strict-arity</code> (where the old contract's arity raises <code>ARITY_MISMATCH</code>), or
+probe the option behaviourally: spawn <code>["/bin/sh", "-c", "test x$SENTINEL = xVALUE"]</code> with the sentinel in <code>env</code> and check the exit code before trusting
+the real run. Prove the sentinel is <em>absent</em> from the parent first — an
+inherited value passes the probe on the very binary the probe exists to catch.</p>
+<p>The four <code>run_argv</code>-only keys are refused <strong>by name</strong> rather than ignored:
+<code>timeout</code> (this runner blocks until the child exits), <code>stdin</code> (it inherits the
+parent's), and <code>max_output</code> / <code>stream</code> (it captures nothing). Each error names
+<code>run_argv</code> as the runner that does honour the key.</p>
+<p>⚠️ A bare <code>argv[0]</code> is resolved against the <strong>child's</strong> <code>PATH</code>, not the
+parent's — so <code>env: {PATH: "/nonexistent"}</code> makes <code>run_stream(["sh", …])</code> fail
+to spawn, even though <code>sh</code> is on yours. (<code>clear_env: true</code> alone leaves no
+<code>PATH</code> at all, and the C library's default path still finds <code>/bin/sh</code> on Linux —
+but that is the platform's fallback, not a guarantee.) Pass an absolute
+<code>argv[0]</code> whenever you touch <code>PATH</code> or clear the environment; see
+<a href="/mix/system#-the-minimal-path-rule">the minimal-PATH rule</a>. Pass one under <code>cwd</code> too — a
+<em>relative</em> <code>argv[0]</code> is resolved in a directory the OS deliberately leaves
+platform-specific, so <code>run_stream(["./build.sh"], {cwd: "/srv/app"})</code> is not
+portable; spell it <code>/srv/app/build.sh</code>.</p>
+<h3 id="run_parallel--process-level-fan-out-v0820">run_parallel — process-level fan-out (v0.82.0)</h3>
+<p><code>run_parallel(jobs [, {max, timeout}])</code> runs many <code>run_argv</code> jobs at once through
+a bounded worker pool and returns a <strong>list of <code>process_result</code> maps in input
+order</strong> — each map is exactly what the same <code>run_argv</code> call would return, so
+existing result-handling code ports unchanged. One job's ordinary failure
+(nonzero exit, timeout, a spawn error) is <strong>data in its map, never a raise</strong>.</p>
+<pre><code class="language-mix">-- Fan a health check across a fleet; collect every result.
+$hosts = ["alpha", "beta", "gamma"]
+$jobs = map($hosts, fn($h) = ["ssh", $h, "uptime"])
+$results = run_parallel($jobs, {max: 8, timeout: 10})
+for each $i in range(0, len($hosts))
+  $r = $results[$i]
+  print($hosts[$i] .. ": " .. ($r.ok ? trim($r.stdout) : "DOWN (" .. $r.exit_code .. ")"))
+end
+</code></pre>
+<p>A job is either an <strong>argv list</strong> (<code>["ssh", $h, "uptime"]</code>) or a <strong><code>{argv, …}</code>
+map</strong> carrying the same per-job options <code>run_argv</code> accepts (<code>stdin</code>, <code>cwd</code>,
+<code>env</code>, <code>clear_env</code>, <code>stdout</code>, <code>stderr</code>, <code>max_output</code>, <code>timeout</code>). <code>max</code> bounds
+concurrency (default 8, <strong>hard-capped at 256</strong> live workers — a larger <code>max</code>
+still runs every job, just no more than 256 at once); a top-level <code>timeout</code>
+(seconds) overrides every job's own. A job may <strong>not</strong> disable its deadline
+(<code>timeout: 0</code> is refused): one never-exiting job would park a worker forever and,
+because the call waits for all workers, hostage the whole batch. A parse error in
+<strong>any</strong> job fails the whole call before a single process spawns, exactly as
+<code>run_argv</code> validates before spawning.</p>
+<p><strong>This is PROCESS-level fan-out, not in-language concurrency.</strong> The evaluator is
+single-threaded by construction and Mix <code>Value</code>s are never shared across
+threads: <code>run_parallel</code> parses every job to plain owned data first, and the
+worker threads touch only process plumbing (argv, pipes, exit codes), marshalling
+results back on the caller's thread. There is deliberately <strong>no</strong> <code>parallel(list, fn)</code> that runs Mix functions concurrently — that would mean rebuilding the value
+model, and it is not planned. The killer use is <code>ssh_mix</code> fan-out: a fleet sweep
+that walked N nodes serially becomes one <code>run_parallel</code> of N ssh jobs. A job's
+<code>stream</code> flag is ignored (a parallel live tee would interleave into garbage).</p>
+<h3 id="which-runner">Which runner?</h3>
+<table><thead><tr><th>Need</th><th>Use</th></tr></thead><tbody>
+<tr><td>stdout string, abort on failure</td><td><code>run</code></td></tr>
+<tr><td>inspect a non-zero exit code as data</td><td><code>run_rc</code></td></tr>
+<tr><td>live output / interactive child / inject-safe argv</td><td><code>run_stream</code></td></tr>
+<tr><td>run Mix source on another node</td><td><a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + heredoc</a></td></tr>
+<tr><td>run a shell snippet on another node</td><td><a href="/mix/remote"><code>ssh_run</code> / <code>ssh_must</code></a></td></tr>
+<tr><td>talk to a local/mesh Bus broker</td><td><a href="/mix/bus"><code>send</code> / <code>emit</code></a></td></tr>
+</tbody></table>
+<h2 id="what-the-command-string-sees">What the command string sees</h2>
+<p><code>run</code>/<code>run_rc</code> hand the whole command string to <code>/bin/sh -c</code>, so POSIX-sh
+syntax inside it just works — and three constructs behave differently there
+than on a <a href="/mix/shell-mode">shell-dispatch line</a>:</p>
+<ul>
+<li>
+<p><strong>Subshell <code>( … )</code> / brace-group <code>{ …; }</code> grouping</strong>: shell dispatch (the REPL / <code>mix -c</code> shell branch) does <strong>not</strong> support POSIX command grouping — a bare <code>(echo a; echo b) | sort</code> at the prompt fails because a <em>leading</em> <code>(</code> classifies the line as Mix, where <code>echo a</code> is not a valid parenthesized expression (and ordinary expression parentheses do not permit <code>;</code> either); a mid-line group gets word-split. The fix is not a <code>.sh</code> file — hand the whole pipeline to <code>/bin/sh</code> as one Mix line:</p>
+<pre><code class="language-mix">$r = run_rc("(echo b; echo a) | sort")   -- {rc, stdout, stderr}; group runs in /bin/sh
+print($r.stdout)
+print(run("(cd /tmp; pwd) | tr a-z A-Z"))
+</code></pre>
+<pre><code class="language-text">a
+b
+/TMP
+</code></pre>
+<p>On a mix-login-shell node a remote <code>(…; …)</code> hits the <em>remote</em> classifier the
+same way. Ship multi-line Mix without nested escaping via
+<a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + heredoc</a>.</p>
+</li>
+<li>
+<p><strong><code>$(...)</code> command substitution</strong>: literal in a double-quoted Mix <a href="/mix/strings">string</a>, but it <strong>passes through</strong> in a <code>run</code>/<code>run_rc</code> command string — it substitutes in the <code>/bin/sh</code> that actually runs the command (local here; the <em>remote</em> shell for <code>ssh_run</code>).</p>
+</li>
+<li>
+<p><strong>Brace expansion <code>{a,b}</code> / <code>{1..5}</code></strong>: a shell-dispatch feature, <strong>not</strong> a <code>/bin/sh</code> one — braces in a <code>run</code>/<code>run_rc</code> command string pass through to POSIX sh, which does no brace expansion. Use a dispatch line or a Mix loop when you need it.</p>
+</li>
+</ul>
+<h2 id="-the-minimal-path-rule">⚠️ The minimal-PATH rule</h2>
+<p><code>run</code>, <code>run_rc</code>, and <code>spawn</code> go through <code>/bin/sh</code> with whatever PATH the parent
+process had — non-interactively that is <strong>minimal</strong>, and <code>~/.mixrc</code> aliases are
+<em>not</em> loaded (those only apply to interactive <code>mix -i</code>). The safe habit:
+<strong>call binaries by full path</strong> inside scripts.</p>
+<pre><code class="language-mix">-- fragile: bare name may not be on /bin/sh's PATH non-interactively
+run("mix --version")
+
+-- robust: absolute path always resolves
+print(run("/opt/cosmix/bin/mix --version"))
+</code></pre>
+<pre><code class="language-text">mix 0.21.2
+</code></pre>
+<p><code>run_stream</code> takes the program name as <code>argv[0]</code> and resolves it against PATH the
+same way — full-path that too if you can't guarantee the environment. The rule
+of thumb: <strong>inside scripts, always full-path</strong> (<code>/opt/cosmix/bin/...</code>). The one
+context where a bare <code>mix</code> <em>does</em> resolve is as the ssh command itself
+(<code>ssh host 'mix status'</code>) — the login-shell mix self-resolves via its own
+executable path, no PATH needed (<a href="/mix/remote">remote</a>).</p>
+<h2 id="background-processes--spawn-kill-process_alive">Background processes — spawn, kill, process_alive</h2>
+<p><code>spawn(cmd[, stdout_path[, stderr_path]])</code> starts a background process via
+<code>/bin/sh -c</code> with stdin from <code>/dev/null</code> and returns its <strong>PID</strong> as a number. It
+does not wait. Stdio routing by arity:</p>
+<ul>
+<li>1 arg — both stdout and stderr → <code>/dev/null</code></li>
+<li>2 args — stdout → file (truncated), stderr → <code>/dev/null</code></li>
+<li>3 args — stdout → file1, stderr → file2; pass the <strong>same path</strong> for both to merge them into one combined log (like bash <code>&amp;&gt;file</code>)</li>
+</ul>
+<pre><code class="language-mix">$p = spawn("echo logged-line", "/tmp/spawn.log")
+sleep(0.2)
+print(run("cat /tmp/spawn.log"))
+</code></pre>
+<pre><code class="language-text">logged-line
+</code></pre>
+<p><strong>All three arguments are strings, and none of them is coerced</strong> (strict since
+v0.52.0). This is the loud-validation rule the opts maps have always had,
+reaching the one runner that had missed it — and <code>spawn</code> needs it most, because
+it is the only runner with nowhere to put a failure. It returns a <strong>PID, not a
+result map</strong>, and it does not wait, so a child that dies on the very first line
+is indistinguishable from one that worked. Until 0.52.0 a non-string was
+stringified into its display form and handed to <code>sh</code> anyway:</p>
+<pre><code class="language-text">spawn(["touch", $p])   -- 0.51.0: returns a healthy PID; sh dies with
+                       --   `sh: line 1: [touch,: command not found`
+                       --   and nothing anywhere reports it
+                       -- 0.52.0: raises TYPE_MISMATCH
+</code></pre>
+<p>There is <strong>no argv form of <code>spawn</code></strong> — it is <code>sh -c</code> by definition. Build the
+command string with <a href="/mix/system#shell_quote"><code>shell_quote</code></a>, or use <code>run_argv</code> /
+<code>run_argv_must</code> when you want an argv list and can accept a foreground child:</p>
+<pre><code class="language-text">spawn(["touch", "/tmp/x"])     -&gt; TYPE_MISMATCH: spawn: cmd must be a shell command
+                                  string, got list — spawn runs `sh -c` and has no
+                                  argv form; build the string with shell_quote(), or
+                                  use run_argv/run_argv_must for an argv list in the
+                                  foreground
+spawn("true", ["a"])           -&gt; TYPE_MISMATCH: spawn: stdout_path must be a string,
+                                  got list (no coercion — encode explicitly)
+spawn(7)                       -&gt; TYPE_MISMATCH: spawn: cmd must be a string, got
+                                  number (no coercion — encode explicitly)
+</code></pre>
+<p>A NUL byte in any of the three raises too — as <code>TYPE_MISMATCH</code>, at argument
+validation. It was never <em>accepted</em>: <code>std</code>'s <code>Command::spawn</code> and <code>File::create</code>
+both reject an interior NUL, so 0.51.0 raised <code>spawn failed: nul byte found in provided data</code>. What changes is when and as what. The check now runs before any
+stdio file is opened, so a NUL in <code>stderr_path</code> can no longer truncate the
+<code>stdout_path</code> file on its way to failing, and the error arrives in the same
+<code>TYPE_MISMATCH</code> shape as every other bad argument instead of as a late
+<code>RUNTIME_ERROR</code> from std.</p>
+<p><code>kill(pid[, signal])</code> sends <code>signal</code> (default <code>15</code> = SIGTERM) and returns a bool
+(<code>true</code> if the syscall succeeded). <strong>Both arguments are whole numbers and
+neither is coerced</strong> (strict since v0.52.0) — the same rule as <code>spawn</code>, and for
+a sharper reason:</p>
+<pre><code class="language-text">kill(false)          -- 0.51.0: to_number(false) is 0, and kill(0, sig) signals
+                     --   EVERY process in the caller's own process group — the
+                     --   script and its siblings — while returning true
+                     -- 0.52.0: raises TYPE_MISMATCH
+kill($p, "SIGKILL")  -- 0.51.0: the signal silently fell back to SIGTERM, so the
+                     --   caller believed SIGKILL had been sent
+                     -- 0.52.0: raises TYPE_MISMATCH
+kill($p, 9.5)        -- 0.51.0: truncated to 9; 0.52.0: raises (a typo, not a request)
+</code></pre>
+<p>A pid arriving as <code>false</code> from a failed lookup is exactly how that first line
+happens in practice. Signal <em>names</em> are not accepted — pass the number (<code>9</code> for
+SIGKILL); <code>kill(-$pgid, sig)</code> still addresses a process group deliberately.</p>
+<p><code>process_alive(pid)</code> is a liveness probe
+(signal-0 test) returning a bool; it first does a non-blocking <code>waitpid(WNOHANG)</code>
+to reap a zombie child of <em>this</em> process before checking — so a <code>spawn</code>ed child
+that has already exited reports <code>false</code>, not a stale "alive" from a <code>&lt;defunct&gt;</code>
+slot.</p>
+<pre><code class="language-mix">$p = spawn("sleep 30")
+print("alive: " .. ("" .. process_alive($p)))
+print("killed: " .. ("" .. kill($p)))
+</code></pre>
+<pre><code class="language-text">alive: true
+killed: true
+</code></pre>
+<p>A signal to a non-existent PID is harmless and reports the failure honestly:</p>
+<pre><code class="language-mix">print("" .. kill(999999))
+print("" .. process_alive(999999))
+</code></pre>
+<pre><code class="language-text">false
+false
+</code></pre>
+<p><code>kill(pid, 9)</code> sends SIGKILL; pass any signal number you need.</p>
+<h2 id="environment-identity--the-working-directory">Environment, identity &amp; the working directory</h2>
+<pre><code>env("NAME")     environment variable value ("" if unset — never raises)
+env("NAME", d)  value, or default d when NAME is unset OR empty
+args()          list of script arguments
+pid()           this process's PID (number)
+uid()           this process's EFFECTIVE user id (number)
+gid()           this process's EFFECTIVE group id (number)
+groups()        every group id this process is in (sorted list of numbers)
+hostname()      the system hostname (from /etc/hostname)
+cwd()           current working directory
+chdir(path)     change the working directory (raises on failure)
+platform()      {os, arch} map
+which("cmd")    the PATH entry joined with cmd if EXECUTABLE, else nil
+has_builtin(n)  does THIS mix have the named builtin? -&gt; bool (v0.78.0)
+mix_version()   {major, minor, patch, string} — the runtime version (v0.78.0)
+exit([code])    unwind finally, then terminate with status code (default 0)
+sleep(secs)     suspend for secs seconds (fractional ok; async-aware)
+</code></pre>
+<p><code>has_builtin(name)</code> and <code>mix_version()</code> are the <strong>portability pair</strong> — for
+a script that must run across a mixed-version fleet, or a compat shim.
+<code>mix builtins NAME</code> exits 0 for <em>any</em> name and cannot tell you whether a
+builtin exists, so <code>has_builtin</code> is the real yes/no:</p>
+<pre><code class="language-mix">if not has_builtin("ws_connect") then die("this needs mix &gt;= 0.74") end
+$v = mix_version()
+if $v.major == 0 and $v.minor &lt; 78 then die("needs mix &gt;= 0.78.0") end
+</code></pre>
+<p>A feature-gated builtin missing from <em>this</em> build still reads <code>true</code> from
+<code>has_builtin</code> (the binary knows the name — calling it raises "requires the
+X feature"); that is the honest answer, distinct from a name the binary
+has never heard of.</p>
+<p><code>env</code> reads an environment variable, returning <code>""</code> (not nil, no raise) when
+unset — distinct from the string-interpolation <code>${NAME}</code> form, which walks
+scope → env → literal-nil. Use <code>env(...)</code> when you want an explicit env read.</p>
+<p>A <strong>second argument is a default</strong>: <code>env("NAME", d)</code> returns <code>d</code> when <code>NAME</code> is
+unset <em>or</em> set-but-empty (shell <code>${VAR:-default}</code> semantics) — the common "env
+or fallback" need in config code, where the plain <code>""</code>-for-unset return would
+otherwise defeat a <code>??</code> (nil-coalesce) default. The default is returned
+<strong>verbatim</strong> (any value), so <code>env("PORT", 8080)</code> yields the number <code>8080</code>. The
+one-arg form is unchanged.</p>
+<pre><code class="language-mix">print(env("FOO"))
+print("missing=[" .. env("NOPE_XYZ") .. "]")
+print(env("NOPE_XYZ", "fallback"))
+print(env("PORT", 8080))
+</code></pre>
+<pre><code class="language-text">bar
+missing=[]
+fallback
+8080
+</code></pre>
+<p><em>(run as <code>FOO=bar mix script.mix</code>)</em></p>
+<p><code>args()</code> is the script's positional arguments — exactly the same list <code>$1</code>,
+<code>$2</code>, … are indexed from, so the two can never disagree. It is what the runner
+parsed, not a slice off the process command line: flags to <code>mix</code> itself are not
+in it, wherever they appear, and under <code>-c</code> the program text is not in it
+either. An embedded interpreter that was never given script arguments returns
+<code>[]</code>. Reach for <a href="/mix/builtins"><code>getopt</code></a> when you want flag parsing.</p>
+<pre><code class="language-mix">-- script.mix:
+print("" .. args())
+</code></pre>
+<pre><code class="language-text">[alpha, beta]
+</code></pre>
+<p><em>(run as <code>mix script.mix alpha beta</code>)</em></p>
+<p><code>uid()</code> / <code>gid()</code> are the <strong>effective</strong> ids (<code>geteuid</code>/<code>getegid</code>) — normally the
+identity filesystem access is checked against, so they are what a <code>stat()</code> map's
+<code>uid</code>/<code>gid</code> should be compared with when a script is deciding whether a path is
+its own. Strictly, Linux checks the <em>filesystem</em> ids, <code>fsuid</code>/<code>fsgid</code>; they track
+the effective ids unless a process deliberately changes them with <code>setfsuid(2)</code>,
+which a Mix script has no way to do — so for Mix code the two are the same
+answer, and for a Mix interpreter embedded in something that does call it, they
+are not.</p>
+<pre><code class="language-mix">$st = stat("/etc/hostname", {follow_symlinks: false})
+print("mine=" .. ("" .. ($st.uid == uid())))
+print("root-owned=" .. ("" .. ($st.uid == 0)))
+</code></pre>
+<pre><code class="language-text">mine=false
+root-owned=true
+</code></pre>
+<p><em>(as a non-root user)</em></p>
+<p>Without these the only way to learn your own uid was to create a file and stat
+it — and that probe is a liability, not a measurement: the write follows
+symlinks, so another user who wins the race gets a file of their choosing
+truncated under your identity, and the uid that comes back is <em>theirs</em>. Ask the
+kernel instead. Under <code>sudo</code> these report the target identity, not the invoking
+one; there is deliberately no real-uid form, because the effective id — with the
+<code>fsuid</code> caveat above — is the one a file access is checked against, and the real
+id is not.</p>
+<p><code>groups()</code> is the <strong>whole</strong> group membership — the <code>getgroups(2)</code> supplementary
+set plus the effective gid, sorted, with no duplicates. (POSIX permits
+<code>getgroups</code> to leave the effective gid out; this always includes it, so a caller
+never has to add it back. The kernel may also report the same gid twice; the
+duplicate is removed here, so the result is a set in the ordinary sense.)</p>
+<p><code>getgroups(2)</code> is a measure-then-fill pair, so the set can change underneath it.
+Mix cannot call <code>setgroups</code>, which means this needs another thread in an
+embedder — which is exactly the case that matters, since the daemons embed this
+interpreter. A set that <em>shrinks</em> is truncated to what was returned; a set that
+<em>grows</em> makes the fill call fail, and <code>groups()</code> re-measures and retries rather
+than reporting "cannot tell", because the answer is available and only the first
+measurement was stale. The retry is bounded at four attempts: a group set that
+will not hold still for four reads raises instead of returning a guess.</p>
+<p>It exists because <code>gid()</code> alone cannot answer the question scripts actually ask
+of it. Unix picks <strong>one</strong> permission class and does not fall through: owner if
+the uid matches, else group if you are in the file's group, else other. So for a
+file owned by someone else, <code>gid()</code> tells you only whether its group is your
+<em>effective</em> one — and a file grouped under any of your other groups gets the
+group bits applied while a <code>gid()</code>-only check reaches for the other bits and
+gets the answer wrong in either direction. Mode <code>0701</code> in a group you belong to
+is <strong>not</strong> executable by you, whatever the other bit says.</p>
+<pre><code class="language-mix">$st = stat("/usr/bin/passwd", {follow_symlinks: false})
+$mine = false
+for each $g in groups()
+  if $g == $st.gid then
+    $mine = true
+  end
+end
+print("in its group=" .. ("" .. $mine))
+print("groups=" .. ("" .. len(groups())))
+</code></pre>
+<pre><code class="language-text">in its group=false
+groups=3
+</code></pre>
+<p><code>platform()</code> returns a <strong>map</strong>, not a bare string — <code>os</code> (<code>linux</code>, <code>macos</code>,
+<code>windows</code>, …) and <code>arch</code> (<code>x86_64</code>, <code>aarch64</code>, …):</p>
+<pre><code class="language-mix">$p = platform()
+print("os=" .. $p.os)
+print("arch=" .. $p.arch)
+</code></pre>
+<pre><code class="language-text">os=linux
+arch=x86_64
+</code></pre>
+<p><code>which</code> searches PATH for an executable, returning the matching path or <code>nil</code>
+(absolute whenever PATH's entries are, which is the normal case — but it is the
+PATH entry joined with <code>cmd</code>, so a relative or empty entry yields a relative
+answer):</p>
+<pre><code class="language-mix">print(which("sh"))
+print("missing: " .. ("" .. which("definitely-not-a-real-binary-xyz")))
+</code></pre>
+<pre><code class="language-text">/usr/bin/sh
+missing: nil
+</code></pre>
+<p><strong>It answers "can I run this?", not "does this exist?"</strong> (since v0.52.0). A PATH
+entry comes back only when it is a regular file <em>and</em> the kernel says this
+process may execute it — asked with the same ACL-aware <code>faccessat2(2)</code> check
+<a href="/mix/io#kernel-permission-checks--access"><code>access</code></a> uses, never from <code>stat().perm</code> arithmetic. Before 0.52.0 the
+test was <code>is_file()</code>, so a non-executable file on PATH was reported as a
+command and the caller's very next <code>run_argv</code> failed to spawn it — a probe
+whose job is to prevent that failure causing it instead.</p>
+<p>Both halves are load-bearing: <code>X_OK</code> is true for a <em>searchable directory</em>, so a
+PATH entry holding a directory named <code>git</code> would come back as the git binary if
+the regular-file test were dropped. And <code>cmd</code> is a string, not coerced —
+<code>which(["git"])</code> raises <code>TYPE_MISMATCH</code> rather than searching for a file named
+<code>[git]</code>.</p>
+<p>The consequence worth knowing: on a PATH you do not control, <code>which</code> can now
+return <code>nil</code> where it used to return a path. That is the honest answer — the
+old one was a spawn failure deferred by one line.</p>
+<p><code>cwd</code> / <code>chdir</code> read and set the working directory; <code>chdir</code> raises a catchable
+error if the path doesn't exist:</p>
+<pre><code class="language-mix">chdir("/tmp")
+print(cwd())
+</code></pre>
+<pre><code class="language-text">/tmp
+</code></pre>
+<p><code>sleep</code> suspends for the given seconds (fractional allowed). Under the Bus
+<a href="/mix/bus"><code>--serve</code></a> runtime it is async-aware — a sleep with registered handlers
+yields to the dispatch loop rather than blocking the OS thread:</p>
+<pre><code class="language-mix">print("before")
+sleep(0.2)
+print("after")
+</code></pre>
+<pre><code class="language-text">before
+after
+</code></pre>
+<p>The duration may be a number or numeric string (<code>sleep("0.2")</code>). A supplied
+value that cannot be parsed as a number raises <code>TYPE_MISMATCH</code>; it no longer
+silently becomes a zero-second sleep.</p>
+<p><code>exit([code])</code> stops ordinary execution, unwinds every active <code>finally</code> block
+innermost-first, then terminates with the given status (default <code>0</code>):</p>
+<pre><code class="language-mix">print("exiting")
+exit(3)
+</code></pre>
+<pre><code class="language-text">exiting
+</code></pre>
+<p><em>(process exit status is <code>3</code>)</em></p>
+<p>The optional status may be a number or numeric string. <code>exit()</code> still defaults
+to status <code>0</code>; a supplied non-numeric value raises <code>TYPE_MISMATCH</code> instead of
+silently exiting successfully.</p>
+<h2 id="safe-interpolation--shell_quote-sql_quote-sanitize">Safe interpolation — shell_quote, sql_quote, sanitize</h2>
+<p>When you <em>must</em> compose a string for an external shell or SQL statement, quote
+the untrusted parts. These are the inert-by-construction helpers — but prefer
+<code>run_stream</code>'s argv list (no shell at all) or a parameterised query whenever you
+can.</p>
+<h3 id="shell_quote">shell_quote</h3>
+<p><code>shell_quote(s)</code> single-quote-wraps <code>s</code> for a POSIX shell (equivalent to PHP
+<code>escapeshellarg</code>): the result is inert under shell parsing, with internal <code>'</code>
+rendered as <code>'\''</code> (close, escape, reopen).</p>
+<pre><code class="language-mix">print(shell_quote("it's a file"))
+</code></pre>
+<pre><code class="language-text">'it'\''s a file'
+</code></pre>
+<pre><code class="language-mix">$name = "rm -rf /; echo pwned"
+print(run("echo " .. shell_quote($name)))
+</code></pre>
+<pre><code class="language-text">rm -rf /; echo pwned
+</code></pre>
+<h3 id="sql_quote">sql_quote</h3>
+<p><code>sql_quote(s)</code> escapes a string for interpolation <strong>inside</strong> a SQL string literal:
+it doubles every <code>'</code> <em>and</em> escapes <code>\</code> → <code>\\</code> (safe under MySQL/MariaDB's default
+sql_mode, the documented target — quote-doubling alone is injectable there), and
+strips NUL bytes. It does <strong>not</strong> add the outer quotes — you compose those.</p>
+<pre><code class="language-mix">print(sql_quote("O'Brien"))
+</code></pre>
+<pre><code class="language-text">O''Brien
+</code></pre>
+<p>It stays safe for SQLite/Postgres standard mode (where <code>\</code> is literal — the
+trade-off is a literal backslash arrives doubled). For exact-byte SQLite
+literals, use a real binding (<code>sqlexec()</code> placeholders), not string composition.</p>
+<h3 id="sanitize">sanitize</h3>
+<p><code>sanitize(s)</code> makes untrusted bytes safe for <strong>one-line diagnostics</strong>: line
+breaks (including U+2028/U+2029) collapse to spaces, and C0/C1 controls plus
+Trojan-Source-class characters (bidi overrides, zero-width spoofing, BOM) become
+<code>?</code>. Printable Unicode is kept intact. This is what <code>run</code>'s die message uses on
+the command excerpt and stderr tail.</p>
+<pre><code class="language-mix">$s = "line1\nline2\ttab"
+print(sanitize($s))
+</code></pre>
+<pre><code class="language-text">line1 line2?tab
+</code></pre>
+<p>Reach for it before logging anything that came from a network peer, a filename, a
+header, or another process's output.</p>
+<h2 id="identity--crypto-primitives">Identity &amp; crypto primitives</h2>
+<pre><code>uuid()                 random UUID v4 string
+random_password([len]) alphanumeric password (default 16, no O/o, class-diverse)
+hash_sha256(s[, {raw:true}])  SHA-256 digest of a string/bytes/buffer value
+hash_blake3(s[, {raw:true}])  BLAKE3 digest
+hash_md5(s[, {raw:true}])     MD5 digest    -- BROKEN hash, legacy interop only
+hash_sha1(s[, {raw:true}])    SHA-1 digest  -- BROKEN hash, legacy interop only
+hmac_sha256(key, msg[, {raw:true}])  HMAC-SHA256 (RFC 2104) — webhook signatures
+constant_time_eq(a, b) timing-safe equality — compare MACs/secrets with this, not ==
+hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
+                       algo: "sha256" (default) "blake3" "md5" "sha1"
+                       (all of the above: lowercase hex, or bytes with raw:true)
+base64_encode(v)       base64 of a string or bytes buffer
+base64_decode(s)       decode base64 -&gt; a bytes buffer
+password_hash(pw[, cost])   bcrypt "$2b$…" hash; cost 4-31, default 12 (v0.71.0)
+password_verify(pw, hash)   check against a bcrypt hash -&gt; bool (v0.71.0)
+</code></pre>
+<p><code>password_hash</code>/<code>password_verify</code> exist for <strong>account passwords written over
+the Bus</strong>: a raw <code>props.set</code> of <code>maild.accounts.password</code> stores the field
+verbatim (only the <code>account add</code> CLI hashed it), so the bcrypt has to happen
+client-side — which used to mean shelling out to PHP. Three deliberate
+edges: input over <strong>72 bytes raises</strong> (bcrypt's own truncation limit,
+surfaced instead of silently applied — hash a digest of longer secrets);
+a <strong>malformed hash raises</strong> in <code>password_verify</code> rather than answering
+<code>false</code> (a corrupt stored hash is a config fault, and "wrong password"
+would misdirect the operator); and the general-purpose digests above are
+<strong>not</strong> password hashes — <code>hash_sha256</code> has no work factor.</p>
+<p>Every <code>hash_*</code> call takes the same trailing options map, and the only option is
+<strong><code>{raw: true}</code></strong> (v0.66.0): return the digest as raw <code>bytes</code> instead of
+lowercase hex. <code>hash_sha256($x, {raw:true})</code> is 32 bytes, <code>hash_md5</code> 16,
+<code>hash_sha1</code> 20, <code>hash_blake3</code> 32, and <code>hmac_sha256</code> 32 — which lets a MAC be
+compared with <code>constant_time_eq</code> without a hex round trip:</p>
+<pre><code class="language-mix">$mac = hmac_sha256($secret, $payload, {raw: true})
+if constant_time_eq($mac, base64_decode($header)) then
+  print("signature ok")
+end
+</code></pre>
+<p>Before 0.66.0 a second argument was <strong>silently ignored</strong>:
+<code>hash_sha256("abc", {raw:true})</code> returned the hex string and said nothing. That
+is fixed, and so is the class of bug behind it — an unknown option key or a
+non-map option now raises <code>OPTION_INVALID</code> rather than being discarded.</p>
+<p><code>raw</code> is a <strong>strict</strong> boolean, unlike <code>bytes_to_string</code>'s <code>lossy</code>, which accepts
+any truthy value. The difference is deliberate: <code>raw</code> selects the <em>return type</em>,
+so <code>{raw: "false"}</code> — a string that a config file or an argument might easily
+produce — would hand back bytes and fail somewhere far from the cause.
+<code>{raw: "false"}</code> raises; only <code>true</code> and <code>false</code> are accepted.</p>
+<h3 id="-md5-and-sha-1-are-broken--legacy-interop-only">⚠ MD5 and SHA-1 are broken — legacy interop only</h3>
+<p><code>hash_md5</code> and <code>hash_sha1</code> exist to talk to formats and tools that already chose
+those algorithms: <code>Content-MD5</code> headers, mail dedup keys, git object ids, older
+ETags and vendor APIs, and checksums you need to compare against an existing
+<code>md5sum</code>/<code>sha1sum</code> output. Mix computes them so a script does not have to fork
+coreutils, not because they are fit for anything new.</p>
+<p><strong>They must never carry a security decision.</strong> MD5 has had practical collisions
+since 2004 and SHA-1 since 2017 (SHAttered), so neither can establish that two
+inputs are the same, that a document is unmodified by an adversary, or that a
+signature is valid. For anything of that kind use <code>hash_sha256</code> or <code>hash_blake3</code>,
+and for authentication <code>hmac_sha256</code> with <code>constant_time_eq</code>. Note that Mix
+classifies both as capability-<code>Pure</code> — that means "touches no host authority",
+which is not the same as "safe"; the sandbox has no opinion about your choice of
+hash.</p>
+<p>The digests are the standard ones and interoperate exactly:</p>
+<pre><code>$ printf 'The quick brown fox jumps over the lazy dog' &gt; /tmp/fox
+$ mix -c 'print(hash_md5(read_file("/tmp/fox")))'
+9e107d9d372bb6826bd81d3542a419d6
+$ md5sum /tmp/fox
+9e107d9d372bb6826bd81d3542a419d6  /tmp/fox
+</code></pre>
+<p><code>hash_file</code> streams with a fixed 64 KiB working set whatever the file's size, so
+it is the right call for anything large — <code>hash_sha256(read_file_bytes($p))</code>
+holds the whole file in memory to compute the same answer.</p>
+<p><code>uuid()</code> is a fresh random v4 each call:</p>
+<pre><code class="language-mix">print(uuid())
+</code></pre>
+<pre><code class="language-text">0a5fcc5b-ad60-4e8e-9e61-b52f14a067e7
+</code></pre>
+<p><code>random_password([len])</code> generates an alphanumeric password from OS entropy
+(<code>OsRng</code>), defaulting to length 16. It <strong>guarantees</strong> at least one upper, one
+lower, and one digit, and excludes the confusable <code>O</code>/<code>o</code>. <code>len</code> must be an
+integer in <code>3..=1024</code>; out of range raises.</p>
+<pre><code class="language-mix">print(random_password())
+print(length(random_password()))
+print(random_password(8))
+</code></pre>
+<pre><code class="language-text">qALPecswZfH3YkP0
+16
+ZDv4WBFl
+</code></pre>
+<p><code>hash_sha256</code> / <code>hash_blake3</code> return the lowercase hex digest of the input
+(string or bytes buffer):</p>
+<pre><code class="language-mix">print(hash_sha256("hello"))
+print(hash_blake3("hello"))
+</code></pre>
+<pre><code class="language-text">2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f
+</code></pre>
+<p><code>hmac_sha256(key, msg)</code> is the keyed twin (RFC 2104): the hex HMAC-SHA256 of
+<code>msg</code> under <code>key</code> (both accept string/bytes/buffer). Its everyday job is
+verifying webhook signatures — e.g. Stripe's <code>Stripe-Signature</code> <code>v1</code> value is
+<code>hmac_sha256(endpoint_secret, timestamp .. "." .. payload)</code>:</p>
+<pre><code class="language-mix">print(hmac_sha256("Jefe", "what do ya want for nothing?"))
+</code></pre>
+<pre><code class="language-text">5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+</code></pre>
+<p>Compare a computed MAC against a received signature with
+<code>constant_time_eq(a, b)</code>, never <code>==</code> — plain equality short-circuits on the
+first differing byte, a timing oracle. <code>constant_time_eq</code> scans the full
+length unconditionally (a length mismatch returns false immediately; MAC
+lengths are public):</p>
+<pre><code class="language-mix">print(constant_time_eq(hmac_sha256("Jefe", "payload"), hmac_sha256("Jefe", "payload")))
+print(constant_time_eq("deadbeef", "deadbee5"))
+</code></pre>
+<pre><code class="language-text">true
+false
+</code></pre>
+<p><code>hash_file(path[, algo])</code> hashes a <strong>file</strong> the same way, but reads it as a
+64 KiB-chunked stream — so a multi-hundred-MB artifact (a release image, a
+rootfs tarball) is digested with bounded memory instead of
+<code>hash_sha256(read_file(path))</code> slurping the whole file into a string (which
+also rejects non-UTF-8). <code>algo</code> defaults to <code>"sha256"</code>; <code>"blake3"</code>, <code>"md5"</code> and
+<code>"sha1"</code> are the others (the last two added in v0.66.0 — read the warning
+above before reaching for either). It takes the same trailing <code>{raw: true}</code>
+as the in-memory family. The sha256 output is byte-identical to <code>hash_sha256</code> over the
+same bytes, so it verifies against any <code>sha256sum</code>. Capability: <strong>FsRead</strong> (it
+opens a path). This is the factory's "name every release artifact + its
+digest, then sign the manifest" primitive.</p>
+<pre><code class="language-mix">print(hash_file("/srv/cosmix-factory/releases/2026-07-06-001/rootfs.tar.gz"))
+print(hash_file("./image.raw", "blake3"))
+</code></pre>
+<p><code>base64_encode</code> accepts a string <strong>or</strong> a <code>Value::Bytes</code> buffer (it encodes the
+raw bytes, not a placeholder). <code>base64_decode</code> returns <strong>raw bytes</strong> — since
+v0.64.0 those can be indexed, sliced, iterated and searched directly (see
+<a href="/mix/io#bytes-as-a-sequence-v0640">io</a>), or wrap in
+<code>bytes_to_string</code> (strict UTF-8; pass <code>{lossy:true}</code> to tolerate non-UTF-8) to
+read it back as text. The pair round-trips:</p>
+<pre><code class="language-mix">$enc = base64_encode("hello mix")
+print($enc)
+print(bytes_to_string(base64_decode($enc)))
+</code></pre>
+<pre><code class="language-text">aGVsbG8gbWl4
+hello mix
+</code></pre>
+<p>These (and <code>base64_*</code>, <code>uuid</code>) are behind the <code>crypto</code> feature, which the <code>mix</code>
+binary always enables.</p>
+<h2 id="udp-datagrams--udp_send-udp_recv-v0710">UDP datagrams — <code>udp_send</code>, <code>udp_recv</code> (v0.71.0)</h2>
+<pre><code>udp_send(host, port, payload)   -&gt; bytes sent; payload string/bytes/buffer, verbatim
+udp_recv(port[, opts])          -&gt; {bytes, text, from_host, from_port} | nil on timeout
+                                   opts: timeout (secs, default 30, 0 = forever),
+                                         host (bind addr, default "0.0.0.0"),
+                                         max  (read cap, default 65535)
+</code></pre>
+<p>One datagram in, one out — deliberately <strong>not</strong> a socket API: there is no
+handle to hold, leak, or close. Before these, a unicast SSDP NOTIFY meant
+<code>run_argv(["nc", "-u", …], {stdin: $pkt})</code>. <code>udp_send</code> resolves the host and
+reports the byte count the kernel accepted (UDP being UDP, that is <em>sent</em>,
+never <em>delivered</em>). <code>udp_recv</code> binds, waits for <strong>one</strong> datagram, and
+returns <code>nil</code> on timeout — an ordinary answer for a datagram wait, not an
+error. <code>text</code> is the payload decoded as UTF-8 or <code>nil</code>; <code>bytes</code> always
+carries the truth. A datagram longer than <code>max</code> is truncated to it —
+<code>recvfrom(2)</code>'s own contract — and the default <code>max</code> of 65535 can never
+truncate, because no UDP payload exceeds it.</p>
+<pre><code class="language-mix">$notify = "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\r\n"
+udp_send("192.168.1.20", 1900, $notify)     -- unicast SSDP to the TV
+
+$got = udp_recv(9999, {timeout: 5})
+if $got != nil then
+  print("from " .. $got["from_host"] .. ": " .. ($got["text"] or "&lt;binary&gt;"))
+end
+</code></pre>
+<h2 id="websocket-client--ws_connect-ws_send-ws_recv-ws_close-v0740">WebSocket client — <code>ws_connect</code>, <code>ws_send</code>, <code>ws_recv</code>, <code>ws_close</code> (v0.74.0)</h2>
+<pre><code>ws_connect(url[, opts])   -&gt; numeric handle; opts: insecure (skip TLS verify),
+                             headers (map), timeout (secs, default 30, connect+handshake)
+ws_send(h, payload)       -&gt; nil; string -&gt; text frame, bytes/buffer -&gt; binary
+ws_recv(h[, timeout])     -&gt; string | bytes | nil on timeout (default 30, 0 = forever)
+ws_close(h)               -&gt; true when live, false when unknown (never raises for that)
+</code></pre>
+<p>A synchronous client with <strong>recv-driven control flow</strong> — the shape every
+stateful request/response protocol needs: send <code>register</code>, wait for the
+<code>registered</code> frame, then issue requests and parse each response (an
+<code>alertId</code> echoed back in a <code>closeAlert</code>, a pairing prompt to wait out).
+A blind <code>(cat msgs; sleep) | websocat</code> pipeline only handles
+fire-and-forget; this is the difference that turned the LG SSAP TV driver
+from a bash FIFO coprocess into a plain Mix loop. Home-Assistant-style
+device control and Grafana live are the same shape.</p>
+<p>The contracts worth knowing:</p>
+<ul>
+<li><strong><code>insecure: true</code></strong> skips TLS certificate verification — for the
+self-signed device endpoint (<code>wss://tv:3001/</code>), never for services with
+real certificates.</li>
+<li><strong><code>ws_recv</code> returns <code>nil</code> on timeout</strong> — an ordinary answer; poll
+again. Ping/pong never surface (answered internally). A <strong>peer close
+RAISES</strong> (catchable) and retires the handle: "no more frames, ever"
+must not be confusable with "no frame yet".</li>
+<li>A closed/raised handle is <strong>retired</strong> — further calls say
+<code>unknown ws handle</code> rather than repeating the close error.</li>
+<li>Handles are process-global numbers (the <code>sqlopen</code> pattern); the kernel
+reaps the sockets at exit, <code>ws_close</code> is the tidy path. One user per
+handle: a handle is checked out of the registry for the duration of a
+call, so a concurrent call on the SAME handle answers <code>unknown ws handle</code> rather than queueing.</li>
+<li><code>ws_send</code> writes under the connect timeout: a very large frame on a
+slow link can raise mid-flush with bytes still buffered — the next send
+on that handle continues the partial frame (no framing corruption).</li>
+</ul>
+<pre><code class="language-mix">$h = ws_connect("wss://192.0.2.20:3001/", {insecure: true})
+ws_send($h, json_encode({type: "register", payload: $manifest}))
+loop
+  $frame = ws_recv($h, 5)
+  if $frame == nil then continue end          -- quiet: keep waiting
+  $msg = json_parse($frame)
+  if $msg["type"] == "registered" then break end
+end
+ws_send($h, json_encode({type: "request", uri: "ssap://api/getServiceList"}))
+print(ws_recv($h, 10))
+ws_close($h)
+</code></pre>
+<h2 id="raw-tcp-client--tcp_connect-tcp_send-tcp_recv-tcp_recv_line-tcp_close-v0780">Raw TCP client — <code>tcp_connect</code>, <code>tcp_send</code>, <code>tcp_recv</code>, <code>tcp_recv_line</code>, <code>tcp_close</code> (v0.78.0)</h2>
+<pre><code>tcp_connect(host, port[, {timeout, tls, insecure}]) -&gt; handle
+tcp_send(h, payload)                    -&gt; bytes sent (string/bytes/buffer)
+tcp_recv(h[, {timeout, max}])           -&gt; bytes | nil on timeout
+tcp_recv_line(h[, {timeout, max}])      -&gt; string (LF+CR stripped) | nil
+tcp_close(h)                            -&gt; bool
+</code></pre>
+<p>The stream-socket primitive for a line-or-binary protocol that UDP, WS
+and HTTP don't cover — an SMTP/IMAP probe, a redis <code>PING</code>, memcached
+stats, a banner grab. <code>tls: true</code> wraps the connection (ring-pinned
+rustls, webpki roots); <code>insecure: true</code> skips certificate verification
+for a self-signed endpoint. Handles are process-global numbers like
+<code>sqlopen</code>/<code>ws_*</code>, one user per handle, reaped by the kernel on drop.</p>
+<p><code>tcp_recv</code> returns whatever bytes are available (up to <code>max</code>, buffered
+bytes first) — <strong>bytes, not a string</strong>, because a stream has no message
+boundary; <code>nil</code> on timeout is an ordinary answer (poll again), and a peer
+<strong>close RAISES</strong> and retires the handle. <code>tcp_recv_line</code> is the
+line-protocol form: it buffers across reads and returns one line with its
+<code>\n</code> (and a trailing <code>\r</code>) stripped, so a caller speaking SMTP or redis
+never hand-rolls a <code>\r\n</code> scanner over accumulated bytes. <code>max</code> caps the
+line length (refused past it, so a peer that never sends a newline can't
+grow the buffer without bound).</p>
+<pre><code class="language-mix">$h = tcp_connect("mx.example.com", 25, {timeout: 10})
+print(tcp_recv_line($h, {timeout: 10}))          -- 220 banner
+tcp_send($h, "EHLO probe.local\r\n")
+loop
+  $line = tcp_recv_line($h, {timeout: 5})
+  if $line == nil then break end
+  print($line)
+  if not starts_with($line, "250-") then break end -- 250&lt;space&gt; = last line
+end
+tcp_close($h)
+</code></pre>
+<p>Same inline-blocking caveat as the others (below): a pending <code>tcp_recv</code>
+holds the evaluator's thread, so <code>{timeout: 0}</code> in a <code>--serve</code> citizen
+can wedge the pump.</p>
+<p>Both UDP builtins above, all four <code>ws_*</code>, and the five <code>tcp_*</code> are <strong>Network</strong>-class (below), like <code>http_*</code> and <code>dns_lookup</code> —
+and like those, the wait happens inline on the evaluator's thread. In a
+<code>--serve</code> citizen that means a pending <code>udp_recv</code> blocks the whole event pump
+for its duration; <strong>never</strong> pass <code>{timeout: 0}</code> there — unlike an HTTP call,
+where the wait rides an in-flight request, a datagram wait with no sender is
+unbounded and nothing can interrupt it.</p>
+<h2 id="capability-classes">Capability classes</h2>
+<p>Each system builtin carries a <a href="/mix/capabilities">capability class</a> used by the
+<a href="/mix/bus"><code>--serve</code></a> sandbox's <code>check_capability</code> gate: <code>env</code> / <code>pid</code> /
+<code>hostname</code> / <code>cwd</code> / <code>platform</code> / <code>which</code> are <strong>Env</strong> (read-only inspection);
+<code>run</code> / <code>run_rc</code> / <code>run_stream</code> / <code>spawn</code> / <code>kill</code> / <code>process_alive</code> / <code>chdir</code> /
+<code>exit</code> (and <code>panic</code> — see <a href="/mix/errors">errors</a>) are <strong>Process</strong> (they touch the
+OS process table or filesystem CWD); <code>shell_quote</code> / <code>sql_quote</code> / <code>sanitize</code> /
+<code>random_password</code> / <code>uuid</code> / hashes / <code>base64_*</code> are <strong>Pure</strong>. An embedding
+daemon can deny the Process class to run untrusted Mix without it spawning
+subprocesses.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — concat, interpolation, the byte/codepoint/grapheme split</li>
+<li><a href="/mix/errors">errors</a> — <code>try</code>/<code>catch</code>, the <code>die</code> raised by <code>run</code>, <code>panic</code></li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>send</code> / <code>emit</code> / <code>on … end</code>; prefer mesh IPC over shelling out</li>
+<li><a href="/mix/remote">ssh</a> — <code>ssh_run</code> / <code>ssh_must</code> / <code>ssh_mix</code> for remote commands</li>
+<li><a href="/mix/shell-mode">shell mode</a> — the dispatch layer: chains, pipes, redirects, brace expansion</li>
+<li><a href="/mix/capabilities">capabilities</a> — the <code>--serve</code> sandbox classes in full</li>
+<li><a href="/mix/builtins">builtins index</a> — <code>getopt</code>, <code>read_file</code>, <code>stat</code>, <code>chmod</code>, the full set</li>
+</ul>
+<pre><code>mix builtins system   list every system builtin with its one-line description
+mix what NAME         one-line description of a single builtin (e.g. mix what run_rc)
+mix help              the full categorized builtin reference
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +1733,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1787,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1916,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

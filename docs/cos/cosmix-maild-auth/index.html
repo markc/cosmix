@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild-auth/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,145 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild-auth/README.md"><div class="prose"><h1 id="cosmix-maild-auth">cosmix-maild-auth</h1>
+<p><code>cosmix-maild-auth</code> provides the mail-authentication library used by <code>cosmix-maild</code>: inbound SPF, DKIM, DMARC, ARC, and iprev verification; outbound DKIM signing; DKIM key generation; DNS resolver construction; and structured authentication results. It lives in the <code>cos</code> repository at the downstream end of the <code>bus &lt;- mix &lt;- cos</code> dependency chain. The default build does not depend on <code>mix</code> or <code>bus</code>; the optional <code>cosmix</code> feature adds direct dependencies on two <code>bus</code> crates.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The Cargo package is named <code>cosmix-maild-auth</code>. Rust code imports it as <code>cosmix_maild_auth</code>.</p>
+<pre><code class="language-rust">use cosmix_maild_auth::keygen::generate;
+use cosmix_maild_auth::KeySpec;
+
+let material = generate(KeySpec::Ed25519)?;
+</code></pre>
+<p>This crate is a library. It does not install a binary, define command-line subcommands, register Bus verbs, or parse a standalone configuration file.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<h3 id="inbound-verification">Inbound verification</h3>
+<p>The <code>Verifier</code> trait defines two asynchronous operations:</p>
+<ul>
+<li><code>verify</code> runs iprev, DKIM, SPF, DMARC, and ARC checks for a raw RFC 5322 message.</li>
+<li><code>verify_spf_only</code> runs a pre-DATA SPF check from the peer address, envelope sender, and HELO identity.</li>
+</ul>
+<p><code>MailAuthVerifier</code> is the concrete implementation. Construct it with a shared <code>DnsResolver</code> and a <code>VerifierConfig</code>.</p>
+<p>The full verification path runs serially. It:</p>
+<ol>
+<li>Builds an internal message copy without prior <code>Authentication-Results</code> fields which claim the configured host identity.</li>
+<li>Checks iprev for the peer address.</li>
+<li>Parses the message for DKIM, ARC, and author-domain data.</li>
+<li>Checks DKIM signatures.</li>
+<li>Checks SPF, using HELO when the envelope sender is empty.</li>
+<li>Checks DMARC from the DKIM and SPF outputs.</li>
+<li>Validates the ARC chain.</li>
+<li>Returns structured results and a rendered <code>Authentication-Results</code> field.</li>
+</ol>
+<p><code>VerifyResult</code> contains <code>SpfCheck</code>, <code>IprevResult</code>, <code>DkimAggregate</code>, <code>DmarcResult</code>, <code>ArcResult</code>, and <code>AuthResultsHeader</code>. The header value retains both the wire-format string and structured fields so callers do not need to parse the rendered field again.</p>
+<p>An SPF timeout becomes <code>SpfResult::TempError</code>. iprev, DKIM, DMARC, and ARC timeouts currently return <code>Error::DnsTimeout</code>.</p>
+<h3 id="outbound-signing">Outbound signing</h3>
+<p>The <code>Signer</code> trait defines:</p>
+<ul>
+<li><code>sign_dkim</code>, which signs a mutable message buffer and prepends a <code>DKIM-Signature</code> field.</li>
+<li><code>seal_arc</code>, which reserves the ARC-sealing operation.</li>
+</ul>
+<p><code>MailAuthSigner::new</code> groups <code>DkimSignerConfig</code> values by domain. <code>lookup_active</code> selects an active signer for the exact author domain or walks towards its parent labels until it finds one.</p>
+<p>DKIM signing supports:</p>
+<ul>
+<li>RSA-SHA256 keys in PKCS#1 or PKCS#8 PEM form.</li>
+<li>Ed25519-SHA256 keys in PKCS#8 PEM form.</li>
+<li>Simple or relaxed header and body canonicalisation.</li>
+<li>Explicit header selection.</li>
+<li>Header oversigning through <code>HeaderSpec::Oversign</code>.</li>
+<li>Optional DKIM <code>l=</code> body-length tags.</li>
+<li>Multiple loaded selectors per domain, with <code>active_for_signing</code> selecting the signing key.</li>
+</ul>
+<p><code>default_signed_headers</code> returns the crate's conventional header set. It oversigns <code>From</code> and includes common message and <code>List-*</code> fields.</p>
+<p><code>MailAuthSigner::validate_pem</code> checks that PEM data matches the selected algorithm. <code>detect_algorithm</code> recognises RSA PKCS#1, RSA PKCS#8, and Ed25519 PKCS#8 private keys.</p>
+<p><code>DkimSignerConfig</code> uses a custom <code>Debug</code> implementation which reports the private-key byte count without printing the key bytes.</p>
+<h3 id="key-generation">Key generation</h3>
+<p><code>keygen::generate</code> accepts a <code>KeySpec</code> and returns <code>DkimKeyMaterial</code>.</p>
+<p><code>KeySpec</code> supports:</p>
+<ul>
+<li><code>Rsa { bits }</code>; values below 1024 bits are rejected.</li>
+<li><code>Ed25519</code>.</li>
+</ul>
+<p><code>DkimKeyMaterial</code> contains the selected <code>DkimAlgorithm</code>, private PEM, raw public-key base64, and a complete DKIM DNS TXT value. RSA output uses PKCS#1 PEM. Ed25519 output uses PKCS#8 PEM.</p>
+<p>The generated TXT value does not add the DKIM <code>t=s</code> flag.</p>
+<h3 id="dns-resolution">DNS resolution</h3>
+<p><code>DnsResolver</code> owns the <code>mail_auth::MessageAuthenticator</code> and its resolver. <code>ResolverChoice</code> selects:</p>
+<table><thead><tr><th>Choice</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>System</code></td><td>Reads the platform resolver configuration. This is the default.</td></tr>
+<tr><td><code>Cloudflare</code></td><td>Uses the resolver preset supplied by <code>mail-auth</code>.</td></tr>
+<tr><td><code>Custom(Vec&lt;IpAddr&gt;)</code></td><td>Adds each supplied address as a UDP resolver with TCP fallback on port 53.</td></tr>
+</tbody></table>
+<p><code>resolver::parse_choice</code> accepts <code>system</code>, <code>cloudflare</code>, or a non-empty comma-separated form such as <code>custom:192.0.2.53,192.0.2.54</code>. The <code>system</code> and <code>cloudflare</code> names are case-insensitive; the <code>custom:</code> prefix is lower-case.</p>
+<p>Resolver construction is fallible. Invalid custom addresses, an empty custom list, or failure to read the system resolver configuration returns the crate's <code>Error</code> type.</p>
+<h3 id="authentication-results-trimming">Authentication-Results trimming</h3>
+<p><code>ar_trim::trim_forged_authentication_results</code> removes every prior <code>Authentication-Results</code> field whose authserv-id matches the configured identity, ignoring ASCII case.</p>
+<p>The trimmer:</p>
+<ul>
+<li>Removes folded continuation lines with the matching field.</li>
+<li>Preserves fields for other authserv-ids.</li>
+<li>Preserves CRLF or LF line endings.</li>
+<li>Stops at the first header/body boundary.</li>
+<li>Leaves the message body byte-identical.</li>
+<li>Limits authserv-id inspection to 256 bytes.</li>
+</ul>
+<p>It returns the rebuilt message and the number of removed fields.</p>
+<h2 id="public-modules">Public modules</h2>
+<table><thead><tr><th>Module</th><th>Surface</th></tr></thead><tbody>
+<tr><td><code>ar_trim</code></td><td>Byte-level removal of forged local <code>Authentication-Results</code> fields.</td></tr>
+<tr><td><code>auth_results</code></td><td>Header rendering helper; see current limitations.</td></tr>
+<tr><td><code>error</code></td><td><code>Error</code> and the crate-wide <code>Result&lt;T&gt;</code> alias.</td></tr>
+<tr><td><code>keygen</code></td><td><code>KeySpec</code>, <code>DkimKeyMaterial</code>, and <code>generate</code>.</td></tr>
+<tr><td><code>mapping</code></td><td>Internal result mapping plus public <code>naive_org_domain</code>.</td></tr>
+<tr><td><code>resolver</code></td><td><code>ResolverChoice</code>, <code>parse_choice</code>, and <code>DnsResolver</code>.</td></tr>
+<tr><td><code>signer</code></td><td><code>Signer</code>, <code>MailAuthSigner</code>, and <code>detect_algorithm</code>.</td></tr>
+<tr><td><code>types</code></td><td>Configuration, result, policy, algorithm, and header-selection types.</td></tr>
+<tr><td><code>verifier</code></td><td><code>Verifier</code> and <code>MailAuthVerifier</code>.</td></tr>
+</tbody></table>
+<p>The crate root re-exports <code>Error</code>, <code>Result</code>, key-material types, signer and verifier traits and implementations, <code>detect_algorithm</code>, and every public item from <code>types</code>.</p>
+<h2 id="verifier-configuration">Verifier configuration</h2>
+<p><code>VerifierConfig::default</code> supplies:</p>
+<table><thead><tr><th>Field group</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>host_identity</code></td><td><code>localhost</code></td></tr>
+<tr><td>SPF timeout</td><td>5 seconds</td></tr>
+<tr><td>DKIM timeout</td><td>10 seconds</td></tr>
+<tr><td>DMARC timeout</td><td>5 seconds</td></tr>
+<tr><td>ARC timeout</td><td>5 seconds</td></tr>
+<tr><td>iprev timeout</td><td>5 seconds</td></tr>
+<tr><td>All policy modes</td><td><code>PolicyMode::Advisory</code></td></tr>
+<tr><td>Maximum DKIM signatures</td><td>10</td></tr>
+<tr><td>Maximum ARC instances</td><td>50</td></tr>
+</tbody></table>
+<p><code>PolicyMode</code> has <code>Off</code>, <code>Advisory</code>, and <code>Enforce</code> variants. The current verifier stores these mode fields but does not branch on them.</p>
+<p>The DKIM signature limit is applied while mapping results. Excess outputs are omitted and <code>DkimAggregate::capped</code> is set.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<p>The default feature set is <code>core</code>.</p>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>core</code></td><td style="text-align: right">Yes</td><td>Empty marker feature for the standalone authentication surface.</td></tr>
+<tr><td><code>cosmix</code></td><td style="text-align: right">No</td><td>Enables optional <code>cosmix-lib-bus</code> and native <code>cosmix-lib-client</code> dependencies.</td></tr>
+</tbody></table>
+<p>The current source tree has no feature-gated modules or functions. Enabling <code>cosmix</code> changes the dependency graph only.</p>
+<h2 id="dependencies">Dependencies</h2>
+<table><thead><tr><th>Dependency</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>mail-auth</code></td><td>SPF, DKIM, DMARC, ARC, iprev, DNS integration, signing, and key generation.</td></tr>
+<tr><td><code>rustls-pki-types</code></td><td>PEM decoding and private-key representation.</td></tr>
+<tr><td><code>tokio</code></td><td>Per-check timeouts and asynchronous trait implementations.</td></tr>
+<tr><td><code>thiserror</code></td><td>The public error enum.</td></tr>
+<tr><td><code>serde</code>, <code>tracing</code></td><td>Declared workspace dependencies; the current crate source does not call them directly.</td></tr>
+<tr><td><code>cosmix-lib-bus</code>, <code>cosmix-lib-client</code></td><td>Optional dependencies enabled by <code>cosmix</code>.</td></tr>
+</tbody></table>
+<p><code>mail-auth</code> disables its default features and enables its <code>ring</code> and <code>generate</code> features.</p>
+<h2 id="errors">Errors</h2>
+<p><code>Error</code> distinguishes DNS timeout, DNS failure, signing-key load failure, malformed prior authentication results, missing domain signer, upstream library failure, and internal failure.</p>
+<p>Public operations use the crate-wide <code>Result&lt;T&gt;</code> alias.</p>
+<h2 id="current-limitations">Current limitations</h2>
+<ul>
+<li><code>Signer::seal_arc</code> is present but <code>MailAuthSigner</code> currently returns <code>Error::Internal</code>; ARC sealing is not implemented.</li>
+<li><code>auth_results::render</code> currently returns an empty string. Normal verification callers use <code>AuthResultsHeader::rendered</code>.</li>
+<li><code>VerifierConfig</code> policy modes do not currently change verification behaviour.</li>
+<li><code>max_arc_instances</code> is passed into result mapping but is not currently enforced.</li>
+<li><code>mapping::naive_org_domain</code> returns the rightmost two labels. It is not Public Suffix List aware and gives incorrect organisational domains for some multi-label public suffixes.</li>
+<li>Only SPF converts a timeout into a structured temporary result; other verification-stage timeouts stop the full operation with <code>Error::DnsTimeout</code>.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +757,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +811,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +940,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

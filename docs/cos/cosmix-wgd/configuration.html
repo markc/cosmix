@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-wgd/configuration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,97 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-wgd/configuration.md"><div class="prose"><h1 id="configuration-and-lifecycle">Configuration and lifecycle</h1>
+<p><code>cosmix-wgd</code> has no crate-specific configuration file. It resolves the local member from the node configuration and reads three trust-state files. Command-line flags override those inputs for controlled tests and one-shot inspection.</p>
+<h2 id="command-line">Command line</h2>
+<pre><code class="language-text">cosmix-wgd [--iface NAME] [--self NAME] [--interval SECONDS]
+           [--genesis PATH] [--signed PATH] [--baseline PATH]
+           [--once]
+</code></pre>
+<p>The parser accepts no positional arguments. An unknown argument or a missing flag value prints an error and returns status 2.</p>
+<p><code>--version</code> and <code>-V</code> print the package version and exit successfully.</p>
+<p>The binary does not implement a help flag.</p>
+<h2 id="local-identity">Local identity</h2>
+<p><code>--self NAME</code> selects the local inventory member explicitly.</p>
+<p>Without <code>--self</code>, the daemon loads the node configuration and uses its non-empty <code>node</code> value. Missing node configuration or an empty node value prevents startup.</p>
+<p>The selected name must identify an active member in the verified inventory. Otherwise derivation fails and no new snapshot is produced.</p>
+<h2 id="interface-selection">Interface selection</h2>
+<p><code>--iface NAME</code> selects the WireGuard interface explicitly.</p>
+<p>Without the override, the daemon derives the interface from the first DNS label of the verified mesh identity by using <code>cosmix-lib-wg</code>.</p>
+<p>An override:</p>
+<ul>
+<li>is 1 to 15 bytes long;</li>
+<li>contains only ASCII letters, digits, <code>.</code>, <code>-</code>, or <code>_</code>;</li>
+<li>is not <code>.</code> or <code>..</code>.</li>
+</ul>
+<p>The daemon passes the validated name to <code>wg</code> as one argument. It does not invoke a shell.</p>
+<p>Example:</p>
+<pre><code class="language-text">cosmix-wgd --self alpha --iface wg-example --once
+</code></pre>
+<h2 id="reconcile-interval">Reconcile interval</h2>
+<p><code>--interval SECONDS</code> changes the normal-mode reconcile cadence.</p>
+<p>The default is 30 seconds. Zero is accepted and normalised to one second. Non-integer values are argument errors.</p>
+<p>Each interval begins a new pass that re-reads all trust inputs. There is no separate reload operation.</p>
+<h2 id="trust-inputs">Trust inputs</h2>
+<table><thead><tr><th>Input</th><th>Default path</th><th>Content</th></tr></thead><tbody>
+<tr><td>Genesis anchor</td><td><code>/etc/cosmix/noded/genesis.pub</code></td><td>Bare base64 Ed25519 public key, with an optional trailing newline.</td></tr>
+<tr><td>Signed inventory</td><td><code>/var/lib/cosmix/noded/inventory.signed</code></td><td>JSON signed-inventory envelope containing <code>payload</code> and <code>signatures</code>.</td></tr>
+<tr><td>Rollback baseline</td><td><code>/var/lib/cosmix/noded/inventory.baseline</code></td><td>JSON object containing numeric <code>epoch</code> and optional <code>recovery_generation</code>.</td></tr>
+</tbody></table>
+<p>The override flags are <code>--genesis</code>, <code>--signed</code>, and <code>--baseline</code>.</p>
+<p>The genesis anchor must decode to exactly 32 bytes. The signed inventory must parse and verify against a trust state containing the active <code>genesis</code> key and the persisted rollback floor.</p>
+<p>The baseline is read-only:</p>
+<ul>
+<li>a missing baseline is treated as epoch zero and recovery generation zero;</li>
+<li>another read error fails closed;</li>
+<li>malformed JSON fails closed;</li>
+<li>a missing or non-numeric <code>epoch</code> fails closed;</li>
+<li>a missing <code>recovery_generation</code> is treated as zero.</li>
+</ul>
+<p><code>cosmix-wgd</code> never writes the baseline, signed inventory, or genesis anchor.</p>
+<p>Paths passed as overrides may point to test fixtures. Do not place private key material in these files; the genesis input is a public verification key.</p>
+<h2 id="one-shot-mode">One-shot mode</h2>
+<p><code>--once</code>:</p>
+<ol>
+<li>verifies the trust inputs;</li>
+<li>derives the intended peer set;</li>
+<li>attempts one live WireGuard read;</li>
+<li>stores one snapshot;</li>
+<li>prints an interface, mesh, epoch, self, intended-peer, and live-state summary;</li>
+<li>exits without connecting to the Bus broker.</li>
+</ol>
+<p>Trust or derivation failure returns failure. Live-read failure remains part of a valid derived snapshot, so the command prints <code>live UNAVAILABLE</code> and exits successfully.</p>
+<p>Example with isolated trust fixtures:</p>
+<pre><code class="language-text">cosmix-wgd \
+  --once \
+  --self alpha \
+  --iface wg-example \
+  --genesis ./fixtures/genesis.pub \
+  --signed ./fixtures/inventory.signed \
+  --baseline ./fixtures/inventory.baseline
+</code></pre>
+<h2 id="normal-mode">Normal mode</h2>
+<p>Normal mode starts two independent tasks:</p>
+<ul>
+<li>a periodic reconcile loop;</li>
+<li>a Bus registration and command loop.</li>
+</ul>
+<p>Reconcile failure is logged and retried. The latest good snapshot continues to serve.</p>
+<p>Bus connection failure is retried with exponential backoff. Reconciliation continues while the broker is unavailable.</p>
+<h2 id="signals">Signals</h2>
+<table><thead><tr><th>Signal</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>SIGINT</code></td><td>Abort both tasks and exit successfully.</td></tr>
+<tr><td><code>SIGTERM</code></td><td>Abort both tasks and exit successfully.</td></tr>
+<tr><td><code>SIGHUP</code></td><td>Log an advisory message. The periodic loop already re-reads inputs, so no explicit reload occurs.</td></tr>
+</tbody></table>
+<h2 id="live-wireguard-requirement">Live WireGuard requirement</h2>
+<p>The live reader executes:</p>
+<pre><code class="language-text">wg show IFACE dump
+</code></pre>
+<p><code>wg</code> must be available on <code>PATH</code>. A spawn failure, non-zero exit, non-UTF-8 output, or dump parse error marks live state unavailable without stopping the daemon.</p>
+<p>The daemon reads only. It does not call a WireGuard set operation or mutate the kernel.</p>
+<p><a href="/cos/cosmix-wgd/">Back to cosmix-wgd</a></p></div></div>
     </div>
 
 </main>
@@ -620,6 +709,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +763,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +892,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-noded/verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,111 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-noded/verbs.md"><div class="prose"><h1 id="cosmix-noded-bus-verbs">cosmix-noded Bus verbs</h1>
+<p>This page describes the Bus commands implemented by <code>cosmix-noded</code> and its built-in <code>mon</code> and <code>log</code> services.</p>
+<h2 id="conventions">Conventions</h2>
+<p>Successful commands return <code>rc: 0</code>. Invalid arguments, denied operations, unknown commands, and unavailable data normally return <code>rc: 10</code>.</p>
+<p>Arguments named as headers below are Bus headers. Commands that accept property or specification arguments also accept a JSON object in the <code>args</code> header or message body; the <code>args</code> header takes precedence.</p>
+<h2 id="node-service">Node service</h2>
+<h3 id="nodedregister"><code>noded.register</code></h3>
+<p>Registers the current WebSocket connection under the Bus <code>from</code> header. The name must not already belong to another connection.</p>
+<p>The optional JSON body is registration provenance. Recognised provenance is stored in the service registry and returned by <code>noded.list</code>. An empty or malformed body still permits name-only registration.</p>
+<p>The result contains the registered name.</p>
+<h3 id="nodedderegister"><code>noded.deregister</code></h3>
+<p>Removes the service name held by the current connection and removes that connection's subscriptions. The operation is idempotent and cannot deregister another connection.</p>
+<h3 id="nodedlist"><code>noded.list</code></h3>
+<p>Returns a name-sorted JSON array of registered service information. Entries can include binary name, version, source revision, dirty state, build time, process identifier, start time, registration time, schema version, and metadata when supplied at registration.</p>
+<h3 id="nodedinfo"><code>noded.info</code></h3>
+<p>Returns live node information: node name, broker address, the broker's build provenance, uptime, registered service count, and schema version.</p>
+<h3 id="nodedping"><code>noded.ping</code></h3>
+<p>Returns <code>pong: true</code> and advertises the core and topic extension versions.</p>
+<h3 id="nodedpeers"><code>noded.peers</code></h3>
+<p>Returns the local node's broker address information and the configured mesh peer roster. Each peer entry contains a name, mesh address, and broker port.</p>
+<p>This is the routing roster. It is distinct from the signed authority inventory.</p>
+<h3 id="nodedinventory"><code>noded.inventory</code></h3>
+<p>Returns the current authority posture.</p>
+<p>A verified result includes the inventory epoch, recovery generation, recovery flag, mesh identifier, content hash, verifying key identifiers, adopted verify-key summaries, and member summaries.</p>
+<p>An unverified result contains <code>posture: "unverified"</code> and a reason.</p>
+<h3 id="nodedtap"><code>noded.tap</code></h3>
+<p>Subscribes the connection to a live copy of every inter-service Bus message routed by this broker.</p>
+<p>The command is restricted to same-node connections. It exposes message headers and bodies and therefore bypasses per-service read controls. Delivery is lossy when the tap consumer's outbound queue is full.</p>
+<h3 id="nodedpropsget"><code>noded.props.get</code></h3>
+<p>Reads the complete broker property snapshot or a selected property path.</p>
+<h3 id="nodedpropslist"><code>noded.props.list</code></h3>
+<p>Lists broker property paths.</p>
+<h3 id="nodedpropsdescribe"><code>noded.props.describe</code></h3>
+<p>Describes a broker property path, including its type and metadata.</p>
+<p>The broker always redacts sensitive values on this surface.</p>
+<h3 id="propswatch"><code>props.watch</code></h3>
+<p>Subscribes the caller to <code>noded.props.changed</code>. The response includes a subscription identifier, topic name, replay flag, and sequence number.</p>
+<h3 id="nodedpropssubscribe_grant"><code>noded.props.subscribe_grant</code></h3>
+<p>Subscribes another registered peer to a reserved property records or audit topic, filtered to one namespace.</p>
+<p>Required headers are <code>topic</code>, <code>target_peer</code>, and <code>namespace</code>. Only the registered owner of the reserved topic may grant the subscription. The target must be a connected, registered peer. Wildcard namespaces are not accepted.</p>
+<p>This is a privileged substrate verb used after a property service performs its own capability check.</p>
+<h2 id="topic-service">Topic service</h2>
+<h3 id="topicpublish"><code>topic.publish</code></h3>
+<p>Publishes an inner Bus message to the topic named by the required <code>name</code> header.</p>
+<p>The optional <code>retain</code> header defaults to <code>true</code>. A retained message replaces the topic's cached snapshot. <code>retain: false</code> delivers the message without replacing that snapshot.</p>
+<p>The inner Bus message is limited to 1 MiB and must parse successfully. Names beginning with <code>$</code> are rejected. The result contains the allocated per-topic sequence and delivered subscriber count.</p>
+<p>The broker overwrites the reserved delivery headers <code>topic</code>, <code>topic_seq</code>, <code>topic_stale</code>, and <code>topic_op</code>.</p>
+<h3 id="topicsubscribe"><code>topic.subscribe</code></h3>
+<p>Subscribes the current peer to the topic named by the required <code>name</code> header. Repeating the same subscription is idempotent.</p>
+<p>The result contains a subscription identifier, whether a retained snapshot was replayed, and its sequence number. A stale retained snapshot is marked with <code>topic_stale: true</code>.</p>
+<p>Direct subscription to <code>&lt;service&gt;.props.records.changed</code> and <code>&lt;service&gt;.props.audit</code> is refused. Callers reach those topics through the owning service's property watch verbs.</p>
+<h3 id="topicunsubscribe"><code>topic.unsubscribe</code></h3>
+<p>Removes the current peer's subscriptions for the topic named by the required <code>name</code> header. The operation is idempotent.</p>
+<h3 id="topicsubscriber_count"><code>topic.subscriber_count</code></h3>
+<p>Returns the subscriber count for the topic named by the required <code>name</code> header.</p>
+<p>For a reserved property records or audit topic, only the registered owning service may read the count.</p>
+<h3 id="topiclist"><code>topic.list</code></h3>
+<p>Returns topic metadata, optionally filtered by the <code>prefix</code> header.</p>
+<p>Each item includes <code>name</code>, <code>subscribers</code>, <code>has_snapshot</code>, <code>snapshot_seq</code>, <code>snapshot_size</code>, <code>last_publisher</code>, and <code>stale</code>. Reserved property records and audit topics are hidden from non-owners.</p>
+<h3 id="topicclear"><code>topic.clear</code></h3>
+<p>Clears the retained snapshot for the topic named by the required <code>name</code> header.</p>
+<p>The optional <code>notify</code> header defaults to <code>true</code>. When enabled, current subscribers receive a clear operation. The result reports the delivered count.</p>
+<p>Only the owning service may clear a reserved property records or audit topic.</p>
+<h3 id="publisher-notifications">Publisher notifications</h3>
+<p>The broker sends <code>topic.active</code> to the last publisher when a topic changes from zero subscribers to one. It sends <code>topic.idle</code> when the count returns to zero. These are pushed notifications, not caller-facing RPC verbs.</p>
+<h2 id="monitor-service">Monitor service</h2>
+<p>The <code>mon</code> service is absent when the daemon starts with <code>--no-monitor</code>.</p>
+<h3 id="monstatus"><code>mon.status</code></h3>
+<p>Returns host name, system uptime, logical CPU count and usage, memory and swap totals and usage, selected disk usage, and one-, five-, and fifteen-minute load averages.</p>
+<p>Disk reporting includes <code>/</code> and mount points below <code>/home</code> or <code>/data</code>.</p>
+<h3 id="monprocesses"><code>mon.processes</code></h3>
+<p>Returns processes sorted by descending CPU usage. Each entry contains process identifier, name, CPU usage, and memory usage in MiB.</p>
+<p>The optional JSON argument <code>limit</code> controls the maximum number of entries. The default is 15.</p>
+<h3 id="monpropsget"><code>mon.props.get</code></h3>
+<p>Reads the complete monitor property snapshot or a selected path.</p>
+<h3 id="monpropslist"><code>mon.props.list</code></h3>
+<p>Lists monitor property paths.</p>
+<h3 id="monpropsdescribe"><code>mon.props.describe</code></h3>
+<p>Describes a monitor property path.</p>
+<p>The monitor property surface includes lifecycle state, system CPU and memory metrics, load averages, disk summaries, and <code>config.top_processes_default_limit</code>.</p>
+<h2 id="logger-service">Logger service</h2>
+<p>The <code>log</code> service is absent when the daemon starts with <code>--no-log</code>.</p>
+<h3 id="logpropsget"><code>log.props.get</code></h3>
+<p>Reads the complete logger property snapshot or a selected path.</p>
+<h3 id="logpropslist"><code>log.props.list</code></h3>
+<p>Lists logger property paths.</p>
+<h3 id="logpropsdescribe"><code>log.props.describe</code></h3>
+<p>Describes a logger property path.</p>
+<p>The logger property surface includes its output path, lifecycle state, tap subscription state, observed event count, and bytes written.</p>
+<h2 id="specification-service">Specification service</h2>
+<h3 id="specget"><code>spec.get</code></h3>
+<p>Reads a specification chapter from the configured specification directory.</p>
+<p>Pass either <code>chapter</code> or <code>name</code> in the JSON arguments. <code>chapter</code> accepts a non-negative number or numeric string. <code>name</code> is a single filename with an optional <code>.md</code> suffix; path separators, absolute paths, empty names, and parent references are rejected.</p>
+<p>Scalar frontmatter fields are copied to response headers. The Markdown prose is returned as the body. Missing configuration, invalid arguments, read errors, and unknown chapters return <code>rc: 10</code>.</p>
+<h2 id="ui-subscription-records">UI subscription records</h2>
+<h3 id="uisubscribe"><code>ui.subscribe</code></h3>
+<p>Registers a UI event filter from <code>source: VALUE</code> and optional <code>action: VALUE</code> lines in the message body.</p>
+<p>The command returns <code>rc: 5</code> and <code>registered_but_not_routed</code>. The subscription is stored, but UI event delivery is not implemented.</p>
+<h3 id="uiunsubscribe"><code>ui.unsubscribe</code></h3>
+<p>Removes the matching UI event filter. <code>source</code> is required and <code>action</code> is optional.</p>
+<h2 id="admission-frames">Admission frames</h2>
+<p>When admission mode is not <code>off</code>, the broker sends <code>noded.admit.challenge</code> as the first Bus frame on a new connection. A capable peer replies with <code>noded.admit.response</code> using the same correlation identifier.</p>
+<p>The broker reconstructs and verifies the signed transcript against its current verified inventory. Observe mode records the result without denying registration. Enforce mode uses the proof result when an inter-node connection attempts <code>noded.register</code>.</p>
+<p>These frames are part of connection admission and are not general RPC commands.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +723,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +777,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +906,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,109 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild/cli.md"><div class="prose"><h1 id="cosmix-maild-command-line">cosmix-maild command line</h1>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-maild [--config PATH] &lt;command&gt;
+</code></pre>
+<p><code>--version</code> prints the crate version, source revision, and build time.</p>
+<p>Most administration commands are transient Bus clients of the running daemon. <code>serve</code>, <code>migrate</code>, and <code>queue</code> use the selected local configuration and storage directly.</p>
+<h2 id="commands">Commands</h2>
+<h3 id="daemon-and-storage">Daemon and storage</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>serve</code></td><td>Build the runtime and serve HTTP, SMTP, and configured IMAP listeners</td></tr>
+<tr><td><code>migrate</code></td><td>Open the configured database and apply migrations</td></tr>
+<tr><td><code>queue list</code></td><td>Show up to 50 queued outbound messages</td></tr>
+<tr><td><code>queue flush</code></td><td>Make queued messages immediately eligible for retry</td></tr>
+</tbody></table>
+<h3 id="accounts">Accounts</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>account add EMAIL [PASSWORD] [--name NAME] [--stdin] [--force]</code></td><td>Create a complete account row</td></tr>
+<tr><td><code>account passwd EMAIL [--stdin]</code></td><td>Patch only the password</td></tr>
+<tr><td><code>account verify EMAIL [--stdin]</code></td><td>Test a password without changing state</td></tr>
+<tr><td><code>account lock EMAIL</code></td><td>Disable password authentication while preserving the hash</td></tr>
+<tr><td><code>account unlock EMAIL</code></td><td>Restore the password retained by <code>lock</code></td></tr>
+<tr><td><code>account mfa EMAIL STATE</code></td><td>Set <code>mfa_enabled</code>; accepts on/off, true/false, yes/no, or 1/0</td></tr>
+<tr><td><code>account list</code></td><td>List account addresses and display names</td></tr>
+<tr><td><code>account show EMAIL</code></td><td>Show the complete property record with secret redaction</td></tr>
+<tr><td><code>account delete EMAIL</code></td><td>Delete an account</td></tr>
+<tr><td><code>account seed-mailboxes [--email EMAIL]</code></td><td>Idempotently create default JMAP mailboxes for one or all accounts</td></tr>
+</tbody></table>
+<p><code>account add</code> is a full replacement. It refuses an existing address unless <code>--force</code> is supplied because replacement resets omitted account settings to the command defaults. Use <code>account passwd</code> for a password-only change.</p>
+<p>If no password argument is supplied, <code>account add</code> prompts without echo and asks for confirmation. <code>account passwd</code> always prompts unless <code>--stdin</code> is used. A positional password is retained for scripted compatibility but is visible in process listings and shell history.</p>
+<p><code>account verify</code> exits successfully for a valid password and with status 1 for an invalid password. Unknown accounts also report invalid, avoiding account enumeration through this command.</p>
+<p>Example:</p>
+<pre><code class="language-text">cosmix-maild account add admin@example.com --name "Example Administrator"
+cosmix-maild account passwd admin@example.com
+cosmix-maild account lock admin@example.com
+cosmix-maild account unlock admin@example.com
+</code></pre>
+<h3 id="per-account-rule-overrides">Per-account rule overrides</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>account-overrides get --email EMAIL</code></td><td>Read an override row</td></tr>
+<tr><td><code>account-overrides set --email EMAIL [OPTIONS]</code></td><td>Replace or patch an override row</td></tr>
+<tr><td><code>account-overrides clear --email EMAIL</code></td><td>Remove the row and restore engine defaults</td></tr>
+</tbody></table>
+<p><code>set</code> accepts:</p>
+<ul>
+<li><code>--threshold NUMBER</code></li>
+<li>repeatable <code>--disable-rule RULE_ID</code></li>
+<li>repeatable <code>--allow GLOB</code></li>
+<li>repeatable <code>--block GLOB</code></li>
+<li><code>--merge</code> for patch semantics</li>
+<li><code>--force</code> to omit the prior-read version check in patch mode</li>
+</ul>
+<p>Without <code>--merge</code>, omitted fields return to schema defaults. With <code>--merge</code>, unspecified fields remain unchanged.</p>
+<h3 id="domains">Domains</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>domain add FQDN</code></td><td>Create a domain row with schema defaults</td></tr>
+<tr><td><code>domain list</code></td><td>List domain, role, and enabled state</td></tr>
+<tr><td><code>domain show FQDN</code></td><td>Show the complete domain row</td></tr>
+<tr><td><code>domain set FQDN FIELD VALUE</code></td><td>Patch one field</td></tr>
+<tr><td><code>domain remove FQDN</code></td><td>Remove a domain row</td></tr>
+</tbody></table>
+<p><code>VALUE</code> is parsed as JSON first and falls back to a plain string. This permits booleans, <code>null</code>, arrays, and unquoted string arguments.</p>
+<pre><code class="language-text">cosmix-maild domain add example.com
+cosmix-maild domain set example.com enabled true
+cosmix-maild domain set example.com mx_targets '["mx.example.com"]'
+cosmix-maild domain show example.com
+</code></pre>
+<h3 id="aliases">Aliases</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>alias add ALIAS TARGET</code></td><td>Create a local single-hop alias</td></tr>
+<tr><td><code>alias list</code></td><td>List alias mappings and enabled state</td></tr>
+<tr><td><code>alias remove ALIAS</code></td><td>Remove an alias idempotently</td></tr>
+</tbody></table>
+<p>The target must be a real local account and cannot itself be an alias. Account and alias addresses are canonicalised before the Bus call.</p>
+<pre><code class="language-text">cosmix-maild alias add info@example.com admin@example.com
+</code></pre>
+<h3 id="tls-and-dkim">TLS and DKIM</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>tls-identity list</code></td><td>List projected TLS identities</td></tr>
+<tr><td><code>tls-identity show SERVER_NAME</code></td><td>Show one projected identity</td></tr>
+<tr><td><code>tls reload</code></td><td>Rebuild and atomically swap the live SNI resolver</td></tr>
+<tr><td><code>dkim generate --domain DOMAIN --selector SELECTOR [--algorithm ALGORITHM]</code></td><td>Generate a substrate-managed key and print its DNS TXT record</td></tr>
+<tr><td><code>dkim rotate --domain DOMAIN --selector SELECTOR</code></td><td>Promote an existing selector</td></tr>
+<tr><td><code>dkim retire --domain DOMAIN --selector SELECTOR</code></td><td>Remove a non-active selector</td></tr>
+</tbody></table>
+<p><code>tls-identity</code> is read-only. <code>tls reload</code> merges startup identities with substrate-declared identities, reloads PEM files, updates the projection, and keeps the previous resolver active if rebuilding fails.</p>
+<p>The default DKIM algorithm is <code>rsa-sha256</code>; <code>ed25519-sha256</code> is also accepted. <code>rotate</code> does not generate a key. An active selector must be replaced before it can be retired.</p>
+<h3 id="engine-and-classifiers">Engine and classifiers</h3>
+<table><thead><tr><th>Command</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>engine-config show</code></td><td>Show the <code>maild.engine_config</code> singleton</td></tr>
+<tr><td><code>rules stats [--top-n N]</code></td><td>Show pack metadata, verdict totals, and rule hits</td></tr>
+<tr><td><code>rules reload</code></td><td>Re-read and atomically swap the configured rule pack</td></tr>
+<tr><td><code>bayesian stats ACCOUNT_ID</code></td><td>Show corpus statistics for a numeric account id</td></tr>
+</tbody></table>
+<p><code>rules stats</code> defaults to 256 per-rule entries. The daemon caps the request at 4096. <code>--top-n 0</code> requests cardinality without cloning the per-rule map.</p>
+<p><code>rules reload</code> is a no-op when <code>rules_pack_path</code> is unset. On a load failure, the previous pack remains active.</p>
+<p>The CLI does not expose <code>maild.rules.explain</code> or <code>maild.bayesian.classify</code>; their base64 message and envelope payloads are intended for direct Bus callers.</p>
+<h2 id="configuration-selection">Configuration selection</h2>
+<p><code>--config PATH</code> loads that strict-data <code>.conf.mix</code> file. Without it, the binary checks the system path, the Cosmix user path, node configuration, and then built-in defaults.</p>
+<p>The config is loaded before every command. Bus-only commands still require a valid selected configuration even though their mutations occur through the running daemon.</p>
+<h2 id="bus-only-command-behaviour">Bus-only command behaviour</h2>
+<p>Account, override, alias, domain, TLS-identity, engine-config, DKIM, rules, Bayesian, and TLS commands connect to the Bus broker and call the running <code>maild</code> service. They do not edit the daemon database directly.</p>
+<p>The daemon must therefore be registered and reachable. Mutations pass through property validation, audit, lifecycle hooks, and change publication.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +721,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +775,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +904,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/10b-repair-improvement-profile</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,959 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/10b-repair-improvement-profile.md"><div class="prose"><h1 id="repair-and-improvement--retained-mechanism-profile">Repair and Improvement — Retained Mechanism Profile</h1>
+<p><strong>DAEMON-REPAIR-001 — Retained mechanisms.</strong> Parts A and B preserve the original repair and improvement requirements, numerical defaults, event shapes, trust gradient and conformance levels. Section numbers restart in each part; a reference to repair §6 means Part A §6, while improvement §6 means Part B §6. Legacy chapter IDs 08 and 09 remain provenance identifiers, not new distribution IDs.</p>
+<p>This profile retains intent during refactoring. It is not ratified by publication, does not override <a href="/spec/00-authority">authority</a> or <a href="/spec/01-foundations">foundations</a>, and does not establish runtime conformance at baseline <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. The <a href="/spec/10-daemon-agent-operation">daemon chapter</a> identifies the narrower implementation evidence. Original files remain in place during candidate review.</p>
+<p>Known discrepancies remain explicit: Part A's user-service-only statement conflicts with the later <a href="/spec/10a-daemon-identity-profile">identity profile</a>, which distinguishes system and user services; a daemon cannot enforce <code>Restart=no</code> simply by exiting; the whole cross-process escalation/DLQ system and Part B proposal/approval pipeline have not been established as implemented. Part B's atomic multi-artifact transaction and backward-compatible reversal requirements require a concrete coordinator and schema recovery design. No implication of automatic authority follows from this retained text. The quorum rule is conditional and dormant under its stated trigger.</p>
+<p>Other legacy references map by subject: self-awareness/property read surfaces → <a href="/spec/06-properties">properties</a>; topic delivery → <a href="/spec/05-broker-topics">broker/topics</a>; persistent recovery → <a href="/spec/07-persistence-recovery">persistence/recovery</a>; mesh trust → <a href="/spec/08-mesh-trust">mesh</a>; Mix language → <a href="/spec/09-mix-integration">Mix integration</a>. Constitution article numbers remain historical clause references pending the suite's complete claim mapping; they are not silently renumbered.</p>
+<p>Paths under <code>deployment-tools/</code> stand for the deployment profile's legacy helper artifacts, not a claimed public directory or executable command recipe. Private operational-reference paths have been replaced by descriptive provenance labels. Numerical rules and safety obligations are otherwise retained. Dated worked examples and source-presence statements are historical evidence, not current test results.</p>
+<h2 id="part-a--deterministic-self-repair-legacy-chapter-08">Part A — Deterministic self-repair (legacy chapter 08)</h2>
+<h2 id="1-purpose-and-non-goals">1. Purpose and Non-Goals</h2>
+<h3 id="11-why-repair-is-a-separate-layer">1.1 Why repair is a separate layer</h3>
+<p>Self-aware (SPEC 07) gives the substrate eyes. Self-improve (SPEC 09) gives
+the substrate hands for <em>intentional change</em>. Self-repair gives the
+substrate reflexes for <em>unintentional damage</em>. The three are orthogonal:</p>
+<ul>
+<li>A daemon can be observable (L1 in SPEC 07) without being repairable.</li>
+<li>A daemon can be supervised by systemd without being observable.</li>
+<li>An improvement proposal can be applied without ever invoking a repair
+action.</li>
+</ul>
+<p>Repair MUST be deterministic. Deterministic means: given the same observable
+signals and the same configuration, the system selects the same action. No
+LLM, no probabilistic classifier, no "best guess." Determinism is what
+makes repair safe to trigger automatically — the operator can predict and
+audit what will happen.</p>
+<h3 id="12-non-goals">1.2 Non-goals</h3>
+<ul>
+<li><strong>Agent-driven repair decisions.</strong> An agent MAY observe repair events
+(via SPEC 07's <code>props.changed</code> and <code>harness.events</code> topic), record them,
+surface them in dashboards. An agent MUST NOT decide whether to restart,
+reset, or escalate. That is policy, not agency.</li>
+<li><strong>Predictive maintenance.</strong> Forecasting failure before it happens is out
+of scope. Repair triggers on observed degradation, not predicted
+degradation.</li>
+<li><strong>Distributed consensus.</strong> This SPEC scopes to single-node repair plus
+cross-process escalation within one mesh peer. Cross-node coordinated
+repair (e.g., fail over indexd from alpha to beta) is deferred until
+multiple mesh nodes are in production.</li>
+<li><strong>State-machine modelling.</strong> Daemons MAY maintain rich internal state
+machines; this SPEC does not specify them. It specifies only the
+externally-observable repair surface.</li>
+</ul>
+<h3 id="13-why-this-spec-matters">1.3 Why this SPEC matters</h3>
+<p>The mandate's reconstructibility criterion (criterion 3) reads, in part:
+"Where safe, components must be hot-swappable. The system must be able to
+rebuild parts of itself given source changes." That hot-swap and rebuild
+work is in SPEC 09. But before a system can be safely <em>modified</em>, it must
+be safely <em>recoverable</em> — otherwise every modification carries the risk of
+unrecoverable degradation. Repair is the floor that makes improvement safe.</p>
+<hr />
+<h2 id="2-the-action-space">2. The Action Space</h2>
+<p>Repair actions form a finite, ordered list. Adding a new action requires a
+SPEC amendment.</p>
+<table><thead><tr><th>#</th><th>Action</th><th>Effect</th><th>Reversibility</th></tr></thead><tbody>
+<tr><td>1</td><td><strong>restart</strong></td><td>Terminate the process; supervisor relaunches it.</td><td>Trivial — same binary, same state on disk.</td></tr>
+<tr><td>2</td><td><strong>reset-state</strong></td><td>Restart + reset volatile state to last-known-good (LKG) on disk.</td><td>Reversible if LKG is preserved (§6).</td></tr>
+<tr><td>3</td><td><strong>fail-over</strong></td><td>Mark this instance as drained; route traffic to a peer instance.</td><td>Reversible by un-draining, <em>if a peer exists</em>.</td></tr>
+<tr><td>4</td><td><strong>escalate</strong></td><td>Emit <code>harness.events crisis.unresolved</code> with a generated crisis ID; refuse further repair attempts on this signal.</td><td>Operator action required (constitution V.4).</td></tr>
+<tr><td>5</td><td><strong>halt</strong></td><td>Exit with non-zero rc, refuse to restart (systemd <code>Restart=no</code> for this transition).</td><td>Operator action required.</td></tr>
+</tbody></table>
+<p>The actions are ordered by intervention severity. The escalation ladder
+(§5) selects actions monotonically — once a higher-severity action has been
+taken for a given signal, lower-severity actions are not reattempted until
+the operator clears the crisis.</p>
+<h3 id="21-what-is-not-an-action">2.1 What is not an action</h3>
+<ul>
+<li>"Notify the operator." Notification is a side-effect of every action via
+<code>harness.events</code>; it is not a standalone repair step. A repair that does
+nothing but notify is a missing repair.</li>
+<li>"Wait." Backoff <em>between</em> actions is a parameter (§5.2), not an action.
+A daemon that handles a degraded signal by silently waiting forever is
+in violation of §8 (root-cause discipline).</li>
+<li>"Apply a patch." Code modification belongs in SPEC 09, never in repair.
+Repair returns the system to a known state; it does not improve the
+system.</li>
+</ul>
+<hr />
+<h2 id="3-in-process-degradation-primitives">3. In-Process Degradation Primitives</h2>
+<p>The primitives below are specified as contracts. Their implementation lives
+in a planned <code>cosmix-lib-core</code> crate (not yet in tree as of 2026-04-25).
+The cosmix-indexd circuit-breaker logic is the precursor to extract.</p>
+<h3 id="31-circuit-breaker">3.1 Circuit breaker</h3>
+<p>A circuit breaker fronts a call site with three states:</p>
+<ul>
+<li><strong>closed</strong> — calls pass through; failures increment a counter.</li>
+<li><strong>open</strong> — calls short-circuit with a fail-fast error; no underlying
+call is made.</li>
+<li><strong>half-open</strong> — a probe call is permitted; on success, transition to
+closed; on failure, return to open.</li>
+</ul>
+<p><strong>Contract:</strong></p>
+<table><thead><tr><th>Property</th><th>Description</th><th>SPEC 07 path</th></tr></thead><tbody>
+<tr><td><code>state</code></td><td><code>closed</code> / <code>open</code> / <code>half_open</code></td><td><code>breakers.&lt;name&gt;.state</code></td></tr>
+<tr><td><code>failure_count</code></td><td>failures in current window</td><td><code>breakers.&lt;name&gt;.failures</code></td></tr>
+<tr><td><code>opened_at</code></td><td>timestamp of last open transition (null if closed)</td><td><code>breakers.&lt;name&gt;.opened_at</code></td></tr>
+<tr><td><code>next_probe_at</code></td><td>timestamp half-open probe is permitted</td><td><code>breakers.&lt;name&gt;.next_probe_at</code></td></tr>
+</tbody></table>
+<p>State transitions MUST emit <code>&lt;svc&gt;.props.changed</code> per SPEC 07 §3 with the
+breaker name in the path. State changes MAY also emit
+<code>harness.events breaker.opened</code> / <code>breaker.closed</code> for cross-service
+visibility.</p>
+<p><strong>Configuration knobs</strong> (per breaker):</p>
+<ul>
+<li><code>failure_threshold</code> — number of failures within <code>window</code> to open (default
+5)</li>
+<li><code>window</code> — sliding window for failure counting (default 60s)</li>
+<li><code>probe_after</code> — time in open state before half-open probe (default 30s)</li>
+<li><code>success_threshold</code> — consecutive half-open successes to close (default 1)</li>
+</ul>
+<h3 id="32-dead-letter-queue">3.2 Dead-letter queue</h3>
+<p>When a daemon cannot process an ABP message — schema violation, persistent
+backend unavailability, repeated handler exception — the message MUST be
+captured in a DLQ rather than silently dropped or infinitely retried.</p>
+<p><strong>Contract:</strong></p>
+<ul>
+<li>DLQ entries persist to disk under
+<code>~/.local/state/cosmix/&lt;svc&gt;/dlq/&lt;id&gt;.bus</code> (one file per entry, ABP
+format on disk).</li>
+<li>DLQ depth is exposed at <code>dlq.depth</code> (SPEC 07 path).</li>
+<li>A daemon SHOULD emit <code>&lt;svc&gt;.dlq.entry</code> on every DLQ write, with the
+failed message id and reason in the body.</li>
+<li>Operator inspection: <code>mix deployment-tools/dlq_show.mix &lt;svc&gt;</code> lists pending entries;
+re-injection is a manual operation.</li>
+</ul>
+<p>DLQ writes are idempotent under message id — re-receiving the same id does
+not produce duplicate DLQ entries.</p>
+<h3 id="33-retry-policy">3.3 Retry policy</h3>
+<p>Retry is the time dimension of the breaker. A daemon making downstream
+calls MUST retry with bounded attempts and exponential backoff. The
+contract:</p>
+<ul>
+<li><code>max_attempts</code> — total tries including the first (default 3)</li>
+<li><code>initial_backoff</code> — first-retry delay (default 100ms)</li>
+<li><code>multiplier</code> — geometric growth factor (default 2.0)</li>
+<li><code>max_backoff</code> — cap on individual delay (default 30s)</li>
+<li><code>jitter</code> — randomisation factor 0.0–1.0 (default 0.2)</li>
+</ul>
+<p>Retries inside the window count toward the breaker's failure threshold.
+Once max_attempts is reached, the call MUST surface a structured error AND
+emit <code>&lt;svc&gt;.retry.exhausted</code> to <code>harness.events</code>.</p>
+<h3 id="34-timer-wheel">3.4 Timer wheel</h3>
+<p>A timer wheel provides bounded-cardinality scheduling for short-lifetime
+timers (probe deadlines, backoff resumption, watchdog kicks). The contract
+is operational, not API-shaped:</p>
+<ul>
+<li>Cancellation MUST be O(1).</li>
+<li>Insertion MUST be O(1) amortised.</li>
+<li>Timer drift under steady-state load SHOULD be &lt; 10% of the smallest tick.</li>
+<li>The wheel exposes <code>timers.scheduled</code> and <code>timers.fired_total</code> as SPEC 07
+properties for capacity diagnosis.</li>
+</ul>
+<p>The wheel exists to keep timer overhead off the daemon's hot path; daemons
+without short-timer scheduling needs MAY skip this primitive.</p>
+<h3 id="35-health-classifier">3.5 Health classifier</h3>
+<p>Every daemon MUST expose a <code>lifecycle.health</code> property (SPEC 07 §2.1) with
+one of:</p>
+<ul>
+<li><code>ok</code> — all subsystems nominal</li>
+<li><code>degraded</code> — partially functional; specific subsystems impaired but the
+service can answer requests</li>
+<li><code>unhealthy</code> — primary function impaired; service responds to control
+commands but not to its main protocol surface</li>
+<li><code>crashing</code> — recently restarted; in initialisation</li>
+<li><code>crisis</code> — refusing further work; constitution V.4 crisis active</li>
+</ul>
+<p>Transitions emit <code>&lt;svc&gt;.props.changed</code> per SPEC 07 §3. The classification
+is deterministic given the daemon's internal state — no probabilistic
+"health score."</p>
+<hr />
+<h2 id="4-process-supervision">4. Process Supervision</h2>
+<h3 id="41-systemd-is-the-supervisor">4.1 systemd is the supervisor</h3>
+<p>Cosmix runs as systemd user services per the constitution's Article VI
+forbidden-targets list (<code>~/.config/systemd/user/cosmix-*.service</code>).
+systemd is the supervisor; cosmix daemons do not implement their own
+restart logic.</p>
+<h3 id="42-required-unit-settings">4.2 Required unit settings</h3>
+<p>Each <code>cosmix-&lt;svc&gt;.service</code> MUST set:</p>
+<table><thead><tr><th>Directive</th><th>Value</th><th>Reason</th></tr></thead><tbody>
+<tr><td><code>Restart=</code></td><td><code>on-failure</code> (default) or <code>always</code> (for the broker)</td><td>Restart on non-zero exit; <code>always</code> for noded since loss of the local broker blocks everything else.</td></tr>
+<tr><td><code>RestartSec=</code></td><td><code>2s</code> (minimum)</td><td>Avoid tight crash loops while still recovering quickly.</td></tr>
+<tr><td><code>StartLimitIntervalSec=</code></td><td><code>60s</code></td><td>Window for crash-loop detection.</td></tr>
+<tr><td><code>StartLimitBurst=</code></td><td><code>5</code></td><td>Crashes within window before systemd gives up and goes to <code>failed</code> state — escalates per §5.</td></tr>
+<tr><td><code>WatchdogSec=</code></td><td><code>30s</code> (where supported)</td><td>Daemon must <code>sd_notify(WATCHDOG=1)</code> within this window or systemd kills + restarts.</td></tr>
+<tr><td><code>Type=</code></td><td><code>notify</code> (where watchdog used) or <code>simple</code></td><td><code>notify</code> enables <code>sd_notify</code> for ready/watchdog signaling.</td></tr>
+</tbody></table>
+<p>Daemons NOT setting <code>WatchdogSec=</code> MUST emit a heartbeat via SPEC 07's
+<code>world.&lt;svc&gt;</code> retained topic at least once every 60s.</p>
+<h3 id="43-drained-state">4.3 Drained state</h3>
+<p>Before restart, a daemon SHOULD enter a <em>drained</em> state: refuse new work,
+finish in-flight work with a bounded deadline, persist DLQ entries for
+anything not finishable. Drain is signaled by setting <code>lifecycle.health = degraded</code> and <code>lifecycle.draining = true</code>. systemd's <code>TimeoutStopSec=</code>
+gives the bound (default 90s; tune per daemon).</p>
+<h3 id="44-health-propagation-to-systemd">4.4 Health propagation to systemd</h3>
+<p>A daemon at <code>lifecycle.health = unhealthy</code> SHOULD <code>sd_notify(STATUS=...)</code>
+with a one-line summary. systemd <code>systemctl status cosmix-&lt;svc&gt;</code> then
+shows the human-readable summary alongside the structured props surface.</p>
+<hr />
+<h2 id="5-cross-process-escalation-ladder">5. Cross-Process Escalation Ladder</h2>
+<p>The escalation ladder is the contract that turns observable signals into
+repair actions. It runs in a meta-supervisor role — an L3 SPEC 07
+subscriber that watches <code>world.*</code> and <code>harness.events</code>, applies the rules
+below, and emits ABP commands to act.</p>
+<p>In the bootstrap implementation, the meta-supervisor is <code>cosmix-noded</code>
+itself (already the local broker) extended with an escalation engine.
+A separate crate is permitted but not required.</p>
+<h3 id="51-the-standard-ladder">5.1 The standard ladder</h3>
+<p>For each watched daemon, the ladder runs the following steps. Each step
+has a <em>trigger condition</em> and an <em>action</em>. Steps are attempted in order;
+once one succeeds, the daemon's signal counter resets.</p>
+<table><thead><tr><th>Step</th><th>Trigger</th><th>Action</th><th>Backoff before next step</th></tr></thead><tbody>
+<tr><td>1</td><td><code>world.&lt;svc&gt;</code> stale &gt; 60s OR <code>lifecycle.health = unhealthy</code> for &gt; 60s</td><td>restart (action #1)</td><td>30s</td></tr>
+<tr><td>2</td><td>Step 1 fired and stale persists &gt; 90s after restart</td><td>reset-state (action #2)</td><td>60s</td></tr>
+<tr><td>3</td><td>Step 2 fired and stale persists &gt; 120s</td><td>fail-over (action #3) — only if peer instance exists, else skip</td><td>120s</td></tr>
+<tr><td>4</td><td>Step 3 unavailable or failed</td><td>escalate (action #4) — emit <code>harness.events crisis.unresolved</code> per constitution V.4</td><td>(terminal)</td></tr>
+<tr><td>5</td><td>Crisis count for this daemon ≥ 3 in 24h</td><td>halt (action #5) — <code>systemctl stop</code> and <code>Restart=no</code></td><td>(terminal)</td></tr>
+</tbody></table>
+<p>Step 5 implements a daemon-scoped variant of the constitution's IV.5
+hallucination-and-drift circuit breaker, applied to repair churn rather
+than autonomous-commit churn.</p>
+<h3 id="52-backoff-and-reset">5.2 Backoff and reset</h3>
+<ul>
+<li>Backoff between steps prevents thrashing when restart alone fixes
+transient issues.</li>
+<li>The signal counter resets to step 1 when <code>lifecycle.health = ok</code> is
+observed for <code>reset_window</code> (default 600s) consecutively.</li>
+<li>Resetting between escalation crises (clearing crisis state) requires an
+operator-authored commit per constitution V.4.</li>
+</ul>
+<h3 id="53-per-daemon-overrides">5.3 Per-daemon overrides</h3>
+<p>A daemon MAY override the standard ladder via <code>~/.config/cosmix/ escalation.toml</code>. Overrides MUST:</p>
+<ul>
+<li>Not reduce the number of steps below the standard ladder.</li>
+<li>Not skip step 4 (the constitution V.4 crisis) without operator commit.</li>
+<li>Be loaded at meta-supervisor start; runtime mutation through <code>props.set</code>
+is forbidden (Operation scope per constitution IV.1).</li>
+</ul>
+<p>Overrides are an Operation-scope artifact (constitution IV.1) — autonomous
+modification requires Tier 2 with branch + human merge.</p>
+<h3 id="54-repair-events-activity-event-format">5.4 Repair events (activity-event format)</h3>
+<p>Every ladder transition — and every other discrete repair action elsewhere
+in this SPEC — MUST emit a structured event using the activity-event
+schema defined in SPEC 07 §3.5. The topic is <code>repair.&lt;verb&gt;</code>, a
+cross-runtime event family per SPEC 07 §3.5.2: subscribers can watch all
+repair activity across all daemons with a single <code>repair.*</code> subscription.</p>
+<pre><code>---
+bus: 1
+type: event
+from: noded
+command: repair.escalation
+topic: repair.escalation
+---
+{
+  "actor": "noded",
+  "verb": "escalation",
+  "ts": "2026-04-25T18:42:11.244Z",
+  "cause": "world.indexd stale 95s after restart",
+  "outcome": "ok",
+  "duration_ms": 3,
+  "details": {
+    "svc": "indexd",
+    "step": 2,
+    "action": "reset-state"
+  }
+}
+</code></pre>
+<p>Field semantics (SPEC 07 §3.5.1 is authoritative):</p>
+<ul>
+<li><code>actor</code> — the meta-supervisor or daemon emitting the event.</li>
+<li><code>verb</code> — the action verb. For ladder transitions this is <code>escalation</code>
+with the per-step action carried in <code>details.action</code>. For direct
+primitives it is the action name (<code>restart</code>, <code>reset_state</code>, etc.).</li>
+<li><code>cause</code> — the trigger signal <strong>verbatim</strong> (§8.2 mandate); never
+paraphrased, never summarised.</li>
+<li><code>outcome</code> — <code>ok</code> if the action completed; <code>error</code> if the action itself
+failed (e.g., <code>systemctl restart</code> returned non-zero); <code>skipped</code> if a
+precondition was unmet (e.g., fail-over with no peer).</li>
+<li><code>duration_ms</code> — wall time of the action; flags pathologically slow
+restarts before they manifest as ladder thrash.</li>
+<li><code>details</code> — repair-specific structured fields. For <code>escalation</code>:
+<code>{svc, step, action}</code>. For other verbs: see §5.4.1 below.</li>
+</ul>
+<h4 id="541-repair-verb-catalog">5.4.1 Repair verb catalog</h4>
+<p>The cross-runtime <code>repair.*</code> family covers every repair-relevant emission
+in this SPEC. Daemons that emit on <code>&lt;svc&gt;.props.changed</code> for repair-
+relevant transitions (per §8.2) MUST also emit the corresponding
+<code>repair.*</code> topic so the operator can subscribe to one topic family and
+reconstruct the full history.</p>
+<p>The catalog uses <strong>Topic</strong> (the ABP <code>topic</code> / <code>command</code> header) and
+<strong>body.verb</strong> (the value of the activity-event body's <code>verb</code> field per
+SPEC 07 §3.5.1) as separate columns, because SPEC 07 §3.5.2's topic
+shape <code>&lt;family&gt;.&lt;verb&gt;</code> includes the family prefix while the body
+field does not. Implementers reading either column alone cannot derive
+the other unambiguously when verbs themselves contain dots
+(<code>breaker.opened</code>, <code>deploy.rolled_back</code>).</p>
+<table><thead><tr><th>Topic</th><th>body.verb</th><th>Emitter</th><th><code>cause</code> field</th><th>Cross-reference</th></tr></thead><tbody>
+<tr><td><code>repair.escalation</code></td><td><code>escalation</code></td><td>meta-supervisor</td><td>trigger signal verbatim</td><td>§5.1</td></tr>
+<tr><td><code>repair.restart</code></td><td><code>restart</code></td><td>meta-supervisor</td><td>trigger signal</td><td>§2 action #1</td></tr>
+<tr><td><code>repair.reset_state</code></td><td><code>reset_state</code></td><td>meta-supervisor</td><td>trigger signal</td><td>§2 action #2</td></tr>
+<tr><td><code>repair.fail_over</code></td><td><code>fail_over</code></td><td>meta-supervisor</td><td>trigger signal</td><td>§2 action #3</td></tr>
+<tr><td><code>repair.escalate</code></td><td><code>escalate</code></td><td>meta-supervisor</td><td>trigger signal</td><td>§2 action #4; emits <code>crisis.unresolved</code> per V.4</td></tr>
+<tr><td><code>repair.halt</code></td><td><code>halt</code></td><td>meta-supervisor</td><td>trigger signal</td><td>§2 action #5</td></tr>
+<tr><td><code>repair.breaker.opened</code></td><td><code>breaker.opened</code></td><td>breaker owner</td><td>downstream call id or error</td><td>§3.1; also emits <code>&lt;svc&gt;.props.changed</code></td></tr>
+<tr><td><code>repair.breaker.closed</code></td><td><code>breaker.closed</code></td><td>breaker owner</td><td>probe call id</td><td>§3.1; ditto</td></tr>
+<tr><td><code>repair.retry.exhausted</code></td><td><code>retry.exhausted</code></td><td>call-site owner</td><td>structured downstream error</td><td>§3.3</td></tr>
+<tr><td><code>repair.daemon.crashed</code></td><td><code>daemon.crashed</code></td><td>systemd journal scraper or daemon pre-exit hook</td><td>rc + signal if available</td><td>§8.2</td></tr>
+<tr><td><code>repair.deploy.lkg_rollback</code></td><td><code>deploy.lkg_rollback</code></td><td>operator script</td><td>operator identity</td><td>§6.4</td></tr>
+<tr><td><code>repair.deploy.rolled_back</code></td><td><code>deploy.rolled_back</code></td><td>deploy script</td><td>smoke-test failure</td><td>§6.2</td></tr>
+<tr><td><code>repair.schema.refused</code></td><td><code>schema.refused</code></td><td>database owner</td><td><code>code_version</code> + on-disk version</td><td>§7.2</td></tr>
+<tr><td><code>repair.schema.migrated</code></td><td><code>schema.migrated</code></td><td>database owner</td><td>migration filename</td><td>§7.3</td></tr>
+</tbody></table>
+<p>Per-daemon escalation history is reconstructible by filtering on
+<code>details.svc</code>. Operator dashboards, audit log writers, and the
+constitution's V.5 audit script subscribe to <code>repair.*</code> rather than to
+the legacy <code>harness.events</code> fan-in.</p>
+<h4 id="542-migration-from-the-pre-35-schema">5.4.2 Migration from the pre-3.5 schema</h4>
+<p>Drafts of this SPEC at version ≤ 0.1.0 used a different field shape
+(<code>{kind, svc, step, action, trigger, ts}</code>) emitted on the generic
+<code>harness.events</code> topic. The shape above replaces it; the rename is driven
+by SPEC 07 §3.5.6's distinction between activity events (discrete
+actions) and <code>props.changed</code> events (state transitions). Repair events
+are the canonical activity-event use case — collapsing them under a
+generic <code>harness.events</code> envelope obscured the actor/verb/cause/outcome
+shape that downstream subscribers actually need to reason about.</p>
+<p>The <code>harness.events</code> topic continues to exist for substrate-level events
+that pre-date the activity-event taxonomy (e.g., V.4 <code>crisis.unresolved</code>
+itself); new repair emissions MUST use <code>repair.&lt;verb&gt;</code>.</p>
+<hr />
+<h2 id="6-atomic-deploy-and-last-known-good">6. Atomic Deploy and Last-Known-Good</h2>
+<p>This section addresses the gap between constitution V.1 (every change is
+git-revertible) and the running-system reality that a reverted commit does
+not roll back a running binary that has already shipped.</p>
+<h3 id="61-two-distinct-rollback-layers">6.1 Two distinct rollback layers</h3>
+<table><thead><tr><th>Layer</th><th>Artifact</th><th>Mechanism</th><th>Constitution reference</th></tr></thead><tbody>
+<tr><td>Source</td><td>git tree</td><td><code>git revert &lt;sha&gt;</code></td><td>V.1, V.2</td></tr>
+<tr><td>Running binary</td><td><code>/opt/cosmix/bin/cosmix-&lt;svc&gt;</code></td><td>LKG copy + restart (this section)</td><td>(this SPEC)</td></tr>
+</tbody></table>
+<p>Reverting source without rolling back the running binary leaves the system
+running the bad code; rolling back the binary without reverting source
+leaves the next deploy reintroducing the bug. Both layers MUST be kept in
+sync; appliers per constitution V.3 are responsible for ordering them.</p>
+<h3 id="62-lkg-retention">6.2 LKG retention</h3>
+<p>Before a binary swap, the deployer MUST:</p>
+<ol>
+<li>Move the existing <code>/opt/cosmix/bin/cosmix-&lt;svc&gt;</code> to
+<code>/opt/cosmix/bin/cosmix-&lt;svc&gt;.lkg</code> (overwriting any prior LKG).</li>
+<li>Copy the new binary to <code>/opt/cosmix/bin/cosmix-&lt;svc&gt;</code>.</li>
+<li>Smoke-test the new binary (§6.3).</li>
+<li>On smoke-test failure: move LKG back to the live path; emit
+<code>harness.events deploy.rolled_back</code>; do not restart the service (the
+old binary is already what's running).</li>
+<li>On smoke-test success: <code>systemctl --user restart cosmix-&lt;svc&gt;</code>; observe
+<code>lifecycle.health</code> returning to <code>ok</code> within a deadline (default 30s);
+on health failure, manually invoke LKG rollback (§6.4).</li>
+</ol>
+<h3 id="63-smoke-test-contract">6.3 Smoke test contract</h3>
+<p>Every cosmix daemon MUST support a <code>--smoke-test</code> invocation that:</p>
+<ul>
+<li>Loads its configuration without binding sockets or modifying state.</li>
+<li>Validates the binary is loadable, dependencies are resolvable, schema
+versions are consistent.</li>
+<li>Exits with rc 0 on success, non-zero on any failure.</li>
+<li>Completes within 5 seconds.</li>
+</ul>
+<p>Smoke tests are the deploy-time analogue of constitution V.3 verification.
+A daemon without a smoke test cannot be safely auto-deployed.</p>
+<h3 id="64-lkg-rollback-as-a-repair-action">6.4 LKG rollback as a repair action</h3>
+<p>LKG rollback is <em>not</em> a step on the standard ladder (§5.1) — it is an
+operator-invoked recovery for the case where a deploy failed and the
+running binary needs reverting outside the autonomous repair flow.</p>
+<pre><code class="language-sh">mix deployment-tools/lkg_rollback.mix &lt;svc&gt;
+</code></pre>
+<p>This script swaps <code>cosmix-&lt;svc&gt;.lkg</code> back to <code>cosmix-&lt;svc&gt;</code>, restarts via
+systemd, and emits <code>harness.events deploy.lkg_rollback</code> with the operator
+identity in the cause field.</p>
+<h3 id="65-multi-version-coexistence">6.5 Multi-version coexistence</h3>
+<p>Cross-mesh deploys may temporarily run mixed versions. This SPEC does not
+require synchronised mesh-wide version. SPEC 07's INFO version surfaces
+allow consumers to detect and tolerate mismatches. Mesh-wide deploy
+coordination is deferred to a future SPEC chapter.</p>
+<hr />
+<h2 id="7-schema-drift">7. Schema Drift</h2>
+<p>Every cosmix daemon that owns a SQLite database (indexd, cosmix-lib-skills,
+maild's JMAP store, syncd's catalog) MUST treat schema as a versioned
+artifact with explicit drift handling.</p>
+<h3 id="71-schema-version-property">7.1 Schema version property</h3>
+<p>Each daemon owning a SQLite store MUST expose:</p>
+<ul>
+<li><code>schema.version</code> — integer version of the on-disk schema.</li>
+<li><code>schema.code_version</code> — integer version the running code expects.</li>
+<li><code>schema.path</code> — filesystem path of the database.</li>
+<li><code>schema.migration_applied_at</code> — timestamp of last successful migration.</li>
+</ul>
+<p>These are SPEC 07 properties; on mismatch, <code>lifecycle.health = unhealthy</code>
+and the daemon refuses to open the database.</p>
+<h3 id="72-migration-contract">7.2 Migration contract</h3>
+<ul>
+<li>Forward migrations (code_version &gt; schema.version) are applied
+automatically at startup, idempotently, in a single transaction. Failure
+rolls back the transaction; daemon exits with rc 20 (constitution V.4
+failure).</li>
+<li>Backward migrations (code_version &lt; schema.version) are NEVER applied
+automatically. The daemon refuses to open the database, emits
+<code>harness.events schema.refused</code>, and waits for operator action.</li>
+<li>Breaking migrations (data loss, semantic shift) require an
+operator-authored commit per constitution IV.1 (Operation scope) — the
+migration script itself is a constitutionally-protected artifact.</li>
+</ul>
+<h3 id="73-migration-discipline">7.3 Migration discipline</h3>
+<p>Every migration:</p>
+<ul>
+<li>Carries a numeric version: <code>migrations/0042_add_property_table.sql</code>.</li>
+<li>Is idempotent: re-running on an already-migrated database is a no-op.</li>
+<li>Is wrapped in <code>BEGIN EXCLUSIVE; ... COMMIT;</code> so a partial failure leaves
+the database at the prior version, not in between.</li>
+<li>Logs to <code>harness.events schema.migrated</code> on success with old/new
+versions and elapsed time.</li>
+</ul>
+<hr />
+<h2 id="8-root-cause-vs-mask-discipline">8. Root-Cause-vs-Mask Discipline</h2>
+<p>This is the most important section of this SPEC and the easiest to violate.</p>
+<h3 id="81-the-failure-mode">8.1 The failure mode</h3>
+<p>A repair action that succeeds in restoring service can hide the underlying
+fault from the operator. An indexd that crashes every 6 hours but is
+restarted automatically by systemd appears healthy in <code>world.indexd</code> —
+until disk fills with crash dumps or an upstream change escalates the
+crash rate.</p>
+<h3 id="82-the-discipline">8.2 The discipline</h3>
+<p>Every repair action MUST surface the <em>signal that triggered it</em>, not just
+the action taken. Specifically:</p>
+<ul>
+<li>The <code>harness.events escalation</code> event (§5.4) MUST include the trigger
+signal verbatim, not a paraphrase.</li>
+<li>A daemon emitting <code>&lt;svc&gt;.props.changed</code> for <code>lifecycle.health</code> MUST
+include in <code>cause</code> the signal that caused the transition (e.g., the
+ABP id of the failed downstream call, or the breaker that opened).</li>
+<li>A crash detected by systemd MUST result in a journal entry that survives
+the restart, AND a <code>harness.events daemon.crashed</code> event with rc and
+signal if available.</li>
+</ul>
+<h3 id="83-cross-service-causation">8.3 Cross-service causation</h3>
+<p>A cascade — indexd unhealthy → maild's search request fails → maild's
+breaker opens → maild marks itself degraded — MUST be reconstructible from
+the <code>cause</code> chain. Each daemon in the chain references the upstream cause
+in its own <code>props.changed</code> event. SPEC 07 §7.4 encourages this; this
+section makes it mandatory for repair-relevant transitions.</p>
+<h3 id="84-crash-dump-retention">8.4 Crash dump retention</h3>
+<p>Daemons that produce crash dumps SHOULD write them to
+<code>~/.local/state/cosmix/&lt;svc&gt;/crashes/&lt;ts&gt;.dump</code> with bounded retention
+(default: keep last 10, oldest evicted). The retention bound is a property:
+<code>crashes.retained</code> and <code>crashes.evicted_total</code>. Operator inspection is
+manual; no autonomous path may delete crash dumps.</p>
+<h3 id="85-the-trap">8.5 The trap</h3>
+<p>A daemon that "self-heals" by clearing its DLQ and resetting its breaker
+on every restart is hiding failures. The DLQ MUST persist across restarts
+(§3.2). Breaker state MAY reset on restart (it represents downstream
+liveness, not local state) but the <em>count of breaker openings since last
+operator clear</em> MUST persist as a property — that count is the signal that
+something is recurrently failing even if individual incidents are
+auto-resolved.</p>
+<h3 id="86-worked-example--mds-class-repair">8.6 Worked example — MDS-class repair</h3>
+<p><code>cosmix-mds</code> (Phase 7, shipped 2026-05-03) is the first concrete daemon
+class to instantiate a substantial subset of this SPEC's action space.
+This subsection maps the shipped primitives onto §2's actions and the
+§5.1 escalation ladder, anchoring the SPEC against a daemon that exists
+rather than against contracts that don't yet have an implementation
+(§3, §9.3). It is the operational sister to SPEC 07 §8.4 (the
+observability worked example for the same daemon class).</p>
+<p>Sources: <code>crates/cosmix-mds/README.md</code>, the operator runbook at
+<code>historical MDS operator guide (2026-05-03)</code>, and
+<code>crates/cosmix-mds/tests/recovery.rs</code> (the SIGKILL recovery proof).</p>
+<h4 id="861-action-space-mapping">8.6.1 Action space mapping</h4>
+<table><thead><tr><th>Action (§2)</th><th>MDS primitive</th><th>Notes</th></tr></thead><tbody>
+<tr><td>restart</td><td>systemd restart of the host daemon (e.g. <code>cosmix-maild</code>)</td><td>MDS itself is library code; restart is mediated by the consuming daemon. WAL recovery on <code>SqliteCasMds::open</code> is the post-restart half — proven safe under SIGKILL by <code>tests/recovery.rs</code>.</td></tr>
+<tr><td>reset-state</td><td><code>cosmix-mds rebuild-index</code> (operator CLI)</td><td>Rebuilds box-wide <code>blobs.sqlite</code> from per-set <code>data.sqlite</code> walks. Idempotent; safe to re-run. <strong>Caveat:</strong> orphan CAS blobs (CAS file present, no <code>blob</code> row) are <em>reported</em> but not deleted — <code>put_blob</code> writes the CAS file <em>before</em> <code>add_item</code> writes the <code>blob</code> row, so a SIGKILL between them legitimately leaves an unindexed file. GC sweeps the <code>blob</code> table, not the filesystem. Cleanup of unindexed CAS files is operator-driven in v1.</td></tr>
+<tr><td>fail-over</td><td>not yet — single-node</td><td>Per-set data lives at <code>containers/&lt;uuid&gt;/data.sqlite</code>; cross-mesh fail-over would replicate sets via <code>export_set</code> / <code>import_set</code>. Tracked under §9.1.</td></tr>
+<tr><td>escalate</td><td>host daemon emits <code>repair.escalate</code> when <code>cosmix-mds verify --full</code> reports <code>mismatches &gt; 0</code> after a recover attempt</td><td>Per the operator guide §Recover, manual surgery on individual CAS files is unsafe; the safe remediation is <code>import_set</code> from a recent backup, which is operator-mediated.</td></tr>
+<tr><td>halt</td><td>host daemon halts; MDS does nothing autonomously</td><td>Storage layer never exits the substrate; only the host daemon does. See §8.6.5 on per-account isolation.</td></tr>
+</tbody></table>
+<h4 id="862-standard-ladder-application">8.6.2 Standard ladder application</h4>
+<p>Applied to the maild daemon (the first MDS consumer):</p>
+<table><thead><tr><th>Step</th><th>Trigger</th><th>Action</th><th>MDS-specific notes</th></tr></thead><tbody>
+<tr><td>1</td><td><code>world.maild</code> stale &gt; 60s OR <code>lifecycle.health = unhealthy</code> for &gt; 60s</td><td>restart maild</td><td>Post-restart, MDS re-opens via <code>SqliteCasMds::open</code>; SQLite WAL recovery completes before maild signals ready. The Phase 7 SIGKILL recovery test (10 randomised iterations per CI run, kill delay 5–50ms into the <code>add_item</code> loop — <code>tests/recovery.rs:153–158</code>) is the proof point that this restart path is safe.</td></tr>
+<tr><td>2</td><td>Step 1 fired and stale persists &gt; 90s</td><td>reset-state — operator runs <code>cosmix-mds rebuild-index</code>, then restarts maild</td><td>Reset is on the <em>index</em> (box-wide blob refs), not the per-set data. Per-set <code>data.sqlite</code> files are the source of truth and are not rebuilt. <code>orphan_blobs_found &gt; 0</code> after rebuild is informational, not a failure — see the caveat above.</td></tr>
+<tr><td>3</td><td>Step 2 fired and stale persists &gt; 120s</td><td>fail-over (not yet) — skip to step 4</td><td>Single-node today.</td></tr>
+<tr><td>4</td><td>Step 3 unavailable</td><td>escalate</td><td><code>repair.escalate</code> with <code>cause = "maild stale after rebuild-index"</code>; operator runs <code>cosmix-mds verify --full</code> to triage. If <code>mismatches &gt; 0</code>, restore from the most recent <code>export</code> (§8.6.3).</td></tr>
+<tr><td>5</td><td>Crisis count ≥ 3 in 24h</td><td>halt</td><td>But see §8.6.5 — per-account isolation may justify a finer-grained halt scope.</td></tr>
+</tbody></table>
+<h4 id="863-lkg-mechanism-for-mds-class-daemons">8.6.3 LKG mechanism for MDS-class daemons</h4>
+<p><code>cosmix-mds export &lt;SET_UUID&gt; &lt;path&gt;</code> is the set-level analogue of §6's
+binary LKG. The export holds the per-set lock for the duration so the
+tarball is a point-in-time snapshot of <code>data.sqlite</code> plus referenced CAS
+blobs. The receiving site uses <code>cosmix-mds import &lt;path&gt;</code> to install the
+tarball atomically (rename of <code>data.sqlite</code> into place, single
+transaction inserting <code>blob_ref</code> rows into <code>blobs.sqlite</code>); the importer
+refuses with exit 2 if a set with the same UUID already exists at the
+target root.</p>
+<p>A nightly <code>export</code> of each high-value set is the recommended LKG rhythm
+for MDS-class daemons. The operator guide §Backup documents the pattern;
+the suggested baseline rhythm in §Health-check pairs every backup with a
+preceding <code>verify --full</code> so corrupt sets are flagged before they become
+the only surviving copy.</p>
+<p>The two LKG layers are orthogonal:</p>
+<ul>
+<li><strong>Binary LKG (§6)</strong> — code rollback. <code>/opt/cosmix/bin/cosmix-maild.lkg</code>.</li>
+<li><strong>Set LKG (this section)</strong> — data rollback. <code>mds-&lt;UUID&gt;-&lt;date&gt;.tar</code>.</li>
+</ul>
+<p>A bad deploy needs binary LKG; corruption from a hardware event needs
+set LKG. The operator chooses by inspecting which symptom the trigger
+signal points at.</p>
+<h4 id="864-gc-quiescence-as-a-repair-safety-primitive">8.6.4 GC quiescence as a repair-safety primitive</h4>
+<p><code>gc()</code> runs in two passes with a configurable quiescence wait between
+them (<code>COSMIX_MDS_GC_QUIESCENCE_SECS</code>, default 60s, floor 5s — values
+below the floor are logged at warn and ignored). The wait prevents a
+delivery in flight at the start of pass 1 from having its blob collected
+before its <code>add_item</code> commits — a classic time-of-check / time-of-use
+trap that would manifest as silent data loss under concurrent load.</p>
+<p>The discipline generalises: any "sweep then act" repair primitive in the
+substrate MUST have an equivalent quiescence parameter, and that
+parameter MUST be exposed as a SPEC 07 property (<code>gc.quiescence_secs</code> in
+MDS's case) so the operator can observe what value is in effect without
+restarting the daemon to inspect its config. Setting a value with no
+property surface is a SPEC 07 §8.4 violation as well as a §8.5 trap
+(operator cannot detect that the daemon is running with an unsafe
+quiescence override).</p>
+<h4 id="865-per-account-isolation-and-halt-scope">8.6.5 Per-account isolation and halt scope</h4>
+<p>MDS serialises writes per set via an in-process mutex; cross-set ops take
+the per-set mutex first, then the box-wide <code>blobs.sqlite</code> mutex, never
+the inverse. This means corruption confined to one account's
+<code>data.sqlite</code> does not block writes to other accounts.</p>
+<p>The §5.1 step-5 halt action is whole-daemon. For an MDS-class daemon
+serving many accounts, a single corrupted set should ideally not halt
+service for the rest. The currently-correct behaviour is to escalate the
+corrupted set (<code>repair.escalate</code> with <code>details.set_uuid</code>) and continue
+serving other sets, with halt reserved for box-wide <code>blobs.sqlite</code>
+corruption or repeated whole-daemon restarts. The meta-supervisor
+contract for per-tenant halt scope is open — see §9.6.</p>
+<h4 id="866-post-commit-emission-as-a-82-cause-chain-enabler">8.6.6 Post-commit emission as a §8.2 cause-chain enabler</h4>
+<p>§8.2 mandates that repair events carry the trigger signal verbatim in
+<code>cause</code>. MDS's <em>post-commit emission</em> discipline — every <code>MdsEvent</code> and
+in-process <code>Notifier</code> event fires <em>after</em> the SQLite transaction commits
+— is what makes downstream <code>cause</code> chains trustworthy: a subscriber that
+receives an MDS event is guaranteed the underlying durable change
+happened. Pre-commit emission would let <code>cause</code> references point at
+half-applied state, breaking the §8.3 cross-service causation contract.</p>
+<p>This is a generalisable invariant for any ABP event referenced as a
+<code>cause</code>: emit post-commit on the durable write that makes the cause
+true. The MDS pattern is the reference shape — <code>EventSink</code> is invoked
+after the per-set transaction commits in <code>store.rs</code>, never before.</p>
+<h4 id="867-why-this-matters-for-the-spec">8.6.7 Why this matters for the SPEC</h4>
+<p>MDS instantiates more of this SPEC's action space than any prior daemon
+— not because it is special, but because <em>storage substrates have no
+choice</em> about repair: a corrupt index is not a "degraded health"
+condition that can be patched over, and silent data loss is not a
+recoverable error mode. The MDS pattern (verify ledger, idempotent
+rebuild, atomic export/import, post-commit emission, quiescence on
+multi-pass operations, per-tenant lock isolation) is the reference shape
+for any future MDS-class daemon — the skills store, the knowledge store,
+the ABP audit log, the syncd catalog, and any other component that
+custodies durable per-tenant state.</p>
+<hr />
+<h2 id="9-open-questions-and-future-work">9. Open Questions and Future Work</h2>
+<h3 id="91-cross-mesh-repair-coordination">9.1 Cross-mesh repair coordination</h3>
+<p>The standard ladder's step 3 (fail-over) requires a peer instance. Today
+each service runs on at most one mesh node. When indexd ships on multiple
+nodes, the ladder will need:</p>
+<ul>
+<li>A way to enumerate viable peers (<code>world.&lt;svc&gt;@&lt;node&gt;</code> snapshots from
+other brokers).</li>
+<li>A draining protocol so that a fail-over does not double-process queued
+work.</li>
+<li>A return protocol so the original instance can be re-promoted after
+recovery.</li>
+</ul>
+<p>Deferred until the second mesh node is in production.</p>
+<h3 id="92-operator-bypass-for-known-good-repair">9.2 Operator-bypass for known-good repair</h3>
+<p>The constitution V.4 crisis state requires operator-authored commit to
+clear. A pattern of identical, well-understood crises (e.g., "indexd
+crashes once a week due to an upstream model file rotation") creates
+noise. A future SPEC amendment may permit operator pre-authorisation of a
+repair pattern: signed metadata declaring "if signal X is the trigger,
+auto-clear on success." Not in this draft — the bias is toward operator
+attention rather than away from it.</p>
+<h3 id="93-cosmix-lib-core-extraction">9.3 cosmix-lib-core extraction</h3>
+<p>The primitives in §3 are specified as contracts because the implementing
+crate does not yet exist. Extracting <code>cosmix-lib-core</code> from indexd's
+existing breaker logic is a near-term task; the SPEC will be amended to
+reference the crate's actual API once it lands.</p>
+<h3 id="94-watchdog-vs-heartbeat-unification">9.4 Watchdog-vs-heartbeat unification</h3>
+<p>§4.2 distinguishes daemons using systemd <code>WatchdogSec=</code> from daemons
+emitting <code>world.&lt;svc&gt;</code> heartbeats. Both are liveness signals; running both
+in parallel is redundant. A future iteration may unify them — <code>world.&lt;svc&gt;</code>
+republish drives systemd watchdog satisfaction via a shim, so daemons emit
+once and both surfaces work. Deferred.</p>
+<h3 id="95-per-tenant-halt-scope-for-mds-class-daemons">9.5 Per-tenant halt scope for MDS-class daemons</h3>
+<p>§8.6.5 surfaces the gap: §5.1 step 5 (halt) is whole-daemon, but for an
+MDS-class daemon serving many accounts a single corrupted set should not
+halt service for the rest. A future SPEC amendment may introduce a
+<em>scoped halt</em> primitive — drain and refuse work for an enumerated subset
+(by <code>set_uuid</code>, <code>tenant_id</code>, or analogous tenancy key) while continuing
+to serve others. The shape question is whether scoped halt is a sixth
+action, a parameter of action #5, or a meta-supervisor concern that the
+SPEC stays out of. Deferred until a second MDS consumer (skills store,
+knowledge store) makes the per-tenant pattern concrete.</p>
+<h3 id="96-repair-event-subscription-cardinality">9.6 Repair-event subscription cardinality</h3>
+<p>§5.4 routes all repair emissions through <code>repair.&lt;verb&gt;</code>. Operator
+dashboards subscribing to <code>repair.*</code> see every repair event substrate-
+wide; on a busy node this can be high-cardinality. Whether subscribers
+need per-daemon <code>&lt;svc&gt;.repair.&lt;verb&gt;</code> aliases (mirroring SPEC 07 §3.5.2's
+per-daemon vs cross-runtime split for activity events) or whether a
+single family topic with <code>details.svc</code> filtering is sufficient is open.
+Resolution is informed by the same evidence as SPEC 07 §10's open
+question on activity-event topic naming — keep the answers aligned.</p>
+<h3 id="97-promotion-to-stable">9.7 Promotion to stable</h3>
+<p>This SPEC moves from <code>draft</code> to <code>stable</code> when:</p>
+<ul>
+<li>(a) <code>cosmix-lib-core</code> ships with the §3 primitives extracted.</li>
+<li>(b) The standard ladder (§5.1) is implemented in a meta-supervisor and
+has run for ≥ 60 days against real signals.</li>
+<li>(c) Schema drift handling (§7) is implemented in indexd and at least one
+other daemon.</li>
+<li>(d) §6 LKG retention has caught at least one bad deploy (the proof point
+that the mechanism works under real conditions).</li>
+</ul>
+<hr />
+<p><em>Document created: 2026-04-25. Drafted in collaboration between Mark
+Constable and Claude Opus 4.7 as the second of three substrate-layer
+SPECs (self-aware / self-repair / self-improve).</em></p>
+<p><em>§5.4 reconciled with SPEC 07 §3.5 activity-event taxonomy and §8.6
+worked example added 2026-05-03 — sister to SPEC 07 §8.4. Driver: the
+Phase 7 cosmix-mds release shipped concrete repair primitives (verify,
+rebuild_index as reset-state, gc with quiescence, SIGKILL recovery test,
+export/import as set-level LKG, post-commit emission discipline) which
+this SPEC could now anchor against rather than against contracts whose
+implementing crate (cosmix-lib-core, §9.3) does not yet exist. New open
+questions §9.5 (per-tenant halt scope) and §9.6 (repair-event
+subscription cardinality) surfaced during the §8.6 drafting.</em></p>
+<h2 id="part-b--gated-improvement-legacy-chapter-09">Part B — Gated improvement (legacy chapter 09)</h2>
+<p>The following section numbers refer to Part B. Calls back to repair §6/§7 refer to Part A. Neither proposal acceptance nor an L3 content grant overrides the invocation's actual resource scope and authorisation.</p>
+<h2 id="1-purpose-and-non-goals-1">1. Purpose and Non-Goals</h2>
+<p><strong>Purpose.</strong> Specify the mechanism by which Cosmix improves itself: how
+signals become proposals, how proposals are triaged, how applications are
+gated by trust class, how outcomes feed back into future selection. Bind the
+mechanism tightly enough that an agent reading this SPEC can implement and
+operate the loop without consulting the operator on routine cases.</p>
+<p><strong>Non-goals.</strong></p>
+<ul>
+<li><strong>Replace the constitution.</strong> Article IV defines tier ladder and policy
+matrix; this SPEC defines mechanism within those constraints. Where they
+appear to conflict, the constitution wins.</li>
+<li><strong>Specify the renderer or display surface for proposal review.</strong> That
+belongs in a future GUI SPEC. The contract here is over ABP topics and
+capability namespaces; any surface meeting the contract is conformant.</li>
+<li><strong>Settle the autonomous-rebuild question.</strong> Whether the substrate will
+ever apply code-modifying proposals without explicit approval is a
+constitutional question (Article IV). This SPEC enumerates the gating
+required <em>if</em> such autonomy is ever extended; it does not advocate for it.</li>
+<li><strong>Re-derive AI-safety canon.</strong> The genuine risks here are operational:
+feedback collapse, drift, identity confusion, irreversible application.
+ARA-frontier framings do not apply (cf. project memory
+<code>project_substrate_layer_split.md</code>).</li>
+</ul>
+<hr />
+<h2 id="2-the-five-stage-loop">2. The Five-Stage Loop</h2>
+<p>Every improvement traverses five stages. Each stage has a dedicated topic
+family on ABP and a dedicated capability on the originating service.</p>
+<pre><code>observe → propose → triage → apply → learn-back
+   ▲                                       │
+   └───────────────────────────────────────┘
+</code></pre>
+<table><thead><tr><th>Stage</th><th>Trigger</th><th>Surface</th><th>Output</th></tr></thead><tbody>
+<tr><td><strong>observe</strong></td><td>signal from SPEC 07 (props.changed, world.*, harness.events) or human input</td><td>service-internal</td><td>candidate set</td></tr>
+<tr><td><strong>propose</strong></td><td>candidate ranked above threshold</td><td><code>improve.proposals</code> topic + Proposal record</td><td>proposal id</td></tr>
+<tr><td><strong>triage</strong></td><td>proposal received</td><td>triage capability per service + <code>improve.triage</code> topic</td><td>accept / defer / reject + rationale</td></tr>
+<tr><td><strong>apply</strong></td><td>triage = accept AND gate satisfied</td><td>service-internal + <code>improve.applied</code> topic</td><td>applied id + outcome record</td></tr>
+<tr><td><strong>learn-back</strong></td><td>outcome observed within window</td><td>feedback capability + <code>improve.outcomes</code> topic</td><td>adjusted scoring for future observe</td></tr>
+</tbody></table>
+<p><strong>Idempotency.</strong> Every stage MUST be idempotent on its input identifier.
+Replaying a stage with the same id MUST NOT produce duplicate side effects.
+This is the substrate's hedge against the loop firing twice during a partial
+restart.</p>
+<p><strong>Audit trailer.</strong> Every transition MUST emit an audit trailer per
+constitution Article IV.4, with <code>proposal_id</code>, <code>from_stage</code>, <code>to_stage</code>, and
+<code>gate_class</code> (see §3).</p>
+<hr />
+<h2 id="3-change-classes-and-the-trust-gradient">3. Change Classes and the Trust Gradient</h2>
+<p>Five change classes, each with explicit gating. The class is determined at
+the <strong>propose</strong> stage and travels with the proposal through all subsequent
+stages. The class MUST NOT be downgraded after triage; if a proposal turns
+out to require a higher class, it MUST be rejected and re-proposed.</p>
+<table><thead><tr><th>Class</th><th>Examples</th><th>Gating</th><th>Reversal</th></tr></thead><tbody>
+<tr><td><strong>L0 — read-only learning</strong></td><td>scoring updates, retrieval-rank tweaks, summarisation cache</td><td>automatic; no review</td><td>discard cache</td></tr>
+<tr><td><strong>L1 — proposing</strong></td><td>a candidate skill, a candidate config change, a candidate doc edit</td><td>automatic to surface; no apply</td><td>drop proposal</td></tr>
+<tr><td><strong>L2 — first execution</strong></td><td>first run of a newly proposed skill or action</td><td><strong>human-in-loop</strong> (explicit accept)</td><td>abort / undo per skill</td></tr>
+<tr><td><strong>L3 — content-addressed re-execution</strong></td><td>nth run of a skill whose content hash matches a previously approved hash</td><td>TOFU (trust on first use) bound to <code>&lt;name&gt;:&lt;sha256-of-content&gt;</code></td><td>revert by content hash; refuse hash drift</td></tr>
+<tr><td><strong>L4 — code-modifying / destructive</strong></td><td>binary swap, schema migration, ABP topic deletion, constitution edit, <code>cosmix-*.lkg</code> rotation, secret rotation</td><td>explicit operator approval per occurrence; quorum per §6 if autonomous quorum is ever enabled</td><td>per SPEC 08 §6 atomic deploy + LKG</td></tr>
+</tbody></table>
+<p><strong>The L2 → L3 transition is the only place TOFU is granted.</strong> All other
+class transitions are forbidden. A skill at L3 that is refined into a new
+content (different sha256) re-enters at L2 — the previous TOFU does not
+transfer (cf. §4).</p>
+<p><strong>Article VI invariants override class.</strong> A proposal whose target is on the
+forbidden-targets list (constitution VI) is rejected at triage regardless
+of class, with cause = <code>forbidden_target</code>.</p>
+<h3 id="31-tool-surface-authority--a-projection-of-the-change-class-gradient">3.1 Tool-surface authority — a projection of the change-class gradient</h3>
+<p>The L0–L4 gradient above governs <em>change proposals</em> (skills, configs,
+code edits) — artifacts that travel through the five-stage loop (§2).
+The same gradient also governs <em>agent tool surfaces</em>: any tool exposed
+to an agent runtime (cf. SPEC 07 §3.5.7) is classified by the same
+gradient at registration time, and the runtime MUST refuse to invoke a
+tool whose authority class exceeds the runtime's mounted ceiling.</p>
+<p>Tool surfaces project onto a <strong>subset</strong> of the gradient, because L1 and
+L3 are skill-lifecycle concepts that don't exist at single-call
+granularity:</p>
+<table><thead><tr><th>Class</th><th>Tool meaning</th><th>Examples</th></tr></thead><tbody>
+<tr><td><strong>L0 — read-only</strong></td><td>The tool reads substrate state; no observable side effect outside the agent's view.</td><td><code>props.get</code>, <code>world.&lt;svc&gt;</code> snapshot, <code>context_search</code>, <code>log_search</code>, <code>bus_list_services</code>.</td></tr>
+<tr><td><strong>L2 — staged write</strong></td><td>The tool mutates substrate state but only through a path that supports dry-run and is scoped to a bounded blast radius (single workspace, single set, single file under an explicit path). First invocation of a newly-mounted L2 provider requires operator acceptance per §3 L2.</td><td><code>index_workspace</code> (deletes + re-stores under a workspace root), <code>write_file</code> (path-scoped), <code>mds.export</code> to an operator-supplied path.</td></tr>
+<tr><td><strong>L4 — code-modifying or unbounded write</strong></td><td>The tool mutates code, schemas, secrets, or unbounded substrate state.</td><td><code>bus_call</code> to arbitrary service, <code>mix_execute</code>, binary swap, schema migration, ABP topic deletion, secret rotation, <code>cosmix-*.lkg</code> rotation.</td></tr>
+</tbody></table>
+<p>L1 (proposing) and L3 (TOFU on content-addressed re-execution) are the
+skill-lifecycle states a <em>proposal</em> passes through; a tool <em>invocation</em>
+is one event in time and projects onto L0/L2/L4. A skill execution is
+the special case where an L3 <em>proposal</em> state is enacted via an L2 or
+L4 <em>tool invocation</em> — the gradient agrees on what the action is even
+when the lifecycle state and the call state differ.</p>
+<p><strong>Why the same gradient, not a parallel one.</strong> A tool that ultimately
+swaps a binary is L4 in both senses — the danger doesn't change because
+the artifact is invoked rather than proposed. Inventing a parallel
+<code>Authority::*</code> taxonomy would make every audit join (constitution V.5)
+have to reconcile two enums for the same concept. The implementation in
+<code>cosmix-lib-tools</code> (per the unification plan) uses the L0/L2/L4 enum
+exactly because this SPEC owns the gradient.</p>
+<p><strong>Catalog vs mount.</strong> A runtime maintains two distinct registers:</p>
+<ul>
+<li>The <strong>catalog</strong> lists every provider known to the runtime, regardless
+of authority class. Catalog entries appear in <code>tools.list</code> (or the
+equivalent agent-facing enumeration) so the agent can see <em>what
+exists</em> and reason about it.</li>
+<li>The <strong>mount set</strong> is the subset of catalog entries the runtime will
+actually invoke. Membership is governed by the runtime's
+authority-class ceiling (declared at startup) and by per-provider
+grants.</li>
+</ul>
+<p>A provider whose <code>authority()</code> exceeds the runtime's ceiling MUST be
+catalogued but MUST NOT be mounted. The runtime MUST NOT silently omit
+it. In <code>tools.list</code> it appears with <code>gated_authority: &lt;class&gt;</code> and
+<code>mountable: false</code>, plus a stable <code>grant_token</code> the agent can present
+when requesting a per-call grant. Invocation of an un-mounted provider
+returns <code>Refused { reason: "authority_gated", required: &lt;class&gt; }</code> —
+not "tool not found". This refusal-with-context is what lets an agent
+know to ask for an upgrade rather than work around the absence.</p>
+<p><strong>Defaults.</strong> <code>cosmix-mcp</code> (in-the-loop operator implicit) ceilings at
+L4; every provider is catalogued <em>and</em> mounted. <code>cosmix-agentd</code>
+(autonomous) ceilings at L2; L4 providers are catalogued but not
+mounted, awaiting a per-call grant from the operator (Tier 1
+acceptance per constitution IV.2) or a session-scoped policy upgrade.</p>
+<p><strong>Why startup-failure isn't the right default.</strong> An earlier draft of
+this section required over-ceiling providers to refuse registration as
+a startup error. That made every agentd startup against the full
+provider catalog impossible, contradicting the unification plan's
+explicit goal of mounting one shared catalog in both runtimes. The
+catalog/mount split preserves the <em>visibility</em> property (operator and
+agent both see the gap) without forcing it through a registration
+failure that would conflate "this tool is absent" with "this tool is
+gated."</p>
+<p><strong>Cross-reference.</strong> Per-tool capability scoping (paths, set UUIDs,
+HTTP origins) is orthogonal to authority class — a tool can be L2 with
+a workspace-root scope, L2 with a per-set scope, etc. The
+unification plan's <code>CapabilityRequest</code> carries the scope; this SPEC's
+class carries the gradient. Both apply at every invocation.</p>
+<hr />
+<h2 id="4-skill-content-addressing">4. Skill Content Addressing</h2>
+<p>Skills are the canonical L3 case. Their identity MUST be bound on <strong>content
+hash</strong>, not name. Otherwise L3's "trust on first use" degrades into "trust
+all future regenerations of anything called X" — a drift surface the
+constitution's audit trailers cannot detect.</p>
+<p><strong>Identity.</strong> A skill's pinned identity is <code>&lt;name&gt;:&lt;sha256-of-canonical-content&gt;</code>,
+where canonical-content is the deterministic serialisation defined in the
+skills-store contract (TBD; see §10 open question). The bare name is a
+convenience handle, not an identity.</p>
+<p><strong>TOFU rule.</strong> Granting L3 to <code>skill_X:hash_A</code> does NOT grant L3 to
+<code>skill_X:hash_B</code>. The latter is L2 and re-prompts the operator on first
+execution. This applies regardless of how the content changed (manual
+refinement, automated refinement, store migration, model-version drift).</p>
+<p><strong>Storage contract.</strong> The skills store MUST persist the content hash with
+each skill record and MUST refuse to return a skill under a TOFU grant if
+the stored hash does not match the granted hash. The grant record itself is
+indexed by <code>&lt;name&gt;:&lt;hash&gt;</code> and has no fallback.</p>
+<p><strong><code>skills_refine</code> semantics.</strong> Refining a skill produces a new content and
+therefore a new hash. The grant on the old hash is preserved (audit) but
+no longer applicable to retrieval; the new hash starts at L2.</p>
+<hr />
+<h2 id="5-feedback-collapse-guard">5. Feedback-Collapse Guard</h2>
+<p>The current skills loop has a known feedback-collapse problem: <code>skills_refine</code>
+is called by the same agent that just executed the skill. The agent that
+ran the skill is not an independent evaluator — it has every incentive to
+confirm its own selection.</p>
+<p><strong>Rule.</strong> <code>skills_refine</code> (and any equivalent learn-back signal) MUST NOT
+be the sole input to L1 → L2 promotion or to L3 grant renewal. At least one
+of the following independent signals MUST also be present:</p>
+<ul>
+<li>a different agent (different session id, different operator, or a
+designated evaluator agent) ran the same skill on a related task and
+emitted a refine signal;</li>
+<li>an out-of-band check (test pass, schema validation, lint pass) succeeded;</li>
+<li>a downstream consumer (different service in the mesh) emitted a
+positive <code>world.*</code> signal correlated to the skill's effect window.</li>
+</ul>
+<p><strong>Implementation hook.</strong> The triage stage (§2) MUST read the proposal's
+signal set and reject (or defer) any proposal whose only positive signal
+is from the originating agent identity. The cause field is <code>feedback_collapse</code>.</p>
+<p><strong>Why this isn't paranoia.</strong> A skill that survives only because its author
+keeps confirming it has not been validated; it has been laundered. The
+substrate's modifiability criterion requires that improvements be
+<em>detectable improvements</em>, which requires independent measurement.</p>
+<hr />
+<h2 id="6-multi-agent-quorum-for-l4-code-modifying-proposals">6. Multi-Agent Quorum (For L4 Code-Modifying Proposals)</h2>
+<p>L4 proposals (code-modifying or destructive) require explicit operator
+approval per occurrence under the current constitution (Article IV.2). If
+constitution Article IV is ever amended to permit autonomous L4 application,
+the gate MUST satisfy the minimum quorum contract below.</p>
+<p><strong>Minimum contract for quorum (when enabled).</strong></p>
+<ul>
+<li>At least three agents from non-correlated sessions (different model
+versions or different operator origins) MUST independently approve.</li>
+<li>Each agent MUST have read the proposal, its diff, its triage record, and
+the affected SPEC chapter(s).</li>
+<li>A single dissent MUST defer the proposal to operator review; quorum is
+not majority-rule.</li>
+<li>The quorum record (agent identities, timestamps, signed approvals) MUST
+be persisted as an audit artefact and is itself L4 (immutable).</li>
+</ul>
+<p><strong>Until the constitution permits autonomous L4, this section is dormant.</strong>
+It is specified now so that any future amendment has a concrete mechanism
+to point at, rather than re-litigating quorum at amendment time.</p>
+<hr />
+<h2 id="7-rollback-for-self-modifying-components">7. Rollback for Self-Modifying Components</h2>
+<p>L4 changes that modify executables, schemas, or specs MUST be revertible
+through the SPEC 08 §6 atomic deploy + LKG contract. This SPEC adds three
+proposal-side requirements:</p>
+<ol>
+<li><strong>Pre-apply LKG capture.</strong> Before applying an L4 proposal, the apply
+stage MUST verify that an LKG snapshot of every artefact the proposal
+touches exists and is healthy (smoke-test rc 0).</li>
+<li><strong>Apply window.</strong> L4 application MUST occur within a single ABP
+transaction window: either all artefacts swap or none. Partial L4 is
+forbidden; on partial failure, SPEC 08 §6 rollback applies.</li>
+<li><strong>Revert proposal.</strong> Every applied L4 proposal MUST emit a
+<code>revert_proposal_id</code> referring to a pre-generated, validated reversal.
+The reversal does not itself need approval at apply time — it inherits
+the original's grant. This makes Article IV.5 circuit-breaker reverts
+mechanical rather than discretionary.</li>
+</ol>
+<p>Schema migrations follow SPEC 08 §7 drift discipline: forward auto, backward
+refused, breaking requires operator. Self-improve does not relax those
+rules; it only enforces that L4 schema proposals carry a backward-compatible
+revert proposal alongside.</p>
+<hr />
+<h2 id="8-constitution-interlock">8. Constitution Interlock</h2>
+<p>This SPEC operates within constitution Article IV's policy matrix. The
+mapping:</p>
+<table><thead><tr><th>Constitution clause</th><th>This SPEC's mechanism</th></tr></thead><tbody>
+<tr><td><strong>IV.1 propose-only autonomy</strong></td><td>L1 (propose) automatic; surfaces to <code>improve.proposals</code> topic</td></tr>
+<tr><td><strong>IV.2 first-execution gate</strong></td><td>L2 → L3 transition; TOFU on content hash (§4)</td></tr>
+<tr><td><strong>IV.3 scope classes</strong></td><td>proposal record carries scope class; triage rejects mismatched class+target combinations</td></tr>
+<tr><td><strong>IV.4 audit trailers</strong></td><td>every stage transition emits trailer (§2)</td></tr>
+<tr><td><strong>IV.5 circuit breaker</strong></td><td>revert_threshold/window_days/pause_hours apply at the apply stage; revert_proposal_id (§7) makes breaker mechanical</td></tr>
+<tr><td><strong>VI forbidden targets</strong></td><td>triage rejects with cause = forbidden_target regardless of class</td></tr>
+<tr><td><strong>VII amendment process</strong></td><td>constitution edits are L4 by definition; require operator-authored commit per VII.1</td></tr>
+</tbody></table>
+<p><strong>Constitution amendments are L4 with extra constraints.</strong> A proposal to
+edit the still-authoritative legacy <code>_spec/2026-04-20-00-constitution.md</code>
+MUST: (a) carry an Article VII amends
+field, (b) have a corresponding CHANGELOG entry, (c) be operator-authored
+in the commit step. This SPEC does not relax VII.1; the proposal mechanism
+prepares the diff but does not commit it.</p>
+<p>The candidate authority/foundations split is not a ratified replacement target.
+Authority cutover must explicitly map the protected constitution and its Article
+VII procedure; renaming a document cannot bypass or silently redirect that gate.</p>
+<hr />
+<h2 id="9-required-topics-and-capabilities">9. Required Topics and Capabilities</h2>
+<p><strong>Topics (retained snapshots per SPEC 03).</strong></p>
+<ul>
+<li><code>improve.proposals.&lt;service&gt;</code> — open proposals targeting <code>&lt;service&gt;</code></li>
+<li><code>improve.triage.&lt;service&gt;</code> — triage decisions</li>
+<li><code>improve.applied.&lt;service&gt;</code> — apply outcomes</li>
+<li><code>improve.outcomes.&lt;service&gt;</code> — learn-back records</li>
+<li><code>improve.grants</code> — active L3 grants by <code>&lt;name&gt;:&lt;hash&gt;</code> (mesh-wide)</li>
+<li><code>improve.quorum</code> — quorum records, when §6 is enabled</li>
+</ul>
+<p><strong>Capabilities (per service, discoverable via SPEC 07 §5 <code>spec.get</code>).</strong></p>
+<ul>
+<li><code>&lt;svc&gt;.improve.propose</code> — submit a proposal (returns proposal_id)</li>
+<li><code>&lt;svc&gt;.improve.triage</code> — request triage (idempotent on proposal_id)</li>
+<li><code>&lt;svc&gt;.improve.apply</code> — apply an accepted proposal (idempotent)</li>
+<li><code>&lt;svc&gt;.improve.refine</code> — submit learn-back signal (subject to §5 guard)</li>
+</ul>
+<p>A service that bears no improvement surface (e.g., a pure transit daemon)
+MAY omit these capabilities, but MUST advertise the omission via
+<code>spec.get</code> so agents do not retry.</p>
+<hr />
+<h2 id="10-open-questions">10. Open Questions</h2>
+<ul>
+<li><strong>Rejection ledger.</strong> Where do rejected proposals live? Per-service
+topic, or a mesh-wide ledger? An agent that re-proposes a rejected idea
+needs a way to find the prior rejection; otherwise rejection is silent
+and the loop wastes triage cycles.</li>
+<li><strong>First-execution human gate surface.</strong> L2 requires human-in-loop, but
+the surface is not specified here (intentionally — display SPEC pending).
+The contract is "operator must explicitly accept"; the implementation
+may be a CLI prompt, a desktop notification, an SMS, or a queued review
+list. Which is canonical?</li>
+<li><strong>Quorum applicability.</strong> §6 enumerates the contract for autonomous L4
+quorum, but the constitution does not currently permit autonomous L4.
+Should §6 be removed until the constitution permits it, or kept as
+forward provision? Current draft keeps it as forward provision.</li>
+<li><strong>Skill canonicalisation.</strong> §4 references "deterministic serialisation
+defined in the skills-store contract" — that contract does not yet
+fully specify whitespace, metadata ordering, or refinement-history
+inclusion. Pending in the skills-store implementation.</li>
+<li><strong>Cross-mesh proposals.</strong> A proposal originating on mesh node A
+affecting service on node B: who triages, who applies, where the audit
+trailer lives. Defer to a cross-mesh extension SPEC.</li>
+<li><strong><code>historical self-updating-systems exploration (2026-04-20)</code> retirement.</strong>
+When does the doc move to historical? Suggested: when SPEC 09 reaches
+status <code>stable</code> and at least one service implements the full loop end
+to end.</li>
+</ul>
+<hr />
+<h2 id="conformance">Conformance</h2>
+<p>A service is <strong>L0-conformant</strong> if it does not participate in the improve
+loop and advertises the omission via <code>spec.get</code>.</p>
+<p>A service is <strong>L1-conformant</strong> if it emits proposals on <code>improve.proposals.&lt;svc&gt;</code>
+with valid Proposal records and accepts triage decisions on
+<code>improve.triage.&lt;svc&gt;</code>.</p>
+<p>A service is <strong>L2-conformant</strong> if it additionally enforces the first-execution
+human-in-loop gate for L2 proposals targeting itself, including refusal to
+apply absent an explicit operator acceptance record.</p>
+<p>A service is <strong>L3-conformant</strong> if it additionally honours content-addressed
+TOFU per §4: storing hashes, refusing drift, and re-prompting on hash
+change.</p>
+<p>A service is <strong>L4-conformant</strong> if it additionally meets §7 rollback
+requirements: pre-apply LKG verification, atomic apply window, and
+revert_proposal_id emission.</p>
+<p>The mesh as a whole is conformant at the lowest conformance level of any
+participating service.</p>
+<hr />
+<p><em>§3.1 (tool-surface authority projection) added 2026-05-03 to make the
+L0–L4 change-class gradient the canonical taxonomy for agent tool
+surfaces as well as change proposals. Driver: the agentd ↔ mcp
+unification plan (<code>historical agent-runtime unification plan (2026-05-03)</code>) introduces an <code>Authority::L0/L2/L4</code> enum on the shared
+<code>ToolProvider</code> trait; without a SPEC home the implementation would have
+been a parallel taxonomy that future runtimes would have had to
+reconcile. Pinning it here keeps every audit chain (constitution V.5)
+joining on a single gradient.</em></p></div></div>
     </div>
 
 </main>
@@ -620,6 +1571,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1625,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1754,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

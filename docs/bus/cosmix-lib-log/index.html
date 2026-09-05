@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/cosmix-lib-log/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,134 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/cosmix-lib-log/README.md"><div class="prose"><h1 id="cosmix-lib-log">cosmix-lib-log</h1>
+<p><code>cosmix-lib-log</code> is the shared logging and process-statistics library for Cosmix binaries. It installs a reloadable <code>tracing</code> subscriber, selects stderr, rolling-file, and journald sinks, bridges records from the <code>log</code> facade, and can install a cardinality-bounded <code>metrics</code> recorder with JSONL, snapshot, Bus, and Prometheus surfaces. The crate lives in the <code>bus</code> protocol layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: its core has no dependency on <code>mix</code> or <code>cos</code>, and its optional Bus handler depends only on <code>cosmix-lib-client</code> in the same layer.</p>
+<p>The Cargo package is <code>cosmix-lib-log</code>; its Rust library name is <code>cosmix_log</code>.</p>
+<h2 id="features">Features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Provides</th></tr></thead><tbody>
+<tr><td><code>default</code></td><td style="text-align: right">Yes</td><td>Empty feature set. Core logging, reload, stats recorder, snapshots, roll-ups, and JSONL support remain available.</td></tr>
+<tr><td><code>bus-handlers</code></td><td style="text-align: right">No</td><td><code>stats::handle_snapshot_bus</code>, <code>stats::SnapshotCaps</code>, and the <code>&lt;svc&gt;.stats.snapshot</code> wire adapter. Adds <code>cosmix-lib-client</code>.</td></tr>
+<tr><td><code>prometheus</code></td><td style="text-align: right">No</td><td><code>LogHandle::attach_prometheus</code>, <code>stats::PrometheusChild</code>, and the HTTP <code>/metrics</code> exporter. Adds the Prometheus exporter, its matching <code>metrics-util</code>, and Tokio.</td></tr>
+</tbody></table>
+<h2 id="logging-bootstrap">Logging bootstrap</h2>
+<p><code>init</code> is the normal entry point:</p>
+<pre><code class="language-rust">use cosmix_log::{init, LogDefaults, LogOpts, StatsOpts};
+
+#[derive(clap::Parser)]
+struct Cli {
+    #[command(flatten)]
+    log: LogOpts,
+
+    #[command(flatten)]
+    stats: StatsOpts,
+}
+
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let cli = &lt;Cli as clap::Parser&gt;::parse();
+    let _log = init(
+        &amp;cli.log,
+        &amp;cli.stats,
+        LogDefaults::daemon("alpha-service"),
+    )?;
+
+    tracing::info!("service started");
+    Ok(())
+}
+</code></pre>
+<p>Hold the returned <code>LogHandle</code> for the process lifetime. It owns non-blocking appender guards, flushes file output when dropped, and performs the final stats roll-up and sink flush. Call <code>LogHandle::shutdown</code> explicitly before <code>std::process::exit</code>, because that function skips destructors.</p>
+<p>When stats are enabled, <code>init</code> installs the stats recorder before it installs the tracing subscriber. Admitted tracing events therefore reach the built-in event counter from the first event.</p>
+<p>stdout is reserved for protocol output. Logging sinks write to stderr, files, or journald.</p>
+<h2 id="filter-selection-and-reload">Filter selection and reload</h2>
+<p>The bootstrap filter precedence is:</p>
+<ol>
+<li>A non-empty <code>RUST_LOG</code> value.</li>
+<li><code>LogOpts.log_filter</code>, appended to the selected base directive.</li>
+<li><code>LogOpts.log_level</code>.</li>
+<li><code>LogDefaults.default_filter</code>, or a directive derived from <code>default_target</code> and <code>level</code>.</li>
+</ol>
+<p>Later directives in an <code>EnvFilter</code> take precedence over earlier directives. <code>LogLevel</code> accepts <code>none</code>, <code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, and <code>trace</code>.</p>
+<p><code>none</code> installs an <code>EnvFilter::off()</code> subscriber behind the reload layer. It does not remove the subscriber, so a later filter reload can enable logging without a restart.</p>
+<pre><code class="language-rust">let reload = log.reload_handle().expect("subscriber installed");
+reload.reload_filter("alpha_service=debug,cosmix_bus=warn".parse()?)?;
+</code></pre>
+<p><code>LogReloadHandle</code> is cloneable. <code>reload_filter</code> returns <code>LogError::Reload</code> if its subscriber no longer exists.</p>
+<h2 id="sinks-and-formats">Sinks and formats</h2>
+<p><code>LogFormat</code> selects <code>human</code> or <code>json</code> output. <code>TriState</code> supplies <code>auto</code>, <code>always</code>, and <code>never</code> for stderr and colour selection.</p>
+<p>The rolling-file sink uses <code>RotationMode::Daily</code> or <code>RotationMode::Never</code>. File and journald setup failures are non-fatal: the crate reports the failure to stderr when possible and continues with the remaining sinks.</p>
+<p>The <code>tracing-subscriber</code> <code>tracing-log</code> integration installs the <code>log</code>-to-<code>tracing</code> bridge. Dependencies that emit through the <code>log</code> facade therefore use the same filters and sinks.</p>
+<h2 id="defaults">Defaults</h2>
+<table><thead><tr><th>Constructor</th><th>Level and format</th><th>Sinks</th><th>Stats</th></tr></thead><tbody>
+<tr><td><code>LogDefaults::daemon(identity)</code></td><td><code>info</code>, JSON</td><td>journald; no rolling file</td><td>Enabled, 60-second interval value, no JSONL file</td></tr>
+<tr><td><code>LogDefaults::serve(identity)</code></td><td><code>info</code>, human</td><td>journald; no rolling file</td><td>Disabled</td></tr>
+<tr><td><code>LogDefaults::gui(identity)</code></td><td><code>warn</code>, human</td><td>stderr fallback; no file or journald</td><td>Disabled</td></tr>
+<tr><td><code>LogDefaults::default()</code></td><td><code>warn</code>, human</td><td>stderr fallback; no file or journald</td><td>Disabled</td></tr>
+</tbody></table>
+<p>Builder-style methods set the Bus service, log directory, rotation, journald state, level, format, baseline filter, stats state, roll-up interval, stats file, byte budget, and Prometheus listener.</p>
+<p><code>default_log_dir()</code> returns <code>$HOME/.local/log/cosmix</code> and falls back to <code>/tmp/cosmix-log</code> when <code>HOME</code> is unset.</p>
+<h2 id="flattened-logging-options">Flattened logging options</h2>
+<p><code>LogOpts</code> is a <code>clap::Args</code> type. Every field is optional; an absent flag leaves the corresponding <code>LogDefaults</code> value in force.</p>
+<table><thead><tr><th>Flag</th><th>Values or effect</th></tr></thead><tbody>
+<tr><td><code>--log-level</code></td><td><code>none</code>, <code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, or <code>trace</code></td></tr>
+<tr><td><code>--log-filter</code></td><td>An <code>EnvFilter</code> directive appended to the base filter</td></tr>
+<tr><td><code>--log-format</code></td><td><code>human</code> or <code>json</code></td></tr>
+<tr><td><code>--log-stderr</code></td><td><code>auto</code>, <code>always</code>, or <code>never</code></td></tr>
+<tr><td><code>--log-file</code></td><td>Rolling-file directory; an empty value disables the sink</td></tr>
+<tr><td><code>--log-journald</code></td><td>Boolean journald override</td></tr>
+<tr><td><code>--log-color</code></td><td><code>auto</code>, <code>always</code>, or <code>never</code></td></tr>
+</tbody></table>
+<p>In automatic stderr mode, stderr is enabled when journald is not active. This avoids duplicate entries when journald is available and preserves a fallback when it is not.</p>
+<h2 id="flattened-stats-options">Flattened stats options</h2>
+<p><code>StatsOpts</code> is independent of <code>LogOpts</code>. A binary includes it by flattening it into its own parser.</p>
+<table><thead><tr><th>Flag</th><th>Values or effect</th></tr></thead><tbody>
+<tr><td><code>--stats</code></td><td><code>off</code> or <code>on</code></td></tr>
+<tr><td><code>--stats-interval</code></td><td>Roll-up seconds; <code>0</code> means final flush only, otherwise <code>1..=3600</code></td></tr>
+<tr><td><code>--stats-file</code></td><td>JSONL output stem; an empty value disables disk persistence</td></tr>
+<tr><td><code>--stats-on-exit</code></td><td>Parsed as <code>off</code> or <code>on</code>; the current <code>init</code> path does not consult it</td></tr>
+<tr><td><code>--stats-byte-budget</code></td><td>Daily soft budget in MiB; accepted range is 16 through 1024</td></tr>
+<tr><td><code>--stats-prometheus-listen</code></td><td>Listener override exposed to the caller; <code>init</code> does not attach the exporter</td></tr>
+</tbody></table>
+<p>Invalid filter syntax, double subscriber installation, failed reloads, and invalid stats bounds are represented by <code>LogError</code>.</p>
+<p><code>init</code> validates <code>stats_interval</code> but does not schedule periodic roll-ups. The host runtime calls <code>stats::perform_rollup</code> at its chosen cadence. <code>LogHandle</code> always performs the final roll-up from <code>shutdown</code> and <code>Drop</code>.</p>
+<h2 id="stats-recorder">Stats recorder</h2>
+<p><code>stats::StatsRecorderBuilder</code> constructs a <code>StatsRecorder</code> for a service identity. It accepts a default per-metric cardinality cap and named overrides. Valid caps range from <code>CARDINALITY_FLOOR</code> (16) through <code>CARDINALITY_CEILING</code> (4096); the default is <code>CARDINALITY_DEFAULT</code> (1024).</p>
+<p><code>StatsRecorder::install</code> claims the process-wide <code>metrics::Recorder</code> slot. Only one recorder can be installed. <code>StatsRecorder::add_sink</code> registers <code>Arc&lt;dyn StatsSink&gt;</code> backends, while <code>stats::add_sink_to_installed</code> adds a sink to the process-installed recorder.</p>
+<p>The recorder accepts the standard <code>metrics</code> counter, gauge, and histogram macros. New label sets above a metric's cap receive no-op handles and increment <code>cosmix_stats_cardinality_drops_total</code>.</p>
+<h2 id="classification-and-redaction">Classification and redaction</h2>
+<p>Call <code>stats::classify(name, LabelSensitivity::Safe)</code> for metric families whose label values are bounded and non-sensitive. Unclassified families default to <code>Restricted</code>.</p>
+<p>Restricted families use <code>SeriesLabels::Hash</code> on cross-process and JSONL surfaces unless the caller is authorised for raw labels. <code>stats::labels_hash</code> returns the canonical, lowercase, 16-character FxHash digest; <code>stats::labels_hash_bytes</code> exposes the frozen length-prefixed input encoding.</p>
+<p>The digest is a stable correlation identifier, not a cryptographic redaction primitive.</p>
+<h2 id="snapshots-and-roll-ups">Snapshots and roll-ups</h2>
+<p><code>stats::local_snapshot()</code> returns the installed recorder as a <code>Snapshot</code>. In-process snapshots always carry raw labels. If no recorder is installed, it returns an empty snapshot.</p>
+<p>The snapshot model consists of:</p>
+<ul>
+<li><code>Snapshot</code>, containing the service identity, capture time, and metric families.</li>
+<li><code>MetricFamily</code>, containing the name, kind, optional description, and series.</li>
+<li><code>Series</code>, with <code>SeriesLabels</code> and a <code>SeriesValue</code>.</li>
+<li><code>SeriesValue</code>, covering counters, gauges, and histogram summaries.</li>
+<li><code>HistogramSummary</code>, containing count, sum, p50, p95, and p99.</li>
+</ul>
+<p><code>stats::snapshot_dispatch</code> applies an optional <code>MetricPattern</code>, label predicates, label hashes, and raw-label capability state to a recorder snapshot. Exact, prefix, and suffix metric patterns are supported.</p>
+<p><code>stats::perform_rollup</code> sends one <code>PeriodSnapshot</code> to every registered <code>StatsSink</code>. Each <code>PeriodRecord</code> carries both the cumulative value and the current-period delta. <code>flush_all_sinks</code> flushes all sinks, and <code>shutdown_installed_recorder</code> performs the final zero-second roll-up before flushing.</p>
+<h2 id="jsonl-sink">JSONL sink</h2>
+<p><code>stats::JsonlSink::daemon</code> and <code>stats::JsonlSink::delta</code> create per-process JSONL sinks. The live filename ends in <code>.jsonl.open</code>; <code>StatsSink::flush</code> fsyncs it and renames it to <code>.jsonl.done</code>.</p>
+<p>The configurable byte budget is a soft daily warning threshold. <code>HARD_BUDGET_BYTES</code> fixes the hard daily ceiling at 1 GiB; crossing it pauses disk appends until the next UTC day without stopping in-memory recording.</p>
+<h2 id="bus-snapshot-handler">Bus snapshot handler</h2>
+<p>With <code>bus-handlers</code>, <code>stats::handle_snapshot_bus</code> handles <code>&lt;svc&gt;.stats.snapshot</code>. The request body is empty and the optional headers are:</p>
+<table><thead><tr><th>Header</th><th>Form</th></tr></thead><tbody>
+<tr><td><code>metric</code></td><td>Exact name, <code>prefix*</code>, or <code>*suffix</code></td></tr>
+<tr><td><code>labels</code></td><td>JSON object; string values mean exact match and <code>null</code> means key presence</td></tr>
+<tr><td><code>labels_hash</code></td><td>Comma-separated 16-character hexadecimal digests</td></tr>
+</tbody></table>
+<p><code>SnapshotCaps.has_snapshot</code> controls admission to the verb. <code>SnapshotCaps.has_raw_labels</code> permits raw labels for restricted families and exact-value filters that would otherwise create a probe oracle.</p>
+<p>The handler returns the <code>(rc, body)</code> pair expected by the broker client response path. Successful bodies contain <code>service</code>, <code>captured_at</code>, and <code>metrics</code>. Responses larger than <code>SNAPSHOT_MAX_RESPONSE_BYTES</code> (1 MiB) are rejected.</p>
+<h2 id="prometheus-exporter">Prometheus exporter</h2>
+<p>With <code>prometheus</code>, call <code>LogHandle::attach_prometheus</code> after <code>init</code>, with stats enabled and a Tokio runtime active:</p>
+<pre><code class="language-rust">let log = log
+    .attach_prometheus("192.0.2.5:9100".parse()?)
+    .await?;
+</code></pre>
+<p>The method consumes and returns the <code>LogHandle</code>. It attaches one redaction-first Prometheus child to the installed stats recorder and starts the HTTP listener. The caller supplies the bind address explicitly; the defaults do not select one.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +746,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +800,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +929,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

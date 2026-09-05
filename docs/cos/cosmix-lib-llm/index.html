@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-llm/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,140 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-llm/README.md"><div class="prose"><h1 id="cosmix-lib-llm">cosmix-lib-llm</h1>
+<p><code>cosmix-lib-llm</code> is the generic multi-backend LLM client for Cosmix. It gives
+Cos crates one interface for Anthropic, OpenAI-compatible servers, Ollama,
+Bus-routed requests, and the Claude CLI. In the <code>bus &lt;- mix &lt;- cos</code> dependency
+chain, it belongs to the cos substrate layer and calls the bus library directly
+for mesh-routed completions.</p>
+<p>The Cargo library name is <code>cosmix_llm</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-rust">use cosmix_llm::LlmClient;
+
+let client = LlmClient::from_config(None)?;
+let response = client
+    .complete("Answer concisely.", "What is 2 + 2?")
+    .await?;
+</code></pre>
+<p>For multi-turn work, construct messages and a chat request:</p>
+<pre><code class="language-rust">use cosmix_llm::{ChatRequest, ContentBlock, LlmClient, Message};
+
+let client = LlmClient::from_config(Some("local"))?;
+let messages = vec![Message::user_text("Summarise the request.")];
+let response = client
+    .chat(
+        ChatRequest::new(&amp;messages)
+            .with_system("Answer concisely.")
+            .with_max_tokens(1024),
+    )
+    .await?;
+
+for block in response.content {
+    if let ContentBlock::Text { text } = block {
+        println!("{text}");
+    }
+}
+</code></pre>
+<h2 id="providers">Providers</h2>
+<table><thead><tr><th>Provider value</th><th>Transport</th><th>Default endpoint or command</th><th>Native tool use</th></tr></thead><tbody>
+<tr><td><code>anthropic</code></td><td>Anthropic Messages API</td><td><code>https://api.anthropic.com</code></td><td>Yes</td></tr>
+<tr><td><code>openai</code></td><td>OpenAI-compatible chat completions</td><td><code>https://api.openai.com</code></td><td>No</td></tr>
+<tr><td><code>ollama</code></td><td>Ollama <code>/api/chat</code></td><td><code>http://localhost:11434</code></td><td>Yes</td></tr>
+<tr><td><code>bus</code></td><td>Bus port call</td><td>port <code>claud</code>, command <code>ask</code></td><td>No</td></tr>
+<tr><td><code>claude-cli</code></td><td><code>claude -p</code> subprocess</td><td>binary <code>claude</code></td><td>No</td></tr>
+</tbody></table>
+<p>OpenAI-compatible mode covers services which implement
+<code>/v1/chat/completions</code>, including OpenAI, vLLM, and LM Studio.</p>
+<p>The Bus backend joins the system and user prompts, sends them as <code>prompt</code>, and
+expects a string <code>response</code> field in the reply. The Claude CLI backend is
+text-only and uses the CLI's existing user authentication.</p>
+<h2 id="client-construction">Client construction</h2>
+<p><code>LlmClient::from_config(backend_name)</code> loads the <code>llm</code> service settings from
+<code>~/.config/cosmix/llm.toml</code>. <code>None</code> selects the configured default backend. A
+name selects that entry from the backend map.</p>
+<p><code>LlmClient::from_settings(settings, backend_name)</code> performs the same selection
+against an existing <code>LlmSettings</code> value.</p>
+<p><code>LlmClient::from_backend_config(config)</code> constructs a client directly from one
+<code>LlmBackendConfig</code>.</p>
+<p>The client consumes these configuration fields:</p>
+<table><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>provider</code></td><td>Selects one of the five provider values</td></tr>
+<tr><td><code>model</code></td><td>Supplies the backend model identifier</td></tr>
+<tr><td><code>base_url</code></td><td>Overrides an HTTP endpoint, or the binary in <code>claude-cli</code> mode</td></tr>
+<tr><td><code>api_key_env</code></td><td>Names an environment variable containing an API key</td></tr>
+<tr><td><code>api_key_cmd</code></td><td>Supplies a shell command which prints an API key</td></tr>
+<tr><td><code>port</code></td><td>Overrides the Bus port name</td></tr>
+<tr><td><code>command</code></td><td>Overrides the Bus command name</td></tr>
+</tbody></table>
+<p>Anthropic and OpenAI-compatible backends require an API key. Resolution checks
+<code>api_key_env</code> first, then executes <code>api_key_cmd</code>. Ollama, Bus, and Claude CLI
+do not require a key from this library. HTTP base URLs have trailing slashes
+removed before request paths are appended.</p>
+<p><code>LlmClient::provider()</code> returns the active provider value.
+<code>LlmClient::model()</code> returns the configured model identifier.</p>
+<h2 id="text-completion">Text completion</h2>
+<p><code>LlmClient::complete(system, user)</code> sends one system prompt and one user prompt
+and returns the first text result.</p>
+<p>Anthropic requests use <code>/v1/messages</code> with a fixed output limit of 4096 tokens.
+OpenAI-compatible requests use <code>/v1/chat/completions</code>; an empty key omits the
+Authorization header. Ollama requests use non-streaming <code>/api/chat</code>. The
+Claude CLI runs in print mode with text output.</p>
+<p>All operations are asynchronous. Transport failures, non-success HTTP statuses,
+invalid responses, missing response fields, unknown providers, missing keys,
+and failed subprocesses return errors.</p>
+<h2 id="chat-types">Chat types</h2>
+<p><code>Role</code> identifies a <code>user</code> or <code>assistant</code> message.</p>
+<p><code>ContentBlock</code> represents one content item:</p>
+<ul>
+<li><code>Text</code> contains model or user text.</li>
+<li><code>ToolUse</code> contains a call ID, tool name, and JSON input.</li>
+<li><code>ToolResult</code> contains the originating call ID, result text, and an error flag.</li>
+</ul>
+<p>The serialised content-block shape follows Anthropic's tagged content format.
+Roles serialise as lower-case strings and block types as snake-case strings.</p>
+<p><code>Message</code> contains a role and a list of content blocks. Its constructors are:</p>
+<ul>
+<li><code>Message::user_text(text)</code></li>
+<li><code>Message::assistant_text(text)</code></li>
+<li><code>Message::user_tool_result(tool_use_id, content, is_error)</code></li>
+</ul>
+<p><code>ToolSchema</code> describes a callable tool with a name, description, and JSON Schema
+input object.</p>
+<p><code>ChatRequest</code> borrows the message history and optional tool definitions.
+<code>ChatRequest::new(messages)</code> sets no system prompt, no tools, and a 4096-token
+limit. Builder methods set the system prompt, tools, and token limit.</p>
+<p><code>ChatResponse</code> returns content blocks, a <code>StopReason</code>, and <code>Usage</code> counts.
+<code>ChatResponse::into_message()</code> converts the response into an assistant message
+for appending to history. <code>ChatResponse::tool_uses()</code> iterates over tool-call
+IDs, names, and JSON inputs.</p>
+<p><code>StopReason</code> distinguishes <code>EndTurn</code>, <code>ToolUse</code>, <code>MaxTokens</code>, <code>StopSequence</code>,
+and <code>Other</code>. <code>Usage</code> reports input and output token counts when supplied by the
+backend.</p>
+<h2 id="backend-behaviour">Backend behaviour</h2>
+<p>Anthropic and Ollama implement the full <code>chat()</code> path with optional tools.
+Anthropic passes the configured token limit and reports its returned stop reason
+and usage. Ollama maps tool schemas to function tools, creates synthetic
+<code>ollama_N</code> IDs for returned calls, and reports prompt and generation counts.
+The Ollama request does not send the <code>max_tokens</code> value.</p>
+<p>OpenAI-compatible, Bus, and Claude CLI backends accept <code>chat()</code> only when the
+tool list is empty. They reduce the request to <code>complete()</code> using the system
+prompt and the most recent user text block. Earlier history is not sent through
+this fallback. Their chat response reports <code>EndTurn</code> and zeroed usage.</p>
+<p>Ollama receives the conversation history. User tool results become <code>tool</code>
+messages, while assistant tool calls become function calls. The request remains
+non-streaming.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The Cargo manifest declares direct dependencies on:</p>
+<ul>
+<li><code>cosmix-lib-config</code> for LLM settings and the current user identity.</li>
+<li><code>cosmix-lib-bus</code> for Bus port calls.</li>
+<li><code>reqwest</code> and <code>tokio</code> for asynchronous HTTP and subprocess execution.</li>
+<li><code>serde</code> and <code>serde_json</code> for request, response, and tool data.</li>
+<li><code>anyhow</code> for contextual errors.</li>
+<li><code>tracing</code>.</li>
+</ul>
+<p>The crate declares no Cargo features.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +752,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +806,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +935,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

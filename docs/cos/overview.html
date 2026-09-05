@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/overview</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,74 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/overview.md"><div class="prose"><h1 id="cos--overview">cos — overview</h1>
+<p><strong>cos</strong> is the cosmix daemon family: every Rust crate that runs a node in a
+cosmix mesh, plus the substrate libraries they share. Where
+<a href="https://github.com/markc/cosmix">mix</a> is the language you drive the mesh <em>with</em>,
+cos is what actually <em>runs</em> on each node — a set of long-running daemons that
+speak the Bus mesh protocol, expose their state as typed property namespaces,
+and are operable from the outside by agents and scripts.</p>
+<p>This page is the orientation: what cos is, how the workspace is laid out, how it
+fits with its sibling repos, and where to go next.</p>
+<h2 id="what-cos-is">What cos is</h2>
+<p>A single Cargo workspace of ~33 crates, split three ways:</p>
+<ul>
+<li><strong>Daemons</strong> — the long-running services: an Bus broker, a mail server, a web server, an authoritative DNS server, a knowledge indexer, and an agent supervisor — with the Wayland compositor and native apps in the sibling <code>src/desktop/</code> workspace.</li>
+<li><strong>Helpers &amp; adapters</strong> — CLI subcrates and integration shims the daemons lean on (the MCP bridge, the Claude SDK adapter, the mail data store, the mail auth / rules / spam subcrates).</li>
+<li><strong>Libraries</strong> — the shared substrate (<code>cosmix-lib-*</code>): property store, mesh peering, node identity, WireGuard config, logging, agent runtime pieces, and protocol codecs.</li>
+</ul>
+<p>Every daemon is built to be <strong>legible</strong> (query its state as structured data),
+<strong>modifiable</strong> (write its config through structured channels, not ad-hoc file
+edits), and <strong>reconstructible</strong> (build and run it from a clean clone). Those
+three criteria are the substrate's design filter — the point of cos is a system
+an AI agent can observe, change, and rebuild.</p>
+<h2 id="the-components">The components</h2>
+<p>Pick any component in the sidebar for its own page.</p>
+<h3 id="daemons">Daemons</h3>
+<ul>
+<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker. Every mesh node runs one; it routes <code>service.node.bus</code> addresses across the mesh.</li>
+<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP, Bayesian spam classifier, Sieve-style rules).</li>
+<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS with automatic ACME certificates; server-rendered web UI over Datastar SSE.</li>
+<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS, zones generated from the mesh inventory.</li>
+<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base; auto-indexes workspaces on commit and powers agent recall.</li>
+<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps; protocol coverage on <a href="/cos/cosmix-comp">cosmix-comp</a>.</li>
+<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
+<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power-source state.</li>
+<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
+</ul>
+<h3 id="bridge--libraries">Bridge &amp; libraries</h3>
+<ul>
+<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge; exposes cosmix surfaces as MCP tools plus a knowledge / skill-learning loop.</li>
+<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
+</ul>
+<h2 id="how-it-fits--bus--mix--cos">How it fits — bus ← mix ← cos</h2>
+<p>cos is one of three public sibling repos with a one-way dependency order:</p>
+<ul>
+<li><strong><a href="https://github.com/markc/cosmix">bus</a></strong> — the Bus protocol family. Depends on nothing.</li>
+<li><strong><a href="https://github.com/markc/cosmix">mix</a></strong> — the language. Depends on bus.</li>
+<li><strong>cos</strong> — the daemon family. Depends on both: its config, DNS, mail, and agent crates consume the mix strict-data parser, and every daemon speaks Bus.</li>
+</ul>
+<p>Neither sibling depends on cos. Build bus and mix first (see
+<a href="/cos/overview#build">Build &amp; install</a>); the workspace clones expect sibling checkouts at
+<code>$COSMIX</code> and <code>$COSMIX</code>.</p>
+<h2 id="building">Building</h2>
+<pre><code class="language-sh"># cos depends on two sibling checkouts under $HOME
+git clone https://github.com/markc/cosmix $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
+
+# build the whole daemon family (release)
+cd $COSMIX/src &amp;&amp; cargo build --workspace --release
+</code></pre>
+<p>Each daemon reads a small root-owned bootstrap config
+(<code>/etc/cosmix/&lt;daemon&gt;/config.toml</code>) before it contacts the mesh, then joins the
+Bus broker and exposes its runtime state through property namespaces.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><strong><a href="/cos/">the component index</a></strong> — every page in this manual.</li>
+<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +686,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +740,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +869,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

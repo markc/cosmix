@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/serve</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,427 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/serve.md"><div class="prose"><h1 id="serving-as-a-bus-citizen">Serving as a Bus citizen</h1>
+<p><strong><code>mix --serve service.mix</code> turns a Mix script into a supervised, mesh-registered
+Bus daemon.</strong> Write the <code>on</code> handlers; the runtime supplies the rest — broker
+registration, reconnect with backoff, the standard <code>HELP</code>/<code>INFO</code>/<code>QUIT</code> verbs, a
+lifecycle property tree, per-handler fault isolation, and graceful shutdown. A
+script with <strong>one</strong> <code>on &lt;cmd&gt; … end</code> handler is a complete service.</p>
+<p>This is the AmigaOS "application with an ARexx port" model made native: a
+long-lived, addressable Mix process that <em>is</em> a service. The full normative
+contract is <strong>SPEC 18</strong> (the Mix Citizen Runtime); this page is the operational
+view — what the flag does, what the runtime injects, and how a citizen behaves.</p>
+<blockquote>
+<p><strong>Most examples here need a live broker</strong> (<code>cosmix-noded</code>, from the
+<a href="https://github.com/markc/cosmix">cos repo</a>). Where one is running, the output
+shown is <strong>real</strong>, captured from a live <code>statecache</code> citizen on a dev node.
+Examples that <em>start</em> a daemon (the <code>mix --serve …</code> invocations) are
+illustrative of the command shape — you can't paste them into a terminal and
+see output without a broker and a unit. The language facts (the <code>on</code>/<code>reply</code>
+model, <code>$result</code>/<code>$rc</code>, the reserved verbs, service-name derivation) are exact,
+and the no-broker and parse paths are verified standalone.</p>
+</blockquote>
+<p>For the messaging primitives themselves — <code>send</code>, <code>emit</code>, <code>address</code>, <code>on</code>,
+<code>reply</code>, topic pub/sub, <code>$result</code>/<code>$rc</code> — see <a href="/mix/bus">Bus messaging</a>. This page
+assumes them and focuses on the <strong>serve runtime</strong>.</p>
+<hr />
+<h2 id="what-mix---serve-does">What <code>mix --serve</code> does</h2>
+<pre><code class="language-text">mix --serve &lt;script.mix&gt; [--name &lt;svc&gt;] [--no-prelude]
+</code></pre>
+<p>Compared with a plain <code>mix &lt;script&gt;</code> run, serve mode differs in three
+load-bearing ways:</p>
+<ol>
+<li><strong>It registers a service name</strong> with the local broker and stays addressable under it. A plain script run has no name and nothing can <code>send</code> to it.</li>
+<li><strong>It is supervised.</strong> A <code>cosmix-noded</code> restart is a transient drop the citizen reconnects / re-registers / re-subscribes through — not a process death. A plain script's broker connection is one-shot.</li>
+<li><strong>The event pump is unconditional and non-terminating.</strong> A resident daemon, not a script with an optional event tail. It exits only on a fatal terminal (the supervised receiver going away for good), <code>SIGTERM</code>/Ctrl-C, or the <code>QUIT</code> universal.</li>
+</ol>
+<p>Serve evaluation is recorded with mode <code>serve</code> and the script basename only.
+For fleet services, set <code>MIX_STATS=off</code> to disable collection and all stats I/O;
+see <a href="/mix/stats">usage statistics</a>.</p>
+<p>The lifecycle on start:</p>
+<pre><code class="language-text">read + parse script   →  connect to broker  →  register &lt;svc&gt;
+                                            →  run the script top-level ONCE (init)
+                                            →  enter the event pump (resident)
+</code></pre>
+<p>The top-level body runs <strong>exactly once</strong> as initialization: open resources,
+<code>subscribe</code> to topics, register <code>on</code> handlers. Then the runtime registers the
+service name and pumps inbound Bus into your handlers until shutdown.</p>
+<p>If the script fails to <strong>lex or parse</strong>, <code>--serve</code> logs the error and exits
+non-zero before any broker contact — so a syntax check is cheap and offline:</p>
+<pre><code class="language-text">$ mix --check service.mix
+service.mix: OK
+</code></pre>
+<hr />
+<h2 id="one-handler-is-a-whole-service">One handler is a whole service</h2>
+<p>There is no service scaffolding to write — no main loop, no registration call, no
+manifest. A file with a single <code>on</code> handler, run under <code>--serve</code>, is a complete,
+addressable citizen:</p>
+<pre><code class="language-mix">-- echo.mix  — run with:  mix --serve echo.mix
+on echo.ping
+  reply("pong")
+end
+</code></pre>
+<pre><code class="language-text">$ mix --serve echo.mix          # registers Bus service "echo"
+</code></pre>
+<p>From any other Mix process on the node:</p>
+<pre><code class="language-mix">send echo echo.ping
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">pong
+</code></pre>
+<p>That tiny script also answers <code>HELP</code>, <code>INFO</code>, <code>QUIT</code>, and
+<code>echo.props.{get,list,describe}</code> — none of which appear in the file. The runtime
+injects them (see <a href="/mix/serve#reserved-verbs--what-the-runtime-injects">Reserved verbs</a>).</p>
+<hr />
+<h2 id="service-name-derivation">Service-name derivation</h2>
+<p>The Bus service name is the <code>&lt;svc&gt;</code> the citizen registers under and the target
+others <code>send</code> to. It comes from <code>--name</code>, falling back to the <strong>script's file
+stem</strong>:</p>
+<pre><code class="language-text">mix --serve worker.mix                 # service name = "worker"  (stem)
+mix --serve worker.mix --name probe    # service name = "probe"   (--name wins)
+mix --serve /usr/local/lib/cosmix/statecache.mix   # → "statecache"
+</code></pre>
+<p>Two normalization rules apply (from <code>derive_serve_name</code> in <code>main.rs</code>):</p>
+<ul>
+<li><strong>A leading <code>cosmix-</code> is stripped</strong> from either source. The system user is <code>cosmix-&lt;svc&gt;</code> but the Bus namespace uses the bare <code>&lt;svc&gt;</code> token, so a script (or <code>--name</code>) accidentally named after the POSIX user still yields the canonical Bus identity: <code>cosmix-statecache.mix</code> → <code>statecache</code>, <code>--name cosmix-foo</code> → <code>foo</code>. Surrounding whitespace is trimmed.</li>
+<li><strong>An anonymous citizen is rejected.</strong> If no name can be derived — an empty path, a root path, a dotfile-only stem (<code>.foo</code>, whose <code>file_stem()</code> is the whole <code>.</code>-led name), or a <code>--name</code> that resolves empty or to a leading dot — <code>--serve</code> is a launch error and exits non-zero. There is no nameless citizen.</li>
+</ul>
+<pre><code class="language-text">$ mix --serve            # no script path
+mix: --serve requires a script path
+Usage: mix --serve &lt;script&gt; [--name &lt;svc&gt;]
+
+$ mix --serve worker.mix junk      # serve mode takes no positional script args
+mix: unexpected argument after --serve script: 'junk'
+Usage: mix --serve &lt;script&gt; [--name &lt;svc&gt;]
+</code></pre>
+<p>Only <code>--name &lt;svc&gt;</code> and <code>--no-prelude</code> may follow the script path, in any order; a
+daemon has no argv, so positional script args are a usage error.</p>
+<hr />
+<h2 id="the-handler-model">The handler model</h2>
+<p>Inbound Bus messages dispatch to matching <code>on &lt;cmd&gt; … end</code> handlers. The
+<code>&lt;cmd&gt;</code> matches the <strong>inner command/verb</strong> the sender used — not the service
+name or topic — so a request <code>send statecache statecache.get</code> fires
+<code>on statecache.get</code>. The full grammar (the <code>$event</code> map, <code>reply(...)</code>,
+<code>async</code>/Class C, <code>subscribe</code>) is in <a href="/mix/bus">Bus messaging</a>; the essentials for a
+citizen:</p>
+<pre><code class="language-mix">on statecache.get               -- a request: read state back to the caller
+  reply($value)                 -- rc defaults to 0
+end
+
+on config.current               -- a topic delivery: update state, no reply
+  $value = $event.body
+end
+</code></pre>
+<h3 id="reply-answers-a-request"><code>reply()</code> answers a request</h3>
+<p><code>reply(body)</code> or <code>reply(rc, body)</code> answers the in-flight request. A non-zero <code>rc</code>
+(<code>0..=255</code>) is an <strong>application error</strong> carried to the caller's <code>$rc</code>/<code>$result</code> —
+distinct from a transport failure. <code>reply</code> is only valid inside a handler
+servicing a request; calling it for a topic delivery (which has no caller) is a
+hard error.</p>
+<pre><code class="language-mix">on do.validate
+  if is_empty($event.body) then
+    reply(10, "missing input")   -- caller sees $rc = 10
+  else
+    reply(0, "ok")
+  end
+end
+</code></pre>
+<h3 id="quit-self-terminates-the-citizen-gracefully"><code>quit()</code> self-terminates the citizen gracefully</h3>
+<p><code>quit()</code> requests the <strong>same graceful shutdown</strong> as the <code>QUIT</code> universal (SPEC 18
+§3.5) — deregister from the broker, then exit <code>0</code> — but self-initiated from
+inside the script rather than driven by an inbound verb. It is the primitive for
+a <strong>one-shot / ephemeral citizen</strong>: register, do a job that needs the event pump
+(open a dialog, await a topic delivery, drive one interaction), then retire
+itself. It takes no meaningful arguments and returns <code>nil</code> — like the <code>QUIT</code>
+universal it has no exit-code channel (graceful serve shutdown is always exit
+<code>0</code>), so any argument passed is accepted and ignored rather than an error. Use
+<code>exit(n)</code> when the citizen must return an exact status: it immediately unwinds
+the current handler/init body through active <code>finally</code> blocks, then enters the
+same bounded deregister-and-drain shutdown path before the process exits with
+<code>n</code>.</p>
+<pre><code class="language-mix">on dialogs.&lt;handle&gt;.state          -- a props.changed delivery
+  if $event.args.new == "resolved" then
+    $r = send interact "interact.dialog-result" handle=$h owner_token=$t
+    -- …use $r…
+    quit()                         -- job done: deregister + exit 0
+  end
+end
+</code></pre>
+<p><code>quit()</code> does <strong>not</strong> abort the current handler: it sets a shutdown request that
+the event pump observes at the top of its next loop turn, so statements after
+<code>quit()</code> in the same handler still run to completion. For a synchronous (Class S)
+handler or the init body the pump stops as soon as that code returns. An <code>async</code>
+(Class C) handler runs as a spawned task while the pump is parked waiting for the
+next message, so <code>quit()</code> there also <strong>wakes the pump immediately</strong> — it does not
+wait for another inbound message to arrive. An idle citizen therefore stops
+promptly on a Class C <code>quit()</code>, not only when the next event happens to come in.
+In-flight handlers get the same bounded grace to finish as any graceful stop.
+Prefer <code>quit()</code> for an ordinary clean citizen shutdown: it lets the current
+handler finish its remaining statements and always exits <code>0</code>. Use <code>exit(n)</code> when
+the current execution must stop immediately (apart from <code>finally</code>) or a specific
+status must reach systemd. Exit requests from both synchronous and spawned async
+handlers wake the event pump; the runtime then deregisters and drains before
+returning the exact requested code.</p>
+<h3 id="outbound-send-from-a-handler-uses-result--rc">Outbound <code>send</code> from a handler uses <code>$result</code> / <code>$rc</code></h3>
+<p>A handler can itself call other citizens. The reply lands in <code>$result</code>, the status
+in <code>$rc</code>, exactly as in any Mix code:</p>
+<pre><code class="language-mix">on aggregate.report
+  send dnsd dnsd.stats
+  if $rc == 0 then
+    reply($result)
+  else
+    reply(10, "upstream failed")
+  end
+end
+</code></pre>
+<p>If a handler makes a <strong>slow / remote</strong> downstream <code>send</code> and the citizen serves
+concurrent callers, mark it <code>async</code> (Class C) so the dispatch yields at each
+<code>send</code>/<code>reply</code>/<code>sleep_ms</code> and other callers interleave instead of
+head-of-line-blocking:</p>
+<pre><code class="language-mix">on aggregate.report async
+  send slow.upstream fetch.data        -- yields here; peers interleave
+  reply($result)
+end
+</code></pre>
+<p>Plain handlers are <strong>Class S</strong> (run-to-completion, one at a time) — the default,
+and correct for fast handlers and sole-caller orchestration drivers. See
+<a href="/mix/bus#async-handlers-class-c">Bus messaging → async handlers</a> for the Class S vs
+Class C rules and the <strong>synchronous-cycle deadlock</strong> prohibition (<code>async</code> does not
+legalise an A→B→A cycle).</p>
+<hr />
+<h2 id="handler-fault-isolation-the-per-request-boundary">Handler fault isolation (the per-request boundary)</h2>
+<p>A panic, a <code>die</code>, or any uncaught error inside one <code>on</code> handler <strong>does not kill
+the citizen</strong>. The runtime catches it at the per-request boundary, logs the real
+error, sends an error reply to the caller if the inbound message was a request
+expecting one, and continues the pump. One malformed request must not deny
+service to every other caller — this is a contract, not best-effort.</p>
+<pre><code class="language-mix">on risky.op
+  $n = to_number($event.body)   -- a bad body raises here…
+  reply("doubled: " .. ("" .. ($n * 2)))
+end
+-- …the citizen logs it, replies an error to THIS caller, keeps serving others.
+</code></pre>
+<p><strong>What the caller sees vs. what you debug with.</strong> The caller's reply is a
+<strong>fixed</strong> <code>rc=1</code>, <code>internal handler error</code> — the real error message is
+deliberately <strong>not</strong> put on the wire (it can carry request data or
+Trojan-Source bytes, and a peer in the mesh is not automatically trusted). The
+real error — with the command, handler index, and the failing line — is
+<strong>logged instead</strong>, and that's where you debug:</p>
+<ul>
+<li><strong>Interactive</strong> (<code>mix --serve foo.mix</code> in a terminal): faults print straight
+to the terminal, e.g. <code>ERROR … Handler body errored … command=risky.op error=Runtime error at line 2: …</code>.</li>
+<li><strong>Under systemd</strong> (the citizen has no terminal): the fault goes to journald —
+<code>journalctl -t cosmix-mix -f</code> (filter further on the <code>service = &lt;svc&gt;</code> field).</li>
+</ul>
+<p>You can still handle errors yourself with <a href="/mix/errors"><code>try … catch</code></a> to send a
+tailored reply; the runtime boundary is the backstop for anything you don't catch.</p>
+<hr />
+<h2 id="reserved-verbs--what-the-runtime-injects">Reserved verbs — what the runtime injects</h2>
+<p>Every serve citizen answers a fixed set of verbs the author does <strong>not</strong> write and
+<strong>cannot override</strong> (SPEC 18 §7-Q4: <em>runtime wins</em>). They are intercepted
+<em>pre-dispatch</em>, so an author <code>on HELP …</code> or <code>on &lt;svc&gt;.props.get …</code> handler is
+unreachable — and is filtered out of <code>HELP</code> rather than advertised as a shadow
+that never fires.</p>
+<table><thead><tr><th>Verb</th><th>Level</th><th>What it returns</th></tr></thead><tbody>
+<tr><td><code>HELP</code></td><td>L0</td><td><code>[{name, description, args}]</code> — reserved verbs first, then the author's commands (sorted, deduped)</td></tr>
+<tr><td><code>INFO</code></td><td>L0</td><td>the <code>{name, version, description}</code> triple</td></tr>
+<tr><td><code>QUIT</code></td><td>L0</td><td>replies <code>rc:0</code>, then triggers the §3.5 graceful shutdown</td></tr>
+<tr><td><code>&lt;svc&gt;.props.get</code></td><td>L1</td><td>a lifecycle property snapshot (root, or an optional <code>path=</code>)</td></tr>
+<tr><td><code>&lt;svc&gt;.props.list</code></td><td>L1</td><td>all defined property paths</td></tr>
+<tr><td><code>&lt;svc&gt;.props.describe</code></td><td>L1</td><td>the schema entry for a path</td></tr>
+</tbody></table>
+<p>This is the same Ch07 L0 + L1 daemon conformance a Rust daemon owes — a Mix
+citizen is exactly as legible as a compiled one. The props surface reuses the
+same <code>cosmix_props</code> encoder the Rust daemons use, so a citizen's <code>props.get</code>
+output is byte-consistent with theirs.</p>
+<p><strong>Live</strong> (captured from a running <code>statecache</code> citizen):</p>
+<pre><code class="language-mix">send statecache HELP
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">[{args: [], description: List all commands this service accepts, name: HELP}, {args: [], description: Service identity and capabilities, name: INFO}, {args: [], description: Graceful shutdown: deregister, then exit 0 (SPEC 18 §3.5), name: QUIT}, {args: [path?], description: Property snapshot at an optional path (root if absent), name: statecache.props.get}, {args: [], description: All defined property paths, name: statecache.props.list}, {args: [path], description: Schema entry (type, mutability, sensitivity) for a path, name: statecache.props.describe}, {args: [], description: Author-defined handler, name: statecache.get}, {args: [], description: Author-defined handler, name: world.statecache.probe}]
+</code></pre>
+<pre><code class="language-mix">send statecache INFO
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">{description: Mix supervised Bus citizen (SPEC 18 Phase 1 runtime), name: statecache, version: 0.21.2}
+</code></pre>
+<blockquote>
+<p><code>INFO.version</code> is the <strong><code>mix</code> runtime version</strong> running the citizen, not a
+version of the script — a citizen's identity is "this mix build plus this
+script." Above it reads <code>0.18.1</code> (the deployed serve binary on that node), which
+need not match a newer <code>mix --version</code> you may have locally.</p>
+</blockquote>
+<h3 id="the-lifecycle-property-tree">The lifecycle property tree</h3>
+<p>The L1 <code>props.*</code> surface exposes a runtime-owned lifecycle tree. Five leaves,
+queryable like any cosmix daemon's properties:</p>
+<pre><code class="language-mix">send statecache statecache.props.get
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">{lifecycle: {health: ok, mode: serving, props_level: L1, started_at: 2026-06-16T07:28:17.231260663+00:00, uptime_s: 10388}}
+</code></pre>
+<pre><code class="language-mix">send statecache statecache.props.list
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">[lifecycle.started_at, lifecycle.uptime_s, lifecycle.mode, lifecycle.health, lifecycle.props_level]
+</code></pre>
+<p>A single leaf, by <code>path=</code>:</p>
+<pre><code class="language-mix">send statecache statecache.props.get path="lifecycle.uptime_s"
+print("uptime_s = " .. ("" .. $result))
+</code></pre>
+<pre><code class="language-text">uptime_s = 10388
+</code></pre>
+<p><code>props.describe</code> returns the schema entry — note <code>uptime_s</code> is <strong>transient</strong> (it's
+recomputed live from the monotonic clock on every <code>props.get</code>, never cached):</p>
+<pre><code class="language-mix">send statecache statecache.props.describe path="lifecycle.uptime_s"
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">{description: Seconds since process start., mutable: false, path: lifecycle.uptime_s, sensitive: false, transient: true, type: number}
+</code></pre>
+<table><thead><tr><th>Leaf</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>lifecycle.started_at</code></td><td>string</td><td>RFC 3339 process start time</td></tr>
+<tr><td><code>lifecycle.uptime_s</code></td><td>number</td><td>seconds since start (live, transient)</td></tr>
+<tr><td><code>lifecycle.mode</code></td><td>string</td><td>operating mode — <code>serving</code></td></tr>
+<tr><td><code>lifecycle.health</code></td><td>string</td><td>coarse health — <code>ok</code></td></tr>
+<tr><td><code>lifecycle.props_level</code></td><td>string</td><td>conformance level — <code>L1</code></td></tr>
+</tbody></table>
+<blockquote>
+<p><code>props.watch</code> (L2) and <code>props.set</code> / <code>props.delete</code> (SPEC 12) are <strong>not</strong>
+reserved — an author <em>may</em> implement them with ordinary <code>on</code> handlers, so they
+fall through to your code rather than being intercepted.</p>
+</blockquote>
+<hr />
+<h2 id="build-provenance--discoverable-in-nodedlist">Build provenance — discoverable in <code>noded.list</code></h2>
+<p>A Mix citizen has no binary of its own; its provenance <strong>is</strong> the <code>mix</code> build that
+runs it. At registration the runtime sends a <code>RegisterProvenance</code> body, so a
+<code>noded.list</code> query reports which <code>mix</code> build runs the citizen — the version-
+discovery contract for a fleet of agents asking "what runs where." The body is
+built once at process start and re-sent on every reconnect, so <code>started_at</code> stays
+the true process start.</p>
+<pre><code class="language-mix">send noded noded.list
+for each $s in $result
+  if $s["name"] == "statecache" then
+    print("" .. $s)
+  end
+end
+</code></pre>
+<pre><code class="language-text">{binary: cosmix-mix, build_time: 2026-06-15T03:06:09Z, git_dirty: false, git_sha: 2877eef19cf5, name: statecache, pid: 1352, registered_at: 2026-06-16T07:28:17Z, schema_version: 1, started_at: 2026-06-16T07:28:17Z, version: 0.21.2}
+</code></pre>
+<p>Note <code>binary: cosmix-mix</code> — the citizen is named <code>statecache</code>, but its provenance
+points at the <code>mix</code> runtime that hosts it.</p>
+<hr />
+<h2 id="supervision-reconnect-and-shutdown">Supervision, reconnect, and shutdown</h2>
+<p>Serve mode wraps the pump in a supervised client, so the citizen behaves like a
+proper daemon across broker churn:</p>
+<ul>
+<li><strong>Reconnect with backoff.</strong> On transport loss the runtime re-enters <code>connect → register → pump</code> with bounded exponential backoff + jitter, then <strong>re-registers</strong> the service name and <strong>re-subscribes every topic</strong> the script subscribed to (init-body <em>and</em> handler-body — the full set, replayed by the runtime, not the author). Broker-side registration and subscriptions do not survive a transport drop and are not silently assumed to.</li>
+<li><strong>No outbound queue while disconnected.</strong> An outbound <code>send</code> while disconnected fails fast with a typed transport error — an outage is surfaced to the caller, never absorbed behind a buffer.</li>
+<li><strong>Initial-connect budget is fatal.</strong> If the <em>first</em> connect+register budget is exhausted (no reachable broker at start), <code>--serve</code> exits non-zero so a misconfigured citizen fails fast under systemd rather than spinning silently.</li>
+<li><strong>Graceful shutdown.</strong> <code>SIGTERM</code> (the systemd stop signal), Ctrl-C, the Ch02 <code>QUIT</code> universal, and the self-initiated <code>quit()</code> builtin all converge on <strong>one</strong> path: stop accepting new requests, let in-flight handlers a bounded grace to finish, <strong>deregister</strong> the service name (bounded so a wedged broker can't hang exit), then exit <code>0</code>. If the grace is exceeded or deregister fails, the process exits non-zero so systemd records an unclean stop and the broker registry doesn't retain a dead name. <code>QUIT</code> is <strong>not</strong> a no-op — it drives this exact sequence.</li>
+</ul>
+<pre><code class="language-mix">send statecache QUIT       -- replies rc:0, then the citizen deregisters and exits 0
+</code></pre>
+<p>Logs go to <strong>journald</strong> under systemd. When <code>mix --serve</code> runs <strong>interactively</strong>
+(stderr is a terminal) they also go straight to that terminal, so a foreground
+dev run shows startup, faults, and pump activity without a <code>journalctl</code> window;
+they fall back to stderr too when there's no journal socket at all. Every
+serve/supervisor line carries a structured <code>service = &lt;svc&gt;</code> field, so the
+process name <code>cosmix-mix</code> never obscures which citizen logged. Tail a citizen's
+logs with <code>journalctl</code> filtered on that field.</p>
+<hr />
+<h2 id="running-under-systemd">Running under systemd</h2>
+<p>A resident citizen is a normal SPEC-10 daemon: a <code>sysusers.d</code> <code>u cosmix-&lt;svc&gt;</code>
+entry in the citizen UID band and a unit whose <code>ExecStart</code> runs the script under
+<code>--serve</code>. The shape is identical to <code>cosmix-{noded,maild,webd}.service</code>:</p>
+<pre><code class="language-ini"># /etc/systemd/system/cosmix-statecache.service  (illustrative)
+[Unit]
+Description=statecache Mix citizen
+After=cosmix-noded.service
+
+[Service]
+ExecStart=/opt/cosmix/bin/mix --serve /usr/local/lib/cosmix/statecache.mix
+User=cosmix-statecache
+Group=cosmix-statecache
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>The <code>mix</code> binary never <code>setuid</code>s itself — identity is assigned by systemd via
+<code>User=</code>/<code>Group=</code>. Restart policy, ordering (<code>After=cosmix-noded.service</code>), and
+resource limits are unit-file concerns; the serve runtime provides only the
+in-process behaviour systemd can't (registration, reconnect, handler isolation,
+graceful deregister).</p>
+<hr />
+<h2 id="a-complete-state-holder-citizen">A complete state-holder citizen</h2>
+<p>The canonical Phase-1 reference shape: subscribe one topic, hold the last value as
+in-process state, answer a query with it. This single file is a full citizen.</p>
+<pre><code class="language-mix">-- statecache.mix
+--   mix --serve statecache.mix          (Bus service name "statecache")
+$value = "(none)"
+
+subscribe("config.current")              -- init: register topic interest
+
+on config.current                        -- topic delivery updates state
+  $value = $event.body
+end
+
+on statecache.get                        -- request reads it back
+  reply($value)
+end
+</code></pre>
+<p>It needs no <code>HELP</code>/<code>INFO</code>/<code>QUIT</code>/<code>props.*</code> handler — those are injected. Across a
+broker bounce, the runtime re-registers <code>statecache</code> <em>and</em> re-subscribes
+<code>config.current</code>, so a value published after the bounce is reflected in the next
+<code>statecache.get</code>.</p>
+<blockquote>
+<p>A <em>transient</em> <code>mix statecache.mix</code> (no <code>--serve</code>) would run the init body, hit
+the end of the script with handlers registered, and pump events for that one
+connection — but it has no service name, no supervision, and dies when
+interrupted. Use <code>--serve</code> for anything resident.</p>
+</blockquote>
+<hr />
+<h2 id="no-broker-present">No broker present</h2>
+<p>The serve <em>entry point</em> needs a broker (the initial-connect budget is fatal), but
+the underlying Bus forms degrade predictably on a bare host — relevant when you
+develop a citizen script before a broker exists. See
+<a href="/mix/bus#no-broker-graceful-degradation">Bus messaging → no broker</a> for the full
+state machine; in brief:</p>
+<ul>
+<li><strong>Never had a broker:</strong> <code>send</code> returns <code>nil</code>, <code>emit</code> no-ops, <code>port_exists</code> is <code>false</code> — no error. The same binary becomes mesh-viable the instant a broker appears, with <strong>no recompile</strong>.</li>
+<li><strong>Had a broker, lost it:</strong> <code>send</code>/<code>emit</code>/<code>port_exists</code> <strong>raise</strong> <code>mesh unavailable: …</code> — an outage is loud, never silently absorbed.</li>
+<li><strong><code>subscribe</code>/<code>reply</code></strong> raise in both cases (a citizen must not believe it subscribed or replied when it didn't).</li>
+</ul>
+<p>So you can <code>mix --check service.mix</code> and even dry-run the init logic offline; the
+resident <code>--serve</code> daemon is what requires the broker to be up.</p>
+<hr />
+<h2 id="quick-reference">Quick reference</h2>
+<table><thead><tr><th>Thing</th><th>Value</th></tr></thead><tbody>
+<tr><td>Start a citizen</td><td><code>mix --serve &lt;script&gt; [--name &lt;svc&gt;] [--no-prelude]</code></td></tr>
+<tr><td>Service name</td><td><code>--name</code>, else the script file stem; leading <code>cosmix-</code> stripped</td></tr>
+<tr><td>Anonymous serve</td><td>a launch error — no nameless citizen</td></tr>
+<tr><td>Init</td><td>top-level body runs <strong>once</strong>, then the pump runs forever</td></tr>
+<tr><td>Reserved (injected)</td><td><code>HELP</code>, <code>INFO</code>, <code>QUIT</code>, <code>&lt;svc&gt;.props.{get,list,describe}</code></td></tr>
+<tr><td>Author can override reserved?</td><td><strong>No</strong> — runtime wins (pre-dispatch intercept)</td></tr>
+<tr><td>Handler fault</td><td>caught per-request, logged, error reply, pump continues</td></tr>
+<tr><td>Slow downstream + concurrent callers</td><td>mark the handler <code>async</code> (Class C)</td></tr>
+<tr><td>Sync cycle A→B→A</td><td>prohibited — deadlocks; break with <code>emit</code> + topic reply</td></tr>
+<tr><td>Shutdown</td><td><code>SIGTERM</code> / Ctrl-C / <code>QUIT</code> → deregister → exit 0</td></tr>
+<tr><td>Logs</td><td>journald, structured <code>service = &lt;svc&gt;</code> field (stderr fallback)</td></tr>
+<tr><td>Provenance</td><td><code>binary: cosmix-mix</code> + <code>mix</code> version, visible in <code>noded.list</code></td></tr>
+<tr><td>Normative spec</td><td>SPEC 18 (Mix Citizen Runtime)</td></tr>
+</tbody></table>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/bus">Bus messaging</a> — <code>send</code> / <code>emit</code> / <code>address</code> / <code>on</code> / <code>reply</code>, topic pub/sub, <code>$result</code>/<code>$rc</code>, the no-broker state machine, <code>async</code>/Class C</li>
+<li><a href="/mix/invocation">invocation &amp; CLI</a> — every <code>mix</code> entry mode, including the <code>--serve</code> flag summary and <code>--check</code></li>
+<li><a href="/mix/capabilities">capabilities &amp; embedding</a> — the trust model; a citizen is a <em>trusted, full-capability</em> process, not a sandbox for untrusted code</li>
+<li><a href="/mix/errors">errors</a> — <code>try … catch</code>, <code>die</code>, and how runaways become clean errors inside a handler</li>
+<li><a href="/mix/functions">functions</a> — handler bodies, lambdas, and the pass-in / return / reassign idiom for threading state</li>
+<li>The <a href="https://github.com/markc/cosmix">cos repo</a> — <code>cosmix-noded</code>, the Bus broker</li>
+<li>The <a href="https://github.com/markc/cosmix">mix repo</a> — <a href="https://github.com/markc/cosmix/blob/main/AGENTS.md">AGENTS.md</a> is the agent orientation sheet; this manual is the language reference</li>
+<li><code>mix help</code> · <code>mix what send</code> · <code>mix what emit</code> · <code>mix what address</code> (<code>mix what</code> covers the Bus keywords; <code>on</code>/<code>reply</code> are handler forms it does not index)</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1039,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1093,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1222,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

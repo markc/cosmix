@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-filesd/verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,114 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-filesd/verbs.md"><div class="prose"><h1 id="bus-verbs">Bus verbs</h1>
+<p><code>cosmix-filesd</code> exposes one Bus namespace per operating mode. Corpus mode uses <code>filesd.*</code>; filesystem mode uses <code>fs.*</code>.</p>
+<h2 id="calling-convention">Calling convention</h2>
+<p>For a bare command, arguments are resolved in this order:</p>
+<ol>
+<li>JSON from the Bus <code>args</code> header.</li>
+<li>The command's non-null <code>args</code> value.</li>
+<li>JSON parsed from the raw body.</li>
+</ol>
+<p>A delegated command instead carries a top-level <code>$cosmix_delegation</code> object and a separate <code>args</code> object. See <a href="/cos/cosmix-filesd/#delegated-calls">README.md</a>.</p>
+<p>Success uses result code <code>0</code>. Errors use result code <code>10</code> and a body shaped as:</p>
+<pre><code class="language-json">{"error":"message"}
+</code></pre>
+<h2 id="corpus-verbs">Corpus verbs</h2>
+<h3 id="filesdlist"><code>filesd.list</code></h3>
+<p>List live indexed documents.</p>
+<table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
+<tr><td><code>limit</code></td><td style="text-align: right"><code>200</code></td><td>Clamped to 1 through 1000</td></tr>
+<tr><td><code>offset</code></td><td style="text-align: right"><code>0</code></td><td>Negative values become 0</td></tr>
+</tbody></table>
+<p>The response contains <code>rows</code> and the live document <code>total</code>.</p>
+<h3 id="filesdread"><code>filesd.read</code></h3>
+<p>Read indexed metadata and, when permitted by size, the current file body.</p>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>Document ID; takes precedence when both selectors are present</td></tr>
+<tr><td><code>path</code></td><td>Corpus-relative path, used when <code>id</code> is absent</td></tr>
+</tbody></table>
+<p>One selector is required. The response contains <code>doc</code>. Bodies larger than 4 MiB are omitted and <code>body_truncated</code> is set to <code>true</code>.</p>
+<h3 id="filesdsearch"><code>filesd.search</code></h3>
+<p>Search indexed documents.</p>
+<table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
+<tr><td><code>q</code> or <code>query</code></td><td style="text-align: right">Required</td><td>Must be a non-empty string</td></tr>
+<tr><td><code>limit</code></td><td style="text-align: right"><code>50</code></td><td>Clamped to 1 through 1000</td></tr>
+</tbody></table>
+<p>The response contains matching <code>rows</code> and <code>count</code>.</p>
+<h3 id="filesdchanges"><code>filesd.changes</code></h3>
+<p>Read the corpus change stream.</p>
+<table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
+<tr><td><code>since</code></td><td style="text-align: right"><code>0</code></td><td>Accepts a decimal string or JSON integer</td></tr>
+<tr><td><code>limit</code></td><td style="text-align: right"><code>200</code></td><td>Clamped to 1 through 1000</td></tr>
+</tbody></table>
+<p>The response contains <code>changes</code> and <code>next</code>. Each change contains string <code>modseq</code>, <code>doc_id</code>, <code>kind</code>, and <code>changed_at</code>. <code>next</code> is the last returned sequence as a string, or null when no change is returned.</p>
+<h3 id="filesdsave"><code>filesd.save</code></h3>
+<p>Atomically write and index a document.</p>
+<table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
+<tr><td><code>path</code></td><td style="text-align: right">Required</td><td>Safe, non-empty corpus-relative path</td></tr>
+<tr><td><code>content</code></td><td style="text-align: right">Empty string</td><td>String</td></tr>
+</tbody></table>
+<p>The daemon preserves an existing ID when ID-less content replaces an indexed file. Otherwise it ensures the content has an ID, creating one when needed.</p>
+<p>The response contains <code>ok</code>, <code>id</code>, <code>path</code>, and string <code>modseq</code>.</p>
+<h3 id="filesdmove"><code>filesd.move</code></h3>
+<p>Rename a file and its index entry.</p>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>from</code></td><td>Existing safe corpus-relative source</td></tr>
+<tr><td><code>to</code></td><td>Safe corpus-relative destination that does not exist</td></tr>
+</tbody></table>
+<p>Missing source index state is recovered by ingesting the moved file as a new index entry. The response contains <code>ok</code>, <code>from</code>, <code>to</code>, and string <code>modseq</code>.</p>
+<h3 id="filesddelete"><code>filesd.delete</code></h3>
+<p>Remove a file and tombstone its index entry.</p>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>path</code></td><td>Safe corpus-relative path</td></tr>
+</tbody></table>
+<p>A missing file is accepted, making the filesystem removal idempotent. The response contains <code>ok</code>, <code>path</code>, and string <code>modseq</code>; <code>modseq</code> is null when no indexed row exists.</p>
+<h3 id="filesdresync"><code>filesd.resync</code></h3>
+<p>Republish every live document to the semantic index and issue purges for tombstoned paths. The response is:</p>
+<pre><code class="language-json">{"ok":true}
+</code></pre>
+<h3 id="filesdpropsget"><code>filesd.props.get</code></h3>
+<p>Read the complete property snapshot or a selected property path.</p>
+<h3 id="filesdpropslist"><code>filesd.props.list</code></h3>
+<p>List the property paths exposed by the daemon.</p>
+<h3 id="filesdpropsdescribe"><code>filesd.props.describe</code></h3>
+<p>Describe a property path, including its type and metadata.</p>
+<p>The property surface is read-only L1. Available paths are listed in <a href="/cos/cosmix-filesd/#properties">README.md</a>.</p>
+<h2 id="filesystem-verbs">Filesystem verbs</h2>
+<p>Filesystem paths begin with a configured place ID. Place writability and allow or deny rules apply before an operation reaches the underlying path.</p>
+<h3 id="read-operations">Read operations</h3>
+<table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
+<tr><td><code>fs.places</code></td><td>None</td></tr>
+<tr><td><code>fs.list</code></td><td>Required <code>path</code>; optional <code>show_hidden</code> (<code>false</code>), <code>sort</code> (<code>name</code>), <code>dir</code> (<code>asc</code>)</td></tr>
+<tr><td><code>fs.stat</code></td><td>Required <code>path</code></td></tr>
+<tr><td><code>fs.tree</code></td><td>Required <code>path</code>; optional <code>max_depth</code> (<code>4</code>, clamped 1-8), <code>max_nodes</code> (<code>1000</code>, clamped 1-5000)</td></tr>
+<tr><td><code>fs.read_blob</code></td><td>Required <code>path</code>; optional byte <code>max</code> (1 MiB)</td></tr>
+<tr><td><code>fs.search</code></td><td>Required <code>path</code> and <code>query</code> or <code>q</code>; optional <code>recursive</code> (<code>true</code>) and <code>limit</code> (<code>200</code>)</td></tr>
+</tbody></table>
+<p><code>fs.places</code> returns the configured place descriptions. Other response shapes come directly from the filesystem layer.</p>
+<h3 id="reversible-write-operations">Reversible write operations</h3>
+<table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
+<tr><td><code>fs.mkdir</code></td><td>Required <code>path</code>; optional <code>parents</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.touch</code></td><td>Required <code>path</code></td></tr>
+<tr><td><code>fs.write</code></td><td>Required <code>path</code>; optional <code>content</code> (empty string), <code>overwrite</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.copy</code></td><td>Required <code>from</code> and <code>to</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.move</code></td><td>Required <code>from</code> and <code>to</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.trash</code></td><td>Required <code>path</code></td></tr>
+<tr><td><code>fs.trash.list</code></td><td>None</td></tr>
+<tr><td><code>fs.trash.restore</code></td><td>Required <code>token</code></td></tr>
+</tbody></table>
+<p>Write operations fail for a read-only place.</p>
+<h3 id="irreversible-operations">Irreversible operations</h3>
+<table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
+<tr><td><code>fs.delete</code></td><td>Required <code>path</code> and <code>confirm: true</code>; optional <code>recursive</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.trash.empty</code></td><td>Required <code>confirm: true</code></td></tr>
+</tbody></table>
+<p>Calls without the exact boolean <code>confirm: true</code> fail with result code <code>10</code>.</p>
+<h2 id="authorisation-boundary">Authorisation boundary</h2>
+<p>An envelope-bearing call is accepted only from a peer named in <code>delegated_peers</code> and only when the envelope validates. An allowlisted delegated peer cannot use the bare command path.</p>
+<p>The current delegated envelope authorises the complete selected namespace for an administrator. There is no per-actor or per-corpus grant check in this crate.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +726,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +780,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +909,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

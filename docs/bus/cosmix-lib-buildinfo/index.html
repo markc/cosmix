@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/cosmix-lib-buildinfo/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,109 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/cosmix-lib-buildinfo/README.md"><div class="prose"><h1 id="cosmix-lib-buildinfo">cosmix-lib-buildinfo</h1>
+<p><code>cosmix-lib-buildinfo</code> records compile-time build provenance for Cosmix daemons and other Rust consumers. It is a dependency-free leaf library at the <code>bus</code> end of the <code>bus ← mix ← cos</code> dependency chain, so crates in <code>mix</code> and <code>cos</code> can embed their own package version, Git state, and build time without reversing that dependency order.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The crate has two cooperating entry points:</p>
+<ul>
+<li><code>emit()</code> runs from the consumer's <code>build.rs</code> and captures provenance from the consumer's repository.</li>
+<li><code>build_info!()</code> expands in the consumer crate and constructs a <code>BuildInfo</code> from package metadata and the values emitted by <code>emit()</code>.</li>
+</ul>
+<p>It also provides <code>now_rfc3339()</code> for runtime start timestamps.</p>
+<p>The crate contains one root module and no public submodules.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<table><thead><tr><th>Item</th><th>Kind</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>BuildInfo</code></td><td>struct</td><td>Holds the calling crate's compile-time provenance</td></tr>
+<tr><td><code>BuildInfo::line()</code></td><td>method</td><td>Formats the provenance as one human-readable line</td></tr>
+<tr><td><code>build_info!()</code></td><td>macro</td><td>Constructs <code>BuildInfo</code> at the macro expansion site</td></tr>
+<tr><td><code>emit()</code></td><td>function</td><td>Emits Cargo build-script environment and rerun directives</td></tr>
+<tr><td><code>now_rfc3339()</code></td><td>function</td><td>Returns the current wall-clock time as RFC3339 UTC</td></tr>
+</tbody></table>
+<h2 id="buildinfo">BuildInfo</h2>
+<p><code>BuildInfo</code> is <code>Debug</code>, <code>Clone</code>, <code>Copy</code>, <code>PartialEq</code>, and <code>Eq</code>.</p>
+<p>All fields are public <code>&amp;'static str</code> values or a boolean:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>pkg</code></td><td><code>CARGO_PKG_NAME</code> of the crate that expands <code>build_info!()</code></td></tr>
+<tr><td><code>version</code></td><td><code>CARGO_PKG_VERSION</code> of that crate</td></tr>
+<tr><td><code>git_sha</code></td><td>Short Git SHA of the consumer repository, or <code>"unknown"</code></td></tr>
+<tr><td><code>git_dirty</code></td><td>Whether the consumer repository was dirty at build time</td></tr>
+<tr><td><code>build_time</code></td><td>RFC3339 UTC build timestamp, or <code>"unknown"</code></td></tr>
+</tbody></table>
+<p>Construct this type with <code>build_info!()</code> so Cargo package values resolve in the calling crate.</p>
+<p><code>BuildInfo::line()</code> returns:</p>
+<pre><code class="language-text">&lt;pkg&gt; &lt;version&gt; (&lt;sha&gt;[-dirty], built &lt;time&gt;)
+</code></pre>
+<p>For example:</p>
+<pre><code class="language-text">cosmix-demo 1.2.3 (abc123def456-dirty, built 2026-06-01T00:00:00Z)
+</code></pre>
+<h2 id="consumer-setup">Consumer setup</h2>
+<p>Add the crate as both a normal dependency and a build dependency:</p>
+<pre><code class="language-toml">[dependencies]
+cosmix-lib-buildinfo = { path = "..." }
+
+[build-dependencies]
+cosmix-lib-buildinfo = { path = "..." }
+</code></pre>
+<p>Call <code>emit()</code> from the consumer's <code>build.rs</code>:</p>
+<pre><code class="language-rust">fn main() {
+    cosmix_lib_buildinfo::emit();
+}
+</code></pre>
+<p>Expand <code>build_info!()</code> in the consumer crate:</p>
+<pre><code class="language-rust">let info = cosmix_lib_buildinfo::build_info!();
+println!("{}", info.line());
+</code></pre>
+<p>The macro uses <code>env!</code> for Cargo package metadata and <code>option_env!</code> for the build-script values. Expansion therefore describes the calling crate rather than <code>cosmix-lib-buildinfo</code>.</p>
+<h2 id="build-script-output">Build-script output</h2>
+<p><code>emit()</code> writes these compile-time variables through <code>cargo:rustc-env</code>:</p>
+<table><thead><tr><th>Variable</th><th>Value</th></tr></thead><tbody>
+<tr><td><code>COSMIX_GIT_SHA</code></td><td>Output of <code>git rev-parse --short=12 HEAD</code>, or <code>"unknown"</code></td></tr>
+<tr><td><code>COSMIX_GIT_DIRTY</code></td><td><code>1</code> when <code>git status --porcelain</code> is non-empty, otherwise <code>0</code></td></tr>
+<tr><td><code>COSMIX_BUILD_TIME</code></td><td>RFC3339 UTC build time</td></tr>
+</tbody></table>
+<p>Git capture is best-effort. A missing Git executable, a non-repository build, or a failed Git command does not fail the build.</p>
+<p>The dirty check is repository-wide. It includes tracked changes and untracked, non-ignored files.</p>
+<h2 id="rebuild-triggers">Rebuild triggers</h2>
+<p><code>emit()</code> asks Cargo to rerun the consumer build script when these inputs change:</p>
+<ul>
+<li>the consumer package's <code>src</code> directory;</li>
+<li>the consumer package's <code>Cargo.toml</code>;</li>
+<li>the Git directory's <code>HEAD</code>;</li>
+<li>the common Git directory's <code>packed-refs</code>;</li>
+<li>the current symbolic branch reference, when present;</li>
+<li>the <code>SOURCE_DATE_EPOCH</code> environment variable.</li>
+</ul>
+<p>The Git-directory and common-directory watches support ordinary checkouts and linked worktrees.</p>
+<p>Dirty-state freshness is best-effort between rebuilds. Changes elsewhere in the repository may not update the bit until one of the watched consumer-package inputs causes the build script to run.</p>
+<h2 id="reproducible-build-time">Reproducible build time</h2>
+<p>When <code>SOURCE_DATE_EPOCH</code> is unset, <code>emit()</code> uses the current system time.</p>
+<p>When <code>SOURCE_DATE_EPOCH</code> contains a valid integer, that Unix timestamp becomes <code>COSMIX_BUILD_TIME</code>.</p>
+<p>When it is set to an invalid value, <code>emit()</code> warns and uses Unix epoch zero:</p>
+<pre><code class="language-text">1970-01-01T00:00:00Z
+</code></pre>
+<p>This invalid-value fallback remains deterministic instead of silently using wall-clock time.</p>
+<p>Timestamp formatting is implemented inside the crate and does not require <code>chrono</code>, <code>time</code>, or another date-time dependency.</p>
+<h2 id="runtime-timestamps">Runtime timestamps</h2>
+<p><code>now_rfc3339()</code> returns the current wall-clock time as an RFC3339 UTC string:</p>
+<pre><code class="language-rust">let started_at = cosmix_lib_buildinfo::now_rfc3339();
+</code></pre>
+<p>This function is intended for live runtime provenance such as a process <code>started_at</code> value.</p>
+<p>It ignores <code>SOURCE_DATE_EPOCH</code>; that variable affects build artifacts, not live timestamps.</p>
+<h2 id="degraded-operation">Degraded operation</h2>
+<p>A consumer may use <code>build_info!()</code> without calling <code>emit()</code> from <code>build.rs</code>.</p>
+<p>The crate still compiles. The resulting values are:</p>
+<ul>
+<li><code>git_sha</code>: <code>"unknown"</code>;</li>
+<li><code>git_dirty</code>: <code>false</code>;</li>
+<li><code>build_time</code>: <code>"unknown"</code>.</li>
+</ul>
+<p>The package name and version remain available because Cargo supplies them at the macro expansion site.</p>
+<h2 id="cargo-surface">Cargo surface</h2>
+<p>The package name is <code>cosmix-lib-buildinfo</code>. Rust code imports it as <code>cosmix_lib_buildinfo</code>.</p>
+<p>The crate declares no Cargo features.</p>
+<p>The crate declares no dependencies and uses only the Rust standard library.</p>
+<p>It is a library only. It defines no CLI, daemon process, configuration format, subcommands, or Bus verbs.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +721,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +775,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +904,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

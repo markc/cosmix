@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-agentd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,142 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-agentd/README.md"><div class="prose"><h1 id="cosmix-agentd">cosmix-agentd</h1>
+<p><code>cosmix-agentd</code> is the Cos daemon that exposes multi-turn LLM agent loops and
+pluggable tools through a Bus Unix-socket port. It belongs to the <code>cos</code> layer
+of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it uses Bus directly for request
+and response framing and uses agent, LLM, configuration, daemon, and logging
+libraries from the substrate. Its manifest has no direct Mix dependency.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-agentd
+</code></pre>
+<p>The binary takes no command-line options or subcommands. Clients operate it by
+sending Bus commands to the <code>agentd</code> port. The crate declares no Cargo features.</p>
+<h2 id="description">Description</h2>
+<p>The daemon:</p>
+<ul>
+<li>creates and resumes agent sessions;</li>
+<li>sends user messages through an LLM-backed agent loop;</li>
+<li>registers the built-in tool set from <code>cosmix-lib-agent</code>;</li>
+<li>returns the registered tool schemas;</li>
+<li>persists session histories as JSONL;</li>
+<li>keeps active sessions in memory; and</li>
+<li>handles each accepted Unix-socket connection in its own asynchronous task.</li>
+</ul>
+<p>The process initialises daemon logging without statistics, binds its port, and
+runs until interrupted. On <code>Ctrl-C</code>, it removes the socket path and exits.</p>
+<h2 id="transport">Transport</h2>
+<p>The daemon listens on:</p>
+<pre><code class="language-text">/run/user/{uid}/cosmix/ports/agentd.sock
+</code></pre>
+<p>Each accepted connection carries one Bus request. The request must have a
+<code>command</code> header. A non-empty request body must be valid JSON; an empty body is
+treated as JSON <code>null</code>.</p>
+<p>The response has:</p>
+<ul>
+<li>an <code>rc</code> Bus header containing a decimal return code; and</li>
+<li>a JSON response body.</li>
+</ul>
+<p>Return code <code>0</code> reports success. Return code <code>10</code> reports command validation,
+lookup, LLM initialisation, agent-loop, or unknown-command errors. Bus framing
+and JSON parse failures terminate request handling without a normal command
+response.</p>
+<h2 id="commands">Commands</h2>
+<table><thead><tr><th>Command</th><th>Request body</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>session.new</code></td><td>Optional <code>system</code> and <code>backend</code> strings</td><td>Creates and saves a session; returns <code>session_id</code></td></tr>
+<tr><td><code>message</code></td><td>Required <code>session_id</code> and <code>text</code> strings</td><td>Runs one agent turn and returns its outcome</td></tr>
+<tr><td><code>session.list</code></td><td>None</td><td>Returns persisted session IDs</td></tr>
+<tr><td><code>session.close</code></td><td>Required <code>session_id</code> string</td><td>Evicts an in-memory session</td></tr>
+<tr><td><code>tools.list</code></td><td>None</td><td>Returns registered tool schemas</td></tr>
+<tr><td><code>help</code></td><td>None</td><td>Returns the command names</td></tr>
+<tr><td><code>info</code></td><td>None</td><td>Returns daemon identity and live counts</td></tr>
+</tbody></table>
+<h3 id="sessionnew"><code>session.new</code></h3>
+<p><code>session.new</code> creates a <code>Session</code>. <code>system</code> supplies an optional system prompt.
+<code>backend</code> selects an optional LLM backend for that session. When <code>backend</code> is
+absent, the daemon-level backend is stored instead.</p>
+<p>Request body:</p>
+<pre><code class="language-json">{
+  "system": "Answer tersely.",
+  "backend": "ollama"
+}
+</code></pre>
+<p>Success body:</p>
+<pre><code class="language-json">{
+  "session_id": "&lt;session-id&gt;"
+}
+</code></pre>
+<p>The daemon attempts to save the new session before adding it to the active
+session map. A persistence failure is logged but does not change the success
+return code.</p>
+<h3 id="message"><code>message</code></h3>
+<p><code>message</code> removes the selected session from the active map for the duration of
+the turn. If the session is not active, the daemon attempts to load it from
+persistent storage.</p>
+<p>Request body:</p>
+<pre><code class="language-json">{
+  "session_id": "&lt;session-id&gt;",
+  "text": "Summarise the current state."
+}
+</code></pre>
+<p>The LLM client uses the backend stored in the session, falling back to the
+daemon-level backend. The registered tool set is available to the agent loop.</p>
+<p>Success body fields are:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>session_id</code></td><td>Session that handled the turn</td></tr>
+<tr><td><code>text</code></td><td>Final text produced by the agent loop</td></tr>
+<tr><td><code>iterations</code></td><td>Number of loop iterations used</td></tr>
+<tr><td><code>hit_cap</code></td><td>Whether the loop reached its iteration cap</td></tr>
+<tr><td><code>message_count</code></td><td>Number of messages now held by the session</td></tr>
+<tr><td><code>usage.input_tokens</code></td><td>Session input-token total</td></tr>
+<tr><td><code>usage.output_tokens</code></td><td>Session output-token total</td></tr>
+</tbody></table>
+<p>The session is saved after a successful turn and reinserted into the active
+map. If the agent loop fails, the daemon also attempts to save and reinsert the
+session before returning an error.</p>
+<h3 id="sessionlist"><code>session.list</code></h3>
+<p><code>session.list</code> calls the session store and returns persisted session IDs in a
+<code>sessions</code> array. The result does not describe only the sessions currently held
+in memory.</p>
+<h3 id="sessionclose"><code>session.close</code></h3>
+<p><code>session.close</code> removes a session from the active in-memory map. It does not
+delete the session JSONL file.</p>
+<p>The success body contains <code>session_id</code> and an <code>evicted</code> boolean. <code>evicted</code> is
+<code>false</code> when the session was not active. This is still a successful operation.</p>
+<h3 id="toolslist"><code>tools.list</code></h3>
+<p><code>tools.list</code> returns the schemas published by the daemon's <code>ToolRegistry</code> in a
+<code>tools</code> array. The registry is populated by <code>BuiltinTools::register_all</code> during
+daemon initialisation.</p>
+<h3 id="help"><code>help</code></h3>
+<p><code>help</code> returns the seven command names in a <code>commands</code> array.</p>
+<h3 id="info"><code>info</code></h3>
+<p><code>info</code> returns:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>
+<tr><td><code>port</code></td><td><code>agentd</code></td></tr>
+<tr><td><code>app</code></td><td><code>cosmix-agentd</code></td></tr>
+<tr><td><code>version</code></td><td>Crate package version</td></tr>
+<tr><td><code>tool_count</code></td><td>Number of registered tools</td></tr>
+<tr><td><code>active_sessions</code></td><td>Number of sessions held in memory</td></tr>
+</tbody></table>
+<h2 id="configuration">Configuration</h2>
+<p>The daemon selects its default LLM backend in this order:</p>
+<ol>
+<li>Non-empty <code>COSMIX_AGENT_BACKEND</code>.</li>
+<li>Non-empty <code>llm_backend</code> from the <code>skills</code> service settings.</li>
+<li><code>claude-api</code>.</li>
+</ol>
+<p>The source identifies the service settings file as <code>skills.toml</code>. A session's
+explicit <code>backend</code> value takes precedence when processing <code>message</code>.</p>
+<p>The default backend must support tool calling. The source notes <code>ollama</code> as a
+local tool-calling option when a suitable model is available.</p>
+<h2 id="persistence">Persistence</h2>
+<p>Sessions persist as JSONL beneath:</p>
+<pre><code class="language-text">$COSMIX_VAR/agent/sessions/{id}.jsonl
+</code></pre>
+<p><code>session.new</code> writes a new session. <code>message</code> loads an inactive session on
+demand and saves it after a turn or agent-loop failure. <code>session.close</code> only
+evicts memory state; it preserves the JSONL history.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +754,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +808,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +937,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

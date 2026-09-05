@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — AGENTS</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,63 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="AGENTS.md"><div class="prose"><h1 id="agent-notes">Agent Notes</h1>
+<p>Read <code>CLAUDE.md</code> as complementary guidance before substantive changes. This
+repository is <strong>public</strong>: never reproduce private mesh values (real host
+names, addresses, domains, keys, operator home paths) anywhere in it.</p>
+<h2 id="repository-role">Repository role</h2>
+<p><code>markc/cosmix</code> is the whole project in one tree, rooted at <code>$COSMIX</code>
+(default <code>~/Projects/cosmix</code>):</p>
+<ul>
+<li><code>src/</code> — one Cargo workspace, every crate flat under <code>src/crates/</code>:
+the Bus family (<code>cosmix-lib-bus</code>, <code>-client</code>, <code>-buildinfo</code>, <code>-log</code>,
+<code>-props-core</code>), Mix (<code>cosmix-lib-mix</code>, <code>cosmix-mix</code>, <code>mix-bench</code>), and the
+substrate libraries + daemons. Dependency direction is bus ← mix ← cos and
+cargo enforces it (no cycles).</li>
+<li><code>src/desktop/</code> — the desktop, a separate workspace with its own toolchain
+and a <code>[patch.crates-io]</code> section; build with <code>--manifest-path</code> or
+<code>setup.mix --desktop</code>.</li>
+<li><code>docs/</code> — the cosmix.dev Pages site. <code>docs/mix/*.md</code> and <code>docs/cos/*.md</code>
+are the manuals' <em>source</em>; <code>mix man</code> reads <code>$COSMIX/docs/mix</code> locally.
+<code>docs/dev/{bus,mix,cos}/</code> holds each former repository's README /
+CLAUDE.md / AGENTS.md, rewritten to monorepo paths — read the one for the
+area you are changing.</li>
+<li><code>bootstrap</code> (sh) + <code>setup.mix</code> (Mix) — the install. <code>bootstrap</code> is the only
+non-Mix script and exists solely because <code>mix</code> does not yet.</li>
+</ul>
+<h2 id="build-and-verify">Build and verify</h2>
+<pre><code class="language-sh">cd $COSMIX/src &amp;&amp; cargo build --workspace --release     # or: mix $COSMIX/setup.mix
+cd $COSMIX/src &amp;&amp; cargo test --workspace
+cd $COSMIX/src &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt -p &lt;crate&gt;          # never a repo-wide fmt from a task
+</code></pre>
+<p><code>src/rust-toolchain.toml</code> pins the compiler; rustup honours it.</p>
+<h2 id="paths">Paths</h2>
+<p>Everything derives from <code>$COSMIX</code>. The rule lives in
+<code>src/crates/cosmix-lib-config/src/paths.rs</code> (daemons) and, verbatim, in
+<code>src/crates/cosmix-mix/src/cosmix_paths.rs</code> (mix) — keep them in step. Root
+from the <code>COSMIX</code> env var, else self-located from the running binary (an
+ancestor holding <code>bootstrap</code> + <code>src/Cargo.toml</code>), else <code>~/Projects/cosmix</code>;
+<code>COSMIX_SRC/ETC/VAR/BIN/RUN/LOG/TMP</code> override single directories; a system
+install at <code>/opt/cosmix/bin</code> with no checkout above it keeps FHS/XDG
+defaults. Never hardcode an install path.</p>
+<h2 id="conventions">Conventions</h2>
+<ul>
+<li>Scripts are Mix. No Python; sh only for <code>bootstrap</code>.</li>
+<li>Docs for a behaviour change go in the same commit, in <code>docs/</code>.</li>
+<li>Version-bump a crate when a consumer would observe the change.</li>
+<li>Public-safe architecture specifications belong in <code>docs/spec/</code>. Read their
+status and evidence labels: draft publication is not normative acceptance.
+Chapter ordering does not reassign legacy runtime specification IDs.</li>
+<li>Operational docs (<code>_doc/</code>, <code>_plan/</code>, journals, private specs and decisions)
+remain in the maintainer's private control repo. Never copy them wholesale
+into the public suite. Update accepted public contracts with affected code.</li>
+</ul>
+<h2 id="history">History</h2>
+<p>Merged 2026-08-30 from <code>markc/bus</code>, <code>markc/mix</code>, <code>markc/cos</code> (git subtree —
+full history preserved) and the former docs-only <code>markc/cosmix</code>. Those three
+repositories are frozen at the merge commit.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +675,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +729,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +858,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

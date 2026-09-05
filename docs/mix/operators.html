@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/operators</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,441 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/operators.md"><div class="prose"><h1 id="operators--arithmetic-concat-comparison--boolean">operators — arithmetic, concat, comparison &amp; boolean</h1>
+<p>Every operator Mix's expression grammar knows, with verified precedence and the
+exact coercion rules. Statements use newline or <code>;</code> separators, every
+variable is <code>$</code>-sigil, and string concatenation is <strong><code>..</code></strong> — not <code>+</code>, not <code>.</code>.
+Verified against <strong>mix 0.56.0</strong>; the binary is the oracle.</p>
+<h2 id="precedence--associativity">Precedence &amp; associativity</h2>
+<p>From the parser (<code>parse_binary_rhs</code>, <code>parser.rs</code>). <strong>All binary operators are
+left-associative</strong> — including <code>**</code>. Higher number = binds tighter.</p>
+<table><thead><tr><th>Prec</th><th>Operators</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>0</td><td><code>? :</code></td><td>ternary conditional (short-circuit, <strong>right-associative</strong>)</td></tr>
+<tr><td>1</td><td><code>or</code></td><td>logical OR (short-circuit)</td></tr>
+<tr><td>2</td><td><code>and</code></td><td>logical AND (short-circuit)</td></tr>
+<tr><td>3</td><td><code>==</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code> <code>eq</code> <code>ne</code></td><td>comparison (no chaining)</td></tr>
+<tr><td>4</td><td><code>??</code></td><td>nil-coalesce (short-circuit)</td></tr>
+<tr><td>5</td><td><code>..</code></td><td>string concatenation</td></tr>
+<tr><td>6</td><td><code>+</code> <code>-</code></td><td>add / subtract (or <code>+</code> string-fallback)</td></tr>
+<tr><td>7</td><td><code>*</code> <code>/</code> <code>%</code></td><td>multiply / divide / modulo</td></tr>
+<tr><td>8</td><td><code>**</code></td><td>power</td></tr>
+</tbody></table>
+<p>Unary <code>-</code> (negate) and <code>not</code> / <code>!</code> (logical not) bind tighter than every binary
+operator. Parenthesise to override.</p>
+<p><code>&amp;&amp;</code> and <code>||</code> are <strong>statement-chain operators</strong>, and <code>;</code> is a statement
+separator rather than an expression operator, so none appears in this table.
+An assignment cannot be any operand of a <strong>Mix-classified</strong> chain: use <code>and</code> /
+<code>or</code> inside an assigned logical expression, or put shell-style conditional
+execution in a separate statement. This rejects both <code>$ok = $a.ok &amp;&amp; $b.ok</code> and
+<code>print("gate") &amp;&amp; $ok = false</code>, and neither line's operands run.
+A line keeps bash semantics instead only when the classifier routes it to the
+shell <em>and</em> the Mix parse gives out before reaching the assignment — a
+path-shaped head, a redirect, an env prefix. Neither half is enough alone:
+<code>print(1); echo hi</code> fails to parse yet stays a Mix error, and <code>true &amp;&amp; $x = false || cmd</code> has a shell-command head yet parses far enough to be rejected.
+See <code>mix man syntax</code> for the exact boundary.</p>
+<p><code>;</code> is the loosest hard boundary. A Mix chain operand can be a pipeline, but
+after <code>|</code> the raw external command tail owns any later <code>&amp;&amp;</code>/<code>||</code> until newline
+or <code>;</code>; there is no symmetric pipeline/chain precedence rule. See the
+authoritative <a href="/mix/syntax">statement-separator contract</a>.</p>
+<p><strong>What a chain tests is <code>$rc</code>.</strong> After the left statement runs, <code>&amp;&amp;</code> executes
+its right side only when <code>$rc</code> reads as success and <code>||</code> only when it reads as
+failure, where (since 0.60.0):</p>
+<ul>
+<li><strong>absent <code>$rc</code> is success</strong> — pure Mix statements like <code>print</code> never set it,
+so a cold <code>print(...) &amp;&amp; next</code> runs its right side. Mind the scope corner:
+when <strong>no global <code>$rc</code> exists yet</strong>, an rc-setting statement inside a
+function writes a <em>function-local</em> <code>$rc</code> that dies with the call, so
+<code>p() &amp;&amp; next</code> can read absent — and run <code>next</code> — off a failure that
+happened inside <code>p()</code>. (Once a global <code>$rc</code> exists, in-function setters
+update it and the gate sees it.) Chain on rc-setting statements directly,
+or return the rc from the function, rather than chaining on a call that
+buries them;</li>
+<li>a <strong>finite whole Number</strong> compares against <code>0</code> (<code>0</code> = success; anything
+else, including the negative Bus transport bands, = failure);</li>
+<li><strong>anything else raises</strong>: a non-Number <code>$rc</code> (string — numeric strings
+included — bool, nil, list, map) is <code>TYPE_MISMATCH</code>, and a non-finite or
+fractional Number is <code>VALUE_OUT_OF_RANGE</code>, both catchable as normal errors.
+Before 0.60.0 the gate cast through <code>to_number().unwrap_or(0)</code>, which
+fabricated an <strong>arbitrary verdict</strong> from every corrupt shape, never an
+error: anything whose coerced-then-truncated value was <code>0</code> read as
+<em>success</em> — non-coercible values and unparseable strings (<code>"inf"</code>
+included), <code>false</code>, NaN, fractions inside <code>(-1, 1)</code> and the numeric
+strings <code>"0"</code>/<code>"0.5"</code> — so <code>&amp;&amp;</code> ran a destructive right side; while
+<code>true</code>, <code>Number</code> infinities and anything truncating to non-zero read as
+<em>failure</em>, so <code>||</code> did. Raising stops both.</li>
+</ul>
+<pre><code class="language-mix">print(2 + 3 * 4)          -- * before +
+print((2 + 3) * 4)        -- parens win
+print("sum=" .. 2 + 3)    -- + (prec 6) before .. (prec 5)
+print(1 + 2 == 3)         -- arith before comparison
+</code></pre>
+<pre><code class="language-text">14
+20
+sum=5
+true
+</code></pre>
+<p><strong><code>**</code> is left-associative</strong> (unlike maths convention and unlike Python):</p>
+<pre><code class="language-mix">print(2 ** 3 ** 2)        -- (2**3)**2 = 64, NOT 2**(3**2) = 512
+print(-2 ** 2)            -- unary minus binds tighter: (-2)**2 = 4
+</code></pre>
+<pre><code class="language-text">64
+4
+</code></pre>
+<p>Comparisons <strong>do not chain</strong> — they are left-associative at the same precedence,
+so <code>1 &lt; 2 == true</code> parses as <code>(1 &lt; 2) == true</code>:</p>
+<pre><code class="language-mix">print(1 &lt; 2 == true)      -- (true) == true
+</code></pre>
+<pre><code class="language-text">true
+</code></pre>
+<p><code>and</code> (prec 2) binds tighter than <code>or</code> (prec 1):</p>
+<pre><code class="language-mix">print(true or false and false)   -- true or (false and false)
+</code></pre>
+<pre><code class="language-text">true
+</code></pre>
+<h2 id="arithmetic-------">Arithmetic: <code>+</code> <code>-</code> <code>*</code> <code>/</code> <code>%</code> <code>**</code></h2>
+<p>Mix numbers are <strong>f64</strong> (see <a href="/mix/numbers">numbers</a> / <a href="/mix/math">math</a>). Operands are
+coerced with <code>to_number</code>: a numeric <strong>string</strong> or a <strong>bool</strong> is accepted
+(<code>true</code> → 1, <code>false</code> → 0); a non-numeric value <strong>raises</strong> a runtime error.
+Numeric strings include scientific notation (<code>"1e3" + 1</code> → <code>1001</code>), but the
+coercion is <strong>strict</strong>: <code>"inf"</code>, <code>"nan"</code>, and overflow spellings like <code>"1e999"</code>
+are <em>not</em> numeric strings — they behave as ordinary text (so <code>"inf" + 1</code>
+falls back to concat, and <code>"nan" &lt; 5</code> errors).</p>
+<pre><code class="language-mix">print(7 + 3)
+print(7 - 3)
+print(7 * 3)
+print(7 / 3)
+print(7 % 3)
+print(2 ** 10)
+</code></pre>
+<pre><code class="language-text">10
+4
+21
+2.3333333333333335
+1
+1024
+</code></pre>
+<p><code>**</code> is real <code>powf</code>, so fractional and negative exponents work; bools coerce:</p>
+<pre><code class="language-mix">print(9 ** 0.5)           -- square root via power
+print(true + true)        -- 1 + 1
+print(true * 5)
+</code></pre>
+<pre><code class="language-text">3
+2
+5
+</code></pre>
+<p><strong>Modulo</strong> follows Rust's <code>%</code> (truncated; the result takes the sign of the
+dividend) and works on floats:</p>
+<pre><code class="language-mix">print(-7 % 3)
+print(7 % -3)
+print(7.5 % 2)
+</code></pre>
+<pre><code class="language-text">-1
+1
+1.5
+</code></pre>
+<p><strong>Division and modulo by zero raise</strong> — catchable runtime errors, not
+<code>NaN</code>/<code>inf</code> (<code>%</code> by zero returned <code>NaN</code> before 0.20.5; both error now):</p>
+<pre><code class="language-mix">print(5 / 0)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: division by zero
+</code></pre>
+<pre><code class="language-mix">print(5 % 0)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: modulo by zero
+</code></pre>
+<p>Wrap a risky divide in <a href="/mix/errors">try/catch</a> if the divisor might be zero. (Note:
+the <code>math</code> builtins like <code>ln(0)</code> <em>do</em> return <code>-inf</code> per IEEE-754 — only the <code>/</code>
+and <code>%</code> operators hard-error. See <a href="/mix/math">math</a>.)</p>
+<p>A genuinely non-numeric operand to <code>-</code> <code>*</code> <code>/</code> <code>%</code> <code>**</code> raises:</p>
+<pre><code class="language-mix">print("ab" * 3)           -- no string-repeat operator
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: cannot use 'ab' as number
+</code></pre>
+<p>Numeric strings still coerce (<code>"8" / "2"</code> → <code>4</code>). In 0.55.0, <code>/</code> and <code>%</code>
+were brought into line with the other arithmetic operators: an unparseable
+right operand now reports that operand as non-numeric, rather than being
+silently treated as zero and misreported as division/modulo by zero; an
+unparseable left operand no longer becomes a plausible numeric <code>0</code> result.</p>
+<p>There is <strong>no string <code>*</code> repeat and no list <code>+</code> merge</strong> — use the
+<a href="/mix/builtins"><code>repeat()</code></a> builtin for strings and <a href="/mix/collections"><code>push()</code></a> /
+<a href="/mix/collections"><code>concat</code>-style helpers</a> for lists.</p>
+<h3 id="-has-a-string-fallback--prefer--for-text"><code>+</code> has a string fallback — prefer <code>..</code> for text</h3>
+<p><code>+</code> first tries to coerce <strong>both</strong> sides to numbers. If both succeed it adds; only
+when at least one side is non-numeric does it fall back to string concatenation.
+This makes <code>+</code> ambiguous on data of unknown type — <strong>always use <code>..</code> for text</strong>:</p>
+<pre><code class="language-mix">print("5" + 3)            -- both numeric -&gt; 8
+print("5" + "10")         -- both numeric strings -&gt; 15, NOT "510"
+print("a" + "b")          -- not numeric -&gt; string concat
+print("inf" + 1)          -- "inf" is NOT a numeric string -&gt; concat
+print([1] + [2])          -- neither numeric -&gt; renders + joins as text
+</code></pre>
+<pre><code class="language-text">8
+15
+ab
+inf1
+[1][2]
+</code></pre>
+<p>That <code>"5" + "10"</code> → <code>15</code> surprise is exactly why the concat operator is separate.</p>
+<h2 id="concatenation-">Concatenation: <code>..</code></h2>
+<p><code>..</code> always converts <strong>both</strong> operands to their Mix string form and joins them.
+It never does arithmetic — this is the unambiguous way to build text. (In <code>"…"</code>
+strings, <code>${name}</code> interpolation is the other path; a bare <code>$name</code> is literal. See
+<a href="/mix/strings">strings</a>.)</p>
+<pre><code class="language-mix">$name = "world"
+print("hello " .. $name)
+print("x" .. 1 .. "y")    -- numbers stringify
+print(1 .. 2)             -- "12", NOT 3
+</code></pre>
+<pre><code class="language-text">hello world
+x1y
+12
+</code></pre>
+<p><strong><code>..</code> is not a range operator</strong> (unlike Rust/Ruby): <code>1 .. 5</code> is the <em>string</em>
+<code>"15"</code>, never a sequence. Use the <code>range()</code> <a href="/mix/builtins">builtin</a> or a
+<code>for</code> loop for numeric sequences.</p>
+<p><code>..</code> is the workhorse for assembling messages, paths, and Bus targets:</p>
+<pre><code class="language-mix">$node = "node1"
+$addr = "noded." .. $node .. ".bus"
+print($addr)
+</code></pre>
+<pre><code class="language-text">noded.node1.bus
+</code></pre>
+<p>When <code>..</code> ends a physical line, the expression continues on the following line.
+Comments and blank lines may separate the operator from its right operand:</p>
+<pre><code class="language-mix">$message = "prefix: " .. -- trailing concat requests more input
+
+  "body"
+</code></pre>
+<p>Only the trailing form is continuation syntax. A line beginning with <code>..</code> is
+not joined to the previous statement, so <code>../tool</code> remains a relative command
+path and <code>source ../file.mix</code> / <code>include ../file.mix</code> retain their path grammar.
+No other binary operator gains newline continuation; use <code>\</code> for the general
+case. A <code>;</code> after <code>..</code> remains a parse error, not a continuation boundary.</p>
+<h2 id="comparison------">Comparison: <code>==</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code></h2>
+<h3 id="equality---">Equality <code>==</code> / <code>!=</code></h3>
+<p>Value equality with <strong>one cross-type rule</strong>: a <code>Number</code> compared to a <code>String</code>
+coerces the string to a number and compares numerically (when it parses);
+otherwise unequal. Same-type compares structurally. No <code>Number</code>↔<code>Bool</code> coercion.</p>
+<pre><code class="language-mix">print(2 == 2.0)           -- numbers
+print(5 == "5")           -- string coerces to number
+print(5 == "5.0")         -- still numeric: 5.0 == 5.0
+print(1 == true)          -- NO number/bool coercion -&gt; false
+print(nil == nil)
+print(3 != 4)
+</code></pre>
+<pre><code class="language-text">true
+true
+true
+false
+true
+true
+</code></pre>
+<p><strong><code>==</code> / <code>!=</code> with a map or list on BOTH sides raises <code>TYPE_ERROR</code></strong> (0.68.0).
+Use <strong><code>deep_eq(a, b)</code></strong> for structural comparison:</p>
+<pre><code class="language-mix">print(deep_eq([1, 2], [1, 2]))   -- true
+print([1, 2] == [1, 2])          -- raises TYPE_ERROR, naming deep_eq
+</code></pre>
+<pre><code class="language-text">true
+</code></pre>
+<p>Until 0.68.0 the comparison answered — always, whatever the contents: <code>false</code>
+for <code>==</code>, <code>true</code> for <code>!=</code>. That is a constant wearing a comparison's clothes,
+which is why it now raises rather than quietly misleading.</p>
+<p>Only <strong>both</strong>-collection comparisons raise. A collection against a <strong>scalar</strong>
+still answers, because that is a genuine type difference and <code>false</code> is
+truthful — which keeps the key-absence idiom working:</p>
+<pre><code class="language-mix">$reg = {}
+print($reg["k"] == nil)   -- true
+$reg.k = [1, 2]
+print($reg["k"] == nil)   -- false  (present; the value is a list)
+print([1, 2] == "text")   -- false
+</code></pre>
+<p>See <a href="/mix/collections#list--list-raises-0680--use-deep_eq">collections</a> for the
+full rule, including which builtins are and are not affected.</p>
+<h3 id="ordering------numeric-first-lexicographic-fallback">Ordering <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code> — numeric-first, lexicographic fallback</h3>
+<p>The rule (<code>num_cmp</code> in <code>evaluator.rs</code>):</p>
+<ol>
+<li>If <strong>both</strong> operands coerce to numbers (numbers, or numeric strings like <code>"5"</code>), compare <strong>numerically</strong>.</li>
+<li>Else if <strong>both</strong> are strings, compare <strong>lexicographically by Unicode codepoint</strong> (byte order for valid UTF-8 — byte-exact, no case-fold, no normalization).</li>
+<li>Otherwise (a non-numeric string vs a number) → <strong>runtime error</strong>.</li>
+</ol>
+<pre><code class="language-mix">print(5 &lt; 10)             -- numeric
+print("5" &lt; "10")         -- both numeric strings -&gt; NUMERIC -&gt; true
+print("apple" &lt; "banana") -- both strings -&gt; lexicographic
+print("Zebra" &lt; "apple")  -- 'Z' (0x5A) &lt; 'a' (0x61) -&gt; true
+print("abc" &lt;= "abc")
+print("5" &lt; "abc")        -- not both numeric, both strings -&gt; lexicographic
+</code></pre>
+<pre><code class="language-text">true
+true
+true
+true
+true
+true
+</code></pre>
+<p>Note <code>"5" &lt; "10"</code> stays <strong>numeric</strong> (→ <code>true</code>), the opposite of a naive
+string compare. The lexicographic path is handy for character-class tests:</p>
+<pre><code class="language-mix">$ch = "m"
+print($ch &gt;= "a" and $ch &lt;= "z")   -- is it a lowercase letter?
+</code></pre>
+<pre><code class="language-text">true
+</code></pre>
+<p>A non-numeric string against a number is genuinely incomparable and <strong>errors</strong>:</p>
+<pre><code class="language-mix">print(5 &lt; "abc")
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: cannot compare 'abc' as number
+</code></pre>
+<h2 id="string-equality-keywords-eq--ne">String equality keywords: <code>eq</code> / <code>ne</code></h2>
+<p><code>eq</code> and <code>ne</code> compare the <strong>rendered Mix string forms</strong> of both operands
+(<code>to_mix_string()</code>) — no numeric coercion. Use them when you want a <em>textual</em>
+match regardless of type, and <code>==</code> when you want value/numeric equality. The
+difference shows on numbers that print differently:</p>
+<pre><code class="language-mix">print(5 eq "5")           -- "5" eq "5" -&gt; true
+print("5" eq 5)           -- symmetric
+print(5 eq "5.0")         -- "5" eq "5.0" -&gt; DIFFERENT text -&gt; false
+print(5 == "5.0")         -- numeric: 5.0 == 5.0 -&gt; true
+print("a" ne "b")
+</code></pre>
+<pre><code class="language-text">true          &lt;- 5 eq "5"
+true          &lt;- "5" eq 5   (symmetric)
+false         &lt;- 5 eq "5.0"  (different printed text: "5" vs "5.0")
+true          &lt;- 5 == "5.0"  (numeric: 5.0 == 5.0)
+true          &lt;- "a" ne "b"
+</code></pre>
+<p>Rule of thumb: <strong><code>==</code> for "same value", <code>eq</code> for "same printed text".</strong></p>
+<h2 id="boolean-and-or-not-and-">Boolean: <code>and</code> <code>or</code> <code>not</code> (and <code>!</code>)</h2>
+<p><code>and</code> / <code>or</code> <strong>short-circuit</strong> and <strong>return the deciding operand value itself</strong>,
+not a coerced bool — like Lua/Python, not C:</p>
+<ul>
+<li><code>a or b</code> → <code>a</code> if <code>a</code> is truthy, else <code>b</code>.</li>
+<li><code>a and b</code> → <code>a</code> if <code>a</code> is falsy, else <code>b</code>.</li>
+</ul>
+<pre><code class="language-mix">print(0 or "fallback")    -- 0 is falsy -&gt; right side
+print("first" or "second")-- left truthy -&gt; left, right not evaluated
+print(1 and "kept")       -- left truthy -&gt; right side
+print("" and "skipped")   -- left falsy ("") -&gt; left, prints empty
+</code></pre>
+<pre><code class="language-text">fallback
+first
+kept
+
+</code></pre>
+<p>This makes <code>or</code> a clean default-picker and <code>and</code> a guard. (<code>not</code> / <code>!</code> is the only
+one that <em>always</em> yields a real bool — see below.)</p>
+<h3 id="not---and-truthiness"><code>not</code> / <code>!</code> and truthiness</h3>
+<p><code>not x</code> (keyword) and <code>!x</code> (symbol) both return a real <code>Bool</code> — the logical
+negation of <code>x</code>'s truthiness. <strong>Truthiness</strong> (<code>is_truthy</code>):</p>
+<table><thead><tr><th>Value</th><th>Truthy?</th></tr></thead><tbody>
+<tr><td><code>nil</code></td><td>false</td></tr>
+<tr><td><code>false</code> / <code>true</code></td><td>as-is</td></tr>
+<tr><td><code>0</code> (number)</td><td>false; any other number true</td></tr>
+<tr><td><code>""</code> <strong>and <code>"0"</code></strong></td><td>false; any other string true</td></tr>
+<tr><td><code>[]</code> / <code>{}</code> empty</td><td>false; non-empty true</td></tr>
+<tr><td>function</td><td>always true</td></tr>
+</tbody></table>
+<p>Note the two string traps: an <strong>empty string and the string <code>"0"</code> are both
+falsy</strong>.</p>
+<pre><code class="language-mix">print(not true)
+print(not 0)
+print(not "")             -- empty string -&gt; falsy -&gt; not -&gt; true
+print(not "0")            -- the string "0" is ALSO falsy
+print(not "x")            -- non-empty -&gt; truthy -&gt; false
+print(not nil)
+print(not [])             -- empty list falsy
+print(not [1])
+</code></pre>
+<pre><code class="language-text">false
+true
+true
+true
+false
+true
+true
+false
+</code></pre>
+<h2 id="nil-coalesce-">Nil-coalesce: <code>??</code></h2>
+<p><code>a ?? b</code> is <strong>nil-coalesce, not falsy-coalesce</strong> — it short-circuits on <strong>nil
+only</strong>: it returns <code>a</code> unless <code>a</code> is <code>nil</code>, in which case it returns <code>b</code>. Unlike
+<code>or</code>, a falsy-but-non-nil left (<code>0</code>, <code>""</code>, <code>false</code>) is kept. Use it to supply a
+default for a possibly-unset value; use <code>? :</code> for a real condition.</p>
+<pre><code class="language-mix">$x = nil
+print($x ?? "default")    -- nil -&gt; right side
+print(0 ?? "default")     -- 0 is not nil -&gt; kept
+print("" ?? "default")    -- "" is not nil -&gt; kept
+print(false ?? "x")       -- false is not nil -&gt; kept
+</code></pre>
+<pre><code class="language-text">default
+0
+
+false
+</code></pre>
+<p>Contrast with <code>or</code>, which <em>would</em> replace <code>0</code>, <code>""</code>, and <code>false</code> because they
+are falsy.</p>
+<p><strong>Precedence trap with <code>..</code>:</strong> concat (prec 5) binds <em>tighter</em> than <code>??</code>
+(prec 4), so <code>"x = " .. $v ?? "d"</code> parses as <code>("x = " .. $v) ?? "d"</code> — the
+concat result is never nil, so the default <strong>never fires</strong> (you get <code>x = nil</code>).
+Parenthesise the coalesce inside a concat:</p>
+<pre><code class="language-mix">$v = nil
+print("x = " .. $v ?? "d")    -- ("x = " .. $v) ?? "d" -&gt; default dead
+print("x = " .. ($v ?? "d"))  -- what you meant
+</code></pre>
+<pre><code class="language-text">x = nil
+x = d
+</code></pre>
+<p>The other direction reads naturally: <code>??</code> binds tighter than comparison, so
+<code>$a ?? 0 &lt; 5</code> is <code>($a ?? 0) &lt; 5</code>.</p>
+<h2 id="ternary-cond--a--b">Ternary: <code>cond ? a : b</code></h2>
+<p>The C-style conditional expression (since 0.20.0). It evaluates <code>cond</code>, then
+<strong>only the taken branch</strong> — <code>a</code> if <code>cond</code> is truthy, else <code>b</code>. It is the
+<strong>loosest-binding</strong> operator (looser than <code>or</code>) and <strong>right-associative</strong>, so a
+chain is an else-if ladder: <code>a ? b : c ? d : e</code> is <code>a ? b : (c ? d : e)</code>.</p>
+<pre><code class="language-mix">$n = 2
+print($n &gt; 0 ? "pos" : "neg")              -- basic
+print($n == 1 ? "one" : $n == 2 ? "two" : "many")  -- right-assoc chain
+</code></pre>
+<pre><code class="language-text">pos
+two
+</code></pre>
+<p><strong>Prefer <code>? :</code> over the <code>cond and a or b</code> idiom.</strong> Because Mix is broadly falsy
+(<code>""</code>, <code>0</code>, <code>false</code>, <code>nil</code>, <code>[]</code>), <code>cond and a or b</code> silently returns <code>b</code> whenever
+the <em>middle</em> operand <code>a</code> is falsy — <code>$ok and false or "x"</code> wrongly yields <code>"x"</code>,
+while <code>$ok ? false : "x"</code> correctly yields <code>false</code>.</p>
+<p>It is single-line at statement top level (a newline before <code>?</code> ends the statement
+first — use an <a href="/mix/control-flow"><code>if</code> expression</a> for a multi-line conditional
+value), but like any expression it may span newlines inside <code>(...)</code>/<code>[...]</code>/<code>{...}</code>.</p>
+<p>A ternary works as a bare statement too, including variable-led (<code>$c ? "y" : "n"</code>),
+but both branches must be <strong>expressions</strong> — <code>print</code> is a <em>statement</em> keyword, so
+<code>$c ? print("y") : print("n")</code> is a parse error. For side-effecting branches use
+an <a href="/mix/control-flow"><code>if</code> statement</a>.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<pre><code class="language-text">+  -  *  /  %  **      arithmetic  (f64; coerces numeric strings/bools; / or % by 0 errors)
+..                     string concat (always stringifies both sides)  &lt;-- use for text
++                      string-concat FALLBACK only when not both numeric (avoid for text)
+== !=                  value equality (Number&lt;-&gt;String coerces; List/Map always !=)
+&lt;  &gt;  &lt;=  &gt;=           ordering: numeric-first, else lexicographic strings, else error
+eq ne                  textual equality on the printed Mix string forms
+and or                 short-circuit; RETURN the deciding operand (not a bool)
+not  !                 logical negation -&gt; always a real Bool
+??                     nil-coalesce: left unless left is nil (keeps falsy non-nil)
+cond ? a : b           ternary: cond truthy -&gt; a else b (loosest, right-assoc, short-circuit)
+-x                     numeric negate;  not x / !x  logical not
+</code></pre>
+<p>No operator chains comparisons (<code>a &lt; b &lt; c</code> is <code>(a&lt;b) &lt; c</code>), and there is no
+string-<code>*</code>-repeat, list-<code>+</code>-merge, or <code>++</code>/<code>--</code>. Reach for the
+<a href="/mix/builtins">builtins</a> (<code>repeat</code>, <code>min</code>, <code>max</code>) instead. For a conditional value
+use the ternary <code>cond ? a : b</code> above or an <a href="/mix/control-flow"><code>if</code> expression</a>.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/numbers">numbers</a> — f64 model, integer-clean printing, radix literals</li>
+<li><a href="/mix/math">math</a> — numeric builtins (<code>sqrt</code>, <code>pow</code>, <code>round</code>, IEEE-754 <code>inf</code>/<code>NaN</code>)</li>
+<li><a href="/mix/strings">strings</a> — <code>'raw'</code> vs <code>"${interp}"</code>, codepoint vs byte ops</li>
+<li><a href="/mix/control-flow">control-flow</a> — <code>if</code> / <code>while</code> / <code>for each</code>, where truthiness is used</li>
+<li><a href="/mix/errors">errors</a> — <code>try</code>/<code>catch</code> for division-by-zero and coercion errors</li>
+<li><a href="/mix/variables">variables</a> — the <code>$</code> sigil and scope</li>
+<li><a href="/mix/collections">lists</a> — why <code>List == List</code> is false; element comparison</li>
+<li>The source: <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs"><code>evaluator.rs</code></a> (<code>eval_binop</code>, <code>num_cmp</code>) and <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/parser.rs"><code>parser.rs</code></a> (<code>parse_binary_rhs</code> precedence table)</li>
+<li><code>mix help</code> for the topic list; <code>mix what NAME</code> for one-line builtin help</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1053,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1107,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1236,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

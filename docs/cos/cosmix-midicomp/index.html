@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-midicomp/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,131 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-midicomp/README.md"><div class="prose"><h1 id="cosmix-midicomp">cosmix-midicomp</h1>
+<p><code>cosmix-midicomp</code> converts Standard MIDI Files (SMF) to a plain-text event
+format and compiles that text back to SMF bytes. It provides a Rust library and
+a thin command-line program. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain, the
+crate belongs to the <code>cos</code> layer; it does not itself depend on <code>bus</code> or <code>mix</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>Decode an SMF file to standard output:</p>
+<pre><code class="language-text">cosmix-midicomp song.mid
+cosmix-midicomp song.mid &gt; song.asc
+</code></pre>
+<p>Decode SMF data from standard input:</p>
+<pre><code class="language-text">cosmix-midicomp &lt; song.mid
+</code></pre>
+<p>Compile text to an SMF file:</p>
+<pre><code class="language-text">cosmix-midicomp --compile song.asc song.mid
+</code></pre>
+<p>Compile text from standard input:</p>
+<pre><code class="language-text">cosmix-midicomp --compile song.mid &lt; song.asc
+</code></pre>
+<p>See <a href="/cos/cosmix-midicomp/text-format">Text format</a> for the accepted event grammar.</p>
+<h2 id="description">Description</h2>
+<p>The default direction decodes SMF bytes to text. The decoder is a
+bounds-checked implementation of the tolerant <code>midicomp</code> reader behaviour. It
+zero-pads short fixed-length meta events, joins split SysEx packets, and
+continues through the rest of a track after a malformed event where possible.</p>
+<p>Compile mode tokenises the text grammar, parses it into owned events, builds a
+<code>midly::Smf</code>, and serialises the result. It supports SMF formats 0, 1, and 2,
+metrical PPQN division, and SMPTE timecode division.</p>
+<p>The plain output form is canonical. Decoding an SMF produced by the compiler
+and compiling it again preserves the generated text and SMF bytes. Arbitrary
+input files are not promised to round-trip byte for byte: the writer uses
+minimal running status and canonical variable-length quantities.</p>
+<p>The crate handles MIDI 1.0 Standard MIDI Files. Universal MIDI Packets and
+MIDI Clip Files are outside its format surface.</p>
+<h2 id="library-interface">Library interface</h2>
+<p>The library crate is named <code>cosmix_midicomp</code>.</p>
+<table><thead><tr><th>Item</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>Options</code></td><td>Selects text rendering and time parsing behaviour.</td></tr>
+<tr><td><code>decode_smf_to_text</code></td><td>Converts an SMF byte slice to text and reports malformed input.</td></tr>
+<tr><td><code>encode_text_to_smf</code></td><td>Compiles text into a new SMF byte vector.</td></tr>
+</tbody></table>
+<h3 id="options"><code>Options</code></h3>
+<pre><code class="language-rust">use cosmix_midicomp::{Options, decode_smf_to_text, encode_text_to_smf};
+
+let options = Options::default();
+let (text, malformed) = decode_smf_to_text(&amp;smf_bytes, &amp;options)?;
+let canonical_bytes = encode_text_to_smf(&amp;text, &amp;options)?;
+</code></pre>
+<p><code>Options::default()</code> selects absolute tick positions, numeric notes, compact
+columns, and no payload folding.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>verbose</code></td><td><code>bool</code></td><td>Aligns decoded columns and renders note names.</td></tr>
+<tr><td><code>note</code></td><td><code>bool</code></td><td>Renders decoded note values as symbolic names.</td></tr>
+<tr><td><code>time</code></td><td><code>bool</code></td><td>Renders decoded time as absolute bar, beat, and click values.</td></tr>
+<tr><td><code>inc</code></td><td><code>bool</code></td><td>Decodes and parses event time as an incremental delta.</td></tr>
+<tr><td><code>fold</code></td><td><code>Option&lt;usize&gt;</code></td><td>Folds decoded SysEx, string, and hexadecimal payloads at the given column.</td></tr>
+</tbody></table>
+<p><code>decode_smf_to_text</code> returns <code>(String, bool)</code>. The Boolean is <code>true</code> when the
+input contains malformed MIDI data, even when useful text was recovered.
+Structural failures are returned as <code>anyhow::Error</code>.</p>
+<p><code>encode_text_to_smf</code> returns the complete SMF as <code>Vec&lt;u8&gt;</code>. Invalid headers,
+track counts, event ranges, strings, payloads, and time sequences return an
+error.</p>
+<h2 id="internal-modules">Internal modules</h2>
+<p>The implementation modules are private.</p>
+<table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>decode</code></td><td>Reads SMF chunks and events and renders canonical text.</td></tr>
+<tr><td><code>encode</code></td><td>Parses event lines, validates values, builds <code>midly</code> events, and writes SMF bytes.</td></tr>
+<tr><td><code>lex</code></td><td>Tokenises keywords, parameters, numbers, notes, strings, comments, and folded lines.</td></tr>
+</tbody></table>
+<p>Library callers use the two crate-level conversion functions rather than these
+modules directly.</p>
+<h2 id="command-line-interface">Command-line interface</h2>
+<p>The command has no subcommands, Bus verbs, or configuration file. Flags,
+positional files, and standard streams define each conversion.</p>
+<p>The binary accepts zero or one positional file in decode mode:</p>
+<table><thead><tr><th>Form</th><th>Input</th><th>Output</th></tr></thead><tbody>
+<tr><td><code>cosmix-midicomp IN.mid</code></td><td><code>IN.mid</code></td><td>Text on standard output</td></tr>
+<tr><td><code>cosmix-midicomp</code></td><td>Standard input</td><td>Text on standard output</td></tr>
+</tbody></table>
+<p>Compile mode accepts one or two positional files:</p>
+<table><thead><tr><th>Form</th><th>Input</th><th>Output</th></tr></thead><tbody>
+<tr><td><code>cosmix-midicomp -c IN.asc OUT.mid</code></td><td><code>IN.asc</code></td><td><code>OUT.mid</code></td></tr>
+<tr><td><code>cosmix-midicomp -c OUT.mid</code></td><td>Standard input</td><td><code>OUT.mid</code></td></tr>
+</tbody></table>
+<table><thead><tr><th>Option</th><th>Long form</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>-c</code></td><td><code>--compile</code></td><td>Compile text to SMF instead of decoding SMF.</td></tr>
+<tr><td><code>-d</code></td><td><code>--debug</code></td><td>Write execution tracing to standard error.</td></tr>
+<tr><td><code>-v</code></td><td><code>--verbose</code></td><td>Align output columns and enable note names.</td></tr>
+<tr><td><code>-n</code></td><td><code>--note</code></td><td>Render decoded note values symbolically.</td></tr>
+<tr><td><code>-t</code></td><td><code>--time</code></td><td>Render decoded absolute time as bar, beat, and click.</td></tr>
+<tr><td><code>-i</code></td><td><code>--inc</code></td><td>Use incremental event times when decoding or compiling.</td></tr>
+<tr><td><code>-f N</code></td><td><code>--fold N</code></td><td>Fold decoded payloads at column <code>N</code>.</td></tr>
+</tbody></table>
+<p>Verbose mode implies symbolic note rendering. Debug output does not replace
+normal conversion output.</p>
+<p>On malformed SMF input, the command writes all recovered text to standard
+output, emits an error, and exits unsuccessfully. Compile mode also exits
+unsuccessfully when the text cannot be validated or written.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>cli</code></td><td>Yes</td><td>Enables <code>clap</code> and builds the <code>cosmix-midicomp</code> binary.</td></tr>
+</tbody></table>
+<p>Library-only users can disable default features to omit the command-line
+dependency:</p>
+<pre><code class="language-toml">[dependencies]
+cosmix-midicomp = { version = "0.3", default-features = false }
+</code></pre>
+<h2 id="dependencies">Dependencies</h2>
+<table><thead><tr><th>Dependency</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>midly</code></td><td>Represents and writes compiled SMF data.</td></tr>
+<tr><td><code>anyhow</code></td><td>Carries conversion and I/O errors.</td></tr>
+<tr><td><code>clap</code></td><td>Parses command-line arguments when the <code>cli</code> feature is enabled.</td></tr>
+</tbody></table>
+<p>The decode path reads SMF bytes directly to preserve its tolerant behaviour.
+The encode path delegates SMF serialisation to <code>midly</code>.</p>
+<h2 id="text-stability">Text stability</h2>
+<p>The examples shipped with the crate contain canonical <code>.asc</code> and <code>.mid</code>
+pairs. For those pairs:</p>
+<pre><code class="language-text">decode(mid) == asc
+compile(asc) == mid
+</code></pre>
+<p>This property applies to files in the compiler's canonical form. It does not
+claim that every valid SMF encoding preserves its original byte layout.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +743,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +797,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +926,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

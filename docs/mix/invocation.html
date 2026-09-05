@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/invocation</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,307 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/invocation.md"><div class="prose"><h1 id="invoking-mix">Invoking Mix</h1>
+<p><code>mix</code> is one binary with several entry modes: an interactive shell (REPL), a
+script runner, a <code>-c</code> one-liner, a stdin reader, a syntax checker, a supervised
+Bus daemon, and a family of one-shot meta commands (<code>mix help</code>, <code>mix man</code>,
+<code>mix stats</code>, …). The same binary is also Mark's mesh <strong>login shell</strong>, so
+<code>ssh host '&lt;mix source&gt;'</code> is evaluated by Mix, not bash. This page covers how to
+start Mix in each mode and the rules that decide whether a <code>-c</code> / login-shell
+line runs as Mix code or dispatches a shell command.</p>
+<p>Verified against <strong>mix 0.61.0</strong> — the binary is the oracle. Argument parsing
+lives in <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-mix/src/main.rs"><code>cosmix-mix/src/main.rs</code></a>;
+the shell-first classifier is in <code>cosmix-mix/src/shell.rs</code>.</p>
+<pre><code class="language-text">$ mix --version
+mix 0.21.2
+</code></pre>
+<h2 id="modes-at-a-glance">Modes at a glance</h2>
+<table><thead><tr><th>Form</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>mix</code></td><td>Interactive REPL (loads <code>~/.mixrc</code>)</td></tr>
+<tr><td><code>mix script.mix [args…]</code></td><td>Run a file from the OS shell; args via <code>args()</code> / <code>$1</code>, <code>$2</code>, …</td></tr>
+<tr><td><code>mix script.mix [args…]</code> at the REPL</td><td>Run the file in a clean child process; the REPL survives</td></tr>
+<tr><td><code>mix -c '&lt;code&gt;'</code></td><td>Run one line of Mix <strong>or</strong> dispatch a shell command (shell-first classifier)</td></tr>
+<tr><td><code>mix -i -c '&lt;code&gt;'</code></td><td>As <code>-c</code>, but load <code>~/.mixrc</code> first (aliases + PATH), like <code>bash -ci</code></td></tr>
+<tr><td><code>mix - [args…]</code></td><td>Read the whole script from <strong>stdin</strong> (clean byte channel)</td></tr>
+<tr><td><code>mix --check &lt;script&gt;</code></td><td>Parse without executing — a syntax check</td></tr>
+<tr><td><code>mix lint [flags] FILE...</code></td><td>Semantic analysis: undefined names, arity, must-use, stable machine-readable diagnostics (0.29.0 — see <a href="/mix/lint">lint</a>)</td></tr>
+<tr><td><code>mix --no-prelude …</code></td><td>Skip loading the standard prelude (applies to any run mode)</td></tr>
+<tr><td><code>mix --no-traceback …</code></td><td>Uncaught errors print the legacy single line instead of a traceback (0.29.0 — see <a href="/mix/errors">errors</a>)</td></tr>
+<tr><td><code>mix --strict-arity …</code></td><td>Strict call arity: wrong-arity user-function/builtin calls raise catchable <code>ARITY_MISMATCH</code> instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see <a href="/mix/functions">functions</a>)</td></tr>
+<tr><td><code>mix --serve &lt;script&gt; [--name &lt;svc&gt;]</code></td><td>Run the script as a supervised Bus daemon citizen — see <a href="/mix/serve">serve</a></td></tr>
+<tr><td><code>mix --version</code> / <code>-V</code></td><td>Print version</td></tr>
+<tr><td><code>mix --help</code> / <code>-h</code></td><td>Usage summary</td></tr>
+<tr><td><code>mix stats [sub…]</code></td><td>Window-labelled usage reports and static authorship coverage — see <a href="/mix/stats">stats</a></td></tr>
+<tr><td><code>mix help</code> / <code>mix what &lt;name&gt;</code> / <code>mix man [topic]</code></td><td>Builtin/keyword reference and this manual — see <a href="/mix/cli">the <code>mix</code> meta-command</a></td></tr>
+</tbody></table>
+<p><code>mix help</code>, <code>mix what</code>, <code>mix man</code>, <code>mix status</code>, <code>mix build</code>, … are the same
+meta commands the REPL's bareword <code>mix</code> dispatcher accepts, exposed as one-shot
+CLI commands: <code>mix man invocation</code> prints this page; bare <code>mix man</code> prints
+<a href="/mix/">the manual index</a>. In both contexts, meta names are checked
+<strong>before</strong> the script-file fallback, so a script named <code>build</code>, <code>status</code>, or
+<code>test</code> in the CWD is shadowed — prefix the path with <code>./</code>, for example
+<code>mix ./build</code>. Full list on <a href="/mix/cli">the cli page</a>. An unknown option
+(<code>mix --zz</code>) errors and exits 1; an unknown REPL meta token names the token,
+notes that no such file exists, then shows the meta-command overview.</p>
+<p>Bare <code>mix</code> with <strong>no arguments</strong> starts the REPL — including when stdin is a
+pipe. The piped lines are then read and executed one at a time through the
+shell-first classifier (with <code>~/.mixrc</code> loaded), so a pipe into bare <code>mix</code>
+<strong>does</strong> run code — it works, but it is not the intended path. For a script use
+<code>mix &lt;file&gt;</code> or <code>mix -</code>: a whole-program parse over a clean byte channel, no
+per-line classification, no <code>~/.mixrc</code>.</p>
+<p>All modes that evaluate Mix record best-effort usage by default and are tagged
+as <code>interactive</code>, <code>script</code>, <code>c</code>, <code>stdin</code>, or <code>serve</code>. Set <code>MIX_STATS=off</code> (also
+<code>0</code> or <code>false</code>) to skip collection and all stats I/O. See <a href="/mix/stats">usage
+statistics</a>.</p>
+<h2 id="running-a-script-file">Running a script file</h2>
+<p>The first non-flag argument is the script path; everything after it is passed to
+the script.</p>
+<pre><code class="language-mix">-- greet.mix
+$all = args()
+print("argc=" .. length($all))
+print("first=" .. $1)
+for each $a in $all
+  print("arg: " .. $a)
+end
+</code></pre>
+<pre><code class="language-text">$ mix greet.mix alpha beta
+argc=2
+first=alpha
+arg: alpha
+arg: beta
+</code></pre>
+<p>Two ways to read arguments, both populated the same way:</p>
+<ul>
+<li><strong><code>args()</code></strong> returns the list of script arguments (not counting the script path, and not counting any flag given to <code>mix</code> itself — <code>mix --strict-arity greet.mix alpha</code> passes one argument, not two). See <a href="/mix/builtins">builtins</a>.</li>
+<li><strong>Positional <code>$1</code>, <code>$2</code>, …</strong> are the same arguments by index; <code>$0</code> is the script path / filename. These are the one place a bare sigil number is allowed to be unbound without raising — an out-of-range positional reads as <code>nil</code>.</li>
+</ul>
+<p><code>include</code> inside a script resolves <strong>relative to the running file's directory</strong>
+(not the CWD), because the runner records the script path (it is also <code>$0</code>, and
+error diagnostics attribute to it). The every-time, CWD-relative loader is
+<code>source</code>. See <a href="/mix/functions">modules</a>.</p>
+<p>The script's exit code is <code>0</code> on success, <code>1</code> on an uncaught error (the error
+message goes to stderr); a <code>Ctrl-C</code> interrupt is a clean exit.</p>
+<p>A command line ending in an odd run of backslashes may continue onto the next
+physical line. Mix splices it before classification, so the same command behaves
+identically here, under <code>-c</code>, and in the REPL. Even trailing runs are literal;
+backslashes inside Mix strings and heredoc bodies are untouched. See
+<a href="/mix/syntax#explicit-line-continuation--at-end-of-line">syntax</a>.</p>
+<p>At the REPL or login-shell prompt, <code>mix FILE [args…]</code> launches the same script
+mode as the OS-shell form in a child process. It therefore gets a <strong>clean
+scope</strong>, <code>$0</code> is <code>FILE</code>, and the remaining words populate <code>args()</code> and <code>$1</code>,
+<code>$2</code>, …; when it finishes, the existing REPL resumes. Use <code>source FILE</code> when
+the file should instead execute in and modify the <strong>current session scope</strong>.
+Meta names keep precedence over files: if <code>status</code> exists in the CWD,
+<code>mix status</code> still shows status and <code>mix ./status</code> runs the file.</p>
+<p>A script that registers <code>on &lt;cmd&gt; … end</code> handlers does <strong>not</strong> exit after its
+last statement — it stays alive pumping events for those handlers. For the
+supervised daemon variant (broker registration, reconnect, journald logging),
+use <a href="/mix/serve"><code>--serve</code></a>.</p>
+<h2 id="mix--c--one-liners-and-the-shell-first-classifier"><code>mix -c</code> — one-liners and the shell-first classifier</h2>
+<p><code>mix -c '&lt;code&gt;'</code> runs a single line. <strong>It is shell-first</strong>: the same classifier
+the REPL uses decides whether the line is Mix code or an external command. This
+is what makes Mix usable as a login shell — <code>mix -c 'hostname'</code> dispatches a
+command, <code>mix -c 'print(1 + 1)'</code> evaluates Mix.</p>
+<pre><code class="language-text">$ mix -c 'print(1 + 1)'
+2
+$ mix -c 'echo hello from shell'
+hello from shell
+</code></pre>
+<h3 id="how-the-classifier-decides-shellrs-classify_input">How the classifier decides (shell.rs <code>classify_input</code>)</h3>
+<p>A line starting with <code>#</code> or <code>--</code> is a comment (empty input). Otherwise the first
+word (after skipping <code>KEY=VALUE</code> env prefixes and expanding any alias) routes
+the line:</p>
+<ol>
+<li><strong>Starts with <code>$</code></strong> → Mix code (e.g. <code>$x = 1</code>), with a shell-chain fallback.</li>
+<li><strong>A Mix statement-keyword head</strong> (<code>print</code>, <code>if</code>, <code>for</code>, <code>send</code>, <code>function</code>, <code>try</code>, …) → Mix, also with the shell-chain fallback. <code>true</code> / <code>false</code> / <code>nil</code> are deliberately <strong>not</strong> keyword heads (since 0.21.0): a bare <code>true</code> or <code>false</code> line routes to <code>/usr/bin/{true,false}</code> so <code>false</code> exits <strong>1</strong> like every shell, and <code>nil</code> (no external binary) falls through to the Mix parse. Inside Mix source the lexer still owns all three literals (<code>$x = true</code>).</li>
+<li><strong>A shell builtin head</strong> (<code>cd</code>, <code>pushd</code>, <code>popd</code>, <code>history</code>, <code>exit</code>, <code>which</code>, <code>type</code>, <code>jobs</code>, <code>mix</code>, …) → external path.</li>
+<li><strong>A tight-hyphenated command-shaped head</strong> (<code>cosmix-comp</code>, <code>systemd-nspawn</code>) → external command before Mix can parse it as subtraction, whether or not it is on <code>PATH</code>. The rule is statement-head-only and requires an ASCII letter/<code>_</code> start with only ASCII letters/digits/<code>_</code>/<code>-</code>; spaced <code>a - b</code>, sigil/numeric subtraction, and expression-position <code>print(a-b)</code> stay Mix. Scope does not affect the decision: bare <code>a</code> is the string <code>"a"</code>, not <code>$a</code>, so <code>a-b</code> remains a command when <code>$a</code> is live.</li>
+<li><strong>First word found on <code>PATH</code> or is a path</strong> (<code>./x</code>, <code>/bin/ls</code>) → external command (design principle: shell-first). Routing is head-first — <code>&amp;&amp;</code> / <code>||</code> / <code>;</code> never force the shell path by themselves: a Mix-keyword head with a chain stays Mix (Mix has native statement chaining), an external head parses the chain on the shell path.</li>
+<li><strong>Otherwise</strong> → parse as Mix (function call, expression). If that fails definitively, a genuinely command-like head (<code>gti status</code>) reports the familiar "command not found" and exits 127; a Mix-shaped head — a lexer failure (<code>0755</code>), an operator, a glued call/index opener (<code>print(…</code>) — surfaces the <strong>real lex/parse error</strong> and exits 1. An unknown command-like semicolon list (<code>zqxfoo; zqxbar</code>) stays on the shell path even though each bare word could parse as a discarded Mix string; this preserves the pre-0.31 shell result instead of silently succeeding. A known preserved wart is that a non-keyword alphabetic head such as <code>not $x; print(1)</code> is also shell-routed and exits 127; use a Mix keyword, sigil, or parenthesized call to make the intent explicit.</li>
+</ol>
+<p>Two consequences worth internalising:</p>
+<pre><code class="language-text">$ mix -c 'false' ; echo $?    # routes to /usr/bin/false — exits 1, like every shell
+1
+$ mix -c 'true' ; echo $?
+0
+$ mix -c 'print(false)'       # the boolean literal, inside Mix source
+false
+</code></pre>
+<p>A dispatched command's exit status becomes Mix's exit code
+(<code>mix -c '/bin/sh -c "exit 7"'</code> exits 7). <code>&amp;&amp;</code> / <code>||</code> / <code>;</code> chaining and pipes
+work on the external path, and a plain foreground <code>cd</code> works inside chains
+(<code>cd /tmp &amp;&amp; pwd</code>) — <code>-c</code> also has bare <code>cd</code> (→ <code>$HOME</code>), <code>cd -</code>, and
+<code>~</code>-expansion. See <a href="/mix/shell-mode">the shell page</a> for the full dispatch
+grammar (redirects, brace expansion, <code>$(…)</code> substitution).</p>
+<p>A definitive Mix lex/parse error exits non-zero with the real diagnostic — it is
+<strong>not</strong> silently retried as a command:</p>
+<pre><code class="language-text">$ mix -c 'print(0755)'
+Lexer error at line 1:7: ambiguous leading-zero number '0755' — use a 0o (octal) / 0x (hex) / 0b (binary) prefix, or drop the leading zero(s) for decimal
+$ echo $?
+1
+</code></pre>
+<h3 id="the-bare-name-footgun">The bare-name footgun</h3>
+<p>Every Mix variable needs a <code>$</code> sigil. A bare <code>name = value</code> line is read as a
+shell command, not an assignment:</p>
+<pre><code class="language-text">$ mix -c 'x = 1'
+mix: x: No such file or directory (os error 2)
+$ echo $?
+127
+$ mix -c '$x = 1
+print($x)'          # the $ sigil makes it Mix
+1
+</code></pre>
+<p>See <a href="/mix/variables">variables</a> for the sigil rules.</p>
+<h3 id="multi-statement--c">Multi-statement <code>-c</code></h3>
+<p>Mix statements may be separated by <code>;</code> or real newlines. Semicolons are the
+compact one-line form:</p>
+<pre><code class="language-text">$ mix -c '$x = 5; $y = 7; print($x * $y)'
+35
+</code></pre>
+<p>Literal newlines remain useful for a readable multi-statement body:</p>
+<pre><code class="language-text">$ mix -c '$x = 5
+$y = 7
+print($x * $y)'
+35
+</code></pre>
+<h3 id="positional-args-under--c">Positional args under <code>-c</code></h3>
+<p>Everything after the code string is a positional <code>$1</code>, <code>$2</code>, … — even a word
+starting with <code>-</code> (so flags like <code>--no-prelude</code> must come <strong>before</strong> <code>-c</code>).
+<code>$0</code> is unset (<code>nil</code>) under <code>-c</code>.</p>
+<pre><code class="language-text">$ mix -c 'print("got " .. $1 .. " and " .. $2)' one two
+got one and two
+</code></pre>
+<p>A bare <code>mix</code> inside a <code>-c</code> line is refused (it would otherwise launch a nested
+REPL):</p>
+<pre><code class="language-text">$ mix -c 'mix'
+mix: -c: bare 'mix' would start an interactive REPL — ignored
+</code></pre>
+<h2 id="mix--i--load-mixrc-first"><code>mix -i</code> — load <code>~/.mixrc</code> first</h2>
+<p><code>-i</code> makes a <code>-c</code> run interactive-flavoured (≈ <code>bash -ci</code>): it sources
+<code>~/.mixrc</code> first, so your aliases and the toolkit's <code>PATH</code> are in scope before
+the line is classified and run. The combined spellings <code>-ci</code> and <code>-ic</code> mean the
+same thing.</p>
+<pre><code class="language-text">$ mix -i -c '&lt;line&gt;'     # aliases expanded, ~/.mixrc PATH applied
+$ mix -ci '&lt;line&gt;'       # same
+</code></pre>
+<p>Without <code>-i</code>, a plain <code>mix -c</code> has <strong>no aliases</strong> and does not read <code>~/.mixrc</code>
+(≈ <code>bash -c</code>). <code>~/.mixrc</code> also auto-loads for the plain interactive REPL
+(<code>mix</code> with no args). It does <strong>not</strong> load for a non-interactive <code>ssh host '&lt;mix&gt;'</code> — that path is closest to <code>mix -c</code>.</p>
+<h2 id="mix----read-a-script-from-stdin"><code>mix -</code> — read a script from stdin</h2>
+<p><code>mix -</code> reads the entire program from stdin as a clean byte channel — no shell
+re-quoting, nothing written to disk. This is the residue-free way to ship a
+script to a remote host (it is also the transport under the <code>ssh_mix</code> builtin —
+see <a href="/mix/remote">remote</a>).</p>
+<pre><code class="language-text">$ echo 'print("from stdin: " .. (2 * 21))' | mix -
+from stdin: 42
+$ echo 'print("name=" .. $1)' | mix - worldarg
+name=worldarg
+</code></pre>
+<p>Args after <code>-</code> are the script's positionals, exactly as with a file. <code>$0</code> is set
+to <code>"-"</code>. Unlike a pipe into bare <code>mix</code> (which the REPL consumes line by line
+through the classifier), <code>mix -</code> parses the whole program up front.</p>
+<h2 id="running-as-a-login-shell-and-over-ssh">Running as a login shell and over SSH</h2>
+<p>When <code>/opt/cosmix/bin/mix</code> is <strong>root's login shell</strong> on a host, <code>ssh host '&lt;cmd&gt;'</code> is evaluated by Mix, not bash. The universal shell <code>-c</code> contract still
+holds because the login path runs through the same shell-first classifier:</p>
+<ul>
+<li><strong><code>ssh host hostname</code></strong> — bare command, dispatched natively (no Mix needed).</li>
+<li><strong><code>ssh host 'mix status'</code></strong> — <code>mix</code> self-resolves via <code>current_exe</code>, no PATH needed for this case.</li>
+<li><strong><code>ssh host '&lt;mix source&gt;'</code></strong> — send Mix source to get Mix behaviour, e.g. <code>ssh host 'print(run("hostname"))'</code>.</li>
+</ul>
+<pre><code class="language-text">$ ssh node1 'print("hostname is: " .. run("hostname"))'   # node1 runs mix as its login shell
+hostname is: node1
+</code></pre>
+<p>(Locally, <code>echo '&lt;mix source&gt;' | mix -</code> runs the same script against <em>this</em> host.)</p>
+<p>From a Mix script, drive a remote mix through the ssh builtins instead of raw
+<code>ssh</code>: <code>ssh_run($host, $cmd)</code> for a one-liner, and <code>ssh_mix($host, $source)</code> —
+which ships whole Mix source over ssh stdin into <code>/opt/cosmix/bin/mix -</code>,
+bypassing every shell-quoting layer — for anything with quoting. The
+<a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + heredoc headline idiom</a>
+shows the interpolation and bindings rules.</p>
+<p>Two PATH gotchas to remember on the remote side:</p>
+<ul>
+<li>Inside <code>run</code> / <code>run_rc</code> (which spawn <code>/bin/sh</code> with a <strong>minimal PATH</strong>), call binaries by <strong>full path</strong> — <code>/opt/cosmix/bin/mix</code>, not bare <code>mix</code>. See <a href="/mix/system">running commands</a>.</li>
+<li>A non-interactive <code>ssh host '&lt;mix&gt;'</code> has <strong>no aliases</strong> (it's the <code>mix -c</code> path, not <code>mix -i</code>).</li>
+</ul>
+<p>For Mix-as-a-shell language facts (<code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chaining, pipes, redirects,
+brace expansion, <code>$(…)</code> command substitution on a shell-dispatch line), see
+<a href="/mix/shell-mode">the shell page</a>.</p>
+<h2 id="--no-prelude"><code>--no-prelude</code></h2>
+<p>Mix loads a small standard prelude (Mix-source helpers) before running your
+code; <code>--no-prelude</code> skips it. It applies to any run mode (<code>-c</code>, file, <code>-</code>,
+<code>--serve</code>). Builtins are compiled in and are unaffected — only prelude-defined
+helpers disappear. Give the flag <strong>before</strong> the code string / script path
+(after them it would be read as a script argument); <code>--serve</code> also accepts it
+after the script path.</p>
+<pre><code class="language-text">$ mix --no-prelude -c 'print("" .. range(1, 3))'   # range is a builtin, still works
+[1, 2, 3]
+</code></pre>
+<p>The prelude source is <code>cosmix-lib-mix/std/prelude.mix</code>, compiled into the binary.
+A user override at <code>&lt;base&gt;/prelude.mix</code> is honoured if it exists, where <code>&lt;base&gt;</code>
+is <code>$COSMIX_SRC</code> when that variable is set, otherwise <code>$COSMIX</code>. (Setting
+<code>$COSMIX_SRC</code> <em>replaces</em> the base — <code>$COSMIX/prelude.mix</code> is then not consulted.)
+Otherwise the built-in prelude is used.</p>
+<h2 id="--check--syntax-check-without-running"><code>--check</code> — syntax check without running</h2>
+<p><code>--check</code> lexes and parses a script and prints <code>&lt;file&gt;: OK</code>, or the first
+parse/lex error and exits 1. Nothing is executed.</p>
+<pre><code class="language-text">$ mix --check good.mix
+good.mix: OK
+$ echo $?
+0
+$ mix --check bad.mix
+Parse error at line 3:1: expected End, got Eof
+$ echo $?
+1
+</code></pre>
+<p>Use it in CI or a pre-commit hook to catch unterminated blocks (missing <code>end</code>),
+unclosed strings, and lexer errors before deploy.</p>
+<h2 id="--serve--run-a-script-as-a-supervised-bus-daemon"><code>--serve</code> — run a script as a supervised Bus daemon</h2>
+<p><code>mix --serve &lt;script&gt; [--name &lt;svc&gt;]</code> runs the script as a long-lived,
+<strong>supervised</strong> Bus citizen instead of a one-shot script. It connects to the local
+broker (<code>cosmix-noded</code>), registers, and runs an unconditional event pump that
+dispatches your <code>on &lt;cmd&gt; … end</code> handlers until SIGTERM/Ctrl-C or a <code>QUIT</code>.</p>
+<pre><code class="language-text">$ mix --serve worker.mix              # Bus service name = script stem ("worker")
+$ mix --serve worker.mix --name probe # explicit service name
+</code></pre>
+<p>Name derivation (SPEC 18 §3.1): <code>--name</code> wins; otherwise the default is the
+script's file <strong>stem</strong>. A leading <code>cosmix-</code> is stripped from either source
+(<code>/usr/local/lib/cosmix/statecache.mix</code> → <code>statecache</code>, and <code>--name cosmix-foo</code>
+canonicalises to <code>foo</code>). An anonymous serve with no derivable name is a launch
+error — never a nameless citizen. Serve mode takes <strong>no positional script args</strong>
+(a daemon has no argv); only <code>--name</code> and <code>--no-prelude</code> may follow the script
+path, in any order.</p>
+<p>It differs from a plain run in four ways: a reconnecting supervised transport (a
+broker bounce is a transient drop, not a death); an <strong>unconditional</strong> event pump
+(a plain run pumps only when the script registered handlers); an exhausted
+initial connect budget that fails fast (exit non-zero) under systemd; and a
+runtime-reserved verb surface — <code>HELP</code> / <code>INFO</code> / <code>QUIT</code> plus
+<code>&lt;svc&gt;.props.{get,list,describe}</code> are answered by the runtime pre-dispatch, so
+an <code>on</code> handler can never shadow them. Logging goes to <strong>journald</strong> (stderr
+fallback off-systemd), tagged with <code>service = &lt;svc&gt;</code>. The full contract is on
+<a href="/mix/serve">the serve page</a>; see <a href="/mix/bus">Bus messaging</a> for <code>on … end</code> handlers
+and the broker model.</p>
+<h2 id="resource-note">Resource note</h2>
+<p>Scripts run by the <code>mix</code> binary on the main thread get a raised recursion cap
+(128 vs the library default of 16). A runaway still returns a clean error rather
+than a native stack overflow. The binary does <strong>not</strong> sandbox its own operator —
+time/collection caps stay unset for binary-run scripts.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/variables">variables</a> — the <code>$</code> sigil and scope rules</li>
+<li><a href="/mix/strings">strings</a> — <code>'raw'</code> vs <code>"${…}"</code>, <code>..</code> concat</li>
+<li><a href="/mix/functions">functions</a> — <code>args()</code>, positionals, <code>include</code>/<code>source</code></li>
+<li><a href="/mix/shell-mode">the shell page</a> — chaining, pipes, redirects, brace/<code>$(…)</code> expansion</li>
+<li><a href="/mix/system">running commands</a> — <code>run</code> / <code>run_rc</code> and the minimal PATH</li>
+<li><a href="/mix/remote">remote execution</a> — <code>ssh_run</code> / <code>ssh_must</code> / <code>ssh_mix</code></li>
+<li><a href="/mix/serve">serve</a> — the full <code>--serve</code> citizen contract</li>
+<li><a href="/mix/cli">the <code>mix</code> meta-command</a> — <code>mix help</code>, <code>mix man</code>, <code>mix stats</code>, …</li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>send</code> / <code>on … end</code> and <code>--serve</code> citizens</li>
+<li><a href="/mix/builtins">builtins index</a> — <code>args</code>, <code>range</code>, <code>run</code>, …</li>
+<li><a href="/mix/">the manual index</a></li>
+<li><code>mix help</code> — full categorised builtin reference; <code>mix what &lt;name&gt;</code> — per-name lookup</li>
+<li><a href="https://github.com/markc/cosmix">Mix repo</a> · <a href="https://en.wikipedia.org/wiki/ARexx">ARexx background</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +919,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +973,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1102,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

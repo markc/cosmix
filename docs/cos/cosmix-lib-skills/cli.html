@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-skills/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,136 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-skills/cli.md"><div class="prose"><h1 id="cosmix-skills-cli">cosmix-skills-cli</h1>
+<p><code>cosmix-skills-cli</code> exercises the skill learning loop and provides index maintenance, health reporting, source indexing, and workspace audit commands.</p>
+<h2 id="invocation">Invocation</h2>
+<p>From the workspace:</p>
+<pre><code class="language-sh">cargo run -p cosmix-lib-skills --bin cosmix-skills-cli -- [GLOBAL OPTIONS] COMMAND
+</code></pre>
+<p>The process writes diagnostics, including the resolved domain, to standard error. Command results and Markdown reports go to standard output.</p>
+<h2 id="global-options">Global options</h2>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--backend NAME</code></td><td>Select an LLM backend by name</td></tr>
+<tr><td><code>--domain DOMAIN</code></td><td>Use an explicit project-domain filter</td></tr>
+<tr><td><code>--all-domains</code></td><td>Disable domain filtering</td></tr>
+<tr><td><code>--socket PATH</code></td><td>Override the indexd Unix socket</td></tr>
+</tbody></table>
+<p>Backend selection uses the command-line value first, then the skills service's backend override, then the LLM client's configured default.</p>
+<p>Domain selection uses <code>--all-domains</code> first, then <code>--domain</code>, then automatic detection from the current directory.</p>
+<p>Socket selection uses <code>--socket</code> first and the indexd service setting otherwise.</p>
+<h2 id="learning-loop-commands">Learning-loop commands</h2>
+<table><thead><tr><th>Command</th><th>Arguments</th><th>Operation</th></tr></thead><tbody>
+<tr><td><code>evaluate</code></td><td><code>PATH</code></td><td>Evaluate a transcript JSON file and report whether it is worth extracting</td></tr>
+<tr><td><code>extract</code></td><td><code>PATH</code></td><td>Extract a skill from a transcript and print the skill as JSON</td></tr>
+<tr><td><code>learn</code></td><td><code>PATH</code></td><td>Evaluate, extract, store, and verify a skill</td></tr>
+<tr><td><code>search</code></td><td><code>QUERY</code>, <code>-n LIMIT</code></td><td>Search for skills; the default limit is 5</td></tr>
+<tr><td><code>list</code></td><td><code>-n LIMIT</code>, <code>--offset OFFSET</code></td><td>List stored skills; defaults to 20 rows from offset 0</td></tr>
+<tr><td><code>refine</code></td><td><code>ID</code>, <code>--success</code>, <code>--notes TEXT</code></td><td>Refine one skill from a reported outcome</td></tr>
+<tr><td><code>delete</code></td><td><code>ID</code></td><td>Delete one skill chunk</td></tr>
+<tr><td><code>format</code></td><td><code>QUERY</code>, <code>-n LIMIT</code></td><td>Print the prompt section generated from matching skills; the default limit is 3</td></tr>
+<tr><td><code>sample-transcript</code></td><td>none</td><td>Print a sample <code>TaskTranscript</code> as JSON</td></tr>
+</tbody></table>
+<p><code>extract</code> performs manual extraction without first evaluating the transcript.</p>
+<p><code>learn</code> stops without storing a skill when evaluation does not meet the success and novelty threshold.</p>
+<p><code>refine --success</code> records a successful use. Omitting the flag records an unsuccessful use. Refinement stores a new version and marks the old chunk as superseded.</p>
+<p><code>delete</code> removes data. It does not preserve a replacement version.</p>
+<h2 id="index-inspection-and-lifecycle-commands">Index inspection and lifecycle commands</h2>
+<table><thead><tr><th>Command</th><th>Arguments</th><th>Operation</th></tr></thead><tbody>
+<tr><td><code>stats</code></td><td><code>-n BENCH_RUNS</code></td><td>Print index statistics and run search-latency probes; defaults to 5 probes</td></tr>
+<tr><td><code>dashboard</code></td><td>none</td><td>Print index totals, confidence tiers, popular skills, unused skills, and stale counts</td></tr>
+<tr><td><code>graduate-all</code></td><td>none</td><td>Check every active skill against graduation thresholds</td></tr>
+<tr><td><code>staleness-report</code></td><td><code>--source SOURCE</code></td><td>Print the three index staleness buckets</td></tr>
+<tr><td><code>skill-composition</code></td><td>none</td><td>Compare active skills for trigger and tool overlap</td></tr>
+</tbody></table>
+<p><code>stats -n 0</code> suppresses latency probing.</p>
+<p><code>graduate-all</code> may modify a domain's <code>CLAUDE.md</code>. It skips superseded records and reports graduation failures without stopping the sweep.</p>
+<p><code>staleness-report</code> uses fixed report thresholds:</p>
+<ul>
+<li>never retrieved and older than 90 days;</li>
+<li>retrieved more than three times with non-positive feedback;</li>
+<li>not retrieved for 180 days.</li>
+</ul>
+<p><code>skill-composition</code> uses word-set similarity for triggers and set overlap for tool lists. Co-retrieval analysis is reported as not implemented.</p>
+<h2 id="workspace-indexing-commands">Workspace indexing commands</h2>
+<table><thead><tr><th>Command</th><th>Arguments</th><th>Operation</th></tr></thead><tbody>
+<tr><td><code>bootstrap-index</code></td><td><code>--path PATH</code>, <code>--filter TEXT</code>, <code>--skip-delete</code></td><td>Index tracked project documents from one Git workspace</td></tr>
+<tr><td><code>bootstrap-all-workspaces</code></td><td><code>--skip-delete</code></td><td>Index documents and source from every configured domain workspace</td></tr>
+<tr><td><code>index-source</code></td><td><code>--path PATH</code>, <code>--filter TEXT</code></td><td>Index Rust doc comments and Mix scripts</td></tr>
+<tr><td><code>delete-paths</code></td><td><code>PATH...</code></td><td>Remove indexed document, journal, and memory chunks for absolute file paths</td></tr>
+</tbody></table>
+<h3 id="bootstrap-index"><code>bootstrap-index</code></h3>
+<p>The target must be a Git repository. The command uses <code>git ls-files</code>, so ignored and untracked files are not included.</p>
+<p>It recognises:</p>
+<ul>
+<li>Markdown under <code>_doc/</code> as <code>doc</code>;</li>
+<li>Markdown under <code>_journal/</code> as <code>journal</code>;</li>
+<li>Markdown under <code>_memory/</code> as <code>memory</code>;</li>
+<li><code>_notes.md</code> as <code>doc</code>.</li>
+</ul>
+<p>Markdown is split at level-two headings. Sections shorter than 50 characters are omitted. Sections longer than 8,000 characters are truncated before storage.</p>
+<p>By default, existing chunks for each file are deleted before new chunks are stored. This makes re-indexing idempotent. <code>--skip-delete</code> avoids that pass but can leave duplicates.</p>
+<p><code>--filter TEXT</code> selects files whose workspace-relative path contains the supplied text.</p>
+<h3 id="bootstrap-all-workspaces"><code>bootstrap-all-workspaces</code></h3>
+<p>Workspace paths come from configured domain mappings. Paths without a <code>.git</code> directory are skipped.</p>
+<p>For every accepted workspace, the command runs both document bootstrapping and source indexing. An error in one workspace is reported and does not prevent the remaining workspaces from being attempted.</p>
+<h3 id="index-source"><code>index-source</code></h3>
+<p>Rust source files come from <code>git ls-files</code>. Each contiguous <code>//!</code> module comment and <code>///</code> item comment becomes an index chunk. Item chunks include the following item signature when one can be identified.</p>
+<p>Each tracked <code>.mix</code> file and <code>_mixrc</code> is stored as one <code>mix-script</code> chunk.</p>
+<p><code>--filter TEXT</code> retains only tracked paths containing the supplied text.</p>
+<h3 id="delete-paths"><code>delete-paths</code></h3>
+<p><code>delete-paths</code> searches the <code>doc</code>, <code>journal</code>, and <code>memory</code> sources for metadata containing each supplied absolute path, then deletes the matching chunk IDs.</p>
+<p>This command is destructive. An empty path list performs no work.</p>
+<h2 id="audit-and-report-commands">Audit and report commands</h2>
+<table><thead><tr><th>Command</th><th>Arguments</th><th>Operation</th></tr></thead><tbody>
+<tr><td><code>doc-freshness</code></td><td><code>--path PATH</code></td><td>Report documents whose referenced source paths changed after the document</td></tr>
+<tr><td><code>claude-md-audit</code></td><td><code>--path PATH</code></td><td>Compare <code>CLAUDE.md</code> crate tables and selected references with a workspace</td></tr>
+<tr><td><code>memory-hygiene</code></td><td><code>--stale-days DAYS</code></td><td>Check memory entries, references, frontmatter, age, and orphan files</td></tr>
+<tr><td><code>doc-coverage</code></td><td><code>--path PATH</code>, <code>--days DAYS</code></td><td>Compare recent crate activity with document references</td></tr>
+<tr><td><code>contradiction-check</code></td><td><code>--path PATH</code></td><td>Find conflicting recommendations in skills and project documents</td></tr>
+</tbody></table>
+<p>The default path for <code>doc-freshness</code>, <code>claude-md-audit</code>, <code>doc-coverage</code>, <code>contradiction-check</code>, and <code>index-source</code> is the current directory.</p>
+<p><code>memory-hygiene</code> defaults to a 30-day stale threshold. It reports findings and performs no automatic deletion.</p>
+<p><code>doc-coverage</code> defaults to the previous 30 days. It classifies active crates with zero or one document reference as under-documented.</p>
+<p><code>contradiction-check</code> scans active skills for use, avoidance, deprecation, and replacement claims. It also reports missing skill provenance files.</p>
+<h2 id="transcript-input">Transcript input</h2>
+<p><code>evaluate</code>, <code>extract</code>, and <code>learn</code> read a JSON-encoded <code>TaskTranscript</code>.</p>
+<p>The required shape is:</p>
+<pre><code class="language-json">{
+  "task_description": "Update the alpha service",
+  "system_prompt": "You are a coding assistant.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Update the alpha service."
+    }
+  ],
+  "tool_calls": [
+    {
+      "name": "read_file",
+      "input": "src/service.rs",
+      "output": "file contents"
+    }
+  ],
+  "final_output": "The service was updated.",
+  "duration_ms": 1200,
+  "token_count": 800,
+  "success": true
+}
+</code></pre>
+<p>Invalid JSON or missing required fields terminates the command with an error.</p>
+<h2 id="configuration-surface">Configuration surface</h2>
+<p>The binary reads settings through <code>cosmix-lib-config</code>.</p>
+<table><thead><tr><th>Service settings</th><th>Fields used by this crate</th></tr></thead><tbody>
+<tr><td>skills</td><td>LLM backend override, minimum retrieval confidence, graduation confidence, minimum uses, minimum successes</td></tr>
+<tr><td>indexd</td><td>Unix socket path</td></tr>
+<tr><td>domains</td><td>path-prefix to domain mappings</td></tr>
+<tr><td>LLM</td><td>default backend and named backend selection through <code>LlmClient</code></td></tr>
+</tbody></table>
+<p>Command-line backend, domain, and socket options override the corresponding automatic or configured selection.</p>
+<h2 id="exit-behaviour">Exit behaviour</h2>
+<p>Commands return a non-zero status when an unhandled file, Git, socket, protocol, configuration, LLM, or JSON error reaches <code>main</code>.</p>
+<p>Some sweep commands handle per-item failures, print a warning, and continue. Reports with findings normally complete successfully; findings are report data rather than process failures.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +748,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +802,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +931,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

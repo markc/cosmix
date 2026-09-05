@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/08-mesh-trust</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,237 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/08-mesh-trust.md"><div class="prose"><h1 id="mesh-membership-transport-and-trust">Mesh membership, transport and trust</h1>
+<p>Baseline <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. Verified-source statements
+describe inspected code, not a deployment attestation. Intended requirements and
+conflicts remain explicit. Examples are conceptual; no deployment roster or private
+key location is published here.
+The <a href="/spec/compatibility-profile">accepted compatibility amendment</a> resolves the
+genesis-only boot trust and never-verified roster fallback discrepancies below.</p>
+<h2 id="1-planes-and-invariants">1. Planes and invariants</h2>
+<p><strong>MESH-001 — Separate authority from delivery.</strong> D0 provides transport (WireGuard),
+D1 carries Bus frames, D2 brokers route, D3 citizens implement applications.
+Authority A declares membership/identity; tooling C authors and distributes it.
+C is never a runtime dependency. Membership is neither WireGuard presence nor
+liveness. Citizens register on member nodes; registration does not create a node.</p>
+<p><strong>MESH-002 — Single declared source in the verified profile.</strong> Membership is signed, versioned, replicated
+and locally cached. Generated config, host projections and UI rosters are derived;
+observed health and contacts cannot overwrite authority or create members. Keep
+serving accepted membership when control tooling is unavailable, subject to the
+explicit trust profile. Topology independence does not promise fault tolerance:
+hub-spoke transport loses remote spoke connectivity when its only hub fails.
+The never-verified compatibility fallback in MESH-018 is an explicit exception
+to signed-authority routing, not proof of verified membership.</p>
+<p><strong>MESH-003 — Responsibility.</strong> Noded implements broker routing and authority
+enforcement; WireGuard control services manage transport; citizens own application
+state. Property projections of peers/trust must not become an independent membership
+registry. Snapshot the member view when running an operation and tolerate later
+changes. Node reachability, session health and registered-service liveness are three
+different advisory observations; do not pre-empt a valid route using stale health.</p>
+<h2 id="2-identities-and-credentials">2. Identities and credentials</h2>
+<p><strong>MESH-004 — Node identity.</strong> Immutable per-mesh names follow ASCII label grammar
+<code>^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$</code>. Names retire by tombstone and are not
+reused. Rename means a new identity; any explicit migration alias needs an expiry
+epoch. Node records carry name, mesh IP, optional noded port, bus flag, status,
+credentials and last-touched provenance. Transport-only <code>bus:false</code> is distinct
+from active routable membership; tombstoned records never route.</p>
+<p><strong>MESH-005 — Three key roles.</strong> WireGuard credentials secure transport; separate
+Ed25519 D2 credentials prove broker-session origin; inventory signing keys authorise
+the member set. A credential is current at accepted epoch E iff
+<code>from_epoch &lt;= E &lt; until_epoch</code>, with absent end unbounded. Rotation overlaps
+credentials without changing the node name. No wall-clock expiry is inferred.
+Private D2 seeds remain node-local and distinct from WG keys; bootstrap storage is
+root-owned but readable by the unprivileged daemon (0640 with its service group).</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-mesh-trust/src/admission.rs">credential selection and admission</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-mesh-trust/src/routing.rs">strict routing types</a>.</p>
+<h2 id="3-signed-inventory-and-freshness">3. Signed inventory and freshness</h2>
+<p><strong>MESH-006 — Signed content.</strong> Envelope contains payload and external signatures.
+Payload includes schema version, canonical encoding, mesh FQDN, subnet, epoch,
+recovery generation, advisory timestamps, hubs, verify keys and member records.
+Normal payloads omit <code>recovery</code>; recovery payloads include <code>recovery:true</code>.
+Signatures cover canonical payload bytes, not a struct containing its own signature.
+The pinned algorithm is Ed25519 and canonical encoding is <code>json/rfc8785</code>.
+Unknown signed encoding is refused; it cannot select a weaker verifier.</p>
+<p><strong>MESH-007 — Malleable signature bag.</strong> Verify using already-trusted key bytes,
+with the key declared in the payload. Skip malformed, unsupported, duplicate or
+untrusted signature entries; count each valid key ID once and require at least one
+authoritative signature. Unsigned carrier junk cannot invalidate an otherwise
+valid authoritative signature. Payload structural validation remains mandatory.</p>
+<p><strong>MESH-008 — Trust-set transition.</strong> Genesis is provisioned out-of-band and cannot
+be removed in-band. Retiring keys may verify but cannot solely authorise addition
+or promotion of verify keys. Intended rotation introduces a new key under the old,
+overlaps signatures, then removes the retiring key after adoption. This remains
+a proposed stronger rotation profile. In the accepted current profile, noded
+re-derives trust from genesis on boot; adopted multi-key anchors are
+reported but not persisted as next-boot trust. Library support is not a complete
+daemon rotation procedure. Restart-persistent multi-key adoption is not guaranteed;
+operators cannot assume an in-band adoption survives a restart as a trust anchor.</p>
+<p><strong>MESH-009 — Epoch and recovery.</strong> Authored changes advance the inventory epoch.
+Normal acceptance cannot lower epoch or recovery generation. Recovery may lower
+epoch only with genesis verification and a strictly greater generation. Equal
+generation recovery is accepted only when canonical hash proves an exact retry.
+Normal higher generation requires genesis verification; legacy absent generation
+means zero only while the cached generation is zero. Explicit <code>recovery:false</code>
+is invalid. Bind accepted freshness pairs to canonical hashes; changing signed_at
+at the same bound pair is not an equivalent re-sign.</p>
+<p><strong>MESH-010 — Persisted floor.</strong> Store epoch, recovery generation and canonical
+hash durably. A wiped node needs a current provisioning floor; a file under a state
+directory alone cannot survive deletion of that directory. Anti-rollback protects
+subsequent acceptance, not initial poisoning by an old but valid provisioning
+artifact. Recovery must remove compromised credentials and attacker-added verify
+keys. Higher recovery epoch is useful hygiene, not the security condition replacing
+generation. Single-key compromise remains a documented profile risk; multi-party
+quorum/offline custody are future profile choices, not new default ceremonies.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-mesh-trust/src/inventory.rs">inventory verifier</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/authority.rs">daemon authority loader</a>.</p>
+<h2 id="4-authorship-distribution-and-rollout">4. Authorship, distribution and rollout</h2>
+<p>The reconciled 0.3.0 <a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/crates/cosmix-lib-mesh-trust/src/combinator.rs">capability adapter</a>
+filters empty cross-mesh grants rejected by the core Capability constructor.
+An invalid cross-mesh grant does not fall through to the base policy. This is a
+fail-closed conversion boundary, not stronger transport or membership verification.</p>
+<p><strong>MESH-011 — Exact proposal lifecycle (intended orchestration contract).</strong> Keep
+authorised proposal bytes distinct from fully rolled-out canonical bytes. Under
+one exclusive control lock, snapshot the freshness floor; reuse a pending verified
+proposal rather than silently minting another; use one immutable byte snapshot for
+verification, derivation and distribution. Normal distribution requires explicit
+generation and genesis verification for cold-node catch-up. Advance the control
+floor after first target acceptance; publish the canonical rolled-out artifact only
+after every target accepts. Retain partial proposals for byte-identical resume;
+discard requires identifying the authenticated canonical hash.</p>
+<p>Recovery distribution is separate: it must record byte-pinned progress and handle
+equal-generation exact retries at already reached targets. Do not copy the normal
+first-accept lifecycle without that recovery resume design. Joins are authored and
+signed, not auto-discovered; leave tombstones and revoke transport credentials.</p>
+<p><strong>MESH-012 — Derivation.</strong> Generate broker rosters, DNS/hosts projection, UI roster
+and WG configuration reproducibly. Allocate addresses from the union of authored
+and rolled-out coverage, retaining tombstoned reservations; require matching
+subnets. A reconciler reports declared/on-wire/IP/key mismatch and separately
+states whether listener-bind and intra-mesh masquerade checks ran. A membership
+check cannot claim a clean admission posture it never examined.</p>
+<p><strong>MESH-013 — Listener cutover.</strong> Resolve port absence as 4200; explicit ports are
+integers 1..65535. Roll compatible binaries before publishing changed endpoints.
+Prepare and verify the actual new listener before publishing signed endpoint
+changes. Outage during prepared cutover is explicit; rollback of listener intent
+is safe only before first new-inventory acceptance, then resume forward. Compare
+resolved old/new endpoints, including custom-port-to-absent/default transitions.
+A daemon reports self-port divergence but does not restart/rebind itself from an
+inventory update; listener identity is start-bound.</p>
+<h2 id="5-session-admission-profiles">5. Session admission profiles</h2>
+<p><strong>MESH-014 — Origin proof.</strong> In enforced profile, every inter-node session proves a
+current D2 credential for an active bus member. Same-node local citizens are the
+local-trust exception, not proof by remote source IP. A remote peer cannot bypass
+admission by registering a non-bridge name. <code>bridge-&lt;node&gt;</code> declares the identity
+to prove; the signature supplies proof. D0 source-IP checks may strengthen hub
+configuration but cannot establish spoke origin through a common hub.</p>
+<p><strong>MESH-015 — Transcript and exchange.</strong> Broker sends <code>noded.admit.challenge</code>
+first; peer answers <code>noded.admit.response</code> under the same ID. Challenge carries
+mesh FQDN, verifying broker, epoch, session ID (16 bytes), nonce (32 bytes), version
+and profile. Response carries source node, signed epoch, signature, ephemeral share
+and channel-binding hash. Binary fields are base64 on wire but decoded before
+canonical transcript construction; epoch is native u64. Transcript order is domain
+tag <code>cosmix-d2-admit-v1</code>, mesh, source, verifier, epoch, session ID, nonce,
+ephemeral share, channel binding, using the shared implementation's canonical
+encoding. Unused fixed-size fields are zero, not omitted.</p>
+<p>Nonce is fresh, unpredictable, socket-bound and consumed once before verification.
+Bound challenge state and waits; a missing broker-first challenge permits legacy
+client fallback, never an enforced broker accepting failed proof. Wire-to-transcript
+round-trip fixtures are mandatory. The canonical digest in observation distinguishes
+wire-construction errors from absent keys.</p>
+<p><strong>MESH-016 — Posture.</strong> <code>off</code> is the staged default; <code>observe</code> computes verdicts
+without refusal; <code>enforce</code> refuses failures. In enforce, no verified trust root or
+non-mesh-bound listener refuses inter-node sessions, with explicit reason, while
+local citizens continue. Missing self D2 credential means prover-incapable, not
+incapable of verifying another peer. Admission features must remain agent-operable;
+human confirmation is not an inherent protocol requirement.</p>
+<p><strong>MESH-017 — Honest trust boundary.</strong> Origin-only profile does not defeat a hub
+actively relaying/altering traffic. Hardened profile requires an end-to-end shared
+secret, role/identity/share-bound exporter and key confirmation/AEAD before use;
+hashing public shares or the common hub's WG key does not provide that property.
+This hardened exchange is intended, not established by origin-only admission.
+A WG PSK protects a hop and is not a substitute for node proof.</p>
+<p>Node proof also does not prove which services it may claim. Mesh-wide service
+claim constraints remain unresolved for mixed-trust use; signed <code>may_register</code>
+is a candidate, not an existing field. Untrusted local code needs a concrete
+isolation boundary preventing broker access; ordinary trusted same-UID agent code
+is not reclassified as hostile. Correctness checks (identity binding, CAS, durable
+floors, lock ownership) stay unconditional even in an unattended profile.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-mesh-trust/src/admission.rs">admission core</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/admission.rs">broker admission</a>.</p>
+<h2 id="6-routing-and-reload">6. Routing and reload</h2>
+<p><strong>MESH-018 — Routing profiles.</strong> The Bus chapter owns address grammar. Verified
+routing uses accepted ActiveBus entries and signed IP/port. Cross-mesh syntax
+remains reserved and fails explicitly. Never-verified noded boot may use its
+derived compatibility roster: universal denial of unverified remote routing is
+superseded for this profile. Such routes must not be described as authenticated
+signed membership. Verified authority never silently falls back after a bad reload.
+This does not disable MESH-016's enforced-admission refusal when verified trust
+is absent; routing selection and session admission remain separate gates.</p>
+<p>Target failures distinguish not-a-member, tombstoned, not-bus-member and
+cross-mesh-unimplemented; source admission failure is admission-refused; attempted
+delivery may fail delivery-timeout. Keep rc 10 compatibility and one structured
+reason. Health hints cannot become a second membership authority. Do not promise
+every refinement exists without handler evidence.</p>
+<p><strong>MESH-019 — Reload authority.</strong> Use the existing verification path; retain last
+good state on rejected/partial/older updates. Off/observe inbound sessions are
+grandfathered; enforce rechecks membership/current credential eligibility and
+revokes ineligible sessions. Do not reverify an old session signature at a new
+epoch: that would wrongly invalidate every session after an epoch change.</p>
+<p><strong>MESH-020 — Outbound fence.</strong> Before publishing accepted routing authority,
+reconcile desired active name→endpoint projection. Retire only removed names or
+changed endpoints, not unchanged connections after unrelated epoch/credential
+changes. Atomically fence enqueue, cancel in-progress connects, stop reader/writer,
+discard stale-generation dequeued frames and fail pending RPCs once, without
+transparent retry. Old resolved routes must not redial a retired endpoint. A frame
+already written may have executed: outcome is unknown. Rejected reload performs
+no transport operation. Emit accepted/reload-applied only after fence and authority
+publication; remote kernel-visible socket closure need not precede the event.</p>
+<p><strong>MESH-021 — Connect/delivery.</strong> TCP plus WebSocket upgrade is bounded to five
+seconds; callers for the same peer share a single attempt and its failure. Admission
+first-frame wait is separate. Fail-fast RPC, best-effort events and no implicit
+retry are the conservative floor; transparent retries need a real idempotency and
+deduplication contract. Earlier B3 “cannot ship teardown” prose conflicts with
+already implemented enforcement teardown. Preserve the missing operational drill
+evidence rather than pretending implementation itself ratifies delivery behaviour.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/authority.rs">authority loader</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/noded.rs">noded runtime</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-mesh/src/lib.rs">mesh transport</a>.</p>
+<h2 id="7-partitions-discovery-and-observability">7. Partitions, discovery and observability</h2>
+<p><strong>MESH-022 — Freshness limitations.</strong> Intended cold/unconfirmed posture serves
+local state, accepts verified revocations and refuses expansion. A known newer
+signed epoch can signal stale authority. Wall-clock signed_at/valid_until are
+advisory for inventory, not trusted expiry. Current Verified/Unverified state is
+not evidence of the complete old degraded/fresh state machine. Emergency signed
+revocation-only deny-list overlay remains intended; it must only remove authority,
+combine most-restrictively and never advance inventory epoch. Exact replay and
+reinstatement rules need implementation review before adoption.</p>
+<p>A sole carrier that suppresses updates can hide staleness indefinitely. Redundant
+carriers, trusted-time design and bounded beacon suspicion remain optional future
+work. Liveness cannot fabricate members. Hub outage preserves local service and
+cached knowledge, not remote delivery. Missed tombstones/rotations apply when a
+new verified authority is accepted, subject to the actual profile.</p>
+<p><strong>MESH-023 — Topology extensions.</strong> Redundant hubs and opportunistic direct WG
+peering are separate future work. Direct peers must use inventory credentials,
+fallback to relaying when NAT prevents connection, and never use TOFU. No node
+count, particular hub, endpoint roster or prior measurement is a public contract.</p>
+<p><strong>MESH-024 — Observable evidence.</strong> Inventory accepted/rejected identity includes
+hash, epoch, generation and verify-key IDs. Report admission configured/effective
+posture, admitted/refused/observed verdict, and claimed-versus-proven source.
+Admission details map to credential signature/window, tombstone, bus flag, name,
+epoch, malformed member, stale challenge, version, missing proof/seed and local
+trust/bind failure. Report delivery fate by session-churn, admission-refused or
+reload-teardown and inbound/outbound direction. Outbound retirement reports peer,
+endpoint and generation; reload-applied reports changed/retained counts. Connect
+timeout and listener divergence/convergence must remain observable. Intended
+freshness/deny-list events must not be advertised as emitted until implemented.</p>
+<h2 id="8-compatibility-and-acceptance">8. Compatibility and acceptance</h2>
+<p><strong>MESH-025 — Upgrade evidence.</strong> Clients precede brokers where separately staged;
+combined prover/challenger binaries stage off→observe→enforce with machine-readable
+verdict evidence. Delivery drills must include actual teardown, not observe-only
+telemetry. Current signed-endpoint and restart-floor tests are source evidence;
+fresh fleet acceptance is separate. Future negotiation should independently name
+inventory schema, D2 admission, routing reasons, reload delivery and E2E profile.
+No compatibility vector is implied to be on wire today.</p>
+<p>Acceptance: verifier adversarial fixtures (malformed bags, recovery generations,
+equal-pair hash conflict, retired/genesis keys); typed endpoint/member tests;
+wire transcript round-trip and enforce failure tests; reload race/fence tests;
+restart durability; and isolated multi-node disruption drills. No live network,
+keys or admission settings were changed or tested by this audit.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +849,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +903,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1032,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

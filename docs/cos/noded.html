@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/noded</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,62 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/noded.md"><div class="prose"><h1 id="cosmix-noded--the-bus-broker">cosmix-noded — the Bus broker</h1>
+<p><strong>Every node in a cosmix mesh runs one <code>cosmix-noded</code>.</strong> It is the WebSocket
+message broker that Bus citizens register with and address each other through —
+the piece that makes <code>send maild maild.stats</code> on one process reach a <code>cosmix-maild</code>
+on another.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>A single binary running three async tasks:</p>
+<ul>
+<li><strong>the broker</strong> — a WebSocket Bus router: services register a name, and it routes requests, replies, and topic pub/sub between them (local and cross-mesh).</li>
+<li><strong>the system monitor</strong> — samples host CPU / memory / load and publishes it.</li>
+<li><strong>the Bus traffic logger</strong> — taps every brokered message to an on-disk log.</li>
+</ul>
+<p>It is the one daemon with no upstream dependency inside the mesh: a citizen needs a
+broker before it can be addressed, so <code>cosmix-noded</code> starts first and everything
+else orders <code>After=</code> it.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>Service registry.</strong> A citizen sends <code>noded.register</code> on connect to claim its service name; the name is released on disconnect or <code>noded.deregister</code>.</li>
+<li><strong>Routing.</strong> Requests to <code>&lt;service&gt;</code> route to the local holder; requests to <code>&lt;service&gt;.&lt;node&gt;.bus</code> route across the WireGuard mesh to that node's broker.</li>
+<li><strong>Topic pub/sub.</strong> Citizens <code>subscribe</code> to topics; publishers fan out to every subscriber, with late-join replay where a topic supports it.</li>
+<li><strong>Admission control.</strong> Under <code>mesh.admission=enforce</code>, a joining peer completes a challenge/response handshake (<code>noded.admit.challenge</code> / <code>noded.admit.response</code>) against the mesh authority before it can register.</li>
+<li><strong>Introspection.</strong> <code>noded.list</code>, <code>noded.peers</code>, and <code>noded.inventory</code> report who is registered, which mesh peers are reachable, and each citizen's build provenance (binary, version, git sha, pid, start time).</li>
+<li><strong>Self-observation.</strong> The monitor and logger each expose their own SPEC 12 property tree, so host metrics and log state are queryable as structured data.</li>
+</ul>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-noded serve
+</code></pre>
+<p>Normally run under systemd as <code>cosmix-noded.service</code>, started before every other
+cosmix daemon. Shared node config is read from <code>/etc/cosmix/node.toml</code> (the
+<code>[noded]</code> block sets the listen address and admission mode); <code>--listen</code>, <code>--node</code>,
+and <code>--mesh-config</code> override at the command line. The broker binds its WebSocket
+listener to the node's WireGuard interface — clients with no <code>node.toml</code> fall back
+to <code>ws://127.0.0.1:4200/ws</code> (loopback).</p>
+<h2 id="interfaces">Interfaces</h2>
+<ul>
+<li><strong>Transport:</strong> WebSocket, path <code>/ws</code>, default port <code>4200</code> on the node's mesh address.</li>
+<li><strong>Broker verbs:</strong> <code>noded.register</code>, <code>noded.deregister</code>, <code>noded.list</code>, <code>noded.peers</code>, <code>noded.inventory</code>, <code>noded.info</code>, <code>noded.ping</code>, <code>noded.tap</code> (the logger's message feed), and the admission pair <code>noded.admit.challenge</code> / <code>noded.admit.response</code>.</li>
+<li><strong>Monitor verbs:</strong> <code>mon.status</code>, <code>mon.processes</code>, plus a <code>mon.props.*</code> property surface (<code>system.cpu_usage</code>, <code>system.mem_percent</code>, <code>system.load_avg_one</code>, …).</li>
+<li><strong>Logger:</strong> taps <code>noded.tap</code>, writes <code>bus.log</code>, exposes a <code>log.props.*</code> surface (<code>runtime.events_seen</code>, <code>runtime.bytes_logged</code>, <code>lifecycle.tap_subscribed</code>, …).</li>
+<li><strong>Broker properties:</strong> <code>noded.props.*</code> with change events on the <code>noded.props.changed</code> topic.</li>
+</ul>
+<h2 id="where-it-fits">Where it fits</h2>
+<ul>
+<li>Links the Bus protocol family from the <a href="https://github.com/markc/cosmix">bus</a> repo (<code>cosmix-lib-bus</code>, <code>cosmix-lib-client</code>) and the substrate libraries <code>cosmix-lib-config</code>, <code>cosmix-lib-mesh</code>, <code>cosmix-lib-mesh-trust</code>, <code>cosmix-lib-props-store</code>, and <code>cosmix-lib-log</code>.</li>
+<li>Every other daemon — <code>cosmix-maild</code>, <code>cosmix-webd</code>, <code>cosmix-dnsd</code>, <code>cosmix-indexd</code> — and every Mix <code>--serve</code> citizen is a client of it.</li>
+<li>Cross-mesh routing rides the WireGuard peering that <code>cosmix-lib-mesh</code> describes.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/maild">maild</a> — a broker client: the JMAP-native mail daemon</li>
+<li><a href="/cos/libraries">libraries</a> — the substrate crates the broker links</li>
+<li><a href="/cos/overview">overview</a> — the cos daemon family</li>
+<li><a href="https://markc.github.io/mix/#_man/bus.md">bus messaging</a> — <code>send</code> / <code>emit</code> / <code>on</code> / <code>reply</code>, the primitives clients use to talk to the broker</li>
+<li><a href="https://markc.github.io/mix/#_man/serve.md">serving as a citizen</a> — writing a Mix service that registers with <code>cosmix-noded</code></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +674,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +728,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +857,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

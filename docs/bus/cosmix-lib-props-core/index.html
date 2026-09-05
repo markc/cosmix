@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/cosmix-lib-props-core/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,115 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/cosmix-lib-props-core/README.md"><div class="prose"><h1 id="cosmix-lib-props-core">cosmix-lib-props-core</h1>
+<p><code>cosmix-lib-props-core</code> provides the pure Rust types and read-side helpers for the SPEC 07 property surface. It sits at the <code>bus</code> end of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: protocol consumers can share property paths, values, schemas, snapshots, redaction, diffs, and revisioned in-memory writes without taking a storage backend or daemon substrate dependency.</p>
+<p>The Cargo package is named <code>cosmix-lib-props-core</code>. Rust code imports it as <code>cosmix_props_core</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-toml">[dependencies]
+cosmix-lib-props-core = { version = "0.2.0" }
+</code></pre>
+<p>Enable Bus request dispatch and publish-message builders when wire integration is required:</p>
+<pre><code class="language-toml">[dependencies]
+cosmix-lib-props-core = { version = "0.2.0", features = ["bus"] }
+</code></pre>
+<pre><code class="language-rust">use cosmix_props_core::{PropPath, PropValue};
+
+let path = PropPath::new("config.endpoint")?;
+let value = PropValue::from("https://alpha.example.com");
+
+assert_eq!(path.as_str(), "config.endpoint");
+assert_eq!(value.type_name(), "string");
+
+# Ok::&lt;(), Box&lt;dyn std::error::Error&gt;&gt;(())
+</code></pre>
+<h2 id="feature-flags">Feature flags</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Provides</th><th>Additional dependencies</th></tr></thead><tbody>
+<tr><td><code>bus</code></td><td style="text-align: right">No</td><td><code>bus::dispatch_props</code>, response construction, topic helpers, and publish-message builders</td><td><code>cosmix-lib-bus</code>, <code>chrono</code></td></tr>
+</tbody></table>
+<p>The default feature set is empty. All pure types, tree helpers, diffs, redaction, and the <code>revwrite</code> module remain available without <code>bus</code>.</p>
+<h2 id="property-paths">Property paths</h2>
+<p><code>PropPath</code> is a validated dotted path. Each segment accepts lowercase ASCII letters, digits, and <code>_</code>.</p>
+<p><code>PropPath::new</code> rejects:</p>
+<ul>
+<li>an empty path;</li>
+<li>an empty segment;</li>
+<li>uppercase or other unsupported characters;</li>
+<li><code>*</code>, which is reserved.</li>
+</ul>
+<p><code>as_str</code> returns the original path, <code>segments</code> iterates its segments, and <code>starts_with</code> tests equality or dotted-path ancestry rather than a plain string prefix.</p>
+<p><code>PropPathError</code> reports <code>Empty</code>, <code>EmptySegment</code>, <code>InvalidChar</code>, or <code>Wildcard</code>.</p>
+<h2 id="property-values">Property values</h2>
+<p><code>PropValue</code> is a Serde-compatible, untagged value enum:</p>
+<table><thead><tr><th>Variant</th><th>Rust payload</th><th><code>type_name()</code></th></tr></thead><tbody>
+<tr><td><code>Null</code></td><td>none</td><td><code>null</code></td></tr>
+<tr><td><code>Bool</code></td><td><code>bool</code></td><td><code>bool</code></td></tr>
+<tr><td><code>Int</code></td><td><code>i64</code></td><td><code>i64</code></td></tr>
+<tr><td><code>UInt</code></td><td><code>u64</code></td><td><code>u64</code></td></tr>
+<tr><td><code>Float</code></td><td><code>f64</code></td><td><code>f64</code></td></tr>
+<tr><td><code>String</code></td><td><code>String</code></td><td><code>string</code></td></tr>
+<tr><td><code>List</code></td><td><code>Vec&lt;PropValue&gt;</code></td><td><code>list</code></td></tr>
+<tr><td><code>Object</code></td><td><code>BTreeMap&lt;String, PropValue&gt;</code></td><td><code>object</code></td></tr>
+</tbody></table>
+<p>Objects use sorted keys for deterministic serialisation. <code>is_object</code> and <code>as_object</code> inspect object values. <code>From</code> implementations cover booleans, numeric primitives, strings, and vectors whose elements convert into <code>PropValue</code>.</p>
+<p>Conversion from <code>&amp;PropValue</code> to <code>serde_json::Value</code> supports Bus body construction. JSON does not distinguish a small non-negative <code>i64</code> from a <code>u64</code>; such values deserialise as <code>Int</code> because the enum is untagged and tries <code>Int</code> first. Values above <code>i64::MAX</code> remain unambiguous.</p>
+<p>Non-finite floating-point values convert to JSON <code>null</code>.</p>
+<h2 id="property-schemas">Property schemas</h2>
+<p><code>PropDescribe</code> describes one leaf or subtree. Its fields cover:</p>
+<ul>
+<li>path, type, mutability, sensitivity, and description;</li>
+<li>optional format, child paths, enum values, numeric bounds, default, and <code>since</code> marker;</li>
+<li>deprecated and transient flags.</li>
+</ul>
+<p><code>PropType</code> serialises as one of <code>null</code>, <code>bool</code>, <code>number</code>, <code>string</code>, <code>list</code>, or <code>object</code>.</p>
+<p><code>PropDescribe::leaf</code> creates an immutable, non-sensitive, non-transient leaf with no optional metadata. Builder methods set sensitivity, mutability, transience, format, unit, minimum, maximum, default, and enum values.</p>
+<p><code>with_unit</code> stores the unit token in the same <code>format</code> field used by <code>with_format</code>.</p>
+<h2 id="property-trees">Property trees</h2>
+<p>Implement <code>PropTree</code> to expose a property surface:</p>
+<pre><code class="language-rust">pub trait PropTree {
+    fn snapshot(&amp;self) -&gt; PropValue;
+    fn list(&amp;self) -&gt; Vec&lt;PropPath&gt;;
+    fn describe(&amp;self, path: &amp;PropPath) -&gt; Option&lt;PropDescribe&gt;;
+}
+</code></pre>
+<p>The default <code>get</code> implementation walks the object returned by <code>snapshot</code>. Implementations may override it for efficiency.</p>
+<p>The default <code>redacted_snapshot</code> implementation calls <code>describe</code> for every path returned by <code>list</code> and redacts leaves marked <code>sensitive</code>.</p>
+<p><code>tree::build_snapshot</code> builds a nested object from flat <code>(PropPath, PropValue)</code> pairs. Input order does not matter. When one path is a strict prefix of another, the longer path wins.</p>
+<h2 id="redaction">Redaction</h2>
+<p><code>redact</code> replaces sensitive strings with <code>"***"</code> and numeric, boolean, or null leaves with <code>null</code>. It recursively redacts lists and objects.</p>
+<p>The function applies redaction unconditionally. Authentication and the decision to reveal a value remain caller responsibilities.</p>
+<h2 id="snapshot-differences">Snapshot differences</h2>
+<p><code>diff(old, new)</code> returns changed leaves as:</p>
+<pre><code class="language-rust">Vec&lt;(PropPath, PropValue, PropValue)&gt;
+</code></pre>
+<p>Results are ordered by path. Added or removed leaves use <code>PropValue::Null</code> for the missing side. Added or removed object subtrees produce one result per leaf. A non-object change at the root is skipped because it has no addressable property path.</p>
+<h2 id="revisioned-writes">Revisioned writes</h2>
+<p><code>revwrite</code> provides an in-memory control-write ledger. It is part of the default API but only affects programs that construct a <code>RevWriteStore</code>.</p>
+<p><code>RevWriteStore</code> maintains a global monotonic revision and current state per path. <code>seed</code> installs an initial value at revision zero without marking it changed. <code>apply</code> accepts a <code>RevWriteRequest</code> in call order and returns <code>RevWriteResponse::Accepted</code> or <code>RevWriteResponse::Rejected</code>.</p>
+<p><code>RevWriteRequest::if_revision</code> adds optimistic concurrency. A mismatch returns the current path revision and value without changing the store. <code>op_id</code> is a correlation value echoed in the response; it is not an idempotency key.</p>
+<p>Every accepted write returns a <code>RevWriteAck</code> containing the authoritative revision, canonical value, source identity, path, and operation ID.</p>
+<p><code>drain_changed</code> returns one terminal <code>ChangedProp</code> per modified path, ordered by path, and clears the pending set. Repeated writes to one path coalesce to the latest state.</p>
+<p><code>accept_if_newer</code> updates a client-side <code>BTreeMap&lt;PropPath, ChangedProp&gt;</code> only when an incoming revision is strictly newer than the cached revision.</p>
+<p>The store performs no domain validation, quantisation, persistence, audit signing, or internal synchronisation. Callers supply already-canonical values and provide locking when sharing a store across threads.</p>
+<h2 id="bus-read-surface">Bus read surface</h2>
+<p>The <code>bus</code> feature adds <code>bus::dispatch_props</code> for <code>&lt;svc&gt;.props.*</code> commands:</p>
+<table><thead><tr><th>Command suffix</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>get</code></td><td>optional JSON string field <code>path</code></td><td>full snapshot or the selected value</td></tr>
+<tr><td><code>list</code></td><td>none</td><td>JSON array of leaf paths</td></tr>
+<tr><td><code>describe</code></td><td>required JSON string field <code>path</code></td><td>serialised <code>PropDescribe</code></td></tr>
+</tbody></table>
+<p><code>dispatch_props</code> receives a <code>PropTree</code>, the command suffix, optional JSON arguments, and a <code>redact_sensitive</code> flag. It returns <code>PropsResponse</code> with an integer return code, JSON body string, and optional error.</p>
+<p>Success uses return code <code>0</code>. Invalid paths, missing paths, missing <code>describe</code> arguments, and unknown command suffixes use return code <code>10</code>.</p>
+<p>Routing and prefix stripping remain caller responsibilities. <code>bus::build_response</code> converts a <code>PropsResponse</code> into a Bus response, mirrors the request sender into <code>to</code>, and sets <code>bus</code>, <code>type</code>, <code>from</code>, <code>command</code>, and <code>rc</code>.</p>
+<h2 id="bus-publish-helpers">Bus publish helpers</h2>
+<p>The <code>publish</code> module is also gated by <code>bus</code>.</p>
+<p><code>world_topic("alpha")</code> returns <code>world.alpha</code>. <code>props_changed_topic("alpha")</code> returns <code>alpha.props.changed</code>.</p>
+<p><code>build_world_message</code> creates an inner Bus message whose <code>command</code> is the service name and whose body is the JSON snapshot.</p>
+<p><code>build_props_changed_message</code> creates one change event. Its JSON body contains <code>path</code>, <code>old</code>, <code>new</code>, an RFC 3339 UTC timestamp in <code>ts</code>, and <code>cause</code>. The message headers include <code>command=props.changed</code>, <code>path</code>, and <code>cause</code>.</p>
+<p>Both builders return <code>BusMessage</code>. Transport, topic publication, retention, triggers, and extra headers remain caller responsibilities.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The core API depends on <code>serde</code> and <code>serde_json</code>.</p>
+<p>The <code>bus</code> feature additionally enables <code>cosmix-lib-bus</code> for <code>BusMessage</code> and <code>chrono</code> for change-event timestamps.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +727,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +781,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +910,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

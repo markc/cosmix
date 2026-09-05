@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-files/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,133 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-files/README.md"><div class="prose"><h1 id="cosmix-lib-files">cosmix-lib-files</h1>
+<p><code>cosmix-lib-files</code> is the daemon-independent core for files-as-truth Markdown corpora and allowlisted live-filesystem operations. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it belongs to the <code>cos</code> layer: it uses <code>cosmix-lib-bus</code> directly, with that dependency's default features disabled, and does not depend on <code>mix</code>. The Rust library target is imported as <code>cosmix_files</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The crate provides two related capabilities:</p>
+<ul>
+<li>Markdown corpus primitives: frontmatter handling, atomic writes, identity, hashing, link extraction, index schema, ingest, persistence, and reconciliation.</li>
+<li>A stateless file-manager backend over configured places, with path containment and per-place write policy.</li>
+</ul>
+<p>The default build contains the pure and filesystem-facing logic. SQLite persistence, ingest, and the complete reconcile pass are opt-in.</p>
+<p>This crate is a library. It does not contain a CLI, a Bus service loop, a filesystem watcher, or CAS integration.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>sqlite</code></td><td style="text-align: right">No</td><td>Adds <code>rusqlite</code> and exposes the <code>store</code>, <code>ingest</code>, and <code>reconcile</code> modules.</td></tr>
+</tbody></table>
+<p>An empty default feature set keeps the core mesh-free and permits:</p>
+<pre><code class="language-console">cargo test --no-default-features
+</code></pre>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Main API</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>atomic</code></td><td><code>write_atomic</code></td><td>Replaces or creates a file through a unique sibling temporary file, file flush, rename, and best-effort directory flush.</td></tr>
+<tr><td><code>frontmatter</code></td><td><code>Parsed</code>, <code>read</code>, <code>get_field</code>, <code>set_field</code>, <code>ensure_id</code>, <code>raw_header</code>, <code>headers_to_json</code></td><td>Reads canonical fenced headers and performs byte-preserving field edits.</td></tr>
+<tr><td><code>hash</code></td><td><code>content_hash</code></td><td>Returns lowercase, 64-character BLAKE3 content hashes.</td></tr>
+<tr><td><code>id</code></td><td><code>new_id</code>, <code>is_valid_id</code></td><td>Mints lowercase UUIDv7 identifiers and validates UUID strings.</td></tr>
+<tr><td><code>links</code></td><td><code>Link</code>, <code>LinkKind</code>, <code>extract_links</code></td><td>Extracts unresolved wiki and Markdown document links.</td></tr>
+<tr><td><code>diff</code></td><td><code>Entry</code>, <code>Change</code>, <code>diff</code></td><td>Classifies differences between a disk scan and an index snapshot.</td></tr>
+<tr><td><code>schema</code></td><td><code>APPLICATION_ID</code>, <code>USER_VERSION</code>, <code>INDEX_SCHEMA_V1</code></td><td>Defines the rebuildable SQLite index schema and its identity constants.</td></tr>
+<tr><td><code>fsops</code></td><td><code>Place</code>, <code>FsLayer</code>, <code>resolve_within</code></td><td>Provides scoped live-filesystem reads and mutations.</td></tr>
+<tr><td><code>error</code></td><td><code>FilesError</code>, <code>Result</code></td><td>Defines the shared error surface.</td></tr>
+<tr><td><code>store</code></td><td><code>Store</code>, <code>DocRecord</code>, <code>ChangeRow</code>, <code>ChangeKind</code>, <code>CorpusStats</code></td><td>Implements the SQLite projection and change stream. Requires <code>sqlite</code>.</td></tr>
+<tr><td><code>ingest</code></td><td><code>scan</code></td><td>Projects one corpus file into a <code>DocRecord</code>. Requires <code>sqlite</code>.</td></tr>
+<tr><td><code>reconcile</code></td><td><code>ReconcileReport</code>, <code>reconcile</code></td><td>Walks a corpus, computes changes, and applies them to a <code>Store</code>. Requires <code>sqlite</code>.</td></tr>
+</tbody></table>
+<p><code>FilesError</code> and <code>Result</code> are re-exported at the crate root.</p>
+<h2 id="frontmatter">Frontmatter</h2>
+<p>The frontmatter grammar is a <code>---</code>-fenced, flat <code>Key: value</code> header. Values beginning with <code>[</code> or <code>{</code> are interpreted as JSON for the index projection; other values remain strings. Reads delegate to the canonical lenient Bus parser.</p>
+<p><code>frontmatter::read</code> returns:</p>
+<ul>
+<li>key-sorted parsed headers;</li>
+<li>the parsed body;</li>
+<li>non-fatal warnings for non-canonical, skipped, or invalid-JSON lines.</li>
+</ul>
+<p><code>frontmatter::set_field</code> edits raw text rather than serialising a parsed header. It replaces only the selected value line, appends a missing field before the closing fence, or creates a minimal header when none exists. Untouched field order, comments, list lines, blank lines, quoting, JSON text, line endings, and body bytes remain unchanged.</p>
+<p>Values passed to <code>set_field</code> must be single-line. Existing field separators are normalised to <code>: </code> on the edited line.</p>
+<p><code>frontmatter::ensure_id</code> preserves an existing valid identifier. If the field is absent or invalid, it inserts a new UUIDv7 and returns the updated content, identifier, and a flag indicating that minting occurred.</p>
+<h2 id="identity-hashing-and-links">Identity, hashing, and links</h2>
+<p>Document identity is an opaque UUID. <code>id::new_id</code> uses UUIDv7 so generated identifiers are time ordered and lexicographically sortable. <code>id::is_valid_id</code> accepts any UUID version.</p>
+<p><code>hash::content_hash</code> hashes the complete file bytes with BLAKE3.</p>
+<p><code>links::extract_links</code> recognises:</p>
+<ul>
+<li><code>[[target]]</code> wiki links;</li>
+<li><code>[text](target)</code> Markdown links.</li>
+</ul>
+<p>Wiki aliases and anchors are removed from the extracted target. Optional Markdown link titles are dropped. Image links are ignored. Targets remain unresolved; index-aware resolution is outside this module.</p>
+<h2 id="reconcile-classification">Reconcile classification</h2>
+<p><code>diff::diff</code> compares <code>Entry</code> values from disk with the current index snapshot.</p>
+<table><thead><tr><th><code>Change</code></th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Added</code></td><td>A managed file appears at a new path.</td></tr>
+<tr><td><code>Changed</code></td><td>A known path has changed content, identity, or keeper role.</td></tr>
+<tr><td><code>Removed</code></td><td>An indexed path is absent from disk and was not consumed by a rename.</td></tr>
+<tr><td><code>Renamed</code></td><td>A new path carries the identity of an indexed keeper whose old path disappeared.</td></tr>
+<tr><td><code>DuplicateId</code></td><td>More than one live path carries the same identity.</td></tr>
+<tr><td><code>Unmanaged</code></td><td>A file has no valid identity.</td></tr>
+</tbody></table>
+<p>For duplicate identities, the lexicographically lowest path is the deterministic keeper. Other paths are reported as duplicates rather than rejected or allowed to overwrite the keeper.</p>
+<p>Passive scans do not mint identifiers. An id-less file remains unmanaged until an explicit authoring path adopts it.</p>
+<h2 id="sqlite-projection">SQLite projection</h2>
+<p>The <code>sqlite</code> feature exposes one rebuildable index per corpus. Markdown files remain authoritative; the database is a derived projection keyed by relative path. Document identifiers are indexed but intentionally not unique.</p>
+<p>The v1 schema contains:</p>
+<ul>
+<li>document projections and tombstones;</li>
+<li>a per-corpus monotonic modification sequence;</li>
+<li>an ordered change stream;</li>
+<li>a derived link graph;</li>
+<li>attachment references;</li>
+<li>conflict-file sightings;</li>
+<li>an FTS5 document table.</li>
+</ul>
+<p><code>Store::open</code> creates or validates an on-disk index. <code>Store::open_in_memory</code> provides the same schema in memory. A database is bound to one corpus identifier.</p>
+<p>Read methods expose the current modification sequence, live reconcile entries, changes since a cursor, corpus statistics, live and tombstoned paths, document metadata, and metadata substring search.</p>
+<p>Mutation methods are transactional:</p>
+<ul>
+<li><code>upsert</code> adds, resurrects, or updates a path and emits <code>ADDED</code> or <code>CHANGED</code>;</li>
+<li><code>tombstone</code> soft-deletes a live path and emits <code>REMOVED</code>;</li>
+<li><code>rename</code> preserves the document row identity and emits <code>RENAMED</code>;</li>
+<li><code>wipe</code> clears the rebuildable projection and resets the modification sequence.</li>
+</ul>
+<p>Callers supply <code>now_ms</code> to mutation and reconcile methods. The store does not read the clock for those records.</p>
+<p><code>ingest::scan</code> reads one file, hashes its complete bytes, parses frontmatter, projects common fields, records size and modification time, counts body words, and marks an invalid or absent identifier as unmanaged.</p>
+<p><code>reconcile::reconcile</code> walks Markdown files without following symlinks. It skips dotfiles, dot-directories, editor temporary files, and conflict sidecars as documents. It scans, diffs, applies index changes, records current conflict sidecars, removes resolved conflict records, and returns per-class counts plus per-file errors.</p>
+<p>Reconciliation reads corpus files but does not rewrite them or mint identifiers.</p>
+<h2 id="live-filesystem-layer">Live-filesystem layer</h2>
+<p><code>Place</code> defines a bounded filesystem root and its presentation and policy fields:</p>
+<ul>
+<li><code>id</code>, <code>label</code>, <code>group</code>, <code>icon</code>, and <code>order</code>;</li>
+<li><code>root</code>;</li>
+<li><code>writable</code>;</li>
+<li>optional <code>allow</code> and <code>deny</code> path patterns.</li>
+</ul>
+<p>An <code>FsLayer</code> contains an immutable places list and a trash root. Paths use the form <code>&lt;place-id&gt;/&lt;relative-path&gt;</code>. Reads may address a place root; mutations of the place root are refused.</p>
+<p><code>resolve_within</code> rejects absolute paths, empty paths when disallowed, <code>.</code> and <code>..</code> components, and paths whose deepest existing ancestor resolves outside the configured root.</p>
+<p>Allow and deny patterns are slash-separated. <code>*</code> matches within one path segment. Deny rules take precedence. An allowed path's ancestors may be traversed for listing but are not themselves writable targets. Policy-scoped places also reject symlink, hardlink, and non-regular-file paths where those forms could cross the policy boundary.</p>
+<p>Read operations are:</p>
+<table><thead><tr><th>Method</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>places</code></td><td>Place metadata for a sidebar or equivalent client.</td></tr>
+<tr><td><code>list</code></td><td>A live directory listing with metadata, counts, sorting, and hidden-file control.</td></tr>
+<tr><td><code>stat</code></td><td>File or directory metadata.</td></tr>
+<tr><td><code>read_blob</code></td><td>A capped UTF-8 preview or a binary marker.</td></tr>
+<tr><td><code>search</code></td><td>Case-insensitive filename substring search.</td></tr>
+<tr><td><code>tree</code></td><td>A depth- and node-capped folders-only tree.</td></tr>
+</tbody></table>
+<p>Mutation operations are:</p>
+<table><thead><tr><th>Method</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>mkdir</code></td><td>Creates one directory or its parent chain.</td></tr>
+<tr><td><code>touch</code></td><td>Creates a new empty file without clobbering.</td></tr>
+<tr><td><code>write</code></td><td>Writes bytes atomically, with explicit overwrite control.</td></tr>
+<tr><td><code>copy</code></td><td>Reads from one place and writes to another; only the destination must be writable.</td></tr>
+<tr><td><code>move_</code></td><td>Moves a path; both source and destination places must be writable.</td></tr>
+<tr><td><code>delete</code></td><td>Deletes a file or, when explicitly recursive, a directory. Missing targets succeed.</td></tr>
+<tr><td><code>trash</code></td><td>Moves a path to reversible trash and records its scoped origin.</td></tr>
+<tr><td><code>trash_list</code></td><td>Lists trash metadata.</td></tr>
+<tr><td><code>trash_restore</code></td><td>Restores to the revalidated writable origin without clobbering.</td></tr>
+<tr><td><code>trash_empty</code></td><td>Permanently removes all trash entries.</td></tr>
+</tbody></table>
+<p>Copy and move reject a destination that is the source or lies inside it. Cross-filesystem moves fall back to copy followed by removal. Atomic writes preserve existing destination permission bits on a best-effort basis.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The always-on dependencies are <code>cosmix-lib-bus</code>, <code>blake3</code>, <code>uuid</code>, <code>serde</code>, <code>serde_json</code>, and <code>thiserror</code>. <code>rusqlite</code> is optional and enabled only by <code>sqlite</code>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +745,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +799,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +928,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

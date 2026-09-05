@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-claud/verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,123 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-claud/verbs.md"><div class="prose"><h1 id="cosmix-claud-bus-verbs">cosmix-claud Bus verbs</h1>
+<p>This page defines the Bus command surface implemented by <code>cosmix-claud</code>.</p>
+<p><a href="/cos/cosmix-claud/">Back to cosmix-claud</a></p>
+<h2 id="common-contract">Common contract</h2>
+<p>The request Bus message requires a <code>command</code> header. Its body is either empty or valid JSON.</p>
+<p>The response Bus message sets an <code>rc</code> header and carries a JSON body:</p>
+<table><thead><tr><th>Return code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>0</code></td><td>The command completed successfully.</td></tr>
+<tr><td><code>10</code></td><td>The command, input, backend, parser, evaluator, or result conversion failed.</td></tr>
+</tbody></table>
+<p>Several commands accept either a JSON object or a top-level JSON string for their primary argument. The sections below identify those forms explicitly.</p>
+<h2 id="ask"><code>ask</code></h2>
+<p>Completes a prompt with caller context and domain-matched knowledge.</p>
+<p>Object arguments:</p>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>prompt</code></td><td>Yes</td><td>User prompt sent to the LLM.</td></tr>
+<tr><td><code>context</code></td><td>No</td><td>Text prepended to the generated system prompt.</td></tr>
+</tbody></table>
+<p>The body may instead be a JSON string containing the prompt.</p>
+<pre><code class="language-json">{"prompt":"Explain this module","context":"Answer for a new maintainer"}
+</code></pre>
+<p>Success body:</p>
+<pre><code class="language-json">{"response":"..."}
+</code></pre>
+<p>The command searches for relevant skills, documents, and journal entries before calling the LLM. Search errors are non-fatal. After a successful completion, eligible interactions enter asynchronous skill evaluation and extraction.</p>
+<p>A missing prompt returns <code>rc=10</code> with <code>{"error":"Missing 'prompt' argument"}</code>.</p>
+<h2 id="ask_raw"><code>ask_raw</code></h2>
+<p>Uses the same request and response shapes as <code>ask</code>, but does not search the knowledge index and does not start skill extraction.</p>
+<p>The optional <code>context</code> field still contributes to the system prompt. Backend selection and error handling are otherwise the same as <code>ask</code>.</p>
+<h2 id="analyze"><code>analyze</code></h2>
+<p>Constructs a concise analysis prompt from code, an error, or both. It uses the knowledge-augmented completion path.</p>
+<p>Object arguments:</p>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>code</code></td><td>Conditional</td><td>Source text to analyse.</td></tr>
+<tr><td><code>error</code></td><td>Conditional</td><td>Error text to analyse.</td></tr>
+<tr><td><code>language</code></td><td>No</td><td>Language named in the generated prompt; defaults to <code>Mix</code>.</td></tr>
+</tbody></table>
+<p>At least one of <code>code</code> or <code>error</code> must be a non-empty string.</p>
+<pre><code class="language-json">{"language":"Rust","code":"fn main() {}","error":"example diagnostic"}
+</code></pre>
+<p>Success body:</p>
+<pre><code class="language-json">{"analysis":"..."}
+</code></pre>
+<p>If both inputs are absent or empty, the command returns <code>rc=10</code> with <code>{"error":"Provide 'code' and/or 'error' arguments"}</code>.</p>
+<h2 id="generate"><code>generate</code></h2>
+<p>Constructs a prompt that asks the LLM to return code without explanation. It uses the knowledge-augmented completion path.</p>
+<p>Object arguments:</p>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>task</code></td><td>Yes</td><td>Description of the code to generate.</td></tr>
+<tr><td><code>language</code></td><td>No</td><td>Requested language; defaults to <code>Mix</code>.</td></tr>
+</tbody></table>
+<p>The body may instead be a JSON string containing the task. That form uses the default language.</p>
+<p>Example body:</p>
+<pre><code class="language-json">{"task":"Print each argument on a separate line","language":"Mix"}
+</code></pre>
+<p>Success body:</p>
+<pre><code class="language-json">{"code":"..."}
+</code></pre>
+<h2 id="mixexecute"><code>mix.execute</code></h2>
+<p>Parses and executes a Mix program in a fresh evaluator.</p>
+<p>Object arguments:</p>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>script</code></td><td>Yes</td><td>Mix source to execute.</td></tr>
+<tr><td><code>vars</code></td><td>No</td><td>Object whose fields become Mix globals.</td></tr>
+</tbody></table>
+<p>The body may instead be a JSON string containing the script.</p>
+<p>Example body:</p>
+<pre><code class="language-json">{"script":"say greeting","vars":{"greeting":"hello"}}
+</code></pre>
+<p>Variable conversion follows these rules:</p>
+<table><thead><tr><th>JSON input</th><th>Mix global</th></tr></thead><tbody>
+<tr><td>String</td><td>String</td></tr>
+<tr><td>Number</td><td>Number represented as <code>f64</code></td></tr>
+<tr><td>Boolean</td><td>Boolean</td></tr>
+<tr><td>Null, array, or object</td><td>Serialised JSON string</td></tr>
+</tbody></table>
+<p>Success returns captured standard output:</p>
+<pre><code class="language-json">{"output":"hello\n"}
+</code></pre>
+<p>If the script writes to standard error without failing, the body also contains <code>stderr</code>.</p>
+<p>Parse and evaluation failures return <code>rc=10</code>. An evaluation failure may include output produced before the error:</p>
+<pre><code class="language-json">{"error":"...","partial_output":"..."}
+</code></pre>
+<h2 id="mixexpr"><code>mix.expr</code></h2>
+<p>Parses and evaluates a Mix expression by wrapping it in a <code>return</code> statement.</p>
+<p>Object arguments:</p>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>expr</code></td><td>Yes</td><td>Mix expression to evaluate.</td></tr>
+</tbody></table>
+<p>The body may instead be a JSON string containing the expression.</p>
+<p>Example body:</p>
+<pre><code class="language-json">{"expr":"1 + 2"}
+</code></pre>
+<p>Success returns the converted JSON value:</p>
+<pre><code class="language-json">{"result":3}
+</code></pre>
+<p>Lexer errors, parser errors, evaluator errors, task panics, and values that cannot be encoded as JSON return <code>rc=10</code> with an <code>error</code> field.</p>
+<h2 id="help"><code>help</code></h2>
+<p>Takes no arguments. It returns the complete command-name array:</p>
+<pre><code class="language-json">{"commands":["ask","ask_raw","analyze","generate","mix.execute","mix.expr","help","info"]}
+</code></pre>
+<h2 id="info"><code>info</code></h2>
+<p>Takes no arguments. It returns:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>port</code></td><td>The fixed port name, <code>claud</code>.</td></tr>
+<tr><td><code>app</code></td><td>The package name, <code>cosmix-claud</code>.</td></tr>
+<tr><td><code>version</code></td><td>The package version compiled into the binary.</td></tr>
+<tr><td><code>knowledge_enabled</code></td><td>Whether knowledge augmentation is enabled in daemon state.</td></tr>
+<tr><td><code>domain</code></td><td>The workspace domain detected at startup.</td></tr>
+<tr><td><code>commands</code></td><td>The command count, <code>8</code>.</td></tr>
+<tr><td><code>command_list</code></td><td>The complete command-name array.</td></tr>
+</tbody></table>
+<h2 id="unknown-commands">Unknown commands</h2>
+<p>Any other command returns <code>rc=10</code>:</p>
+<pre><code class="language-json">{"error":"Unknown command: example"}
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +735,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +789,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +918,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

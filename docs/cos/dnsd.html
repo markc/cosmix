@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/dnsd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,72 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/dnsd.md"><div class="prose"><h1 id="cosmix-dnsd--authoritative-dns-for-the-mesh">cosmix-dnsd — authoritative DNS for the mesh</h1>
+<p><strong><code>cosmix-dnsd</code> is an authoritative DNS server for a WireGuard mesh: it answers
+the mesh's internal names, with zones generated from the mesh inventory rather
+than hand-edited zone files.</strong> One source of truth (the node roster) compiles
+to the A/AAAA/SOA/NS records the daemon serves.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>A small authoritative resolver that binds <code>:53</code> on the node's WireGuard mesh
+address (plus a loopback <code>127.0.0.1:53</code> for the node's own stub resolver). It
+serves the mesh's private naming — every node reachable by a stable name over
+the WG interface — and refuses anything outside its authority. It is not a
+recursive resolver and not a public nameserver.</p>
+<p>Zones are <strong>generated, never hand-written</strong>. The mesh inventory (the roster of
+nodes and their WG addresses) is the source of truth; a build step turns it
+into a validated zone snapshot with real apex <code>SOA</code>/<code>NS</code> records. Editing zone
+data means editing the inventory and regenerating — the daemon serves whatever
+the snapshot says.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>Authoritative answers</strong> for the mesh's internal zones over UDP and TCP on <code>:53</code>.</li>
+<li><strong>Inventory-driven zones</strong> — records compiled from the node roster via the <code>cosmix-lib-dns</code> codec, so a node rename or renumber flows from one edit.</li>
+<li><strong>Serial discipline</strong> — one owner drives the serial across all its zones; a mismatch fails closed rather than serving a split view.</li>
+<li><strong>Read-only Bus surface (v0)</strong> — the zone snapshot and per-rcode response stats are queryable; mutation verbs are deliberately rejected in v0.</li>
+</ul>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-dnsd
+</code></pre>
+<p>Runs under systemd as <code>cosmix-dnsd.service</code> (identity <code>User=cosmix-dnsd</code>).
+It reads the node's mesh IP from <code>/etc/cosmix/node.toml</code> and binds
+<code>&lt;wg-ip&gt;:53</code>, retrying briefly on <code>AddrNotAvailable</code> so the unit stays
+portable across nodes that bring the WG interface up asynchronously. Binding
+<code>:53</code> needs <code>CAP_NET_BIND_SERVICE</code>. Standalone <code>--listen &lt;ip:port&gt;</code> flags are
+available for testing without a live WG interface.</p>
+<p>Example generated zone (illustrative — public placeholders only):</p>
+<pre><code class="language-text">; zone: example.com  (compiled from the mesh inventory)
+example.com.        SOA   ns1.example.com. hostmaster.example.com. ( 42 ... )
+example.com.        NS    ns1.example.com.
+node-a.example.com. A     192.0.2.10
+node-b.example.com. A     192.0.2.11
+</code></pre>
+<h2 id="interfaces">Interfaces</h2>
+<p>Listeners:</p>
+<ul>
+<li><code>&lt;wg-ip&gt;:53</code> — authoritative UDP + TCP for mesh zones.</li>
+<li><code>127.0.0.1:53</code> — loopback bind for the node's own resolver.</li>
+</ul>
+<p>Bus verbs (service <code>dnsd</code>):</p>
+<table><thead><tr><th>Verb</th><th>Status</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>dnsd.zone.snapshot</code></td><td>v0</td><td>serial-excluded assembled zone snapshot</td></tr>
+<tr><td><code>dnsd.stats</code></td><td>v0</td><td>per-rcode response counters (e.g. <code>REFUSED</code>)</td></tr>
+<tr><td><code>dnsd.zone.{set,adopt}</code>, <code>dnsd.reload</code></td><td>rejected in v0</td><td>future mutation surface</td></tr>
+</tbody></table>
+<h2 id="where-it-fits">Where it fits</h2>
+<p>Built on the <code>cosmix-lib-dns</code> codec library (record model, wire encoding,
+strict-data zone parsing, resolver). Depends on <code>cosmix-lib-config</code> for node
+identity and <code>cosmix-lib-daemon</code> for the daemon framework, and registers on the
+local <a href="/cos/noded">cosmix-noded</a> broker for its Bus surface. Consumes the mesh
+inventory that the mesh tooling maintains; <a href="/cos/webd">cosmix-webd</a> relies on it
+to resolve the vhost names it serves.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/noded">noded</a> — the Bus broker dnsd registers with</li>
+<li><a href="/cos/libraries">libraries</a> — <code>cosmix-lib-dns</code>, the authoritative DNS codec</li>
+<li><a href="/cos/webd">webd</a> — the web front door whose names dnsd resolves</li>
+<li><a href="/cos/overview">overview</a> — the daemon family at a glance</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +684,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +738,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +867,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

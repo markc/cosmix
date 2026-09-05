@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-config/node-config</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,165 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-config/node-config.md"><div class="prose"><h1 id="node-configuration">Node configuration</h1>
+<p><code>node.conf.mix</code> defines one node's identity and the service configuration used
+by noded, maild, webd, and simple service toggles. It is strict-data Mix, not
+executable Mix. TOML is not accepted.</p>
+<h2 id="loading">Loading</h2>
+<p>Use <code>node::load_from(path)</code> when a caller already has an explicit path. The
+built-in discovery functions use this order:</p>
+<ol>
+<li>The path in <code>COSMIX_NODE_CONFIG</code>.</li>
+<li><code>node.conf.mix</code> in the resolved <code>CosmixDir::Etc</code> directory.</li>
+<li><code>/etc/cosmix/node.conf.mix</code> when <code>COSMIX_ETC</code> is not set and that path is
+distinct from the resolved configuration directory.</li>
+</ol>
+<p><code>load_node_config()</code> returns <code>Ok(None)</code> if no candidate exists.
+<code>require_node_config()</code> reports absence as an error. A selected file that
+cannot be read or parsed is a hard error; discovery does not continue to a
+later candidate.</p>
+<p>Setting <code>COSMIX_ETC</code> is an isolation boundary. Discovery does not fall through
+from that directory to <code>/etc/cosmix</code>.</p>
+<h2 id="minimal-form">Minimal form</h2>
+<p><code>NodeConfig</code> and its main service sections use serde defaults, so a file may
+state only the values that differ from defaults.</p>
+<pre><code class="language-text">node: "alpha"
+wg_ip: "192.0.2.10"
+mesh: "example.com"
+noded: {
+  port: 4200
+  admission: "off"
+}
+</code></pre>
+<p>The <code>node</code> value is a human-readable node name. <code>wg_ip</code> is the address used to
+derive the default service binds. <code>mesh</code> is an optional mesh FQDN used to
+recognise cross-mesh addresses.</p>
+<h2 id="top-level-sections">Top-level sections</h2>
+<table><thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>node</code></td><td>string</td><td>Human-readable node name.</td></tr>
+<tr><td><code>wg_ip</code></td><td>string</td><td>Node address used by derived listener and upstream values.</td></tr>
+<tr><td><code>mesh</code></td><td>optional string</td><td>Mesh FQDN for cross-mesh address recognition.</td></tr>
+<tr><td><code>noded</code></td><td><code>NodedConfig</code></td><td>Broker port, mesh file, and admission posture.</td></tr>
+<tr><td><code>maild</code></td><td><code>MaildConfig</code></td><td>Mail listeners, storage, TLS, and spam settings.</td></tr>
+<tr><td><code>webd</code></td><td><code>WebdConfig</code></td><td>Web listeners, vhosts, TLS, ACME, and routing settings.</td></tr>
+<tr><td><code>deskd</code></td><td><code>ServiceToggle</code></td><td>Enables or disables deskd.</td></tr>
+<tr><td><code>indexd</code></td><td><code>ServiceToggle</code></td><td>Enables or disables indexd.</td></tr>
+<tr><td><code>claud</code></td><td><code>ServiceToggle</code></td><td>Enables or disables claud.</td></tr>
+<tr><td><code>mcp</code></td><td><code>ServiceToggle</code></td><td>Enables or disables MCP.</td></tr>
+</tbody></table>
+<p><code>ServiceToggle.enabled</code> defaults to <code>true</code>.</p>
+<h2 id="noded">Noded</h2>
+<p><code>noded.port</code> defaults to <code>4200</code>. <code>noded.mesh_config</code> is an optional mesh
+configuration path.</p>
+<p><code>noded.admission</code> accepts:</p>
+<table><thead><tr><th>Value</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>off</code></td><td>Disables admission challenges. This is the default.</td></tr>
+<tr><td><code>observe</code></td><td>Runs challenges, verdicts, and logging without refusing a session.</td></tr>
+<tr><td><code>enforce</code></td><td>Refuses a failed gated session.</td></tr>
+</tbody></table>
+<p><code>NodeConfig::noded_listen()</code> returns <code>wg_ip:noded.port</code>.
+<code>NodeConfig::noded_url()</code> returns <code>ws://wg_ip:noded.port/ws</code>; an empty <code>wg_ip</code>
+uses <code>127.0.0.1</code>.</p>
+<h2 id="maild">Maild</h2>
+<p>The mail section provides:</p>
+<table><thead><tr><th>Field group</th><th>Fields</th></tr></thead><tbody>
+<tr><td>Service and network</td><td><code>enabled</code>, <code>jmap_port</code>, <code>smtp_port</code>, <code>smtps_port</code>, <code>hostname</code></td></tr>
+<tr><td>Storage</td><td><code>database</code>, <code>blob_dir</code>, <code>mds_dir</code></td></tr>
+<tr><td>Legacy TLS</td><td><code>tls_cert</code>, <code>tls_key</code></td></tr>
+<tr><td>SNI TLS</td><td><code>tls.identity</code>, <code>tls.strict_sni</code></td></tr>
+<tr><td>Spam filtering</td><td><code>spam_enabled</code>, <code>spam_db_dir</code></td></tr>
+</tbody></table>
+<p>Each <code>maild.tls.identity</code> row requires <code>server_name</code>, <code>cert</code>, and <code>key</code>.
+<code>default</code> selects the greeting and SNI-mismatch fallback identity.
+<code>no_sni_fallback</code> selects the identity for implicit TLS without SNI. Both flags
+default to <code>false</code>.</p>
+<p>When <code>tls.identity</code> is empty, maild may collapse the legacy <code>tls_cert</code> and
+<code>tls_key</code> pair into one fallback identity. <code>strict_sni</code> defaults to <code>false</code>.</p>
+<p>The helper methods <code>jmap_listen</code>, <code>smtp_inbound_listen</code>, and <code>smtps_listen</code>
+combine <code>wg_ip</code> with their corresponding ports. <code>jmap_upstream</code> produces an
+HTTPS upstream URL for webd.</p>
+<h2 id="webd">Webd</h2>
+<p>The web section provides:</p>
+<table><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>enabled</code></td><td>Enables webd.</td></tr>
+<tr><td><code>port</code></td><td>Port used by the implicit node-address listener.</td></tr>
+<tr><td><code>www_dir</code></td><td>Legacy document root.</td></tr>
+<tr><td><code>tls_cert</code>, <code>tls_key</code></td><td>Legacy manual certificate and key paths.</td></tr>
+<tr><td><code>tls_server_name</code></td><td>Hostnames covered by the legacy certificate pair.</td></tr>
+<tr><td><code>http_listen</code></td><td>Optional explicit plain-HTTP bind used by HTTP-01 and redirects.</td></tr>
+<tr><td><code>acme_tos_accepted</code></td><td>Accepted Let's Encrypt Subscriber-Agreement URL for production ACME.</td></tr>
+<tr><td><code>served_mail_domains</code></td><td>Allowlist for mail autoconfiguration requests.</td></tr>
+<tr><td><code>autoconfig_mail_host</code></td><td>Optional advertised mail host override.</td></tr>
+<tr><td><code>vhost</code></td><td>Per-vhost routing, content, TLS, ACME, and upstream settings.</td></tr>
+<tr><td><code>listener</code></td><td>Explicit per-interface listener rows and vhost allowlists.</td></tr>
+<tr><td><code>listeners.operators</code></td><td>Bus sender names allowed to write listener-control properties.</td></tr>
+</tbody></table>
+<p>An empty <code>listener</code> array makes <code>synthesize_listeners</code> produce one internal
+listener named <code>wg</code>, bound to <code>wg_ip:webd.port</code>, serving every resolved host.</p>
+<p>With explicit listeners, every row contains:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>Non-empty stable listener identifier.</td></tr>
+<tr><td><code>bind</code></td><td>Explicit <code>ip:port</code> socket address.</td></tr>
+<tr><td><code>external</code></td><td>Marks the connection as public or untrusted-facing.</td></tr>
+<tr><td><code>enabled</code></td><td>Bootstrap state; defaults to <code>true</code>.</td></tr>
+<tr><td><code>vhosts</code></td><td>Hostname allowlist served by this listener.</td></tr>
+</tbody></table>
+<p>Listener IDs and parsed binds must be unique. A wildcard bind cannot share its
+port with another bind. Every served hostname must belong to exactly one
+enabled listener. A hostname disabled during vhost resolution may be skipped;
+an unknown hostname remains an error.</p>
+<h2 id="vhosts">Vhosts</h2>
+<p>Each <code>webd.vhost</code> row may set:</p>
+<table><thead><tr><th>Field group</th><th>Fields</th></tr></thead><tbody>
+<tr><td>Routing and files</td><td><code>host</code>, <code>aliases</code>, <code>www_dir</code>, <code>docs_dir</code></td></tr>
+<tr><td>TLS and ACME</td><td><code>tls_cert</code>, <code>tls_key</code>, <code>acme</code></td></tr>
+<tr><td>Data</td><td><code>cms_db_path</code>, <code>aux_dbs</code></td></tr>
+<tr><td>Upstreams</td><td><code>jmap_upstream</code>, <code>noded_ws</code></td></tr>
+<tr><td>Development session</td><td><code>dev_session_email</code>, <code>dev_session_password</code></td></tr>
+<tr><td>Public read identity</td><td><code>public_read_email</code>, <code>public_read_password</code></td></tr>
+<tr><td>System sender</td><td><code>system_sender_email</code>, <code>system_sender_password</code></td></tr>
+<tr><td>Emergency policy</td><td><code>mfa_break_glass</code></td></tr>
+</tbody></table>
+<p><code>aux_dbs</code> rows require <code>name</code> and <code>path</code>. Validation of the schema name and
+path occurs when webd opens the database.</p>
+<p>The three password fields are deserialised but skipped during serialisation.
+The <code>Debug</code> implementation prints a redaction marker instead of their values.</p>
+<p><code>WebdVhostConfig</code> tolerates unknown fields so older daemon builds can still
+read the shared node file. Core listener, auxiliary-database, and ACME
+structures reject unknown fields.</p>
+<h2 id="acme">ACME</h2>
+<p>A vhost selects manual PEM with <code>tls_cert</code> and <code>tls_key</code>, or ACME with an
+<code>acme</code> block. It cannot select both.</p>
+<pre><code class="language-text">webd: {
+  http_listen: "192.0.2.10:80"
+  vhost: [
+    {
+      host: "www.example.com"
+      aliases: ["example.com"]
+      www_dir: "/srv/www/example"
+      acme: {
+        provider: "letsencrypt_staging"
+        challenge: "http01"
+        contact_email: "admin@example.com"
+      }
+    }
+  ]
+}
+</code></pre>
+<p><code>provider</code> accepts <code>letsencrypt_prod</code> and <code>letsencrypt_staging</code>.
+<code>challenge</code> defaults to <code>http01</code>. <code>dns01</code> parses but
+<code>resolve_webd_acme</code> rejects it as unsupported.</p>
+<p>Every ACME vhost requires <code>webd.http_listen</code>. Contact addresses must contain
+non-empty local and domain parts, contain no carriage return or line feed, and
+be at most 253 bytes.</p>
+<p>Any production ACME vhost requires <code>acme_tos_accepted</code>. The resolver trims the
+value and requires a non-empty URL below <code>https://letsencrypt.org/</code>. Staging
+does not mint a ToS proof.</p>
+<p><code>resolve_webd_acme</code> returns one <code>AcmeVhostPlan</code> per ACME vhost and one optional
+node-level <code>AcmeTosAcceptance</code>. The plan retains the source vhost index, primary
+name, aliases, provider, challenge, and contact address. Hostname
+normalisation remains the caller's responsibility.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +777,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +831,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +960,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

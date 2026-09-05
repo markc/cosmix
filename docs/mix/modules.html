@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/modules</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,88 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/modules.md"><div class="prose"><h1 id="modules--require-include-source">modules — require, include, source</h1>
+<p>Three ways to pull another <code>.mix</code> file into a running script, on a spectrum
+from <strong>isolated</strong> to <strong>splice-into-my-scope</strong>:</p>
+<table><thead><tr><th></th><th><code>require(path)</code></th><th><code>include "path"</code></th><th><code>source "path"</code></th></tr></thead><tbody>
+<tr><td>Form</td><td>expression (builtin, returns a value)</td><td>statement</td><td>statement</td></tr>
+<tr><td>Caller's scope</td><td><strong>untouched</strong> — exports come back as a value</td><td>file's fns + <code>$vars</code> land in the caller's scope</td><td>same as include</td></tr>
+<tr><td>Runs</td><td>once per canonical path (cached)</td><td>once per canonical path (deduped, returns nil on repeat)</td><td>every time</td></tr>
+<tr><td>Path resolution</td><td>script-relative, then CWD</td><td>script-relative, then CWD</td><td>CWD only</td></tr>
+<tr><td>Parse failure</td><td>hard error</td><td>hard error</td><td>may fall back to per-line shell (<code>.mixrc</code>-style)</td></tr>
+<tr><td>Capability</td><td><code>fs-read</code></td><td><code>fs-read</code></td><td><code>fs-read</code></td></tr>
+</tbody></table>
+<blockquote>
+<p><strong>Script-relative follows symlinks</strong> (0.74.0): the entry script's path is
+canonicalised before its directory is taken, so the symlinked-launcher
+pattern (<code>~/.local/bin/x -&gt; repo/_bin/x.mix</code>) resolves <code>../_lib/…</code>
+against the repo the script lives in. Before this, every such launcher
+silently depended on being run from the right CWD.</p>
+</blockquote>
+<p><code>require</code> is the module loader: it evaluates the file in a <strong>fresh, fully
+isolated scope</strong> and hands back its exports — the caller's variables and
+functions cannot be clobbered, and the module cannot see them. <code>include</code> is
+the trusting opposite: a splice that shares helper functions into your scope.
+<code>source</code> is shell-style config loading.</p>
+<h2 id="require-in-one-example">require in one example</h2>
+<pre><code class="language-mix">-- strutil.mix ------------------------------------
+$version = "1.0"
+$_sep = "-"                          -- '_' prefix: private, not exported
+function _squash($s)                 -- private helper
+  return replace($s, "  ", " ")
+end
+function slugify($s)
+  return lower(replace(_squash($s), " ", $_sep))
+end
+
+-- main.mix ---------------------------------------
+$str = require("strutil.mix")
+print($str.version)                  -- 1.0
+print($str.slugify("Hello  World"))  -- hello-world
+$f = $str.slugify                    -- extract-then-call works too
+print($f("A B"))                     -- a-b
+</code></pre>
+<h2 id="what-gets-exported">What gets exported</h2>
+<ul>
+<li>By default: a <strong>map</strong> of every top-level function and <code>$var</code>, minus names starting with <code>_</code> (private by convention), the implicit frame names (<code>rc</code>, <code>result</code>, <code>status</code>, <code>event</code>), and prelude functions the module didn't redefine.</li>
+<li>A top-level <code>return &lt;expr&gt;</code> <strong>replaces</strong> auto-export entirely — the file can return a map, a single function, a number, anything (Lua-style). Only an explicit <code>return</code> does this; an incidental value in the last statement does not.</li>
+<li>A side-effect-only module exports <code>{}</code> — <code>require</code> doubles as "run this file exactly once".</li>
+</ul>
+<h2 id="module-semantics">Module semantics</h2>
+<ul>
+<li><strong>Cached once per canonical path.</strong> The module body runs on the first <code>require</code>; later requires (any relative spelling, symlinks included) return a fresh copy of the cached exports without re-running the body. Mutating the returned map never affects the cache. Exception: an exported <code>Buffer</code> is reference-semantic as always — every require-hit shares it.</li>
+<li><strong>Cycles are hard errors</strong> (<code>a.mix -&gt; b.mix -&gt; a.mix</code> reports the chain), as is nesting deeper than 64 requires. A require that fails (missing file, parse error, runtime error) caches nothing — fix the module and require again.</li>
+<li><strong>Exported functions keep working</strong>: they can call the module's other functions (including <code>_</code>-privates) and read the module's top-level <code>$vars</code>. Those vars are injected <strong>by value per call</strong> — writes inside a call don't persist to the next call. Module-level mutable state is not a thing; return state to the caller instead.</li>
+<li><strong>Nested <code>require</code> is module-relative</strong>: a module requiring <code>"sibling.mix"</code> resolves next to itself, transitively.</li>
+<li><strong>What a module sees</strong>: builtins, HOFs, the prelude (iff the program loaded it), extensions, <code>env()</code>/<code>args()</code>/process state, and further <code>require</code>s. It does NOT see the caller's <code>$vars</code>, functions, <code>~/.mixrc</code>, or an enclosing <code>address</code> block. It runs under the caller's capability policy and eval limits — <code>require</code> is not a sandbox escape.</li>
+<li>A free name in a module function that is <strong>not</strong> a module top-level resolves against the <em>requiring program's</em> globals at call time, like any named function. Define what you use at the module top level.</li>
+<li><code>alias</code> and <code>export NAME=</code> at module top level affect the shared program state (documented, allowed); registering an <code>on</code> handler from a module is an <strong>error</strong>.</li>
+</ul>
+<h2 id="calling-exports--precedence">Calling exports — precedence</h2>
+<p><code>$m.foo(args)</code> dispatches <strong>member-first</strong> since 0.72.0: when <code>$m</code> has a
+<strong>function-valued</strong> member <code>foo</code>, that member is called (the flip that made
+exports named <code>sum</code>/<code>lines</code> reachable via dot-call — from 0.27.0 to 0.71 a
+free/prelude name won instead and the prelude ran on the stringified map).
+When no such member exists, the call is the usual UFCS sugar (<code>$list.map($f)</code>,
+<code>$s.upper()</code>), then an address-block send. Two collisions survive the flip:</p>
+<ul>
+<li>An export named after a <strong>builtin</strong> must still be called via the index form (<code>$m["keys"](...)</code>) — a builtin-named dot-call desugars at parse time, before the member can be seen.</li>
+<li>Serve-mode <strong>extension</strong> verbs outrank members by design — a citizen's map can never fake an injected <code>props.*</code> verb.</li>
+</ul>
+<p>The index form <code>$m["foo"](...)</code> calls the member unconditionally and remains
+the collision-proof spelling.</p>
+<p><code>$m.foo</code> (no call) extracts the function value; <code>$f = $m.foo</code> then <code>$f(x)</code>
+always calls the member, collisions or not.</p>
+<p>Also new with require: a <strong>Function-valued variable is callable bareword</strong> —
+<code>$b = function() ... end</code> then <code>b()</code> — wherever no builtin/named function of
+that name exists.</p>
+<h2 id="when-to-use-which">When to use which</h2>
+<ul>
+<li>Reach for <strong><code>require</code></strong> for anything library-shaped: namespaced helpers, shared constants, run-once setup. It is the only loader safe against name collisions in both directions.</li>
+<li>Reach for <strong><code>include</code></strong> when you <em>want</em> the file's functions unprefixed in your scope (a project's helper set) and you own both files.</li>
+<li>Reach for <strong><code>source</code></strong> for <code>.mixrc</code>-style config that may mix Mix with bareword shell lines and must re-run each time.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +700,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +754,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +883,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

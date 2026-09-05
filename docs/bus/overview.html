@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/overview</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,75 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/overview.md"><div class="prose"><h1 id="bus--cosmix-agent-bus">bus — CosMix Agent Bus</h1>
+<p><strong>bus is the pure-Rust protocol family for messaging between named,
+agent-operable services on a WireGuard-secured mesh.</strong> It defines the wire
+message, broker client, property read types, build provenance, and common
+logging surface. The broker and the operating substrate live elsewhere.</p>
+<p>This page is the orientation: what Bus is, which crates bus contains, where the
+protocol boundary sits, and how bus fits with mix and cos.</p>
+<h2 id="what-bus-is">What Bus is</h2>
+<p>Bus follows the AmigaOS ARexx convention: every service exposes a named port.
+A peer can send that port a command, call it and wait for a reply, or subscribe
+to its event topics. Local names such as <code>maild</code> resolve through the node's
+service registry; <code>maild.delta.bus</code> addresses the service on a named mesh node.</p>
+<p>Every node runs a <code>cosmix-noded</code> broker, supplied by the
+<a href="https://github.com/markc/cosmix">cos</a> repo. Citizens connect over WebSocket,
+register a service name, and exchange Bus messages through that broker. Remote
+node traffic crosses the WireGuard mesh. Trust is granted per WireGuard subnet:
+peers admitted to that subnet are inside the corresponding Bus trust boundary.</p>
+<p>The design separates the message contract from the machinery that operates it.
+A bus consumer can construct, parse, and validate a <code>BusMessage</code> without a
+broker or mesh being present.</p>
+<h2 id="the-crate-family">The crate family</h2>
+<table><thead><tr><th>Crate</th><th>What it is</th></tr></thead><tbody>
+<tr><td><a href="/bus/wire-format"><code>cosmix-lib-bus</code></a></td><td>Bus header/body wire format, addresses, return codes, discovery records, and native Unix-socket port helpers.</td></tr>
+<tr><td><a href="/bus/client"><code>cosmix-lib-client</code></a></td><td><code>NodedClient</code>, the native and browser WebSocket client; native builds also expose <code>SupervisedClient</code>.</td></tr>
+<tr><td><a href="/bus/props-core"><code>cosmix-lib-props-core</code></a></td><td>SPEC 07 property read types and, behind <code>bus</code>, read dispatch and event-message builders.</td></tr>
+<tr><td><a href="/bus/buildinfo"><code>cosmix-lib-buildinfo</code></a></td><td>Dependency-free compile-time package, git, dirty-tree, and build-time provenance.</td></tr>
+<tr><td><a href="/bus/log"><code>cosmix-lib-log</code></a></td><td>Common tracing, sink, filter-reload, and metrics/statistics surface.</td></tr>
+</tbody></table>
+<p>The workspace builds standalone. Its crates use ordinary third-party Rust
+dependencies and sibling dependencies within bus, but no crate depends on mix
+or cos.</p>
+<h2 id="the-protocol-boundary">The protocol boundary</h2>
+<p>bus owns data shapes and protocol-facing client primitives. It deliberately
+does not own:</p>
+<ul>
+<li>persistent application/property backends or audit state;</li>
+<li>TLS, ACME, WireGuard setup, mesh inventory, or broker implementation;</li>
+<li>service configuration files or broker URL discovery; or</li>
+<li>general daemon lifecycle and system-service integration.</li>
+</ul>
+<p>Those are substrate concerns in cos. In particular,
+<code>cosmix-lib-props-store</code> supplies the SPEC 12 mutation and storage side paired
+with bus's property core, while <code>cosmix-noded</code> supplies the broker. The
+logging crate's rolling-file and stats JSONL sinks are operational output, not
+a service-state backend.</p>
+<h2 id="how-it-fits--bus--mix--cos">How it fits — bus ← mix ← cos</h2>
+<p>The public repositories have a one-way dependency order:</p>
+<ul>
+<li><strong>bus</strong> — protocol libraries at the bottom; depends on neither sibling.</li>
+<li><strong><a href="https://github.com/markc/cosmix">mix</a></strong> — the ARexx-flavoured language and shell; depends on bus for <code>send</code>, <code>address</code>, <code>emit</code>, subscriptions, and serving.</li>
+<li><strong><a href="https://github.com/markc/cosmix">cos</a></strong> — the daemon and substrate family; depends on bus and mix, and ships <code>cosmix-noded</code>.</li>
+</ul>
+<p>Neither mix nor cos is required to compile the bus workspace.</p>
+<h2 id="building">Building</h2>
+<pre><code class="language-sh">git clone https://github.com/markc/cosmix ~/.bus
+cd ~/.bus/src
+cargo build --workspace
+cargo test --workspace
+</code></pre>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/bus/wire-format">wire format</a> — messages, framing, addresses, and native ports</li>
+<li><a href="/bus/client">client</a> — connect, call, send, subscribe, and reconnect</li>
+<li><a href="/bus/props-core">property core</a> — the SPEC 07 read surface</li>
+<li><a href="/bus/buildinfo">build information</a> — compile-time provenance</li>
+<li><a href="/bus/log">logging</a> — tracing sinks, reload, and statistics</li>
+<li><a href="/bus/">the manual index</a> — every page in this manual</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +687,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +741,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +870,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

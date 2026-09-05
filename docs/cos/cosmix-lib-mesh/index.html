@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-mesh/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,132 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-mesh/README.md"><div class="prose"><h1 id="cosmix-lib-mesh">cosmix-lib-mesh</h1>
+<p><code>cosmix-lib-mesh</code> provides mesh peer configuration, Bus message relay over broker WebSockets, mesh node records, and read-only WireGuard status queries. It belongs to the <code>cos</code> daemon and substrate layer in the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it consumes Bus message primitives and supports Cos daemons, while defining neither the Bus wire format nor the Mix language.</p>
+<h2 id="package">Package</h2>
+<p>The Cargo package is named <code>cosmix-lib-mesh</code>.</p>
+<p>Rust code imports it as <code>cosmix_mesh</code>:</p>
+<pre><code class="language-rust">use cosmix_mesh::{MeshConfig, MeshNode, MeshPeers, PeerConfig};
+</code></pre>
+<p>The crate is a library. It installs no binary and provides no command-line interface.</p>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>node</code></td><td>Serializable mesh node identity and discovery record</td></tr>
+<tr><td><code>peer</code></td><td>Peer configuration and asynchronous broker connections</td></tr>
+<tr><td><code>wg</code></td><td>Read-only WireGuard interface and peer status</td></tr>
+</tbody></table>
+<p><code>MeshNode</code>, <code>MeshConfig</code>, <code>MeshPeers</code>, and <code>PeerConfig</code> are re-exported from the crate root. WireGuard status types and query functions remain under <code>cosmix_mesh::wg</code>.</p>
+<h2 id="mesh-node-records">Mesh node records</h2>
+<p><code>MeshNode</code> is a serializable description of one node.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td><code>Uuid</code></td><td>Node identifier</td></tr>
+<tr><td><code>name</code></td><td><code>String</code></td><td>Human-readable node name</td></tr>
+<tr><td><code>wg_pubkey</code></td><td><code>String</code></td><td>WireGuard public key</td></tr>
+<tr><td><code>wg_endpoint</code></td><td><code>Option&lt;String&gt;</code></td><td>Optional WireGuard endpoint</td></tr>
+<tr><td><code>jmap_url</code></td><td><code>Option&lt;String&gt;</code></td><td>Optional JMAP URL</td></tr>
+<tr><td><code>mesh_ip</code></td><td><code>String</code></td><td>Address on the WireGuard mesh</td></tr>
+</tbody></table>
+<p>The type derives <code>Debug</code>, <code>Clone</code>, <code>Serialize</code>, and <code>Deserialize</code>.</p>
+<h2 id="peer-configuration">Peer configuration</h2>
+<p><code>PeerConfig</code> describes one remote broker.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td><code>String</code></td><td>Node name used for lookup and Bus addressing</td></tr>
+<tr><td><code>mesh_ip</code></td><td><code>String</code></td><td>WireGuard mesh address</td></tr>
+<tr><td><code>noded_port</code></td><td><code>u16</code></td><td>Broker WebSocket port; defaults to <code>4200</code></td></tr>
+</tbody></table>
+<p><code>PeerConfig::noded_url</code> produces <code>ws://&lt;mesh_ip&gt;:&lt;noded_port&gt;/ws</code>.</p>
+<p>Peer entries reject unknown fields. In particular, the obsolete <code>hub_port</code> field is an error rather than an alias for <code>noded_port</code>.</p>
+<p><code>MeshConfig</code> contains:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>node_name</code></td><td><code>String</code></td><td>Local node name</td></tr>
+<tr><td><code>peers</code></td><td><code>Vec&lt;PeerConfig&gt;</code></td><td>Known remote peers; defaults to an empty list</td></tr>
+<tr><td><code>d2_seed</code></td><td><code>Option&lt;[u8; 32]&gt;</code></td><td>Runtime-only input for admission proofs</td></tr>
+</tbody></table>
+<p><code>d2_seed</code> is skipped by Serde. It is not read from <code>mesh.conf.mix</code>.</p>
+<p>A minimal <code>mesh.conf.mix</code> file is:</p>
+<pre><code class="language-text">node_name: "alpha"
+peers: [
+  { name: "beta", mesh_ip: "192.0.2.2" },
+  { name: "gamma", mesh_ip: "192.0.2.3", noded_port: 4300 }
+]
+</code></pre>
+<p>Map entries inside the list use commas.</p>
+<h3 id="loading-configuration">Loading configuration</h3>
+<p><code>MeshConfig::load(path)</code> reads an explicit <code>mesh.conf.mix</code> path. Read and parse failures return an error.</p>
+<p><code>MeshConfig::load_default(node_name)</code> checks the default Cosmix configuration directory for <code>mesh.conf.mix</code>.</p>
+<p>If the default file is absent, it returns a configuration containing the supplied node name, no peers, and no admission-proof input.</p>
+<p>If the default file exists but cannot be loaded, the function emits a warning and returns the same empty configuration.</p>
+<p><code>MeshConfig::find_peer(node_name)</code> returns the first peer with an exact matching name.</p>
+<h2 id="peer-connections">Peer connections</h2>
+<p><code>MeshPeers</code> manages reusable WebSocket connections to remote brokers.</p>
+<p>Create it with a <code>MeshConfig</code> and an unbounded Tokio sender:</p>
+<pre><code class="language-rust">let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+let peers = MeshPeers::new(config, incoming_tx);
+</code></pre>
+<p>The sender receives inbound Bus messages that do not complete a pending request.</p>
+<h3 id="inspection-methods">Inspection methods</h3>
+<table><thead><tr><th>Method</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>node_name()</code></td><td>Local configured node name</td></tr>
+<tr><td><code>peer_names()</code></td><td>Owned list of configured peer names</td></tr>
+<tr><td><code>peers()</code></td><td>Borrowed slice of full peer records</td></tr>
+<tr><td><code>is_remote_peer(name)</code></td><td>Whether the name exists in the configuration</td></tr>
+</tbody></table>
+<h3 id="sending-messages">Sending messages</h3>
+<p><code>call(node_name, message)</code> sends a <code>BusMessage</code> and waits for a correlated response.</p>
+<p>The method:</p>
+<ol>
+<li>Rejects an unknown peer.</li>
+<li>Opens the peer connection on first use.</li>
+<li>Reuses an existing connection when present.</li>
+<li>Preserves the message <code>id</code>, or assigns a UUID when none is present.</li>
+<li>Matches a received message by <code>id</code>.</li>
+<li>Returns an error if the response does not arrive within 30 seconds.</li>
+</ol>
+<p><code>send(node_name, message)</code> sends a <code>BusMessage</code> without waiting for a response. It also opens the connection on first use.</p>
+<p>Disconnected reader tasks remove their peer from the active connection map. A later send or call can therefore establish a new connection.</p>
+<h3 id="broker-registration-and-admission">Broker registration and admission</h3>
+<p>Each new connection registers the local bridge with <code>noded.register</code>.</p>
+<p>The connection recognises these admission messages:</p>
+<table><thead><tr><th>Bus command</th><th>Direction</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>noded.admit.challenge</code></td><td>Remote broker to bridge</td><td>Supplies an admission transcript challenge</td></tr>
+<tr><td><code>noded.admit.response</code></td><td>Bridge to remote broker</td><td>Returns a signed response when proof input is available</td></tr>
+<tr><td><code>noded.register</code></td><td>Bridge to remote broker</td><td>Registers the bridge after admission handling</td></tr>
+</tbody></table>
+<p>The bridge waits up to one second for an initial challenge. A silent broker is treated as compatible with registration-first behaviour.</p>
+<p>Malformed challenges or missing proof input produce no admission response. Registration still proceeds.</p>
+<h2 id="wireguard-status">WireGuard status</h2>
+<p>The <code>wg</code> module queries the kernel WireGuard backend. It does not create or modify interfaces.</p>
+<p><code>wg::list_interfaces()</code> returns the names of all WireGuard interfaces visible through that backend.</p>
+<p><code>wg::query_interface(name)</code> parses an interface name and returns <code>WgInterfaceStatus</code>.</p>
+<table><thead><tr><th><code>WgInterfaceStatus</code> field</th><th>Type</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td><code>String</code></td></tr>
+<tr><td><code>public_key</code></td><td><code>Option&lt;String&gt;</code></td></tr>
+<tr><td><code>listen_port</code></td><td><code>Option&lt;u16&gt;</code></td></tr>
+<tr><td><code>peers</code></td><td><code>Vec&lt;WgPeerStatus&gt;</code></td></tr>
+</tbody></table>
+<p>Each <code>WgPeerStatus</code> reports the peer public key, optional endpoint, allowed IP ranges, seconds since the last handshake, transmitted bytes, and received bytes.</p>
+<p>WireGuard keys are represented as standard Base64 strings.</p>
+<p>Interface queries require root or <code>CAP_NET_ADMIN</code>. Invalid names and backend query failures return errors.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<p>The crate declares no Cargo features.</p>
+<p>Its mesh-trust dependency is built with that dependency's default features disabled.</p>
+<h2 id="runtime-dependencies">Runtime dependencies</h2>
+<p>The main integration points are:</p>
+<ul>
+<li><code>cosmix-lib-bus</code> for <code>BusMessage</code> parsing and serialization.</li>
+<li><code>cosmix-lib-config</code> for <code>.conf.mix</code> loading and default paths.</li>
+<li><code>cosmix-lib-mesh-trust</code> for admission transcript signing.</li>
+<li>Tokio, Tokio Tungstenite, and Futures Utilities for asynchronous WebSockets and channels.</li>
+<li><code>wireguard-control</code> for kernel interface inspection.</li>
+<li>Serde and <code>serde_json</code> for configuration and admission message data.</li>
+<li><code>tracing</code> for connection and configuration diagnostics.</li>
+</ul>
+<h2 id="error-behaviour">Error behaviour</h2>
+<p>Public fallible operations return <code>anyhow::Result</code>.</p>
+<p>Configuration loaded from an explicit path fails closed. Default configuration loading is best-effort and falls back to an empty peer list.</p>
+<p>Calls fail for unknown peers, connection errors, send failures, closed response channels, lost connections, and response timeouts.</p>
+<p>WireGuard operations fail for invalid interface names, insufficient access, or kernel backend errors.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +744,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +798,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +927,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

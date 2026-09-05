@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/cosmix-lib-bus/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,162 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/cosmix-lib-bus/README.md"><div class="prose"><h1 id="cosmix-lib-bus">cosmix-lib-bus</h1>
+<p><code>cosmix-lib-bus</code> defines the Bus wire format and native IPC primitives for
+Cosmix applications. It is the protocol-layer crate at the bottom of the
+<code>bus &lt;- mix &lt;- cos</code> dependency chain: higher layers consume its messages,
+addresses, discovery records, and local port API, while this crate has no
+dependency on Mix or Cos.</p>
+<p>Rust code imports the <code>cosmix-lib-bus</code> package as <code>cosmix_bus</code>.</p>
+<pre><code class="language-rust">use cosmix_bus::bus::{parse_strict, BusMessage};
+
+let message = BusMessage::new()
+    .with_header("type", "request")
+    .with_header("to", "indexd.beta.bus")
+    .with_header("command", "status")
+    .with_body(r#"{"detail":true}"#);
+
+let decoded = parse_strict(&amp;message.to_wire())?;
+assert_eq!(decoded.command_name(), Some("status"));
+</code></pre>
+<h2 id="what-it-provides">What it provides</h2>
+<ul>
+<li><code>bus</code> defines Bus messages, parsers, validation, addresses, targets, and
+native stream helpers.</li>
+<li><code>service_info</code> defines the service and node discovery records exchanged with
+a broker.</li>
+<li>With the <code>native</code> feature, the crate exports a Unix-socket command port,
+client call helpers, typed replies, and port events.</li>
+</ul>
+<h2 id="wire-format">Wire format</h2>
+<p><code>BusMessage</code> contains an ordered <code>BTreeMap&lt;String, String&gt;</code> of headers and an
+optional string body. The wire representation uses Markdown-style frontmatter:</p>
+<pre><code class="language-text">---
+command: get
+from: mix.alpha.bus
+to: props.beta.bus
+type: request
+---
+{"key":"value"}
+</code></pre>
+<p><code>BusMessage::new</code> and <code>BusMessage::empty</code> create an empty message.
+<code>BusMessage::command</code> constructs a header-only command. <code>with_header</code>,
+<code>with_body</code>, <code>set</code>, and <code>get</code> build or inspect a message.</p>
+<p><code>to_wire</code> serialises to text and <code>to_bytes</code> serialises to UTF-8 bytes. <code>Display</code>
+uses the same wire representation. <code>EMPTY_MESSAGE</code> is the canonical
+header-free, body-free heartbeat or keepalive frame.</p>
+<p>Convenience accessors expose <code>from</code>, <code>to</code>, <code>command</code>, <code>type</code>, JSON <code>args</code>, JSON
+<code>json</code>, display-protocol fields, and the <code>ui.*</code> command test. <code>error_message</code>
+prefers the <code>error</code> header, then a JSON-body <code>error</code>, then the raw body, and
+finally <code>unknown error</code>.</p>
+<h2 id="parsing-and-validation">Parsing and validation</h2>
+<p>Choose the parser according to the input contract:</p>
+<table><thead><tr><th>Function</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>bus::parse_strict</code></td><td>Rejects malformed header lines and invalid JSON-looking header values. Use for canonical Bus content.</td></tr>
+<tr><td><code>bus::parse_lenient</code></td><td>Returns a <code>BusMessage</code> and a <code>ParseReport</code> containing skipped lines and JSON parse errors.</td></tr>
+<tr><td><code>bus::parse</code></td><td>Preserves the compatibility behaviour of silently ignoring the lenient parse report.</td></tr>
+</tbody></table>
+<p>Header lines use the exact <code>key: value</code> separator. Values beginning with <code>[</code> or
+<code>{</code> are checked as JSON by the strictness report. Parsing trims trailing
+whitespace from the body.</p>
+<p><code>bus::validate</code> performs permissive protocol checks and returns warnings. It
+checks known headers, message type, JSON in <code>args</code> and <code>json</code>, and numeric <code>rc</code>
+and <code>ttl</code> values. An empty warning vector means the message conforms.</p>
+<p>The recognised message types are <code>request</code>, <code>response</code>, <code>event</code>, and <code>stream</code>.
+Validation does not reject unknown headers or invalid values by itself.</p>
+<h2 id="addressing">Addressing</h2>
+<p><code>BusAddress</code> models the local portion of a Bus address:</p>
+<ul>
+<li><code>&lt;node&gt;.bus</code> addresses the node; the broker service is implicit.</li>
+<li><code>&lt;service&gt;.&lt;node&gt;[.bus]</code> addresses a service on a node.</li>
+<li><code>&lt;sub&gt;.&lt;service&gt;.&lt;node&gt;[.bus]</code> adds an opaque sub-protocol or instance label.</li>
+</ul>
+<p><code>BusAddress::parse_local</code> accepts local addresses. A bare service name such as
+<code>indexd</code> is registry shorthand, not a parseable Bus address.</p>
+<p><code>BusTarget::parse</code> handles local targets such as <code>indexd.alpha.bus</code> and the
+reserved cross-mesh form <code>indexd.alpha.bus@example.com</code>.</p>
+<p><code>BusTarget::is_cross_mesh</code> makes the distinction explicit. Cross-mesh targets
+are parsed and represented, but routing remains unimplemented and routers must
+refuse them.</p>
+<p>Address labels use lowercase ASCII letters, digits, and hyphens. A label is at
+most 63 bytes and cannot start or end with a hyphen. A mesh FQDN must contain a
+dot, use the same label rules, and cannot use <code>xn--</code> labels.</p>
+<h2 id="return-codes-and-responses">Return codes and responses</h2>
+<p>The crate follows four ARexx-style return-code constants:</p>
+<table><thead><tr><th>Constant</th><th style="text-align: right">Value</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>RC_SUCCESS</code></td><td style="text-align: right">0</td><td>Success</td></tr>
+<tr><td><code>RC_WARNING</code></td><td style="text-align: right">5</td><td>Warning</td></tr>
+<tr><td><code>RC_ERROR</code></td><td style="text-align: right">10</td><td>Application error</td></tr>
+<tr><td><code>RC_FAILURE</code></td><td style="text-align: right">20</td><td>Failure</td></tr>
+</tbody></table>
+<p><code>PortResponse</code> carries <code>rc</code>, <code>ok</code>, optional JSON <code>data</code>, and optional error
+text. Its <code>success</code>, <code>ok</code>, <code>warning</code>, <code>error</code>, and <code>failure</code> constructors create
+the standard response shapes.</p>
+<p>For typed native calls, every <code>rc &lt; 10</code> is <code>PortReply::Ok</code> and preserves the
+exact code. Every <code>rc &gt;= 10</code> is <code>PortReply::AppError</code>. Transport, framing,
+UTF-8, size, and JSON failures remain the enclosing <code>Result::Err</code>.</p>
+<h2 id="service-and-node-discovery">Service and node discovery</h2>
+<p><code>ServiceInfo</code> is the broker registry record for one service. It contains the
+required registered name and optional binary name, version, Git revision,
+dirty-tree flag, build time, process ID, process start, registration time,
+schema version, and open <code>meta</code> values.</p>
+<p><code>ServiceInfo::from_name</code> creates a name-only record. Deserialisation accepts
+both the object form and a legacy bare service-name string. Unknown object
+fields are ignored, and optional fields default when absent, so additive record
+changes remain compatible.</p>
+<p><code>RegisterProvenance</code> contains the build and process facts a service sends when
+registering. <code>RegisterProvenance::from_parts</code> assembles those fields, records
+the current process ID, and leaves the caller responsible for supplying one
+process-start timestamp that survives reconnects.</p>
+<p><code>NodeInfo</code> describes a node, its optional mesh identity and broker build,
+current uptime, registered service count, schema version, and open metadata.
+<code>SCHEMA_VERSION</code> is the current discovery-record format version.</p>
+<h2 id="native-unix-socket-ports">Native Unix-socket ports</h2>
+<p>The default <code>native</code> feature exports <code>Port</code>. A port:</p>
+<ul>
+<li>registers named JSON command handlers with descriptions;</li>
+<li>optionally emits <code>PortEvent</code> notifications;</li>
+<li>can generate <code>help</code>, <code>info</code>, and <code>activate</code> commands;</li>
+<li>listens at <code>/run/user/&lt;uid&gt;/cosmix/ports/&lt;name&gt;.sock</code>; and</li>
+<li>dispatches one Bus request per connection.</li>
+</ul>
+<p>Requests carry the command in the <code>command</code> header and JSON arguments in the
+body. Responses carry <code>rc</code> and optional <code>error</code> headers plus an optional JSON
+body. The internal <code>__scripts__</code> command emits <code>PortEvent::ScriptsUpdated</code>.</p>
+<p><code>PortEvent</code> reports completed commands, activation requests, and script-list
+updates. <code>ScriptInfo</code> supplies the display name and full path for one script
+menu entry.</p>
+<p><code>call_port</code> is the compatibility client helper. It converts both transport
+failures and peer replies with <code>rc &gt;= 10</code> into errors. <code>call_port_typed</code>
+preserves the distinction with <code>PortReply</code>.</p>
+<p>The <code>bus::read_from_stream</code> and <code>bus::write_to_stream</code> helpers exchange a
+single message on a Tokio Unix stream. The reader waits for EOF, applies a
+10-second timeout, enforces the message-size limit, decodes UTF-8, and parses
+the frame.</p>
+<h2 id="features">Features</h2>
+<table><thead><tr><th>Feature</th><th>Default</th><th>What it adds</th></tr></thead><tbody>
+<tr><td><code>default</code></td><td>Yes</td><td>Enables <code>native</code>.</td></tr>
+<tr><td><code>native</code></td><td>Yes</td><td>Tokio Unix-stream transport, the Unix-socket <code>Port</code> server, call helpers, <code>PortReply</code>, and <code>libc</code>-based socket paths.</td></tr>
+</tbody></table>
+<p>With <code>--no-default-features</code>, the wire types, parsers, validation, addressing,
+return-code types, and discovery records remain available without Tokio or
+<code>libc</code>.</p>
+<p>The core crate uses <code>serde</code> and <code>serde_json</code> for wire data, <code>anyhow</code> for
+fallible parsing, and <code>tracing</code> for diagnostics. The <code>native</code> feature adds the
+optional <code>tokio</code> and <code>libc</code> dependencies.</p>
+<h2 id="limits">Limits</h2>
+<p><code>MAX_MESSAGE_BYTES</code> limits one native local-transport message to 16 MiB.
+<code>MAX_HEADERS</code> limits parsing to 4096 non-empty header lines. Lenient parsing
+records a header overflow; strict parsing rejects it.</p>
+<p>These bounds apply to the native Unix-socket transport and parser. Other
+transports enforce their own frame and message limits.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/bus/wire-format">Bus wire format</a></li>
+<li><a href="/bus/overview">Bus overview</a></li>
+<li><a href="/bus/client">broker client</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +774,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +828,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +957,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/errors</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,581 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/errors.md"><div class="prose"><h1 id="errors--error-handling--exit-control">errors — error handling &amp; exit control</h1>
+<p>Mix has one error channel and three ways to use it: <strong>catch</strong> an error and recover
+(<code>try … catch $e … end</code>), <strong>raise</strong> one deliberately (<code>die</code>), or <strong>stop the whole
+process</strong> (<code>exit</code>, or the uncatchable <code>panic</code>). <code>exit</code> first unwinds active
+<code>finally</code> cleanup; <code>panic</code> aborts past it. Command failures are split two ways
+on purpose — <code>run</code> <em>raises</em> (catch it or it kills the script), while <code>run_rc</code>
+<em>returns a status map</em> you branch on. The parser and evaluator have resource caps
+(nesting, recursion) that turn a runaway script into a <strong>clean, catchable error</strong>
+instead of a native crash.</p>
+<p>Mental model: when you <code>catch $e</code>, <code>$e</code> is the <strong>message string</strong> — unchanged since
+the beginning. Since 0.29.0 every runtime error ALSO carries a structured payload
+(a stable <code>code</code>, optional <code>details</code> map, and a call traceback); bind it with the
+optional second catch variable — <code>catch $msg, $err</code> — and raise your own with
+<code>raise(code, message[, details])</code>. Since 0.30.0 a <code>finally</code> clause runs on every
+exit path. There is no exception hierarchy.</p>
+<h2 id="the-two-kinds-of-failure">The two kinds of failure</h2>
+<table><thead><tr><th></th><th>Raised by</th><th>Catchable by <code>try</code>?</th><th>Exit code if uncaught</th></tr></thead><tbody>
+<tr><td><strong><code>die</code> error</strong></td><td><code>die "msg"</code>, <code>run(...)</code> on non-zero exit or timeout</td><td><strong>yes</strong></td><td>1</td></tr>
+<tr><td><strong>runtime error</strong></td><td>unbound <code>$var</code>, bad builtin arg, recursion cap, division/modulo by zero, <code>ssh_must(...)</code> on failure</td><td><strong>yes</strong></td><td>1</td></tr>
+<tr><td><strong>lexer / parse error</strong></td><td>bad syntax (a misplaced <code>;</code> inside an expression, missing operand, nesting cap)</td><td><strong>no</strong> — fails before any code runs</td><td>1</td></tr>
+<tr><td><strong><code>panic(...)</code></strong></td><td>the <code>panic</code> builtin only</td><td><strong>no</strong> — aborts the process (see <a href="/mix/errors#panic--the-uncatchable-abort">§ panic</a>)</td><td>101 (Rust panic abort)</td></tr>
+<tr><td><strong><code>exit(code)</code></strong></td><td>the <code>exit</code> builtin</td><td><strong>no</strong> — it <em>is</em> the exit</td><td><code>code</code></td></tr>
+</tbody></table>
+<p>The dividing line: <code>try</code> catches the two errors that happen <strong>while your code is
+running</strong> (<code>die</code> and runtime errors). A <strong>syntax</strong> error is detected at parse time —
+before the first statement executes — so no <code>try</code> can wrap it. <code>exit</code> and <code>panic</code>
+are not errors at all and cannot land in <code>catch</code>: <code>exit</code> is an interpreter control
+signal that runs <code>finally</code> while unwinding to the process boundary; <code>panic</code> aborts.</p>
+<h2 id="structured-errors-codes--tracebacks-0290">Structured errors, codes &amp; tracebacks (0.29.0)</h2>
+<p>Every catchable error carries a structured payload. <code>catch $msg, $err</code> binds it —
+<code>$msg</code> stays the plain message string, <code>$err</code> is a map:</p>
+<pre><code class="language-mix">try
+  raise("VALIDATION_REQUIRED", "node is required", {field: "node"})
+catch $msg, $err
+  print($err.code)             -- VALIDATION_REQUIRED
+  print($err.message)          -- node is required
+  print($err.details.field)    -- node
+  print(length($err.frames))   -- call traceback, outermost first
+end
+</code></pre>
+<ul>
+<li><code>$err.code</code> — a stable <code>UPPER_SNAKE</code> identifier. Legacy errors surface as <code>RUNTIME_ERROR</code> (generic runtime failures) and <code>USER_DIE</code> (<code>die</code>, plus <code>run</code> non-zero/timeout today). Emitted today: <code>NAME_UNDEFINED</code>, <code>FUNCTION_UNDEFINED</code>, <code>CAPABILITY_DENIED</code>, <code>TYPE_MISMATCH</code>/<code>OPTION_INVALID</code> (argument validation), <code>VALUE_OUT_OF_RANGE</code> (a typed value outside a backend's representable domain), <code>TOML_UNREPRESENTABLE</code> (<code>toml_encode</code>, with <code>{path,type}</code> details), the <code>PROCESS_*</code> family (<code>run_argv</code>/<code>run_argv_must</code>), the <code>PIPELINE_*</code> family (<code>run_pipeline</code>/<code>run_pipeline_must</code>), the <code>VALIDATION_*</code> family (<code>validate</code> and friends), and <code>IO_BROKEN_PIPE</code>/<code>IO_WRITE_FAILED</code> (<code>write_stdout</code>/<code>write_stderr</code> and their <code>print_raw</code>/<code>eprint_raw</code> aliases — see <a href="/mix/io#a-failed-write-raises--the-one-difference-from-print">io</a>; <code>print</code>/<code>printf</code> still discard write errors). The <code>SSH_*</code>/<code>HTTP_*</code> families are reserved and roll out as those builtins migrate (0.29–0.30); until then ssh/http failures surface as <code>RUNTIME_ERROR</code>/<code>USER_DIE</code>. Codes are stable identifiers, never reused; scripts may define their own.</li>
+<li><code>$err.message</code> — the same string <code>$msg</code> binds.</li>
+<li><code>$err.details</code> — an operation-specific map (<code>nil</code> when the error carries none).</li>
+<li><code>$err.cause</code> — a nested error map, or <code>nil</code> (used by wrapping layers).</li>
+<li><code>$err.frames</code> — the call traceback, a list of <code>{kind, function, file, line, column}</code> maps, outermost-to-innermost with the failure site last. <code>kind</code> is <code>"script"</code> or <code>"builtin"</code>. Frames cover the standard call path; the numeric fast paths contribute no frames, and <code>column</code> is always <code>nil</code> today.</li>
+</ul>
+<p><code>PROCESS_STDIO</code> means <code>run_argv</code> could not set up a requested
+<code>stdin</code>/<code>stdout</code>/<code>stderr</code> destination before spawning the child — opening or
+creating a route file, or creating the pipe/descriptor a <code>stderr: "stdout"</code>
+merge needs. <code>run_argv</code> encodes it in
+the returned process_result (<code>ok: false</code>, <code>exit_code: nil</code>); <code>run_argv_must</code>
+raises the same code with that result under <code>$err.details.result</code>. The child is
+not spawned after this setup failure. No route is truncated until all routes
+have opened; truncation itself is not transactional, so a later truncation
+failure can leave an earlier route truncated. A deadline expiring while an
+input FIFO waits for a writer is also <code>PROCESS_STDIO</code>; Mix wakes and reaps the
+open worker before returning, so repeated failures do not leak blocked threads.</p>
+<p>Capture abandonment is a deadline/interrupt cleanup outcome, not a
+<code>PROCESS_IO</code> error. The returned captured prefix is marked truncated, and an
+abandoned <code>stream: true</code> reader stops teeing before the call returns; an
+already-blocked parent-stream write can delay that return. With <code>timeout: 0</code>,
+normal completion waits for capture EOF and for any stdin-data writer, rather
+than abandoning either worker. Late descendant output is returned untruncated;
+a descendant retaining stdin without reading can make the explicit no-deadline
+call wait indefinitely.</p>
+<p>The pipeline family is distinct because a pipeline can fail in a middle stage
+while its final stage exits 0. The codes split by which builtin can produce
+them, exactly as <code>PROCESS_*</code> does.</p>
+<p><strong>Returned in the pipeline_result</strong> (<code>ok: false</code>, <code>error_code</code> set) by
+<code>run_pipeline</code>, and raised with that same result under <code>$err.details.result</code> by
+<code>run_pipeline_must</code> — these are setup/lifecycle failures, never ordinary
+command failure:</p>
+<ul>
+<li><code>PIPELINE_STDIO</code> — a requested stdin/stdout/stderr file or pipe could not be
+opened or created. Every stage's routes and every pipeline/capture pipe are
+prepared before any stage is spawned, so this code means no stage ran. No
+route is truncated until the full set has opened, but the later truncation
+pass is not transactional.</li>
+<li><code>PIPELINE_SPAWN</code> — a stage could not be spawned. If earlier stages had
+already started, <code>.stages</code> contains their reaped outcomes; captured stderr
+abandoned during that cleanup is empty and marked truncated.</li>
+<li><code>PIPELINE_IO</code> — writing pipeline stdin or draining captured output failed.</li>
+<li><code>PIPELINE_INTERNAL</code> — process polling, waiting, or a pipeline worker failed.</li>
+</ul>
+<p><strong>Raised only by <code>run_pipeline_must</code>.</strong> <code>run_pipeline</code> reports these outcomes as
+data — <code>ok</code>, <code>exit_code</code>, <code>signal</code>, <code>timed_out</code>, <code>interrupted</code>,
+<code>stdout_truncated</code>/<code>stderr_truncated</code> — and leaves <code>error_code</code> nil:</p>
+<ul>
+<li><code>PIPELINE_EXIT_NONZERO</code> — at least one stage exited non-zero.</li>
+<li><code>PIPELINE_SIGNAL</code> — a stage was signal-killed and was not an accepted
+non-final SIGPIPE.</li>
+<li><code>PIPELINE_TIMEOUT</code> — the whole-pipeline deadline expired.</li>
+<li><code>PIPELINE_INTERRUPTED</code> — Ctrl-C interrupted the pipeline.</li>
+<li><code>PIPELINE_OUTPUT_LIMIT</code> — a captured stream exceeded <code>max_output</code>.</li>
+</ul>
+<p><code>raise(code, message[, details])</code> raises a catchable structured error. The code
+must match <code>[A-Z][A-Z0-9]*(_[A-Z0-9]+)*</code> and <code>details</code> must be a map when given.</p>
+<p>An <strong>uncaught</strong> error that crossed a function or builtin boundary prints a
+traceback to stderr (exit 1, as before):</p>
+<pre><code class="language-text">Traceback (most recent call last):
+  at &lt;main&gt; (/path/job.mix:7)
+  at provision (/path/job.mix:2)
+  at connect (/path/job.mix:5)
+  at &lt;builtin:raise&gt; (/path/job.mix:5)
+SSH_TIMEOUT: remote operation exceeded 60 seconds
+</code></pre>
+<p><code>mix --no-traceback script.mix</code> restores the legacy single-line rendering
+(<code>Runtime error at file:line: message</code>); errors that never crossed a function
+boundary render single-line either way, so shallow scripts and stderr scrapers
+are unaffected. Deep stacks elide the middle frames in the <em>rendering</em> only —
+<code>$err.frames</code> always holds the full list.</p>
+<p>One field-name note: <code>$err.frames[0].function</code> works — <code>function</code> is accepted in
+field position since 0.29.0 (<code>fn</code> reads the same field; map-literal and
+strict-data keys still require quoting <code>"function"</code>).</p>
+<h3 id="errors-that-teach-0790">Errors that teach (0.79.0)</h3>
+<p>Four cheap additions turn a runtime failure from a statement of what is wrong
+into a pointer at the fix. All are display/message enrichments — <code>$err.code</code>
+and the traceback shape are unchanged, so catch-based scripts and scrapers see
+the same structure.</p>
+<ul>
+<li>
+<p><strong><code>FUNCTION_UNDEFINED</code> suggests a name.</strong> A typo resolves to the nearest
+builtin or in-scope user function (edit distance ≤ 2, tightening to ≤ 1 for
+short names): <code>undefined function 'lenght' — did you mean 'length'?</code>. The
+same applies to <code>NAME_UNDEFINED</code> for a <code>$variable</code> read, suggesting the
+nearest name in scope.</p>
+</li>
+<li>
+<p><strong>Deleted builtins name their replacement.</strong> Calling a name removed by a
+release — the five pattern-first regex/grep names deleted in 0.73.0, and any
+future removal — reports the rename rather than a bare "undefined":
+<code>undefined function 'grep' — deleted in mix 0.73.0; use grep_lines(text, pattern)</code>.
+This is the same table that drives the <code>MIX-D3001</code>–<code>D3005</code> lint notes, so
+authoring-time and run-time guidance cannot drift.</p>
+</li>
+<li>
+<p><strong>Builtin refusals point at the manual.</strong> A builtin's <em>coded</em> contract
+violation or refusal (a <code>TYPE_MISMATCH</code>, <code>OPTION_INVALID</code>, <code>VALIDATION_*</code>,
+… — not an arity error, not a bare <code>raise</code>/<code>die</code>) ends with a pointer to the
+page that documents it: <code>OPTION_INVALID hash_sha256(): unknown option 'rawr' (only 'raw' is accepted) (see: mix man system)</code>. Read the whole page with
+<code>mix man &lt;topic&gt;</code>.</p>
+</li>
+<li>
+<p><strong>The offending source line prints under the error.</strong> An uncaught error whose
+failure site is in the top-level source (a <code>-c</code> body or the script file) shows
+that line beneath it, rustc-style — rendered from the exact bytes that ran, so
+it is never stale:</p>
+<pre><code class="language-text">Runtime error at job.mix:2: undefined variable '$y' — did you mean '$x'?
+  2 | print($y)
+</code></pre>
+<p>A failure inside an imported module (a different file) prints no line rather
+than risk a stale disk read.</p>
+</li>
+</ul>
+<h2 id="try--catch--recover-from-a-failure">try … catch — recover from a failure</h2>
+<pre><code class="language-mix">try
+  die("boom: something failed")
+catch $e
+  print("caught: " .. $e)
+end
+print("after")
+</code></pre>
+<pre><code class="language-text">caught: boom: something failed
+after
+</code></pre>
+<p><code>catch $e</code> binds the <strong>message string</strong> to <code>$e</code>. The block closes with <code>end</code> (no
+<code>do</code>; statements use newline or <code>;</code> separators). A <code>catch</code> clause is
+<strong>mandatory</strong>: a bare <code>try … end</code> is a parse error.</p>
+<pre><code class="language-mix">try
+  print("hi")
+end
+</code></pre>
+<pre><code class="language-text">Parse error at line 3:1: unexpected token End
+</code></pre>
+<h3 id="it-also-catches-runtime-errors">It also catches runtime errors</h3>
+<p>Not just <code>die</code> — any runtime error (an unbound variable, a bad builtin argument)
+is caught by the same <code>catch</code>:</p>
+<pre><code class="language-mix">try
+  print($nope)
+catch $e
+  print("caught: " .. $e)
+end
+</code></pre>
+<pre><code class="language-text">caught: undefined variable '$nope'
+</code></pre>
+<pre><code class="language-mix">try
+  sqrt("hello")
+catch $e
+  print("caught: " .. $e)
+end
+</code></pre>
+<pre><code class="language-text">caught: sqrt() expects a number, got string
+</code></pre>
+<h3 id="e-is-a-string-not-an-object"><code>$e</code> is a string, not an object</h3>
+<p>There is no <code>$e.message</code> / <code>$e.code</code> — <code>$e</code> <em>is</em> the message. Use it with <code>..</code>
+concat, <code>contains()</code>, <code>split()</code>, or any <a href="/mix/strings">string</a> builtin:</p>
+<pre><code class="language-mix">try
+  die("disk full: /var")
+catch $e
+  if contains($e, "disk full") then
+    print("handling disk-full path")
+  end
+end
+</code></pre>
+<pre><code class="language-text">handling disk-full path
+</code></pre>
+<p>This holds even when <code>die</code> is given a non-string: the argument is <strong>stringified</strong>
+at the raise. <code>die(42)</code> catches as the <em>string</em> <code>"42"</code> (<code>length($e)</code> is 2), and
+<code>die({code: 7})</code> catches as the map's repr text — <code>$e["code"]</code> fails with <em>cannot
+index string with string</em>. If you want structured error data, put it <em>in</em> the
+message yourself (e.g. a JSON string) and <code>json_parse($e)</code> in the catch — Mix
+won't do it for you.</p>
+<h3 id="catch-e-is-a-function-local-binder"><code>catch $e</code> is a function-local binder</h3>
+<p>Inside a function, <code>catch $e</code> binds <code>$e</code> <strong>locally</strong> — it shadows, and cannot
+clobber, a same-named caller/global variable (the same rule as loop vars and
+parameters — see <a href="/mix/functions">functions</a>):</p>
+<pre><code class="language-mix">$e = "outer"
+function risky()
+  try
+    die("inside")
+  catch $e
+    print("local e: " .. $e)
+  end
+end
+risky()
+print("outer e still: " .. $e)
+</code></pre>
+<pre><code class="language-text">local e: inside
+outer e still: outer
+</code></pre>
+<h3 id="finally--cleanup-that-always-runs-0300"><code>finally</code> — cleanup that always runs (0.30.0)</h3>
+<p>A <code>finally</code> clause runs on <strong>every</strong> exit path of the <code>try</code>: normal completion, a
+caught error, and a <em>propagating</em> error, <code>return</code>, <code>break</code>, or <code>continue</code>. It is
+the right place for cleanup that must happen whether or not the work succeeded
+(remove a temp file, unmount, release a lock). <code>catch</code> is optional when <code>finally</code>
+is present — a <code>try … finally … end</code> runs the finally body, then lets the error
+propagate. At least one of <code>catch</code>/<code>finally</code> must be present.</p>
+<pre><code class="language-mix">function provision($tmp)
+  try
+    do_work($tmp)          -- may die
+    return "ok"
+  finally
+    remove($tmp)           -- runs on success, on die, and on the return
+  end
+end
+</code></pre>
+<p><code>finally</code> runs after any <code>catch</code> body, on <code>return</code>/<code>break</code>/<code>continue</code> out of the
+<code>try</code>, on an uncaught error, and while <code>exit()</code> unwinds towards the process
+boundary. Nested cleanup runs innermost-to-outermost. Only <code>panic()</code>, SIGKILL, or
+another process-level abort bypasses it.</p>
+<p>Control replacement follows one rule: an outcome produced by <code>finally</code> overrides
+the outcome that entered it. A later/inner <code>exit(9)</code> therefore replaces a pending
+<code>exit(2)</code>. If <code>finally</code> raises while an exit is pending, the cleanup error wins and
+is catchable by an outer <code>try</code>; the exit is not stored as <code>$err.cause</code> because an
+exit request is control flow, not an error payload. When both outcomes are errors,
+the displaced error remains available as <code>cause</code> (readable via
+<code>catch $msg, $err</code> → <code>$err.cause</code>), so a cleanup failure never silently hides the
+error it replaced.</p>
+<h3 id="nested-try-and-re-raising">Nested try and re-raising</h3>
+<p>A <code>catch</code> body can <code>die</code> again; the next enclosing <code>try</code> catches it. There is no
+<code>rethrow</code> keyword — just <code>die($e)</code> (or a new message):</p>
+<pre><code class="language-mix">try
+  try
+    die("inner")
+  catch $e
+    print("inner caught: " .. $e)
+    die("rethrown: " .. $e)
+  end
+catch $outer
+  print("outer caught: " .. $outer)
+end
+</code></pre>
+<pre><code class="language-text">inner caught: inner
+outer caught: rethrown: inner
+</code></pre>
+<blockquote>
+<p><strong><code>return</code> / <code>break</code> / <code>continue</code> / <code>exit</code> are not errors.</strong> They unwind through
+a <code>try</code> without being caught. A <code>return</code> inside a <code>try</code> body returns from the
+enclosing function; <code>exit()</code> continues through every enclosing <code>finally</code> and is
+consumed only by the process boundary.</p>
+</blockquote>
+<h2 id="die--raise-a-catchable-error">die — raise a catchable error</h2>
+<p><code>die</code> is a statement that takes an expression (parentheses optional). Uncaught, it
+prints the message to <strong>stderr</strong> and exits <strong>1</strong>:</p>
+<pre><code class="language-mix">print("one")
+die("stop here")
+print("two")
+</code></pre>
+<pre><code class="language-text">one
+stop here
+exit=1
+</code></pre>
+<p>Both call styles work and are equivalent:</p>
+<pre><code class="language-mix">die("with parens")
+die "no parens"
+</code></pre>
+<p>The message is any expression — build it with <code>..</code>:</p>
+<pre><code class="language-mix">$code = 42
+die("exit code " .. $code)
+</code></pre>
+<p>Use <code>die</code> for <strong>must-succeed</strong> steps where you want fail-fast rather than a status
+check — and wrap the section in <code>try</code> if a caller should recover:</p>
+<pre><code class="language-mix">try
+  run("install -m 0755 src dst")   -- run() dies on non-zero exit
+  print("installed")
+catch $e
+  print("install failed: " .. $e)
+end
+</code></pre>
+<h2 id="run-vs-run_rc--the-two-command-failure-styles">run vs run_rc — the two command-failure styles</h2>
+<p>This is the most important practical distinction. See <a href="/mix/system">running commands</a> for
+the full surface; here is the error angle.</p>
+<p><strong><code>run(cmd)</code></strong> returns stdout as a string and <strong>raises a catchable <code>die</code></strong> on a
+non-zero exit — fail-fast:</p>
+<pre><code class="language-mix">try
+  run("false")
+catch $e
+  print("run died: " .. $e)
+end
+</code></pre>
+<pre><code class="language-text">run died: run: 'false' failed (rc=1)
+</code></pre>
+<p>When the failed command wrote to stderr, <code>run</code>'s message appends a stderr tail:
+<code>run: 'ls /no/such/path' failed (rc=2): ls: cannot access '/no/such/path': No such file or directory</code> — so the caught <code>$e</code> usually already says <em>why</em>.</p>
+<p><strong><code>run_rc(cmd)</code></strong> <strong>never raises</strong> — it returns a map
+<code>{rc, stdout, stderr, timed_out, interrupted}</code> you branch on. The exit code is
+<em>data</em>, not <code>$?</code> soup:</p>
+<pre><code class="language-mix">$r = run_rc("false")
+print("rc=" .. $r.rc)
+if $r.rc != 0 then
+  print("command failed, continuing")
+end
+</code></pre>
+<pre><code class="language-text">rc=1
+command failed, continuing
+</code></pre>
+<p><code>run_rc</code> also captures stderr, so you can log <em>why</em> it failed without aborting:</p>
+<pre><code class="language-mix">$r = run_rc("ls /no/such/path")
+print("rc=" .. $r.rc)
+print("stderr=" .. trim($r.stderr))
+</code></pre>
+<pre><code class="language-text">rc=2
+stderr=ls: cannot access '/no/such/path': No such file or directory
+</code></pre>
+<h3 id="timeouts-ctrl-c-and-signals">Timeouts, Ctrl-C, and signals</h3>
+<p>Both <code>run</code> and <code>run_rc</code> take an optional trailing <code>{timeout: seconds}</code> opts map.
+The default is <code>0</code> = <strong>no deadline</strong> (the historic contract for long builds); a
+bounded call is killed at the deadline (own process group, SIGKILL path — it can
+never wedge the shell). Each failure mode follows the split above — <code>run</code> raises,
+<code>run_rc</code> reports:</p>
+<table><thead><tr><th>Event</th><th><code>run</code></th><th><code>run_rc</code></th></tr></thead><tbody>
+<tr><td>deadline hit</td><td>dies (catchable): <code>run: 'sleep 5' timed out after 1s</code></td><td>returns <code>rc: -1, timed_out: true</code></td></tr>
+<tr><td>Ctrl-C during the child</td><td>raises <code>run: interrupted</code></td><td>returns <code>rc: -2, interrupted: true</code></td></tr>
+<tr><td>child killed by a signal</td><td>dies: <code>run: '…' failed (rc=143)</code></td><td><code>rc</code> = shell-convention <strong>128+sig</strong> (SIGTERM → 143)</td></tr>
+</tbody></table>
+<pre><code class="language-mix">$r = run_rc("sleep 30", {timeout: 5})
+if $r.timed_out then
+  print("gave up after 5s")
+end
+</code></pre>
+<p>Two things to know about the sentinels: the <strong>negative</strong> <code>rc</code> values (<code>-1</code>
+timeout, <code>-2</code> interrupt) can never collide with a real child exit (<code>0..255</code>,
+including <code>128+sig</code>); and an <strong>interrupt is a stop request, not a recoverable
+error</strong> — after Ctrl-C the interpreter winds the script down and the process
+exits cleanly (0), so don't build recovery logic on catching <code>run: interrupted</code>
+or branching on <code>.interrupted</code> (later statements may not run).</p>
+<p>The opts map is validated loudly (and catchably): an unknown key raises
+<code>run_rc: unknown opt "bogus" (supported: timeout)</code>, and a surplus argument raises
+<code>run() expects at most 2 argument(s), got 3</code> — a misplaced opts map errors instead
+of running unbounded.</p>
+<p><strong>Choosing:</strong> loop over many commands and keep going → <code>run_rc</code> + <code>.rc</code> branch. One
+step that <em>must</em> succeed before the next → <code>run</code> inside a <code>try</code> (or let it abort).</p>
+<pre><code class="language-mix">$cmds = ["true", "false", "true"]
+for each $c in $cmds
+  $r = run_rc($c)
+  if $r.rc == 0 then
+    print($c .. " ok")
+  else
+    print($c .. " FAILED rc=" .. $r.rc)
+  end
+end
+</code></pre>
+<pre><code class="language-text">true ok
+false FAILED rc=1
+true ok
+</code></pre>
+<p>The same split exists for SSH: <strong><code>ssh_run</code></strong> returns a map (with <code>.ok</code>,
+<code>.exit_code</code>, <code>.timed_out</code>, <code>.interrupted</code>) and never raises; <strong><code>ssh_must</code></strong>
+returns the stdout string and raises a catchable Mix error on any non-success —
+non-zero exit, timeout, interrupt, or signal — with the host, disposition, and
+exit code in the message (<code>ssh_must: &lt;what&gt; on &lt;host&gt; (exit_code=N): &lt;stderr&gt;</code>).
+See <a href="/mix/remote">remote execution</a> and <code>mix what ssh_run</code> / <code>mix what ssh_must</code>.</p>
+<h2 id="exit--stop-the-process-with-a-code">exit — stop the process with a code</h2>
+<p><code>exit(code)</code> requests process termination with that status. <code>exit()</code> defaults to
+0. It is <strong>not</strong> an error and <strong>not</strong> catchable: execution immediately unwinds
+through every active <code>finally</code> block, innermost first, then the script, <code>-c</code>, stdin,
+REPL, or serve entrypoint terminates with the requested code. Ordinary statements
+after the call never run:</p>
+<pre><code class="language-mix">print("before exit")
+exit(3)
+print("never")
+</code></pre>
+<pre><code class="language-text">before exit
+exit=3
+</code></pre>
+<p><code>exit</code> is for <em>deliberate</em> control-flow termination (a CLI tool reporting a status
+to its caller). For a <em>failure</em> you want a script-level recovery point to see, use
+<code>die</code> instead — <code>die</code> is catchable, <code>exit</code> is not.</p>
+<p>The same rule applies inside <code>catch</code>: <code>exit()</code> leaves the catch body, runs that
+try's <code>finally</code> if present, then keeps unwinding. An <code>exit()</code> called by a <code>finally</code>
+replaces an earlier pending exit; a cleanup error raised by <code>finally</code> overrides a
+pending exit, as described above.</p>
+<h2 id="panic--the-uncatchable-abort">panic — the uncatchable abort</h2>
+<pre><code class="language-mix">panic("hard abort")   -- aborts via a Rust panic; NOT caught by try
+</code></pre>
+<p><code>panic</code> exists for one narrow purpose: it is the hard-abort primitive that the
+<strong>Bus <code>--serve</code> handler boundary</strong>
+(SPEC 18 §3.4 — formal spec in the operator control repo) is designed to <em>isolate</em>. In
+<code>mix --serve</code>, a panic raised inside an <code>on … end</code> handler is caught by the
+per-handler boundary, its payload sanitized, and the supervisor keeps running — that
+survival is the acceptance gate the boundary proves. <strong>Outside a handler it aborts
+the process like any Rust panic, and <code>try</code> does not catch it</strong> — uncaught, it
+prints a raw <code>thread 'main' panicked at …</code> trace to stderr (not a Mix error line)
+and exits <strong>101</strong>, the Rust panic status. You almost never want <code>panic</code> — reach
+for <code>die</code> (catchable) for ordinary failures. See <a href="/mix/serve">serve mode</a>.</p>
+<h2 id="resource-caps--runaways-become-clean-errors">Resource caps — runaways become clean errors</h2>
+<p>The point of the caps is that a pathological script (or a hostile one in an embedded
+daemon) returns a <strong>clean error</strong> instead of taking down the process with a native
+stack overflow or OOM.</p>
+<h3 id="recursion-depth">Recursion depth</h3>
+<p>The <code>mix</code> binary caps function-call recursion at <strong>128</strong> (the library default for
+embedders is a more conservative 16). Past it you get a catchable runtime error, not
+a SIGSEGV:</p>
+<pre><code class="language-mix">function f($n)
+  return f($n + 1)
+end
+try
+  f(0)
+catch $e
+  print("caught: " .. $e)
+end
+</code></pre>
+<pre><code class="language-text">caught: recursion depth exceeded (limit 128)
+</code></pre>
+<p>Because it is a <em>runtime</em> error, you can catch it — but the right fix is almost
+always to rewrite unbounded recursion as a loop or a <a href="/mix/functions">HOF</a>
+(<code>reduce</code>/<code>map</code>).</p>
+<h3 id="parser-nesting-depth">Parser nesting depth</h3>
+<p>The parser caps expression/statement nesting at <strong>200</strong>. Over-deep nesting
+(<code>((((…</code>, deeply nested <code>if</code>/maps) is a <strong>parse error</strong> — it happens before any code
+runs, so it is <em>not</em> catchable:</p>
+<pre><code class="language-mix">print((((( ... 201 levels ... )))))
+</code></pre>
+<pre><code class="language-text">Parse error at line 1:202: nesting too deep (limit 200)
+</code></pre>
+<p>Other bounded builtins follow the same philosophy — <code>repeat</code>/<code>lpad</code>/<code>rpad</code> reject a
+result over 256 MiB, <code>range</code> over 10M elements, <code>http_*</code> a body over 64 MiB — each a
+normal runtime error rather than an OOM. <code>substr</code> clamps an out-of-range
+length/offset rather than panicking. The <code>http_*</code> builtins also carry a <strong>30-second
+total-request deadline by default</strong> (override with a trailing <code>{timeout: N}</code> opts
+map, <code>{timeout: 0}</code> disables) — a stalled server becomes a catchable error, not a
+wedged script. See <a href="/mix/http">HTTP</a>.</p>
+<h2 id="syntax-errors-are-not-catchable">Syntax errors are not catchable</h2>
+<p>A lexer or parse error is reported before the first statement executes, so wrapping
+it in <code>try</code> does nothing — the whole source fails to compile:</p>
+<pre><code class="language-mix">try
+  $x =
+catch $e
+  print("caught: " .. $e)
+end
+</code></pre>
+<pre><code class="language-text">Parse error at line 2:7: unexpected token Newline
+</code></pre>
+<p>This is about <strong>your</strong> source. Bad syntax in a data file someone else wrote is
+an ordinary runtime condition, and <code>load_data</code> raises it as a catchable
+<code>RuntimeError</code> naming the path — see <a href="/mix/data">data</a>. (Before 0.36.1 it leaked
+the parse error, so a config typo aborted past the <code>catch</code> with exit 1.)</p>
+<p>Semicolons are valid executable-Mix statement separators, so compact error
+handling is legal too:</p>
+<pre><code class="language-text">$ mix -c 'print("a"); print("b")'
+a
+b
+</code></pre>
+<p>A semicolon is not universally legal punctuation: it must follow a complete
+statement at a real statement boundary. <code>print(1; 2)</code>, <code>print((1; 2))</code>, and
+<code>print(1) &amp;&amp;; print(2)</code> are parse errors, and nothing runs. See the authoritative
+<a href="/mix/syntax">statement-separator contract</a>.</p>
+<p>Classification remains whole-line: <code>print(1); echo hi</code> is a Mix parse error,
+not a request to execute half Mix and half shell. On a shell-dispatch line,
+<code>echo a; echo b</code> keeps the shell command-list meaning. See <a href="/mix/overview">overview</a>.</p>
+<h2 id="error-message-anatomy">Error message anatomy</h2>
+<p>Uncaught, each error kind prints a recognisable prefix and exits 1:</p>
+<table><thead><tr><th>Error</th><th>Printed form</th></tr></thead><tbody>
+<tr><td><code>die</code></td><td>the message verbatim, e.g. <code>fatal</code></td></tr>
+<tr><td>runtime</td><td><code>Runtime error at line N: &lt;msg&gt;</code></td></tr>
+<tr><td>parse</td><td><code>Parse error at line N:C: &lt;msg&gt;</code></td></tr>
+<tr><td>lexer</td><td><code>Lexer error at line N:C: &lt;msg&gt;</code></td></tr>
+</tbody></table>
+<pre><code class="language-text">$ mix -c 'die("fatal")'         ; echo $?    →  fatal               1
+$ mix -c 'print($x)'            ; echo $?    →  Runtime error …     1
+$ mix -c '$x ='                 ; echo $?    →  Parse error …       1
+</code></pre>
+<p>When the error comes from a script <strong>file</strong> (rather than <code>mix -c</code>), the runtime
+form names it: <code>Runtime error at /path/script.mix:1: undefined variable '$nope'</code>.</p>
+<p>When caught, <code>$e</code> holds only the human-readable <code>&lt;msg&gt;</code> part (no <code>Runtime error at line N:</code> prefix) — as seen in the examples above (<code>undefined variable '$nope'</code>).</p>
+<h2 id="idioms">Idioms</h2>
+<p><strong>Validate, then fail fast.</strong></p>
+<pre><code class="language-mix">$path = args()[0]
+if is_empty($path) then
+  die("usage: tool &lt;path&gt;")
+end
+</code></pre>
+<p><strong>Try a recoverable step, fall back.</strong></p>
+<pre><code class="language-mix">$cfg = nil
+try
+  $cfg = json_parse(read_file("/etc/app/config.json"))
+catch $e
+  print("no config (" .. $e .. "), using defaults")
+  $cfg = { port: 8080 }
+end
+</code></pre>
+<p><strong>Branch on command status instead of catching.</strong></p>
+<pre><code class="language-mix">if run_rc("systemctl is-active some-service").rc == 0 then
+  print("service up")
+else
+  print("service down")
+end
+</code></pre>
+<p><strong>Bound a command that might hang, branch on the outcome.</strong></p>
+<pre><code class="language-mix">$r = run_rc("curl -s https://example.com/health", {timeout: 10})
+if $r.timed_out then
+  print("health check hung")
+else if $r.rc != 0 then
+  print("health check failed rc=" .. $r.rc)
+end
+</code></pre>
+<p><strong>Aggregate failures across a batch without aborting.</strong></p>
+<pre><code class="language-mix">$failed = []
+for each $host in ["node1", "node2"]
+  $r = ssh_run($host, "uptime")
+  if not $r.ok then
+    push($failed, $host)
+  end
+end
+if not is_empty($failed) then
+  die("hosts unreachable: " .. join($failed, ", "))
+end
+</code></pre>
+<h2 id="gotchas">Gotchas</h2>
+<ul>
+<li><strong><code>catch $e</code> gives a string, not an object</strong> — no <code>.message</code>/<code>.code</code>. Even <code>die(42)</code> / <code>die($map)</code> stringify at the raise. Use string ops on <code>$e</code>.</li>
+<li><strong><code>try</code> requires <code>catch</code> and/or <code>finally</code></strong> — bare <code>try … end</code> is invalid.</li>
+<li><strong><code>run</code> raises, <code>run_rc</code> does not.</strong> Mixing them up is the usual command-handling bug: a <code>run(...)</code> whose failure you forgot to wrap aborts the whole script.</li>
+<li><strong><code>run_rc</code>'s timeout/interrupt sentinels are negative</strong> — <code>rc: -1</code> (timed out) and <code>rc: -2</code> (interrupted) can never collide with a real child exit; a signal-killed child is a real exit, <code>128+sig</code>.</li>
+<li><strong>Bus <code>send</code>/<code>emit</code> failures never raise.</strong> A failed <code>send</code> sets a <strong>negative <code>$rc</code></strong> (<code>-1</code> transport, <code>-2</code> timeout, <code>-3</code> no broker) and the statement returns nil; a peer error is <code>$rc &gt;= 10</code>; <code>emit</code> is silently fire-and-forget. Delivery status is data, not an exception — see <a href="/mix/bus">Bus messaging</a>.</li>
+<li><strong>Syntax errors can't be caught</strong> — they fail at parse time. Only <code>die</code> and runtime errors reach <code>catch</code>.</li>
+<li><strong><code>exit</code> and <code>panic</code> are not catchable.</strong> <code>exit</code> unwinds <code>finally</code> and then ends with your code; <code>panic</code> aborts past <code>finally</code> with the Rust panic status 101 (only meaningful behind the <code>--serve</code> handler boundary).</li>
+<li><strong>Newline or <code>;</code> separates statements</strong> — comments still own the rest of their physical line, so a <code>;</code> inside <code>--</code>/<code>#</code> does not resume execution.</li>
+<li><strong><code>return</code>/<code>break</code>/<code>continue</code> propagate through <code>try</code></strong> uncaught — they are control flow, not errors.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/system">running commands</a> — <code>run</code> / <code>run_rc</code> / <code>run_stream</code>, the structured-return model</li>
+<li><a href="/mix/remote">remote execution</a> — <code>ssh_run</code> / <code>ssh_must</code> / <code>ssh_mix</code>, the same raise-vs-report split over SSH</li>
+<li><a href="/mix/functions">functions</a> — <code>return</code>, recursion, function-local binders (incl. <code>catch $e</code>)</li>
+<li><a href="/mix/strings">strings</a> — operating on the caught <code>$e</code> message</li>
+<li><a href="/mix/bus">Bus messaging</a> — the <code>$rc</code> band contract: send failures are data, never exceptions</li>
+<li><a href="/mix/serve">serve mode</a> — the <code>--serve</code> per-handler boundary that isolates a <code>panic</code></li>
+<li><a href="/mix/overview">overview</a> — Mix vs shell, the <code>mix -c</code> classifier, statement separation</li>
+<li><a href="/mix/builtins">builtins index</a> — every builtin by category</li>
+<li><code>mix what die</code> · <code>mix what exit</code> · <code>mix what panic</code> · <code>mix what run</code> · <code>mix what run_rc</code> — one-line live help</li>
+<li><a href="https://github.com/markc/cosmix">Mix on GitHub</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1193,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1247,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1376,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

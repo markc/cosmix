@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-indexd/verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,125 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-indexd/verbs.md"><div class="prose"><h1 id="cosmix-indexd-verbs">cosmix-indexd verbs</h1>
+<p>This page describes the JSON operation surface shared by Bus and the local Unix socket.</p>
+<p>For Bus, call service <code>indexd</code> with a command such as <code>indexd.search</code>. The command arguments become the request object.</p>
+<p>For the Unix socket, send one JSON object per line and include <code>"action":"search"</code>. The action names below are the values accepted by that field.</p>
+<p>All responses are JSON. Failures have the form:</p>
+<pre><code class="language-json">{"error":"description"}
+</code></pre>
+<h2 id="embed"><code>embed</code></h2>
+<p>Produces one 768-element embedding for each input text.</p>
+<p>Request fields:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>texts</code></td><td>array of strings</td><td style="text-align: right">yes</td><td>Texts to embed, in result order.</td></tr>
+<tr><td><code>prefix</code></td><td>string</td><td style="text-align: right">no</td><td>Task prefix. Defaults to <code>search_document: </code>.</td></tr>
+</tbody></table>
+<p>Response fields:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>embeddings</code></td><td>array of number arrays</td><td>L2-normalised vectors in input order.</td></tr>
+</tbody></table>
+<p>At most 256 texts are accepted.</p>
+<h2 id="store"><code>store</code></h2>
+<p>Embeds and stores text chunks.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>texts</code></td><td>array of strings</td><td style="text-align: right">yes</td><td>Chunk content.</td></tr>
+<tr><td><code>source</code></td><td>string</td><td style="text-align: right">no</td><td>Configured source type. Defaults to an empty string.</td></tr>
+<tr><td><code>metadata</code></td><td>array of strings</td><td style="text-align: right">no</td><td>JSON strings aligned by index with <code>texts</code>. Missing entries become empty metadata.</td></tr>
+</tbody></table>
+<p>The response contains <code>stored</code>, <code>duplicates</code>, and <code>ids</code>. Exact duplicates use the source-and-content hash, return the existing identifier, and may update metadata.</p>
+<p>Non-empty metadata is parsed as JSON. For a non-empty source, the configured source-type policy controls required fields and any date field.</p>
+<p>At most 256 texts are accepted.</p>
+<h2 id="search"><code>search</code></h2>
+<p>Embeds a query with the <code>search_query: </code> prefix and performs nearest-neighbour search.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>query</code></td><td>string</td><td style="text-align: right">yes</td><td>Search text.</td></tr>
+<tr><td><code>limit</code></td><td>integer</td><td style="text-align: right">no</td><td>Neighbour count passed to <code>sqlite-vec</code>. Defaults to 10.</td></tr>
+<tr><td><code>source</code></td><td>string</td><td style="text-align: right">no</td><td>Exact source filter. Empty means all sources.</td></tr>
+<tr><td><code>metadata_filter</code></td><td>array</td><td style="text-align: right">no</td><td>JSON metadata comparisons.</td></tr>
+</tbody></table>
+<p>Each metadata filter contains:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>field</code></td><td>string</td><td>Metadata field appended to the JSON path.</td></tr>
+<tr><td><code>op</code></td><td>string</td><td><code>eq</code>, <code>gt</code>, <code>lt</code>, <code>gte</code>, <code>lte</code>, or <code>contains</code>.</td></tr>
+<tr><td><code>value</code></td><td>JSON value</td><td>Comparison value. <code>contains</code> uses the string value as a substring pattern.</td></tr>
+</tbody></table>
+<p>At most 32 metadata filters are accepted.</p>
+<p>The response contains <code>results</code>. Each result includes <code>id</code>, <code>content</code>, <code>source</code>, <code>metadata</code>, <code>distance</code>, <code>feedback_score</code>, <code>retrieval_count</code>, <code>created</code>, and, when set, <code>last_retrieved</code>.</p>
+<p>Search excludes superseded chunks. Returning a result increments its retrieval count and updates its last-retrieved time.</p>
+<h2 id="update"><code>update</code></h2>
+<p>Changes selected fields on one chunk.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>integer</td><td style="text-align: right">yes</td><td>Chunk identifier.</td></tr>
+<tr><td><code>content</code></td><td>string or null</td><td style="text-align: right">no</td><td>Replacement content. The daemon computes and stores a new vector.</td></tr>
+<tr><td><code>metadata</code></td><td>string or null</td><td style="text-align: right">no</td><td>Replacement metadata string.</td></tr>
+<tr><td><code>source</code></td><td>string or null</td><td style="text-align: right">no</td><td>Replacement source.</td></tr>
+</tbody></table>
+<p>The response contains <code>updated</code> and <code>re_embedded</code>. Supplying no changes returns <code>updated: false</code>.</p>
+<h2 id="delete"><code>delete</code></h2>
+<p>Deletes chunks and their corresponding vector rows in one transaction.</p>
+<pre><code class="language-json">{"action":"delete","ids":[41,42]}
+</code></pre>
+<p>The response contains the number of chunk rows deleted.</p>
+<h2 id="list"><code>list</code></h2>
+<p>Lists chunks in descending creation order.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>source</code></td><td>string</td><td style="text-align: right">no</td><td>Exact source filter. Empty means all sources.</td></tr>
+<tr><td><code>limit</code></td><td>integer</td><td style="text-align: right">no</td><td>Page size. Defaults to 10.</td></tr>
+<tr><td><code>offset</code></td><td>integer</td><td style="text-align: right">no</td><td>Row offset. Defaults to 0.</td></tr>
+</tbody></table>
+<p>The response contains <code>items</code> and <code>total</code>. Each item contains <code>id</code>, <code>content</code>, <code>source</code>, <code>metadata</code>, and <code>created</code>.</p>
+<h2 id="feedback"><code>feedback</code></h2>
+<p>Adjusts a chunk's relevance score.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>integer</td><td style="text-align: right">yes</td><td>Chunk identifier.</td></tr>
+<tr><td><code>useful</code></td><td>boolean</td><td style="text-align: right">yes</td><td>Adds one when true and subtracts one when false.</td></tr>
+</tbody></table>
+<p>The response returns <code>ok</code>, <code>id</code>, and the new <code>feedback_score</code>.</p>
+<h2 id="supersede"><code>supersede</code></h2>
+<p>Marks an older chunk as replaced by a newer chunk.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>old_id</code></td><td>integer</td><td style="text-align: right">yes</td><td>Chunk to hide from normal search.</td></tr>
+<tr><td><code>new_id</code></td><td>integer</td><td style="text-align: right">yes</td><td>Existing replacement chunk.</td></tr>
+<tr><td><code>reason</code></td><td>string</td><td style="text-align: right">no</td><td>Human-readable reason written to the log.</td></tr>
+</tbody></table>
+<p>The old chunk remains stored for audit or rollback. The operation rejects self-supersession and a missing <code>new_id</code>.</p>
+<h2 id="stale"><code>stale</code></h2>
+<p>Reports cleanup candidates in three independent buckets.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th style="text-align: right">Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>source</code></td><td>string</td><td style="text-align: right">no</td><td style="text-align: right">empty</td><td>Exact source filter.</td></tr>
+<tr><td><code>never_retrieved_age_days</code></td><td>integer</td><td style="text-align: right">no</td><td style="text-align: right">90</td><td>Minimum age for a never-retrieved chunk.</td></tr>
+<tr><td><code>low_value_min_retrievals</code></td><td>integer</td><td style="text-align: right">no</td><td style="text-align: right">3</td><td>Retrieval threshold for a non-positive-feedback chunk.</td></tr>
+<tr><td><code>long_dormant_days</code></td><td>integer</td><td style="text-align: right">no</td><td style="text-align: right">180</td><td>Minimum time since last retrieval.</td></tr>
+<tr><td><code>per_bucket_limit</code></td><td>integer</td><td style="text-align: right">no</td><td style="text-align: right">50</td><td>Maximum rows returned in each bucket.</td></tr>
+</tbody></table>
+<p>The response contains <code>never_retrieved_old</code>, <code>low_value</code>, <code>long_dormant</code>, and <code>total_chunks</code>. Candidate rows include a content preview and, when present in metadata, path and filename.</p>
+<h2 id="index_file"><code>index_file</code></h2>
+<p>Indexes a Markdown file as independently searchable sections.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>path</code></td><td>string</td><td style="text-align: right">yes</td><td>Path used for reading and metadata.</td></tr>
+<tr><td><code>content</code></td><td>string or null</td><td style="text-align: right">no</td><td>Caller-supplied content. When present, the daemon does not read the path.</td></tr>
+<tr><td><code>source</code></td><td>string</td><td style="text-align: right">no</td><td>Explicit source. Otherwise inferred as <code>doc</code> or <code>journal</code>.</td></tr>
+<tr><td><code>domain</code></td><td>string</td><td style="text-align: right">no</td><td>Explicit domain. Otherwise resolved from domains settings, then <code>general</code>.</td></tr>
+<tr><td><code>background</code></td><td>boolean</td><td style="text-align: right">no</td><td>Queue the work and return immediately. Defaults to false.</td></tr>
+</tbody></table>
+<p>Foreground success returns <code>indexed</code>, <code>file</code>, <code>sections</code>, and <code>domain</code>. A background acknowledgement returns <code>accepted</code>, <code>queued</code>, and <code>file</code>.</p>
+<p>The indexer splits on <code>## </code> headings. Sections with at most 50 bytes are omitted. Sections over 6,000 characters are split at line boundaries or, for an overlong line, at UTF-8 character boundaries. A file may produce at most 4,000 final chunks.</p>
+<p>When re-indexing a path, old chunks remain searchable until all new sections store successfully. The daemon then removes old identifiers not reused by deduplication.</p>
+<h2 id="stats"><code>stats</code></h2>
+<p>Takes no request fields.</p>
+<p>The response contains:</p>
+<ul>
+<li><code>total_vectors</code> and <code>db_size_bytes</code>;</li>
+<li><code>model_loaded</code>, <code>model_circuit</code>, and <code>embed_circuit</code>;</li>
+<li><code>embed_cache_entries</code>, <code>embed_cache_hits</code>, and <code>embed_cache_misses</code>;</li>
+<li><code>by_source</code>, containing source names and counts.</li>
+</ul>
+<h2 id="property-verbs">Property verbs</h2>
+<p><code>indexd.props.get</code>, <code>indexd.props.list</code>, and <code>indexd.props.describe</code> dispatch through the property store. Arguments may arrive in the Bus <code>args</code> header, structured Bus arguments, or a JSON body.</p>
+<p><code>indexd.props.watch</code> and <code>props.watch</code> return the <code>indexd.props.changed</code> topic name. The caller subscribes through the broker.</p>
+<p>The daemon also publishes a retained <code>world.indexd</code> snapshot.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +737,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +791,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +920,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

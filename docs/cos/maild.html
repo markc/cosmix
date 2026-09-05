@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/maild</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,120 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/maild.md"><div class="prose"><h1 id="cosmix-maild--jmap-native-mail-daemon">cosmix-maild — JMAP-native mail daemon</h1>
+<p><strong><code>cosmix-maild</code> is a single-binary mail server: SMTP in and out, IMAP and JMAP for
+clients, CalDAV/CardDAV for calendars and contacts, and a three-stage inbound
+filter that verifies, rules-checks, and Bayesian-classifies every message.</strong> It is
+a first-class Bus citizen — everything an operator would reach for a CLI or config
+reload to do is also an addressable Bus verb.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>One daemon that speaks the standard mail protocols on their standard ports, stores
+everything in a content-addressable metadata store, and exposes its whole
+management surface over Bus. JMAP is the native model; IMAP and SMTP are mapped
+onto the same store. It is built from a small family of crates:</p>
+<table><thead><tr><th>Crate</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>cosmix-maild</code></td><td>the daemon — protocol servers, filter pipeline, Bus surface</td></tr>
+<tr><td><code>cosmix-mds</code></td><td>mail data store — per-container SQLite metadata + content-addressable blob CAS</td></tr>
+<tr><td><code>cosmix-maild-auth</code></td><td>SPF / DKIM / DMARC / ARC / iprev verification and DKIM/ARC signing</td></tr>
+<tr><td><code>cosmix-maild-rules</code></td><td>deterministic Sieve-style rule engine (stage two of the filter)</td></tr>
+<tr><td><code>cosmix-maild-bayesian</code></td><td>Robinson-Fisher spam classifier, per-account (stage three)</td></tr>
+<tr><td><code>cosmix-mail</code></td><td>a headless JMAP client app (an Bus citizen that reads/composes via a maild)</td></tr>
+</tbody></table>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>Inbound SMTP</strong> on port 25 with opportunistic (or required) STARTTLS. Each message runs the three-stage DATA filter: <code>cosmix-maild-auth</code> verifies SPF / DKIM / DMARC / ARC / iprev and prepends an <code>Authentication-Results</code> header → <code>cosmix-maild-rules</code> returns <code>HardAccept</code>, <code>HardJunk</code>, or <code>Continue</code> → <code>cosmix-maild-bayesian</code> scores anything that continued and routes it to Inbox or Junk.</li>
+<li><strong>Submission</strong> on SMTPS (465), signing outbound mail with DKIM and sealing forwards with ARC.</li>
+<li><strong>Client access</strong> via IMAPS (993) and JMAP over HTTP, plus CalDAV/CardDAV for calendars and contacts — all backed by the same <code>cosmix-mds</code> store.</li>
+<li><strong>Spam training</strong> and classification that live and update per account.</li>
+<li><strong>vtoken</strong> — an address-as-RPC scheme where a minted token encodes a scoped capability into an email address (mint / lookup / disable / list over Bus).</li>
+<li><strong>Retention</strong> — a background worker that ages messages out per policy.</li>
+<li><strong>DKIM key lifecycle</strong> — generate, rotate, and retire signing keys per domain.</li>
+</ul>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-maild --config /etc/cosmix/maild/config.toml serve
+</code></pre>
+<p>Subcommands cover setup and operations: <code>migrate</code> (run DB migrations), <code>account</code>
+(account management), <code>queue</code> (SMTP queue), plus per-account rule overrides. Run
+under systemd as <code>cosmix-maild.service</code>, ordered <code>After=cosmix-noded.service</code> so
+the broker exists first. Listen addresses default from <code>/etc/cosmix/node.toml</code>
+(JMAP, SMTP, SMTPS, IMAPS) and are overridable in the per-daemon
+<code>config.toml</code>, which also carries the <code>[[dkim.domain]]</code> signing config. Each
+listen field accepts a single address or a list, for multi-homed binds.</p>
+<h2 id="interfaces">Interfaces</h2>
+<ul>
+<li><strong>Protocol ports:</strong> SMTP <code>25</code>, SMTPS submission <code>465</code>, IMAPS <code>993</code>, and JMAP over HTTP (dev default <code>127.0.0.1:8088</code>); CalDAV/CardDAV share the HTTP surface.</li>
+<li><strong>Bus management surface</strong> — the operational verbs, grouped:</li>
+<li>accounts: <code>maild.accounts.seed_mailboxes</code>, <code>maild.accounts.seed_content</code>, <code>maild.accounts.revoke_tokens</code></li>
+<li>stats: <code>maild.stats.server</code>, <code>maild.stats.account</code>, <code>maild.stats.mailboxes</code>, <code>maild.stats.online</code>, <code>maild.stats.top</code></li>
+<li>rules: <code>maild.rules.reload</code>, <code>maild.rules.explain</code>, <code>maild.rules.stats</code></li>
+<li>bayesian: <code>maild.bayesian.classify</code>, <code>maild.bayesian.stats</code>, <code>maild.bayesian.rebuild</code>, <code>maild.bayesian.rebuild_status</code></li>
+<li>dkim: <code>maild.dkim.generate</code>, <code>maild.dkim.rotate</code>, <code>maild.dkim.retire</code></li>
+<li>vtoken: <code>maild.vtoken.mint_opaque</code>, <code>maild.vtoken.lookup_opaque</code>, <code>maild.vtoken.list_opaque</code>, <code>maild.vtoken.disable_opaque</code></li>
+<li>retention: <code>maild.retention.run</code>, <code>maild.retention.status</code></li>
+<li>search / tls: <code>maild.search.rebuild</code>, <code>maild.tls.reload</code></li>
+<li><strong>Property surface:</strong> the SPEC 12 <code>maild.props.*</code> namespace (<code>list</code> / <code>set</code> / <code>delete</code> / <code>watch</code>), with change events on the <code>maild.props.records.changed</code> topic.</li>
+</ul>
+<h3 id="bayesian-corpus-rebuild">Bayesian corpus rebuild</h3>
+<p><code>maild.bayesian.rebuild</code> accepts <code>account_id</code> (an integer or digit string),
+<code>snapshot</code> (optional, default <code>true</code>), <code>wait</code> (optional, default <code>false</code>), and
+<code>allow_empty</code> (optional, default <code>false</code>). It reserves one in-memory job per
+canonical account ID, enumerates the current mail store, and trains a per-job
+<code>&lt;account&gt;/bayes.rebuild-&lt;pid&gt;-&lt;unix_ms&gt;.db</code> without touching the live corpus. An
+exclusive non-blocking advisory lock on
+<code>&lt;account&gt;/rebuild.lock</code> serialises rebuilds across maild processes; stale
+per-job shadows are removed only while that lock is held.
+Junk is Spam; Trash, Drafts, Sent, and upload staging are ignored. A mailbox
+inherits the nearest ancestor's special-use role when it has none of its own;
+otherwise it is Ham. User corrections made while enumeration or training runs
+are replayed into the shadow corpus before it is validated and atomically
+copied over the live corpus in one SQLite write transaction.</p>
+<p>Mailbox enumeration is not one MDS snapshot. The fence and replay protect user
+corrections: moves across the Junk boundary, which write a live label row. The
+swap re-reads that correction set inside the same <code>BEGIN IMMEDIATE</code> transaction
+used to replace the corpus. If the set changed, maild re-derives those items
+from their current folder memberships, replays and revalidates the shadow, then
+retries. Five consecutive conflicts fail the job. Membership-only changes after
+enumeration — a deleted message, a move between non-Junk folders, or newly
+delivered mail — are not corrections, write no label row, and are reflected by
+the next rebuild. The corpus is folder state as of enumeration, plus every
+correction made before the swap.</p>
+<p>After the initial shadow validation and before the first replay read, <code>snapshot: true</code> writes a consistent <code>bayes.pre-rebuild-*.db</code> rollback copy. A refused empty
+rebuild creates no snapshot. Retention pruning runs only after a successful
+swap, keeping the newest two snapshots. Aborted or failed jobs delete the shadow
+database and leave the live corpus unchanged.</p>
+<p>Before snapshot creation, after replay, and after each conflict retry, a
+zero-message shadow fails with
+<code>rebuild produced an empty corpus; live corpus left untouched (pass allow_empty: true to replace it anyway)</code>. Set <code>allow_empty: true</code> only when deliberately
+clearing the live Bayesian corpus.</p>
+<p><code>bayesian_rebuild_operators</code> in maild's <code>conf.mix</code> is an opt-in peer allowlist
+for <code>maild.bayesian.rebuild</code>. Its semantics are deliberately the inverse of
+<code>retention_operators</code>: EMPTY means open to every Bus peer, the deliberate
+agentic-first default; NON-EMPTY admits only exact <code>cmd.from</code> matches.
+<code>rebuild_status</code>, <code>stats</code>, and <code>classify</code> remain open regardless of this list.</p>
+<p>The job body contains <code>state</code>, <code>started_at</code>, <code>finished_at</code>, candidate and trained
+Ham/Spam counts, <code>replayed</code>, <code>already_labeled</code>, <code>skipped_missing</code>, <code>conflicts</code>,
+<code>errors</code>, <code>last_error</code>, <code>snapshot</code>, and <code>ignored_mailboxes</code>. <code>wait: true</code> holds
+maild's Bus dispatcher for the whole rebuild and is subject to the client's
+60-second request timeout; use it only for tests or small mailboxes. Real
+mailboxes should use <code>wait: false</code>, which returns the reserved <code>running</code> job
+immediately, then poll <code>maild.bayesian.rebuild_status</code> with the same <code>account_id</code>.
+Status returns the latest daemon-memory job, or <code>idle</code> when none has run since
+startup.</p>
+<h2 id="where-it-fits">Where it fits</h2>
+<ul>
+<li>Registers with and is addressed through <a href="/cos/noded">noded</a>, the Bus broker.</li>
+<li>Links the Bus protocol family (<code>cosmix-lib-bus</code>, <code>cosmix-lib-client</code>) from the <a href="https://github.com/markc/cosmix">bus</a> repo, and substrate libraries <code>cosmix-lib-config</code>, <code>cosmix-lib-daemon</code> (TLS / ACME), <code>cosmix-lib-props-store</code>, and <code>cosmix-lib-log</code>.</li>
+<li>Parses its native <code>*.conf.mix</code> config through <code>cosmix-lib-mix</code> from the <a href="https://github.com/markc/cosmix">mix</a> repo.</li>
+<li><code>cosmix-webd</code> fronts webmail against maild's JMAP; <code>cosmix-mail</code> is a native client; both drive it over JMAP + Bus.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/noded">noded</a> — the Bus broker maild registers with</li>
+<li><a href="/cos/libraries">libraries</a> — the substrate crates maild links</li>
+<li><a href="/cos/overview">overview</a> — the cos daemon family</li>
+<li><a href="https://markc.github.io/mix/#_man/bus.md">bus messaging</a> — the Bus primitives used to drive maild's management verbs</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +732,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +786,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +915,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

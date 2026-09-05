@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/10a-daemon-identity-profile</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,1579 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/10a-daemon-identity-profile.md"><div class="prose"><h1 id="managed-daemon-identity-profile--retained-contract">Managed Daemon Identity Profile — Retained Contract</h1>
+<p><strong>DAEMON-PROFILE-001 — Retained identity contract.</strong> The following numbered sections preserve the managed fixed-identity profile, including allocation rules, filesystem ownership, sysusers projection, system/user-unit distinctions, hardening directives, fail-closed verification, conformance lints and the registry. Original section numbers are local to this profile; <code>SPEC 10</code> references name the legacy identity contract, not a new distribution ID.</p>
+<p>This is intended normative detail retained during refactoring, not a fresh attestation of deployed accounts, unit effectiveness or generator availability. Dated statements such as “present”, “shipped”, “verified”, version frontiers and rollout coverage remain historical assertions until supported by a current conformance record. The main <a href="/spec/10-daemon-agent-operation">daemon chapter</a> explains the implementation boundary. No existing allocation is changed by publication.</p>
+<p>Examples and verification pseudocode are descriptive legacy material, not scripts to execute. Production paths use <code>/opt/cosmix/bin</code>; where a legacy example conflicts with that convention, the discrepancy is retained for explicit correction rather than silently authorising an alternate install. Cross-references to other legacy chapter numbers resolve through the migration map. The distribution surveys and change history are retained in the private historical snapshot, not republished as current platform facts.</p>
+<h2 id="1-introduction">1. Introduction</h2>
+<p><strong>Registry drift — do not allocate or regenerate from this historical table.</strong>
+The retained registry is version 1.4.4 and lacks the normative 1.4.5/1.4.6
+amendments. The <a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/_etc/sysusers/cosmix.conf">committed sysusers projection</a>
+labels itself 1.4.6 and assigns 519 to powerd and 520 to mprisd. Appendix A's
+“next free 519” comments are historical, not allocation authority. Recover and
+reconcile the registry amendments before generating accounts or passing a registry
+equality gate; this refactor neither frees those IDs nor ratifies new allocations.</p>
+<p><strong>Retained observability obligations (legacy Appendix D 1.4.0/1.4.1).</strong>
+The six observability identities require identity-profile L2 from first install,
+including non-ABP-registering upstream binaries. Mask package-native units and
+supervise the same binary through <code>cosmix-&lt;d&gt;.service</code> with its Cosmix user/group,
+state directory and §5.2 hardening. A package-native POSIX user may remain but
+must not appear in a Cosmix unit's <code>User=</code>/<code>Group=</code> or join <code>cosmix-tls</code> or any
+future Cosmix shared-credential group. These units must declare
+<code>After=cosmix-noded.service</code> under §5.4 despite not registering with the broker.
+These are retained requirements, not fresh deployed-hardening evidence.</p>
+<h3 id="11-purpose">1.1 Purpose</h3>
+<p>This SPEC defines:</p>
+<ol>
+<li>The numeric range Cosmix daemons occupy in the system UID/GID space.</li>
+<li>The initial registry of daemon names to UID/GID assignments.</li>
+<li>The rules by which the registry grows, changes, and tombstones entries.</li>
+<li>The filesystem layout under which daemons own state.</li>
+<li>The <code>sysusers.d</code> fragment that materializes the registry.</li>
+<li>The systemd unit directives every daemon's service file MUST carry.</li>
+<li>The install-time preflight that verifies identity before service start.</li>
+<li>The conformance levels and CI lint shape that prevent drift.</li>
+</ol>
+<h3 id="12-scope">1.2 Scope</h3>
+<p>This SPEC applies to every long-running Cosmix daemon that registers as a
+service on the node-local Bus broker (<code>cosmix-noded</code>) or runs under
+systemd as a system unit. It does
+not apply to:</p>
+<ul>
+<li><strong>Session-scoped processes</strong> (§7) — compositors, launchers, and other
+components bound to a logged-in human seat.</li>
+<li><strong>Build-time identities</strong> — the UID under which <code>cargo build</code> runs is
+intentionally unspecified; see §1.3.</li>
+<li><strong>Per-tenant vhost identities</strong> — NetServa NS 3.0 vhost users at
+UID ≥ 1000 are governed by NetServa, not by this SPEC.</li>
+</ul>
+<p>Every daemon in scope is a <strong>full Bus citizen by default</strong>: it SHALL connect
+to the node-local broker, register its service name, and expose its control
+surface over ABP verbs — there is no "edge daemon, no Bus" exemption, and no
+custom IPC/control-file/signal-based control surface may substitute for the
+ABP surface. (Promoted 2026-07-23 from the all-daemons-amp-citizens decision;
+rationale in the historical core/citizen architecture decision.)</p>
+<h3 id="13-non-goals">1.3 Non-goals</h3>
+<ul>
+<li><strong>A globally reserved UID range.</strong> Cosmix does not own any portion of
+the POSIX system UID space by fiat. The 500–599 window is a <em>preferred</em>
+allocation on Cosmix-managed hosts; conflicts with non-Cosmix
+reservations are detected and resolved at install time, not assumed
+away.</li>
+<li><strong>A standard build identity.</strong> A public clone of the Cosmix repository
+builds under whatever UID the operator chooses. This SPEC governs
+<em>deployed</em> identity, not <em>development</em> identity.</li>
+<li><strong>Universal hardening.</strong> Per-daemon <code>systemd.exec(5)</code> hardening
+(<code>ProtectSystem=</code>, <code>RestrictAddressFamilies=</code>, <code>SystemCallFilter=</code>) is
+REQUIRED but daemon-specific; this SPEC mandates the directives every
+unit MUST carry, not the full hardening profile.</li>
+</ul>
+<h3 id="14-terminology">1.4 Terminology</h3>
+<table><thead><tr><th>Term</th><th>Definition</th></tr></thead><tbody>
+<tr><td><strong>registry</strong></td><td>The canonical mapping of daemon names to UID/GID values, defined in §2 and Appendix A.</td></tr>
+<tr><td><strong>canonical source</strong></td><td>The Markdown table in this SPEC and Appendix A. The <code>sysusers.d</code> fragment is <em>generated</em> from this source (§4).</td></tr>
+<tr><td><strong>daemon leaf</strong></td><td>A directory of the form <code>/etc/cosmix/&lt;d&gt;/</code>, <code>/var/lib/cosmix/&lt;d&gt;/</code>, etc., owned by <code>cosmix-&lt;d&gt;</code>.</td></tr>
+<tr><td><strong>substrate-shared state</strong></td><td>Directories under <code>/var/lib/cosmix/</code> that are not daemon-leaves, owned by <code>root:root</code>, and accessed by daemons through explicit ABP contracts (§3.4).</td></tr>
+<tr><td><strong>tombstone</strong></td><td>A registry entry whose UID/GID is permanently retired from allocation but kept in the spec for audit (§2.4). Applies to daemon-identity and shared-credential entries only; the citizen-identity stream uses the retire→quarantine→reclaim lifecycle (§2.5) instead of tombstoning.</td></tr>
+<tr><td><strong>citizen-identity entry</strong></td><td>A registry entry (v1.2.0) with the <em>same shape</em> as a daemon-identity entry (POSIX <code>cosmix-&lt;d&gt;</code> user + same-numbered group, GID==UID, ABP service name = name minus <code>cosmix-</code>) but allocated in the dedicated <strong>citizen band</strong> and governed by the scoped, gated <strong>reuse rule</strong> (§2.3 R7/R8, §2.5) rather than the strict daemon no-reuse rule. It is the SPEC-10 identity of a <em>registered serve-mode Mix citizen</em> (SPEC 18 §2).</td></tr>
+<tr><td><strong>citizen band</strong></td><td>The inclusive UID/GID window <strong>600–699</strong>, the citizen-identity stream's preferred fixed-ID window (§2.1). Disjoint from the 500–599 daemon-identity/shared-credential window.</td></tr>
+<tr><td><strong>quarantine window</strong></td><td>The fixed interval (<strong>30 days</strong>, §2.3 R8) that MUST elapse after a citizen-identity entry is <code>retired:</code> before its UID is eligible to re-enter the free pool, in addition to (not instead of) purge-verification passing.</td></tr>
+<tr><td><strong>purge-verification</strong></td><td>The automated, mesh-wide check (§2.3 R8) that a retired citizen UID owns no file, no enabled/started unit, and no leftover state-directory leaf on <em>any</em> node that ever projected it, and that the <code>cosmix-&lt;d&gt;</code> projection has been removed everywhere. It is R2.a's conjunctive check set, generalized and automated because the citizen class has a uniform machine-checkable footprint.</td></tr>
+<tr><td><strong>preflight</strong></td><td>The install-time procedure (§6) that verifies every registry entry is either free or already correctly assigned, before any service is started.</td></tr>
+<tr><td><strong>fail closed</strong></td><td>An install-time check that, on any deviation, halts installation rather than auto-correcting. The operator MUST resolve the conflict manually.</td></tr>
+<tr><td><strong>session-scoped process</strong></td><td>A Cosmix process that runs under the logged-in human user via a user systemd unit, not as a system daemon (§7).</td></tr>
+</tbody></table>
+<hr />
+<h2 id="2-uidgid-registry">2. UID/GID Registry</h2>
+<h3 id="21-the-preferred-allocation-window">2.1 The preferred allocation window</h3>
+<p>Cosmix daemons are allocated UIDs and GIDs in the inclusive range
+<strong>500–599</strong> on Cosmix-managed hosts. This range is the <strong>preferred
+fixed-ID window</strong>, not a globally reserved range.</p>
+<p>The window is a deployment-profile choice, not proof that these IDs are
+available on a particular host. Check local account collisions at installation.
+Historical deployment surveys and allocation rationale are not reproduced here.</p>
+<p>UIDs in 500–599 that are not yet allocated to a Cosmix daemon are
+<em>available for future Cosmix allocation</em>, subject to install-time
+preflight (§6). They are not reserved against external packages. An
+operator who installs an unrelated package that pins a UID in 500–599
+SHALL resolve the conflict at install time (§6.1); the substrate does
+not silently work around it.</p>
+<p>The <strong>citizen band</strong> is the inclusive range <strong>600–699</strong> (100 slots),
+introduced in v1.2.0 as the citizen-identity stream's preferred
+fixed-ID window. It is <strong>disjoint</strong> from the 500–599 daemon-identity /
+shared-credential window: no number is ever shared across the two
+windows, which makes the daemon and citizen streams trivially
+separable in <code>getent passwd | grep cosmix-</code> output (a UID ≥ 600 is a
+citizen; a UID 500–599 is a daemon or a shared-credential group).
+The citizen band carries the <strong>same posture</strong> as 500–599 — <em>preferred,
+not globally reserved</em>: it is not owned by fiat, conflicts are
+detected and resolved at install-time preflight (§6) and fail closed,
+and an operator who installs an unrelated package pinning a UID in
+600–699 SHALL resolve the conflict at install time. The 600–699
+window was selected because Appendix C already records it as surveyed
+clean ("600 | 600–699 | No known reservations | Clean"); a
+confirmatory re-survey on 2026-05-16 (Appendix B.4) found no new
+reservations. This satisfies the R5 obligation that a <em>new window</em>
+rest on a fresh empirical survey rather than on the 500-anchor
+survey alone. Allocation within the band is governed by R7/R8 (§2.3),
+not by R1.</p>
+<h3 id="22-initial-registry">2.2 Initial registry</h3>
+<p>The initial allocation, as of this SPEC's publication, is given in
+Appendix A. As a summary:</p>
+<table><thead><tr><th style="text-align: right">UID/GID</th><th>POSIX name</th><th>ABP service</th><th>Role</th></tr></thead><tbody>
+<tr><td style="text-align: right">500</td><td><code>cosmix-noded</code></td><td><code>noded</code></td><td>Per-node ABP broker / mesh peer</td></tr>
+<tr><td style="text-align: right">501</td><td><code>cosmix-maild</code></td><td><code>maild</code></td><td>Mail daemon</td></tr>
+<tr><td style="text-align: right">502</td><td><code>cosmix-webd</code></td><td><code>webd</code></td><td>Web daemon</td></tr>
+<tr><td style="text-align: right">503</td><td><code>cosmix-indexd</code></td><td><code>indexd</code></td><td>Knowledge / vector index daemon</td></tr>
+<tr><td style="text-align: right">504</td><td><code>cosmix-agentd</code></td><td><code>agentd</code></td><td>Agent runtime</td></tr>
+<tr><td style="text-align: right">505</td><td><code>cosmix-mcp</code></td><td><code>mcp</code></td><td>MCP bridge</td></tr>
+<tr><td style="text-align: right">506</td><td><code>cosmix-dnsd</code></td><td><code>dnsd</code></td><td>Authoritative WG-mesh DNS daemon (R2.a-reclaimed cloudd slot)</td></tr>
+<tr><td style="text-align: right">507</td><td><code>cosmix-cron</code></td><td><code>cron</code></td><td>Scheduler</td></tr>
+<tr><td style="text-align: right">508</td><td><code>cosmix-prometheus</code></td><td><code>prometheus</code></td><td>Observability tier: Prometheus time-series store (v1.4.0)</td></tr>
+<tr><td style="text-align: right">509</td><td><code>cosmix-grafana</code></td><td><code>grafana</code></td><td>Observability tier: Grafana dashboards (v1.4.0)</td></tr>
+<tr><td style="text-align: right">510 (GID-only)</td><td><code>cosmix-tls</code></td><td>—</td><td>Shared-credential group: TLS keypair read access (§3.3)</td></tr>
+<tr><td style="text-align: right">516 (GID-only)</td><td><code>cosmix-mesh</code></td><td>—</td><td>Shared-credential group: signed-inventory read access (§3.3) (v1.4.2)</td></tr>
+<tr><td style="text-align: right">511</td><td><code>cosmix-loki</code></td><td><code>loki</code></td><td>Observability tier: Loki log store (v1.4.0)</td></tr>
+<tr><td style="text-align: right">512</td><td><code>cosmix-alloy</code></td><td><code>alloy</code></td><td>Observability tier: Grafana Alloy log shipper, per-node (v1.4.0)</td></tr>
+<tr><td style="text-align: right">513</td><td><code>cosmix-pveexport</code></td><td><code>pveexport</code></td><td>Observability tier: proxmox-exporter (Starttoaster, Go), PVE API scraper (v1.4.0)</td></tr>
+<tr><td style="text-align: right">514</td><td><code>cosmix-nodeexport</code></td><td><code>nodeexport</code></td><td>Observability tier: <code>node_exporter</code> (Prometheus, Go), per-host OS metrics (v1.4.1)</td></tr>
+<tr><td style="text-align: right">515</td><td><code>cosmix-wgd</code></td><td><code>wgd</code></td><td>WireGuard mesh control plane (SPEC-13 D0) (v1.4.2)</td></tr>
+<tr><td style="text-align: right">517</td><td><code>cosmix-interactd</code></td><td><code>interact</code></td><td>Reserved interaction namespace/props identity; desktop sink runs in-session (§7.3) (v1.4.3, explicit R6 override)</td></tr>
+<tr><td style="text-align: right">518</td><td><code>cosmix-nspawnd</code></td><td><code>nspawnd</code></td><td>nspawn host executor: generation-fenced CT lifecycle (nspawn cluster-lite C1) (v1.4.4)</td></tr>
+<tr><td style="text-align: right">600</td><td><code>cosmix-statecache</code></td><td><code>statecache</code></td><td>Citizen-identity: SPEC-18 reference citizen (§2.5)</td></tr>
+</tbody></table>
+<p><code>cosmix-noded</code> registers under the ABP service name <code>noded</code>,
+matching the binary name. The historical alias <code>hub</code> was
+removed in the 2026-05-09 cosmix-noded rename — the substrate
+no longer has a centralised "hub" role; every mesh node runs
+its own <code>cosmix-noded</code> and peers as equals.</p>
+<p>The registry has three entry classes:</p>
+<ul>
+<li><strong>Daemon-identity entries</strong> (the <code>cosmix-&lt;d&gt;</code> rows in 500–599): pair
+a POSIX user with a same-numbered group. GID <strong>MUST</strong> equal UID for
+every daemon-identity entry. This is enforced by the CI lint defined
+in §8.2 and by <code>systemd-sysusers</code> when only a <code>u</code> line is given.
+Governed by the strict no-reuse rules R1–R6 (§2.3).</li>
+<li><strong>Shared-credential group entries</strong> (the <code>cosmix-tls</code> row, and any
+future rows of the same shape): a POSIX group with <strong>no associated
+user</strong>. Shared-credential GIDs are allocated within the same
+500–599 window as a <em>separate append-only stream</em> from the
+daemon-identity stream, starting at GID 510 and continuing
+upward. The two streams SHALL NOT collide on a single number, but
+each advances independently — the daemon-identity stream's "next
+free UID" pointer is not bumped when a shared-credential entry is
+added, and vice versa. The GID==UID rule does not apply because
+there is no user. The 500–509 range is reserved for the
+daemon-identity stream so the two streams stay visually separable
+in <code>getent group | grep cosmix-</code> output (entries up to 509 are
+always daemons; entries from 510 may be either, distinguished by
+whether a same-numbered user exists). These entries exist to
+mediate credential read access shared by two or more daemons (TLS
+material, secret bundles) without coupling daemon identities to
+one another. They are <strong>not</strong> ABP services and have no ABP service
+name (the <code>bus</code> column is <code>—</code>).</li>
+<li><strong>Citizen-identity entries</strong> (the <code>cosmix-&lt;d&gt;</code> rows in the 600–699
+citizen band, v1.2.0): pair a POSIX user with a same-numbered group,
+<em>exactly the same shape</em> as a daemon-identity entry — GID <strong>MUST</strong>
+equal UID, R6's two-name split applies (POSIX <code>cosmix-&lt;d&gt;</code> +
+prefix-stripped ABP service name), and R3's tier-neutral numbering
+applies. They differ from daemon-identity entries in <strong>two</strong> respects
+only: (1) they are allocated in the disjoint citizen band (§2.1),
+forming a <em>third separate append-only stream</em> whose "next free UID"
+pointer advances independently of the daemon-identity and
+shared-credential streams and never collides with either; and (2)
+their UID may be <strong>reclaimed</strong> under the scoped, gated reuse rule
+R7/R8 (§2.3) and the retire→quarantine→reclaim lifecycle (§2.5),
+<em>instead of</em> the strict daemon no-reuse/tombstone rule (R2, §2.4).
+A citizen-identity entry is the SPEC-10 identity of a <em>registered
+serve-mode Mix citizen</em> (SPEC 18 §2); the unregistered transient
+Mix-citizen form (SPEC 18 §2) consumes <strong>no</strong> registry slot and is
+out of scope for this registry. The reuse exception is confined to
+this class: it SHALL NOT be read as relaxing R2/R2.a for
+daemon-identity entries or the no-reuse posture of the
+shared-credential stream.</li>
+</ul>
+<p>Shared-credential groups SHALL NOT be used to grant <em>write</em> access
+across daemon identities; per §3.4 substrate-shared writable state is
+mediated by the §3.4 mechanisms (ABP contract or supplemental write
+group), not by general-purpose shared groups in this section.</p>
+<h3 id="23-allocation-rules">2.3 Allocation rules</h3>
+<p>The following rules govern the registry over time. They are normative.
+<strong>R1–R6 govern the daemon-identity stream</strong> (and, where stated,
+shared-credential entries). <strong>R7–R8 govern the citizen-identity stream
+(§2.2, v1.2.0).</strong> R3 (tier-neutral numbering) and R6 (the two-name
+split) additionally bind citizen-identity entries by §2.2's
+"same shape" clause; R1/R2/R2.a/R4/R5 do <strong>not</strong> apply to the citizen
+stream, which has its own allocation and reuse rules (R7/R8). No rule
+below relaxes any pre-v1.2.0 constraint on the daemon-identity or
+shared-credential streams.</p>
+<p><strong>R1.</strong> New daemons SHALL be allocated the <strong>next free UID</strong> in the
+500–599 daemon-identity window in append-only order. Existing
+allocations SHALL NOT be reordered, renumbered, or compacted. The sole
+exception is an R2.a-reclaimed UID, which is allowed to sit numerically
+below the current append-only frontier (see R2.a below); such a UID
+re-enters the free pool and is preferred over the next sequential UID
+for the next eligible daemon allocation. R1 does not govern the
+citizen band (600–699); see R7.</p>
+<p><strong>R2.</strong> UIDs SHALL NOT be reused, with one exception. When a daemon is
+retired (renamed, merged into another daemon, or removed entirely), its
+UID becomes a tombstone (§2.4) and SHALL NOT be assigned to any future
+daemon.</p>
+<p><em>Exception (R2.a — never-functional reclamation).</em> A UID that was
+allocated to a daemon which was retired without that daemon ever
+becoming functional on any mesh node MAY be reclaimed: the allocation
+is fully removed from the registry (no tombstone) and re-enters the
+free pool, where per R1 it is preferred over the next sequential UID
+for the next eligible daemon allocation (i.e. allowed out of
+append-order).</p>
+<p>The substantive precondition is <strong>the absence of on-disk state owned
+by the retired UID</strong> — that is the ambiguity R2 exists to prevent.
+A passwd/group projection alone (the sysusers fragment having created
+the user on one or more nodes) does NOT block reclamation, but it
+SHALL be cleaned up before the new fragment promotes (see remediation
+below). The conditions are conjunctive — <em>all</em> of the following SHALL
+hold for the operator to invoke R2.a:</p>
+<ul>
+<li>No file on any mesh node is owned by the retired UID or its group.
+This SHALL be verified by <code>sudo find / -uid &lt;N&gt; -o -gid &lt;N&gt;</code> on
+every node that ever ran <code>systemd-sysusers</code> against a fragment
+containing the retired entry. Empty output on every node is required.</li>
+<li>No systemd unit, ABP-registered service, on-disk daemon-state
+directory, or unit-managed <code>StateDirectory=</code>/<code>RuntimeDirectory=</code>
+ever ran in production under the retired UID. (Allocations that
+were never wired up to a unit, or whose unit was never enabled or
+started, satisfy this trivially.)</li>
+<li>Where a node has projected the retired <code>cosmix-&lt;d&gt;</code> user from a
+prior sysusers fragment, the operator SHALL <code>userdel cosmix-&lt;d&gt;</code>
+(which also removes the same-numbered group via <code>USERGROUPS_ENAB</code>,
+per Debian/Ubuntu default; <code>groupdel cosmix-&lt;d&gt;</code> is the explicit
+fallback) on every such node BEFORE promoting the new fragment.
+This is the remediation step that closes the gap between the
+registry and the live <code>getent passwd|group</code> state, restoring the
+invariant before file ownership has a chance to drift.</li>
+<li>The reclamation commit message records the R2.a invocation, names
+the retired daemon and its UID, and (where remediation was needed)
+lists the nodes on which <code>userdel</code> was run, so the audit trail
+survives even though the registry row does not.</li>
+</ul>
+<p>The justification for R2.a is that the no-reuse invariant exists to
+prevent file-ownership ambiguity after a <code>chown</code>-style sweep —
+ambiguity that cannot arise when no host has files owned by the
+retired UID. A sysusers projection that created the passwd entry but
+never had any file, unit, or service materialise under it is <em>not</em>
+the failure mode R2 guards against; the projection is removable with
+<code>userdel</code> and leaves no residue. UIDs of daemons that <em>did</em> become
+functional in production — that owned files, ran units, or registered
+ABP services — SHALL continue to follow the strict tombstone rule.</p>
+<p><strong>R3.</strong> Tier or category (substrate, application, UI plumbing, etc.)
+SHALL NOT influence the numeric allocation. Tier MAY appear as
+metadata in the Markdown registry but SHALL NOT be encoded in the
+numeric ordering. Architecture taxonomy is mutable; UID numbers are
+not.</p>
+<p><strong>R4.</strong> When two daemons merge, the merged daemon SHOULD inherit the
+UID of whichever predecessor owns more on-disk state, to avoid a
+filesystem-wide <code>chown</code> sweep. The other predecessor's UID becomes
+a tombstone.</p>
+<p><strong>R5.</strong> When the next free daemon-identity UID would exceed 599, the
+SPEC SHALL be amended (per Constitution Article VII) to either (a)
+extend the window or (b) move to a new window after a fresh empirical
+survey of upstream UID reservations. The operator SHALL NOT silently
+allocate beyond 599. (v1.2.0 invoked R5(b)'s "fresh empirical survey"
+discipline to open the <em>separate</em> 600–699 citizen window — §2.1,
+Appendix B.4 — even though the daemon stream was not exhausted; the
+citizen band's own exhaustion is handled by R7, not R5.)</p>
+<p><strong>R6.</strong> Each daemon-identity entry has two distinct names. (Shared-credential
+group entries per §2.2 have only the POSIX/systemd group name and no ABP
+service name, because they are credential boundaries rather than process
+identities.)</p>
+<ul>
+<li>The <strong>POSIX/systemd name</strong> SHALL begin with the prefix <code>cosmix-</code>
+and SHALL match the regex <code>^cosmix-[a-z][a-z0-9-]{1,30}$</code>. This
+name is used for <code>User=</code>, <code>Group=</code>, the systemd unit file
+(<code>cosmix-&lt;d&gt;.service</code>), the <code>sysusers.d</code> entry, and on-disk paths
+(<code>/etc/cosmix/&lt;d&gt;/</code>, <code>/var/lib/cosmix/&lt;d&gt;/</code>). The portion after
+the <code>cosmix-</code> prefix is the registry's <code>&lt;d&gt;</code> token.</li>
+<li>The <strong>ABP service name</strong> is the same <code>&lt;d&gt;</code> token <em>without</em> the
+<code>cosmix-</code> prefix (e.g. <code>noded</code>, <code>maild</code>, <code>webd</code>, <code>indexd</code>). It
+is the name the daemon registers with under its node-local
+<code>cosmix-noded</code> broker. The ABP service name SHALL match
+<code>^[a-z][a-z0-9-]{1,30}$</code> and SHALL be unique across the
+registry. Because a registered serve-mode Mix citizen registers
+on the same node-local broker as a daemon, ABP-name uniqueness is
+enforced across the <strong>union</strong> of non-tombstoned daemon-identity
+entries and non-retired/non-reclaimed citizen-identity entries: a
+citizen ABP name SHALL NOT collide with a daemon ABP name or with
+another live citizen ABP name (CI lint L14, §8.2).</li>
+</ul>
+<p>Existing ABP service names that diverge from this derivation
+(historical aliases, multi-service daemons) SHALL be recorded
+explicitly in the registry's <code>bus:</code> field per entry; absence of an
+<code>bus:</code> field means the ABP service name is the registry name minus
+<code>cosmix-</code>.</p>
+<p><strong>R7. (Citizen allocation — citizen-identity stream only.)</strong> New
+citizens SHALL be allocated a UID/GID in the 600–699 citizen band.
+The allocation order is the <strong>lowest free UID in the band</strong>, where
+the <em>free pool</em> is the union of (a) UIDs in 600–699 never allocated
+to any citizen and (b) UIDs whose only remaining registry rows are
+<code>reclaimed:</code> rows (R8). Append-only ordering does <strong>not</strong> bind
+citizen allocation — a reclaimed UID re-enters the pool and may be
+re-allocated below the current frontier. The safety mechanism is the
+R8 reuse gate, <strong>not</strong> numeric monotonicity. Within <em>never-reclaimed</em>
+citizen rows the canonical source SHALL remain append-only: a row
+that has not been reclaimed SHALL NOT be reordered, renumbered, or
+removed (it is <code>retired:</code> or live, never silently deleted). The
+citizen stream's "next free UID" pointer advances independently of
+the daemon-identity and shared-credential pointers and SHALL NOT
+collide with either window (the bands are disjoint by §2.1, so the
+non-collision is structural; the CI lint asserts it as
+defence-in-depth).</p>
+<p><strong>R8. (Citizen reuse gate — citizen-identity stream only.)</strong> A
+retired citizen UID <code>N</code> re-enters the free pool (R7) <strong>if and only
+if BOTH</strong> of the following hold; the conditions are <em>conjunctive</em>
+and neither alone is sufficient:</p>
+<ul>
+<li><strong>(a) Mesh-wide purge-verification passes.</strong> On <em>every</em> mesh node
+that ever projected the entry (ran <code>systemd-sysusers</code> against a
+fragment containing <code>cosmix-&lt;d&gt;</code>), <em>all</em> of the following SHALL
+hold: <code>sudo find / -uid N -o -gid N</code> produces empty output; no
+enabled or started systemd unit references the retired identity;
+the per-name <code>StateDirectory=</code>/<code>RuntimeDirectory=</code>/<code>LogsDirectory=</code>
+leaves (<code>/var/lib/cosmix/&lt;d&gt;/</code>, <code>/run/cosmix/&lt;d&gt;/</code>,
+<code>/var/log/cosmix/&lt;d&gt;/</code>) are absent; the citizen's
+<code>/usr/local/lib/cosmix/&lt;d&gt;.mix</code> script is absent; and the
+<code>cosmix-&lt;d&gt;</code> projection has been <code>userdel</code>'d (group via
+<code>USERGROUPS_ENAB</code>, <code>groupdel</code> fallback). This is R2.a's conjunctive
+check set, <strong>automated and generalized to functional citizens</strong>.</li>
+<li><strong>(b) The 30-day quarantine window has elapsed.</strong> At least 30 days
+SHALL have passed since the entry's <code>retired:</code> date before its UID
+is eligible, <em>even if (a) already passes</em>. The window covers
+eventually-consistent mesh state and nodes that were offline during
+the verification sweep.</li>
+</ul>
+<p>When BOTH hold, the operator SHALL annotate the retired row with a
+<code>reclaimed: &lt;date&gt;</code> attribute and a <code>verifier: &lt;record&gt;</code> token (the
+per-node purge-verification run record), leaving the row in the
+canonical source for audit (it materializes as a comment only — §4.3,
+§2.5). The reclamation change message SHALL record the R8 invocation,
+the citizen name and UID, the <code>retired:</code> and <code>reclaimed:</code> dates, and
+the per-node verifier run records. R8 SHALL NOT auto-correct,
+auto-allocate, or bypass either gate; a tooling-unavailable or
+inconclusive purge-verification is a non-pass and the UID stays in
+quarantine.</p>
+<p><em>Justification for R7/R8 (why scoped reuse is sound for citizens but
+not daemons).</em> The no-reuse invariant (R2) exists to prevent
+file-ownership ambiguity after a <code>chown</code>-style sweep. For the
+daemon-identity class that ambiguity is unbounded — daemons have
+heterogeneous, spec-specific on-disk footprints — so daemons stay
+strictly no-reuse with only the narrow, <strong>manual</strong> R2.a escape for
+never-functional allocations. The citizen-identity class is different
+<em>in kind</em>: every registered serve-mode Mix citizen has the <strong>same</strong>
+machine-enumerable footprint (exactly one
+<code>/usr/local/lib/cosmix/&lt;d&gt;.mix</code>, exactly one per-name
+<code>StateDirectory=cosmix/&lt;d&gt;</code> leaf, exactly one <code>cosmix-&lt;d&gt;.service</code>
+unit — SPEC 18 §2, §9). "No file, unit, or state owned by <code>N</code> on any
+node" is therefore an <em>automatable, exhaustive</em> predicate for citizens
+in a way it is <strong>not</strong> for daemons, which is precisely why R8 may
+generalize and automate R2.a for <em>functional</em> citizens whereas R2.a
+must stay manual and never-functional-only for daemons. The 30-day
+quarantine adds defence-in-depth against eventually-consistent and
+offline-node state that a single sweep could miss. The pair
+(automated exhaustive purge-verify) ∧ (quarantine) reconstructs
+exactly the safety property R2 protects — which is why bounded scoped
+reuse is sound for the citizen band specifically and is <strong>not</strong>
+extended to the daemon-identity or shared-credential streams. This
+also keeps the <code>506</code>/cloudd daemon-stream question orthogonal to the
+citizen band: the SPEC-18 reference citizen is a citizen-band entry
+and never touches the 500–599 stream. The <code>506</code>/cloudd question is
+itself <strong>resolved</strong> by the v1.3.0 amendment — <code>cosmix-dnsd</code> consumes
+the R2.a-reclaimed <code>506</code> slot as the next eligible daemon allocation
+(R1's "preferred over the next sequential UID" rule for an
+R2.a-reclaimed UID; Appendix A, Appendix D 1.3.0). No daemon-stream
+gap remains; the append-only frontier is unchanged at 508 because the
+R2.a slot sits <em>below</em> the frontier (R1).</p>
+<h3 id="24-tombstones">2.4 Tombstones</h3>
+<p>Tombstoning applies to <strong>daemon-identity and shared-credential
+entries only</strong>. Citizen-identity entries are <em>never</em> tombstoned;
+their retirement is governed by the retire→quarantine→reclaim
+lifecycle in §2.5 (the citizen-class analogue of a tombstone is a
+permanently-<code>retired:</code>, never-<code>reclaimed:</code> row).</p>
+<p>A tombstoned entry remains in the registry with a <code>tombstoned: &lt;date&gt;</code>
+attribute and a <code>reason:</code> field. Tombstones are visible in the
+generated <code>sysusers.d</code> fragment as comments only — they SHALL NOT
+materialize as system users on installed hosts.</p>
+<p>The CI lint (§8.2) SHALL reject any change that:</p>
+<ul>
+<li>removes a tombstone entry from the canonical source,</li>
+<li>assigns a tombstoned UID to a new daemon, or</li>
+<li>silently re-uses a tombstoned name without an explicit <code>successor:</code>
+pointer.</li>
+</ul>
+<h3 id="25-citizen-retirement-quarantine-and-reclamation">2.5 Citizen retirement, quarantine, and reclamation</h3>
+<p>A citizen-identity entry (§2.2) moves through up to three lifecycle
+states. The state is carried as an attribute on the canonical
+Appendix A row and determines how the entry projects into the
+generated <code>sysusers.d</code> fragment (§4.3):</p>
+<table><thead><tr><th>State</th><th>Registry attributes</th><th>sysusers projection</th><th>UID reusable?</th></tr></thead><tbody>
+<tr><td><strong>live</strong> (default)</td><td>none (no <code>retired:</code>/<code>reclaimed:</code>)</td><td><code>u cosmix-&lt;d&gt; &lt;uid&gt; …</code> (materializes)</td><td>No — it is in use</td></tr>
+<tr><td><strong>retired</strong></td><td><code>retired: &lt;date&gt;</code></td><td>comment <code># quarantine: …</code> (does <strong>not</strong> materialize)</td><td>No — in quarantine (R8)</td></tr>
+<tr><td><strong>reclaimed</strong></td><td><code>retired: &lt;date&gt;</code> + <code>reclaimed: &lt;date&gt;</code> + <code>verifier: &lt;record&gt;</code></td><td>comment <code># reclaimed: …</code> (does <strong>not</strong> materialize)</td><td>Yes — back in the free pool (R7)</td></tr>
+</tbody></table>
+<p>Transitions:</p>
+<ol>
+<li><strong>live → retired.</strong> The operator decommissions the citizen
+(removes its unit, stops/disables it, deletes its
+<code>/usr/local/lib/cosmix/&lt;d&gt;.mix</code>). The Appendix A row gains
+<code>retired: &lt;date&gt;</code>; the row is <strong>kept</strong> (never deleted — R7) and
+stops materializing as a <code>u</code> line. The 30-day quarantine clock
+(R8(b)) starts at <code>&lt;date&gt;</code>.</li>
+<li><strong>retired → reclaimed.</strong> Only when <strong>both</strong> R8 gates pass
+(automated mesh-wide purge-verification <em>and</em> the 30-day window).
+The operator adds <code>reclaimed: &lt;date&gt;</code> and <code>verifier: &lt;record&gt;</code>;
+the UID re-enters the citizen free pool (R7). The row remains in
+Appendix A as an audit record (comment-only projection).</li>
+<li><strong>(re-)allocation.</strong> A reclaimed UID may be assigned to a <em>new</em>
+citizen by appending a <strong>new</strong> live row with the same UID and a
+different name. The prior <code>reclaimed:</code> row(s) for that UID are
+retained for audit. The CI lint (§8.2 L5) enforces that <strong>at most
+one non-reclaimed row</strong> (live or retired) exists per citizen UID
+at any time, and that every <code>reclaimed:</code> row carries both a
+<code>reclaimed:</code> date and a <code>verifier:</code> token.</li>
+</ol>
+<p>A row that is <code>retired:</code> but has never satisfied R8 stays in
+quarantine indefinitely; it is the citizen-class equivalent of a
+tombstone and SHALL NOT be reclaimed until both gates pass. There is
+no "never-functional" citizen short-cut analogous to R2.a — the
+uniform-footprint purge-verification (R8(a)) already subsumes the
+never-functional case (a never-started citizen trivially passes the
+<code>find</code>/unit/state checks), and the quarantine window still applies.</p>
+<hr />
+<h2 id="3-filesystem-layout">3. Filesystem Layout</h2>
+<h3 id="31-directory-hierarchy">3.1 Directory hierarchy</h3>
+<p>Every Cosmix daemon's on-disk presence SHALL conform to the following
+hierarchy. The structure mirrors across all five trees: each daemon
+owns a leaf named <code>&lt;d&gt;/</code> corresponding to its registry name minus the
+<code>cosmix-</code> prefix.</p>
+<table><thead><tr><th>Path</th><th>Purpose</th><th>Created by</th><th>Owner / mode</th></tr></thead><tbody>
+<tr><td><code>/etc/cosmix/</code></td><td>Configuration root</td><td>Cosmix package</td><td><code>root:root 0755</code></td></tr>
+<tr><td><code>/etc/cosmix/&lt;d&gt;/</code></td><td>Per-daemon configuration</td><td>Cosmix package</td><td><code>root:root 0755</code></td></tr>
+<tr><td><code>/etc/cosmix/&lt;d&gt;/config.toml</code></td><td>Daemon configuration file</td><td>Cosmix package</td><td>see §3.3</td></tr>
+<tr><td><code>/var/lib/cosmix/</code></td><td>State root</td><td>systemd-sysusers / package</td><td><code>root:root 0755</code></td></tr>
+<tr><td><code>/var/lib/cosmix/&lt;d&gt;/</code></td><td>Per-daemon writable state</td><td><code>StateDirectory=cosmix/&lt;d&gt;</code></td><td><code>cosmix-&lt;d&gt;:cosmix-&lt;d&gt; 0750</code></td></tr>
+<tr><td><code>/var/lib/cosmix/&lt;shared&gt;/</code></td><td>Substrate-shared state (§3.4)</td><td>Cosmix package</td><td><code>root:root 0755</code></td></tr>
+<tr><td><code>/run/cosmix/&lt;d&gt;/</code></td><td>Per-daemon ephemeral runtime</td><td><code>RuntimeDirectory=cosmix/&lt;d&gt;</code></td><td><code>cosmix-&lt;d&gt;:cosmix-&lt;d&gt; 0750</code></td></tr>
+<tr><td><code>/var/cache/cosmix/&lt;d&gt;/</code></td><td>Per-daemon cache (OPTIONAL)</td><td><code>CacheDirectory=cosmix/&lt;d&gt;</code></td><td><code>cosmix-&lt;d&gt;:cosmix-&lt;d&gt; 0750</code></td></tr>
+<tr><td><code>/usr/share/cosmix/&lt;d&gt;/</code></td><td>Per-daemon read-only data</td><td>Cosmix package</td><td><code>root:root 0755</code></td></tr>
+<tr><td><code>/usr/share/cosmix/spec/</code></td><td>Substrate-wide read-only data (specs, schemas)</td><td>Cosmix package</td><td><code>root:root 0755</code></td></tr>
+<tr><td><code>/var/log/cosmix/&lt;d&gt;/</code></td><td>Per-daemon file logs (CONDITIONAL — see §3.5)</td><td><code>LogsDirectory=cosmix/&lt;d&gt;</code></td><td><code>cosmix-&lt;d&gt;:cosmix-&lt;d&gt; 0750</code></td></tr>
+</tbody></table>
+<p>Unit files SHALL use the <strong>nested</strong> form (<code>StateDirectory=cosmix/&lt;d&gt;</code>),
+not the flat form (<code>StateDirectory=cosmix-&lt;d&gt;</code>). The flat form is
+forbidden because it produces sibling directories that defeat the
+unified-parent property.</p>
+<p>Unit files SHALL NOT mix nested-form (<code>StateDirectory=cosmix/&lt;d&gt;</code>) with
+parent-form (<code>StateDirectory=cosmix</code>) across the daemon set. The parent
+<code>cosmix/</code> is owned by <code>root:root</code>; if any unit declares <code>StateDirectory=cosmix</code>,
+ownership of the parent collapses to that daemon and other daemons lose
+traversal guarantees.</p>
+<h3 id="32-ownership-matrix">3.2 Ownership matrix</h3>
+<p>The default ownership and mode for each directory class:</p>
+<table><thead><tr><th>Class</th><th>Owner</th><th>Group</th><th>Mode</th><th>Daemon access</th></tr></thead><tbody>
+<tr><td>Tree roots (<code>/etc/cosmix/</code>, <code>/var/lib/cosmix/</code>, <code>/run/cosmix/</code>, <code>/usr/share/cosmix/</code>)</td><td><code>root</code></td><td><code>root</code></td><td><code>0755</code></td><td>Traverse only</td></tr>
+<tr><td>Daemon leaf (state, runtime, cache, logs)</td><td><code>cosmix-&lt;d&gt;</code></td><td><code>cosmix-&lt;d&gt;</code></td><td><code>0750</code></td><td>Read/write</td></tr>
+<tr><td>Daemon leaf (config, share)</td><td><code>root</code></td><td><code>root</code> or <code>cosmix-&lt;d&gt;</code></td><td><code>0755</code> or <code>0750</code> (see §3.3)</td><td>Read only</td></tr>
+<tr><td>Substrate-shared state (§3.4)</td><td><code>root</code></td><td><code>root</code></td><td><code>0755</code></td><td>Traverse + explicit ABP-contract write only</td></tr>
+</tbody></table>
+<h3 id="33-configuration-ownership">3.3 Configuration ownership</h3>
+<p>Daemons SHALL NOT own their own configuration files. Configuration is
+owned by the package or the operator, not by the daemon process. The
+ownership rules are:</p>
+<ul>
+<li><strong>Non-secret configuration:</strong> <code>root:root 0644</code> for the file,
+<code>root:root 0755</code> for the containing directory. This is the case
+satisfied by <code>ConfigurationDirectory=cosmix/&lt;d&gt;</code> alone, because
+<code>systemd.exec(5)</code> documents that <code>ConfigurationDirectory=</code> does
+<em>not</em> chown the directory to the daemon's <code>User=</code>/<code>Group=</code> (unlike
+<code>StateDirectory=</code>). The <code>0755</code> mode allows world-traverse to the
+config file, which the daemon reads as a regular user.</li>
+<li><strong>Configuration containing secrets</strong> (API tokens, TLS keys,
+database passwords, ABP credentials): <code>root:cosmix-&lt;d&gt; 0640</code> for
+the file, <code>root:cosmix-&lt;d&gt; 0750</code> for the containing directory.
+Because <code>ConfigurationDirectory=</code> does not set group ownership,
+the secret-config directory SHALL be created by the package
+installer or by a <code>tmpfiles.d</code> fragment with the correct
+<code>root:cosmix-&lt;d&gt; 0750</code> ownership <em>before</em> the unit starts, and
+the unit SHALL declare <code>ConfigurationDirectoryMode=0750</code>. The
+registry user (§2) SHALL exist before this directory is
+materialised: the installer (or boot sequence) SHALL run
+<code>systemd-sysusers</code> before <code>systemd-tmpfiles --create</code> invokes the
+Cosmix tmpfiles fragment, so that the <code>cosmix-&lt;d&gt;</code> group exists
+when the tmpfiles fragment chowns the directory. This is an
+installer/boot ordering requirement, not a property of the
+tmpfiles fragment itself.</li>
+<li><strong>TLS keypairs read by more than one daemon</strong> (e.g. a host
+certificate consumed by both <code>cosmix-maild</code> and <code>cosmix-webd</code>):
+<code>root:cosmix-tls 0640</code> for the private key. The <code>cosmix-tls</code>
+shared-credential group (§2.2) SHALL be the access mechanism;
+per-host POSIX ACLs (<code>setfacl u:cosmix-&lt;d&gt;:r …</code>) SHALL NOT be used
+for this case. Each consuming daemon's <code>cosmix-&lt;d&gt;</code> user SHALL be
+added to <code>cosmix-tls</code> via the canonical sysusers fragment so that
+the membership is reproducible and auditable rather than a
+per-host operator action. The certificate (public material) MAY
+remain <code>root:root 0644</code>. This pattern keeps the daemons mutually
+isolated — neither daemon's primary group grants the other any
+access — while avoiding both the per-host ACL workaround and the
+<code>acl</code> package dependency on hosts (e.g. Debian 13) that do not
+ship <code>setfacl</code> by default.</li>
+<li><strong>Daemon-writable runtime state derived from config</strong> (e.g. a
+generated cache of resolved DNS names) SHALL be written under
+<code>/var/lib/cosmix/&lt;d&gt;/</code> or <code>/var/cache/cosmix/&lt;d&gt;/</code>, never back into
+<code>/etc/cosmix/&lt;d&gt;/</code>.</li>
+</ul>
+<p>A daemon process SHALL NOT have write access to <code>/etc/cosmix/&lt;d&gt;/</code>.
+This is enforced by <code>ReadOnlyPaths=/etc/cosmix</code> (or the equivalent
+implicit guarantee from <code>ProtectSystem=strict</code> plus a
+<code>ReadWritePaths=</code> allow-list that excludes <code>/etc/cosmix</code>).</p>
+<h3 id="34-substrate-shared-state">3.4 Substrate-shared state</h3>
+<p>Some state is owned by the substrate as a whole, not by any individual
+daemon. Examples (each governed by its own SPEC or doc):</p>
+<ul>
+<li><code>/var/lib/cosmix/registry/</code> — service-name registry (planned)</li>
+<li><code>/var/lib/cosmix/topology/</code> — mesh topology snapshot (planned)</li>
+<li><code>/var/lib/cosmix/spec/</code> — SPEC delivery cache (per SPEC 07)</li>
+</ul>
+<p>These directories are owned by <code>root:root 0755</code>. Daemons SHALL access
+them only through one of:</p>
+<ol>
+<li><strong>Read-only traversal</strong>, with no writes;</li>
+<li><strong>An explicit ABP contract</strong> that delegates writes to a designated
+substrate service (e.g. <code>cosmix-noded</code> may write to
+<code>/var/lib/cosmix/registry/</code> because the registry is part of its
+contract); or</li>
+<li><strong>A supplemental group</strong> that grants the specific daemon write
+access, with the supplemental group declared in this SPEC's
+amendment record.</li>
+</ol>
+<p>Daemons SHALL NOT use file ownership of substrate-shared directories
+to coordinate. Cross-daemon coordination is ABP, not filesystem.</p>
+<h3 id="35-logging">3.5 Logging</h3>
+<p><code>/var/log/cosmix/&lt;d&gt;/</code> SHALL exist only when a daemon emits log files
+directly. Daemons that log via <code>journald</code> (the default) SHALL NOT
+declare <code>LogsDirectory=</code>. The <code>/var/log/cosmix/</code> parent SHALL NOT be
+created unless at least one daemon requires it, to avoid empty-tree
+litter.</p>
+<h3 id="36-backup-restore-and-image-transfer-boundary">3.6 Backup, restore, and image-transfer boundary</h3>
+<p>The 500–599 window is <strong>preferred</strong>, not globally reserved (§2.1).
+Numeric ownership of files in <code>/var/lib/cosmix/</code> is therefore only
+meaningful on a host that has passed §6.2 verification. The
+following SHALL hold:</p>
+<ul>
+<li>Backup, restore, snapshot, replication, container-image, and
+rsync-style transfer tooling SHALL NOT interpret numeric UID/GID
+500–599 ownership as "Cosmix-owned" on a target host before that
+host has passed §6.2 verification.</li>
+<li>A restore that places <code>/var/lib/cosmix/</code> content onto a host
+failing §6.2 SHALL be reported as a fail-closed condition; the
+restore tool SHALL NOT chown the tree to satisfy the registry.</li>
+<li>Bind-mounting <code>/var/lib/cosmix/&lt;d&gt;/</code> from a host into a container
+is permitted only when the container's registry projection
+(sysusers fragment baked into the container image) matches the
+host's. Mismatched projections SHALL be treated as a §6.2 failure
+inside the container. When the container uses user-namespace
+remapping (e.g. systemd-nspawn with a private user namespace, or
+rootless Podman), the
+comparison SHALL be made against the <em>effective</em> UIDs/GIDs
+visible inside the container's mount namespace — i.e. the
+remapped IDs, not the host-side IDs. A registry user whose
+remapped ID falls outside the 500–599 window inside the
+container is a fail-closed condition.</li>
+</ul>
+<p>This boundary protects against a class of cross-host confused-deputy
+attacks where files restored from a backup of a Cosmix host end up
+owned by an unrelated UID 500–599 on the destination host.</p>
+<hr />
+<h2 id="4-sysusersd-derivation">4. sysusers.d Derivation</h2>
+<h3 id="41-canonical-source">4.1 Canonical source</h3>
+<p>The Markdown table in Appendix A is the <strong>single canonical source</strong> for
+the registry. The <code>/usr/lib/sysusers.d/cosmix.conf</code> fragment is a
+<strong>generated artifact</strong>.</p>
+<p>When the canonical Markdown and the generated fragment disagree, the
+canonical Markdown is authoritative. CI (§8.2) SHALL reject any commit
+in which they disagree.</p>
+<h3 id="42-generated-artifact">4.2 Generated artifact</h3>
+<p>The generated fragment SHALL be installed at
+<code>/usr/lib/sysusers.d/cosmix.conf</code>. It SHALL be machine-applied via
+<code>systemd-sysusers</code> at install time (§6) and at every package update.</p>
+<h3 id="43-syntax">4.3 Syntax</h3>
+<p>Each registry entry SHALL produce a <code>sysusers.d</code> line of the form:</p>
+<pre><code>u &lt;name&gt; &lt;uid&gt; "&lt;gecos&gt;" /nonexistent /usr/sbin/nologin
+</code></pre>
+<ul>
+<li>The <code>u</code> directive (lowercase <code>u</code>, no <code>!</code>) creates a system user.
+Cosmix does not use the <code>u!</code> form (which marks the user as
+system-only and prevents login by some tools' heuristics) because
+<code>nologin</code> shell already prevents interactive use, and <code>u!</code> adds a
+non-uniformity that complicates automation.</li>
+<li>The home directory SHALL be <code>/nonexistent</code>. Daemons own state under
+<code>/var/lib/cosmix/&lt;d&gt;/</code>, not under a traditional home.</li>
+<li>The shell SHALL be <code>/usr/sbin/nologin</code>. (<code>/sbin/nologin</code> is also
+acceptable on systems that use the older path; the generator SHALL
+pick the path that exists on the target host.)</li>
+<li>The GECOS field SHALL be the descriptive role string from the
+registry, double-quoted.</li>
+<li>The matching group SHALL be created implicitly by <code>systemd-sysusers</code>
+when only a <code>u</code> line is given. No separate <code>g</code> line is required;
+one MAY be added if a future daemon needs supplemental group
+membership beyond its primary group.</li>
+</ul>
+<p>Tombstoned entries SHALL appear in the generated fragment as comments
+of the form:</p>
+<pre><code># tombstone: &lt;name&gt; &lt;uid&gt; retired &lt;date&gt; — &lt;reason&gt;
+</code></pre>
+<p><strong>Citizen-identity entries</strong> project per their §2.5 lifecycle state:</p>
+<ul>
+<li>
+<p>A <strong>live</strong> citizen row produces a normal <code>u</code> line, <em>identical in
+shape</em> to a daemon-identity <code>u</code> line (no <code>:gid</code> suffix; same
+<code>/nonexistent</code> home and <code>nologin</code> shell):</p>
+<pre><code>u &lt;name&gt; &lt;uid&gt; "&lt;gecos&gt;" /nonexistent /usr/sbin/nologin
+</code></pre>
+</li>
+<li>
+<p>A <strong>retired</strong> (in-quarantine) citizen row SHALL NOT materialize a
+<code>u</code> line; it appears as a comment of the form:</p>
+<pre><code># quarantine: &lt;name&gt; &lt;uid&gt; retired &lt;date&gt; — eligible &lt;date+30d&gt; (SPEC-10 R8)
+</code></pre>
+</li>
+<li>
+<p>A <strong>reclaimed</strong> citizen row SHALL NOT materialize a <code>u</code> line; it
+appears as a comment of the form:</p>
+<pre><code># reclaimed: &lt;name&gt; &lt;uid&gt; retired &lt;date&gt; reclaimed &lt;date&gt; verifier &lt;record&gt;
+</code></pre>
+</li>
+</ul>
+<p>Citizen <code>u</code> lines are emitted in their own sub-block, after the
+daemon-identity <code>u</code> lines and the shared-credential <code>g</code>/<code>m</code> lines, so
+the three streams stay visually separable in the fragment (§9.1).</p>
+<hr />
+<h2 id="5-systemd-unit-requirements">5. systemd Unit Requirements</h2>
+<h3 id="51-required-directives">5.1 Required directives</h3>
+<h4 id="511-system-service-daemons">5.1.1 System-service daemons</h4>
+<p>Every system-service Cosmix daemon's <code>cosmix-&lt;d&gt;.service</code> unit file SHALL
+include the following directives in <code>[Service]</code>:</p>
+<table><thead><tr><th>Directive</th><th>Value</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>User=</code></td><td><code>cosmix-&lt;d&gt;</code></td><td>Match registry</td></tr>
+<tr><td><code>Group=</code></td><td><code>cosmix-&lt;d&gt;</code></td><td>Match registry</td></tr>
+<tr><td><code>StateDirectory=</code></td><td><code>cosmix/&lt;d&gt;</code></td><td>Materialize <code>/var/lib/cosmix/&lt;d&gt;/</code></td></tr>
+<tr><td><code>RuntimeDirectory=</code></td><td><code>cosmix/&lt;d&gt;</code></td><td>Materialize <code>/run/cosmix/&lt;d&gt;/</code></td></tr>
+<tr><td><code>ConfigurationDirectory=</code></td><td><code>cosmix/&lt;d&gt;</code></td><td>Materialize <code>/etc/cosmix/&lt;d&gt;/</code> (read-only at runtime)</td></tr>
+<tr><td><code>ProtectSystem=</code></td><td><code>strict</code></td><td>Read-only <code>/usr</code>, <code>/boot</code>, <code>/etc</code></td></tr>
+<tr><td><code>ProtectHome=</code></td><td><code>true</code></td><td>No <code>/home</code>, <code>/root</code>, <code>/run/user</code> access</td></tr>
+<tr><td><code>PrivateTmp=</code></td><td><code>true</code></td><td>Per-daemon <code>/tmp</code> namespace</td></tr>
+<tr><td><code>NoNewPrivileges=</code></td><td><code>true</code></td><td>Block <code>setuid</code>/<code>setgid</code> escalation</td></tr>
+</tbody></table>
+<h4 id="512-registered-systemd-user-daemons">5.1.2 Registered systemd-user daemons</h4>
+<p>A registry entry MAY be classified by an amendment as a <strong>registered
+systemd-user daemon</strong> when its live service must inherit resources belonging to
+the logged-in session and cannot truthfully run under its reserved POSIX row.
+Version 1.4.3 classifies only <code>cosmix-interactd</code> this way (§7.3). This is a
+closed class: placing a unit under the user manager does not implicitly earn
+the exception.</p>
+<p>A registered systemd-user daemon's unit SHALL:</p>
+<ul>
+<li>be installed for the user manager and run as the logged-in user;</li>
+<li>omit <code>User=</code>, <code>Group=</code>, <code>DynamicUser=</code>, <code>StateDirectory=</code>,
+<code>RuntimeDirectory=</code>, and <code>ConfigurationDirectory=</code>;</li>
+<li>declare <code>After=graphical-session.target</code> and
+<code>PartOf=graphical-session.target</code> when it consumes the session D-Bus;</li>
+<li>use an absolute <code>/opt/cosmix/bin/cosmix-&lt;d&gt;</code> <code>ExecStart=</code> and declare
+<code>Restart=on-failure</code>; and</li>
+<li>rely on the daemon's broker reconnect loop instead of declaring
+<code>After=</code>/<code>Requires=cosmix-noded.service</code>, because system and user managers
+do not share a dependency graph.</li>
+</ul>
+<p>Session-bus access under <code>/run/user/&lt;uid&gt;/bus</code> is explicitly permitted for this
+class. The reserved SPEC-10 POSIX row remains sysusers/preflight and future
+namespace-ownership material; it is not asserted as the live process UID/GID.</p>
+<h3 id="52-hardening-expectations">5.2 Hardening expectations</h3>
+<p>This subsection defines the <strong>Level 2 mandatory hardening set</strong> for
+system-service daemons. At conformance Level 2 (§8.1), every such daemon's <code>[Service]</code>
+section SHALL include each of the following directives, in the
+<strong>canonical hardening order</strong> given by the row order of the table
+below, <strong>with the exact value shown</strong> — except for the four
+directives where a named alternative is permitted:</p>
+<ul>
+<li><code>RestrictAddressFamilies=</code> MAY be a strict subset of
+<code>AF_UNIX AF_INET AF_INET6</code> (i.e. the daemon MAY drop families it
+does not need; it MUST NOT add others).</li>
+<li><code>SystemCallFilter=</code> MAY add daemon-specific deny filters
+(<code>SystemCallFilter=~@&lt;group&gt;</code>), but the base allow filter SHALL
+remain <code>@system-service</code>.</li>
+<li><code>CapabilityBoundingSet=</code> MAY be either empty or a non-empty
+<code>CAP_*</code> allow-list. A non-empty value SHALL list only <code>CAP_*</code>
+tokens (no minus operators, no <code>~</code> complement form).</li>
+<li><code>AmbientCapabilities=</code> MAY be either empty or a non-empty
+<code>CAP_*</code> allow-list. A non-empty value SHALL be a subset of
+<code>CapabilityBoundingSet=</code> (per <code>systemd.exec(5)</code> semantics) and
+SHALL list only <code>CAP_*</code> tokens.</li>
+</ul>
+<p>Any other deviation is permitted only via an in-line deviation
+comment placed in canonical order at the position the directive
+would otherwise occupy. The comment SHALL match the exact form</p>
+<pre><code># §5.2 deviation: &lt;Directive&gt;= — &lt;reason&gt;
+</code></pre>
+<p>where <code>&lt;Directive&gt;=</code> is the directive name with a single trailing
+<code>=</code> (e.g. <code>MemoryDenyWriteExecute=</code>). Documented deviations are
+permitted at Level 2; silent omissions and value drift are not.</p>
+<p><strong>Boolean normalisation.</strong> Boolean values in this table use the
+canonical <code>true</code> / <code>false</code> form. Implementations and the CI lint
+SHALL treat the systemd-equivalent spellings (<code>yes</code>/<code>on</code>/<code>1</code>,
+<code>no</code>/<code>off</code>/<code>0</code>, per <code>systemd.syntax(5)</code>) as identical for §5.2
+conformance purposes. The §9.2 example uses <code>yes</code>/<code>no</code> to match
+common upstream systemd unit conventions.</p>
+<table><thead><tr><th>Directive</th><th>Level 2 value</th></tr></thead><tbody>
+<tr><td><code>RestrictAddressFamilies=</code></td><td><code>AF_UNIX AF_INET AF_INET6</code> (or a strict subset)</td></tr>
+<tr><td><code>RestrictNamespaces=</code></td><td><code>true</code></td></tr>
+<tr><td><code>RestrictRealtime=</code></td><td><code>true</code></td></tr>
+<tr><td><code>RestrictSUIDSGID=</code></td><td><code>true</code></td></tr>
+<tr><td><code>LockPersonality=</code></td><td><code>true</code></td></tr>
+<tr><td><code>MemoryDenyWriteExecute=</code></td><td><code>true</code></td></tr>
+<tr><td><code>SystemCallArchitectures=</code></td><td><code>native</code></td></tr>
+<tr><td><code>SystemCallFilter=</code></td><td><code>@system-service</code> plus daemon-specific add/deny lists</td></tr>
+<tr><td><code>ProtectKernelTunables=</code></td><td><code>true</code></td></tr>
+<tr><td><code>ProtectKernelModules=</code></td><td><code>true</code></td></tr>
+<tr><td><code>ProtectKernelLogs=</code></td><td><code>true</code></td></tr>
+<tr><td><code>ProtectControlGroups=</code></td><td><code>true</code></td></tr>
+<tr><td><code>ProtectProc=</code></td><td><code>invisible</code></td></tr>
+<tr><td><code>ProcSubset=</code></td><td><code>pid</code></td></tr>
+<tr><td><code>CapabilityBoundingSet=</code></td><td>empty, or an explicit <code>CAP_*</code> allow-list</td></tr>
+<tr><td><code>AmbientCapabilities=</code></td><td>empty, or an explicit <code>CAP_*</code> allow-list</td></tr>
+<tr><td><code>UMask=</code></td><td><code>0027</code></td></tr>
+</tbody></table>
+<p>CI lint L13 (§8.2) is the enforcement contract for this table.</p>
+<p>A daemon's unit file SHOULD declare <code>ReadWritePaths=</code> only when the
+state directory machinery (<code>StateDirectory=</code>, <code>RuntimeDirectory=</code>)
+is insufficient. Adding a path here is a privilege escalation
+relative to the default; it SHALL carry a comment explaining the
+need.</p>
+<h3 id="53-forbidden-directives">5.3 Forbidden directives</h3>
+<p>The following directives SHALL NOT appear in any Cosmix daemon's
+service unit:</p>
+<ul>
+<li><code>DynamicUser=</code> — incompatible with the fixed registry. Conflicts
+with the append-only and never-reused invariants and produces UIDs
+in 61184–65519 that are not under registry control.</li>
+<li><code>User=root</code> — Cosmix daemons do not run as root. A daemon that
+legitimately requires root capability (e.g. binding port &lt; 1024)
+SHALL use <code>AmbientCapabilities=</code> and the relevant <code>CAP_*</code> token
+rather than running as root.</li>
+<li><code>User=</code> matching a UID outside the registry — every Cosmix daemon
+SHALL run as its registered identity.</li>
+</ul>
+<h3 id="54-unit-ordering-and-dependencies">5.4 Unit ordering and dependencies</h3>
+<p>System-service <code>cosmix-&lt;d&gt;.service</code> units SHALL declare:</p>
+<ul>
+<li><code>After=network-online.target</code> (for daemons requiring network)</li>
+<li><code>Wants=network-online.target</code> (matching pair)</li>
+<li><code>After=cosmix-noded.service</code> for any daemon that registers as an
+ABP service (registration requires the local broker be up first),
+with one exception (next bullet)</li>
+<li><code>Requires=cosmix-noded.service</code> is OPTIONAL; daemons MAY survive
+broker bounces and reconnect via ABP's reconnection contract
+(SPEC 01 §10).</li>
+</ul>
+<p>A <strong>registered serve-mode Mix citizen</strong> is a SPEC-10 daemon for the
+purposes of this section: its <code>cosmix-&lt;d&gt;.service</code> unit carries the
+§5.1 required directives and the §5.2 hardening set <em>identically</em> to a
+Rust daemon, differing only in <code>ExecStart=/opt/cosmix/bin/mix --serve /usr/local/lib/cosmix/&lt;d&gt;.mix</code> (the interpreter is the long-running
+process; <code>MemoryDenyWriteExecute=</code> remains <code>true</code> because Mix is a
+tree-walking interpreter with no JIT). Such a unit registers as an ABP
+service and therefore declares <code>After=cosmix-noded.service</code> under the
+rule above, and <code>Requires=cosmix-noded.service</code> is OPTIONAL on the same
+terms (the SPEC 18 §3.3 supervised reconnect contract is the in-process
+counterpart). See SPEC 18 §2 (identity delegated here, not reinvented)
+and SPEC 18 §9 (the Phase 1 unit template).</p>
+<p><strong>Broker-provider exception.</strong> The unit that <em>provides</em> the
+node-local ABP broker (currently <code>cosmix-noded.service</code>, registry
+UID 500, ABP service <code>noded</code>) SHALL NOT declare
+<code>After=cosmix-noded.service</code> or <code>Requires=cosmix-noded.service</code>
+against itself. CI lint L15 (§8.2) is the enforcement contract: it
+requires <code>After=cosmix-noded.service</code> on every other
+ABP-registering unit and excludes the single broker-provider unit.
+If a future amendment moves the broker-provider role to a different
+unit, the exception SHALL move with it; only one unit holds this
+exception at a time.</p>
+<p>Registered systemd-user daemons are exempt from the noded ordering rule and
+MUST NOT name the system-manager <code>cosmix-noded.service</code> in <code>After=</code> or
+<code>Requires=</code>. Their mandatory reconnect loop is the cross-manager startup-race
+control; <code>cosmix-interactd</code> is the v1.4.3 instance (§5.1.2, §7.3).</p>
+<h3 id="55-unit-installation-path-and-the-per-crate-deploy-slice">5.5 Unit installation, PATH, and the per-crate deploy slice</h3>
+<p>(Promoted 2026-07-23 from the cosmix-deployment-layout decision; full
+rationale in git history.)</p>
+<ul>
+<li><strong>Units are linked, not copied.</strong> The canonical unit file lives at
+<code>/opt/cosmix/systemd/cosmix-&lt;d&gt;.service</code>; it is activated via
+<code>systemctl link</code> (a symlink under <code>/etc/systemd/system/</code>), never by
+copying the file. The reinstallable tree stays the single source of
+truth; an image-rebuild or upgrade replaces <code>/opt/cosmix/</code> wholesale and
+the links follow.</li>
+<li><strong>PATH</strong> is provided by a one-line <code>/etc/profile.d/cosmix.sh</code> adding
+<code>/opt/cosmix/bin</code> — no per-user shell config, no parallel installs.</li>
+<li><strong>Users and directories</strong> are declared via <code>/etc/sysusers.d/cosmix.conf</code>
+(generated per §4) and <code>/etc/tmpfiles.d/cosmix.conf</code>; both are applied
+idempotently at boot, never by ad-hoc <code>useradd</code>/<code>mkdir</code> in scripts.</li>
+<li><strong>Each daemon crate carries its own <code>deploy/</code> slice</strong> (unit file, config
+template — <code>*.conf.mix</code> since the fleet-wide conf.mix migration — and
+libexec scripts), mirroring the core-and-citizen pattern into deployment;
+only genuinely cross-cutting artifacts (meta-units, node-role units,
+per-host drop-ins) live outside the crate.</li>
+</ul>
+<hr />
+<h2 id="6-install-time-and-startup-verification">6. Install-Time and Startup Verification</h2>
+<p>The substrate distinguishes three verification phases. Each phase
+runs at a different point in the lifecycle, against a different set
+of expected states, and on a different failure surface. An
+implementation SHALL implement all three.</p>
+<table><thead><tr><th>Phase</th><th>When</th><th>Expected state of registry entries</th><th>On absence</th><th>On wrong UID/GID</th><th>ABP availability</th></tr></thead><tbody>
+<tr><td><strong>Install preflight</strong> (§6.1)</td><td>Before <code>systemd-sysusers</code> materializes entries; before any unit is enabled</td><td>MAY be absent</td><td>OK to create</td><td>Fail closed</td><td>Not assumed</td></tr>
+<tr><td><strong>Post-sysusers verification</strong> (§6.2)</td><td>After <code>systemd-sysusers</code> runs; before any <code>cosmix-*.service</code> is started</td><td>MUST exist</td><td>Fail closed</td><td>Fail closed</td><td>Not assumed</td></tr>
+<tr><td><strong>Startup verification</strong> (§6.3)</td><td>At <code>cosmix-noded</code> startup, before any ABP socket is bound</td><td>MUST exist</td><td>Fail closed</td><td>Fail closed</td><td>Initial run: log locally only (ABP is not up yet by definition). Subsequent reload-time runs: MAY emit on the <code>preflight</code> topic.</td></tr>
+</tbody></table>
+<h3 id="61-install-preflight">6.1 Install preflight</h3>
+<p>Before <code>systemd-sysusers</code> materializes new entries, the installer
+SHALL perform the following preflight, <strong>in order</strong>, with the rules
+that apply to each entry's class:</p>
+<p><strong>Daemon-identity entries</strong> (§2.2):</p>
+<pre><code>For each daemon-identity entry (name, uid):
+    let user_by_uid    = getent passwd &lt;uid&gt;
+    let user_by_name   = getent passwd &lt;name&gt;
+    let group_by_gid   = getent group &lt;uid&gt;     # GID == UID per §2.2
+    let group_by_name  = getent group &lt;name&gt;
+
+    if (user_by_uid empty and user_by_name empty
+        and group_by_gid empty and group_by_name empty):
+        # UID/GID and name both free — sysusers may safely create
+        OK to create
+
+    elif (user_by_uid.name == &lt;name&gt; and user_by_uid.uid == &lt;uid&gt;
+          and user_by_name.uid == &lt;uid&gt;
+          and group_by_gid.name == &lt;name&gt; and group_by_gid.gid == &lt;uid&gt;
+          and group_by_name.gid == &lt;uid&gt;):
+        # Already correctly assigned — no-op
+        OK to skip
+
+    else:
+        # Conflict — fail closed
+        ABORT with diagnostic: which UID/GID is taken by which existing
+        user/group, and which existing user/group holds the cosmix-*
+        name with a different ID. Operator MUST resolve before
+        installation proceeds.
+</code></pre>
+<p><strong>Shared-credential group entries</strong> (§2.2):</p>
+<pre><code>For each shared-credential group entry (name, gid):
+    let user_by_name   = getent passwd &lt;name&gt;     # MUST be empty
+    let group_by_gid   = getent group  &lt;gid&gt;
+    let group_by_name  = getent group  &lt;name&gt;
+
+    if (user_by_name empty
+        and group_by_gid empty and group_by_name empty):
+        # GID and name both free — sysusers may safely create
+        OK to create
+
+    elif (user_by_name empty
+          and group_by_gid.name == &lt;name&gt; and group_by_gid.gid == &lt;gid&gt;
+          and group_by_name.gid == &lt;gid&gt;):
+        # Already correctly assigned — no-op
+        OK to skip
+
+    else:
+        # Conflict — fail closed (includes the case where a
+        # same-named user has appeared, which §2.2 forbids).
+        ABORT with diagnostic: which GID is taken by which existing
+        group, which existing group holds the cosmix-* name with a
+        different GID, or that a user with the same name exists.
+        Operator MUST resolve before installation proceeds.
+</code></pre>
+<p><strong>Citizen-identity entries</strong> (§2.2, §2.5):</p>
+<pre><code>For each citizen-identity entry (name, uid, state):
+    if state == live:
+        # Identical to the daemon-identity preflight: a live citizen
+        # has the same passwd+same-numbered-group shape (GID == UID).
+        apply the Daemon-identity preflight block above, verbatim,
+        to (name, uid).
+
+    else:   # state in { retired, reclaimed }
+        # A retired/reclaimed row does NOT materialize (§4.3). Its
+        # NAME MUST NOT resolve to a live user or group. The check is
+        # by-NAME ONLY — never by UID: if the UID has been
+        # R7-re-allocated it is held by a *different* live citizen
+        # name, preflighted above on its own live row; a by-UID test
+        # would false-positive that legitimate re-allocation, so the
+        # by-name rule needs no R7 exception clause.
+        let user_by_name  = getent passwd &lt;name&gt;
+        let group_by_name = getent group  &lt;name&gt;
+
+        if user_by_name empty and group_by_name empty:
+            # The retired/reclaimed NAME is unbound — OK. A
+            # R7-re-allocated UID held under a *different* live name
+            # is verified by that citizen's own live row, never here.
+            OK to skip
+        else:
+            # A retired/reclaimed citizen NAME is unexpectedly
+            # live (stale projection, drift) — fail closed
+            ABORT with diagnostic: retired/reclaimed citizen &lt;name&gt;
+            (&lt;uid&gt;) name resolves to a live user/group; operator MUST
+            run the §2.5 / R8 remediation (userdel on every
+            projecting node) before installation proceeds.
+</code></pre>
+<p>The R8 reuse gate (purge-verification + quarantine) is an <strong>operator
+amendment-time</strong> procedure performed when a row transitions
+retired→reclaimed in the canonical source; it is <strong>not</strong> an
+install-time check. Install preflight only enforces the <em>projection</em>
+consequence: a retired/reclaimed row fails closed if it is
+unexpectedly live on the host.</p>
+<p>Membership lines (<code>m &lt;user&gt; &lt;group&gt;</code>) are not preflighted on their
+own: they take effect only when <code>systemd-sysusers</code> runs Phase 3, at
+which point the §6.2 post-sysusers verification re-asserts every
+declared membership.</p>
+<p>The install preflight SHALL NOT auto-correct, auto-allocate, or
+rename to bypass a conflict.</p>
+<h3 id="62-post-sysusers-verification">6.2 Post-sysusers verification</h3>
+<p>After <code>systemd-sysusers</code> has been invoked, and before any
+<code>cosmix-*.service</code> unit is enabled or started, the installer SHALL
+re-query each registry entry and SHALL fail closed under the rules
+that apply to the entry's class:</p>
+<ul>
+<li><strong>Daemon-identity entries</strong> (§2.2) SHALL resolve to a user <em>and</em>
+same-numbered group with <code>uid == gid == registered UID</code> and
+<code>name == registered name</code>.</li>
+<li><strong>Shared-credential group entries</strong> (§2.2) SHALL resolve to a
+group with <code>gid == registered GID</code> and <code>name == registered name</code>,
+and SHALL have <em>no</em> associated user with the same name. In
+addition, every membership pair declared in the canonical
+sysusers fragment for that group (each <code>m &lt;user&gt; &lt;group&gt;</code> line)
+SHALL be present in <code>getent group &lt;group&gt;</code>'s membership list.</li>
+<li><strong>Citizen-identity entries</strong> (§2.2, §2.5): a <strong>live</strong> citizen row
+SHALL resolve to a user <em>and</em> same-numbered group with
+<code>uid == gid == registered UID</code> and <code>name == registered name</code>
+(the daemon-identity rule, applied unchanged). A <strong>retired</strong> or
+<strong>reclaimed</strong> citizen row is comment-only (§4.3) and its
+<strong>name</strong> SHALL NOT resolve to a live user or group. The check is
+<strong>by name only — never by UID</strong>: if the retired/reclaimed UID has
+been R7-re-allocated it is held by a <em>different</em> live citizen
+<em>name</em>, which is verified independently by that citizen's own live
+row above; a by-UID test would false-positive that legitimate
+re-allocation, so the by-name rule needs no R7 exception clause.</li>
+</ul>
+<p>Any of the following constitutes a fail-closed condition:</p>
+<ul>
+<li>A registry user or group is absent after sysusers should have
+created it (sysusers fragment drift, install ordering bug, or a
+lock contention).</li>
+<li>A registry name resolves to a UID/GID outside the registry.</li>
+<li>A registry UID/GID resolves to a name other than the registered
+name.</li>
+<li>A shared-credential group has unexpectedly acquired a same-named
+user, or has lost a declared membership.</li>
+<li>A tombstoned UID/GID is currently held by a live user or group.</li>
+<li>A <code>retired:</code> or <code>reclaimed:</code> citizen <strong>name</strong> resolves to a live
+user or group (by-name check; the §6.1 retired/reclaimed-state
+check, re-asserted post-sysusers). A UID R7-re-allocated to a
+<em>different</em> live name is <strong>not</strong> a violation — that name is
+verified by its own live row, never by this audit row.</li>
+<li>A citizen UID has more than one non-<code>reclaimed</code> (live or
+<code>retired:</code>) registry row, or a <code>reclaimed:</code> row lacks its
+<code>reclaimed:</code> date or <code>verifier:</code> token (§2.5; CI lint L5 catches
+this in-source, this re-asserts it against the projected state).</li>
+<li>The <code>sysusers.d</code> fragment on disk does not match the canonical
+source.</li>
+</ul>
+<p>Failures here SHALL halt installation with a structured diagnostic
+and SHALL NOT be silently coerced.</p>
+<h3 id="63-startup-verification">6.3 Startup verification</h3>
+<p>At <code>cosmix-noded</code> startup, before any ABP socket is bound, the
+daemon SHALL run §6.2's verification pass against its own registry
+copy. The same fail-closed rules apply: a single mismatch prevents
+the ABP broker socket from binding.</p>
+<p>Because this phase runs before ABP is up, results SHALL be written
+to the daemon's local log channel (systemd journal, with the
+structured fields <code>cosmix.spec=10</code>, <code>cosmix.spec.version=1.0.0</code>,
+<code>cosmix.preflight=ok|fail</code>, and on failure a <code>cosmix.preflight.errors=</code>
+field listing affected entries). Once ABP is up, subsequent
+verification runs (e.g. on broker reload) MAY additionally emit
+structured events on the substrate's <code>preflight</code> topic; absence of
+that topic SHALL NOT be treated as a failure.</p>
+<h3 id="64-idempotency">6.4 Idempotency</h3>
+<p>All three phases are idempotent. Re-running any of them on a
+correctly provisioned host SHALL be a no-op and SHALL exit zero.
+This is the property the CI lint depends on (§8.2).</p>
+<h3 id="65-fail-closed-semantics">6.5 Fail-closed semantics</h3>
+<p>"Fail closed" in this SPEC means: the verifier exits non-zero, no
+<code>cosmix-*.service</code> is started by the installer or broker, and (where
+applicable) the ABP socket is not bound. There SHALL be no fallback
+path that allows partial start-up under a registry mismatch.</p>
+<h3 id="66-read-only-root-and-immutable-image-hosts">6.6 Read-only-root and immutable-image hosts</h3>
+<p>On hosts with read-only root filesystems (e.g. systemd-portabled
+images, OSTree-style deployments), the registry SHALL be applied at
+<strong>image build time</strong>, not at first boot. The <code>sysusers.d</code> fragment is
+baked into the image; first-boot verification is the §6.2 pass
+against the baked state, and runtime verification is §6.3.</p>
+<p>Live mutation of the registry on a read-only-root host is a SPEC
+violation: the only path is to rebuild the image with an amended
+SPEC.</p>
+<hr />
+<h2 id="7-session-scoped-exclusions">7. Session-Scoped Exclusions</h2>
+<h3 id="71-test-for-inclusion">7.1 Test for inclusion</h3>
+<p>A Cosmix process belongs in the daemon registry (§2) if and only if it
+runs <strong>as a system service</strong> with persistent identity across user
+logins. A process is <strong>session-scoped</strong> and excluded from the registry
+if any of the following hold:</p>
+<ul>
+<li>The process binds to a logged-in human seat (Wayland session,
+console, audio group, video group).</li>
+<li>The process consumes per-user XDG state under <code>$XDG_*_HOME</code>.</li>
+<li>The process uses the user D-Bus bus rather than the system bus.</li>
+<li>The process is launched by a <code>systemd --user</code> unit, not a system
+unit.</li>
+<li>The process holds capabilities or file descriptors that are valid
+only within an active session (e.g. a logind session ID).</li>
+</ul>
+<p>If any one of the above holds, the process SHALL run as the logged-in
+human user. It SHALL NOT have a registry entry, a <code>cosmix-*</code> system
+UID, or a <code>/var/lib/cosmix/&lt;d&gt;/</code> daemon leaf.</p>
+<h3 id="72-listed-exclusions">7.2 Listed exclusions</h3>
+<p>The following Cosmix components are session-scoped and excluded from
+the registry as of this SPEC's publication:</p>
+<table><thead><tr><th>Component</th><th>Reason</th></tr></thead><tbody>
+<tr><td><code>cosmix-comp</code> and native CTK applications</td><td>Desktop processes bound to the logged-in seat/session; the compositor is specified by SPEC 16</td></tr>
+</tbody></table>
+<p>Future Cosmix components SHALL apply the test in §7.1 to decide
+inclusion. (<code>cosmix-menu</code> was previously listed here; the crate was
+removed when its assumptions — XDG-tray launcher for a desktop full
+of Dioxus apps — no longer matched the post-pivot Cosmix surface.)</p>
+<h3 id="73-cosmix-interactd-reserved-identity-and-session-runtime">7.3 <code>cosmix-interactd</code> reserved identity and session runtime</h3>
+<p><code>cosmix-interactd</code> is the narrow exception to §7.1's “no registry entry”
+rule. UID/GID <strong>517</strong> reserves a stable POSIX identity for the interaction
+namespace and any future system-owned persisted props projection, but the
+current notify.v1 implementation is memory-backed and its freedesktop sink
+requires the logged-in user's session D-Bus. The shipped process therefore
+MUST run from <code>cosmix-interactd.service</code> as a <code>systemd --user</code> service under
+the logged-in user and conform to §5.1.2; it MUST NOT claim that its live
+process is running as <code>cosmix-interactd</code> UID/GID 517.</p>
+<p>This reservation does not grant the session process access to a
+<code>/var/lib/cosmix/interactd/</code> daemon leaf and does not weaken the general
+session-scoped exclusion. A later system-owned persistence helper MAY use the
+reserved identity only through a separately specified trust boundary; until
+then the row is namespace/ownership reservation and preflight material only.</p>
+<hr />
+<h2 id="8-conformance">8. Conformance</h2>
+<h3 id="81-conformance-levels">8.1 Conformance levels</h3>
+<p>A Cosmix installation conforms to this SPEC at one of three levels:</p>
+<p><strong>Level 0 (Pre-conformance).</strong> Daemons run under arbitrary identities,
+without registry verification. Permitted only in a dev box during
+substrate bootstrap. Not permitted on any mesh node.</p>
+<p><strong>Level 1 (Registered).</strong> Every system-service daemon's running UID/GID matches
+its registry entry; every registered systemd-user daemon satisfies §5.1.2 and
+is not claimed to run as its reserved row. The <code>sysusers.d</code> fragment on disk
+matches the canonical source. The applicable §5.1 directives are present.
+Required for every mesh node.</p>
+<p><strong>Level 2 (Hardened).</strong> Level 1 plus the §5.2 hardening directives for
+system-service daemons; registered systemd-user daemons remain governed by
+§5.1.2. Install-time preflight (§6) is executed and logged and CI lint (§8.2)
+is green at the time of last package update. Required for any internet-exposed
+mesh node.</p>
+<h3 id="82-ci-lint-shape">8.2 CI lint shape</h3>
+<p>A CI lint SHALL be runnable in the source tree and SHALL verify all of
+the following invariants. The lint is part of the substrate's
+self-observation surface (per the Three Design Criteria) and is itself
+agent-operable.</p>
+<table><thead><tr><th>ID</th><th>Invariant</th></tr></thead><tbody>
+<tr><td>L1</td><td>Canonical Markdown registry parses without syntax errors into up to three ordered blocks, each opened by its own header row: a <strong>daemon-identity</strong> block (header begins <code>uid</code>) of <code>(name, uid, gid, bus, gecos)</code> tuples (the <code>bus</code> field is either an explicit ABP service name or the placeholder <code>-</code> meaning "default-derive: name minus <code>cosmix-</code> prefix"); an OPTIONAL <strong>shared-credential-group</strong> block (header begins <code>gid</code>) of <code>(name, gid, purpose)</code> tuples (no UID, no ABP service); and an OPTIONAL <strong>citizen-identity</strong> block (header begins <code>cid</code>) of <code>(name, uid, gid, bus, gecos, state)</code> tuples where <code>state</code> is one of live (no <code>retired:</code>/<code>reclaimed:</code>), <code>retired:</code> (with a date), or <code>reclaimed:</code> (with both a <code>retired:</code> and a <code>reclaimed:</code> date and a <code>verifier:</code> token). The lint MUST distinguish the three blocks and apply the per-class rules below.</td></tr>
+<tr><td>L2</td><td>UID == GID for every non-tombstoned daemon-identity entry and for every citizen-identity entry (citizen entries have the daemon-identity shape, §2.2). Enforced via the projected <code>u &lt;name&gt; &lt;uid&gt;</code> form carrying no <code>:gid</code> suffix. (Shared-credential group entries have no UID; this rule does not apply to them.)</td></tr>
+<tr><td>L3</td><td>Allocation is monotonic <em>within each block</em>: daemon UIDs appear in append-only order; shared-credential GIDs appear in append-only order; <strong>non-<code>reclaimed:</code> citizen rows</strong> appear in append-only order. Tombstones (daemon/shared) and <code>retired:</code>/<code>reclaimed:</code> citizen rows appear in their original positions; a <code>reclaimed:</code> citizen UID is exempt from monotonicity because R7 permits below-frontier re-allocation.</td></tr>
+<tr><td>L4</td><td>Every daemon UID and every shared-credential GID is in the 500–599 window; every citizen-identity UID is in the 600–699 citizen band (§2.1). (Or in a window declared by a future amendment.)</td></tr>
+<tr><td>L5</td><td>No tombstoned UID or name appears as a live daemon/shared entry. For the citizen-identity block: at most <strong>one</strong> non-<code>reclaimed:</code> row (live or <code>retired:</code>) exists per citizen UID; every <code>reclaimed:</code> row carries both a <code>reclaimed:</code> date and a non-empty <code>verifier:</code> token; no <code>retired:</code> or <code>reclaimed:</code> citizen row projects a <code>u</code> line (§4.3); a re-allocated UID's new live row has a different <code>name</code> from every prior <code>reclaimed:</code> row for that UID.</td></tr>
+<tr><td>L6</td><td><code>systemd-sysusers --dry-run &lt;build-tree&gt;/cosmix.conf</code> succeeds against the freshly generated fragment in the build tree (not the installed <code>/usr/lib/sysusers.d/</code> copy, which may be older or absent in CI).</td></tr>
+<tr><td>L7</td><td>The generated <code>sysusers.d</code> fragment matches the canonical source (regenerate, diff, fail on diff).</td></tr>
+<tr><td>L8</td><td>Every system-service <code>cosmix-*.service</code> unit carries §5.1.1's directives and its <code>User=</code> / <code>Group=</code> / <code>StateDirectory=</code> / <code>RuntimeDirectory=</code> references a canonical registry name. Every registered systemd-user unit explicitly listed by §5.1.2 instead carries that subsection's directives and omits <code>User=</code> / <code>Group=</code> / <code>DynamicUser=</code> / <code>StateDirectory=</code> / <code>RuntimeDirectory=</code> / <code>ConfigurationDirectory=</code>. A filename alone does not select the user-unit branch.</td></tr>
+<tr><td>L9</td><td>No <code>cosmix-*.service</code> unit declares <code>DynamicUser=</code> or <code>User=root</code>.</td></tr>
+<tr><td>L10</td><td>No daemon-writable path under <code>/etc/cosmix/</code> appears in any unit's <code>ReadWritePaths=</code>.</td></tr>
+<tr><td>L11</td><td>No two units declare conflicting <code>StateDirectory=</code> parents (i.e. one declaring <code>cosmix</code> while another declares <code>cosmix/&lt;d&gt;</code>).</td></tr>
+<tr><td>L12</td><td>The session-scoped exclusion list (§7.2) is consistent: every name listed there has no registry entry; every component with a registry entry is not in the exclusion list.</td></tr>
+<tr><td>L13</td><td>Every system-service <code>cosmix-*.service</code> unit at Level 2 declares each §5.2 directive <strong>with the value listed in the §5.2 table, compared after systemd boolean normalisation</strong> (per <code>systemd.syntax(5)</code>: <code>true</code>/<code>yes</code>/<code>on</code>/<code>1</code> are equivalent for a boolean <code>true</code>; <code>false</code>/<code>no</code>/<code>off</code>/<code>0</code> for <code>false</code>), in canonical hardening order (the row order in the §5.2 table). Named alternatives are accepted only for the four directives listed under §5.2 (<code>RestrictAddressFamilies=</code> strict subset; <code>SystemCallFilter=</code> base allow plus daemon-specific deny filters; <code>CapabilityBoundingSet=</code> and <code>AmbientCapabilities=</code> empty or <code>CAP_*</code> allow-list). Each missing directive is replaced by an in-line comment of the form <code># §5.2 deviation: &lt;Directive&gt;= — &lt;reason&gt;</code> placed in the same canonical order, where <code>&lt;Directive&gt;=</code> is the directive name with trailing <code>=</code>. Registered systemd-user units are checked under L8's §5.1.2 branch, not this system-service hardening table.</td></tr>
+<tr><td>L14</td><td>The R6 split is enforced: every <strong>daemon-identity entry</strong>'s and every <strong>non-<code>retired:</code>/non-<code>reclaimed:</code> citizen-identity entry</strong>'s resolved ABP service name (the explicit <code>bus:</code> value, or the default derivation when <code>bus:</code> is <code>-</code>) matches the regex <code>^[a-z][a-z0-9-]{1,30}$</code>, does not start with <code>cosmix-</code>, and is unique across the <strong>union</strong> of non-tombstoned daemon-identity entries and live citizen-identity entries (a citizen ABP name SHALL NOT collide with a daemon ABP name or another live citizen ABP name — §2.3 R6). (Shared-credential group entries have no ABP service name; this rule does not apply to them.)</td></tr>
+<tr><td>L15</td><td>Every system-service <code>cosmix-*.service</code> unit other than the broker-provider unit that registers as an ABP service declares <code>After=cosmix-noded.service</code>. The broker-provider unit (currently <code>cosmix-noded.service</code> per §5.4) does not order against itself. Registered systemd-user daemons are explicitly exempt from this cross-manager ordering and MUST omit <code>After=</code>/<code>Requires=cosmix-noded.service</code>; the lint verifies that omission and their explicit §5.1.2 classification.</td></tr>
+<tr><td>L16</td><td>The shared-credential-group block in Appendix A and the corresponding <code>g</code>/<code>m</code> lines in the generated <code>sysusers.d</code> fragment agree pairwise: every <code>g &lt;name&gt; &lt;gid&gt;</code> line in the fragment has a matching shared-credential row in Appendix A with identical <code>name</code> and <code>gid</code>, and vice versa. Every <code>m &lt;user&gt; &lt;group&gt;</code> line names a <code>&lt;user&gt;</code> that exists as a daemon-identity entry (non-tombstoned) and a <code>&lt;group&gt;</code> that exists as a shared-credential-group entry (non-tombstoned). Every <code>m &lt;user&gt; &lt;group&gt;</code> line in the fragment SHALL appear after both its referenced <code>u &lt;user&gt;</code> line and its referenced <code>g &lt;group&gt;</code> line (per §9.1), so that <code>systemd-sysusers</code> cannot silently materialize a referent with defaults via its implicit-creation behavior. No shared-credential-group <code>&lt;name&gt;</code> collides with any daemon-identity <code>&lt;name&gt;</code>, and no shared-credential-group <code>&lt;gid&gt;</code> collides with any daemon-identity <code>&lt;uid&gt;</code>.</td></tr>
+<tr><td>L17</td><td>The citizen-identity block in Appendix A and the corresponding citizen <code>u</code> lines in the generated <code>sysusers.d</code> fragment agree pairwise: every <strong>live</strong> citizen row has exactly one matching <code>u cosmix-&lt;name&gt; &lt;uid&gt;</code> fragment line with identical <code>name</code> and <code>uid</code> (and no <code>:gid</code> suffix), and every citizen <code>u</code> line in the fragment has a matching <strong>live</strong> Appendix A citizen row; every <code>retired:</code> row projects exactly one <code># quarantine:</code> comment and <strong>no</strong> <code>u</code> line; every <code>reclaimed:</code> row projects exactly one <code># reclaimed:</code> comment and <strong>no</strong> <code>u</code> line (§4.3). No citizen-identity <code>&lt;name&gt;</code> collides with any daemon-identity or shared-credential-group <code>&lt;name&gt;</code>, and no citizen-identity <code>&lt;uid&gt;</code> collides with any daemon-identity <code>&lt;uid&gt;</code> or shared-credential-group <code>&lt;gid&gt;</code> (the 600–699 band is disjoint from 500–599 so this is structural; the lint asserts it as defence-in-depth). Citizen <code>u</code> lines appear after the daemon-identity <code>u</code> lines and after the shared-credential <code>g</code>/<code>m</code> lines.</td></tr>
+</tbody></table>
+<p>The lint SHALL be invoked by CI on every pull request and SHALL block
+merge on any failure. It MAY also be invoked by the install-time
+preflight (§6) for additional defense in depth.</p>
+<hr />
+<h2 id="9-examples">9. Examples</h2>
+<h3 id="91-generated-sysusersd-fragment">9.1 Generated <code>sysusers.d</code> fragment</h3>
+<p>The fragment below is the canonical projection of Appendix A into
+<code>systemd-sysusers</code> syntax. It SHALL be installed at
+<code>/usr/lib/sysusers.d/cosmix.conf</code> (vendor) or
+<code>/etc/sysusers.d/cosmix.conf</code> (admin override). The order of <code>u</code>
+lines SHALL match the append-only order of the daemon-identity block
+in the canonical registry; the order of <code>g</code> and <code>m</code> lines SHALL
+match the append-only order of the shared-credential-group block.
+<code>m &lt;user&gt; &lt;group&gt;</code> lines SHALL appear after the <code>g &lt;group&gt;</code> line
+they reference and after the <code>u &lt;user&gt;</code> lines they name; this is
+the natural order produced by emitting daemon-identity entries first.
+Citizen-identity <code>u</code> lines (§2.2, v1.2.0) are emitted in their own
+sub-block after the shared-credential <code>g</code>/<code>m</code> lines, and only for
+<strong>live</strong> citizen rows; <code>retired:</code>/<code>reclaimed:</code> rows project as
+comment lines (§4.3) and SHALL NOT emit a <code>u</code> line.</p>
+<pre><code class="language-sysusers"># /usr/lib/sysusers.d/cosmix.conf
+# Generated from Appendix A of cosmix-daemon-identity v1.4.4.
+# DO NOT EDIT — regenerate from the canonical Markdown registry.
+
+# --- Daemon-identity entries (POSIX user + same-numbered group) ---
+#Type Name              ID   GECOS                                Home           Shell
+u     cosmix-noded      500  "Cosmix node daemon (ABP broker)"    /nonexistent   /usr/sbin/nologin
+u     cosmix-maild      501  "Cosmix mail daemon"                 /nonexistent   /usr/sbin/nologin
+u     cosmix-webd       502  "Cosmix web daemon"                  /nonexistent   /usr/sbin/nologin
+u     cosmix-indexd     503  "Cosmix knowledge daemon"            /nonexistent   /usr/sbin/nologin
+u     cosmix-agentd     504  "Cosmix agent runtime"               /nonexistent   /usr/sbin/nologin
+u     cosmix-mcp        505  "Cosmix MCP bridge"                  /nonexistent   /usr/sbin/nologin
+u     cosmix-dnsd       506  "Cosmix authoritative DNS daemon"    /nonexistent   /usr/sbin/nologin
+u     cosmix-cron       507  "Cosmix scheduler"                   /nonexistent   /usr/sbin/nologin
+u     cosmix-prometheus 508  "Cosmix Prometheus (obs tier)"       /nonexistent   /usr/sbin/nologin
+u     cosmix-grafana    509  "Cosmix Grafana (obs tier)"          /nonexistent   /usr/sbin/nologin
+u     cosmix-loki       511  "Cosmix Loki (obs tier)"             /nonexistent   /usr/sbin/nologin
+u     cosmix-alloy      512  "Cosmix Grafana Alloy (obs tier)"    /nonexistent   /usr/sbin/nologin
+u     cosmix-pveexport  513  "Cosmix proxmox-exporter (obs tier)" /nonexistent   /usr/sbin/nologin
+u     cosmix-nodeexport 514  "Cosmix node_exporter (obs tier)"    /nonexistent   /usr/sbin/nologin
+u     cosmix-wgd        515  "Cosmix WireGuard mesh control plane" /nonexistent   /usr/sbin/nologin
+u     cosmix-interactd  517  "Cosmix interaction broker"          /nonexistent   /usr/sbin/nologin
+u     cosmix-nspawnd    518  "Cosmix nspawn host executor"        /nonexistent   /usr/sbin/nologin
+
+# --- Shared-credential groups (group only; no associated user) ---
+# cosmix-tls mediates read access to TLS keypairs shared by ≥2 daemons
+# (SPEC 10 §3.3). Membership lines below add the consuming daemons; new
+# consumers add their own `m cosmix-&lt;d&gt; cosmix-tls` line in this fragment
+# rather than via per-host setfacl.
+g     cosmix-tls     510
+m     cosmix-maild   cosmix-tls
+m     cosmix-webd    cosmix-tls
+# cosmix-mesh mediates read access to the signed mesh inventory (SPEC-13
+# INV-1) under /var/lib/cosmix/noded/, shared by mesh daemons, WITHOUT
+# granting cosmix-noded's group any read on the private d2 seed (§3.3).
+g     cosmix-mesh    516
+m     cosmix-wgd     cosmix-mesh
+
+# --- Citizen-identity entries (POSIX user + same-numbered group) ---
+# Citizen-identity entries (SPEC 10 §2.2, §2.5, v1.2.0) have the exact
+# same on-disk shape as a daemon-identity entry but live in the disjoint
+# 600–699 band and are governed by scoped, gated reuse (§2.3 R7/R8): a
+# retired UID re-enters the free pool only after mesh-wide automated
+# purge-verification AND a 30-day quarantine. Only LIVE citizen rows
+# materialize a `u` line here; retired:/reclaimed: rows are comment-only
+# in the canonical registry (Appendix A) and SHALL NOT appear below
+# (SPEC 10 §4.3, §9.1). The consumer is SPEC 18 (Mix Citizen Runtime).
+u     cosmix-statecache 600 "Cosmix SPEC-18 reference citizen" /nonexistent   /usr/sbin/nologin
+</code></pre>
+<p><code>Home=/nonexistent</code> matches §4.3; daemons and citizens own state
+under <code>/var/lib/cosmix/&lt;d&gt;/</code> created by systemd <code>StateDirectory=</code>
+(§5.1, §3.4), not under a traditional home. <code>Shell=/usr/sbin/nologin</code>
+satisfies the no-interactive-login rule of §4.3. A citizen <code>u</code> line
+is byte-for-byte the same shape as a daemon <code>u</code> line — the difference
+is purely registry governance (§2.3 R7/R8), invisible to
+<code>systemd-sysusers</code>.</p>
+<h3 id="92-service-unit-fragment">9.2 Service unit fragment</h3>
+<p>The fragment below is a minimal, normative example of a Cosmix
+daemon unit at conformance Level 2 (§8.1). It demonstrates §5.1
+required directives, §5.2 hardening directives, and §5.4 ordering.
+Local installations MAY add directives, but SHALL NOT remove or
+weaken any directive shown here.</p>
+<pre><code class="language-ini"># /usr/lib/systemd/system/cosmix-maild.service
+[Unit]
+Description=Cosmix mail daemon
+Documentation=https://cosmix.dev/spec/10
+After=network-online.target cosmix-noded.service
+Wants=network-online.target
+Requires=cosmix-noded.service
+
+[Service]
+Type=notify
+User=cosmix-maild
+Group=cosmix-maild
+StateDirectory=cosmix/maild
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/maild
+RuntimeDirectoryMode=0750
+
+ConfigurationDirectory=cosmix/maild
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/maild
+# %E/cosmix/maild expands to /etc/cosmix/maild — the per-daemon config
+# leaf defined in §3.1. The daemon reads from this path. This example
+# is the non-secret case (root:root 0755 dir, root:root 0644 file) —
+# see §3.3. For a secret-config variant the dir is created in advance
+# by the package or a tmpfiles fragment as root:cosmix-maild 0750, and
+# ConfigurationDirectoryMode= is set to 0750 to match.
+ExecStart=/opt/cosmix/bin/cosmix-maild --config %E/cosmix/maild/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+# Optional belt-and-braces: device namespace lock-down
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li><code>User=</code> and <code>Group=</code> match the canonical registry entry for UID
+501 (Appendix A); CI lint L8 (§8.2) verifies this.</li>
+<li><code>StateDirectory=cosmix/maild</code> causes systemd to create
+<code>/var/lib/cosmix/maild/</code> owned <code>cosmix-maild:cosmix-maild</code> mode
+<code>0750</code> before the daemon starts, satisfying §3.4.</li>
+<li><code>ConfigurationDirectory=cosmix/maild</code> materialises
+<code>/etc/cosmix/maild/</code> (§3.1) and exposes it as <code>%E/cosmix/maild</code>.
+The daemon reads <code>config.toml</code> from there. Per §3.3 the directory
+is read-only at runtime — the unit does not list <code>/etc/cosmix/</code>
+in <code>ReadWritePaths=</code> (lint L10).</li>
+<li><code>Requires=cosmix-noded.service</code> plus <code>After=</code> realises the §5.4
+ordering invariant: the local ABP broker is up before any mesh
+citizen starts.</li>
+<li><code>CapabilityBoundingSet=</code> and <code>AmbientCapabilities=</code> are emptied;
+bind-to-port-25 daemons (e.g. <code>cosmix-maild</code> SMTP inbound) SHOULD
+prefer <code>AmbientCapabilities=CAP_NET_BIND_SERVICE</code> over running as
+root, and SHALL document the deviation in an in-line comment per
+§5.2.</li>
+</ul>
+<h3 id="93-verification--pseudocode">9.3 Verification — pseudocode</h3>
+<p>The pseudocode below illustrates the §6.2 post-sysusers verification
+pass and the §6.3 startup verification pass. It is <strong>not</strong> a
+language reference and is <strong>not</strong> a normative implementation; the
+contract is the prose in §6.1–§6.5. A real implementation MAY be
+written in Mix, Rust, or shell, provided it observes fail-closed
+semantics (§6.5) and emits diagnostics matching §6.3.</p>
+<pre><code># Post-sysusers verification (§6.2) and startup verification (§6.3).
+# Difference: §6.2 expects sysusers has just run; §6.3 expects the
+# users to have existed since the last successful install.
+#
+# The registry has three classes (§2.2 v1.2.0):
+#   * DAEMON_IDENTITY:  rows that own a POSIX user + same-numbered group.
+#   * SHARED_GROUPS:    group-only rows with declared memberships.
+#   * CITIZEN_IDENTITY: live rows verify exactly like DAEMON_IDENTITY;
+#                       a retired:/reclaimed: row's NAME MUST NOT
+#                       resolve to a live user or group (by-name only;
+#                       an R7-re-allocated UID is held under a
+#                       different live name, verified by its own live
+#                       row) (§2.5, §6.2).
+# Each class verifies under its own rule set; failures from any
+# halt installation under §6.5 fail-closed semantics.
+
+DAEMON_IDENTITY = [
+  (500, "cosmix-noded"),      (501, "cosmix-maild"),    (502, "cosmix-webd"),
+  (503, "cosmix-indexd"),     (504, "cosmix-agentd"),   (505, "cosmix-mcp"),
+  (506, "cosmix-dnsd"),       (507, "cosmix-cron"),     (508, "cosmix-prometheus"),
+  (509, "cosmix-grafana"),    (511, "cosmix-loki"),     (512, "cosmix-alloy"),
+  (513, "cosmix-pveexport"), (514, "cosmix-nodeexport"),
+  (515, "cosmix-wgd"),
+  (517, "cosmix-interactd"),
+  (518, "cosmix-nspawnd"),
+]
+
+SHARED_GROUPS = [
+  # (gid, name, members)
+  (510, "cosmix-tls", ["cosmix-maild", "cosmix-webd"]),
+  (516, "cosmix-mesh", ["cosmix-wgd"]),
+]
+
+CITIZEN_IDENTITY = [
+  # (uid, name, state)  state ∈ {"live", "retired", "reclaimed"}
+  (600, "cosmix-statecache", "live"),
+]
+
+errors = []
+
+# --- Daemon-identity entries ---
+for (want_uid, want_name) in DAEMON_IDENTITY:
+    user_by_uid   = getent("passwd", want_uid)    # numeric lookup
+    user_by_name  = getent("passwd", want_name)   # name lookup
+    group_by_gid  = getent("group",  want_uid)
+    group_by_name = getent("group",  want_name)
+
+    # Absence — fail-closed at §6.2 and §6.3
+    if user_by_uid is None or user_by_name is None:
+        errors.append((want_name, "absent"))
+        continue
+    if group_by_gid is None or group_by_name is None:
+        errors.append((want_name, "group absent"))
+        continue
+
+    # Name/UID disagree — somebody else holds the slot
+    if user_by_uid.name != want_name:
+        errors.append((want_name, f"uid {want_uid} held by {user_by_uid.name}"))
+    if user_by_name.uid != want_uid:
+        errors.append((want_name, f"name held by uid {user_by_name.uid}"))
+    if group_by_gid.name != want_name:
+        errors.append((want_name, f"gid {want_uid} held by {group_by_gid.name}"))
+    if group_by_name.gid != want_uid:
+        errors.append((want_name, f"group held by gid {group_by_name.gid}"))
+
+    # GID must equal UID (§2.2 daemon-identity rule)
+    if user_by_uid.uid != user_by_uid.gid:
+        errors.append((want_name, f"uid {user_by_uid.uid} != gid {user_by_uid.gid}"))
+
+# --- Shared-credential group entries ---
+for (want_gid, want_name, want_members) in SHARED_GROUPS:
+    group_by_gid  = getent("group",  want_gid)
+    group_by_name = getent("group",  want_name)
+    user_by_name  = getent("passwd", want_name)   # MUST be empty (§2.2)
+
+    if group_by_gid is None or group_by_name is None:
+        errors.append((want_name, "shared group absent"))
+        continue
+    if group_by_gid.name != want_name:
+        errors.append((want_name, f"gid {want_gid} held by {group_by_gid.name}"))
+    if group_by_name.gid != want_gid:
+        errors.append((want_name, f"group held by gid {group_by_name.gid}"))
+    if user_by_name is not None:
+        # §2.2: shared-credential entries SHALL NOT have a same-named user.
+        errors.append((want_name, f"shared-credential name collides with user uid {user_by_name.uid}"))
+
+    # §6.2: every declared membership SHALL be present in getent.
+    live_members = group_by_name.members  # 4th colon-field, comma-split
+    for m in want_members:
+        if m not in live_members:
+            errors.append((want_name, f"missing membership: {m}"))
+
+# --- Citizen-identity entries (§2.5 lifecycle) ---
+for (want_uid, want_name, state) in CITIZEN_IDENTITY:
+    user_by_uid   = getent("passwd", want_uid)
+    user_by_name  = getent("passwd", want_name)
+    group_by_gid  = getent("group",  want_uid)
+    group_by_name = getent("group",  want_name)
+
+    if state == "live":
+        # A live citizen verifies under the exact daemon-identity rule
+        # set (§2.2 — citizens have the daemon shape; GID==UID).
+        if user_by_uid is None or user_by_name is None:
+            errors.append((want_name, "citizen absent")); continue
+        if group_by_gid is None or group_by_name is None:
+            errors.append((want_name, "citizen group absent")); continue
+        if user_by_uid.name != want_name:
+            errors.append((want_name, f"uid {want_uid} held by {user_by_uid.name}"))
+        if user_by_name.uid != want_uid:
+            errors.append((want_name, f"name held by uid {user_by_name.uid}"))
+        if group_by_gid.name != want_name:
+            errors.append((want_name, f"gid {want_uid} held by {group_by_gid.name}"))
+        if group_by_name.gid != want_uid:
+            errors.append((want_name, f"group held by gid {group_by_name.gid}"))
+        if user_by_uid.uid != user_by_uid.gid:
+            errors.append((want_name, f"uid {user_by_uid.uid} != gid {user_by_uid.gid}"))
+    else:
+        # state in {"retired", "reclaimed"}: §2.5/§4.3 — the row is
+        # comment-only and MUST NOT materialize. The check is by-NAME
+        # ONLY, fail-closed: the retired/reclaimed NAME MUST NOT resolve
+        # to any live user or group, regardless of UID. A by-UID check
+        # would be laxer (partial-truth): a reclaimed UID may be
+        # legitimately R7-re-allocated to a *different-named* live
+        # citizen — that row is its own live CITIZEN_IDENTITY tuple,
+        # checked above — so a by-UID test would false-NEGATIVE the
+        # genuine "name still bound" violation whenever the UID happens
+        # to be re-held by a differently-named live citizen. This
+        # matches §6.2 and `spec10_postcheck.mix` exactly (by-name).
+        if user_by_name is not None:
+            errors.append((want_name,
+                f"{state} citizen name still resolves to a live user "
+                f"(uid {user_by_name.uid})"))
+        if group_by_name is not None:
+            errors.append((want_name,
+                f"{state} citizen name still resolves to a live group "
+                f"(gid {group_by_name.gid})"))
+
+# Fail-closed reporting (§6.5)
+if errors:
+    log_local("cosmix.spec=10 cosmix.preflight=fail", errors)
+    if bus_broker_is_up():
+        bus_emit("preflight.failed", {spec: 10, version: "1.4.4", errors: errors})
+    exit(1)
+
+live_citizens = [c for c in CITIZEN_IDENTITY if c[2] == "live"]
+log_local("cosmix.spec=10 cosmix.preflight=ok",
+          daemons=len(DAEMON_IDENTITY), shared=len(SHARED_GROUPS),
+          citizens=len(live_citizens))
+if bus_broker_is_up():
+    bus_emit("preflight.ok", {
+        spec: 10, version: "1.4.4",
+        daemons:  len(DAEMON_IDENTITY),
+        shared:   len(SHARED_GROUPS),
+        citizens: len(live_citizens),
+    })
+exit(0)
+</code></pre>
+<p>Notes on the ABP-emit branch:</p>
+<ul>
+<li>§6.3 runs <em>before</em> <code>cosmix-noded</code> binds its ABP socket. The
+verifier therefore SHALL log to the local journal and SHALL NOT
+treat ABP being down as a failure.</li>
+<li>§6.2 runs after <code>systemd-sysusers</code> and before any
+<code>cosmix-*.service</code> is started. ABP MAY be up if a prior
+<code>cosmix-noded</code> is already running (e.g. an in-place upgrade); if
+so, the verifier MAY emit on the <code>preflight</code> topic. If not, local
+logging is sufficient.</li>
+</ul>
+<hr />
+<h2 id="appendix-a-initial-uidgid-registry-144">Appendix A. Initial UID/GID Registry (1.4.4)</h2>
+<pre><code># Cosmix daemon identity registry — version 1.4.4
+# Date: 2026-08-08
+# Daemon/shared window: 500-599 (preferred fixed-ID window; see §2.1)
+# Citizen window:        600-699 (citizen-identity stream, v1.2.0; §2.1, R7)
+# Daemon/shared allocation rule: append-only, no reuse (R1, R2, R2.a)
+# Citizen allocation rule:       lowest-free in 600-699; scoped gated
+#   reuse only after R8 (mesh-wide purge-verification AND a 30-day
+#   quarantine window) — see §2.3 R7/R8 and §2.5.
+# ABP service name defaults to &lt;name&gt; minus the "cosmix-" prefix unless
+# an explicit `bus:` field overrides it (R6). The ABP name is the
+# identity the daemon registers with on the node-local broker if it
+# ABP-registers; L14 uniqueness binds the name across the daemon and
+# live citizen blocks whether or not the daemon currently registers.
+# The v1.4.0 observability-tier entries (508/509/511/512/513) hold
+# their R6 default names (`prometheus`, `grafana`, `loki`, `alloy`,
+# `pveexport`) without currently ABP-registering — see Appendix D for
+# the precedent and the package-native-unit masking requirement. The
+# v1.4.1 addition (514 `cosmix-nodeexport`, R6 name `nodeexport`)
+# follows the same deployment shape.
+
+# --- Daemon-identity entries (POSIX user + same-numbered group) ---
+uid  name              bus     gecos                                  tier         tombstoned
+---  ----------------  ------  -------------------------------------  -----------  ----------
+500  cosmix-noded      -       "Cosmix node daemon (ABP broker)"      substrate    -
+501  cosmix-maild      -       "Cosmix mail daemon"                   application  -
+502  cosmix-webd       -       "Cosmix web daemon"                    application  -
+503  cosmix-indexd     -       "Cosmix knowledge daemon"              substrate    -
+504  cosmix-agentd     -       "Cosmix agent runtime"                 substrate    -
+505  cosmix-mcp        -       "Cosmix MCP bridge"                    substrate    -
+506  cosmix-dnsd       -       "Cosmix authoritative DNS daemon"      substrate    -
+507  cosmix-cron       -       "Cosmix scheduler"                     substrate    -
+508  cosmix-prometheus -       "Cosmix Prometheus (obs tier)"         substrate    -
+509  cosmix-grafana    -       "Cosmix Grafana (obs tier)"            substrate    -
+511  cosmix-loki       -       "Cosmix Loki (obs tier)"               substrate    -
+512  cosmix-alloy      -       "Cosmix Grafana Alloy (obs tier)"      substrate    -
+513  cosmix-pveexport  -       "Cosmix proxmox-exporter (obs tier)"   substrate    -
+514  cosmix-nodeexport -       "Cosmix node_exporter (obs tier)"      substrate    -
+515  cosmix-wgd        -       "Cosmix WireGuard mesh control plane"  substrate    -
+517  cosmix-interactd  interact "Cosmix interaction broker"            session-reserved -
+518  cosmix-nspawnd    -       "Cosmix nspawn host executor"          substrate    -
+
+# --- Shared-credential group entries (group only; no associated user) ---
+gid  name        purpose                                                   tombstoned
+---  ----------  --------------------------------------------------------  ----------
+510  cosmix-tls  Read access to TLS keypairs shared by ≥2 daemons (§3.3)   -
+516  cosmix-mesh Read access to the signed mesh inventory (SPEC-13 INV-1) shared by mesh daemons (§3.3)  -
+
+# --- Citizen-identity entries (POSIX user + same-numbered group; §2.5 scoped reuse) ---
+# Columns after gecos: tier, then the §2.5 lifecycle audit triple
+# (retired / reclaimed / verifier). State is DERIVED: `-` retired ⇒
+# live; retired set, reclaimed `-` ⇒ in quarantine (R8); both set with
+# a verifier token ⇒ reclaimed (UID back in the R7 free pool). A
+# retired:/reclaimed: row is KEPT here (never deleted — R7) and does
+# NOT project a `u` line (§4.3, §9.1).
+cid  name               bus  gecos                               tier     retired     reclaimed   verifier
+---  -----------------  ---  ----------------------------------  -------  ----------  ----------  --------
+600  cosmix-statecache  -    "Cosmix SPEC-18 reference citizen"  citizen  -           -           -
+
+# `-` in the bus column means the default derivation applies (name minus
+# "cosmix-" prefix). Entry 500 follows the default — it registers as
+# `noded` (the historical `hub` alias was removed in the 2026-05-09
+# cosmix-noded rename; the substrate has no central hub role, every
+# mesh node runs its own `cosmix-noded`). The v1.4.0 observability-tier
+# entries (508/509/511/512/513) likewise carry the default; their R6
+# ABP names are reserved per L14 even though the upstream Go binaries
+# do not currently ABP-register (see Appendix D 1.4.0 for the
+# deployment-shape requirement that the package-native systemd unit
+# be masked and the daemon be supervised by the Cosmix-managed
+# `cosmix-&lt;d&gt;.service` unit). The v1.4.1 addition (514
+# `cosmix-nodeexport`, R6 default `nodeexport`) carries the same
+# deployment shape — see Appendix D 1.4.1.
+#
+# The shared-credential group block sits in the same 500–599 window as
+# the daemon-identity block per §2.1. Group GIDs are picked from the
+# next free number that does not collide with daemon-identity numbering.
+# The 500–509 daemon-only reserve was fully consumed by v1.4.0 (508
+# `cosmix-prometheus`, 509 `cosmix-grafana`); the daemon-identity stream
+# has now crossed into the 510+ shared zone (511 `cosmix-loki`, 512
+# `cosmix-alloy`, 513 `cosmix-pveexport`), skipping 510 which is held by
+# `cosmix-tls`. The two-stream non-collision invariant still holds (each
+# number appears in at most one stream). v1.4.2 adds a second shared-cred
+# group, `cosmix-mesh` (GID 516, signed-inventory read access §3.3); the
+# daemon stream skips 516 to preserve non-collision. Future shared-
+# credential groups continue from the next free GID that does not collide
+# with the daemon-identity frontier (519 as of v1.4.4, after nspawnd 518).
+#
+# The citizen-identity block lives in its own 600–699 window (§2.1),
+# disjoint from 500–599, so citizen numbering never collides with
+# daemon or shared-credential numbering. Citizen allocation is
+# lowest-free in 600–699 (R7); a UID re-enters the free pool only
+# after R8 (mesh-wide purge-verification AND the 30-day quarantine).
+#
+# The former 506 gap was RESOLVED by v1.3.0: `cosmix-dnsd` consumed the
+# R2.a-reclaimed `506` slot (freed from `cosmix-cloudd` by bb87724,
+# 2026-05-12 — never-functional pre-deployment reclamation). No daemon-
+# stream gap remains. v1.4.0 makes no R2.a claim and introduces no new
+# gap: 508 and 509 advance the append-only frontier in sequence, then
+# (skipping the existing 510 shared-cred entry) 511/512/513 continue
+# the sequence. v1.4.1 appends one further daemon-identity entry (514
+# `cosmix-nodeexport`) at the next-sequential slot — no R2.a, no
+# tombstone, no new gap. v1.4.2 appends one further daemon-identity
+# entry (515 `cosmix-wgd`, the WireGuard mesh control plane, SPEC-13
+# D0) at the next-sequential slot — no R2.a, no tombstone, no new gap.
+# v1.4.3 appends 517 `cosmix-interactd`, skipping the already-deployed
+# `cosmix-mesh` shared-credential GID 516. Its row reserves the stable
+# namespace/props ownership identity; §7.3 governs the desktop sink's distinct
+# logged-in-user runtime shape.
+# v1.4.4 appends 518 `cosmix-nspawnd` (nspawn host executor, nspawn
+# cluster-lite C1) at the next-sequential slot — no R2.a, no tombstone,
+# no new gap. R6 default ABP/Bus service name `nspawnd`.
+# The two-stream non-collision rule (§2.2) is preserved.
+#
+# Next free daemon UID: 519 (516 is held by the deployed `cosmix-mesh` shared-
+#   credential group; 517 is `cosmix-interactd`, 518 is `cosmix-nspawnd`).
+# Next free shared-credential GID: 519 (the shared-cred stream holds 510
+#   `cosmix-tls` and 516 `cosmix-mesh`; the daemon stream now also holds
+#   517 and 518).
+# Next free citizen UID: 601 (lowest-free in 600–699; reclaimed UIDs
+#   re-enter this pool only after R8 — §2.3 R7/R8, §2.5).
+# Tombstones (kept for audit; SHALL NOT be reused per R2): none.
+# Citizens in quarantine (retired:, not yet R8-reclaimed): none.
+# Citizens reclaimed (UID returned to the R7 free pool): none.
+</code></pre>
+<p>The <code>tier</code> column is informational only. It does not influence
+numeric allocation (R3) and MAY be revised without renumbering.</p>
+<hr /></div></div>
     </div>
 
 </main>
@@ -620,6 +2191,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +2245,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +2374,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

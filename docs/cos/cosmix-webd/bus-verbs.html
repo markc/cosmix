@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-webd/bus-verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,136 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-webd/bus-verbs.md"><div class="prose"><h1 id="bus-verbs">Bus verbs</h1>
+<p><code>cosmix-webd</code> registers the Bus service name <code>webd</code>. The service reconnects after initial broker failure or a later stream end. HTTP serving and certificate renewal do not depend on the Bus session remaining online.</p>
+<p>Successful verbs return <code>rc=0</code>. Caller, validation, authorisation, and unsupported-action failures use <code>rc=10</code> with a JSON error body.</p>
+<h2 id="read-only-snapshots">Read-only snapshots</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>webd.routes.list</code></td><td>None</td><td>Sorted vhosts with aliases and <code>has_cms</code>, <code>has_jmap</code>, <code>has_ws</code>, and <code>has_docs</code> flags</td></tr>
+<tr><td><code>webd.stats</code></td><td>None</td><td>Sorted per-vhost response-class counters</td></tr>
+<tr><td><code>webd.tls.status</code></td><td>None</td><td>Manual identity names, ACME plan summary, disabled vhosts, and per-vhost issuance state</td></tr>
+<tr><td><code>webd.autoconfig.served_domains</code></td><td>None</td><td>Sorted mail-autoconfiguration admission domains</td></tr>
+</tbody></table>
+<p>These snapshots are built from atomically published runtime views. Route and statistics results contain one record per primary vhost; aliases share the primary's state.</p>
+<h2 id="vhost-verbs">Vhost verbs</h2>
+<table><thead><tr><th>Verb</th><th>Required arguments</th><th>Optional arguments</th><th>Capability</th></tr></thead><tbody>
+<tr><td><code>webd.vhost.add</code></td><td><code>fqdn</code>, <code>www_dir</code></td><td><code>enabled</code>, ACME trio, or manual TLS pair</td><td><code>props.write:webd.vhosts</code></td></tr>
+<tr><td><code>webd.vhost.remove</code></td><td><code>fqdn</code></td><td>None</td><td><code>props.write:webd.vhosts</code></td></tr>
+<tr><td><code>webd.vhost.list</code></td><td>None</td><td>None</td><td><code>props.read:webd.vhosts</code></td></tr>
+</tbody></table>
+<p><code>webd.vhost.add</code> accepts dotted or underscored names for:</p>
+<ul>
+<li><code>acme.provider</code> or <code>acme_provider</code></li>
+<li><code>acme.challenge</code> or <code>acme_challenge</code></li>
+<li><code>acme.contact_email</code> or <code>acme_contact_email</code></li>
+<li><code>tls.cert_path</code> or <code>tls_cert_path</code></li>
+<li><code>tls.key_path</code> or <code>tls_key_path</code></li>
+</ul>
+<p>Dotted names take precedence. <code>enabled</code> accepts <code>true</code>, <code>false</code>, <code>1</code>, or <code>0</code> and defaults to true.</p>
+<p>The add verb stamps <code>source = "bus_runtime"</code> and uses a tombstone-aware version anchor. It supports re-adding a previously removed FQDN.</p>
+<p>The remove verb deletes the property row. Namespace hooks notify the runtime and certificate provisioner so routing and managed state can be reconciled.</p>
+<p>The list verb adds a derived <code>acme_status</code> to each row. Secret fields are returned only when the caller has the secret-read capability.</p>
+<h2 id="acme-verbs">ACME verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Capability</th></tr></thead><tbody>
+<tr><td><code>webd.acme.renew</code></td><td><code>fqdn</code></td><td><code>webd.acme.renew:webd.vhosts</code></td></tr>
+<tr><td><code>webd.acme.status</code></td><td><code>fqdn</code></td><td><code>props.read:webd.vhosts</code></td></tr>
+</tbody></table>
+<p><code>webd.acme.renew</code> queues an immediate sweep and returns <code>state = "pending"</code>. It bypasses cooldown and the normal renewal window. It rejects missing, disabled, non-ACME, or unattached vhosts.</p>
+<p><code>webd.acme.status</code> returns:</p>
+<ul>
+<li><code>fqdn</code></li>
+<li>derived <code>acme_status</code></li>
+<li><code>not_after</code></li>
+<li><code>last_attempt</code></li>
+<li><code>last_error_count</code></li>
+<li><code>last_error</code></li>
+<li><code>next_attempt_after</code></li>
+<li><code>issued</code></li>
+</ul>
+<p><code>last_error</code> is redacted unless the caller has <code>props.read:webd.vhosts:secrets</code>.</p>
+<h2 id="listener-verbs">Listener verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Capability</th></tr></thead><tbody>
+<tr><td><code>webd.listener.enable</code></td><td><code>id</code></td><td><code>props.write:webd.listeners</code></td></tr>
+<tr><td><code>webd.listener.disable</code></td><td><code>id</code></td><td><code>props.write:webd.listeners</code></td></tr>
+<tr><td><code>webd.listener.status</code></td><td>Optional <code>id</code></td><td><code>props.read:webd.listeners</code></td></tr>
+</tbody></table>
+<p>Enable and disable update the persisted <code>enabled</code> field. The listener reaction loop performs the bind or unbind asynchronously and writes observed state back. Read <code>webd.listener.status</code> to confirm <code>bound</code>.</p>
+<p>Disabling a non-external listener is rejected to preserve the control path.</p>
+<p>Status returns the listener ID, enabled and external flags, bind state, active connections, strict-SNI state, limits, CIDR lists, and last transition. <code>last_error</code> requires <code>props.read:webd.listeners:secrets</code>.</p>
+<h2 id="tls-reload">TLS reload</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Capability</th></tr></thead><tbody>
+<tr><td><code>webd.tls.reload</code></td><td>None</td><td><code>props.write:webd.listeners</code></td></tr>
+</tbody></table>
+<p>The verb is available on manual-PEM deployments. It:</p>
+<ol>
+<li>Reads each configured certificate and key again.</li>
+<li>Validates each certificate against every name it covers.</li>
+<li>Builds all replacement SNI resolvers.</li>
+<li>Swaps the resolvers only if every read, validation, and build succeeds.</li>
+<li>Republishes the TLS status snapshot.</li>
+</ol>
+<p>Failure leaves the previous resolvers serving. ACME-managed deployments refresh their resolver set through the provisioner.</p>
+<h2 id="session-revocation">Session revocation</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Capability</th></tr></thead><tbody>
+<tr><td><code>webd.session.revoke</code></td><td><code>email</code></td><td><code>webd.session.revoke:webd.vhosts</code></td></tr>
+</tbody></table>
+<p>The verb increments the account's <code>session_epochs</code> row in every vhost CMS database. Cookie-authorised requests compare the sealed epoch with the current value, so the increment invalidates outstanding web cookies.</p>
+<p>The response reports successful vhosts, per-vhost failures, and the number of vhosts without a CMS database. A failure on one vhost does not hide successful revocations on others.</p>
+<p>This verb revokes the web cookie path only. It does not revoke bearer tokens owned by another daemon.</p>
+<h2 id="property-verbs">Property verbs</h2>
+<p>Every command below the <code>webd.props.*</code> prefix is passed to the daemon's SPEC 12 property router.</p>
+<p>The crate registers:</p>
+<table><thead><tr><th>Namespace</th><th>Primary key</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>vhosts</code></td><td><code>fqdn</code></td><td>Vhost declaration and TLS lifecycle state</td></tr>
+<tr><td><code>handlers</code></td><td><code>route_id</code></td><td>Embedded Mix route declarations</td></tr>
+<tr><td><code>listeners</code></td><td><code>id</code></td><td>Listener controls, guards, and observed state</td></tr>
+<tr><td><code>log</code></td><td>Namespace-defined</td><td>Live logging filter</td></tr>
+</tbody></table>
+<p>The source names the following generic verbs:</p>
+<ul>
+<li><code>webd.props.get</code></li>
+<li><code>webd.props.list</code></li>
+<li><code>webd.props.set</code></li>
+<li><code>webd.props.delete</code></li>
+<li><code>webd.props.watch</code></li>
+<li><code>webd.props.audit.watch</code></li>
+</ul>
+<p>Property requests identify a namespace and, where applicable, a key. The crate-defined collection namespaces require optimistic-concurrency versions for writes.</p>
+<p><code>webd.props.watch</code> and <code>webd.props.audit.watch</code> establish broker topic grants. Committed changes are published on <code>webd.props.records.changed</code>; dispatcher tasks survive broker reconnects and use the refreshed client handle.</p>
+<h2 id="capability-policy">Capability policy</h2>
+<p><code>webd.vhosts</code> grants public read, secret read, describe, audit, write, ACME-renew, and session-revoke capabilities under its current peer policy.</p>
+<p><code>webd.handlers</code> grants read, write, describe, and audit capabilities under its current peer policy.</p>
+<p><code>webd.listeners</code> deliberately differs:</p>
+<ul>
+<li>Read, describe, and audit are available under the normal peer policy.</li>
+<li>Write and secret-read capabilities require the caller's Bus service name to appear in <code>listeners.operators</code>.</li>
+<li>An empty operator list grants no remote listener writes.</li>
+</ul>
+<p>Daemon-origin writes do not pass through caller capability resolution. They remain subject to schema and cross-field validation.</p>
+<h2 id="property-ownership">Property ownership</h2>
+<p>Caller writes cannot set daemon-owned fields.</p>
+<p>For <code>webd.vhosts</code>, daemon-owned fields are <code>source</code>, <code>cert_blob_id</code>, <code>key_blob_id</code>, <code>not_after</code>, <code>last_attempt</code>, <code>last_error_count</code>, and <code>last_error</code>.</p>
+<p>For <code>webd.listeners</code>, daemon-owned fields are <code>external</code>, <code>bound</code>, <code>bound_addr</code>, <code>active_conns</code>, <code>last_transition</code>, and <code>last_error</code>.</p>
+<p>The vhost schema also enforces:</p>
+<ul>
+<li>Canonical FQDN and row-key agreement.</li>
+<li>Empty aliases on the runtime property surface.</li>
+<li>ACME provider, challenge, and contact completeness.</li>
+<li>Manual certificate and key completeness.</li>
+<li>Mutual exclusion between ACME and manual TLS.</li>
+<li>A disabled state when no TLS mode is present.</li>
+</ul>
+<p>The handler schema enforces:</p>
+<ul>
+<li>A known primary vhost.</li>
+<li>A supported method and <code>mix</code> handler kind.</li>
+<li>An absolute request path pattern with at most one trailing glob.</li>
+<li>A relative <code>.mix</code> handler reference with no parent traversal.</li>
+<li>Known capability tokens and explicit delegated-verb allowlists.</li>
+</ul>
+<h2 id="unknown-verbs">Unknown verbs</h2>
+<p>An unsupported <code>webd.*</code> command returns <code>rc=10</code>, identifies the action, and reports the fixed read-only snapshot list. Mutation verbs are accepted only by their explicit asynchronous dispatchers or the property router.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +748,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +802,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +931,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

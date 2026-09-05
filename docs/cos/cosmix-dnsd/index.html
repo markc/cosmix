@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-dnsd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,110 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-dnsd/README.md"><div class="prose"><h1 id="cosmix-dnsd">cosmix-dnsd</h1>
+<p><code>cosmix-dnsd</code> is an authoritative DNS daemon for mesh-local zones. It serves
+the same static zone snapshot over UDP and TCP, reloads that snapshot without
+discarding the last-known-good state, and optionally exposes read-only Bus
+status. It belongs to the <code>cos</code> daemon layer in the <code>bus &lt;- mix &lt;- cos</code>
+dependency chain: the citizen build uses Bus libraries directly, while zone
+data reaches the daemon through the <code>cosmix-lib-dns</code> substrate.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-dnsd --zones &lt;zones.mix&gt; --state &lt;state-file&gt; \
+  --listen &lt;ip:port&gt; [--listen &lt;ip:port&gt; ...] \
+  [--allow-non-loopback-listen]
+</code></pre>
+<pre><code class="language-text">cosmix-dnsd --version
+cosmix-dnsd --help
+</code></pre>
+<p>The daemon requires a zone file, a state file, and at least one explicit
+listen address. Each address receives both a UDP socket and a TCP listener.</p>
+<p>See <a href="/cos/cosmix-dnsd/configuration">configuration.md</a> for the command-line, zone file,
+state, and bind rules.</p>
+<h2 id="build-modes">Build modes</h2>
+<table><thead><tr><th>Cargo feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>cosmix</code></td><td style="text-align: right">yes</td><td>Builds the Cosmix citizen with node configuration, Bus registration, response counters, shared daemon logging, bind retry, and a best-effort loopback listener.</td></tr>
+</tbody></table>
+<p>Build with <code>--no-default-features</code> for the standalone server. That build keeps
+the authoritative DNS service but omits citizen configuration, Bus, response
+statistics, bind retry, and the implicit loopback listener.</p>
+<h2 id="dns-service">DNS service</h2>
+<p>The daemon loads a <code>StaticZoneStore</code> from <code>--zones</code> and persists serial-floor
+state through <code>FilePersistence</code> at <code>--state</code>. All explicit listeners serve the
+same shared snapshot.</p>
+<p>The tested service behaviour includes:</p>
+<ul>
+<li>authoritative <code>A</code>, <code>MX</code>, <code>SRV</code>, <code>PTR</code>, apex <code>SOA</code>, and apex <code>NS</code> answers;</li>
+<li>in-zone address glue for <code>MX</code> and <code>SRV</code> targets;</li>
+<li><code>NXDOMAIN</code> with an authority-section <code>SOA</code> for absent names;</li>
+<li><code>NOERROR</code> with an empty answer and authority-section <code>SOA</code> for NODATA;</li>
+<li><code>REFUSED</code> without authoritative data for out-of-zone queries;</li>
+<li>a minimal empty answer for <code>ANY</code>;</li>
+<li>UDP and DNS-over-TCP framing; and</li>
+<li>EDNS0 response support when the request carries an OPT record.</li>
+</ul>
+<p>The crate is authoritative-only. It does not provide recursive resolution.</p>
+<h2 id="reload-and-state">Reload and state</h2>
+<p><code>SIGHUP</code> asks the zone store to reload <code>zones.mix</code>. A valid candidate replaces
+the current snapshot. A rejected candidate is logged and the daemon continues
+serving the last-known-good snapshot.</p>
+<p>A corrupt or unreadable state file is logged at startup and treated as absent;
+the daemon continues. An invalid initial zone file with no usable last-known-
+good state is a fatal startup error.</p>
+<p><code>Ctrl-C</code> aborts the serving and Bus tasks, then exits successfully.</p>
+<h2 id="bus-service">Bus service</h2>
+<p>The default citizen build registers the Bus service name <code>dnsd</code>. It provides
+exactly two read-only actions:</p>
+<table><thead><tr><th>Action</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>dnsd.zone.snapshot</code></td><td>Configuration hash, zone count, and sorted zone names.</td></tr>
+<tr><td><code>dnsd.stats</code></td><td>Monotone response counts grouped by DNS response code.</td></tr>
+</tbody></table>
+<p>Unknown actions and write-shaped actions return caller-error code <code>10</code>. DNS
+serving does not depend on broker availability; Bus registration retries with
+bounded exponential backoff.</p>
+<p>See <a href="/cos/cosmix-dnsd/bus-verbs">bus-verbs.md</a> for response bodies and counter semantics.</p>
+<h2 id="bind-policy">Bind policy</h2>
+<p>Wildcard addresses such as <code>0.0.0.0</code> and <code>::</code> are always rejected. Loopback is
+always accepted.</p>
+<p>The standalone build accepts another non-loopback address only when
+<code>--allow-non-loopback-listen</code> is present. It logs that the address cannot be
+identified as a mesh address.</p>
+<p>The citizen build reads <code>wg_ip</code> from <code>node.conf.mix</code>. When that value is
+usable, only the configured address or loopback is accepted; the command-line
+override does not bypass this check. If node configuration is unavailable or
+invalid, the daemon logs the degraded state and applies the standalone rule.</p>
+<p>The citizen retries an address-not-available bind failure for a bounded startup
+window. Other bind failures fail immediately. It also attempts
+<code>127.0.0.1:53</code> as a best-effort listener unless that address was explicitly
+requested.</p>
+<h2 id="internal-modules">Internal modules</h2>
+<table><thead><tr><th>Module</th><th>Build</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>main</code></td><td>all</td><td>Argument parsing, bind validation, zone loading, socket tasks, reload, and shutdown.</td></tr>
+<tr><td><code>citizen</code></td><td><code>cosmix</code></td><td>Daemon identity reporting, node configuration, address canonicalisation, and citizen bind policy.</td></tr>
+<tr><td><code>bus</code></td><td><code>cosmix</code></td><td>Bus registration, reconnect loop, and read-only action dispatch.</td></tr>
+<tr><td><code>stats</code></td><td><code>cosmix</code></td><td>Lock-free response-code counters used by <code>dnsd.stats</code>.</td></tr>
+<tr><td><code>bind_retry</code></td><td><code>cosmix</code></td><td>Bounded retry for UDP and TCP binds when the address is not yet available.</td></tr>
+</tbody></table>
+<p>This package exports a binary, not a Rust library API.</p>
+<h2 id="exit-status">Exit status</h2>
+<table><thead><tr><th style="text-align: right">Status</th><th>Meaning</th></tr></thead><tbody>
+<tr><td style="text-align: right"><code>0</code></td><td>Version output or orderly <code>Ctrl-C</code> shutdown.</td></tr>
+<tr><td style="text-align: right"><code>1</code></td><td>Zone startup, socket bind, signal handler, or other runtime failure.</td></tr>
+<tr><td style="text-align: right"><code>2</code></td><td>Invalid arguments or a rejected listen address.</td></tr>
+</tbody></table>
+<p><code>--help</code> prints usage and exits with status <code>2</code>.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The always-built path uses <code>cosmix-lib-dns</code>, Tokio, and tracing. The <code>cosmix</code>
+feature adds configuration, Bus client and message types, build provenance,
+shared logging, JSON response construction, and direct Hickory protocol access.</p>
+<p>The build script records package build provenance for citizen Bus
+registration.</p>
+<h2 id="tests">Tests</h2>
+<p>The integration prober starts the binary on loopback with a temporary zone and
+state file. It sends real UDP and TCP queries and verifies authoritative
+answers, negative responses, refusal, minimal <code>ANY</code>, and EDNS0 behaviour.</p>
+<p>Unit tests cover citizen address policy, daemon identity consistency, Bus
+dispatch, response JSON, and response-code accounting.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +722,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +776,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +905,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

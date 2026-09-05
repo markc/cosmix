@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/builtins</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,366 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/builtins.md"><div class="prose"><h1 id="builtin-index">Builtin index</h1>
+<p>Every Mix builtin grouped by category, generated from <code>mix builtins</code> (mix 0.82.0). See the linked topical page for prose and examples; <code>mix what NAME</code> prints a one-line description of any single builtin (or keyword), and <code>mix help</code> prints the compact names-only summary of the same ten categories.</p>
+<p>Some builtins are feature-gated on the <code>cosmix-lib-mix</code> crate (<code>json</code>, <code>regex</code>, <code>toml</code>, <code>yaml</code>, <code>datetime</code>, <code>url</code>, <code>crypto</code>, <code>http</code>, <code>sqlite</code>, <code>dkim</code>, <code>markdown</code>, <code>datastar</code>, <code>xml</code>) so embedders can pull only what they need — the <code>mix</code> binary turns them all on.</p>
+<h2 id="machine-readable-discovery-metadata_schema-1">Machine-readable discovery (metadata_schema 1)</h2>
+<p>Since 0.29.0 every builtin carries a structured contract — per-argument names/kinds/optionality, derived min/max arity, a return shape, effect flags, an operational-failure mode, and any conditional capabilities. The human signature shown by <code>mix builtins &lt;name&gt;</code> is derived from the same contract, so it can never drift from the machine metadata.</p>
+<ul>
+<li><code>mix builtins --json</code> — the full table as a JSON array; each entry carries <code>metadata_schema</code> (1), <code>kind</code> (<code>builtin</code> or <code>statement</code> for print/eprint), <code>name</code>, <code>category</code>, <code>capability</code> (kebab class, or <code>statement</code>), <code>conditional_capabilities</code> (<code>[{option, capability}]</code>), <code>description</code>, <code>signature</code>, <code>arity</code> (<code>{min, max, exact}</code> — <code>max: null</code> = variadic; <code>exact</code> is normally <code>null</code>, but when a builtin's accepted argument counts are NOT a contiguous range it lists them exhaustively, e.g. <code>random</code> has <code>exact: [0, 2]</code> — an arity checker must use <code>exact</code> when present), <code>args</code> (<code>[{name, required, variadic, kind}]</code>), <code>returns</code>, <code>effects</code>, and <code>operational_failure</code>.</li>
+<li><code>mix builtins --data</code> — the same logical array as strict-data Mix source (parse with <code>data_parse</code> / <code>load_data</code>); <code>null</code> becomes <code>nil</code>.</li>
+<li>Value shapes (<code>kind</code>/<code>returns</code>) are <code>{type: "any"|"nil"|"bool"|"number"|"string"|"bytes"|"buffer"|"function"}</code> scalars, <code>{type: "list", items: shape}</code>, <code>{type: "map", shape: name-or-null, fields: [...]}</code>, or <code>{any_of: [shapes...]}</code> unions.</li>
+<li><code>effects</code> flags: <code>must_use</code> (discarding the result hides a failure — <code>run_rc</code>, <code>ssh_run</code>, <code>http_*</code>, ...), <code>blocking</code> (unbounded/external wait: process, network, stdin, sleep), <code>shell</code> (backed by <code>/bin/sh</code>), <code>mutates_args</code> (<code>push</code>, <code>buffer_push</code>, ...), <code>terminates</code> (<code>exit</code>, <code>panic</code>).</li>
+<li><code>operational_failure</code>: how I/O-level failure is reported — <code>not-applicable</code> (pure), <code>raises</code> (catchable error), <code>returns-result</code> (encoded in the returned value, e.g. <code>ok:false</code> / <code>status:0</code> / exit code), <code>terminates</code>. Argument-validation errors always raise regardless.</li>
+<li>Arity in the contract is the documented surface; a few older builtins tolerate surplus arguments at runtime. <code>mix lint</code> checks calls against the contract, which is deliberately stricter.</li>
+</ul>
+<blockquote>
+<p>Every table category is listed below (0.63.0 — the index is regenerated
+from <code>mix builtins --json</code> by <code>docs/build/gen-builtins-md.mix</code>; the
+previously-unbucketed <code>db</code>/<code>jmap</code>/<code>bus</code>/<code>datastar</code> families now have
+sections). The Bus-layer callables <code>noded_register</code>, <code>subscribe</code>,
+<code>unsubscribe</code>, <code>bus_reconnect</code>, and <code>reply(...)</code> (inside <code>on</code> handlers)
+remain evaluator forms on top of the keyword layer, not table builtins —
+<code>mix what</code> does not know them; see <a href="/mix/bus">bus</a>.</p>
+</blockquote>
+<h2 id="string---see-strings">string  — see <a href="/mix/strings">strings</a></h2>
+<p>length          Length of a string (codepoints), list/map (elements), or bytes/buffer (bytes, v0.64.0)
+len             Alias for length()
+upper           Convert string to uppercase
+lower           Convert string to lowercase
+left            Return leftmost N characters
+right           Return rightmost N characters
+substr          Extract substring by codepoint position and length (splits emoji/combining; see grapheme_substr)
+pos             Find first position of needle in haystack (1-based, 0=not found — so <code>if pos(..)</code> reads correctly, since 0 is falsy). 0-based twin: index_of(), which takes its args the other way round and is NOT safe in a condition
+lastpos         Find last position of needle in haystack (1-based, 0=not found — safe in a condition, 0 is falsy). 0-based twin: last_index_of(), which takes its args the other way round
+strip           Remove leading/trailing whitespace, or codepoints in charset: strip(s[, charset]) (0.63.0 — the 2nd arg was silently IGNORED before)
+trim            Alias for strip(): trim(s[, charset]) — charset is a SET of codepoints to strip from both ends (0.63.0; was silently ignored). One-sided: ltrim/rtrim
+replace         Replace all occurrences of old with new in string
+split           Split string into list by delimiter (default: space)
+join            Join list into string with delimiter (default: space)
+starts_with     Test if string starts with prefix
+ends_with       Test if string ends with suffix
+contains        Test if string/list contains a value, or a bytes/buffer contains a byte needle (needle: bytes/buffer/string/byte number, non-empty; v0.70.0) — the correct yes/no test, and what to use instead of a bare index_of() in a condition
+repeat          Repeat string N times
+lpad            Left-pad string to width (codepoint count; see lpad_w for display cells). Optional 3rd arg is the fill character, default space: lpad(s, 12, "0") (v0.54.0)
+rpad            Right-pad string to width (codepoint count; see rpad_w for display cells). Optional 3rd arg is the fill character, default space (v0.54.0)
+lpad_w          Left-pad to width in terminal display CELLS (UAX #11; CJK/emoji=2) — aligns wide-char columns. Optional 3rd arg is the fill character (must be 1 cell wide), default space (v0.54.0)
+rpad_w          Right-pad to width in terminal display CELLS (UAX #11; CJK/emoji=2) — aligns wide-char columns. Optional 3rd arg is the fill character (must be 1 cell wide), default space (v0.54.0)
+reverse         Reverse a string (by codepoint; splits emoji — see grapheme_reverse), list, or bytes/buffer (byte-wise → a new value-semantic bytes, v0.70.0)
+words           Count whitespace-delimited words in string
+word            Extract Nth word from string (1-based)
+before          Text before the FIRST delim: before(s, delim) -&gt; string | nil (nil when delim absent; "" is a real result — delim at the start). Empty delim raises
+after           Text after the FIRST delim: after(s, delim) -&gt; string | nil (nil when delim absent; "" when delim at the end). Empty delim raises. Want a default? <code>after($s, "=") or ""</code>
+before_last     Text before the LAST delim -&gt; string | nil (nil when absent). Empty delim raises
+after_last      Text after the LAST delim -&gt; string | nil (nil when absent) — basename/extension: after_last(path, "/"), after_last(name, "."). Empty delim raises
+split_once      Split at the FIRST delim: split_once(s, delim) -&gt; [head, tail] | nil (nil when absent — never a 1-element list). Empty delim raises
+rsplit_once     Split at the LAST delim -&gt; [head, tail] | nil (nil when absent). Empty delim raises
+between         Text after the first a and before the NEXT b: between(s, a, b) -&gt; string | nil (nil if either marker absent, in that order). Empty a or b raises
+strip_prefix    s without a leading p, else s UNCHANGED (never nil — "nothing to strip" is an answer). Empty p -&gt; unchanged. Kills the starts_with+substr idiom
+strip_suffix    s without a trailing x, else s UNCHANGED (never nil). Empty x -&gt; unchanged
+replace_first   Replace the FIRST occurrence of old; old absent -&gt; s unchanged. Empty old mirrors replace(): inserts new at the start (replace_first("ab", "", "X") is "Xab")
+count_of        Non-overlapping occurrences of needle in s; 0 for an empty needle. (The HOF count(list, pred) is a different builtin)
+ltrim           Strip leading whitespace, or leading codepoints in charset: ltrim(s[, charset]) — PHP-style charset is a SET of codepoints, not a prefix string
+rtrim           Strip trailing whitespace, or trailing codepoints in charset: rtrim(s[, charset])
+lines           Split into lines: \n-separated, ONE trailing \r stripped per line (CRLF and LF both work; a lone \r is not a terminator), exactly one trailing empty element dropped (the final newline). lines("") -&gt; []; "a\n\n" -&gt; ["a", ""]. Native since 0.63.0 (was a prelude fn that kept \r and the trailing "")
+fields          awk-style fields: split on whitespace RUNS, no empties; fields("") -&gt; []. 0-based access fields(s)[2]; the 1-based single-field form is word(s, n)
+chars           Codepoints as 1-char strings (grapheme_* builtins exist for clusters). Native since 0.63.0 (was a prelude fn)
+last_index_of   0-based codepoint index of the LAST occurrence in a string, or last index of a value in a list; -1 if absent. The 0-based twin of lastpos() (args reversed). List search compares with == — SCALAR elements only, exactly like index_of (a map/list element never matches; deep_eq is the structural comparison). ⚠ Like index_of, NEVER bare in a condition: -1 is truthy, 0 is falsy
+template        Substitute single-brace {key} placeholders in a string from a map
+word_wrap       Wrap text to a column width (codepoint budget; see word_wrap_w for display cells)
+word_wrap_w     Wrap text to a column width in terminal display CELLS (UAX #11; CJK/emoji=2)
+markdown_escape Escape markdown metacharacters in a string
+markdown        Render CommonMark + GFM markdown (tables, strikethrough, task lists, footnotes) to HTML; raw HTML is escaped and unsafe URL schemes neutralised (requires markdown feature)
+html_escape     Escape &amp; &lt; &gt; " ' for HTML element text + quoted attribute values (not JS/CSS/URL/srcdoc contexts)
+sanitize        Make untrusted bytes safe for one-line diagnostics: collapse line breaks (incl. U+2028/9) to spaces, replace C0/C1 controls and Trojan-Source bidi/zero-width chars with '?'
+re_match        Subject-first regex test: re_match(s, pattern) -&gt; bool, true if pattern matches anywhere in s
+re_find         All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; the deleted legacy regex_find answered in UTF-8 BYTE offsets). [] when none
+re_replace      Replace ALL matches: re_replace(s, pattern, replacement) — subject FIRST; $1/${name} backrefs in replacement
+re_split        Split s on each match of pattern (subject first)
+grep_lines      Lines of text matching pattern (subject first; regex when enabled, else substring) — the line filter (its pattern-first predecessor grep() was deleted in release B)
+csv_parse       Parse CSV string into a list of header-keyed row maps
+ini_parse       Parse INI string into nested map of sections
+xml_parse       Parse a strict-XML string (or bytes, e.g. an HTTP body) into a Value tree (requires xml feature). Default simple mode is the SOAP/RSS consumer shape: {RootName: …} with namespace prefixes stripped, attributes as @name keys, repeated sibling elements collapsed to a list, a leaf element's text as its value, mixed text under #text, xmlns declarations dropped. Pass {mode:"tree"} for full fidelity: nodes are {name, attrs, children} with prefixes + xmlns preserved and text children as plain strings. Strict XML only — real-world HTML is tag soup and will NOT parse.
+url_parse       Parse URL into {scheme, host, port, path, query, fragment}
+url_decode      Percent-decode a URL/form-encoded string ('+' → space)
+url_encode      Percent-encode a string for use in a URL/form body
+rfc2047_decode  Decode RFC 2047 encoded-words in a mail header value (=?charset?B/Q?data?=) to a plain string. Honours the charset token (utf-8/us-ascii/iso-8859-1; anything else falls back to UTF-8-lossy), joins adjacent encoded-words at the BYTE level per §6.2 so a character split across two words survives, and passes malformed words through literally rather than losing the header. Accepts string/bytes/buffer (v0.67.0)
+rfc2047_encode  Encode a header value as RFC 2047 encoded-words in UTF-8, or return it UNCHANGED when it is already plain ASCII with no "=?" (§5: encode only when needed). Optional {encoding: "B"|"Q"}, default B. Words are kept within the §2 75-character limit and split on CHARACTER boundaries so each stays independently decodable (v0.67.0)
+parse_query     Parse a k=v&amp;k2=v2 query/form string into a map (url-decoded, last-wins)
+parse_form      Parse an x-www-form-urlencoded body into a map (alias of parse_query)
+byte_length     Length of a string in raw UTF-8 bytes (the pre-0.8.0 length() value for strings)
+byte_pos        Byte offset of needle in haystack (1-based, 0=not found) — byte twin of pos(), 0-based twin byte_index_of(). Safe in a condition (0 is falsy)
+byte_lastpos    Last byte offset of needle in haystack (1-based, 0=not found) — byte twin of lastpos()
+byte_index_of   Byte offset of needle in string (0-based, -1=not found) — byte twin of string index_of(), 1-based twin byte_pos(). ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305)
+grapheme_count  Count grapheme clusters (user-perceived chars: emoji/flags/combining count as 1)
+grapheme_substr Substring by grapheme cluster position and length (won't split emoji/combining marks)
+grapheme_reverse Reverse a string by grapheme cluster (emoji/combining-safe, unlike reverse())
+display_width   Terminal display width in cells (UAX #11; CJK/emoji=2, combining=0, East-Asian-ambiguous=1)</p>
+<h2 id="type---see-numbers">type  — see <a href="/mix/numbers">numbers</a></h2>
+<p>deep_eq         Structural equality for any two values: maps compare by key set + deep_eq values (insertion order IGNORED), lists elementwise in order, scalars as ==. The answer <code>==</code> cannot give for maps/lists — since v0.68.0 <code>==</code>/<code>!=</code> RAISES when both sides are a map or list, and names this builtin. Caveats, inherited from ==: a FUNCTION value is never equal (even to itself — a callback-bearing map is not deep_eq its own copy) and Buffer-vs-Bytes is false (freeze() first). Raises past 512 nesting levels
+type            Return type name: string, number, bool, list, map, nil
+to_number       Convert value to number (nil if not numeric)
+to_string       Convert value to its string representation
+is_number       Test if value is numeric or a numeric string
+is_empty        Test if string/list/map is empty, or value is nil ("0" is NOT empty)
+has_builtin     Does THIS mix have the named builtin? has_builtin(name) -&gt; bool. <code>mix builtins NAME</code> exits 0 for any name and cannot answer this; use for feature gates and compat shims: <code>if not has_builtin("ws_connect") then die "needs mix &gt;= 0.74" end</code>. A feature-gated name absent from this build still reads true (the binary knows it, and calling raises 'requires the X feature') (v0.78.0)
+mix_version     The language runtime version as structured data: {major, minor, patch, string} — so a version gate never parses --version text (v0.78.0)</p>
+<h2 id="math---see-math">math  — see <a href="/mix/math">math</a></h2>
+<p>round           Round to nearest integer, half away from zero; round(x, n) to n decimal places (n&lt;0 rounds to tens/hundreds) (v0.19.0)
+floor           Round down toward -inf; floor(x, n) to n decimal places (v0.19.0)
+ceil            Round up toward +inf; ceil(x, n) to n decimal places (v0.19.0)
+trunc           Truncate toward zero (drop the fraction); trunc(x, n) to n decimal places (v0.19.0)
+abs             Absolute value (v0.19.0)
+sign            Sign of x: -1, 0, or 1 (±0→0, NaN→NaN) (v0.19.0)
+band            Bitwise AND of two integers. Both arguments must be exact integers within ±2^53 (the range f64 represents without loss); a fraction, an infinity, a NaN or an out-of-range magnitude raises rather than silently truncating. Chiefly for permission bits: band(stat(p)["perm"], 0o111) != 0 asks whether any execute bit is set (v0.46.0)
+bor             Bitwise OR of two integers; same exact-integer domain as band (v0.46.0)
+bxor            Bitwise exclusive-OR of two integers; same exact-integer domain as band (v0.46.0)
+bnot            Bitwise NOT (one's complement) over 64-bit two's complement: bnot(0) is -1. Same exact-integer domain as band (v0.46.0)
+bshl            Shift left by n bits (n in 0..63). Raises rather than wrapping if the result leaves the exact-integer range (v0.46.0)
+bshr            Arithmetic shift right by n bits (n in 0..63); the sign bit is replicated, so bshr(-8, 1) is -4 (v0.46.0)
+sqrt            Square root (negative→NaN) (v0.19.0)
+cbrt            Cube root (defined for negatives) (v0.19.0)
+pow             Raise to a power: pow(base, exp) = base^exp (v0.19.0)
+exp             e raised to the x (v0.19.0)
+ln              Natural logarithm, base e (ln(0)→-inf, ln(neg)→NaN) (v0.19.0)
+log10           Base-10 logarithm (v0.19.0)
+log2            Base-2 logarithm (v0.19.0)
+log             Logarithm in an arbitrary base: log(x, base) (v0.19.0)
+min             Smallest of the number arguments, or of a single list argument: min(a, b, …) | min(list). Lexicographic when all args are strings; NaN-skipping (v0.19.0)
+max             Largest of the number arguments, or of a single list argument: max(a, b, …) | max(list). Lexicographic when all args are strings; NaN-skipping (v0.19.0)
+clamp           Constrain a number to a range: clamp(x, lo, hi) (errors if lo &gt; hi) (v0.19.0)
+hypot           Euclidean distance sqrt(x²+y²) computed without intermediate overflow: hypot(x, y) (v0.19.0)
+sin             Sine of x in radians (v0.19.0)
+cos             Cosine of x in radians (v0.19.0)
+tan             Tangent of x in radians (v0.19.0)
+asin            Arcsine in radians (domain [-1, 1], else NaN) (v0.19.0)
+acos            Arccosine in radians (domain [-1, 1], else NaN) (v0.19.0)
+atan            Arctangent in radians (v0.19.0)
+atan2           Angle in radians of the point (x, y): atan2(y, x) (v0.19.0)
+pi              The constant π (v0.19.0)
+e               Euler's number e (v0.19.0)
+random          random() -&gt; float in [0,1); random(min, max) -&gt; integer in [min, max] inclusive (v0.23.0)</p>
+<h2 id="list---see-collections">list  — see <a href="/mix/collections">collections</a></h2>
+<p>push            Append value to end of list (mutates)
+pop             Remove and return last element of list (mutates)
+shift           Remove and return first element of list (mutates)
+sort            Return sorted copy of list (all-number lists sort numerically; else lexicographic)
+index_of        Find 0-based index of value in a list, of a needle substring in a string (codepoint-based), or of a byte needle in a bytes/buffer (byte offset; needle: bytes/buffer/string/byte number, non-empty; v0.70.0); -1 if absent. 1-based twin: pos() (args reversed). ⚠ NEVER use bare in a condition — -1 (absent) is TRUTHY and 0 (first position) is FALSY, so both answers invert; use contains() for yes/no or compare &gt;= 0 (MIX-W2305)
+unique          Return list with duplicates removed
+range           Generate list of numbers from start to end with optional step. Bounds/step must be whole numbers within i64 — fractional or oversized values raise VALUE_OUT_OF_RANGE instead of silently saturating (strict since v0.59.0)
+flat            Flatten nested lists into a single list
+concat          Concatenate 2+ lists into one new list (one level; each arg must be a list)
+slice           Sub-sequence [start, end): negative indices and out-of-range clamp, a reversed range is empty (v0.2.0). Slices a list (elements), string (codepoints), or bytes/buffer (bytes → a new value-semantic bytes, v0.64.0)
+take            First N items of a list (negative N = last N) (v0.2.0); also string (codepoints) and bytes/buffer (bytes → a new value-semantic bytes, v0.70.0)
+drop            Skip first N items of a list (negative N = drop last N) (v0.2.0); also string (codepoints) and bytes/buffer (bytes → a new value-semantic bytes, v0.70.0)
+zip             Pair two lists element-wise into [a, b] tuples (v0.2.0)</p>
+<h2 id="map---see-collections">map  — see <a href="/mix/collections">collections</a></h2>
+<p>keys            Return list of map keys
+values          Return list of map values
+has_key         Test if map contains a key
+merge           Merge two maps (second wins on conflicts)
+delete          Return map with key removed</p>
+<h2 id="buffer---see-buffer">buffer  — see <a href="/mix/buffer">buffer</a></h2>
+<p>buffer          Create a reference-semantic MUTABLE byte buffer (the escape hatch from value semantics for large binary/audio/video). buffer() empty; buffer(n) n zero bytes; buffer(string) UTF-8; buffer(bytes|buffer) independent copy; buffer([items]) flat splice of int 0-255 / string / bytes / buffer. Append with buffer_push (O(1) amortized, aliases share); freeze() to a value-semantic bytes (v0.26.0)
+buffer_push     Append bytes to a buffer IN PLACE (reference-semantic: every alias sees the growth). Each item is an int 0-255, string (UTF-8), bytes, or buffer. Self-append-safe (v0.26.0)
+buffer_get      Byte at 0-based index i as a number 0-255, or nil if out of range (v0.26.0)
+buffer_set      Write byte (0-255) at 0-based index i, in place; errors if i is out of range — grow with buffer_push first (v0.26.0)
+freeze          Snapshot a buffer to a value-semantic bytes (a copy of the current content) — the bridge into write_file/hash/base64/http (v0.26.0)</p>
+<h2 id="io---see-io">io  — see <a href="/mix/io">io</a></h2>
+<p>read_file       Read entire file contents as string
+read_file_bytes Read file contents as raw bytes. Optional 2nd arg caps the read: read_file_bytes(path, 8192) reads at most 8192 bytes (header-sniffing without slurping a huge file) (v0.3.1; cap v0.17.1)
+read_lines      Read file as a list of lines (trailing newline stripped, empty last line dropped) (v0.2.3)
+load_data       Read + parse a strict-data .mix file (bare-key <code>k: v</code>, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)
+write_file      Write string or bytes to file (creates/overwrites). Bytes are written verbatim (v0.3.1).
+write_new       Atomically create a new file with mode. write_new(path, content, 0o600) — mode as a value (octal literal) or octal string "0600"; fails if path exists; mode applied at creation (no umask race)
+append_file     Append string to file
+exists          Test if path exists. FOLLOWS symlinks by default, so a dangling link reads as absent — that is the right answer for "can I open something here" and the wrong one for "is this name taken". exists(path, {follow_symlinks: false}) is the lstat form and sees the link itself (v0.39.0).
+access          Ask the kernel whether this process can access path using its effective uid/gid: mode is a non-empty, duplicate-free string of r/w/x/f letters (f = existence and is redundant when combined). Follows symlinks. Unlike inspecting stat().perm, this honours POSIX ACLs. Ordinary absence/denial returns false; malformed input or an unexpected syscall failure raises (v0.45.0).
+is_dir          Test if path is a directory
+is_file         Test if path is a regular file
+realpath        Canonicalise a path: resolve every symlink + <code>.</code>/<code>..</code> to the absolute real path (like <code>readlink -f</code> / realpath(3)). The path MUST exist. realpath(path) -&gt; string | nil (nil when it can't be resolved — a missing component, a symlink loop, or a non-UTF-8 resolved path). NORMALISATION ONLY, not a race-free authorization primitive: canonicalise-then-use is not atomic, so for an exec/open safety check, exec/open the RETURNED canonical path (which has no symlinks to re-traverse), not the original (v0.31.2)
+glob            List files matching a glob pattern (supports ** globstar in v0.2.1)
+ls              List directory entries
+mkdir           Create directory: mkdir(path[, {parents}]). parents defaults to true (create_dir_all). {parents: false} creates only the final component and fails if the parent is missing — the form to use when the parent was placed deliberately and re-creating it would hide its removal (v0.42.0)
+flock           Take a process-held advisory file lock: flock(path[, {shared, wait}]) -&gt; bool. Exclusive and non-blocking by default; contention returns false, genuine filesystem errors raise. wait is seconds (0 = do not wait). Repeated acquisition of the same canonical path by this process is idempotent-true (v0.43.0)
+funlock         Release and close this process's advisory lock for path. Returns true when held, false when not held (v0.43.0)
+fcntl_lock      Take a POSIX record lock over the whole file: fcntl_lock(path[, {shared, wait}]) -&gt; bool — the fcntl(2) lock namespace C daemons use for pidfiles/lockfiles, which flock(2) locks never see (Linux keeps the two families separate). Contract-identical to flock: exclusive + non-blocking default, contention false, real errors raise, per-process idempotent-true by canonical path. Implemented as open-file-description locks (F_OFD_SETLK): they conflict with other processes' traditional fcntl records, and survive this process opening/closing the same path elsewhere — a read_file of the locked path cannot drop them (v0.71.0)
+fcntl_unlock    Release and close this process's POSIX record lock for path. true when held, false when not (v0.71.0)
+copy            Copy a single file: copy(src, dst). Overwrites dst; preserves the source permission bits. Use copy_tree for a directory (v0.22.0).
+copy_tree       Recursively copy a directory: copy_tree(src, dst). Creates dst, copies files (perms preserved) and symlinks (as symlinks); merges into an existing dst (v0.22.0).
+symlink         Create a symbolic link: symlink(target, linkpath) — symlink(2), arguments in symlink(2) order (target first, the link to create second). <code>target</code> is stored verbatim and is NOT resolved or validated: a relative target resolves against the link's own directory, and creating a dangling link is legal. Raises EEXIST if linkpath already exists. Read the other way with read_link() (v0.38.0).
+read_link       Read a symbolic link's target: read_link(path) -&gt; string — readlink(2), returning the target EXACTLY as stored (possibly relative, possibly dangling), which is what distinguishes it from realpath()'s full resolution. Raises EINVAL when path is not a symlink; test first with stat(path, {follow_symlinks: false}).is_symlink (v0.38.0).
+rename          Rename/move a path within one filesystem: rename(src, dst) — rename(2), so replacing an existing dst is ATOMIC (a concurrent reader sees either the old file or the new one, never a partial write). This is the primitive for a safe in-place update: write a temp file beside the target, then rename over it. Raises EXDEV across filesystems (copy + remove instead) and ENOENT when src is missing (v0.37.0).
+remove          Remove a single file/symlink: remove(path). No-op if already gone (rm -f). Errors if path is a directory — use remove_dir (v0.22.0).
+remove_dir      Recursively remove a directory and its contents: remove_dir(path) (rm -rf). No-op if already gone (v0.22.0).
+chmod           Set file/directory permissions. chmod(path, 0o755) — mode as a VALUE (use an octal literal) or an octal string "0755" (v0.11.0: a number is now the value, not its decimal digits read as octal)
+chown           Set file owner/group by numeric uid/gid: chown(path, 1000, 1000). Follows symlinks. Numeric only (no name resolution) (v0.17.1)
+stat            Stat a path → map {uid, gid, nlink, size, mode, perm, ino, dev, ctime, mtime, atime, ctime_nsec, mtime_nsec, atime_nsec, is_file, is_dir, is_symlink}. ino/dev are STRINGS (u64, exceed f64 exact range); mode is full st_mode, perm = mode &amp; 0o7777; *time are epoch seconds (f64) and *_nsec the sub-second part 0..=999999999 (v0.44.0) — compare the PAIR to see a same-second rewrite. Follows symlinks by default; stat(path, {follow_symlinks:false}) is lstat (v0.17.1)
+line_count      Count lines in a file by streaming — never loads the whole file (byte-oriented, so it works on non-UTF-8 files too) (streams since v0.28.1)
+head            First N lines of a file as a list (default 10) — streams and stops after N lines, never reads the rest (the no-slurp twin of take(read_lines(p), n)) (v0.28.1)
+tail            Last N lines of a file as a list (default 10) — reads backwards in blocks from EOF, never slurps the whole file (the no-slurp twin of take(read_lines(p), -n)) (v0.28.1)
+basename        Return the filename component of a path
+dirname         Return the directory component of a path
+extname         Return the file extension (including the leading dot)
+path_join       Join path components with the native separator
+path_parts      Decompose a path into {dir, base, stem, ext} (v0.2.1)
+walk            Recursive directory walk: walk(dir, {max_depth, follow_symlinks, include_dirs}); invalid max_depth raises instead of becoming unlimited (strict since v0.55.0)
+readline        Read a line from stdin (optional prompt argument)
+read_stdin      Read all of stdin to EOF as a string (for pipe/hook input). STRICT UTF-8 — binary stdin raises; use read_stdin_bytes for that
+read_stdin_bytes Read all of stdin to EOF as raw bytes — the binary twin of read_stdin, which refuses invalid UTF-8. Optional arg caps the read: read_stdin_bytes(8192) reads at most 8192 bytes, the same cap contract as read_file_bytes (v0.65.0)
+sqlopen         Open a SQLite database and return a handle
+sqlexec         Execute SQL on a SQLite handle, return result rows
+sqlclose        Close a SQLite database handle
+write_stdout    Write values to fd 1 AS THEY ARE — no trailing newline, no separator, flushed. bytes/buffer go out verbatim; every other value renders exactly as print() renders it. Never re-opens a path, so it works when fd 1 belongs to another user (the sieve-filter case). A failed write RAISES (catchable): IO_BROKEN_PIPE when the consumer went away, else IO_WRITE_FAILED — unlike print, which swallows it (v0.65.0)
+write_stderr    Write values to fd 2 as they are — the stderr twin of write_stdout, same contract (v0.65.0)
+print_raw       ALIAS of write_stdout — identical contract, the spelling for <code>print</code> without the trailing newline (v0.65.0)
+eprint_raw      ALIAS of write_stderr — identical contract, the spelling for <code>eprint</code> without the trailing newline (v0.65.0)
+print           Print values to stdout with newline (statement, not a builtin call); bare <code>print</code> emits a blank line
+eprint          Print values to stderr with newline (statement, not a builtin call); bare <code>eprint</code> emits a blank line</p>
+<h2 id="system---see-system">system  — see <a href="/mix/system">system</a></h2>
+<p>env             Get environment variable value ("" if unset); env(name, default) returns default when unset or empty
+time            Return current Unix timestamp as float
+pid             Return current process ID
+uid             Effective user id of this process (geteuid) — normally the id a file access is checked against (Linux checks fsuid, which tracks euid unless setfsuid(2) is called; no Mix script can call it, though an embedder can), so it is the one to compare a stat() map's <code>uid</code> against when deciding whether a path is yours (v0.41.0)
+gid             Effective group id of this process (getegid) — the companion to uid(), for comparing against a stat() map's <code>gid</code>; same fsgid caveat, and it answers only whether a file's group is the EFFECTIVE one, so use groups() to decide which permission class applies (v0.41.0)
+groups          Every group id this process is in — the getgroups(2) supplementary set plus the effective gid, sorted. This is what decides whether the kernel applies a file's GROUP or OTHER permission bits: gid() alone cannot answer it for a file grouped under one of your other groups (v0.42.0)
+args            Return list of script arguments
+getopt          Parse args against a spec map: getopt(args(), {all:{short:"a"}, out:{short:"o", arg:true}}) -&gt; {opts, rest, errors}. opts has every declared option (flag-&gt;bool, value-&gt;string|nil); rest=positionals (incl. post <code>--</code>); errors=collected unknown-option/missing-value strings ([]=clean). Forms: --long, -s, --k=v, --k v, -s v, -- terminator. Minimal: no bundling/abbrev (v0.12.0)
+exit            Exit with optional status code
+sleep           Sleep for N seconds (async)
+run             Run shell command via sh, return trimmed stdout as string. run(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; a timed-out child is PG-killed and run dies (catchable)
+run_rc          Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true
+run_stream      Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an <code>env</code> prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing
+run_argv        Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return "" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream
+run_parallel    Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -&gt; list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's <code>stream</code> flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)
+run_argv_must   Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated ("" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result
+run_pipeline    Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching <code>set -o pipefail</code>. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the <code>yes | head -1</code> idiom). Ordinary failure is encoded in the VALUE — never raises
+run_pipeline_must Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result
+spawn           Start background process via /bin/sh -c, return PID. Every argument must be a STRING and none is coerced — a non-string raises TYPE_MISMATCH rather than being stringified into a doomed sh command (spawn returns a PID, not a result map, so a misrun child would otherwise fail invisibly). There is no argv form: use run_argv for an argv list in the foreground (strict since v0.52.0)
+kill            Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)
+shell_quote     Single-quote-wrap a string for safe interpolation into a POSIX shell command
+sql_quote       Escape a string for SQL string literals: doubles ' and escapes \ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped
+random_password Generate an alphanumeric password (default len 16, no O/o, guaranteed upper+lower+digit)
+ssh_run         Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy}
+ssh_must        ssh_run wrapper: returns stdout on success, throws a Mix error otherwise
+ssh_mix         Run Mix source on a remote host: ships the source over ssh stdin into <code>/opt/cosmix/bin/mix -</code>, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -&gt; same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as <code>$name</code> assignments, and decode:"data"|"json" adds a parsed <code>.value</code> from stdout. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)
+ssh_exec        Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin "inherit" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command
+process_alive   Test if a process exists (signal 0 check). pid must be a whole NUMBER and is not coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0, which would make the reaping waitpid() collect an arbitrary child of this process group and then report a boolean as alive (strict since v0.52.0)
+panic           Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode
+raise           Raise a catchable structured error: raise(code, message[, details]) — code is UPPER_SNAKE (e.g. "VALIDATION_REQUIRED", stable identifiers, scripts may define their own); a non-string message is coerced to its string form; catch with <code>catch $msg, $err</code> and read $err.code / $err.details / $err.frames (v0.29.0)
+hostname        Return the system hostname
+cwd             Return current working directory
+chdir           Change current working directory
+platform        Return OS platform string (linux, macos, windows, etc.)
+which           Locate an EXECUTABLE in PATH: a PATH entry is returned only if it is a regular file the kernel says this process may execute (faccessat2 X_OK, so POSIX ACLs count), never merely a file that exists, and never a directory. cmd must be a string and is not coerced. Returns nil when nothing on PATH is runnable under that name (executability enforced since v0.52.0)
+date_format     Format Unix timestamp with strftime pattern
+date_parse      Parse date string with strftime pattern into Unix timestamp
+now_iso         Current time as ISO 8601 string
+duration_format Format seconds as human-readable duration (e.g. "2h 15m")
+relative_time   Format timestamp as relative string (e.g. "3 hours ago")
+base64_encode   Encode string as base64
+base64_decode   Decode base64 string
+hash_blake3     BLAKE3 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw digest as bytes (v0.66.0)
+hash_sha256     SHA-256 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw 32 digest bytes (v0.66.0 — before that a second argument was silently IGNORED)
+hash_md5        MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)
+hash_sha1       SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)
+hmac_sha256     HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)
+password_hash   bcrypt-hash a password: password_hash(plaintext[, cost]) → $2b$… string; cost 4-31, default 12; input over 72 bytes raises (bcrypt's own truncation limit, surfaced instead of silently applied). For client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0)
+password_verify Check a plaintext password against a bcrypt hash from password_hash() (any $2a$/$2b$/$2y$ form) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0)
+constant_time_eq Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer
+hash_file       Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, "md5"|"sha1"|"sha256"|"blake3"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)
+uuid            Generate a new random UUID v4 string
+dkim_keygen     Generate a DKIM keypair. dkim_keygen("rsa", [bits=2048]) or dkim_keygen("ed25519") → {algorithm, private_pem, public_b64, dns_txt_record}
+http_get        HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). <code>body</code> is the response decoded as UTF-8 (nil if not valid UTF-8); <code>bytes</code> is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).
+http_post       HTTP POST. http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and <code>body</code>/<code>bytes</code> semantics (incl. the 64 MiB body cap) match http_get.
+http_request    HTTP any-verb. http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and <code>body</code>/<code>bytes</code> semantics (incl. the 64 MiB body cap) match http_get.
+bytes_len       Length of a Value::Bytes buffer in bytes (v0.3.1)
+string_to_bytes Convert a string to its UTF-8 byte representation (v0.3.1)
+bytes_to_string Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.
+bytes_find      0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional <code>from</code> (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)
+bytes_starts_with Test whether a bytes/buffer value starts with a prefix (bytes/buffer/string/byte number 0-255); an empty prefix is true (v0.64.0)
+bytes_ends_with Test whether a bytes/buffer value ends with a suffix (bytes/buffer/string/byte number 0-255); an empty suffix is true (v0.70.0)
+bytes_split     Split a bytes/buffer value on a separator (bytes/buffer/string/byte number 0-255) → list of bytes. Same piece rules as split(): absent separator → one whole piece, leading/trailing separator → empty piece. An EMPTY separator raises (v0.64.0)
+bytes_concat    Concatenate 1+ bytes/buffer/string values into one new bytes (a string joins as its own UTF-8). A list argument raises and names bytes_from (v0.64.0)
+bytes_from      Build bytes from a LIST, flat-splicing each item — int 0-255 = one byte, string = its UTF-8, bytes/buffer = its content (same item vocabulary as buffer([items])) (v0.64.0)
+bytes_to_hex    Lowercase hex of a bytes/buffer value, two chars per byte, no separator (v0.64.0)
+bytes_from_hex  Decode a hex string to bytes — strict: even length, [0-9a-fA-F] only, no separators or whitespace. Exact inverse of bytes_to_hex (v0.64.0)
+dns_lookup      Resolve a hostname to a list of IP address strings
+udp_send        Send ONE UDP datagram: udp_send(host, port, payload) -&gt; bytes sent. Payload (string/bytes/buffer) goes out verbatim; host is resolved. Not a socket API — nothing to hold or close (v0.71.0)
+udp_recv        Receive ONE UDP datagram: udp_recv(port[, {timeout, host, max}]) -&gt; {bytes, text, from_host, from_port}, or nil on timeout (an ordinary answer, not a fault). timeout seconds default 30, 0 = wait forever; host = bind address default 0.0.0.0; max caps the read (default 65535 = never truncates; a longer datagram truncates to max, recvfrom(2)'s own contract). text is the payload as UTF-8 or nil — bytes always carries the truth (v0.71.0)
+ws_connect      Open a websocket (ws:// or wss://): ws_connect(url[, {insecure, headers, timeout}]) -&gt; numeric handle. insecure:true skips TLS cert verification (self-signed device endpoints — the LG SSAP case); headers adds handshake request headers; timeout seconds bounds connect AND handshake (default 30, must be positive). Requires ws feature (v0.74.0)
+ws_send         Send one websocket frame: text for a string payload, binary for bytes/buffer; flushed before returning. A closed connection raises and retires the handle (v0.74.0)
+ws_recv         Wait for the next DATA frame: ws_recv(handle[, timeout]) -&gt; string (text frame) | bytes (binary frame) | nil on timeout (poll again). timeout seconds default 30, 0 = wait forever. Ping/pong handled internally. A peer close RAISES (catchable) and retires the handle — closed is not confusable with quiet (v0.74.0)
+ws_close        Close a websocket handle: true when it was live, false when unknown/already retired (never raises for the not-held case, like funlock) (v0.74.0)
+http_serve      BLOCKING static file server — the python -m http.server slot: http_serve(root[, {port, host, duration, index, listing, render_md, requests}]) -&gt; requests served. GET/HEAD only (405 otherwise), NO TLS ever and NO dynamic handlers (both are webd's job). port 0 (default) binds ephemeral and PRINTS the URL; host defaults 127.0.0.1 (pass "0.0.0.0" to expose); duration 0 = until SIGINT; listing opts into directory indexes; render_md serves .md as HTML (markdown feature); spa (true=index, or a shell filename) answers an extensionless would-be-404 with that shell so a client-side router boots — for a single-shell SPA; clean_urls serves /foo.html for /foo (GitHub Pages parity — for a pre-rendered page-per-route site), tried before spa. Traversal-proof: every canonicalised path must stay under the canonicalised root (v0.75.0)
+http_recv       Accept ONE HTTP request, answer it, return it: http_recv(port[, {timeout, host, max, respond}]) -&gt; {method, path, query, headers, body, bytes, from_host, from_port}, or nil on timeout. The OAuth-localhost-redirect / webhook-catch shape. respond: {status, body, content_type, headers} (default 200 "ok"); max caps the request body (default 1 MiB); host defaults 127.0.0.1 (v0.75.0)
+tcp_connect     Open a raw TCP connection: tcp_connect(host, port[, {timeout, tls, insecure}]) -&gt; numeric handle. tls:true wraps in TLS (ring-pinned, webpki roots); insecure:true skips cert verification. The stream-socket primitive for a line/binary protocol (SMTP/redis/memcached probe, banner grab) UDP/WS/HTTP don't cover (v0.78.0)
+tcp_send        Send bytes on a TCP handle: tcp_send(h, payload) -&gt; bytes sent (string/bytes/buffer, verbatim; flushed) (v0.78.0)
+tcp_recv        Read available bytes: tcp_recv(h[, {timeout, max}]) -&gt; bytes (buffered bytes first, then one read of at most 256 KiB — poll again for more even when max is larger) | nil on timeout (poll again). Bytes not string — a stream has no frame boundary. A peer close RAISES and retires the handle. timeout default 30 (0=forever, wedges a serve pump), max default 64 KiB (v0.78.0)
+tcp_recv_line   Read the next LINE: tcp_recv_line(h[, {timeout, max}]) -&gt; string (LF + one trailing CR stripped) | nil on timeout. Buffers across reads; if <code>max</code> bytes accumulate with no newline the handle RAISES and RETIRES (a peer that never terminates a line — broken framing). For line protocols (SMTP/redis) so a caller need not hand-roll a \r\n scanner (v0.78.0)
+tcp_close       Close a TCP handle: true when live, false when unknown/already closed (never raises for that, like funlock) (v0.78.0)
+help            Show Mix builtin help in the REPL
+require         Load a Mix module: evaluate the file once in an isolated scope, return its exports (map of top-level fns + $vars, or the file's top-level return value). Cached per canonical path; cycles error (v0.27.0)</p>
+<h2 id="format---see-strings">format  — see <a href="/mix/strings">strings</a></h2>
+<p>fmt             printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,"0") for strings). Dynamic width <code>*</code> takes the width from the next argument: %*s %-*s %<em>d %0</em>d %*f (v0.63.0; the width argument must be a non-negative integer). For byte-exact C-printf parity (%e %g %x, flags, glibc float rounding) use sprintf()
+sprintf         C-compatible printf: sprintf(fmt, ...) → string. Conversions %d %i %u %o %x %X %f %F %e %E %g %G %s %c %%; flags - + 0 # and space; width/precision incl. *; length modifiers parsed and ignored (integer conversions are 64-bit, so a negative %u/%x prints its 64-bit two's-complement). Float output matches glibc printf byte-for-byte (fixture-tested) — for emitting numbers a C/Rust consumer compares exactly. Divergences: %s pads by codepoints and %.Ns truncates to ≤N bytes without splitting a codepoint; %c takes a Unicode scalar (v0.71.0)
+printf          Formatted write to stdout (no trailing newline — include \n explicitly) (v0.2.0)
+eprintf         Formatted write to stderr (v0.2.0)
+format_bytes    Format byte count as human-readable size (e.g. "1.5 MB"); a non-numeric argument raises (strict since v0.55.0)
+format_number   Format number with thousands separators; non-numeric value/decimals arguments raise (strict since v0.55.0)</p>
+<h2 id="json---see-data">json  — see <a href="/mix/data">data</a></h2>
+<p>json_parse      Parse JSON string into Mix value
+json_encode     Encode Mix value as JSON string
+jq              Run a jq filter; filter MUST yield 0 (→nil) or 1 (→value) output, &gt;1 raises. jq(value, filter)
+jq_all          Run a jq filter, collect ALL outputs as a list (the stream case). jq_all(value, filter)
+read_json       Read a single-record JSON file directly into a Mix value (v0.2.3)
+read_jsonl      Read a JSON-lines file — list of records, strict by default, {skip_errors: true} for lenient (v0.2.3)
+yaml_parse      Parse a YAML string into a Mix value (requires yaml feature; v0.71.0). Single document by default (0 docs → nil, &gt;1 raises); pass {docs:true} for a list of every document. Anchors/aliases resolved; scalar mapping keys become string keys; a non-scalar key raises
+yaml_encode     Encode a Mix value as YAML (requires yaml feature; v0.71.0). No leading --- marker, trailing newline guaranteed; whole numbers emit as integers; nil/bool/number/string/list/map only — bytes, buffer or function values raise
+toml_parse      Parse TOML string into Mix map
+toml_encode     Encode Mix value as TOML. Raises TOML_UNREPRESENTABLE with {path,type} details for nil, function, bytes, or buffer values instead of silently replacing them with empty strings (strict since v0.55.0)
+data_parse      Parse a strict-data <code>.conf.mix</code> string into a Mix value (inverse of data_encode) (v0.3.2)
+data_encode     Encode a Mix value as a strict-data <code>.conf.mix</code> string with correct $ / ~ / \ escaping; round-trips through data_parse. data_encode(value, [pretty]) — truthy 2nd arg emits multi-line indented output (v0.3.2)</p>
+<h2 id="validate---see-data">validate  — see <a href="/mix/data">data</a></h2>
+<p>require_key     Assert a map key is present with a non-nil value and return it; raises VALIDATION_REQUIRED with details {path, expected, actual_type} (v0.29.0)
+expect_type     Assert a value's type and return it: expect_type($v, "integer") — types: any nil bool number integer string bytes buffer list map function (integer = finite whole within ±2^53-1); raises VALIDATION_TYPE (v0.29.0)
+nonblank        Assert a string contains a non-whitespace character, return it UNTRIMMED; the optional label names the value in the error; raises VALIDATION_NONBLANK — the boundary guard against nil/"" flowing into hostnames and paths (v0.29.0)
+get_or          Map lookup with a default that covers BOTH an absent key and a nil value (the tolerant twin of require_key) (v0.29.0)
+validate        Validate a map against a field spec at a job/API boundary: validate($raw, {node: {type: "string", nonblank: true}, plan: {enum: ["gold", "silver"]}, vmid: {type: "integer", min: 100, max: 999999}, tags: {required: false, type: "list", items: {type: "string"}}, owner: {type: "map", schema: {name: {nonblank: true}}}}). Rules: required (default TRUE) / type (string or list of types) / nonblank / enum / min / max / min_length / max_length / items / schema. Returns the ORIGINAL map unchanged; optional absent-or-nil fields skip their rules; unknown INPUT fields pass through; unknown RULE keys raise VALIDATION_SPEC; violations raise VALIDATION_* with details {path, expected, actual_type} — paths like owner.name and tags[2] (v0.29.0)</p>
+<h2 id="hof---see-hof">hof  — see <a href="/mix/hof">hof</a></h2>
+<p>sort_by         Return list sorted ascending by key function (stable) (v0.2.0)
+filter          Return new list of items where predicate returns truthy (v0.2.0)
+map             Return new list of transform(item) results (v0.2.0)
+reduce          Fold list left with an explicit init: reduce($xs, $init, function($a, $b) = ...) (v0.2.0)
+any             Short-circuit: true if any item matches predicate (v0.2.0)
+all             Short-circuit: true if every item matches predicate (v0.2.0)
+count           Count items where predicate returns truthy (v0.2.0)
+min_by          Return the ITEM (not the key) with minimum key-function value (v0.2.0)
+max_by          Return the ITEM with maximum key-function value (v0.2.0)
+sum_by          Sum of key(item) across all items, returns number (v0.2.0)
+group_by        Map of stringified-key → list of items (first-seen key order) (v0.2.0)
+unique_by       Dedup list by key function, first occurrence wins (v0.2.0)</p>
+<h2 id="bus---see-bus">bus  — see <a href="/mix/bus">bus</a></h2>
+<p>bus_call        Call a host-injected Bus verb under delegated identity: bus_call(verb, args) → reply. The embedder bounds which verbs are reachable and injects the delegation envelope; the script names no host/peer/actor
+publish         One-call topic publish (0.63.0): publish(topic, body[, opts]) builds the SPEC-02 wire frame and sends it via noded topic.publish — no hand-built ---\n frames, no body=/name= header-route trap. body is the payload STRING (json_encode a map first); opts: {retain: bool, command: string (inner frame header override, defaults to topic), headers: map}. Sets $rc/$result like <code>send</code>; returns rc (0 = published)</p>
+<h2 id="db---see-capabilities">db  — see <a href="/mix/capabilities">capabilities</a></h2>
+<p>db_query        Query the host-injected scoped DB: db_query(sql, [params]) → rows
+db_exec         Exec on the host-injected scoped DB: db_exec(sql, [params]) → {affected, last_insert_id}</p>
+<h2 id="jmap---see-capabilities">jmap  — see <a href="/mix/capabilities">capabilities</a></h2>
+<p>jmap            Call the host-injected JMAP upstream: jmap(method, args) → result, or jmap([[method,args,callId],…]) → methodResponses
+jmap_upload     Upload bytes as a JMAP blob via the host-injected upstream: jmap_upload(body[, content_type]) → blobId (the compose half of the mail seam; Email/set create is blob-only)</p>
+<h2 id="datastar---see-datastar">datastar  — see <a href="/mix/datastar">datastar</a></h2>
+<p>ds_patch_elements Frame an HTML fragment as a Datastar patch-elements SSE event: ds_patch_elements(html, [{selector, mode, view_transition}]) → event string. mode=outer(default)/inner/remove/replace/prepend/append/before/after. Caller MUST html_escape() untrusted content first — this only frames (requires datastar feature) (v0.18.1)
+ds_patch_signals Frame a signal update as a Datastar patch-signals SSE event: ds_patch_signals(signals_map_or_json, [{only_if_missing}]) → event string. A map is JSON-encoded; a string is used verbatim (requires datastar feature) (v0.18.1)
+ds_sse          Assemble a text/event-stream response body from one event string or a list of them: ds_sse(event | [events]) → body. Pair with headers={"Content-Type":"text/event-stream"} (requires datastar feature) (v0.18.1)</p>
+<h2 id="prelude--mix-defined-helpers-not-builtins">Prelude — Mix-defined helpers, not builtins</h2>
+<p><code>mix help</code> also lists a small <strong>prelude</strong> (<code>sum</code>, <code>avg</code>): plain Mix functions auto-loaded from <code>std/prelude.mix</code> before every script and <code>~/.mixrc</code>. They are not builtins — <code>mix builtins</code> and <code>mix what</code> do not know them. A builtin always shadows a same-named Mix function, which is why the old prelude <code>min</code>/<code>max</code>/<code>abs</code>/<code>clamp</code> shims were retired when the native <code>math</code> category landed in v0.19.0, and why the <code>lines</code>/<code>chars</code>/<code>read_lines</code> shims went with the 0.63.0 native <code>lines</code>/<code>chars</code> (the <code>read_lines</code> builtin had shadowed its shim since v0.2.3).</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/overview">overview</a> · <a href="/mix/keywords">keywords</a> · <a href="/mix/cli">the mix CLI</a></li>
+<li><code>mix builtins [CATEGORY]</code> lists one category with one-line descriptions (<code>mix builtins</code> alone lists all ten); <code>mix what NAME</code> describes one builtin or keyword; <code>mix help</code> prints the compact category / keyword / subcommand summary.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +978,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1032,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1161,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

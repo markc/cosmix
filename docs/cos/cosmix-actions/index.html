@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-actions/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,156 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-actions/README.md"><div class="prose"><h1 id="cosmix-actions">cosmix-actions</h1>
+<p><code>cosmix-actions</code> is the mesh-free action spine for Cosmix applications and CTK menus. It defines stable action names, serialisable metadata, a local handler registry, engine-independent keyboard input, layered strict-data keymaps, and deterministic chord resolution. In the <code>bus ← mix ← cos</code> dependency chain it sits in <code>cos</code>; it uses <code>cosmix-lib-config</code> for the Mix strict-data serde bridge and deliberately has no direct Bus or mesh dependency.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>Rendering engines translate keyboard events into <code>RawInput</code>. Applications register
+<code>ActionMeta</code>, handlers, and enabled predicates in an <code>ActionRegistry</code>. A <code>Keymap</code>
+maps input chords to <code>ActionId</code> values, while <code>resolve</code> and <code>resolve_timeout</code>
+advance caller-owned <code>ResolveState</code>.</p>
+<p>The crate does not read a wall clock. Callers supply a monotonic <code>Tick</code>, which
+makes input replay and timeout testing deterministic.</p>
+<p>The crate is a library. It has no binary, CLI, configuration search path, or
+Cargo feature flags.</p>
+<h2 id="public-api">Public API</h2>
+<table><thead><tr><th>Area</th><th>Main items</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Action identity</td><td><code>ActionId</code>, <code>ActionIdError</code></td><td>Validate, intern, compare, display, and serialise stable action names</td></tr>
+<tr><td>Input model</td><td><code>Key</code>, <code>Modifiers</code>, <code>KeyStroke</code>, <code>Chord</code>, <code>RawInput</code>, <code>FocusContext</code>, <code>Tick</code></td><td>Represent engine-normalised physical keyboard input</td></tr>
+<tr><td>Keymaps</td><td><code>Keymap</code>, <code>Binding</code>, <code>BindingOverride</code>, <code>EffectiveBinding</code></td><td>Define app defaults and per-app user overrides</td></tr>
+<tr><td>Keymap I/O</td><td><code>load_keymap</code>, <code>parse_keymap</code>, <code>to_keymap_mix</code>, <code>save_keymap</code></td><td>Read, validate, emit, and write strict-data <code>.mix</code> keymaps</td></tr>
+<tr><td>Resolution</td><td><code>ResolveState</code>, <code>Resolved</code>, <code>ResolveOutcome</code>, <code>resolve</code>, <code>resolve_timeout</code></td><td>Resolve strokes and chord timeouts without engine or clock dependencies</td></tr>
+<tr><td>Registry</td><td><code>ActionRegistry</code>, <code>ActionMeta</code>, <code>ActionMetadata</code></td><td>Join queryable metadata to app-local runtime behaviour</td></tr>
+<tr><td>Invocation</td><td><code>ActionArgs</code>, <code>ActionValue</code>, <code>ActionHandler</code>, <code>EnabledPredicate</code></td><td>Validate typed arguments and invoke enabled handlers</td></tr>
+<tr><td>Source policy</td><td><code>ActionSource</code>, <code>ActionSources</code>, <code>InteractiveAction</code></td><td>Control which ingress sources may request an action</td></tr>
+<tr><td>Built-ins</td><td><code>fable</code>, <code>fusion</code>, <code>theme</code></td><td>Publish canonical action identifiers for bundled applications</td></tr>
+</tbody></table>
+<p>Most types are re-exported from the crate root. The <code>fable</code>, <code>fusion</code>, and
+<code>theme</code> identifier sets remain public modules.</p>
+<h2 id="action-identifiers">Action identifiers</h2>
+<p><code>ActionId::from_static</code> constructs a compile-time identifier from a string
+literal. <code>ActionId::intern</code> validates and interns a runtime string for the
+remainder of the process. <code>ActionId::validate_str</code> checks an untrusted name
+without allocating or interning it.</p>
+<p>Identifiers are non-empty ASCII strings. They may contain letters, digits,
+<code>.</code>, <code>-</code>, <code>_</code>, <code>:</code>, and <code>/</code>. An identifier is at most 128 UTF-8 bytes.</p>
+<p>Static identifiers do not consume the dynamic interner budget. Reusing an
+already interned value also consumes no additional slot.</p>
+<h2 id="input-model">Input model</h2>
+<p><code>Key</code> covers ASCII letter and digit keys, navigation and editing keys, common
+punctuation keys, and function keys <code>F1</code> through <code>F24</code>. Engine adapters pass
+physical keys rather than locale-produced text; focused widgets remain
+responsible for text editing.</p>
+<p><code>KeyStroke</code> combines one key with exact <code>Ctrl</code>, <code>Alt</code>, <code>Shift</code>, and <code>Super</code>
+modifier state. <code>Chord</code> contains one to eight ordered strokes. Its display and
+serde spelling uses forms such as <code>Ctrl+K</code> and <code>Ctrl+K, Ctrl+C</code>.</p>
+<p><code>BindingScope</code> supports:</p>
+<ul>
+<li><code>global</code> when no modal owns input;</li>
+<li><code>modal:name</code> for the named captured modal;</li>
+<li><code>focus:name</code> for an application-defined focus tag.</li>
+</ul>
+<p>Modal capture is exclusive. Focus-tag bindings outrank global bindings.
+<code>allow_in_editable</code> controls whether a binding may resolve while an editable
+widget has focus. <code>RepeatPolicy</code> either ignores or admits operating-system key
+repeat presses.</p>
+<h2 id="keymap-format">Keymap format</h2>
+<p>Keymaps use strict-data <code>.mix</code> and schema version 1:</p>
+<pre><code class="language-mix">{
+  version: 1,
+  chord_timeout_ms: 1000,
+  defaults: [
+    {
+      action: "view.refresh",
+      chord: ["Ctrl+R"],
+      scope: "global",
+      repeat: "ignore",
+      allow_in_editable: false
+    }
+  ],
+  custom: [
+    {
+      action: "view.refresh",
+      chord: ["F5"],
+      scope: "global",
+      repeat: "ignore",
+      allow_in_editable: false
+    }
+  ]
+}
+</code></pre>
+<p>Any custom entry for an <code>(action, scope)</code> pair removes every default for that
+pair. A custom entry with <code>chord: nil</code> leaves the action unbound in that scope.
+Several non-<code>nil</code> custom entries may assign several replacement chords.</p>
+<p><code>Keymap::effective_bindings</code> applies this layering. <code>Keymap::binding_for</code>
+returns a usable global accelerator label and omits shadowed or conflicted
+bindings. <code>Keymap::diagnostics</code> reports replaced defaults, shadowed exact
+bindings, and equal-priority conflicts.</p>
+<h2 id="resolution">Resolution</h2>
+<p><code>resolve</code> processes one <code>RawInput</code> event. <code>resolve_timeout</code> polls an existing
+partial chord against the current focus context and keymap. Both functions
+return emitted action identifiers, a <code>ResolveOutcome</code>, and non-fatal
+<code>ResolveDiagnostic</code> values.</p>
+<p>Resolution applies these rules:</p>
+<ol>
+<li>A captured modal is exclusive; otherwise matching focus tags beat globals.</li>
+<li>Custom exact bindings beat default exact bindings.</li>
+<li>Longer chords preserve a shorter completed binding as a timeout fallback.</li>
+<li>Equal-priority exact bindings for different actions report a conflict and do not fire.</li>
+</ol>
+<p>Shared prefixes are not conflicts. Releases do not resolve actions. A pending
+prefix is invalidated when relevant focus or effective keymap state changes.</p>
+<h2 id="action-registry">Action registry</h2>
+<p><code>ActionMeta</code> carries the stable identifier, label, typed argument schema,
+optional category, icon name, description, interaction metadata, and source
+allowlist. It contains no handler or process pointer.</p>
+<p><code>ActionRegistry::register</code> joins metadata to an <code>ActionHandler</code> and an
+<code>EnabledPredicate</code>. The registry rejects duplicate identifiers, malformed
+schemas, and capacity overruns. It exposes stable-order metadata queries,
+snapshots, a structural revision, and aggregate metadata accounting.</p>
+<p><code>invoke</code> validates and runs an app-local action. <code>invoke_from</code> additionally
+enforces an explicit <code>ActionSource</code>. <code>validate_invocation</code> and
+<code>validate_invocation_from</code> perform the same live enabled-state and typed
+argument checks without running the handler.</p>
+<p><code>metadata_named</code> looks up an untrusted runtime name without interning it. It is
+the appropriate lookup boundary for ingress adapters that must avoid consuming
+the process-lifetime interner with unknown names.</p>
+<p>Action arguments are string, finite number, or boolean values. Schemas may
+mark fields as required and may either reject or permit undeclared fields.</p>
+<h2 id="source-policy-and-interaction">Source policy and interaction</h2>
+<p><code>ActionSources::default</code> permits app, keyboard, mouse, and menu invocation. It
+denies Bus, MIDI, and OSC until each source is explicitly enabled for the
+action. <code>ActionSources::Bus</code> adds Bus to the permitted local sources.</p>
+<p>An action with <code>InteractiveAction</code> metadata requires local interaction.
+Interactive actions may name a typed non-interactive <code>direct_verb</code>, or declare
+no remote equivalent. Metadata decoding and live registration reject every
+interactive action whose source policy permits Bus.</p>
+<p>The crate defines source-policy metadata but no Bus service or verb handlers.</p>
+<h2 id="bundled-identifiers-and-keymaps">Bundled identifiers and keymaps</h2>
+<p>The <code>fable</code> module publishes canonical file, navigation, view, selection, and
+application action identifiers. The <code>fusion</code> module publishes transport, song,
+session, view, settings, and export identifiers. The <code>theme</code> module publishes
+shared mode and colour-scheme identifiers.</p>
+<p><code>FABLE_DEFAULT_KEYMAP_MIX</code> and <code>FUSION_DEFAULT_KEYMAP_MIX</code> expose the checked-in
+default keymaps as strings suitable for <code>parse_keymap</code>. Each application module
+also exposes ordered menu and default-keymap identifier arrays.</p>
+<h2 id="bounds">Bounds</h2>
+<table><thead><tr><th>Boundary</th><th style="text-align: right">Limit</th></tr></thead><tbody>
+<tr><td>Action identifier length</td><td style="text-align: right">128 bytes</td></tr>
+<tr><td>Dynamically interned identifiers per process</td><td style="text-align: right">16,384</td></tr>
+<tr><td>Strokes per chord</td><td style="text-align: right">8</td></tr>
+<tr><td>Distinct action identifiers per keymap</td><td style="text-align: right">1,024</td></tr>
+<tr><td>Default plus custom bindings per keymap</td><td style="text-align: right">4,096</td></tr>
+<tr><td>Keymap source size</td><td style="text-align: right">1 MiB</td></tr>
+<tr><td>Metadata records per transactional decode</td><td style="text-align: right">4,096</td></tr>
+<tr><td>Argument fields per action</td><td style="text-align: right">128</td></tr>
+<tr><td>Metadata source or live-registry metadata</td><td style="text-align: right">1 MiB</td></tr>
+<tr><td>Actions per live registry</td><td style="text-align: right">4,096</td></tr>
+</tbody></table>
+<p>Keymap chord timeouts must be between 1 and 60,000 milliseconds.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p><code>cosmix-lib-config</code> supplies strict-data <code>.mix</code> decoding and encoding. <code>serde</code>
+provides the serialisable data model. <code>thiserror</code> provides typed public errors.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +768,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +822,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +951,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

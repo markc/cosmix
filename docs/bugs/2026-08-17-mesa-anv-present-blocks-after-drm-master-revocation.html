@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bugs/2026-08-17-mesa-anv-present-blocks-after-drm-master-revocation</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,81 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bugs/2026-08-17-mesa-anv-present-blocks-after-drm-master-revocation.md"><div class="prose"><h1 id="anvwsi_display-vkqueuepresentkhr-never-returns-after-drm-master-revocation-vt-switch">anv/wsi_display: <code>vkQueuePresentKHR</code> never returns after DRM master revocation (VT switch)</h1>
+<p><strong>Found:</strong> 2026-08-17, during development of
+<a href="https://github.com/markc/cosmix">cosmix-comp</a>, the CosMix Wayland compositor.
+<strong>Status:</strong> documented here; not yet filed upstream. CosMix's own exposure is
+closed — the compositor retired its <code>VK_KHR_display</code> presentation path
+entirely (2026-08-18) in favour of compositor-owned KMS atomic commits with
+cancellable, absolutely-deadlined waits.
+<strong>Severity for affected users:</strong> an externally-initiated VT/seat switch
+permanently wedges any direct-display Vulkan client with an in-flight
+present; the only recovery is killing the process.</p>
+<h2 id="summary">Summary</h2>
+<p>When a Vulkan application presents through a <code>VK_KHR_display</code> (direct
+display) swapchain and the kernel revokes its DRM master (a VT switch
+initiated by another session), an in-flight <code>vkQueuePresentKHR</code> blocks
+forever inside ANV's display WSI flip wait instead of failing with
+<code>VK_ERROR_SURFACE_LOST_KHR</code>. The wait has no timeout and no cancellation
+path, so the presenting thread — and everything serialized behind it (queue
+locks, the swapchain, the surface) — is lost for the life of the process.</p>
+<h2 id="environment">Environment</h2>
+<ul>
+<li>Mesa 26.1.6 (Arch <code>mesa 3:26.1.6-1</code>, <code>vulkan-intel 3:26.1.6-1</code>)</li>
+<li>Intel Meteor Lake-P / Arc Graphics <code>8086:7d55</code>, Xe KMD
+(the "Support for this platform is experimental with Xe KMD" path)</li>
+<li>Kernel 7.1.8</li>
+<li>Wayland compositor presenting via <code>VK_KHR_display</code> (direct display),
+wgpu/wgpu-hal 29 on top of ANV; compositor holds DRM master on its VT</li>
+</ul>
+<h2 id="steps-to-reproduce">Steps to reproduce</h2>
+<ol>
+<li>Compositor acquires DRM master on a VT and presents through a
+<code>VK_KHR_display</code> swapchain (FIFO), steady 60 fps.</li>
+<li>From another session, switch the VT away (<code>chvt N</code> — the kernel revokes
+DRM master / the seat pauses the device). The compositor has an in-flight
+<code>vkQueuePresentKHR</code>, or issues one before it can observe the pause.</li>
+<li>That <code>vkQueuePresentKHR</code> call never returns.</li>
+</ol>
+<h2 id="observed">Observed</h2>
+<p>The presenting thread is stuck indefinitely in ANV's display WSI flip wait.
+Stack of the blocked thread (release build, dynamic symbols):</p>
+<pre><code>#0 usleep                                (libc)
+#1-#2 ?? ()                              (libvulkan_intel.so — wsi_display flip/event handling)
+#3 drmHandleEvent                        (libdrm.so.2)
+#4 ?? ()                                 (libvulkan_intel.so — event loop)
+</code></pre>
+<p>The flip event it waits for can never arrive: scanout stopped when master
+was revoked, and re-acquiring the VT later does not deliver it either (the
+flip belonged to the revoked master epoch). The wait is unbounded — no
+timeout, no cancellation — so the thread never comes back.</p>
+<h2 id="expected">Expected</h2>
+<p>When the DRM event source is dead because master was revoked, present
+should complete with <code>VK_ERROR_SURFACE_LOST_KHR</code> (or
+<code>VK_ERROR_OUT_OF_DATE_KHR</code>) so the application can retire the swapchain and
+rebuild after re-acquiring the seat. An unbounded wait inside
+<code>vkQueuePresentKHR</code> makes seat switching unsurvivable for any direct-display
+client with an in-flight present, because the revocation <em>races the client's
+own pause handling by design</em>: the kernel revokes first, the client learns
+second. No application-side ordering can close that window.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>Reproduces deterministically (2/2 and further repeats) with an in-flight
+FIFO present at the moment of revocation. Diagnosed live with gdb against
+the blocked process.</li>
+<li>The compositor's own orchestrated VT switches (drain presents first, then
+switch) work fine — only externally-initiated revocation hits the window,
+which is exactly the case the application cannot order around.</li>
+<li>Workaround adopted by CosMix: stop presenting through <code>VK_KHR_display</code>
+altogether. cosmix-comp now renders offscreen into GBM-allocated scanout
+buffers and issues its own KMS atomic commits (<code>NONBLOCK</code> +
+<code>PAGE_FLIP_EVENT</code>), waiting on the DRM fd and a cancellation eventfd with
+an absolute deadline — every wait is bounded and cancellable, so master
+revocation is survivable at any instant.</li>
+<li>Full traces, an strace of the wait loop, and patch testing on this
+hardware are available on request.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +693,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +747,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +876,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

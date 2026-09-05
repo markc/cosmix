@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/01-foundations</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,63 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/01-foundations.md"><div class="prose"><h1 id="foundational-principles">Foundational principles</h1>
+<p>These principles carry forward the ownership and safety intent of the historical
+constitution and architectural index. Enforcement status is separate: this audit
+does not establish that a complete constitutional policy engine exists.</p>
+<h2 id="ownership-and-legibility">Ownership and legibility</h2>
+<p><strong>FOUND-001 — Operator-owned state.</strong> Canonical application data and credentials
+remain under operator control. External replication, credentials handling and
+remote actions require the configured authority for that deployment and task.
+An available network connection is not permission to send private data.</p>
+<p><strong>FOUND-002 — Reconstructible operation.</strong> Interfaces, configuration and state
+transitions must be inspectable through documented contracts. Discovery should
+expose enough structure for both people and agents to act without guessing.
+Private production values are not part of a public protocol specification.</p>
+<h2 id="architecture">Architecture</h2>
+<p><strong>FOUND-003 — State and presentation have different owners.</strong> Protocol/substrate
+state is authoritative for its domain. UI views derive from it. Compositor-local
+frame and buffer state stays with the compositor; a remote control interface does
+not become a rendering dependency.</p>
+<p><strong>FOUND-004 — Keep Bus out of the frame path.</strong> Rendering and input-critical
+mechanisms must not require a broker round trip. Bus carries control, observation
+and policy, not per-frame pixels. See <a href="/spec/11-desktop">desktop</a>.</p>
+<p><strong>FOUND-005 — Mechanism and policy remain separable.</strong> Put reusable domain logic
+in libraries, expose it through typed daemon contracts, and orchestrate external
+processes with Mix. Do not encode deployment-specific policy into shared types.</p>
+<p><strong>FOUND-006 — Coherent defaults, explicit alternatives.</strong> Support standard
+Wayland contracts where applicable and a coherent default toolkit. Alternative
+clients are allowed through explicit interfaces, not by duplicating authority.
+Trusted, security-sensitive surfaces require a stronger boundary than decorative
+or replaceable desktop furniture.</p>
+<p><strong>FOUND-007 — Evidence before architectural expansion.</strong> Prefer event-driven
+wakeups and measured idle cost. Additional renderers, bypass paths and orchestration
+layers need a demonstrated requirement and tests of the new boundary. Aspirational
+canvas/places designs are not proof of existing runtime functionality.</p>
+<h2 id="safety-and-autonomy">Safety and autonomy</h2>
+<p><strong>FOUND-008 — Authorisation is separate from parsing.</strong> A well-formed path, actor
+token or capability string does not prove existence, identity, permission or current
+state. Check these at the responsible environment/transaction boundary.</p>
+<p><strong>FOUND-009 — Fail safely without collateral rollback.</strong> Scope edits and rollback
+to the authorised operation. Preserve unrelated work and durable records. Never use
+a whole-tree reset as an autonomous error handler. Data and schema changes require
+an explicit recovery plan; a Git revert alone cannot reverse external effects.</p>
+<p><strong>FOUND-010 — Autonomy cannot waive correctness.</strong> The operator may configure
+unattended work or human checkpoints. Either mode must preserve authenticated
+identity, permission checks, bounded resource use, race-safe state transitions and
+auditable outcomes. Human ceremony is not a substitute for technical enforcement.</p>
+<p><strong>FOUND-011 — No invented enforcement.</strong> Historical T0–T3 tiers, mandatory Git
+trailers, drift breakers, constitutional path maps and crisis machinery must not
+be advertised as active protections without corresponding configuration, code and
+execution evidence. Their policy status requires reconciliation with current
+working agreements before adoption.</p>
+<h2 id="retained-policy-questions">Retained policy questions</h2>
+<p>The old constitution prescribed exact dependency versions, a fixed mesh subnet,
+specific external-action prohibitions and human-only amendment paths. Current
+source and operating agreements differ in places. This edition preserves their
+sovereignty/safety intent but does not quietly ratify replacements for those exact
+rules. Their detailed disposition remains an acceptance gate in the private audit.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +675,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +729,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +858,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-indexd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,121 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-indexd/README.md"><div class="prose"><h1 id="cosmix-indexd">cosmix-indexd</h1>
+<p><code>cosmix-indexd</code> is the CosMix semantic indexing and vector-storage daemon. It embeds text with a Nomic BERT model through Candle, stores 768-dimensional vectors in SQLite through <code>sqlite-vec</code>, and serves indexing and retrieval operations over Bus and a local Unix socket. It belongs to the downstream <code>cos</code> repository in the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it uses Bus protocol and client crates together with <code>cos</code> daemon, configuration, logging, and property-store substrate.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-indexd [--config PATH] [--f32]
+cosmix-indexd --version
+</code></pre>
+<p>The daemon:</p>
+<ul>
+<li>loads configuration before accepting requests;</li>
+<li>opens or creates the vector database;</li>
+<li>accepts newline-delimited JSON on a Unix socket;</li>
+<li>registers the Bus service <code>indexd</code> when the broker is available;</li>
+<li>loads the embedding model on the first embedding request;</li>
+<li>optionally unloads the model after an idle period;</li>
+<li>reconnects to the Bus broker after connection loss.</li>
+</ul>
+<p>The local socket remains available while Bus registration is unavailable.</p>
+<h2 id="command-line-options">Command-line options</h2>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>-c PATH</code>, <code>--config PATH</code></td><td>Load the named <code>.conf.mix</code> file. A missing, unreadable, or invalid explicit file is fatal.</td></tr>
+<tr><td><code>--f32</code></td><td>Force <code>f32</code> model precision, overriding the configured <code>dtype</code>.</td></tr>
+<tr><td><code>--version</code></td><td>Print the crate version, Git revision, and build time.</td></tr>
+</tbody></table>
+<p>See <a href="/cos/cosmix-indexd/configuration">configuration.md</a> for configuration lookup and fields.</p>
+<h2 id="client-surfaces">Client surfaces</h2>
+<p>The daemon exposes the same data operations through two transports.</p>
+<p>The Bus surface registers as service <code>indexd</code>. Commands normally use names such as <code>indexd.search</code> and carry their request fields as Bus arguments. Responses use Bus return code <code>0</code> for success and <code>10</code> when the generated JSON contains a top-level error.</p>
+<p>The Unix socket accepts one JSON object per line. Each request contains an <code>action</code> field. Each response is one JSON object followed by a newline.</p>
+<pre><code class="language-json">{"action":"search","query":"property snapshots","limit":5,"source":"doc"}
+</code></pre>
+<p>See <a href="/cos/cosmix-indexd/verbs">verbs.md</a> for the complete request surface.</p>
+<h2 id="operations">Operations</h2>
+<table><thead><tr><th>Action or Bus verb</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>embed</code>, <code>indexd.embed</code></td><td>Produce embeddings for one or more texts.</td></tr>
+<tr><td><code>store</code>, <code>indexd.store</code></td><td>Embed and persist text chunks with source and metadata.</td></tr>
+<tr><td><code>search</code>, <code>indexd.search</code></td><td>Run nearest-neighbour search with optional source and metadata filters.</td></tr>
+<tr><td><code>update</code>, <code>indexd.update</code></td><td>Change a chunk and re-embed it when its content changes.</td></tr>
+<tr><td><code>delete</code>, <code>indexd.delete</code></td><td>Delete chunks and their vectors.</td></tr>
+<tr><td><code>list</code>, <code>indexd.list</code></td><td>List stored chunks with pagination and optional source filtering.</td></tr>
+<tr><td><code>feedback</code>, <code>indexd.feedback</code></td><td>Add positive or negative relevance feedback to a chunk.</td></tr>
+<tr><td><code>supersede</code>, <code>indexd.supersede</code></td><td>Mark an older chunk as replaced while retaining it for audit.</td></tr>
+<tr><td><code>stale</code>, <code>indexd.stale</code></td><td>Report never-used, low-value, and dormant chunks.</td></tr>
+<tr><td><code>index_file</code>, <code>indexd.index_file</code></td><td>Split and index a Markdown file.</td></tr>
+<tr><td><code>stats</code>, <code>indexd.stats</code></td><td>Report corpus, database, model, circuit-breaker, and cache state.</td></tr>
+</tbody></table>
+<h2 id="embedding-model">Embedding model</h2>
+<p>The daemon loads <code>config.json</code>, <code>tokenizer.json</code>, and <code>model.safetensors</code> from the Hugging Face cache when all three are present. It fetches missing model files through <code>hf-hub</code>.</p>
+<p>Embedding runs on the CPU in <code>f16</code> or <code>f32</code>. Input receives a task prefix:</p>
+<ul>
+<li>documents use <code>search_document: </code>;</li>
+<li>queries use <code>search_query: </code>;</li>
+<li>direct <code>embed</code> requests default to <code>search_document: </code> and may supply another prefix.</li>
+</ul>
+<p>Mean-pooled embeddings are L2-normalised. The fixed database vector width is 768.</p>
+<p>Model loading and inference have separate circuit breakers. A model-load breaker opens after two consecutive failures and retries after 60 seconds. An inference breaker opens after three consecutive failures or timeouts and retries after 30 seconds. A single inference batch has a 120-second wall-clock limit.</p>
+<p>The in-memory embedding cache keys entries by text and prefix. It holds at most 512 entries and expires entries after five minutes.</p>
+<h2 id="vector-store">Vector store</h2>
+<p>The database uses SQLite in WAL mode with <code>sqlite-vec</code>. A <code>chunks</code> table holds content, source, metadata, timestamps, feedback, retrieval counters, supersession state, and a content hash. A <code>vec_chunks</code> virtual table holds the vectors.</p>
+<p>The content hash covers the source and text. Re-storing the same source and text returns the existing identifier and may refresh its metadata without recomputing an embedding.</p>
+<p>Search:</p>
+<ul>
+<li>excludes chunks whose <code>superseded_by</code> field is set;</li>
+<li>supports an exact source filter;</li>
+<li>supports JSON metadata comparisons;</li>
+<li>records retrieval count and last-retrieved time;</li>
+<li>adjusts vector distance with explicit feedback, repeated unrewarded retrievals, and age.</li>
+</ul>
+<p>Lower adjusted distance ranks first.</p>
+<h2 id="markdown-indexing">Markdown indexing</h2>
+<p><code>index_file</code> accepts a path and may also accept caller-supplied content. Supplied content takes precedence and lets a caller index a file that the daemon cannot read directly.</p>
+<p>The indexer:</p>
+<ul>
+<li>detects <code>doc</code> and <code>journal</code> sources from <code>_doc</code> and <code>_journal</code> path components when no source is supplied;</li>
+<li>resolves a domain from the separate domains settings when no domain is supplied;</li>
+<li>splits Markdown at level-two headings;</li>
+<li>ignores sections of 50 bytes or fewer;</li>
+<li>splits oversized sections at a 6,000-character budget;</li>
+<li>stores path, filename, section, domain, type, and date metadata;</li>
+<li>removes obsolete chunks only after every replacement section stores successfully.</li>
+</ul>
+<p>A request may set <code>background</code> to <code>true</code>. The daemon then acknowledges the request immediately and processes it through a single serial background worker.</p>
+<h2 id="properties-and-events">Properties and events</h2>
+<p>The Bus property surface implements:</p>
+<ul>
+<li><code>indexd.props.get</code>;</li>
+<li><code>indexd.props.list</code>;</li>
+<li><code>indexd.props.describe</code>;</li>
+<li><code>indexd.props.watch</code>.</li>
+</ul>
+<p><code>props.watch</code> is also accepted as an alias. It returns the topic name that the caller must subscribe to.</p>
+<p>Queryable paths cover:</p>
+<ul>
+<li><code>config.socket_path</code>, <code>config.model_id</code>, <code>config.dtype</code>, <code>config.idle_timeout_secs</code>, and <code>config.embed_dim</code>;</li>
+<li><code>lifecycle.started_at</code>, <code>lifecycle.uptime_s</code>, <code>lifecycle.health</code>, <code>lifecycle.props_level</code>, <code>lifecycle.model_loaded</code>, <code>lifecycle.model_circuit</code>, and <code>lifecycle.embed_circuit</code>;</li>
+<li><code>corpus.chunks</code>, <code>corpus.bytes_db</code>, and <code>corpus.kinds</code>.</li>
+</ul>
+<p>The daemon publishes retained full snapshots to <code>world.indexd</code> and non-retained leaf changes to <code>indexd.props.changed</code>. It polls once per second, ignores transient uptime changes, and debounces corpus-only changes to at most one publication every ten seconds.</p>
+<h2 id="limits">Limits</h2>
+<table><thead><tr><th>Limit</th><th style="text-align: right">Value</th></tr></thead><tbody>
+<tr><td>Texts in one <code>embed</code> or <code>store</code> request</td><td style="text-align: right">256</td></tr>
+<tr><td>Metadata filters in one <code>search</code> request</td><td style="text-align: right">32</td></tr>
+<tr><td>Chunks produced by one <code>index_file</code> request</td><td style="text-align: right">4,000</td></tr>
+<tr><td>Markdown chunk character budget</td><td style="text-align: right">6,000</td></tr>
+<tr><td>Embedding timeout</td><td style="text-align: right">120 seconds</td></tr>
+</tbody></table>
+<h2 id="cargo-features">Cargo features</h2>
+<p>This crate defines no crate-specific Cargo features.</p>
+<h2 id="implementation-layout">Implementation layout</h2>
+<table><thead><tr><th>File</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>src/main.rs</code></td><td>CLI, configuration lookup, model lifecycle, vector database, request dispatch, Bus registration, and Unix socket server.</td></tr>
+<tr><td><code>src/props.rs</code></td><td>SPEC 07 property snapshot, path listing, and descriptions.</td></tr>
+<tr><td><code>src/world.rs</code></td><td>Property diff loop and Bus topic publication.</td></tr>
+<tr><td><code>build.rs</code></td><td>Build revision and timestamp metadata.</td></tr>
+</tbody></table></div></div>
     </div>
 
 </main>
@@ -620,6 +733,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +787,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +916,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

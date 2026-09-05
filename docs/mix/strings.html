@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/strings</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,594 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/strings.md"><div class="prose"><h1 id="strings">Strings</h1>
+<p>Mix has two string literal forms, <code>..</code> for concatenation, and a deliberately
+<strong>codepoint-based</strong> core with explicit byte and grapheme twins. This page covers
+the lexer rules (what interpolates, what stays literal, the escapes) and the
+string-category <a href="/mix/builtins">builtins</a>. Every example below was run on <strong>Mix
+0.21.2</strong>; the output shown is real.</p>
+<blockquote>
+<p>Mental model: <code>"double"</code> interpolates <code>${...}</code> and expands a leading <code>~</code>;
+<code>'single'</code> is fully raw; <code>..</code> joins; <code>length</code>/<code>pos</code>/<code>substr</code> count <strong>Unicode
+codepoints</strong>, with <code>byte_*</code> and <code>grapheme_*</code> twins when you need the other units.</p>
+</blockquote>
+<h2 id="the-two-literal-forms">The two literal forms</h2>
+<pre><code class="language-mix">$name = "world"
+print("hello ${name}")          -- ${...} interpolates
+print("hello $name")            -- bare $name is LITERAL (unlike bash!)
+print('raw ${name} $(date)')    -- single-quote: nothing interpolates
+</code></pre>
+<pre><code class="language-text">hello world
+hello $name
+raw ${name} $(date)
+</code></pre>
+<p>The split mirrors bash's quoting, with one trap that bites everyone:</p>
+<table><thead><tr><th>Form</th><th>Interpolates <code>${x}</code></th><th>Bare <code>$x</code></th><th><code>$(...)</code></th><th>leading <code>~</code></th><th>Escapes</th></tr></thead><tbody>
+<tr><td><code>"double"</code></td><td>yes (scope → env)</td><td><strong>literal text</strong></td><td><strong>literal text</strong></td><td>expands to <code>$HOME</code></td><td><code>\n \t \r \e \" \\ \$ \~ \u{…}</code></td></tr>
+<tr><td><code>'single'</code></td><td>no</td><td>literal</td><td>literal</td><td>literal</td><td>only <code>\'</code> and <code>\\</code></td></tr>
+</tbody></table>
+<p><strong>Only <code>${...}</code> interpolates</strong> inside double quotes. A bare <code>$name</code> is the literal
+three-or-more characters <code>$name</code> — the opposite of bash, and the single most common
+error an agent makes here. When unsure, prefer <code>..</code> concat (below) over
+interpolation.</p>
+<p><code>$(...)</code> and <code>$((...))</code> are <strong>literal text</strong> inside a Mix string — the old
+build-time command-substitution footgun was removed. To splice a command's output,
+use <a href="/mix/system"><code>run</code>/<code>run_rc</code></a> plus <code>..</code>. (Two exceptions still substitute: a
+<a href="/mix/strings#heredocs">heredoc</a> body, and the standalone <code>$(cmd)</code> expression — neither is a
+plain string literal.)</p>
+<p>Know the two contexts. The literal rule above is about <strong>Mix string literals</strong>. In
+a <code>run</code>/<code>run_rc</code>/<code>ssh_run</code> <em>command string</em>, a literal <code>$(...)</code> passes through to
+the target shell — so it substitutes in the <code>/bin/sh</code> that actually runs the
+command: local for <code>run</code>/<code>run_rc</code>, the <strong>remote</strong> shell for <code>ssh_run</code>:</p>
+<pre><code class="language-mix">print(run("echo $(echo passthru)"))   -- /bin/sh does the substitution
+</code></pre>
+<pre><code class="language-text">passthru
+</code></pre>
+<p>And on a <em>shell-dispatch</em> line (<code>mix -c</code>'s shell branch, the login shell), <code>$(...)</code>
+<strong>is</strong> command substitution — see <a href="/mix/shell-mode">shell mode</a>.</p>
+<h3 id="interpolation-walks-scope-then-env">Interpolation walks scope, then env</h3>
+<p><code>${X}</code> looks up the name in the local scope first, then the process environment:</p>
+<pre><code class="language-mix">print("val=${MYVAR}")
+</code></pre>
+<pre><code class="language-text"># run as:  MYVAR=fromenv mix -c '...'
+val=fromenv
+</code></pre>
+<p>A name unbound in <strong>both</strong> scope and env is a <strong>runtime error</strong> — the same as
+reading a bare <code>$X</code>, so a typo is caught loudly rather than silently splicing
+text:</p>
+<pre><code class="language-mix">print("[${NOPE_NOT_SET}]")
+</code></pre>
+<pre><code class="language-text">Runtime error: undefined variable '$NOPE_NOT_SET' in interpolation (use ${NOPE_NOT_SET ?? default} for a fallback)
+</code></pre>
+<p>A variable whose <strong>value</strong> is nil is bound, so it still renders the literal
+<code>nil</code> (<code>$x = nil</code> → <code>${x}</code> → <code>nil</code>); likewise a missing map key in a dotted path
+(<code>${a.b}</code> → <code>nil</code>), matching <code>$a.b</code>.</p>
+<h3 id="defaults--x--default-and-x--default">Defaults — <code>${x ?? default}</code> and <code>${x ?: default}</code></h3>
+<p>Supply a fallback with the same coalescing operators Mix uses in expressions.
+The default is any Mix expression, evaluated <strong>only</strong> when the fallback fires:</p>
+<pre><code class="language-mix">print("[${NOPE ?? "none"}]")     -- unbound → the default (no error)
+$x = nil
+print("[${x ?? $home}]")          -- nil value → default may be a variable…
+print("[${x ?? upper("hi")}]")    -- …or any expression
+</code></pre>
+<pre><code class="language-text">[none]
+[/home/you]
+[HI]
+</code></pre>
+<ul>
+<li><code>??</code> fires on <strong>nil only</strong> (an unbound name or a nil value). <code>${e ?? "x"}</code>
+where <code>$e</code> is <code>""</code> keeps the empty string — <code>??</code> does not treat it as missing.</li>
+<li><code>?:</code> fires on any <strong>falsy</strong> value (<code>nil</code>, <code>""</code>, <code>0</code>, <code>false</code>, <code>[]</code>) — use it
+when you want bash's <code>${x:-…}</code> "empty also falls back" behaviour.</li>
+<li>Limitation: a default cannot contain a literal <code>}</code> (the scanner ends at the
+first <code>}</code>) — bind it to a variable first.</li>
+</ul>
+<p>For an explicit, unambiguous environment read use <code>env("X")</code> (see
+<a href="/mix/builtins">builtins</a>); for scope-only data prefer <code>..</code> concat.</p>
+<h2 id="concatenation-is-">Concatenation is <code>..</code></h2>
+<p>Join with <code>..</code> — never <code>+</code> (that's numeric addition, see <a href="/mix/numbers">numbers</a>) and
+never <code>.</code> (that's map/field access). Non-string operands are stringified:</p>
+<pre><code class="language-mix">$x = 42
+print("answer is " .. $x .. "!")
+</code></pre>
+<pre><code class="language-text">answer is 42!
+</code></pre>
+<p><code>..</code> is the most robust way to build strings — it sidesteps the bare-<code>$name</code>
+interpolation trap entirely:</p>
+<pre><code class="language-mix">$user = "ada"
+print("hi " .. $user)           -- always works
+print("hi $user")               -- literal "hi $user" — usually NOT what you meant
+</code></pre>
+<pre><code class="language-text">hi ada
+hi $user
+</code></pre>
+<h2 id="escapes-and-uxxxx">Escapes and <code>\u{XXXX}</code></h2>
+<p>Double-quoted strings honour <code>\n \t \r</code>, <code>\e</code> (ESC, <code>\x1b</code>), <code>\" \\ \$ \~</code>, and the
+braced unicode escape <code>\u{XXXX}</code> (1–6 hex digits):</p>
+<pre><code class="language-mix">print("tab\there")
+print("price: \$5")             -- \$ for a literal dollar
+print("\u{2764} love")          -- U+2764 HEAVY BLACK HEART
+print("strip BOM:[\u{FEFF}]")   -- zero-width no-break space
+</code></pre>
+<pre><code class="language-text">tab	here
+price: $5
+❤ love
+strip BOM:[﻿]
+</code></pre>
+<p><code>\u{…}</code> is <strong>braced-only</strong>: a bare <code>\u</code> with no <code>{</code> stays literal, so a Windows path
+<code>"C:\users"</code> or an embedded JSON <code>\uXXXX</code> is unchanged. Single-quoted strings keep
+<code>\u{…}</code> literal too. A surrogate or out-of-range codepoint is a loud lex error
+(<code>\u{D800} is not a valid unicode codepoint</code>), never a silent pass-through.</p>
+<p>Any <strong>unrecognised</strong> escape keeps the backslash literally: <code>"\d"</code> is the two
+characters <code>\d</code>, not an error. Strip a BOM with the real codepoint:
+<code>replace($s, "\u{FEFF}", "")</code>.</p>
+<h2 id="leading--expansion">Leading <code>~</code> expansion</h2>
+<p>A <code>~</code> at the <strong>very start</strong> of a double-quoted string expands to <code>$HOME</code> at
+runtime, and only when the <code>~</code> is followed by <code>/</code> or ends the string — i.e.
+exactly <code>"~"</code> and <code>"~/..."</code>. Mid-string <code>~</code> is always literal (so DNS-zone tokens
+like <code>"~example.com"</code> survive), and <code>'~/...'</code> in single quotes does not expand:</p>
+<pre><code class="language-mix">print("~/.config")
+</code></pre>
+<pre><code class="language-text">/home/user/.config
+</code></pre>
+<p>Use <code>"\~"</code> for a literal leading tilde. <code>~user</code> is not supported — <code>"~root/x"</code>
+stays the literal text <code>~root/x</code> (no expansion, no error); only the running
+user's home expands.</p>
+<p><strong>Trap — tilde strings as <em>text</em>, not paths.</strong> The expansion is lexical, so it
+fires on any double-quoted literal, including one you meant as a search needle.
+<code>replace($s, "~/.gh/x", "~/new/x")</code> looks for the literal <code>/home/you/.gh/x</code> and
+silently matches nothing against file text that says <code>~/.gh/x</code> — no error, no
+change. The same applies to <code>contains</code>, <code>starts_with</code>, <code>split</code>, <code>index</code>, and to
+<code>"~" .. "/x"</code> (the bare <code>"~"</code> already expanded). For literal-tilde text use single
+quotes, and <code>grep_lines</code> the result after a rewrite:</p>
+<pre><code class="language-mix">$s = "see ~/.gh/x"
+print(replace($s, "~/.gh/x", "Z"))     -- needle became /home/you/.gh/x: no match
+print(replace($s, '~/.gh/x', "Z"))     -- single quotes: literal needle
+</code></pre>
+<pre><code class="language-text">see ~/.gh/x
+see Z
+</code></pre>
+<h2 id="heredocs">Heredocs</h2>
+<p><code>&lt;&lt;TAG ... TAG</code> is a multi-line literal whose body <strong>does</strong> interpolate <code>${...}</code>
+(scope → env, like double quotes) and, in this context, <code>$(...)</code> command
+substitution:</p>
+<pre><code class="language-mix">$who = "team"
+$body = &lt;&lt;END
+Dear ${who},
+welcome.
+END
+print($body)
+</code></pre>
+<pre><code class="language-text">Dear team,
+welcome.
+</code></pre>
+<p>The rules, precisely:</p>
+<ul>
+<li>The tag is ASCII letters/digits/<code>_</code>. The closing tag must sit alone on its line (surrounding whitespace is allowed); the newline before it is stripped.</li>
+<li>A bare <code>$name</code> in the body stays <strong>literal</strong>, exactly as in double quotes — only <code>${...}</code> interpolates.</li>
+<li><code>$(cmd)</code> runs via <code>/bin/sh</code> and splices its stdout — the one string context where Mix itself substitutes a command.</li>
+<li>Escapes <code>\n \t \r \e \\ \$</code> work (<code>\$</code> suppresses interpolation: <code>\${not_a_var}</code>); <strong><code>\u{…}</code> is NOT processed</strong> in a heredoc body — it stays literal. Any other <code>\x</code> stays literal too.</li>
+</ul>
+<h2 id="codepoint-byte-grapheme--pick-the-right-unit">Codepoint, byte, grapheme — pick the right unit</h2>
+<p>This is the design decision to internalise. The core string ops — <code>length</code>/<code>len</code>,
+<code>pos</code>, <code>lastpos</code>, the string overload of <code>index_of</code> — count <strong>Unicode codepoints</strong>,
+so they compose with <code>substr</code>/<code>reverse</code>/<code>$s[i]</code> (also codepoint-based). When you
+need raw bytes or user-perceived characters, reach for the explicit twin family.
+(The pre-0.8.0 byte value of <code>length</code> lives on as <code>byte_length</code>.)</p>
+<pre><code class="language-mix">print(length("café"))           -- codepoints: c a f é
+print(byte_length("café"))      -- raw UTF-8 bytes (é is 2)
+print(grapheme_count("café"))   -- user-perceived chars
+print(display_width("日本語"))   -- terminal cells (CJK = 2 each)
+print(pos("é", "café"))         -- 1-based codepoint position
+</code></pre>
+<pre><code class="language-text">4
+5
+4
+6
+4
+</code></pre>
+<p><code>length</code>/<code>len</code> on a <strong>list or map</strong> is the element count, not a string length.</p>
+<p>The three boundaries, in one table:</p>
+<table><thead><tr><th>Want</th><th>Builtins</th><th>Unit</th></tr></thead><tbody>
+<tr><td>codepoints (default)</td><td><code>length</code>/<code>len</code>, <code>pos</code>, <code>lastpos</code>, <code>index_of</code>, <code>substr</code>, <code>reverse</code>, <code>left</code>, <code>right</code></td><td>Unicode scalar values</td></tr>
+<tr><td>raw bytes</td><td><code>byte_length</code>, <code>byte_pos</code>, <code>byte_lastpos</code>, <code>byte_index_of</code></td><td>UTF-8 bytes</td></tr>
+<tr><td>user-perceived chars</td><td><code>grapheme_count</code>, <code>grapheme_substr</code>, <code>grapheme_reverse</code></td><td>grapheme clusters (UAX #29)</td></tr>
+<tr><td>terminal columns</td><td><code>display_width</code>, <code>lpad_w</code>, <code>rpad_w</code>, <code>word_wrap_w</code></td><td>display cells (UAX #11)</td></tr>
+</tbody></table>
+<p>All four rows are operations on <strong>text</strong>. Operations on a raw <code>bytes</code>/<code>buffer</code>
+<em>value</em> are a different family, <code>bytes_*</code> — see
+<a href="/mix/io#naming-byte_-vs-bytes_">io</a>. The two are easy to confuse and are not
+interchangeable: <code>byte_length($some_bytes)</code> stringifies its argument first and
+so measures the <code>&lt;bytes:N&gt;</code> placeholder, not the bytes.</p>
+<p>A plain <code>substr</code>/<code>reverse</code> is codepoint-based and <strong>splits</strong> an emoji ZWJ sequence or
+combining cluster; the <code>grapheme_*</code> ops keep it whole:</p>
+<pre><code class="language-mix">print(reverse("a👍🏽b"))          -- codepoint reverse splits the skin-tone modifier
+print(grapheme_reverse("a👍🏽b")) -- grapheme reverse keeps it whole
+</code></pre>
+<pre><code class="language-text">b🏽👍a
+b👍🏽a
+</code></pre>
+<p>A decomposed <code>e</code> + combining acute is 2 codepoints but 1 grapheme and 1 display cell:</p>
+<pre><code class="language-mix">$d = "e\u{0301}"                -- e + U+0301 COMBINING ACUTE
+print(length($d))
+print(grapheme_count($d))
+print(display_width($d))
+</code></pre>
+<pre><code class="language-text">2
+1
+1
+</code></pre>
+<p>The spread gets dramatic with ZWJ sequences — a 👨‍👩‍👧 family emoji is <strong>1 grapheme,
+5 codepoints, 18 bytes</strong>:</p>
+<pre><code class="language-mix">$f = "👨‍👩‍👧"
+print(grapheme_count($f))
+print(length($f))
+print(byte_length($f))
+</code></pre>
+<pre><code class="language-text">1
+5
+18
+</code></pre>
+<h3 id="indexing-bases-differ--a-footgun">Indexing bases differ — a footgun</h3>
+<ul>
+<li><code>substr</code>, array indexing, list <code>index_of</code>, <code>slice</code> are <strong>0-based</strong>. (<code>left</code>/<code>right</code> take a <em>count</em>, not an index — <code>left("hello", 2)</code> → <code>"he"</code> — so they have no base.)</li>
+<li><code>pos</code> and <code>lastpos</code> are <strong>1-based</strong>, returning <strong>0 when not found</strong>.</li>
+<li>An empty needle gives <code>pos == 1</code>.</li>
+</ul>
+<pre><code class="language-mix">print(substr("hello world", 0, 5))   -- 0-based, length 5
+print(substr("hello world", 6))      -- no len → to the end
+print(pos("world", "hello world"))   -- 1-based
+print(pos("xyz", "hello world"))     -- not found → 0
+print(lastpos("o", "hello world"))   -- 1-based last
+</code></pre>
+<pre><code class="language-text">hello
+world
+7
+0
+8
+</code></pre>
+<p><code>substr</code> clamps a start past the end to empty and never panics on an oversized
+length. The byte twins keep their codepoint counterparts' base conventions:
+<code>byte_pos</code>/<code>byte_lastpos</code> are 1-based with <code>0</code> = not found (like <code>pos</code>/<code>lastpos</code>),
+while <code>byte_index_of</code> follows the <code>index_of</code> convention (0-based, <code>-1</code> when not
+found). Watch the arg order: <code>index_of</code>/<code>byte_index_of</code> take
+<code>(haystack, needle)</code>, <code>pos</code>/<code>byte_pos</code> take <code>(needle, haystack)</code>.</p>
+<h2 id="case-search-edit">Case, search, edit</h2>
+<pre><code class="language-mix">print(upper("hello"))
+print(lower("HELLO"))
+print(contains("hello", "ell"))
+print(starts_with("hello", "he"))
+print(ends_with("hello", "lo"))
+print(replace("aaa", "a", "b"))       -- replaces ALL occurrences
+</code></pre>
+<pre><code class="language-text">HELLO
+hello
+true
+true
+true
+bbb
+</code></pre>
+<p><code>contains</code> also works on a list (membership, not substring):</p>
+<pre><code class="language-mix">print(contains([1,2,3], 2))
+</code></pre>
+<pre><code class="language-text">true
+</code></pre>
+<blockquote>
+<p><strong>Match ops are byte-exact</strong> — <code>contains</code>/<code>starts_with</code>/<code>ends_with</code>/<code>split</code>/<code>join</code>/
+<code>replace</code>/<code>template</code> do <strong>no</strong> Unicode normalization and <strong>no</strong> case-folding. A
+precomposed <code>é</code> (U+00E9) will not match a decomposed <code>e</code>+<code>◌́</code>. Normalize first if
+you need NFC-insensitive matching.</p>
+</blockquote>
+<p><code>upper</code>/<code>lower</code> do full Unicode case mapping (<code>upper("café")</code> → <code>"CAFÉ"</code>); the
+byte-exact rule is about <em>matching</em>, not casing. For word extraction there are the
+ARexx-flavoured <code>words($s)</code> (count whitespace-delimited words) and <code>word($s, n)</code>
+(Nth word, 1-based); for pattern matching see <a href="/mix/regex">regex</a>.</p>
+<h2 id="ordering-and-equality">Ordering and equality</h2>
+<p>The comparison operators <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code> pick their mode from <strong>both</strong> operands:</p>
+<ol>
+<li>If both coerce to numbers — real numbers, or numeric strings like <code>"5"</code> — the comparison is <strong>numeric</strong>. So <code>"5" &lt; "10"</code> is <code>true</code> (not a bash-style string surprise).</li>
+<li>Otherwise, if both are strings, the comparison is <strong>lexicographic by codepoint</strong>: <code>"apple" &lt; "banana"</code>, <code>"Z" &lt; "a"</code> (uppercase sorts before lowercase), and the classic range test <code>$ch &gt;= "a" and $ch &lt;= "z"</code> all work. <code>"5" &lt; "abc"</code> is a string-vs-string compare (lexicographic → <code>true</code>).</li>
+<li>A number against a <strong>non-numeric</strong> string is a runtime error, not a silent coercion.</li>
+</ol>
+<pre><code class="language-mix">print("5" &lt; "10")     -- both numeric strings → numeric compare
+print("apple" &lt; "banana")
+print("Z" &lt; "a")      -- codepoint order: U+005A &lt; U+0061
+</code></pre>
+<pre><code class="language-text">true
+true
+true
+</code></pre>
+<pre><code class="language-mix">print(5 &lt; "abc")
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: cannot compare 'abc' as number
+</code></pre>
+<p><code>==</code>/<code>!=</code> never error: a number and a numeric string compare <strong>equal by value</strong>
+(<code>"5" == 5</code> is <code>true</code>), but two strings compare as text (<code>"5" == "05"</code> is
+<code>false</code>, <code>"abc" == 5</code> is <code>false</code>). Full operator detail in
+<a href="/mix/operators">operators</a>.</p>
+<h2 id="split-join-slice">Split, join, slice</h2>
+<p><code>split</code> defaults to a space delimiter; <code>join</code> to a space separator:</p>
+<pre><code class="language-mix">$parts = split("a,b,c", ",")
+print(join($parts, " | "))
+print(length(split("one two three")))   -- default delim = space
+</code></pre>
+<pre><code class="language-text">a | b | c
+3
+</code></pre>
+<p>For substring-by-position use <code>substr</code>/<code>grapheme_substr</code>; for a sublist use <code>slice</code>
+(0-based, half-open <code>[start, end)</code>, see <a href="/mix/builtins">builtins</a>):</p>
+<pre><code class="language-mix">print(join(slice([10,20,30,40], 1, 3), ","))
+</code></pre>
+<pre><code class="language-text">20,30
+</code></pre>
+<h2 id="the-delimiter-family--beforeaftersplit_once-0630">The delimiter family — <code>before</code>/<code>after</code>/<code>split_once</code> (0.63.0)</h2>
+<p>The helpers a script reaches for on line 3, replacing every
+<code>substr($s, pos(..) ± n)</code> computation. All subject-first. <strong>Contract:</strong>
+absent delimiter → <code>nil</code> (never <code>""</code> and never the whole string — <code>""</code> is
+a <em>real</em> result, the delimiter at the edge); empty delimiter raises.</p>
+<pre><code class="language-mix">print(after("key=value", "="))          -- value
+print(before("key=value", "="))         -- key
+print(after_last("/a/b/base.txt", "/")) -- base.txt   (basename)
+print(after_last("base.txt", "."))      -- txt        (extension)
+$kv = split_once("k=v=w", "=")          -- [head, tail] at the FIRST =
+print($kv[0] .. " / " .. $kv[1])        -- k / v=w    (rsplit_once: LAST)
+print(between("a &lt;b&gt; c", "&lt;", "&gt;"))     -- b
+print(after("no-equals", "=") or "dflt")-- dflt  (nil-coalesce a default)
+</code></pre>
+<p><code>before_last</code> mirrors <code>before</code> at the last occurrence. Absence is <code>nil</code>,
+so <code>if after($s, "=") == nil</code> is the "not found" test — an empty capture
+and a missing delimiter never blur.</p>
+<p><strong>Prefix/suffix forms</strong> return the subject <strong>unchanged</strong> when there is
+nothing to strip ("nothing to do" is an answer, not a failure):
+<code>strip_prefix(s, p)</code>, <code>strip_suffix(s, x)</code>, <code>replace_first(s, old, new)</code>
+(first occurrence only; empty <code>old</code> mirrors <code>replace()</code>), and
+<code>count_of(s, needle)</code> (non-overlapping; 0 for an empty needle).</p>
+<p><strong>Lines, fields, chars</strong> (0.63.0 — <code>lines</code>/<code>chars</code> were prelude
+functions, now native): <code>lines(s)</code> splits on <code>\n</code>, strips one trailing
+<code>\r</code> per line (CRLF-safe) and drops exactly one trailing empty element
+(the final newline) — <code>lines("a\nb\n")</code> is <code>["a", "b"]</code>, <code>lines("")</code> is
+<code>[]</code>, <code>"a\n\n"</code> keeps its real empty line. <code>fields(s)</code> splits on
+whitespace <em>runs</em> like awk (no empties; <code>word(s, n)</code> is the 1-based
+single-field form). <code>chars(s)</code> yields codepoints as 1-char strings.
+<code>last_index_of(s, v)</code> is the 0-based codepoint twin of <code>lastpos()</code> (args
+reversed, -1 when absent — same condition warning as <code>index_of</code>).</p>
+<h2 id="trim-pad-repeat-reverse">Trim, pad, repeat, reverse</h2>
+<p><code>trim</code>/<code>strip</code> take an optional <strong>charset</strong> — a <em>set</em> of codepoints to
+strip (PHP-style), honoured since 0.63.0 (before that the second argument
+was silently ignored — the call "worked" and did nothing). One-sided:
+<code>ltrim</code>/<code>rtrim</code>, same optional charset:</p>
+<pre><code class="language-mix">print(trim("xxhelloxx", "x"))     -- hello
+print(ltrim("zyxabczyx", "xyz"))  -- abczyx
+print(rtrim("zyxabczyx", "xyz"))  -- zyxabc
+</code></pre>
+<pre><code class="language-mix">print("[" .. trim("  hi  ") .. "]")    -- strip is an alias for trim
+print("[" .. lpad("7", 4) .. "]")      -- right-align in width 4
+print("[" .. rpad("7", 4) .. "]")      -- left-align in width 4
+print(repeat("ab", 3))
+print(reverse("hello"))
+</code></pre>
+<pre><code class="language-text">[hi]
+[   7]
+[7   ]
+ababab
+olleh
+</code></pre>
+<p><code>lpad</code>/<code>rpad</code> pad by <strong>codepoint count</strong>, which misaligns a column of CJK/emoji (a
+wide glyph counts as 1 there but renders as 2 cells). The <code>%Ns</code> width of
+<a href="/mix/builtins"><code>fmt</code>/<code>printf</code></a> pads by codepoints too (<code>fmt("%6s", "日本")</code> adds
+four spaces, not two). Use <code>lpad_w</code>/<code>rpad_w</code> to pad by <strong>display cells</strong>:</p>
+<pre><code class="language-mix">print("[" .. rpad("日本", 6) .. "]")    -- codepoint pad: 2 chars → +4 spaces
+print("[" .. rpad_w("日本", 6) .. "]")  -- cell pad: width 4 → +2 spaces
+</code></pre>
+<pre><code class="language-text">[日本    ]
+[日本  ]
+</code></pre>
+<h3 id="padding-with-something-other-than-a-space">Padding with something other than a space</h3>
+<p>All four padders take an <strong>optional third argument: the fill character</strong> (v0.54.0).
+It defaults to a space, so existing two-argument calls are unchanged.</p>
+<pre><code class="language-mix">print(lpad("7", 4, "0"))        -- zero-pad a number-as-text
+print(rpad("Name", 10, "."))    -- dot leader
+print(lpad_w("日本", 6, "."))   -- fill by display cells
+</code></pre>
+<pre><code class="language-text">0007
+Name......
+..日本
+</code></pre>
+<p>The fill must be <strong>exactly one character</strong>, and for the <code>_w</code> variants exactly one
+<strong>display cell</strong> — a wide fill would overshoot the target by a cell per pad
+character, which defeats the point of padding by width. Both raise a runtime
+error naming the offending value rather than silently mis-aligning:</p>
+<pre><code class="language-text">lpad: fill must be exactly one character, got "ab" (2 chars)
+lpad_w: fill must be exactly 1 display cell wide, got '漢' (2 cells)
+</code></pre>
+<p>Padding is <strong>saturating</strong> — content already at or beyond the width is returned
+unchanged, never truncated.</p>
+<p>To zero-pad a <strong>number</strong>, prefer <code>fmt</code>'s <code>%0Nd</code>, which keeps the sign to the left
+of the zeros (<code>fmt("%05d", -42)</code> → <code>-0042</code>). Reach for <code>lpad(s, n, "0")</code> when the
+value is already a string, since <code>%0Ns</code> is undefined for strings in C and is
+ignored here.</p>
+<p><code>repeat</code>/<code>lpad</code>/<code>rpad</code> cap a result at 256 MiB and raise a normal runtime error
+rather than OOM on a hostile count/width. Since 0.59.0 the cap bounds the
+<strong>bytes the padding would build</strong> — a multibyte fill counts at its UTF-8 width
+and the original string is included in the sum — so the error fires before the
+allocation it names, not after a 4-byte fill has built four times the
+advertised limit. (For a width within the cap, a string already at or past that width passes
+through unchanged, whatever its size — the cap meters what padding
+constructs, not what you already had. A width beyond the cap errors before
+anything is examined.)</p>
+<p>Every numeric position/count/width argument in this page uses Mix numeric
+coercion: a number or numeric string works (<code>left("abcdef", "2")</code> is <code>ab</code>, as
+is <code>left("abcdef", 2)</code>). A supplied value that cannot be parsed as a number now
+raises <code>TYPE_MISMATCH</code>, naming the builtin, 1-based argument position, value,
+and type. It never silently becomes zero or the omitted default. This applies
+to <code>left</code>, <code>right</code>, <code>substr</code>, <code>grapheme_substr</code>, <code>repeat</code>, <code>lpad</code>, <code>rpad</code>,
+<code>lpad_w</code>, <code>rpad_w</code>, <code>word</code>, <code>word_wrap</code>, and <code>word_wrap_w</code>:</p>
+<pre><code class="language-mix">print(substr("abcdef", "2x"))
+</code></pre>
+<pre><code class="language-text">TYPE_MISMATCH: substr(): argument 2 must be a number, got "2x" (string)
+</code></pre>
+<h2 id="sprintf--c-compatible-formatting-v0710">sprintf — C-compatible formatting (v0.71.0)</h2>
+<p><code>fmt()</code> is the Mix-native formatter for everyday alignment; <strong><code>sprintf()</code></strong>
+exists for the byte-exact cases: generating fixtures, protocol fields, or
+log lines that a C/Rust program will compare byte-for-byte.</p>
+<pre><code>sprintf(fmt, ...args) -&gt; string
+</code></pre>
+<ul>
+<li><strong>Conversions:</strong> <code>%d %i %u %o %x %X %f %F %e %E %g %G %s %c %%</code>.</li>
+<li><strong>Flags</strong> <code>- + 0 #</code> and space; <strong>width</strong> and <strong>precision</strong>, both taking
+<code>*</code> (from the next argument; a negative <code>*</code> width left-justifies, a
+negative <code>*</code> precision is treated as omitted — C's rules).</li>
+<li><strong>Length modifiers</strong> (<code>hh h l ll L q j z t</code>) are parsed and <strong>ignored</strong>:
+Mix numbers are one type, and the integer conversions behave as the
+64-bit (<code>ll</code>) forms — <code>sprintf("%u", -1)</code> is <code>18446744073709551615</code>, the
+64-bit two's-complement, and a C reference must use <code>%llu</code> to match.</li>
+<li><strong>Float output matches glibc <code>printf</code> byte-for-byte</strong> (fixture-tested:
+<code>%.0f</code> of <code>2.5</code> is <code>2</code> and of <code>3.5</code> is <code>4</code> — both round the exact binary
+value ties-to-even; <code>%g</code> picks its style from the <em>rounded</em> value, so
+<code>%.3g</code> of <code>999999.5</code> is <code>1e+06</code>). <code>inf</code>/<code>nan</code> come out as glibc prints
+them: lowercase for <code>%f %e %g</code>, upper for <code>%F %E %G</code>, space-padded even
+under the <code>0</code> flag.</li>
+<li>Integer conversions require a <strong>whole number</strong> in the exact-integer
+range (±2⁵³−1 — Mix numbers are f64, so a positive value C could print
+as a full u64 is unreachable above that); anything else raises rather
+than truncating. Unknown conversions and missing arguments raise too,
+and POSIX positional arguments (<code>%1$d</code>) are not supported — the <code>$</code>
+surfaces as an unknown-conversion error.</li>
+</ul>
+<p>Two documented divergences, both about Unicode: <code>%s</code> pads by <strong>codepoints</strong>
+(C pads by bytes — identical for the ASCII output of numeric conversions,
+which is what the parity claim covers), and <code>%.Ns</code> truncates to at most N
+<strong>bytes without splitting a codepoint</strong>, so the result is always valid
+UTF-8. <code>%c</code> takes a Unicode scalar value, not a C <code>int</code> cast to a byte.</p>
+<pre><code class="language-mix">print(sprintf("%08.3f|%+d|%#llx", 3.14159, 42, 255))   -- 0003.142|+42|0xff
+print(sprintf("%e", 12345.6789))                       -- 1.234568e+04
+print(sprintf("%.*f", 2, 2.5))                         -- 2.50
+</code></pre>
+<h2 id="templates-and-wrapping">Templates and wrapping</h2>
+<p><code>template</code> substitutes single-brace <code>{key}</code> placeholders from a map (distinct from
+<code>${...}</code> interpolation, and from the <code>%s</code>/<code>%d</code> of <a href="/mix/builtins"><code>fmt</code>/<code>printf</code></a>):</p>
+<pre><code class="language-mix">$m = { name: "Ada", role: "dev" }
+print(template("{name} is a {role}", $m))
+</code></pre>
+<pre><code class="language-text">Ada is a dev
+</code></pre>
+<p><code>template</code> is <strong>single-pass</strong>: a substituted value is emitted verbatim and never
+rescanned, so untrusted data containing <code>{other_key}</code> cannot inject a second
+substitution (<code>template("{a}", {a: "{b}", b: "X"})</code> → <code>{b}</code>), and the output does
+not depend on map iteration order. A placeholder with no matching key stays
+literal (<code>template("{missing}", {})</code> → <code>{missing}</code>).</p>
+<p><code>word_wrap</code> greedily wraps to a codepoint budget (<code>word_wrap_w</code> to a display-cell
+budget):</p>
+<pre><code class="language-mix">print(word_wrap("the quick brown fox jumps", 10))
+</code></pre>
+<pre><code class="language-text">the quick
+brown fox
+jumps
+</code></pre>
+<h2 id="quoting-for-shells-and-sql">Quoting for shells and SQL</h2>
+<p>When a string must cross into a shell command or a SQL literal, escape it natively
+rather than hand-rolling quotes:</p>
+<pre><code class="language-mix">print(shell_quote("it's a test"))     -- safe single-quote wrap for POSIX sh
+print(sql_quote("O'Brien"))           -- doubles ' (MySQL/MariaDB-safe)
+</code></pre>
+<pre><code class="language-text">'it'\''s a test'
+O''Brien
+</code></pre>
+<p><code>sql_quote</code> doubles <code>'</code> <strong>and escapes <code>\</code></strong> (<code>sql_quote("a\\b")</code> → <code>a\\b</code>) and
+strips NUL bytes — MySQL/MariaDB-safe. It is also safe for SQLite, where a
+literal backslash arrives doubled; for exact bytes use <code>sqlexec</code> parameter binds
+instead of quoting (see <a href="/mix/system">system</a>) — binds are typed (nil → NULL,
+whole number → INTEGER, string → TEXT, bytes → BLOB), so the value never passes
+through a quoted literal at all.</p>
+<p><code>sanitize</code> makes untrusted bytes safe for a one-line diagnostic — collapsing line
+breaks to spaces and replacing C0/C1 controls and Trojan-Source bidi/zero-width
+characters with <code>?</code>:</p>
+<pre><code class="language-mix">print(sanitize("line1\nline2\ttab"))
+</code></pre>
+<pre><code class="language-text">line1 line2?tab
+</code></pre>
+<p>For HTML output use <code>html_escape</code>; for Bus/SSE framing see <a href="/mix/bus">Bus messaging</a>
+and the <a href="https://data-star.dev">Datastar</a> <code>ds_*</code> builtins. To embed a value as
+re-parseable Mix source, use <code>data_encode</code> (see <a href="/mix/builtins">builtins</a>).</p>
+<h2 id="mail-headers--rfc2047_decode--rfc2047_encode-0670">Mail headers — <code>rfc2047_decode</code> / <code>rfc2047_encode</code> (0.67.0)</h2>
+<p>A mail header may only carry ASCII, so anything else travels as RFC 2047
+<strong>encoded-words</strong>: <code>=?charset?B-or-Q?data?=</code>. A <code>Subject:</code> read raw comes back
+as <code>=?utf-8?B?Q2Fmw6k=?=</code>, which is exactly the unreadable output a report
+exists to prevent.</p>
+<pre><code>rfc2047_decode(header)             -&gt; plain string
+rfc2047_encode(text[, {encoding}]) -&gt; header value ("B" default, or "Q")
+</code></pre>
+<pre><code class="language-mix">print(rfc2047_decode("=?utf-8?B?SGVsbG8gV29ybGQ=?="))
+print(rfc2047_decode("=?ISO-8859-1?Q?caf=E9?="))
+print(rfc2047_decode("Re: =?utf-8?B?dGVzdA==?= (fwd)"))
+print(rfc2047_encode("plain ascii subject"))
+print(rfc2047_encode("café"))
+</code></pre>
+<pre><code class="language-text">Hello World
+café
+Re: test (fwd)
+plain ascii subject
+=?UTF-8?B?Y2Fmw6k=?=
+</code></pre>
+<p><strong>Decoding.</strong> The charset token is honoured — <code>utf-8</code>, <code>us-ascii</code> and
+<code>iso-8859-1</code> (with the usual aliases, and RFC 2231's <code>*language</code> suffix
+stripped) decode properly; <strong>any other charset falls back to UTF-8 with U+FFFD
+substitution</strong>, so a <code>koi8-r</code> header is legible-ish rather than exact. Adjacent
+encoded-words are joined at the <strong>byte</strong> level and the whitespace between them
+is dropped, per RFC 2047 §6.2 — which is not cosmetic: a long non-ASCII subject
+is folded by splitting it into several words, and a multi-byte character
+straddling that split only survives if the bytes are joined before decoding.
+Anything that is not a well-formed encoded-word is passed through <strong>literally</strong>,
+never dropped; a visible <code>=?utf-8?X?…?=</code> beats a silently lost subject line.</p>
+<p><strong>Encoding.</strong> Plain ASCII is returned <strong>unchanged</strong> (§5 permits an encoded-word
+only where one is needed), unless it contains a literal <code>=?</code>, which would
+otherwise be misread by the receiving decoder. Output is always UTF-8 — the
+right answer for modern mail, and not a choice worth offering. <code>B</code> (base64) is
+the default; <code>{encoding: "Q"}</code> is more readable when the text is mostly ASCII.
+Each emitted word stays within §2's 75-character limit and splits on
+<strong>character</strong> boundaries, because an encoded-word must be independently
+decodable — a 4-byte emoji may never straddle two words.</p>
+<p>This pair was promoted from a deployed nospam report script, with <strong>three</strong>
+changes the original could not justify:</p>
+<ol>
+<li>it decoded every charset as UTF-8-lossy — right for the one mailbox it
+served, wrong in general;</li>
+<li>it joined adjacent words as decoded <em>strings</em> rather than bytes, so a
+character split across the fold became two replacement characters;</li>
+<li>on a malformed word it either emitted the raw payload with the wrapper
+stripped (presenting undecoded bytes as though they had been decoded) or
+abandoned the whole scan, leaving every later word in the header encoded.</li>
+</ol>
+<p>Everything the original got right is unchanged, including the false-terminator
+handling that is the reason this was promoted rather than rewritten. All three
+changes are pinned by tests.</p>
+<h2 id="gotchas-recap">Gotchas recap</h2>
+<ul>
+<li><code>"double"</code> interpolates <strong>only</strong> <code>${...}</code>; a bare <code>$name</code> is literal text.</li>
+<li><code>'single'</code> is fully raw — nothing interpolates, <code>~</code> does not expand.</li>
+<li><code>$(...)</code> is literal inside a Mix string (use <code>run</code>/<code>run_rc</code> + <code>..</code> to splice output) — but it <em>does</em> substitute in a heredoc body, as a standalone expression, and it passes through to the target shell in a <code>run</code>/<code>ssh_run</code> command string.</li>
+<li>Concatenate with <code>..</code>, never <code>+</code> or <code>.</code>.</li>
+<li><code>length</code>/<code>pos</code>/<code>substr</code>/<code>reverse</code> are <strong>codepoints</strong>; use <code>byte_*</code> for bytes, <code>grapheme_*</code> for emoji/combining, <code>display_width</code>/<code>*_w</code> for terminal columns. <code>length</code>/<code>len</code> on a list/map is the element count.</li>
+<li><code>pos</code>/<code>lastpos</code>/<code>byte_pos</code>/<code>byte_lastpos</code> are <strong>1-based, 0 = not found</strong>; <code>substr</code>/arrays/<code>index_of</code>/<code>byte_index_of</code>/<code>slice</code> are <strong>0-based</strong> (<code>index_of</code> returns <code>-1</code> when not found).</li>
+<li><code>replace</code> replaces <strong>all</strong> occurrences; match ops are byte-exact (no case-fold, no normalization).</li>
+<li><code>&lt;</code>/<code>&gt;</code> compare <strong>numerically</strong> when both sides coerce to numbers (<code>"5" &lt; "10"</code> is <code>true</code>), <strong>lexicographically by codepoint</strong> when both are strings; a number vs a non-numeric string is a runtime error.</li>
+<li><code>lpad</code>/<code>rpad</code>/<code>%Ns</code> pad by codepoints — <code>lpad_w</code>/<code>rpad_w</code> for cell-exact columns.</li>
+<li><code>${X}</code> unbound in scope <strong>and</strong> env is a runtime error (like a bare <code>$X</code>); a nil <em>value</em> still renders <code>nil</code>. Supply a fallback with <code>${X ?? default}</code> (nil-only) or <code>${X ?: default}</code> (any falsy).</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/numbers">numbers</a> — the f64 numeric type, <code>+</code>/<code>%</code>/<code>**</code>, radix literals</li>
+<li><a href="/mix/operators">operators</a> — <code>..</code> concat, <code>==</code>/<code>&lt;</code> ordering, <code>??</code> nil-coalesce</li>
+<li><a href="/mix/regex">regex</a> — <code>re_match</code>/<code>re_find</code>/<code>re_replace</code>/<code>re_split</code>/<code>grep_lines</code></li>
+<li><a href="/mix/syntax">syntax</a> — the lexer, comments, and the shell/Mix classifier</li>
+<li><a href="/mix/functions">functions</a> — lambdas and HOFs for transforming string lists</li>
+<li><a href="/mix/builtins">builtins index</a> — the full string/byte/grapheme/<code>_w</code> builtin set</li>
+<li><a href="/mix/system">running commands</a> — <code>run</code>/<code>run_rc</code> for splicing command output</li>
+<li><a href="/mix/shell-mode">shell mode</a> — where <code>$(...)</code> <em>is</em> command substitution</li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>send</code>/<code>emit</code>, <code>ds_*</code> SSE framing, <code>html_escape</code></li>
+<li><code>mix help</code> — list all builtins · <code>mix what NAME</code> — describe one (e.g. <code>mix what grapheme_substr</code>)</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1206,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1260,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1389,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

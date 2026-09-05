@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/09-mix-integration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,142 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/09-mix-integration.md"><div class="prose"><h1 id="mix-integration-and-supervised-citizens">Mix integration and supervised citizens</h1>
+<h2 id="language-authority-and-execution-modes">Language authority and execution modes</h2>
+<p><strong>MIX-001:</strong> Mix grammar and builtin semantics belong to the shipped manual
+and interpreter. This suite specifies integration requirements. Consult
+<code>mix --help</code>, <code>mix man overview</code>, <code>mix man syntax</code>, <code>mix man bus</code>,
+<code>mix builtins --json</code>, <code>mix what NAME</code> and <code>mix apropos TERM</code>; verify uncertain
+behaviour with a bounded probe of the actual installed version. An installed
+binary's behaviour is evidence of that build, not authority to silently amend
+a protocol requirement. Use <code>mix --check SCRIPT</code> and <code>mix lint SCRIPT</code> for
+non-executing validation before running a script.</p>
+<p><strong>MIX-002:</strong> Distinguish transient clients (<code>mix script.mix</code>) from registered
+citizens (<code>mix --serve script.mix --name service</code>). A transient client need
+not register and can still use broker topics. It has no named request service
+unless explicitly registered. Serve mode requires a valid service name,
+initialisation, supervised registration and a resident event pump.
+Do not treat <code>--serve</code> as an untrusted-code sandbox.</p>
+<h2 id="calls-events-and-payloads">Calls, events and payloads</h2>
+<p><strong>MIX-003:</strong> <code>send target command ...</code> performs RPC and sets numeric <code>$rc</code>
+and <code>$result</code>; <code>emit target command ...</code> is fire-and-forget and sets neither.
+An emitted command is not automatically a topic publication. Use the
+documented <code>publish</code>/<code>subscribe</code> primitives or explicit <code>topic.*</code> commands.
+<code>address</code> supplies a block's target; it does not license inventing command
+aliases. Use fully documented wire command names. The examined evaluator and
+Bus adapter pass the command expression through; the old blanket claim that
+Mix prefixes every shorthand command is not an established contract.</p>
+<pre><code class="language-mix">send "noded" "noded.ping" timeout=2
+if $rc != 0 then
+  print($result)
+end
+</code></pre>
+<p><strong>MIX-004:</strong> Preserve status distinctions: 0 success, 1–9 warning, ≥10 peer
+application error, -1 transport failure, -2 local per-send timeout, -3 Bus
+unavailable before delivery. Peer error codes remain intact. The old timeout
+example using string <code>"-1"</code> is superseded. <code>timeout=</code> must be finite and
+positive, is consumed locally and is not a command argument. No local timeout
+argument does not remove an underlying client's transport deadline. A timeout
+does not cancel a remote side effect; retry only under a declared idempotency
+contract.</p>
+<p><code>send</code> and <code>emit</code> have intentionally non-fatal transport-failure behaviour
+in the evaluator; callers requiring delivery must inspect RPC status.
+<code>subscribe</code>, <code>unsubscribe</code> and <code>reply</code> surface errors when their required
+broker operation cannot happen. Ordinary transient clients distinguish
+never-present and lost brokers; <code>bus_reconnect()</code> reopens discovery.</p>
+<p><strong>MIX-005:</strong> Validate incoming values before constructing paths, process argv,
+SQL statements or outbound commands. Prefer <code>run_argv</code>/<code>run_argv_must</code>,
+<code>ssh_exec</code>/<code>ssh_mix</code>, and bound SQLite parameters to string-built shell or SQL.
+The wire envelope, Mix dynamic values and Rust service-owned types are
+separate validation boundaries. Existing validated constructors and Serde
+conversions SHOULD be used before introducing a new generic validation trait.</p>
+<p>The adapter supports JSON-body RPC and explicit header/body routing. A <code>body</code>
+map key selects header routing; property operations carrying <code>namespace</code> also
+need their contract's header form. See the adapter and maintained manual for
+exact conversion rules. Bodies may contain structured JSON or text.</p>
+<h2 id="registration-and-reconnect">Registration and reconnect</h2>
+<p><strong>MIX-006:</strong> A supervised citizen MUST register its allocated Bus identity
+and preserve process-start provenance across reconnection. Identity and OS
+permissions are supplied by its supervisor, not by self-<code>setuid</code> in Mix.
+Registered citizens use the system's citizen identity policy; transient jobs
+inherit their supervisor's authorised identity. UID allocation and reuse
+belong to the identity chapter, not this runtime.</p>
+<p><strong>MIX-007:</strong> On transport loss, outbound RPC MUST fail visibly without an
+offline replay queue. Reconnect MUST re-register and replay the complete
+successful subscription registry, including subscriptions created inside
+handlers. Registry changes occur only after successful subscribe/unsubscribe
+acknowledgement. Partial replay MUST keep the client disconnected and retry;
+socket recovery alone is not readiness. The script owns recovery of derived
+state and in-flight workflows and MUST be able to observe a reconnect.</p>
+<p>Source profile: the shared supervised client implements five initial attempts,
+then an unbounded resident reconnect loop with full jitter, a 250 ms base and
+30-second backoff ceiling. It publishes connection state/generation, preserves
+the outward incoming lane and replays subscriptions in recorded order. A
+bounded delay is not a bounded total reconnect lifetime. The old assertion
+that reconnect does not exist is obsolete; adoption and live behaviour still
+need to be verified for each citizen.</p>
+<h2 id="handler-isolation-concurrency-and-shutdown">Handler isolation, concurrency and shutdown</h2>
+<p><strong>MIX-008:</strong> Plain <code>on command ... end</code> handlers run to completion serially.
+An explicit <code>on command async ... end</code> permits cooperative interleaving at
+await points such as <code>send</code>, <code>reply</code> and <code>sleep_ms</code>. An invocation retains its
+own suspended frame. Authors MUST review shared-state invariants across
+awaits; <code>async</code> does not make synchronous blocking work non-blocking.</p>
+<p><strong>MIX-009:</strong> Synchronous request cycles (A → B → A) MUST NOT be deployed.
+The broker does not detect them; timeouts can bound waiting but do not make
+the cycle correct. Use acyclic request graphs or explicit asynchronous
+events and correlated replies. A registered service with slow downstream
+calls needs the async concurrency path even if it currently has only one
+caller. A transient sequential orchestration driver has no such shared-service
+claim. Pipeline, scatter/gather and review workflows remain application policy.</p>
+<p><strong>MIX-010:</strong> A handler error or recoverable panic MUST be isolated at the
+invocation boundary, reflected in health/logging and answered when a request
+expects a reply. Process aborts and external termination are outside panic
+recovery. <code>reply(body)</code> or <code>reply(rc, body)</code> requires a request context and an
+integer code 0–255; a topic delivery does not acquire an RPC caller.</p>
+<p><strong>MIX-011:</strong> <code>QUIT</code> and SIGTERM MUST use the same bounded drain and deregister
+path. Stop accepting new work, resolve or terminate outstanding invocations
+within the shutdown budget, deregister and close the client. A graceful exit
+returns success; an exceeded grace period must remain observable. Restart
+policy, child lifetime, resource limits and journal capture belong to the
+supervisor. Validate child parent-death behaviour where scripts spawn work.</p>
+<p><strong>MIX-012:</strong> Serve mode MUST reserve runtime <code>HELP</code>, <code>INFO</code>, <code>QUIT</code> and
+<code>&lt;service&gt;.props.get/list/describe</code> ahead of author handlers. The source
+implements lifecycle <code>started_at</code>, <code>uptime_s</code>, <code>mode</code>, <code>health</code>, <code>props_level</code>,
+<code>handler_faults</code>, <code>last_fault</code>, and reports L1. A caught handler fault degrades
+health. This does not establish L2 watch or L3 world publication. Readiness
+notification is conditional on implementation and unit type; do not configure
+<code>Type=notify</code> without verifying the ready signal.</p>
+<h2 id="external-exposure-and-application-integration">External exposure and application integration</h2>
+<p><strong>MIX-013 (intended, gated):</strong> Externally exposed citizens MUST use an explicit
+gateway route and default-deny command authorisation. Gateway duties include
+TLS, host/path/header validation, bounded request bodies, rate controls and
+response translation. Citizen code owns business logic. No external citizen
+route may rely solely on a gateway-supplied string claiming a principal.</p>
+<p>A protected authenticated principal distinct from transport origin, its
+broker injection mechanism and route/authz configuration remain cross-cutting
+design dependencies. <code>broker_origin: local</code> proves the gateway's local
+delivery class, not that its remote caller is trusted. These dependencies
+must be resolved and tested before enabling the proposed external citizen
+surface. This chapter does not claim that current generic web proxy behaviour
+already implements that design.</p>
+<p>MCP use remains outbound capability use under the citizen's identity; it does
+not create a second trust regime. Native desktop applications expose semantic
+Bus commands; the old <code>ui.window</code>/<code>ui.data</code> rendering citizen model is retired.</p>
+<h2 id="evidence-and-acceptance">Evidence and acceptance</h2>
+<p>Source: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/docs/mix/bus.md">Bus manual</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-mix/src/bus.rs">adapter</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-mix/src/serve_runtime.rs">runtime introspection</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-client/src/supervised.rs">supervisor</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-mix/src/evaluator.rs">evaluator</a>.</p>
+<p>Acceptance uses an isolated broker and a state-holding reference citizen:
+prove registration, initial and handler-added subscription replay after broker
+restart, disconnected failures, post-reconnect state refresh, fault isolation,
+runtime command precedence, async fast-call interleaving, plain-handler
+serialisation, numeric timeout status, and both graceful shutdown entry points.
+System identity and child lifetime need a disposable systemd environment.
+External routes additionally need forged-principal and missing-authorisation
+tests. These are required evidence, not tests reported as run by this audit.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +754,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +808,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +937,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

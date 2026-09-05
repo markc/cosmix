@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-webd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,111 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-webd/README.md"><div class="prose"><h1 id="cosmix-webd">cosmix-webd</h1>
+<p><code>cosmix-webd</code> is the CosMix web daemon: an Axum-based, host-routed HTTP and HTTPS server with static-file delivery, a SQLite CMS API, trusted embedded Mix handlers, JMAP and broker WebSocket proxies, mail-client autoconfiguration, and per-vhost TLS lifecycle management. It belongs to the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain. It consumes Bus citizenship and client crates directly, embeds the Mix evaluator for HTTP handlers, and uses the shared Cos daemon, configuration, property-store, and logging substrates.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-webd &lt;COMMAND&gt;
+</code></pre>
+<p>The binary provides server, database, certificate, vhost, ACME, route, statistics, TLS, and autoconfiguration commands.</p>
+<p>See <a href="/cos/cosmix-webd/commands-and-configuration">commands and configuration</a> for the full command and configuration surface.</p>
+<p>See <a href="/cos/cosmix-webd/bus-verbs">Bus verbs</a> for the daemon's Bus service and SPEC 12 property namespaces.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<ul>
+<li>Host-routed HTTP and HTTPS serving for multiple virtual hosts.</li>
+<li>Per-listener host allowlists and separate TLS identity buckets.</li>
+<li>Static-file fallback rooted at each vhost's <code>www_dir</code>.</li>
+<li>A SQLite-backed posts API and session-revocation store.</li>
+<li>Trusted, operator-authored <code>.mix</code> request handlers.</li>
+<li>Per-route Mix capabilities for database, JMAP, network, delegated Bus, auxiliary database, public-read, public-cache, and accelerator-wake access.</li>
+<li>JMAP HTTP proxying and broker WebSocket proxying.</li>
+<li>Markdown documentation rendering below <code>/docs</code>.</li>
+<li>Mail-client autoconfiguration with a served-domain admission allowlist.</li>
+<li>Manual PEM TLS and ACME HTTP-01 certificate provisioning.</li>
+<li>Runtime listener guards, kill switches, TLS status, response counters, and live property publication.</li>
+</ul>
+<h2 id="http-surface">HTTP surface</h2>
+<p>Known hosts receive the per-vhost router. Unknown hosts return <code>404</code>; missing or malformed <code>Host</code> headers return <code>400</code>.</p>
+<table><thead><tr><th>Path</th><th>Methods</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>/api/posts</code></td><td><code>GET</code>, <code>POST</code></td><td>List or create CMS posts</td></tr>
+<tr><td><code>/api/posts/{id}</code></td><td><code>GET</code>, <code>PUT</code>, <code>DELETE</code></td><td>Read, update, or delete one post</td></tr>
+<tr><td><code>/jmap</code></td><td>Any</td><td>Proxy a JMAP request to the vhost upstream</td></tr>
+<tr><td><code>/jmap/{path}</code></td><td>Any</td><td>Proxy a JMAP sub-path</td></tr>
+<tr><td><code>/.well-known/jmap</code></td><td>Any</td><td>Proxy JMAP session discovery</td></tr>
+<tr><td><code>/auth/login</code></td><td><code>GET</code>, <code>POST</code></td><td>Session login</td></tr>
+<tr><td><code>/auth/login/verify</code></td><td><code>POST</code></td><td>Email second-factor verification</td></tr>
+<tr><td><code>/auth/logout</code></td><td><code>POST</code></td><td>Session logout</td></tr>
+<tr><td><code>/portal/auth/login</code></td><td><code>POST</code></td><td>Customer portal login</td></tr>
+<tr><td><code>/portal/auth/set-password</code></td><td><code>POST</code></td><td>Customer password setup</td></tr>
+<tr><td><code>/portal/auth/change-password</code></td><td><code>POST</code></td><td>Customer password change</td></tr>
+<tr><td><code>/admin/media/upload</code></td><td><code>POST</code></td><td>CMS image upload</td></tr>
+<tr><td><code>/admin/media/delete</code></td><td><code>POST</code></td><td>CMS image deletion</td></tr>
+<tr><td><code>/ws</code></td><td><code>GET</code></td><td>Broker WebSocket proxy</td></tr>
+<tr><td><code>/docs</code></td><td><code>GET</code></td><td>Markdown documentation index</td></tr>
+<tr><td><code>/docs/{path}</code></td><td><code>GET</code></td><td>Render a Markdown document</td></tr>
+<tr><td><code>/assets/{path}</code></td><td><code>GET</code></td><td>Serve an asset</td></tr>
+<tr><td>all other paths</td><td>Any</td><td>Match a Mix handler, then fall back to static files</td></tr>
+</tbody></table>
+<p>The autoconfiguration branch adds:</p>
+<table><thead><tr><th>Path</th><th>Methods</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>/mail/config-v1.1.xml</code></td><td><code>GET</code></td><td>Mozilla mail autoconfiguration</td></tr>
+<tr><td><code>/.well-known/autoconfig/mail/config-v1.1.xml</code></td><td><code>GET</code></td><td>Well-known mail autoconfiguration</td></tr>
+<tr><td><code>/autodiscover/autodiscover.xml</code></td><td><code>POST</code></td><td>Reserved; currently returns <code>404</code></td></tr>
+</tbody></table>
+<p>A plain-HTTP listener also serves ACME HTTP-01 challenges and redirects admitted non-autoconfiguration requests to HTTPS.</p>
+<h2 id="embedded-mix-handlers">Embedded Mix handlers</h2>
+<p>The <code>webd.handlers</code> namespace maps a method and path pattern to a <code>.mix</code> file below the vhost's <code>www_dir</code>. Exact paths and one trailing <code>/*</code> glob are supported. <code>ANY</code> matches every request method.</p>
+<p>Handlers receive request globals including <code>$METHOD</code>, <code>$PATH</code>, <code>$QUERY</code>, <code>$HOST</code>, <code>$BODY</code>, <code>$HEADERS</code>, <code>$SIGNALS</code>, <code>$SESSION</code>, and <code>$CSRF</code> when the corresponding state exists.</p>
+<p>A handler returns one of:</p>
+<ul>
+<li>A string, served as <code>200 text/html</code>.</li>
+<li>Raw bytes, preserved for binary responses.</li>
+<li>A map containing <code>status</code>, <code>headers</code>, and <code>body</code>.</li>
+<li>Printed output, used as the response body.</li>
+</ul>
+<p>The default sandbox permits pure operations and filesystem reads. Filesystem writes, process execution, environment access, shell syntax, and pipes remain denied. Route capabilities selectively add database, JMAP, Bus, or outbound-network access.</p>
+<p>Evaluation has a 1 MiB request-body cap, a five-second deadline, the Mix default recursion limit of 16, collection limits of 100,000 entries, and a 4 MiB string limit. Parsed handler ASTs are cached and refreshed when the script modification time changes.</p>
+<h2 id="persistence">Persistence</h2>
+<p><code>cosmix-webd init</code> creates the legacy database schema. It contains:</p>
+<ul>
+<li><code>posts</code>, the CMS post table.</li>
+<li><code>session_epochs</code>, per-account counters used to invalidate sealed session cookies.</li>
+</ul>
+<p>Production serving also stores SPEC 12 property rows in the configured web database. Per-vhost CMS databases are optional and may attach named auxiliary databases.</p>
+<h2 id="virtual-hosts-and-listeners">Virtual hosts and listeners</h2>
+<p>Each configured vhost has its own static root and optional CMS database, JMAP upstream, broker WebSocket upstream, documentation directory, and authentication credentials. Primary hosts and configured aliases share runtime state and counters.</p>
+<p>Explicit listeners partition vhosts by interface. Each listener has a stable ID, bind address, external/internal classification, enabled state, host allowlist, connection limits, rate limit, CIDR policy, and strict-SNI setting.</p>
+<p>Listener state is persisted in <code>webd.listeners</code>. Configuration seeds new rows; later runtime changes remain authoritative across restarts.</p>
+<h2 id="tls">TLS</h2>
+<p>Manual TLS uses a certificate and private-key path. Public-facing manual chains are validated for the configured names before serving. Internal-only listeners may use an internal or self-signed certificate.</p>
+<p>ACME mode supports production and staging providers with HTTP-01. The provisioner performs startup recovery, issuance, renewal, backoff, atomic staging and promotion, archive pruning, resolver hot-swap, and status publication.</p>
+<p>Manual-PEM deployments can reload certificate contents without restarting through <code>webd.tls.reload</code>. Validation failure keeps every previous resolver active.</p>
+<h2 id="bus-citizenship">Bus citizenship</h2>
+<p>The daemon registers the Bus service name <code>webd</code>. Broker connection failures and mid-session disconnects enter an exponential reconnect loop capped at 60 seconds. HTTP serving and ACME renewal continue while the Bus surface is offline.</p>
+<p>The service exposes read-only snapshots, ergonomic lifecycle verbs, listener controls, session revocation, TLS reload, and the generic <code>webd.props.*</code> family. Property changes publish on <code>webd.props.records.changed</code>; watch grants are refreshed after broker reconnection.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<p>This crate defines no Cargo features. Bus citizenship and the embedded Mix runtime are unconditional dependencies.</p>
+<h2 id="main-source-modules">Main source modules</h2>
+<table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>main</code></td><td>CLI, configuration resolution, HTTP routes, runtime assembly, and serving</td></tr>
+<tr><td><code>bus</code></td><td>Bus registration, reconnect loop, dispatch, verbs, and property publication</td></tr>
+<tr><td><code>vhosts_namespace</code></td><td><code>webd.vhosts</code> schema, policy, validation, and events</td></tr>
+<tr><td><code>handlers_namespace</code></td><td><code>webd.handlers</code> schema and route-table reload signalling</td></tr>
+<tr><td><code>listeners_namespace</code></td><td><code>webd.listeners</code> schema, guards, status, and control events</td></tr>
+<tr><td><code>mix_handler</code></td><td>Trusted Mix route matching, sandboxing, evaluation, and response mapping</td></tr>
+<tr><td><code>acme_provisioner</code></td><td>ACME issuance, renewal, recovery, persistence, and TLS publication</td></tr>
+<tr><td><code>vhost_directory</code></td><td>Atomically published host-routing directory</td></tr>
+<tr><td><code>listeners_reaction</code></td><td>Applies persisted listener changes to the live listener set</td></tr>
+<tr><td><code>session</code></td><td>Sealed session cookies and CSRF tokens</td></tr>
+<tr><td><code>db</code></td><td>Capability-scoped SQLite access for Mix</td></tr>
+<tr><td><code>jmap_handler</code></td><td>Capability-scoped JMAP calls for Mix</td></tr>
+<tr><td><code>file_share</code></td><td>Tokenised file-share records and path confinement</td></tr>
+<tr><td><code>media</code></td><td>Authenticated CMS image storage</td></tr>
+<tr><td><code>mxresolve</code></td><td>Cached MX lookup and implicit-TLS probes</td></tr>
+<tr><td><code>public_response_cache</code></td><td>Short-lived anonymous response cache</td></tr>
+</tbody></table>
+<h2 id="package-metadata">Package metadata</h2>
+<p>The crate builds one binary, <code>cosmix-webd</code>. Its package description is “Lightweight web server daemon — axum-based CMS API backed by SQLite”.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +723,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +777,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +906,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

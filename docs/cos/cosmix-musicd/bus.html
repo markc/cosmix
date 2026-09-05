@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-musicd/bus</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,177 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-musicd/bus.md"><div class="prose"><h1 id="cosmix-musicd-bus-service">cosmix-musicd Bus service</h1>
+<h2 id="name">Name</h2>
+<p><code>musicd</code> — Bus service for MIDI rendering and playback, or for the 32-channel mixer.</p>
+<h2 id="modes">Modes</h2>
+<p><code>cosmix-musicd serve</code> and <code>cosmix-musicd mixer-serve</code> both register as <code>musicd</code>. They are alternative service modes and must not run together on one broker.</p>
+<p><code>serve</code> provides MIDI render, playback, SoundFont, status, and read-only property verbs.</p>
+<p><code>mixer-serve</code> provides revisioned mixer properties, transport control, snapshots, and real-time telemetry.</p>
+<p>Both modes require the <code>cosmix</code> Cargo feature.</p>
+<h2 id="main-service-verbs">Main service verbs</h2>
+<p>Commands use the <code>musicd.</code> prefix. Request fields are supplied as the Bus argument object.</p>
+<h3 id="musicdrender">musicd.render</h3>
+<p>Renders a MIDI file without requiring an output device.</p>
+<p>Arguments:</p>
+<table><thead><tr><th>Field</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>midi_path</code></td><td style="text-align: right">Yes</td><td>Input Standard MIDI File path. A leading <code>~/</code> is expanded.</td></tr>
+<tr><td><code>out_path</code></td><td style="text-align: right">No</td><td>Relative output name below the daemon render directory.</td></tr>
+<tr><td><code>sample_rate</code></td><td style="text-align: right">No</td><td>Output sample rate in hertz.</td></tr>
+<tr><td><code>gain</code></td><td style="text-align: right">No</td><td>Output gain multiplier.</td></tr>
+<tr><td><code>soundfont</code></td><td style="text-align: right">No</td><td>SoundFont name relative to the daemon state directory.</td></tr>
+<tr><td><code>channels</code></td><td style="text-align: right">No</td><td><code>stereo</code>, <code>mono</code>, <code>left</code>, or <code>right</code>; defaults to <code>stereo</code>.</td></tr>
+<tr><td><code>format</code></td><td style="text-align: right">No</td><td><code>wav16</code>, <code>wav24</code>, <code>wavf32</code>, or <code>flac24</code>; defaults to <code>wav16</code>.</td></tr>
+</tbody></table>
+<p>The daemon confines <code>out_path</code> below <code>state_dir/renders</code>. Absolute paths, parent traversal, and empty names are rejected.</p>
+<p>A successful response contains:</p>
+<pre><code class="language-json">{
+  "rendered": true,
+  "out_path": "rendered output path",
+  "duration_s": 12.5,
+  "frames": 551250,
+  "sample_rate": 44100,
+  "peak": 0.8,
+  "clipped": false
+}
+</code></pre>
+<h3 id="musicdplay">musicd.play</h3>
+<p>Starts MIDI playback through the default audio output device.</p>
+<p>Arguments:</p>
+<table><thead><tr><th>Field</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>midi_path</code></td><td style="text-align: right">Yes</td><td>Input Standard MIDI File path.</td></tr>
+<tr><td><code>gain</code></td><td style="text-align: right">No</td><td>Playback gain multiplier.</td></tr>
+<tr><td><code>soundfont</code></td><td style="text-align: right">No</td><td>SoundFont name relative to the daemon state directory.</td></tr>
+</tbody></table>
+<p>The request fails when no output device is available. A successful response reports <code>playing</code>, duration, sample rate, and MIDI path.</p>
+<h3 id="musicdstop">musicd.stop</h3>
+<p>Stops current playback. The response reports <code>stopped: true</code> and whether playback had been active.</p>
+<h3 id="musicdstatus">musicd.status</h3>
+<p>Returns SoundFont state, device availability, playback state and position, render and play counters, uptime, and sample rate.</p>
+<h3 id="musicdsoundfonts">musicd.soundfonts</h3>
+<p>Lists <code>.sf2</code> files directly inside the daemon state directory. The response identifies the configured default, the loaded bank, and each available file's name, path, and byte count.</p>
+<h3 id="musicdload_soundfont">musicd.load_soundfont</h3>
+<p>Loads a SoundFont already present in the daemon state directory.</p>
+<p>Arguments:</p>
+<table><thead><tr><th>Field</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td style="text-align: right">No</td><td>Relative SoundFont name.</td></tr>
+<tr><td><code>path</code></td><td style="text-align: right">No</td><td>Relative SoundFont path; takes precedence over <code>name</code>.</td></tr>
+</tbody></table>
+<p>When both fields are absent, the configured SoundFont name is used. Absolute paths and traversal outside the state directory are rejected.</p>
+<h2 id="main-service-properties">Main service properties</h2>
+<p>The main service implements:</p>
+<ul>
+<li><code>musicd.props.get</code></li>
+<li><code>musicd.props.list</code></li>
+<li><code>musicd.props.describe</code></li>
+<li><code>musicd.props.watch</code></li>
+</ul>
+<p>The property tree contains:</p>
+<table><thead><tr><th>Group</th><th>Leaves</th></tr></thead><tbody>
+<tr><td><code>config</code></td><td><code>state_dir</code>, <code>soundfont_name</code>, <code>soundfont_url</code>, <code>sample_rate</code>, <code>max_polyphony</code></td></tr>
+<tr><td><code>lifecycle</code></td><td><code>started_at</code>, <code>uptime_s</code>, <code>health</code>, <code>props_level</code>, <code>soundfont_loaded</code>, <code>soundfont_error</code>, <code>device_available</code></td></tr>
+<tr><td><code>playback</code></td><td><code>playing</code>, <code>current_midi</code>, <code>position_s</code>, <code>duration_s</code>, <code>renders_total</code>, <code>plays_total</code></td></tr>
+</tbody></table>
+<p><code>lifecycle.uptime_s</code> and <code>playback.position_s</code> are transient.</p>
+<p><code>musicd.props.watch</code> returns the <code>musicd.props.changed</code> topic. The daemon publishes a retained full snapshot on <code>world.musicd</code>. A 1 Hz loop publishes changes for non-transient leaves.</p>
+<h2 id="mixer-service-verbs">Mixer service verbs</h2>
+<p><code>mixer-serve</code> accepts:</p>
+<ul>
+<li><code>musicd.props.get</code></li>
+<li><code>musicd.props.list</code></li>
+<li><code>musicd.props.describe</code></li>
+<li><code>musicd.props.watch</code></li>
+<li><code>musicd.props.set</code></li>
+<li><code>musicd.mixer.snapshot</code></li>
+</ul>
+<h3 id="musicdpropsset">musicd.props.set</h3>
+<p>The request body is a mixer write with these fields:</p>
+<pre><code class="language-json">{
+  "path": "mixer.channels.0.fader",
+  "value": -6.0,
+  "op_id": "operation-1",
+  "if_revision": null
+}
+</code></pre>
+<p>Writes require a broker-verified sender and a non-empty <code>op_id</code>.</p>
+<p>The service validates type, mutability, enum membership, and finite numeric values. Numeric values are clamped and quantised to the leaf schema. <code>if_revision</code>, when present, provides optimistic concurrency.</p>
+<p>Return codes are:</p>
+<table><thead><tr><th style="text-align: right">Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td style="text-align: right"><code>0</code></td><td>Accepted and assigned a control revision.</td></tr>
+<tr><td style="text-align: right"><code>4</code></td><td>Busy; the real-time control ring is full and the caller may retry.</td></tr>
+<tr><td style="text-align: right"><code>10</code></td><td>Rejected for authentication, validation, or revision mismatch.</td></tr>
+</tbody></table>
+<p>An accepted reply contains the revision, path, canonical value, authenticated source identity, and operation identifier. DSP application is reported later on the applied topic.</p>
+<p>Writing <code>false</code> to a <code>meter.clip</code> leaf resets that meter's latched clip state. Writing <code>transport.position</code> performs a revisioned seek and is clamped to the finite session length when one exists.</p>
+<h3 id="musicdmixersnapshot">musicd.mixer.snapshot</h3>
+<p>Returns a revisioned bootstrap snapshot of seeded mixer leaves plus run-integrity state. It includes whether real audio is active and whether audio or applied-event faults have occurred.</p>
+<p>Clients subscribe before reading the snapshot, then discard change events whose revision is not newer than the snapshot revision.</p>
+<h2 id="mixer-property-tree">Mixer property tree</h2>
+<p>There are 32 channel strips numbered <code>0</code> through <code>31</code>.</p>
+<p>Each <code>mixer.channels.N</code> group contains:</p>
+<ul>
+<li><code>trim</code></li>
+<li><code>fader</code></li>
+<li><code>pan</code></li>
+<li><code>mute</code></li>
+<li><code>solo</code></li>
+<li><code>name</code></li>
+<li><code>meter.rms_l</code></li>
+<li><code>meter.rms_r</code></li>
+<li><code>meter.peak_l</code></li>
+<li><code>meter.peak_r</code></li>
+<li><code>meter.hold_l</code></li>
+<li><code>meter.hold_r</code></li>
+<li><code>meter.clip</code></li>
+</ul>
+<p>The master group contains <code>fader</code>, <code>mute</code>, the six meter level leaves, and <code>meter.clip</code>.</p>
+<p>The remaining leaves are:</p>
+<ul>
+<li><code>transport.state</code></li>
+<li><code>transport.position</code></li>
+<li><code>transport.length</code></li>
+<li><code>mixer.song.title</code></li>
+<li><code>mixer.song.artist</code></li>
+<li><code>mixer.song.copyright</code></li>
+<li><code>mixer.schema_version</code></li>
+<li><code>mixer.engine</code></li>
+<li><code>mixer.source_profile</code></li>
+<li><code>mixer.benchmark_eligible</code></li>
+</ul>
+<p><code>transport.state</code> accepts <code>stopped</code> or <code>playing</code>. Pan uses <code>-1</code> for left and <code>+1</code> for right. Meter levels use dBFS; trim and fader values use dB.</p>
+<p>Use <code>musicd.props.describe</code> for each leaf's mutability, range, default, enum values, unit, and transient status.</p>
+<h2 id="mixer-topics">Mixer topics</h2>
+<p><code>musicd.props.watch</code> returns all mixer topic names and the snapshot verb.</p>
+<table><thead><tr><th>Topic</th><th>Content</th></tr></thead><tbody>
+<tr><td><code>musicd.mixer.changed</code></td><td>Coalesced per-path control changes, including revisions.</td></tr>
+<tr><td><code>musicd.mixer.applied</code></td><td>DSP latch events containing <code>revision</code> and <code>sample_frame</code>.</td></tr>
+<tr><td><code>musicd.mixer.meters</code></td><td>Base64-encoded 465-byte meter frames at 60 Hz.</td></tr>
+</tbody></table>
+<p>Meter publication is latest-wins and non-retained. Applied events preserve the real-time latch frame for accepted revisions.</p>
+<h2 id="configuration">Configuration</h2>
+<p><code>serve --config &lt;path&gt;</code> reads the named <code>.conf.mix</code> file.</p>
+<p>Without an explicit path, <code>serve</code> checks <code>/etc/cosmix/musicd/config.conf.mix</code>, then the user-mode <code>musicd</code> service configuration.</p>
+<p>The settings consumed by this crate are:</p>
+<table><thead><tr><th>Setting</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>state_dir</code></td><td>Holds the active SoundFont and the <code>renders</code> output directory.</td></tr>
+<tr><td><code>soundfont_name</code></td><td>Default SoundFont filename within <code>state_dir</code>.</td></tr>
+<tr><td><code>soundfont_url</code></td><td>Source used for first-run download.</td></tr>
+<tr><td><code>soundfont_sha256</code></td><td>Expected SHA-256 digest for download verification.</td></tr>
+<tr><td><code>sample_rate</code></td><td>Default render and playback sample rate.</td></tr>
+<tr><td><code>gain</code></td><td>Default render and playback gain.</td></tr>
+<tr><td><code>max_polyphony</code></td><td>Maximum synthesiser voice count.</td></tr>
+</tbody></table>
+<p>The crate does not define a separate configuration file for <code>mixer-serve</code>; its source profile is selected by command-line options.</p>
+<h2 id="soundfont-initialisation">SoundFont initialisation</h2>
+<p>At startup, <code>serve</code> ensures <code>state_dir/soundfont_name</code> exists and matches the configured SHA-256 digest. A matching file is reused.</p>
+<p>A missing or mismatched file is fetched to a temporary <code>.new</code> path, checked while streaming, and atomically renamed after verification. Failed downloads remove the partial file.</p>
+<p>Fetching and parsing run outside the broker registration path. The service remains available in degraded state when initialisation fails, while render and play requests report the SoundFont error.</p>
+<h2 id="stem-session-source">Stem-session source</h2>
+<p><code>mixer-serve --stems &lt;path&gt;</code> preloads a stem session before starting the audio thread.</p>
+<p>Version 1 is JSON with schema <code>stem-session.v1</code>. It declares a 48 kHz frame length and a set of channel, WAV path, SHA-256, and optional display-name entries.</p>
+<p>Version 2 is a strict-data <code>.mix</code> document with schema <code>stem-session.v2</code>. It adds optional non-destructive regions containing timeline start, source start, length, gain, fade-in, and fade-out values.</p>
+<p>Relative WAV paths resolve against the session file. Missing channels remain silent. Duplicate or out-of-range channels, hash mismatches, non-mono or non-48 kHz WAV files, and stems longer than the declared session are rejected.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +789,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +843,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +972,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

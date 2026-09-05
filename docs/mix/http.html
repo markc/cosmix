@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/http</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,412 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/http.md"><div class="prose"><h1 id="http--http-client-builtins">http — HTTP client builtins</h1>
+<p>The HTTP client builtins — a small, blocking HTTP/1.1 client built on
+<a href="https://docs.rs/ureq"><code>ureq</code></a>. Three calls cover the whole surface:
+<code>http_get</code>, <code>http_post</code>, and the any-verb <code>http_request</code>. They are
+<strong>feature-gated</strong> (the <code>http</code> cargo feature) in <code>cosmix-lib-mix</code>; the shipped
+<code>mix</code> binary turns the feature on, so they are always present in the CLI. In
+the builtin catalogue they list under the <code>system</code> category
+(<code>mix builtins system</code>); one-line help for any name: <code>mix what http_get</code>.</p>
+<blockquote>
+<p>Mental model: every call <strong>returns a map, never raises, for anything that
+happens on the network</strong>. A successful or HTTP-error response is
+<code>{status, body, bytes}</code>; a transport failure — including a
+<a href="/mix/http#timeouts">timeout</a> — is <code>{status: 0, error}</code>. You branch on <code>status</code>, you
+don't wrap the call in <a href="/mix/errors">try/catch</a>. (Argument mistakes — wrong
+arity, a bad opts map, a bytes header value — do raise: they are script
+bugs, not network weather.)</p>
+</blockquote>
+<pre><code class="language-mix">$r = http_get("https://example.com")
+print("status=" .. $r["status"])
+print("body_len=" .. length($r["body"]))
+</code></pre>
+<pre><code class="language-text">status=200
+body_len=559
+</code></pre>
+<h2 id="the-three-calls">The three calls</h2>
+<pre><code>http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}])                      -- GET
+http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}])               -- POST with a body
+http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}])  -- any verb
+</code></pre>
+<ul>
+<li><code>url</code> — a string (anything else is stringified via the usual coercion).</li>
+<li><code>headers</code> — an optional <strong>map</strong> of header name → value (see <a href="/mix/http#headers">Headers</a>).</li>
+<li><code>body</code> — a string (sent as UTF-8) or a <code>bytes</code> buffer (sent raw); see <a href="/mix/http#request-bodies">Request bodies</a>.</li>
+<li><code>method</code> (<code>http_request</code> only) — upper-cased internally, so <code>"get"</code>, <code>"Get"</code>, <code>"GET"</code> are equivalent. It must be a valid <a href="https://www.rfc-editor.org/rfc/rfc7230">RFC 7230</a> token (no spaces / control bytes) or the call returns the error shape — this guards against request-line injection.</li>
+<li><code>{timeout, ssl_verify, ca_file, ca_pem}</code> — an optional trailing <strong>opts map</strong>. <code>timeout</code> bounds the whole request (default 30 s, <code>{timeout: 0}</code> disables — see <a href="/mix/http#timeouts">Timeouts</a>). <code>ssl_verify</code> defaults to <code>true</code>; <code>ssl_verify: false</code> <strong>skips TLS certificate and hostname verification</strong> for that call (like <code>curl -k</code>) — see <a href="/mix/http#skipping-tls-verification">Skipping TLS verification</a>.</li>
+<li><code>ca_file</code> / <code>ca_pem</code> (v0.29.0) — trust a <strong>private CA</strong> for this call: <code>ca_file</code> reads PEM certificate(s) from a path, <code>ca_pem</code> takes them inline (string/bytes/buffer). The certificates are <strong>ADDED to the default (Mozilla webpki) roots</strong> — chain building and hostname verification still run in full, so this is the right way to talk to an internal endpoint with a proper private-CA-issued cert (the readiness-check case), unlike <code>ssl_verify: false</code> which proves nothing. Mutually exclusive with each other and with <code>ssl_verify: false</code>; input capped at 4 MiB; a missing/unreadable file, invalid PEM, or PEM with no certificates raises a catchable <code>HTTP_TLS</code> structured error (see <a href="/mix/errors">errors</a>). In a capability-sandboxed embedder, <code>ca_file</code> additionally requires the <code>fs-read</code> class (declared as a conditional capability in the builtin metadata).</li>
+</ul>
+<p><code>http_get</code> takes 1–3 arguments, <code>http_post</code> 2–4, <code>http_request</code> 2–5. Too few
+raises a runtime error, and — unlike the Mix-wide minimum-arity convention —
+<strong>too many also raises</strong>, so a misplaced opts map can't be silently ignored
+and leave a call unbounded:</p>
+<pre><code class="language-mix">http_get()
+-- Runtime error at line 1: http_get() expects at least 1 argument(s), got 0
+http_post("https://example.com")
+-- Runtime error at line 1: http_post() expects at least 2 argument(s), got 1
+http_get($url, {}, {}, {})
+-- Runtime error at line 1: http_get() expects at most 3 argument(s), got 4
+</code></pre>
+<h2 id="the-return-shape">The return shape</h2>
+<p>Every call resolves to one of two map shapes.</p>
+<h3 id="success--http-error-response">Success / HTTP-error response</h3>
+<table><thead><tr><th>key</th><th>type</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>status</code></td><td>number</td><td>the HTTP status code (<code>200</code>, <code>404</code>, <code>503</code>, …)</td></tr>
+<tr><td><code>body</code></td><td>string | nil</td><td>the body <strong>decoded as UTF-8</strong>; <code>nil</code> when the bytes are not valid UTF-8</td></tr>
+<tr><td><code>bytes</code></td><td>bytes</td><td>the <strong>raw</strong> response byte buffer, always present</td></tr>
+<tr><td><code>headers</code></td><td>map</td><td>response headers — <strong>lowercase</strong> names → <strong>list</strong> of string values (repeated fields preserved), e.g. <code>$r.headers["content-type"]</code> is <code>["text/html"]</code> (v0.30.0)</td></tr>
+<tr><td><code>final_url</code></td><td>string</td><td>the URL after any redirects (v0.30.0)</td></tr>
+<tr><td><code>duration_ms</code></td><td>number</td><td>wall-clock request duration (v0.30.0)</td></tr>
+<tr><td><code>error_code</code></td><td>string | nil</td><td><code>nil</code> on any HTTP response (incl. 4xx/5xx); an <code>HTTP_*</code> code only on a transport failure (v0.30.0)</td></tr>
+<tr><td><code>error</code></td><td>string | nil</td><td><code>nil</code> on an HTTP response; the message on a transport failure</td></tr>
+</tbody></table>
+<p>The <code>headers</code>/<code>final_url</code>/<code>duration_ms</code>/<code>error_code</code> keys are <strong>additive</strong> —
+pre-0.30 scripts reading <code>status</code>/<code>body</code>/<code>bytes</code> are unaffected.</p>
+<p>A <strong>4xx / 5xx is a response, not a failure</strong> — it carries the real code plus
+whatever error payload the server sent, so REST callers can read both:</p>
+<pre><code class="language-mix">$r = http_get("https://example.com/does-not-exist-xyz")
+print("status=" .. $r["status"])
+print("body=" .. substr($r["body"], 0, 40))
+</code></pre>
+<pre><code class="language-text">status=404
+body=&lt;!doctype html&gt;&lt;html lang="en"&gt;&lt;head&gt;&lt;ti
+</code></pre>
+<p>The documented success test is <code>status == 200</code> (or a <code>2xx</code> range check) — it is
+unaffected by error statuses landing in <code>status</code> rather than the error shape.</p>
+<h3 id="transport-failure--status-0-error">Transport failure — <code>{status: 0, error}</code></h3>
+<p>Only a genuine transport error — DNS failure, TLS handshake, connection refused,
+a <a href="/mix/http#timeouts">deadline expiry</a>, a mid-stream read error, an invalid method, or
+an over-cap body — collapses to <code>status == 0</code> with a human-readable <code>error</code>
+string and <strong>no</strong> <code>body</code>/<code>bytes</code>:</p>
+<pre><code class="language-mix">$r = http_get("http://127.0.0.1:1/")
+print("status=" .. $r["status"])
+print("error=" .. $r["error"])
+</code></pre>
+<pre><code class="language-text">status=0
+error=http://127.0.0.1:1/: Connection Failed: Connect error: Connection refused (os error 111)
+</code></pre>
+<p><code>status: 0</code> is the one sentinel that means "no HTTP exchange happened" — a real
+server never returns code 0, so a single <code>if $r["status"] == 0</code> cleanly
+separates "the network broke" from "the server answered". The canonical guard:</p>
+<pre><code class="language-mix">$r = http_get($url)
+if $r["status"] == 0 then
+  print("transport error: " .. $r["error"])
+else
+  -- $r["status"] is a real HTTP code; $r["body"]/$r["bytes"] are present
+end
+</code></pre>
+<h2 id="text-vs-binary--body-and-bytes">Text vs binary — <code>body</code> and <code>bytes</code></h2>
+<p><code>bytes</code> always carries the raw buffer. <code>body</code> is the <strong>UTF-8 decode</strong> of that
+buffer, or <code>nil</code> when the bytes are not valid UTF-8 — so a binary response
+(image, archive, anything high-bit) does <strong>not</strong> silently corrupt through a
+lossy decode. An <em>empty</em> body decodes to the empty string <code>""</code>, not <code>nil</code> —
+<code>nil</code> strictly means "not UTF-8". Reach for <code>.body</code> for JSON/text, <code>.bytes</code>
+for binary:</p>
+<pre><code class="language-mix">$r = http_get("https://www.google.com/favicon.ico")
+print("status=" .. $r["status"])
+print("body_is_nil=" .. ("" .. ($r["body"] == nil)))
+print("bytes_present=" .. ("" .. (not is_empty($r["bytes"]))))
+</code></pre>
+<pre><code class="language-text">status=200
+body_is_nil=true
+bytes_present=true
+</code></pre>
+<p>For a text response, <code>body</code> is a normal string and <code>bytes</code> holds the same data
+as a raw buffer — write it straight to disk with <code>write_file</code> (a bytes value
+is written verbatim), or pass it to a <a href="/mix/data">bytes helper</a>:</p>
+<pre><code class="language-mix">$r = http_get("https://example.com")
+write_file("/tmp/example.html", $r["bytes"])
+</code></pre>
+<p>To measure the buffer use <code>bytes_len($r["bytes"])</code> or, since <strong>v0.64.0</strong>, plain
+<code>length($r["bytes"])</code> — both answer the byte count. The raw body can also be
+indexed, sliced, iterated and searched directly (<code>bytes_find</code>, <code>bytes_split</code>,
+<code>bytes_starts_with</code>); see <a href="/mix/io#bytes-as-a-sequence-v0640">io</a>.</p>
+<h2 id="headers">Headers</h2>
+<p>The optional <code>headers</code> argument is a <strong>map</strong>. Keys are header names, values are
+stringified the usual way. If you don't set a <code>User-Agent</code>, <code>ureq</code>'s default
+(<code>ureq/2.12.1</code>) goes out — the examples here set their own because some APIs
+care:</p>
+<pre><code class="language-mix">$r = http_get("https://api.github.com/zen", { "User-Agent": "mix-docs" })
+print("status=" .. $r["status"])
+print("body=" .. $r["body"])
+</code></pre>
+<pre><code class="language-text">status=200
+body=Encourage flow.
+</code></pre>
+<p>A <code>bytes</code> <strong>value</strong> is rejected (not stringified) so the internal <code>&lt;bytes:N&gt;</code>
+placeholder never ships over the wire — HTTP headers are text. If you genuinely
+need binary header metadata, encode it yourself:</p>
+<pre><code class="language-mix">http_get($url, { "X-Token": $raw_bytes })
+-- Runtime error: http: header `X-Token` does not accept bytes; base64_encode($v) first
+</code></pre>
+<p>One carve-out: a <strong>sole</strong> map in this slot whose keys are <strong>all</strong> opts keys
+(<code>timeout</code>, <code>ssl_verify</code>, <code>ca_file</code>, <code>ca_pem</code>) is read as the opts map, not as headers — see
+<a href="/mix/http#the-trailing-map-rule">the trailing-map rule</a>. Any real-world header map
+(carrying a non-opts key like <code>Authorization</code>) is unaffected.</p>
+<h2 id="request-bodies">Request bodies</h2>
+<p><code>http_post</code> (and <code>http_request</code>'s optional 3rd slot) send a body. A <strong>string</strong>
+is sent as UTF-8; a <strong>bytes</strong> buffer is sent raw (so a binary upload doesn't go
+through string coercion). Set <code>Content-Type</code> yourself — the client does not
+guess it:</p>
+<pre><code class="language-mix">$payload = "{\"hello\":\"world\"}"
+$r = http_post("https://httpbin.org/post", $payload, { "Content-Type": "application/json" })
+print("status=" .. $r["status"])
+$j = json_parse($r["body"])
+print("echoed=" .. $j["data"])
+</code></pre>
+<pre><code class="language-text">status=200
+echoed={"hello":"world"}
+</code></pre>
+<p><code>http_request</code>'s body slot is <strong><code>nil</code>-tolerant</strong>: an absent or <code>nil</code> 3rd
+argument sends a bodyless request (the right behaviour for <code>GET</code>/<code>DELETE</code>/
+<code>OPTIONS</code>):</p>
+<pre><code class="language-mix">$r = http_request("GET", "https://example.com")   -- no 3rd arg → bodyless
+print("status=" .. $r["status"])
+</code></pre>
+<pre><code class="language-text">status=200
+</code></pre>
+<p><code>HEAD</code> reports the real status with an empty body — a bodyless response is
+not a transport failure:</p>
+<pre><code class="language-mix">$r = http_request("HEAD", "https://example.com")
+print($r["status"] .. " / body=" .. length($r["body"]) .. " bytes")
+</code></pre>
+<pre><code class="language-text">200 / body=0 bytes
+</code></pre>
+<blockquote>
+<p>A <code>HEAD</code> response mirrors the headers a <code>GET</code> would return — including a
+<code>Content-Encoding</code> — but the server omits the body. The body is skipped
+rather than drained; before this fix, a <code>HEAD</code> from a server that sends
+<code>Content-Encoding</code> (example.com, github.com, …) collapsed to <code>{status: 0, error}</code> because the (empty) body was still run through a decoder.</p>
+</blockquote>
+<p>An invalid method short-circuits to the error shape (no request is sent):</p>
+<pre><code class="language-mix">$r = http_request("BAD METHOD", "https://example.com")
+print($r["status"] .. " / " .. $r["error"])
+</code></pre>
+<pre><code class="language-text">0 / http: invalid request method "BAD METHOD" (must be an RFC 7230 token)
+</code></pre>
+<h2 id="timeouts">Timeouts</h2>
+<p>Every call runs under a <strong>total-request deadline — 30 seconds by default</strong> —
+one wall-clock budget covering connect, TLS, request write, and response read
+(<code>ureq</code> itself sets no timeout; before mix 0.21 a stalled server could hang
+the evaluator, and a login shell, forever). Override it per call with the
+trailing opts map:</p>
+<pre><code class="language-mix">$r = http_get($url, {timeout: 5})            -- 5 s deadline
+$r = http_get($url, $headers, {timeout: 5})  -- headers AND a deadline
+$r = http_get($url, {timeout: 0})            -- no deadline (deliberately long transfer)
+</code></pre>
+<p><code>timeout</code> takes a <strong>non-negative integer, in seconds</strong>. A fractional,
+negative, or non-number value is a loud runtime error, and so is any other
+key in the opts map — a typo can't silently produce an unbounded call:</p>
+<pre><code class="language-mix">http_get($url, {}, {timeot: 5})
+-- Runtime error at line 1: http_get: unknown opt "timeot" (supported: timeout)
+http_get($url, {timeout: 1.5})
+-- Runtime error at line 1: http_get: timeout must be a non-negative integer, got 1.5
+</code></pre>
+<p>A deadline expiry is a <strong>transport failure, not a raise</strong> — the usual
+<code>{status: 0, error}</code> shape. (There is no <code>timed_out</code> key; that is a
+<a href="/mix/system"><code>run_rc</code></a> convention.)</p>
+<pre><code class="language-mix">$r = http_get("http://127.0.0.1:8098/", {timeout: 1})   -- a hanging server
+print($r["status"] .. " / " .. $r["error"])
+</code></pre>
+<pre><code class="language-text">0 / http://127.0.0.1:8098/: Network Error: Network Error: Error encountered in the status line: timed out reading response
+</code></pre>
+<h3 id="the-trailing-map-rule">The trailing-map rule</h3>
+<p>The opts map rides in the <strong>last</strong> slot, after the optional headers (and, for
+<code>http_request</code>, body) slots. To keep the common case short, a <strong>sole trailing
+map whose keys are all opts keys (<code>timeout</code>, <code>ssl_verify</code>, <code>ca_file</code>, <code>ca_pem</code>) is always read as the
+opts map</strong> — never as a headers map, and never as a request body:</p>
+<pre><code class="language-mix">http_get($url, {timeout: 1})                     -- deadline, not a `timeout` header
+http_get($url, {ssl_verify: false})              -- skip TLS verification
+http_post($url, $body, {timeout: 1})             -- deadline, not a header
+http_request("GET", $url, {timeout: 1})          -- deadline, not a body
+http_request("POST", $url, $body, {timeout: 1})  -- deadline, not a header
+</code></pre>
+<p>To genuinely send a literal <code>timeout</code> HTTP header, spell out the opts slot —
+an empty opts map keeps the 30 s default:</p>
+<pre><code class="language-mix">$r = http_get($url, {timeout: "60s"}, {})   -- sends the header `timeout: 60s`
+</code></pre>
+<p>A map carrying any non-opts key (e.g. <code>Authorization</code>) is a plain headers map
+(or, in <code>http_request</code>'s 3rd slot, a stringified body), so real-world maps never
+trip the rule.</p>
+<h2 id="skipping-tls-verification">Skipping TLS verification</h2>
+<p>TLS is on for every <code>https://</code> URL, and a bad certificate surfaces as a
+transport error (<code>{status: 0, error}</code>), not a panic. Some internal endpoints —
+Proxmox VE (<code>:8006</code>), Proxmox Backup Server (<code>:8007</code>), and other appliances —
+serve a <strong>self-signed</strong> certificate that no public CA vouches for. Rather than
+pin their CA, pass <code>ssl_verify: false</code> in the opts map to skip certificate and
+hostname verification for that call, exactly like <code>curl -k</code>:</p>
+<pre><code class="language-mix">$r = http_get("https://b1.example:8006/api2/json/version",
+              {"Authorization": $tok}, {ssl_verify: false})
+</code></pre>
+<p>The TLS handshake still happens — the connection is encrypted and the peer's
+signatures are checked against the ring provider's algorithms — but the
+certificate-chain / hostname <strong>trust</strong> decision is bypassed. That removes
+protection against a man-in-the-middle, so use it <strong>only</strong> for endpoints you
+reach over a trusted path (a private/WireGuard network, localhost, an SSH
+tunnel). <code>ssl_verify</code> defaults to <code>true</code>; there is no way to disable
+verification globally — it is always per-call and explicit.</p>
+<h2 id="the-64-mib-body-cap">The 64 MiB body cap</h2>
+<p>A response body is buffered fully into memory and <strong>capped at 64 MiB</strong>
+(<code>67_108_864</code> bytes). The cap exists so a huge or endlessly-streaming response
+can't OOM a process embedding the Mix evaluator. An over-cap body collapses to
+the transport-error shape:</p>
+<pre><code class="language-text">{status: 0, error: "http: response body exceeds the 67108864 byte cap (64 MiB)"}
+</code></pre>
+<p>This is a hard limit, not a tunable — these builtins are for API calls and
+modest fetches, not for streaming multi-gigabyte downloads. For a large file,
+shell out to a streaming tool by full path (see <a href="/mix/system">run</a>), which takes
+its own <code>{timeout: seconds}</code> opts map if you want the download bounded too:</p>
+<pre><code class="language-mix">run("/usr/bin/curl -fsSL https://example.com/big.iso -o /tmp/big.iso", {timeout: 600})
+</code></pre>
+<h2 id="parsing-responses">Parsing responses</h2>
+<p><code>body</code> is just a string, so feed it to the <a href="/mix/data">data</a> builtins. JSON is
+the common case — <code>json_parse</code> turns the body into a map/list with dotted /
+indexed field access:</p>
+<pre><code class="language-mix">$r = http_get("https://api.github.com/repos/markc/mix",
+  { "User-Agent": "mix-docs", "Accept": "application/vnd.github+json" })
+if $r["status"] == 200 then
+  $j = json_parse($r["body"])
+  print("name=" .. $j["name"])
+  print("default_branch=" .. $j["default_branch"])
+end
+</code></pre>
+<pre><code class="language-text">name=mix
+default_branch=main
+</code></pre>
+<p>For richer extraction use <code>jq(...)</code>; for a numeric field, <code>to_number(...)</code>. See
+<a href="/mix/data">data</a> for the full parse / serialize surface (<code>json_parse</code>, <code>jq</code>,
+<code>data_encode</code>, the <code>bytes_*</code> helpers).</p>
+<h2 id="worked-example--a-guarded-json-fetch-helper">Worked example — a guarded JSON fetch helper</h2>
+<p>The idiom in one function — single <code>status == 0</code> transport guard, then branch
+on the HTTP code, parse on success. It uses the
+<a href="/mix/functions">pass-in / return / reassign</a> discipline (no shared globals):</p>
+<pre><code class="language-mix">fn fetch_json($url)
+  $r = http_get($url, { "User-Agent": "mix-docs", "Accept": "application/json" })
+  if $r["status"] == 0 then
+    return { ok: false, why: $r["error"] }
+  end
+  if $r["status"] != 200 then
+    return { ok: false, why: "http " .. $r["status"] }
+  end
+  return { ok: true, data: json_parse($r["body"]) }
+end
+
+$res = fetch_json("https://api.github.com/zen")
+if $res["ok"] then
+  print("got: " .. ("" .. $res["data"]))
+else
+  print("failed: " .. $res["why"])
+end
+</code></pre>
+<h2 id="notes--sharp-edges">Notes &amp; sharp edges</h2>
+<ul>
+<li><strong>Blocking &amp; synchronous.</strong> Each call blocks until the response is buffered, the deadline expires (30 s default — see <a href="/mix/http#timeouts">Timeouts</a>), or the body cap / a transport error trips. There is no async variant — for latency- sensitive paths, tighten <code>{timeout: N}</code> and branch on <code>status == 0</code>.</li>
+<li><strong>No automatic retries, no cookie jar, no redirect-body replay</strong> — <code>ureq</code>'s defaults apply (redirects are followed). Add your own retry loop if you need one.</li>
+<li><strong>TLS is on for <code>https://</code>.</strong> A bad certificate surfaces as a transport error (<code>status: 0</code>), not a panic.</li>
+<li><strong>Headers and methods are validated</strong> to block request-line / header injection: a non-token method and a <code>bytes</code> header value are both rejected in-band (the former as <code>{status: 0, error}</code>, the latter as a runtime error).</li>
+<li><strong>Don't confuse Mix-string <code>$(...)</code> with the URL.</strong> In a double-quoted Mix string, <code>${name}</code> interpolates but <code>$(...)</code> is literal text — build URLs with <code>..</code> concat or <code>${...}</code>, e.g. <code>"https://example.com/api/" .. $id</code>. See <a href="/mix/strings">strings</a>.</li>
+</ul>
+<h2 id="serving--http_serve-http_recv-v0750">Serving — <code>http_serve</code>, <code>http_recv</code> (v0.75.0)</h2>
+<p>The other direction, deliberately minimal. <strong>The boundary first</strong>: no TLS
+ever, and no dynamic handlers — certificates, vhosts, and request
+dispatch to code are [webd]'s job and serve-mode citizens' job. What
+lives here is the pair of shapes an agent keeps needing locally:</p>
+<pre><code>http_serve(root[, {port, host, duration, index, listing, render_md,
+                   requests, spa, clean_urls}])
+    -&gt; requests served (BLOCKING)
+http_recv(port[, {timeout, host, max, respond}])
+    -&gt; {method, path, query, headers, body, bytes, from_host, from_port} | nil
+</code></pre>
+<p><strong><code>http_serve</code> is the <code>python -m http.server</code> slot</strong>: serve a directory
+to a browser — docs preview, a build artifact, a report. GET and HEAD
+only; anything else answers 405. <code>port: 0</code> (the default) binds an
+ephemeral port and <strong>prints the URL</strong> before serving, so the caller
+always learns where. <code>host</code> defaults to <code>127.0.0.1</code>; exposing to the LAN
+is one explicit <code>host: "0.0.0.0"</code>. <code>duration</code> bounds the run in seconds
+(0 = until interrupted) — an in-flight request gets at most a 10-second
+read grace past it, so one slow client cannot hold the server open;
+<code>requests</code> stops after N exchanges; <code>listing</code>
+opts into directory indexes; <code>render_md</code> (markdown feature) serves <code>.md</code>
+files as styled HTML — <code>http_serve("docs/mix", {render_md: true})</code> renders
+the raw manual <code>.md</code> files (but not the site's HTML shell, whose assets
+live at the site root — serve the whole <code>docs/</code> tree, not a subdirectory,
+if you want the interactive site).</p>
+<blockquote>
+<p><strong>Serving a subdirectory of a larger site?</strong> A page that references
+root-absolute assets (<code>/web/style.css</code>) 404s them when the served root
+is a subdirectory — the assets are above it. Serve the <strong>site root</strong>, or
+pre-render a self-contained copy (see <code>docs/build/gen-static-site.mix</code>
+for the pattern: each page carries its own inline CSS and needs no
+external asset, so it works from any root, <code>curl</code>, <code>wget</code>, or <code>file://</code>).</p>
+</blockquote>
+<p>Traversal is the defended edge: the request path is percent-decoded
+<em>first</em>, then the resolved file is canonicalised and must remain under
+the canonicalised root — <code>../</code>, <code>%2e%2e%2f</code>, and symlinks inside the
+root pointing out all answer 403/404, and the tests prove each one
+against raw sockets (a polite HTTP client normalizes <code>../</code> away; an
+attacker's socket does not).</p>
+<p><strong>Serving a site with clean URLs, two shapes.</strong> A static server maps
+<code>/bus/props-core</code> to a file of that exact name and 404s when there isn't
+one — but real sites use extensionless URLs. Two options cover the two
+site shapes, and they compose (clean_urls is tried first — a specific
+page beats a generic fallback):</p>
+<ul>
+<li><strong><code>clean_urls: true</code></strong> — a would-be 404 on an extensionless path serves
+<code>&lt;path&gt;.html</code> when it exists (<code>/bus/props-core</code> → <code>/bus/props-core.html</code>).
+This mirrors GitHub Pages' pretty-URL behaviour, and is the fix for a
+<strong>pre-rendered page-per-route site</strong> — a real page or a router stub at
+every clean URL. A section page (<code>bus.html</code>) sitting beside its
+children directory (<code>bus/</code>) resolves too: <code>/bus</code> serves the page,
+<code>/bus/props-core</code> its child, and <code>/bus/</code> (trailing slash) stays a
+directory request. <code>http_serve("docs", {clean_urls: true})</code> serves the
+cosmix.dev docs tree locally, fully styled, as Pages does.</li>
+<li><strong><code>spa: true</code></strong> (or <code>spa: "shell.html"</code>) — a would-be 404 on an
+extensionless path serves ONE shell, so a <strong>single-shell SPA</strong>'s
+client-side router boots on every deep URL (<code>/users/42/settings</code> →
+the shell → the router renders). Point it at any Vite/React build.
+The shell path is checked at startup, not per request.</li>
+</ul>
+<p>Both are frontend-only, and the boundary is exact: a <strong>static SPA</strong> —
+assets from root, data from static files or a <em>separate</em> API — works
+completely; <code>http_serve</code> serves the app, never runs its backend. A path
+<strong>with</strong> an extension (<code>/main.css</code>, <code>/logo.png</code>) is never rewritten by
+either option, so a genuinely missing asset stays an honest 404 instead
+of silently becoming the HTML shell.</p>
+<p><strong><code>http_recv</code> catches ONE request and answers it</strong> — the OAuth
+localhost-redirect wait, the webhook test, the "curl me when the job is
+done" rendezvous. It blocks up to <code>timeout</code> seconds (default 30, 0 =
+forever), returns <code>nil</code> on timeout (an ordinary answer — poll again),
+and hands back the full request: <code>body</code> as UTF-8 or nil, <code>bytes</code> always
+the truth, headers lowercase-keyed. <code>respond</code> shapes the reply
+(<code>{status, body, content_type, headers}</code>, default <code>200 ok</code>); <code>max</code> caps
+the request body (default 1 MiB, refused with 413 beyond it).</p>
+<pre><code class="language-mix">-- wait for an OAuth redirect, answer the browser, extract the code
+$r = http_recv(8910, {timeout: 120, respond: {body: "You can close this tab.\n"}})
+if $r == nil then die "no redirect within 2 minutes" end
+$code = parse_query($r["query"])["code"]
+</code></pre>
+<p><code>http_serve</code> blocks until <code>duration</code>/<code>requests</code> ends it, or until
+<strong>Ctrl-C</strong> — SIGINT stops the accept loop cleanly and the call returns
+the count served so far, so an interactive <code>http_serve(dir)</code> is a normal
+"serve until I stop it" command.</p>
+<p>Both are sequential, <code>Connection: close</code>, one exchange per connection —
+a browser and a script, not a load. The moment the words "certificate",
+"virtual host", or "route this to a function" appear, the answer is webd.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/data">data</a> — <code>json_parse</code>, <code>jq</code>, <code>data_encode</code>, <code>bytes_to_string</code> for parsing and serializing HTTP payloads</li>
+<li><a href="/mix/system">run</a> — shelling out (<code>curl</code>/<code>wget</code>) for streaming or oversized transfers</li>
+<li><a href="/mix/strings">strings</a> — building URLs and bodies (<code>..</code> concat, interpolation rules)</li>
+<li><a href="/mix/functions">functions</a> — the pass-in / return / reassign idiom used in the helper above</li>
+<li><a href="/mix/errors">errors</a> — why these builtins return a shape instead of raising</li>
+<li><a href="/mix/builtins">builtins index</a> — the full builtin catalogue</li>
+<li><a href="/mix/bus">Bus messaging</a> — in-mesh RPC (<code>send</code>/<code>emit</code>); HTTP is for the world <em>outside</em> the mesh</li>
+<li><a href="/mix/">the manual index</a> — every page in this manual</li>
+<li><code>mix what http_get</code> · <code>mix what http_post</code> · <code>mix what http_request</code> · <code>mix builtins system</code> · the <a href="https://github.com/markc/cosmix">mix repo</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1024,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1078,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1207,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

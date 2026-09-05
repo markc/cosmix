@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/keywords</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,62 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/keywords.md"><div class="prose"><h1 id="reserved-words">Reserved words</h1>
+<p>Mix's keyword lexemes, verified against the lexer (mix 0.21.x). Since 0.21 the
+old reserved-word footgun is retired: a keyword is accepted anywhere it is
+unambiguously a <strong>name</strong> (bare map keys, <code>.field</code> access, strict-data keys,
+<code>send</code> kwargs, <code>parse … with</code> delimiters) — see <em>Keywords as names</em> below.
+What remains reserved: a keyword cannot be a <strong>function name</strong> or fill any
+other bare-identifier slot.</p>
+<h2 id="the-full-set">The full set</h2>
+<p>The lexer reserves <strong>46 lexemes</strong> (<code>fn</code> and <code>function</code> share one token):</p>
+<table><thead><tr><th>Group</th><th>Lexemes</th></tr></thead><tbody>
+<tr><td>Conditionals &amp; matching</td><td><code>if</code> <code>then</code> <code>else</code> <code>end</code> <code>select</code> <code>when</code> <code>otherwise</code></td></tr>
+<tr><td>Loops</td><td><code>for</code> <code>each</code> <code>in</code> <code>to</code> <code>step</code> <code>while</code> <code>loop</code> <code>break</code> <code>continue</code> <code>label</code> — plus the legacy terminators <code>next</code> (for) and <code>done</code> (while/loop/on)</td></tr>
+<tr><td>Functions</td><td><code>function</code> <code>fn</code> <code>return</code></td></tr>
+<tr><td>Errors</td><td><code>try</code> <code>catch</code> <code>finally</code> <code>die</code></td></tr>
+<tr><td>Template parsing</td><td><code>parse</code> <code>with</code></td></tr>
+<tr><td>Bus messaging</td><td><code>send</code> <code>address</code> <code>emit</code> <code>on</code></td></tr>
+<tr><td>Output</td><td><code>print</code> <code>eprint</code></td></tr>
+<tr><td>Shell &amp; loading</td><td><code>export</code> <code>alias</code> <code>source</code> <code>include</code> <code>sh</code></td></tr>
+<tr><td>Operators &amp; literals</td><td><code>and</code> <code>or</code> <code>not</code> <code>eq</code> <code>ne</code> <code>true</code> <code>false</code> <code>nil</code></td></tr>
+</tbody></table>
+<p><code>mix keywords</code> prints a 34-word core list; the other 12 lexemes (<code>then</code> <code>each</code>
+<code>to</code> <code>step</code> <code>next</code> <code>done</code> <code>with</code> <code>on</code> <code>include</code> <code>label</code> <code>eq</code> <code>ne</code>) are just as
+reserved — each fails identically as an identifier
+(<code>function step($x)</code> → <code>Parse error … expected identifier, got Step</code>).</p>
+<h2 id="what-is-and-isnt-restricted">What is (and isn't) restricted</h2>
+<ul>
+<li><strong>Function names</strong> — no keyword may name a function: <code>function step(...)</code>, <code>fn parse(...)</code>, even <code>function eq(...)</code> are parse errors. Pick another name (<code>phase</code>, not <code>step</code>).</li>
+<li><strong>Other bare-identifier slots</strong> — same rule: a loop label must be a plain identifier (<code>while true label outer</code> works, <code>label to</code> is a parse error).</li>
+<li><strong><code>$</code>-sigil variables are unaffected.</strong> The sigil is its own namespace — the lexer reads the name after <code>$</code> raw, so <code>$to = 1</code>, <code>$step = 5</code>, <code>$if = 1</code>, and even <code>$fn = 1</code> all work, as do keyword-named parameters (<code>function f($to)</code>).</li>
+<li><strong>Contextual barewords are not reserved</strong> — e.g. <code>async</code> (from <code>on &lt;cmd&gt; async … end</code>) is a valid function name.</li>
+<li><strong>Builtins are a separate rule, not keywords.</strong> Defining a user function with a builtin's name is accepted without error, but calls dispatch to the builtin — the user function is silently unreachable (<code>function trim($x) … end</code> then <code>trim(" a ")</code> still runs the builtin).</li>
+</ul>
+<h2 id="keywords-as-names-021">Keywords as names (0.21+)</h2>
+<p>A keyword is accepted wherever it is unambiguously a name:</p>
+<pre><code class="language-mix">$m = {label: 1, to: "x", on: true, parse: 2}   -- bare map keys
+print($m.to)                                    -- field access -&gt; x
+$m.label = 5                                    -- field assignment
+$v = data_parse("{to: 1, on: true}")            -- strict-data keys, unquoted
+send maild mailbox.move to=$dest                -- send/emit/address kwargs
+parse $s with $a to $b                          -- literal delimiter word
+</code></pre>
+<ul>
+<li><strong><code>parse … with</code> exception:</strong> the block/branch terminator set — <code>end</code> <code>else</code> <code>catch</code> <code>finally</code> <code>when</code> <code>otherwise</code> <code>done</code> <code>next</code> — still ends an inline <code>parse</code> statement, so those eight can't be delimiter words.</li>
+<li><strong>The one name exception is <code>fn</code>:</strong> it lexes to the same token as <code>function</code>, so the original spelling is unrecoverable. <code>{fn: 1}</code> and <code>$m.fn</code> are parse errors (<code>expected identifier, got Function</code>) — use a quoted key <code>{"fn": 1}</code> and index access <code>$m["fn"]</code>.</li>
+<li>The operator lexemes <code>eq</code>/<code>ne</code> also work as bare keys and fields (<code>{eq: 1}</code>, <code>$m.eq</code>).</li>
+<li>Grammar adjacency holds: <code>for $i = $m.to to 7</code> parses — dot-field consumption never crosses the following keyword.</li>
+</ul>
+<p>Most keywords are covered in <a href="/mix/syntax">syntax</a>,
+<a href="/mix/control-flow">control flow</a>, <a href="/mix/functions">functions</a>,
+<a href="/mix/operators">operators</a>, <a href="/mix/errors">errors</a>, <a href="/mix/bus">Bus messaging</a> and
+<a href="/mix/data">data</a> (strict-data keys).</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/syntax">syntax</a> · <a href="/mix/functions">functions</a> · <a href="/mix/builtins">builtins index</a> · <code>mix keywords</code></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +674,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +728,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +857,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

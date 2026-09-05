@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-midicomp/text-format</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,141 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-midicomp/text-format.md"><div class="prose"><h1 id="cosmix-midicomp-text-format">cosmix-midicomp text format</h1>
+<p>The format represents an SMF header, one or more tracks, and one event per line.
+Keywords are case-insensitive. Strings retain their original case.</p>
+<h2 id="file-structure">File structure</h2>
+<p>Every input begins with an <code>MFile</code> header:</p>
+<pre><code class="language-text">MFile FORMAT TRACKS DIVISION
+</code></pre>
+<p><code>FORMAT</code> is <code>0</code>, <code>1</code>, or <code>2</code>. <code>TRACKS</code> is the number of following track
+blocks. A non-negative <code>DIVISION</code> is the PPQN value and must fit the SMF
+15-bit metrical range.</p>
+<p>A negative division selects SMPTE timing and requires a ticks-per-frame value:</p>
+<pre><code class="language-text">MFile 1 2 -25 40
+</code></pre>
+<p>The supported frame rates are 24, 25, 29, and 30 frames per second. The
+ticks-per-frame value is in the range 0 through 255.</p>
+<p>Each track is delimited by <code>MTrk</code> and <code>TrkEnd</code>:</p>
+<pre><code class="language-text">MFile 0 1 480
+MTrk
+0 Meta TrkName "Example"
+0 PrCh ch=1 p=0
+0 On ch=1 n=60 v=96
+480 Off ch=1 n=60 v=0
+480 Meta TrkEnd
+TrkEnd
+</code></pre>
+<p>The declared track count must match the number of track blocks. Format 0
+requires exactly one track.</p>
+<p>The compiler adds an end-of-track meta event when the track does not already
+end with <code>Meta TrkEnd</code>.</p>
+<h2 id="event-time">Event time</h2>
+<p>Every event line starts with a time value. Without <code>--inc</code>, the value is an
+absolute tick position and must not move backwards.</p>
+<p>With <code>--inc</code>, each value is the event's delta from the preceding event:</p>
+<pre><code class="language-text">0 On ch=1 n=60 v=96
+480 Off ch=1 n=60 v=0
+</code></pre>
+<p>Bar, beat, and click time uses either <code>:</code> or <code>/</code> separators:</p>
+<pre><code class="language-text">1:0:0 On ch=1 n=c4 v=96
+2/0/0 Off ch=1 n=c4 v=0
+</code></pre>
+<p>The time-signature events seen so far define the bar and beat calculation.
+<code>--time</code> makes the decoder emit this form.</p>
+<h2 id="channel-events">Channel events</h2>
+<table><thead><tr><th>Event</th><th>Syntax</th></tr></thead><tbody>
+<tr><td>Note on</td><td><code>On ch=N n=NOTE v=N</code></td></tr>
+<tr><td>Note off</td><td><code>Off ch=N n=NOTE v=N</code></td></tr>
+<tr><td>Polyphonic pressure</td><td><code>PoPr ch=N n=NOTE v=N</code></td></tr>
+<tr><td>Channel pressure</td><td><code>ChPr ch=N v=N</code></td></tr>
+<tr><td>Controller change</td><td><code>Par ch=N c=N v=N</code></td></tr>
+<tr><td>Pitch bend</td><td><code>Pb ch=N v=N</code></td></tr>
+<tr><td>Program change</td><td><code>PrCh ch=N p=N</code></td></tr>
+</tbody></table>
+<p>Channels are numbered 1 through 16. Notes, velocities, pressures, controllers,
+and programs use the MIDI data-byte range 0 through 127. Pitch bend uses the
+combined 14-bit range 0 through 16383.</p>
+<p>Parameter aliases are accepted:</p>
+<table><thead><tr><th>Canonical</th><th>Accepted forms</th></tr></thead><tbody>
+<tr><td>Channel</td><td><code>ch=</code></td></tr>
+<tr><td>Note</td><td><code>n=</code>, <code>note=</code></td></tr>
+<tr><td>Value or velocity</td><td><code>v=</code>, <code>val=</code>, <code>vol=</code></td></tr>
+<tr><td>Controller</td><td><code>c=</code>, <code>con=</code></td></tr>
+<tr><td>Program</td><td><code>p=</code>, <code>prog=</code></td></tr>
+</tbody></table>
+<p>The lexer also accepts <code>PolyPr</code> for <code>PoPr</code>, <code>Param</code> for <code>Par</code>, <code>ProgCh</code> for
+<code>PrCh</code>, and <code>ChanPr</code> for <code>ChPr</code>.</p>
+<h2 id="system-and-meta-events">System and meta events</h2>
+<table><thead><tr><th>Event</th><th>Syntax</th></tr></thead><tbody>
+<tr><td>System exclusive</td><td><code>SysEx HEX</code></td></tr>
+<tr><td>Arbitrary F7 escape bytes</td><td><code>Arb HEX</code></td></tr>
+<tr><td>Sequence number</td><td><code>SeqNr N</code></td></tr>
+<tr><td>Key signature</td><td><code>KeySig N major</code> or <code>KeySig N minor</code></td></tr>
+<tr><td>Tempo</td><td><code>Tempo N</code></td></tr>
+<tr><td>Time signature</td><td><code>TimeSig NUM/DEN CLOCKS THIRTYSECONDS</code></td></tr>
+<tr><td>SMPTE offset</td><td><code>SMPTE H M S F FF</code></td></tr>
+<tr><td>Text-family meta</td><td><code>Meta TYPE "STRING"</code></td></tr>
+<tr><td>End of track meta</td><td><code>Meta TrkEnd</code></td></tr>
+<tr><td>Sequencer-specific meta</td><td><code>SeqSpec HEX</code></td></tr>
+<tr><td>Other meta</td><td><code>Meta 0xNN HEX</code></td></tr>
+</tbody></table>
+<p><code>KeySig</code> accepts values from <code>-7</code> through <code>7</code>.</p>
+<p><code>Tempo</code> is microseconds per quarter note and occupies the SMF 24-bit range.</p>
+<p>The time-signature numerator is 1 through 255. Its denominator must be a
+positive power of two. The clocks and thirty-seconds values are MIDI data
+bytes.</p>
+<p><code>SMPTE</code> takes five MIDI data-byte values.</p>
+<p>The named text-family types are:</p>
+<pre><code class="language-text">Text Copyright SeqName TrkName InstrName Lyric Marker Cue
+</code></pre>
+<p><code>SeqName</code> and <code>TrkName</code> select the same meta-event type.</p>
+<h2 id="numbers-and-notes">Numbers and notes</h2>
+<p>Integers can be decimal, such as <code>127</code>, or hexadecimal, such as <code>0x7f</code>.</p>
+<p>Bank notation begins with <code>$</code> or <code>'</code>. It uses base 8 with <code>1</code> through <code>8</code> or
+<code>a</code> through <code>h</code> representing digits 0 through 7.</p>
+<p>Notes can be numeric or symbolic, such as <code>n=60</code>, <code>n=c5</code>, <code>n=f#4</code>, or <code>n=eb3</code>.</p>
+<p>A symbolic note uses <code>A</code> through <code>G</code>, an optional accidental, and an octave
+with no separating space. <code>#</code> or <code>+</code> sharpens the note. <code>b</code> or <code>-</code> flattens
+it. The crate's convention maps <code>c4</code> to MIDI note 48.</p>
+<h2 id="payloads-and-strings">Payloads and strings</h2>
+<p>Hexadecimal payloads may contain spaces or run together as pairs:</p>
+<pre><code class="language-text">0 SysEx f0 7e 00 09 01 f7
+0 SeqSpec 010203
+</code></pre>
+<p>Where a payload is accepted, a quoted string can supply the bytes instead.
+Strings support these escapes:</p>
+<table><thead><tr><th>Escape</th><th>Value</th></tr></thead><tbody>
+<tr><td><code>\"</code></td><td>Double quote</td></tr>
+<tr><td><code>\\</code></td><td>Backslash</td></tr>
+<tr><td><code>\0</code></td><td>Zero byte</td></tr>
+<tr><td><code>\r</code></td><td>Carriage return</td></tr>
+<tr><td><code>\n</code></td><td>Line feed</td></tr>
+<tr><td><code>\t</code></td><td>Tab</td></tr>
+<tr><td><code>\xHH</code></td><td>Byte written in hexadecimal</td></tr>
+</tbody></table>
+<p>The decoder escapes quotes, backslashes, zero bytes, line endings, and other
+non-printable bytes when it renders a string.</p>
+<p><code>--fold N</code> wraps long decoded strings and hexadecimal payloads. A folded line
+ends with a backslash and continues on the following indented line. The
+compiler joins this form before parsing the event.</p>
+<h2 id="lexical-rules">Lexical rules</h2>
+<p>Blank lines are accepted. Input lines must be newline-terminated.</p>
+<p><code>#</code> starts a comment outside strings and symbolic note accidentals. The comment
+continues to the end of the physical line.</p>
+<p>Keywords and parameter names are case-insensitive. Quoted string contents are
+not case-folded.</p>
+<p>An unterminated string, malformed hexadecimal tail, out-of-range value,
+unsupported format, mismatched track count, backwards time, or excessive SMF
+delta causes compilation to fail.</p>
+<h2 id="canonical-output">Canonical output</h2>
+<p>Plain decode output uses absolute ticks, numeric notes, compact spacing, and no
+folding. This is the canonical text form used by the crate's round-trip corpus.</p>
+<p>The compiler writes minimal running status and canonical variable-length
+quantities through <code>midly</code>. Decoding and recompiling compiler-produced files is
+byte-stable; arbitrary equivalent SMF encodings may be normalised.</p>
+<p><a href="/cos/cosmix-midicomp/">Back to cosmix-midicomp</a></p></div></div>
     </div>
 
 </main>
@@ -620,6 +753,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +807,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +936,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

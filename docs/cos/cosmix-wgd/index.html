@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-wgd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,119 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-wgd/README.md"><div class="prose"><h1 id="cosmix-wgd">cosmix-wgd</h1>
+<p><code>cosmix-wgd</code> is the Cos-layer WireGuard mesh control-plane daemon. It verifies this node's signed mesh inventory, derives the peer set that the kernel should contain, reads the live WireGuard state, and reports drift without changing the kernel or inventory. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it belongs to <code>cos</code>; it depends directly on Bus client, protocol, build-information, and logging crates, and declares no direct Mix dependency.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-wgd [--iface NAME] [--self NAME] [--interval SECONDS]
+           [--genesis PATH] [--signed PATH] [--baseline PATH]
+           [--once]
+
+cosmix-wgd --version
+cosmix-wgd -V
+</code></pre>
+<p><code>cosmix-wgd</code> is a binary crate. It does not expose a Rust library API.</p>
+<p>The crate is phase P2: derive and dry-run only. It contains no apply path, peer-allocation path, key-rotation writer, inventory writer, or kernel mutation verb.</p>
+<h2 id="operation">Operation</h2>
+<p>Each reconcile pass performs these operations:</p>
+<ol>
+<li>Read the genesis public key, signed inventory, and rollback baseline.</li>
+<li>Verify the signed inventory against the genesis trust state and baseline.</li>
+<li>Derive the intended peer set for this node.</li>
+<li>Run <code>wg show IFACE dump</code> without invoking a shell.</li>
+<li>Compare intended peers with the parsed live peer set.</li>
+<li>Replace the shared snapshot consumed by the Bus handlers.</li>
+<li>Log whether the interface is in sync or has drift.</li>
+</ol>
+<p>Trust or derivation failure leaves the last good snapshot in place. The daemon logs the failure and retries at the next interval.</p>
+<p>A live WireGuard read failure is non-fatal. The new snapshot retains the derived intent, records the live error, and remains available through Bus.</p>
+<h2 id="intended-peer-derivation">Intended peer derivation</h2>
+<p>The signed inventory is the membership authority. <code>cosmix-wgd</code> does not maintain a parallel membership registry.</p>
+<p>Derivation:</p>
+<ul>
+<li>accepts members whose status is <code>active</code>;</li>
+<li>skips members whose status is <code>tombstoned</code>;</li>
+<li>excludes the local node from its own peer list;</li>
+<li>requires active names and mesh addresses to be unique;</li>
+<li>requires each mesh address to be inside the inventory subnet;</li>
+<li>rejects a WireGuard public key shared by different active members;</li>
+<li>selects <code>kind: "wg"</code> credentials valid at the accepted inventory epoch;</li>
+<li>accepts either key during a legitimate credential-overlap window;</li>
+<li>assigns each peer a single <code>/32</code> IPv4 or <code>/128</code> IPv6 host route;</li>
+<li>sorts peers by mesh address for deterministic output.</li>
+</ul>
+<p>An active member without a current WireGuard credential is skipped and recorded as a warning. Malformed membership, an unknown status, duplicate identity data, an invalid subnet, or an absent local member stops that reconcile pass.</p>
+<h2 id="drift-model">Drift model</h2>
+<p>The peer mesh address is the stable join key between intent and live state. A public key may rotate, so it is not used as the join key.</p>
+<p>The dry-run report classifies:</p>
+<table><thead><tr><th>Kind</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>missing</code></td><td>An intended peer has no live peer routing its mesh address.</td></tr>
+<tr><td><code>extra</code></td><td>A live peer routes no intended mesh address.</td></tr>
+<tr><td><code>key_mismatch</code></td><td>The live peer routes the right address with no currently accepted key.</td></tr>
+<tr><td><code>allowed_ips_drift</code></td><td>The peer identity and key match, but <code>allowed_ips</code> is not exactly the intended host route.</td></tr>
+<tr><td><code>duplicate_kernel_claimant</code></td><td>More than one live peer claims the same intended mesh address.</td></tr>
+</tbody></table>
+<p>Endpoint, persistent keepalive, and preshared-key values are not compared. The signed inventory does not provide intended values for those fields.</p>
+<p>Correctly configured peers receive a liveness state of <code>pending</code>, <code>connected</code>, or <code>offline</code>, derived from the latest handshake time.</p>
+<h2 id="bus-service">Bus service</h2>
+<p>In normal mode the daemon registers the Bus service name <code>wgd</code>. Broker connection failure does not stop reconciliation. The Bus task retries with exponential backoff from one second to 60 seconds.</p>
+<p>The service exposes four read-only verbs:</p>
+<table><thead><tr><th>Verb</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>wgd.iface.status</code></td><td>Interface, inventory, live-read, synchronisation, and refresh summary.</td></tr>
+<tr><td><code>wgd.peer.status</code></td><td>Live status for peers that currently match intent.</td></tr>
+<tr><td><code>wgd.topology.snapshot</code></td><td>Derived topology plus any available drift items.</td></tr>
+<tr><td><code>wgd.drift</code></td><td>The complete dry-run drift report.</td></tr>
+</tbody></table>
+<p>Before the first successful reconcile, every read verb returns a successful response with <code>ready: false</code>.</p>
+<p>Unknown verbs and write-shaped verbs return caller error <code>rc=10</code>. The daemon does not publish drift or peer-status topics.</p>
+<p>See <a href="/cos/cosmix-wgd/verbs">Bus verbs</a> for response fields and drift item shapes.</p>
+<h2 id="runtime-configuration">Runtime configuration</h2>
+<p>The daemon has no crate-specific configuration file. Runtime inputs come from command-line overrides, the node configuration used to resolve the local node name, and the trust files owned by the inventory authority.</p>
+<table><thead><tr><th>Option</th><th>Purpose</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>--iface NAME</code></td><td>Override the derived WireGuard interface name.</td><td>First DNS label of the verified mesh identity.</td></tr>
+<tr><td><code>--self NAME</code></td><td>Override the local mesh member name.</td><td><code>node</code> from the node configuration.</td></tr>
+<tr><td><code>--interval SECONDS</code></td><td>Set the reconcile period.</td><td>30 seconds; values below one become one.</td></tr>
+<tr><td><code>--genesis PATH</code></td><td>Override the genesis public-key path.</td><td><code>/etc/cosmix/noded/genesis.pub</code></td></tr>
+<tr><td><code>--signed PATH</code></td><td>Override the signed-inventory path.</td><td><code>/var/lib/cosmix/noded/inventory.signed</code></td></tr>
+<tr><td><code>--baseline PATH</code></td><td>Override the rollback-baseline path.</td><td><code>/var/lib/cosmix/noded/inventory.baseline</code></td></tr>
+<tr><td><code>--once</code></td><td>Reconcile once, print a summary, and exit without Bus.</td><td>Disabled.</td></tr>
+</tbody></table>
+<p>An interface override must contain 1 to 15 ASCII alphanumeric, <code>.</code>, <code>-</code>, or <code>_</code> characters. <code>.</code> and <code>..</code> are rejected.</p>
+<p>See <a href="/cos/cosmix-wgd/configuration">Configuration and lifecycle</a> for trust handling, one-shot operation, and signals.</p>
+<h2 id="modules">Modules</h2>
+<p>The binary is divided into private modules:</p>
+<table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>trust</code></td><td>Read the trust inputs, enforce the rollback floor, and verify the signed inventory.</td></tr>
+<tr><td><code>derive</code></td><td>Purely derive the intended peer set and validate membership coherence.</td></tr>
+<tr><td><code>live</code></td><td>Execute and parse <code>wg show IFACE dump</code>.</td></tr>
+<tr><td><code>reconcile</code></td><td>Purely compare intended and live peer sets.</td></tr>
+<tr><td><code>runner</code></td><td>Run one pass or the periodic reconcile loop and publish snapshots.</td></tr>
+<tr><td><code>state</code></td><td>Hold the latest complete snapshot behind a shared mutex.</td></tr>
+<tr><td><code>bus</code></td><td>Register the service and answer read-only verbs.</td></tr>
+<tr><td><code>citizen</code></td><td>Report the daemon identity and advisory effective UID/GID check.</td></tr>
+</tbody></table>
+<h2 id="dependencies">Dependencies</h2>
+<p>The principal Cosmix dependencies are:</p>
+<table><thead><tr><th>Crate</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>cosmix-lib-wg</code></td><td>WireGuard value types, interface naming, dump parsing, CIDR parsing, and peer liveness.</td></tr>
+<tr><td><code>cosmix-lib-mesh-trust</code></td><td>Signed-inventory verification and epoch-based WireGuard credential selection.</td></tr>
+<tr><td><code>cosmix-lib-config</code></td><td>Node configuration and default Bus client connection.</td></tr>
+<tr><td><code>cosmix-lib-bus</code></td><td>Bus service registration provenance.</td></tr>
+<tr><td><code>cosmix-lib-client</code></td><td>Native broker client and command handling.</td></tr>
+<tr><td><code>cosmix-lib-buildinfo</code></td><td>Build provenance and version-discovery data.</td></tr>
+<tr><td><code>cosmix-lib-log</code></td><td>Daemon logging initialisation.</td></tr>
+</tbody></table>
+<p>The manifest defines no Cargo features. The citizen stack and native Bus client are unconditional.</p>
+<h2 id="exit-status">Exit status</h2>
+<p>Argument errors return status 2.</p>
+<p>Startup failure to resolve the local node name returns failure.</p>
+<p><code>--once</code> returns failure when inventory trust or intended-set derivation fails. A live-read failure is reported in the printed summary but does not invalidate a successfully derived snapshot.</p>
+<p>Normal mode exits successfully after <code>SIGINT</code> or <code>SIGTERM</code>.</p>
+<h2 id="limits">Limits</h2>
+<p><code>cosmix-wgd</code> requires Linux for its advisory identity check and expects <code>wg</code> from <code>wireguard-tools</code> on <code>PATH</code> for live reads.</p>
+<p>It does not mutate WireGuard state. Drift entries include future-action labels for reporting, but no action is executed.</p>
+<p>It reads the rollback baseline but never advances or rewrites it.</p>
+<p>It serves the most recent complete snapshot; readers never observe a partially replaced snapshot.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +731,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +785,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +914,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

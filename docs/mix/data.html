@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/data</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,692 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/data.md"><div class="prose"><h1 id="data--data--serialization">data — data &amp; serialization</h1>
+<p>Mix reads and writes structured data through a single mental model: <strong>every
+format parses to the same <code>Value</code> tree</strong> (string · number · bool · list · map ·
+nil), and every encoder turns that tree back into text. There is one in-memory
+shape; the format is just the doorway. So <code>json_parse</code> → walk with <code>.field</code> /
+<code>[i]</code> → <code>json_encode</code> (or <code>toml_encode</code>, or <code>data_encode</code>) is the universal
+round-trip.</p>
+<p>List the category live with <code>mix builtins json</code>; one-line help for any name with
+<code>mix what NAME</code>.</p>
+<table><thead><tr><th>Format</th><th>Text → Value</th><th>Value → text</th><th>File reader</th></tr></thead><tbody>
+<tr><td>JSON</td><td><code>json_parse</code></td><td><code>json_encode</code></td><td><code>read_json</code>, <code>read_jsonl</code></td></tr>
+<tr><td>TOML</td><td><code>toml_parse</code></td><td><code>toml_encode</code></td><td>— (use <code>read_file</code> + <code>toml_parse</code>)</td></tr>
+<tr><td>YAML</td><td><code>yaml_parse</code></td><td><code>yaml_encode</code></td><td>— (use <code>read_file</code> + <code>yaml_parse</code>)</td></tr>
+<tr><td>strict-data <code>.mix</code></td><td><code>data_parse</code></td><td><code>data_encode</code></td><td><code>load_data</code></td></tr>
+<tr><td>CSV</td><td><code>csv_parse</code></td><td>—</td><td>—</td></tr>
+<tr><td>INI</td><td><code>ini_parse</code></td><td>—</td><td>—</td></tr>
+<tr><td>XML</td><td><code>xml_parse</code></td><td>—</td><td>—</td></tr>
+<tr><td>jq query</td><td><code>jq</code>, <code>jq_all</code> (over a <code>Value</code>)</td><td>—</td><td>—</td></tr>
+<tr><td>numeric coercion</td><td><code>to_number</code></td><td>—</td><td>—</td></tr>
+</tbody></table>
+<p><code>json_parse</code>/<code>json_encode</code>, <code>jq</code>/<code>jq_all</code>, <code>read_json</code>/<code>read_jsonl</code> are gated
+behind the <code>json</code> feature, <code>toml_parse</code>/<code>toml_encode</code> behind <code>toml</code>,
+<code>yaml_parse</code>/<code>yaml_encode</code> behind <code>yaml</code>, and <code>xml_parse</code> behind <code>xml</code>; the shipped <code>mix</code> binary turns them all on.
+<code>data_parse</code>/<code>data_encode</code>, <code>load_data</code>, <code>csv_parse</code>, <code>ini_parse</code>, <code>to_number</code>,
+and <code>template</code> are core — always present, no feature gate.</p>
+<p>This page also covers <a href="/mix/data#template--filling-text-from-a-map"><code>template</code></a>
+(placeholder substitution from a map) and the typed
+<a href="/mix/data#sqlexec--typed-sql-binds"><code>sqlexec</code> binds</a> — the other two places Mix values
+cross a text/SQL serialization boundary.</p>
+<h2 id="json">JSON</h2>
+<p><code>json_parse(string)</code> turns a JSON document into a Mix value; field access is
+<code>.key</code> for objects, <code>[i]</code> for arrays. <code>json_encode(value[, pretty])</code> is the
+inverse.</p>
+<pre><code class="language-mix">$m = json_parse("{\"name\":\"alpha\",\"port\":25,\"tags\":[\"a\",\"b\"]}")
+print($m.name)
+print($m.port)
+print($m.tags[0])
+</code></pre>
+<pre><code class="language-text">alpha
+25
+a
+</code></pre>
+<pre><code class="language-mix">$m = { name: "alpha", port: 25, on: true }
+print(json_encode($m))
+</code></pre>
+<pre><code class="language-text">{"name":"alpha","on":true,"port":25}
+</code></pre>
+<blockquote>
+<p>Since 0.21 a Mix <strong>keyword works as a bare map key</strong> — <code>on: true</code>, <code>to: "x"</code>,
+<code>label: 1</code> all parse unquoted. The one exception is <code>fn</code> (it lexes identically
+to <code>function</code>): write <code>{ "fn": … }</code>. Keys with a dash/dot/space still need
+quotes. See <a href="/mix/collections">maps</a>.</p>
+</blockquote>
+<p>A truthy second argument selects multi-line indented output:</p>
+<pre><code class="language-mix">$m = { name: "alpha", nested: { a: 1, b: 2 } }
+print(json_encode($m, true))
+</code></pre>
+<pre><code class="language-text">{
+  "name": "alpha",
+  "nested": {
+    "a": 1,
+    "b": 2
+  }
+}
+</code></pre>
+<h3 id="key-ordering--the-one-json-footgun">Key ordering — the one JSON footgun</h3>
+<p>A Mix <code>Map</code> is insertion-ordered, but the JSON doorway is not — <strong>in either
+direction</strong>. <code>json_encode</code> goes through <code>serde_json</code> <strong>without</strong> <code>preserve_order</code>,
+so it emits keys <strong>sorted alphabetically</strong>; <code>json_parse</code> returns object keys
+sorted the same way, <strong>not</strong> in document order. If byte-stable, order-preserving
+output matters (a generated config a human will diff, a signed canonical form),
+use <a href="/mix/data#strict-data-mix--the-substrate-format"><code>data_encode</code></a> instead — it
+preserves insertion order.</p>
+<pre><code class="language-mix">$m = { zebra: 1, apple: 2, mango: 3 }
+print("literal:     " .. ("" .. $m))   -- map literal: insertion order
+print("data_encode: " .. data_encode($m))
+print("json_encode: " .. json_encode($m))
+print("json_parse:  " .. data_encode(json_parse("{\"zebra\":1,\"apple\":2}")))
+</code></pre>
+<pre><code class="language-text">literal:     {zebra: 1, apple: 2, mango: 3}
+data_encode: {"zebra": 1, "apple": 2, "mango": 3}
+json_encode: {"apple":2,"mango":3,"zebra":1}
+json_parse:  {"apple": 2, "zebra": 1}
+</code></pre>
+<h3 id="json-value-mapping">JSON value mapping</h3>
+<table><thead><tr><th>JSON</th><th>Mix</th></tr></thead><tbody>
+<tr><td><code>null</code></td><td><code>nil</code></td></tr>
+<tr><td><code>true</code> / <code>false</code></td><td>bool</td></tr>
+<tr><td>number</td><td><code>Number</code> (f64)</td></tr>
+<tr><td>string</td><td><code>String</code></td></tr>
+<tr><td>array</td><td><code>List</code></td></tr>
+<tr><td>object</td><td><code>Map</code> (<code>IndexMap</code>)</td></tr>
+</tbody></table>
+<pre><code class="language-mix">$m = json_parse("{\"a\":null,\"b\":3.5,\"c\":1000000000000}")
+print($m.a == nil)
+print($m.b)
+print($m.c)
+</code></pre>
+<pre><code class="language-text">true
+3.5
+1000000000000
+</code></pre>
+<p>Mix numbers are f64, so an integer above 2^53 loses exact precision on the way
+through — a documented constraint, not a bug (see <a href="/mix/numbers">numbers</a>). JSON
+object keys must be strings, and they come back <strong>sorted</strong>, not in document
+order (§above).</p>
+<h3 id="what-json-cant-represent">What JSON can't represent</h3>
+<p><code>json_encode</code> is <strong>loud on non-finite numbers</strong>: a <code>NaN</code> / <code>±inf</code> anywhere in
+the value raises a catchable error (JSON has no spelling for them — encoding
+<code>0</code> silently would corrupt data):</p>
+<pre><code class="language-mix">try
+  print(json_encode({ bad: sqrt(-1) }))
+catch $e
+  print("" .. $e)
+end
+</code></pre>
+<pre><code class="language-text">json_encode: non-finite number NaN has no JSON representation (JSON has no NaN/Infinity)
+</code></pre>
+<p>A <strong>function</strong> or <strong>bytes</strong> value inside the tree encodes as <code>null</code> — JSON
+simply has no such type:</p>
+<pre><code class="language-mix">print(json_encode({ f: function($x) return $x end, s: "ok" }))
+</code></pre>
+<pre><code class="language-text">{"f":null,"s":"ok"}
+</code></pre>
+<p><code>data_encode</code> is stricter on both counts — it <strong>raises</strong> on functions and bytes
+too (§strict-data below).</p>
+<h3 id="reading-json-from-disk">Reading JSON from disk</h3>
+<p><code>read_json($path)</code> is <code>read_file</code> + <code>json_parse</code> in one call (one record per
+file). <code>read_jsonl($path[, opts])</code> reads a <strong>JSON-lines</strong> file — one independent
+record per line — into a list, skipping blank lines.</p>
+<pre><code class="language-mix">-- /tmp/rec.json  = {"name":"alpha","port":25,"tags":["a","b"]}
+$r = read_json("/tmp/rec.json")
+print($r.name)
+print($r.tags[1])
+</code></pre>
+<pre><code class="language-text">alpha
+b
+</code></pre>
+<pre><code class="language-mix">-- /tmp/recs.jsonl =
+--   {"id":1,"ok":true}
+--   {"id":2,"ok":false}
+--   {"id":3,"ok":true}
+$recs = read_jsonl("/tmp/recs.jsonl")
+print(length($recs))
+print($recs[0].id)
+print($recs[2].ok)
+</code></pre>
+<pre><code class="language-text">3
+1
+true
+</code></pre>
+<p><code>read_jsonl</code> is <strong>strict by default</strong> — one malformed line aborts the whole read
+with a line number. Pass <code>{ skip_errors: true }</code> to silently drop bad lines
+(useful for a log whose rotated tail can be truncated):</p>
+<pre><code class="language-mix">-- /tmp/bad.jsonl has a junk middle line
+$strict = read_jsonl("/tmp/bad.jsonl")            -- raises: "... line 2: ..."
+$lenient = read_jsonl("/tmp/bad.jsonl", { skip_errors: true })
+print(length($lenient))                            -- the two good records
+</code></pre>
+<pre><code class="language-text">2
+</code></pre>
+<h3 id="parse-errors-raise">Parse errors raise</h3>
+<p><code>json_parse</code> / <code>read_json</code> / <code>read_jsonl</code> raise a catchable runtime error on
+malformed input (the same fail-fast policy as the rest of Mix — a broken literal
+is a script bug, not absent data). Wrap with <a href="/mix/errors"><code>try</code>/<code>catch</code></a>:</p>
+<pre><code class="language-mix">try
+  $m = json_parse("{oops")
+catch $e
+  print("bad json: " .. ("" .. $e))
+end
+</code></pre>
+<pre><code class="language-text">bad json: json_parse: key must be a string at line 1 column 2
+</code></pre>
+<h2 id="jq--querying-a-value">jq — querying a Value</h2>
+<p><code>jq(value, filter)</code> and <code>jq_all(value, filter)</code> run a real <a href="https://jqlang.github.io/jq/">jq</a>
+filter (embedded <a href="https://github.com/01mf02/jaq">jaq</a> engine) over any Mix value
+— typically <code>json_parse</code> output, but any list/map tree works. The <code>value</code> is a
+<strong>Mix value, not a JSON string</strong>: <code>json_parse</code> is the text→value door, <code>jq</code> is the
+query door — any list/map literal works too, no JSON round-trip needed. Design
+notes: the jq-builtin design doc (operator control repo since 2026-07-23).</p>
+<p>The split is about <strong>output cardinality</strong>, the thing jq makes hard for a
+single-return language:</p>
+<ul>
+<li><strong><code>jq(value, filter)</code></strong> — for a filter that yields <strong>0 or 1</strong> output. 0 → <code>nil</code>, 1 → that value unwrapped. A filter that returns an <em>array as one value</em> (<code>map(.x)</code>, <code>[ .a[] ]</code>) belongs here — it's one output. <strong>More than one output raises.</strong></li>
+<li><strong><code>jq_all(value, filter)</code></strong> — for a <strong>stream</strong> filter (<code>.items[]</code>, <code>.[] | select(…)</code>). <strong>Always a list</strong>: 0 outputs → <code>[]</code>, N → <code>[v0, …]</code>. You can always <code>for each</code> it.</li>
+</ul>
+<pre><code class="language-mix">$m = json_parse("{\"a\":{\"b\":{\"c\":42}}}")
+print(jq($m, ".a.b.c"))
+</code></pre>
+<pre><code class="language-text">42
+</code></pre>
+<pre><code class="language-mix">$m = json_parse("{\"items\":[{\"n\":\"x\"},{\"n\":\"y\"}]}")
+print(jq($m, "[ .items[].n ]"))      -- bracketed: one array output -&gt; jq()
+</code></pre>
+<pre><code class="language-text">[x, y]
+</code></pre>
+<pre><code class="language-mix">$m = json_parse("{\"items\":[{\"n\":\"x\",\"sz\":50},{\"n\":\"y\",\"sz\":150}]}")
+$big = jq_all($m, ".items[] | select(.sz &gt; 100) | .n")   -- stream -&gt; jq_all()
+print($big)
+</code></pre>
+<pre><code class="language-text">[y]
+</code></pre>
+<p>A stream filter handed to <code>jq()</code> raises with the fix spelled out:</p>
+<pre><code class="language-mix">$m = json_parse("[1,2,3]")
+print(jq($m, ".[]"))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 2: jq(): filter produced more than one output; use jq_all(), or wrap the filter as `[ … ]` / `map(...)` / add `first` to make it a single value
+</code></pre>
+<h3 id="absent-data-vs-errors">Absent data vs. errors</h3>
+<p>A valid filter over absent data is <strong>not</strong> an error — <code>.missing</code> → jq <code>null</code> →
+Mix <code>nil</code> for <code>jq()</code>, and an empty stream → <code>[]</code> for <code>jq_all()</code>. There is no
+<code>default</code> argument; use jq's own alternative operator <code>//</code>:</p>
+<pre><code class="language-mix">$m = json_parse("{\"a\":1}")
+print(jq($m, ".missing // \"none\""))   -- absent -&gt; the alternative
+$r = jq($m, ".nope")
+if $r == nil then print("got nil") end
+</code></pre>
+<pre><code class="language-text">none
+got nil
+</code></pre>
+<p>A <strong>malformed filter</strong> or a <strong>jq runtime type error</strong> (e.g. indexing a number)
+raises, like <code>json_parse</code> on bad JSON:</p>
+<pre><code class="language-mix">$m = json_parse("{\"a\":1}")
+print(jq($m, ".a |"))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 2: jq(): cannot parse filter ".a |": Parse([(Term, "")])
+</code></pre>
+<blockquote>
+<p>jq (the embedded jaq engine) <strong>preserves</strong> object key insertion order — <code>jq($m, ".")</code> returns keys in their original order, and constructed objects like <code>jq($m, "{b: .b, a: .a}")</code> keep the written order. The alphabetical look in JSON examples
+above comes from <code>json_parse</code>/<code>json_encode</code>, not from jq. For canonical,
+order-stable serialization reach for <code>data_encode</code>.</p>
+</blockquote>
+<h2 id="yaml-v0710">YAML (v0.71.0)</h2>
+<p><code>yaml_parse(string[, {docs: true}])</code> → value; <code>yaml_encode(value)</code> → a YAML
+string. This is the surface the provisioned-YAML fleet runs on — Grafana
+alerting/dashboards/datasources, Prometheus and Alloy config that deploy
+scripts generate, edit, and <strong>gate on</strong>: a deploy script that cannot parse
+what it deploys cannot validate it either (this used to shell out to
+<code>ruby -ryaml</code>).</p>
+<pre><code class="language-mix">$y = yaml_parse(read_file("rules.yaml"))
+for each $g in $y["groups"]
+  print($g["name"] .. ": " .. len($g["rules"]) .. " rule(s)")
+end
+write_file("rules.yaml", yaml_encode($y))
+</code></pre>
+<p>The mapping mirrors JSON's: scalars → nil/bool/number/string, sequences →
+lists, mappings → maps in document order. The details that differ from a
+naive reading:</p>
+<ul>
+<li><strong>Documents.</strong> By default the input must hold at most one document —
+none is <code>nil</code>, more than one <strong>raises</strong> (naming the fix). Pass
+<code>{docs: true}</code> for a list of every document in the stream.</li>
+<li><strong>Keys.</strong> Mix maps are string-keyed: scalar YAML keys keep their natural
+text (<code>25:</code> becomes <code>"25"</code>); a sequence or mapping used as a key raises.</li>
+<li><strong>Anchors and aliases</strong> are resolved during parsing; tags are not
+preserved. <strong>Merge keys are NOT resolved</strong>: yaml-rust2 has no <code>&lt;&lt;</code>
+handling, so <code>&lt;&lt;: *defaults</code> parses as a literal <code>"&lt;&lt;"</code> entry whose
+inherited fields are <em>not</em> flattened into the map — a gating script
+must flatten them itself or avoid <code>&lt;&lt;</code> in files it validates.
+<code>.inf</code>/<code>.nan</code>-style reals that Rust cannot parse keep their text as
+strings rather than being guessed at.</li>
+<li><strong>Encoding</strong> emits no leading <code>---</code> marker, guarantees a trailing
+newline, writes whole numbers as integers, and quotes only what YAML
+requires — including keys like <code>on</code>/<code>yes</code> that YAML 1.1 would read as
+booleans. <code>nil</code>/bool/number/string/list/map only; bytes, buffer or
+function values raise — and so does a <strong>non-finite number</strong> (bare
+<code>inf</code>/<code>NaN</code> would read back as <em>strings</em>; <code>json_encode</code> and
+<code>toml_encode</code> refuse the same way).</li>
+<li><strong>Nesting is capped at 256 levels</strong> in both directions (a hostile
+deep-nesting input raises a catchable error, like <code>serde_json</code>'s 128).</li>
+<li>Round trip holds: <code>yaml_parse(yaml_encode($v))</code> rebuilds the same value.</li>
+</ul>
+<h2 id="toml">TOML</h2>
+<p><code>toml_parse(string)</code> → map; <code>toml_encode(value)</code> → a pretty TOML string. Tables
+become nested maps; a whole-valued number encodes as a TOML integer, a fractional
+one as a float.</p>
+<pre><code class="language-mix">$t = toml_parse("name = \"alpha\"\nport = 25\n\n[server]\nhost = \"192.0.2.1\"")
+print($t.name)
+print($t.port)
+print($t.server.host)
+</code></pre>
+<pre><code class="language-text">alpha
+25
+192.0.2.1
+</code></pre>
+<pre><code class="language-mix">$m = { name: "alpha", port: 25, server: { host: "192.0.2.1" } }
+print(toml_encode($m))
+</code></pre>
+<pre><code class="language-text">name = "alpha"
+port = 25
+
+[server]
+host = "192.0.2.1"
+</code></pre>
+<p>There is no <code>read_toml</code>; compose it — <code>toml_parse(read_file($path))</code>. TOML
+datetimes parse to a string.</p>
+<p>TOML has no representation for Mix <code>nil</code>, function, <code>bytes</code>, or <code>buffer</code>
+values. <code>toml_encode</code> therefore raises <code>TOML_UNREPRESENTABLE</code> instead of
+silently replacing any of them with <code>""</code>. The structured error's <code>details</code>
+map carries the exact <code>path</code> and <code>type</code>, including list indexes:</p>
+<pre><code class="language-mix">try
+  print(toml_encode({jobs: [{payload: freeze(buffer([1, 2]))}]}))
+catch $message, $error
+  print($error.code)
+  print($error.details.path)
+  print($error.details.type)
+end
+</code></pre>
+<pre><code class="language-text">TOML_UNREPRESENTABLE
+$.jobs[0].payload
+bytes
+</code></pre>
+<p>Convert deliberately before encoding: <code>base64_encode($bytes)</code> for binary
+payloads, omit an absent field rather than storing <code>nil</code>, and never put a
+function in a data tree.</p>
+<h2 id="strict-data-mix--the-substrate-format">strict-data <code>.mix</code> — the substrate format</h2>
+<p>Mix has its own JSON-equivalent data format: a <code>.conf.mix</code> / <code>.spec.mix</code> file is a
+JSON-shaped tree with a friendlier surface — bareword keys, optional top-level
+braces, <code>#</code> comments, trailing commas, <code>nil</code>. Crucially it <strong>parses only as
+data</strong>: no <code>$vars</code>, no <code>$(cmd)</code>, no <code>${...}</code>, no function calls, no control flow.
+It is the format for substrate-internal config that must never run as code.</p>
+<ul>
+<li><code>data_parse(string)</code> — text → value (the non-executing parser).</li>
+<li><code>data_encode(value[, pretty])</code> — value → text, with correct escaping; <strong>round-trips</strong> through <code>data_parse</code> and <strong>preserves key order</strong>.</li>
+<li><code>load_data($path)</code> — read + <code>data_parse</code> a file (the non-executing twin of <a href="/mix/functions"><code>source</code>/<code>include</code></a>, which <em>run</em> a file).</li>
+</ul>
+<p>Literal heredocs are accepted as strings, including their normal trailing-newline
+semantics. A heredoc containing <code>${...}</code> interpolation or <code>$(...)</code> command
+substitution is rejected like every other executable strict-data construct.</p>
+<pre><code class="language-mix">$cfg = { name: "alpha", port: 25, tags: ["a", "b"] }
+print(data_encode($cfg))
+print(data_encode($cfg, true))   -- truthy 2nd arg = multi-line
+</code></pre>
+<pre><code class="language-text">{"name": "alpha", "port": 25, "tags": ["a", "b"]}
+{
+  "name": "alpha",
+  "port": 25,
+  "tags": [
+    "a",
+    "b"
+  ]
+}
+</code></pre>
+<p><code>data_encode</code> emits exactly the escaping the strict-data lexer round-trips —
+<code>\$</code>, <code>\"</code>, <code>\\</code>, <code>\n</code>, <code>\t</code>, <code>\r</code>, <code>\e</code>; any other control character as
+<code>\u{…}</code>; and a leading <code>\~</code> when (and only when) the string is <code>~</code> or starts
+with <code>~/</code>, the two shapes the lexer would expand to <code>$HOME</code> — so a string that
+ends in <code>$</code> (a regex) or contains a backslash survives intact. This is what
+makes it <strong>safe to splice hostile values</strong>
+into a generated config or a remote script: the value arrives as inert data, never
+as a command. (It is <strong>not</strong> a shell escaper — don't feed its output to <code>/bin/sh</code>.)</p>
+<pre><code class="language-mix">$v = { rx: "ends-with$", win: "a\\b" }
+print(data_encode($v))
+</code></pre>
+<pre><code class="language-text">{"rx": "ends-with\$", "win": "a\\b"}
+</code></pre>
+<p>The round-trip is exact for any data-shaped tree:</p>
+<pre><code class="language-mix">$orig = { name: "alpha", regex: "x$", tags: ["a", "b"], n: 7 }
+$back = data_parse(data_encode($orig))
+print($back.regex)
+print($back.tags[1])
+print($back.n)
+</code></pre>
+<pre><code class="language-text">x$
+b
+7
+</code></pre>
+<p><code>data_parse</code> accepts the canonical no-braces top-level map (newline- or
+comma-separated <code>key: value</code>):</p>
+<pre><code class="language-mix">$d = data_parse("name: \"alpha\"\nport: 25\nenabled: true")
+print($d.name)
+print($d.enabled)
+</code></pre>
+<pre><code class="language-text">alpha
+true
+</code></pre>
+<p>Strict-data does <strong>not</strong> accept executable Mix's <code>;</code> statement separator — use
+newlines or commas. <code>data_parse("a: 1; b: 2")</code> raises a line-numbered
+strict-data violation rather than quietly widening the configuration format.</p>
+<p>A <strong>missing comma</strong> inside a braced map or list is named as exactly that
+(0.72.0): <code>missing `,` after this map entry</code>, anchored at the line of the
+entry that lacks it. (It used to surface as <code>expected RBrace, got String("b")</code> at the line <em>after</em> the omission — the parser's state, not the
+author's mistake, and 20 lines away in a real config.)</p>
+<p>…and <strong>rejects every executable construct</strong> with a line-numbered error — that
+rejection is the whole point:</p>
+<pre><code class="language-mix">print(data_parse("x: now()"))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: data_parse: Strict-data violation at line 1: function call `now(...)` not allowed in data files. data files cannot invoke functions; use a literal value
+</code></pre>
+<p>Keys that are Mix <strong>keywords</strong> need no quoting (since 0.21): a <code>.conf.mix</code> key
+named <code>to</code>, <code>on</code>, <code>in</code>, or <code>label</code> parses bare. The one exception is <code>fn</code> — it
+lexes identically to <code>function</code>, so quote it (<code>"fn": 1</code>).</p>
+<p><code>load_data</code> is the file-reading form, for data the Mix tooling and a Rust
+consumer should read through the one same parser (e.g. a mesh inventory):</p>
+<pre><code class="language-mix">-- /tmp/inv.mix (strict-data, NOT a script):
+--   name: "mesh-inventory"
+--   nodes: [
+--     { host: "node1", addr: "192.0.2.1" },
+--     { host: "node2", addr: "192.0.2.2" },
+--   ]
+$inv = load_data("/tmp/inv.mix")
+print($inv.name)
+print($inv.nodes[0].host)
+print($inv.nodes[1].addr)
+</code></pre>
+<pre><code class="language-text">mesh-inventory
+node1
+192.0.2.2
+</code></pre>
+<p><strong>Every way <code>load_data</code> can fail is catchable</strong> (since 0.36.1) — missing file,
+unreadable file, syntax error in the data, or an executable construct the
+strict-data rules reject. All four arrive as ordinary runtime errors naming the
+path, so a <code>try/catch</code> around a config read actually holds:</p>
+<pre><code class="language-mix">$cfg = nil
+try
+  $cfg = load_data("/etc/cosmix/app.conf.mix")
+catch $e
+  print("cannot read config: " .. $e)
+  exit(2)
+end
+</code></pre>
+<blockquote>
+<p>Before 0.36.1 a <em>malformed</em> file raised a raw parse error, and
+<a href="/mix/errors"><code>try/catch</code></a> deliberately does not catch those — the script
+aborted with exit 1 straight through the handler above, while a <em>missing</em>
+file was caught normally. If you rely on that <code>catch</code>, check
+<code>mix --version</code>.</p>
+</blockquote>
+<blockquote>
+<p><code>data_encode</code> cannot represent a non-finite number (<code>NaN</code>/<code>±inf</code>), a function
+value, or a bytes value — it <strong>raises</strong> a catchable error rather than emit
+silently-lossy text (where <code>json_encode</code> degrades functions/bytes to <code>null</code>,
+§above).</p>
+</blockquote>
+<h2 id="csv--ini--text-tables-and-config">CSV &amp; INI — text tables and config</h2>
+<p><code>csv_parse(string[, delim])</code> reads the <strong>first line as a header</strong> and returns a
+list of maps keyed by those headers. Fields are trimmed. The optional second
+argument is a one-character delimiter (default <code>,</code>).</p>
+<pre><code class="language-mix">$rows = csv_parse("name,port\nalpha,25\nbeta,143")
+print($rows[0].name)
+print($rows[1].port)
+print(length($rows))
+</code></pre>
+<pre><code class="language-text">alpha
+143
+2
+</code></pre>
+<pre><code class="language-mix">$rows = csv_parse("a|b\n1|2", "|")
+print($rows[0].a)
+print($rows[0].b)
+</code></pre>
+<pre><code class="language-text">1
+2
+</code></pre>
+<p>Three sharp edges: the parser is a <strong>naive split</strong> — no RFC-4180 quote handling,
+so a quoted field containing the delimiter splits in two (<code>"x,y"</code> becomes the
+fields <code>"x</code> and <code>y"</code>); only the <strong>first character</strong> of the delimiter argument is
+used; and a row with more fields than headers keys the extras by 0-based field
+index (<code>col1</code>, <code>col2</code>, …). Blank lines are skipped.</p>
+<p><code>ini_parse(string)</code> reads <code>[section]</code> headers and <code>key = value</code> lines into a
+nested map. Lines starting <code>#</code> or <code>;</code> are comments. Keys before any section land
+under <code>_global</code>.</p>
+<pre><code class="language-mix">$ini = ini_parse("debug = true\n[server]\nhost = 192.0.2.1\nport = 25\n[log]\nlevel = info")
+print($ini["_global"].debug)
+print($ini.server.host)
+print($ini.server.port)
+print($ini.log.level)
+</code></pre>
+<pre><code class="language-text">true
+192.0.2.1
+25
+info
+</code></pre>
+<blockquote>
+<p><strong>Every CSV / INI value is a string</strong> — even <code>25</code> and <code>true</code>. These parsers do
+no type inference (a value with leading zeros, a hostname, and a port look the
+same as text). Coerce numerics yourself with <code>to_number</code> (next section). JSON,
+TOML, and strict-data preserve the types they can represent; each serializer
+documents what happens when a Mix-only type reaches its boundary. TOML and
+strict-data raise rather than substituting a different value.</p>
+</blockquote>
+<h2 id="xml--soaprss-documents">XML — SOAP/RSS documents</h2>
+<p><code>xml_parse(string[, {mode}])</code> parses <strong>strict XML</strong> into a Value tree. The
+default <code>simple</code> mode is shaped for consuming SOAP/RSS-style API responses:
+namespace prefixes are stripped, attributes become <code>@name</code> keys, repeated
+sibling elements collapse into a list, a leaf element's trimmed text becomes
+its value, mixed text lands under <code>#text</code>, and <code>xmlns</code> declarations are
+dropped. The result is <code>{RootName: …}</code>, so a SOAP response navigates as plain
+map access:</p>
+<pre><code class="language-mix">$r = xml_parse("&lt;e:Envelope xmlns:e=\"urn:x\"&gt;&lt;e:Body&gt;&lt;status&gt;OK&lt;/status&gt;&lt;ns&gt;&lt;s&gt;ns1.example.net&lt;/s&gt;&lt;s&gt;ns2.example.net&lt;/s&gt;&lt;/ns&gt;&lt;/e:Body&gt;&lt;/e:Envelope&gt;")
+print($r.Envelope.Body.status)
+print($r.Envelope.Body.ns.s[1])
+print(length($r.Envelope.Body.ns.s))
+</code></pre>
+<pre><code class="language-text">OK
+ns2.example.net
+2
+</code></pre>
+<p>Attribute and mixed-text keys start with <code>@</code>/<code>#</code>, so they need bracket access:</p>
+<pre><code class="language-mix">$a = xml_parse("&lt;a id=\"7\"&gt;hi &amp;amp; bye&lt;/a&gt;")
+print($a.a["@id"])
+print($a.a["#text"])
+</code></pre>
+<pre><code class="language-text">7
+hi &amp; bye
+</code></pre>
+<p>Pass <code>{mode: "tree"}</code> for full fidelity: every element is a
+<code>{name, attrs, children}</code> node with namespace prefixes and <code>xmlns</code> attributes
+preserved and child order intact; text children appear as plain strings
+(whitespace-only text between elements is dropped in both modes).</p>
+<pre><code class="language-mix">$t = xml_parse("&lt;ns:a x=\"1\"&gt;t&lt;b/&gt;u&lt;/ns:a&gt;", {mode: "tree"})
+print($t.name)
+print($t.attrs.x)
+print($t.children[0])
+print($t.children[1].name)
+</code></pre>
+<pre><code class="language-text">ns:a
+1
+t
+b
+</code></pre>
+<p>Sharp edges: <strong>strict XML only</strong> — real-world HTML is tag soup and will not
+parse (that needs an HTML5 parser, deliberately not this builtin). Every parsed
+value is a <strong>string</strong> (like CSV/INI — coerce with <code>to_number</code>). Simple mode is
+<strong>lossy by design</strong>: ordering across differently-named siblings, mixed-content
+interleaving, and namespace identity are all dropped — reach for <code>{mode: "tree"}</code> when they matter. A single child element is a scalar and two-plus
+collapse to a list, so a maybe-repeated element needs a <code>type()</code> check (or
+navigate the tree mode instead). Only predefined (<code>&amp;amp;</code> <code>&amp;lt;</code> <code>&amp;gt;</code>
+<code>&amp;apos;</code> <code>&amp;quot;</code>) and numeric character entities resolve — no DTD, so custom
+entities error. Input must be UTF-8 (a <code>bytes</code> payload from <code>http_get</code> is
+accepted and decoded strictly). Nesting is capped at 256 levels; malformed
+input, mismatched/unclosed tags, multiple roots, and text outside the root all
+error rather than best-guess.</p>
+<h2 id="to_number--numeric-coercion">to_number — numeric coercion</h2>
+<p><code>to_number(value)</code> returns the value as a <code>Number</code>, or <code>nil</code> if it can't coerce.
+It accepts a number, a numeric string (surrounding whitespace trimmed), or a bool
+(<code>true</code>→1, <code>false</code>→0); anything else → <code>nil</code>. This is the bridge from
+string-typed CSV/INI/form data back to arithmetic.</p>
+<pre><code class="language-mix">print(to_number("3.14"))
+print(to_number("  42  "))
+print(to_number(true))
+print(to_number("nope"))
+print(to_number([1, 2]))
+</code></pre>
+<pre><code class="language-text">3.14
+42
+1
+nil
+nil
+</code></pre>
+<p>Coercion is <strong>strict about non-finite spellings</strong>: <code>"inf"</code>, <code>"infinity"</code>,
+<code>"nan"</code>, and an overflowing <code>"1e999"</code> all return <code>nil</code> — a word the Rust float
+parser happens to accept is not a Mix numeric string. <code>is_number</code> agrees on the
+string case. Number <strong>values</strong> still propagate IEEE-754 non-finites through
+math (<code>sqrt(-1)</code> is <code>NaN</code>) — it is the string doorway that's strict. Ordinary
+scientific notation is fine (<code>to_number("1e6")</code> → <code>1000000</code>). See
+<a href="/mix/numbers">numbers</a>.</p>
+<pre><code class="language-mix">print(to_number("inf"))
+print(to_number("1e999"))
+print(is_number("nan"))
+print(sqrt(-1))
+</code></pre>
+<pre><code class="language-text">nil
+nil
+false
+NaN
+</code></pre>
+<p>The <code>nil</code>-on-failure return is the validation idiom — branch instead of crashing:</p>
+<pre><code class="language-mix">$rows = csv_parse("name,port\nalpha,25")
+$p = to_number($rows[0].port)
+if $p == nil then
+  print("port is not a number")
+else
+  print($p + 1)
+end
+</code></pre>
+<pre><code class="language-text">26
+</code></pre>
+<h2 id="template--filling-text-from-a-map">template — filling text from a map</h2>
+<p><code>template(tmpl, map)</code> substitutes single-brace <code>{key}</code> placeholders (not
+<code>{{key}}</code>) with the map's values, stringified the way <code>print</code> would. The second
+argument must be a map — anything else raises.</p>
+<pre><code class="language-mix">print(template("{name} is a {role}", { name: "alpha", role: "relay" }))
+print(template("{n} items, ok={ok}", { n: 3, ok: true }))
+</code></pre>
+<pre><code class="language-text">alpha is a relay
+3 items, ok=true
+</code></pre>
+<p>Three rules make it safe over untrusted values:</p>
+<ul>
+<li><strong>Single-pass</strong>: a substituted value is emitted verbatim and never rescanned, so data containing <code>{other_key}</code> cannot inject a second substitution — and the output never depends on map iteration order:</li>
+</ul>
+<pre><code class="language-mix">print(template("{a} and {b}", { a: "{b}", b: "SECRET" }))
+</code></pre>
+<pre><code class="language-text">{b} and SECRET
+</code></pre>
+<ul>
+<li>A <code>{key}</code> not present in the map, a <code>{</code> with no closing <code>}</code>, and a nested <code>{</code> all stay <strong>literal</strong> — no error, no silent empty string.</li>
+<li>Matching is <strong>byte-exact</strong> — no Unicode normalization, no case-folding (see <a href="/mix/strings">strings</a>).</li>
+</ul>
+<h2 id="sqlexec--typed-sql-binds">sqlexec — typed SQL binds</h2>
+<p>The embedded SQLite builtins (<code>sqlite</code> feature; on in the shipped binary) are
+the other place Mix values cross a serialization boundary. <code>sqlopen(path)</code>
+opens <strong>read-only</strong>; <code>sqlopen(path, "rw")</code> opens read-write (WAL mode, 5s busy
+timeout). <code>sqlexec(handle, sql[, params])</code> executes with <code>?</code> placeholders;
+<code>sqlclose(handle)</code> closes.</p>
+<p>Parameters bind <strong>typed</strong> — never stringified:</p>
+<table><thead><tr><th>Mix value</th><th>SQLite bind</th></tr></thead><tbody>
+<tr><td><code>nil</code></td><td><code>NULL</code></td></tr>
+<tr><td>bool</td><td><code>INTEGER</code> <code>0</code>/<code>1</code></td></tr>
+<tr><td>whole finite number (i64 range)</td><td><code>INTEGER</code></td></tr>
+<tr><td>any other number (fractional, huge)</td><td><code>REAL</code></td></tr>
+<tr><td>string</td><td><code>TEXT</code></td></tr>
+<tr><td>bytes</td><td><code>BLOB</code></td></tr>
+<tr><td>list / map / function</td><td><strong>loud error</strong> — no SQL representation</td></tr>
+</tbody></table>
+<p><code>params</code> is a list (one element per <code>?</code>) or a single bare value. A non-reading
+statement (<code>INSERT</code>/<code>UPDATE</code>/<code>CREATE</code> …) returns <code>{affected: N}</code>; a
+row-returning statement (<code>SELECT</code>, a row-returning <code>PRAGMA</code> — decided by SQLite
+itself, not a keyword match) returns a <strong>list of maps</strong>, mapping back <code>NULL</code> →
+<code>nil</code>, <code>INTEGER</code>/<code>REAL</code> → number, <code>TEXT</code> → string, and a <code>BLOB</code> → the
+placeholder string <code>"&lt;blob N bytes&gt;"</code>.</p>
+<pre><code class="language-mix">$db = sqlopen(":memory:", "rw")
+sqlexec($db, "create table t (a, b, c)")
+print(data_encode(sqlexec($db, "insert into t values (?, ?, ?)", [nil, true, 2.5])))
+print(data_encode(sqlexec($db, "select typeof(a) as ta, typeof(b) as tb, typeof(c) as tc from t")))
+sqlclose($db)
+</code></pre>
+<pre><code class="language-text">{"affected": 1}
+[{"ta": "null", "tb": "integer", "tc": "real"}]
+</code></pre>
+<p>Binds are the <strong>exact-bytes</strong> path — prefer them over composing SQL text with
+<code>sql_quote</code> (which escapes for a string literal and doubles a backslash on the
+way into SQLite; see <a href="/mix/system">system</a>).</p>
+<h2 id="boundary-validation-v0290">Boundary validation (v0.29.0)</h2>
+<p>Mix's tolerant <code>nil</code> semantics stay the default everywhere — a missing map key
+reads as <code>nil</code>, and general string coercion renders that as <code>"nil"</code>, which is
+exactly how a blank provisioning field once became part of a constructed
+hostname. The validation family makes strictness a one-call choice at your
+job/API/form boundary; failures raise structured <code>VALIDATION_*</code> errors with
+<code>details {path, expected, actual_type}</code> (see <a href="/mix/errors">errors</a>):</p>
+<pre><code class="language-mix">$job = validate($raw, {
+  node: {type: "string", nonblank: true},
+  host: {type: "string", nonblank: true},
+  vmid: {type: "integer", min: 100, max: 999999},
+  plan: {enum: ["gold", "silver"]},
+  tags: {required: false, type: "list", items: {type: "string", nonblank: true}},
+  owner: {required: false, type: "map", schema: {name: {nonblank: true}}}
+})
+</code></pre>
+<ul>
+<li><code>validate(value, spec)</code> — validates a map against a field spec, returns the ORIGINAL map unchanged (composable; no hidden normalization). Rules per field: <code>required</code> (default TRUE), <code>type</code> (one name or a list — <code>any nil bool number integer string bytes buffer list map function</code>; <code>integer</code> = finite whole within ±2^53-1), <code>nonblank</code>, <code>enum</code> (normal Mix equality, so <code>"8080"</code> matches <code>8080</code>), <code>min</code>/<code>max</code> (inclusive numeric), <code>min_length</code>/<code>max_length</code> (string codepoints / list items / map entries), <code>items</code> (rule map for every list element), <code>schema</code> (nested field spec). Optional fields that are absent or nil skip their rules; unknown INPUT fields pass through; a typo'd RULE key raises <code>VALIDATION_SPEC</code> instead of silently no-opping. Violation paths read <code>owner.name</code>, <code>tags[2]</code>.</li>
+<li><code>require_key(map, key)</code> — assert present + non-nil, return the value (<code>VALIDATION_REQUIRED</code>).</li>
+<li><code>expect_type(value, kind)</code> — assert the type, return the value (<code>VALIDATION_TYPE</code>).</li>
+<li><code>nonblank(value[, label])</code> — assert a non-blank string, return it UNTRIMMED; the label names the value in the error (<code>VALIDATION_NONBLANK</code>).</li>
+<li><code>get_or(map, key, default)</code> — the tolerant twin: default covers both absent and nil.</li>
+</ul>
+<p>Using <code>validate(...)</code>/<code>require_key(...)</code> as a bare statement is a legitimate
+assertion — the raise is the point; the return value is for composing.</p>
+<h2 id="choosing-a-format">Choosing a format</h2>
+<ul>
+<li><strong>JSON</strong> — interop with the outside world (HTTP APIs, JMAP, other tools). Loses key order in both directions (keys come back sorted); types preserved.</li>
+<li><strong>strict-data <code>.mix</code></strong> (<code>data_*</code> / <code>load_data</code>) — substrate-internal config and data a human authors or an agent generates. Order-preserving, comment-friendly, safe-by-construction (never runs as code), exact round-trip. The default for anything Mix owns end-to-end.</li>
+<li><strong>TOML</strong> — interop with TOML-native tooling.</li>
+<li><strong>CSV / INI</strong> — ingesting legacy text tables / config; string-typed, no encoder.</li>
+<li><strong>jq</strong> — querying/filtering a value you already have, especially predicate selection over a stream.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — string vs. raw quoting, <code>${...}</code> interpolation, <code>..</code> concat</li>
+<li><a href="/mix/collections">collections</a> — lists, maps, indexing, <code>.field</code> / <code>[i]</code> access</li>
+<li><a href="/mix/functions">functions</a> — and the HOFs (<code>map</code>/<code>filter</code>/<code>sort_by</code>) you run over parsed data</li>
+<li><a href="/mix/io">files</a> — <code>read_file</code> / <code>write_file</code> / <code>read_lines</code> / <code>read_file_bytes</code></li>
+<li><a href="/mix/errors">errors</a> — <code>try</code>/<code>catch</code> around a parse that may raise</li>
+<li><a href="/mix/functions">modules</a> — <code>source</code> / <code>include</code> (which <em>run</em> a file) vs. <code>load_data</code> (which doesn't)</li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>data_encode</code> for safely splicing values into a remote script</li>
+<li><a href="/mix/math">math</a> — numeric builtins over the numbers <code>to_number</code> produces</li>
+<li><a href="/mix/numbers">numbers</a> — f64 precision, radix literals, non-finite propagation</li>
+<li><a href="/mix/system">system</a> — <code>sql_quote</code> / <code>shell_quote</code> and when binds beat quoting</li>
+<li>The <a href="https://github.com/markc/cosmix">mix repo</a></li>
+</ul>
+<pre><code>mix builtins json     list every JSON / TOML / data builtin
+mix what NAME         one-line description of a single builtin (e.g. mix what jq)
+mix help              the full categorized builtin reference
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +1304,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1358,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1487,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

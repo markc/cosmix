@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,465 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/cli.md"><div class="prose"><h1 id="cli--the-mix-meta-command">cli — the <code>mix</code> meta-command</h1>
+<p>Inside the Mix REPL (and from the OS shell as <code>mix &lt;subcommand&gt;</code>) the bareword
+<strong><code>mix</code></strong> is its own dispatcher: a built-in suite for introspecting the live
+session, reading the language reference, building/testing the interpreter,
+probing the Bus mesh, and driving AI-assisted workflows. It is <em>not</em> a Mix
+builtin function — it is a command the shell intercepts before evaluation, so
+you write <code>mix vars</code>, never <code>mix("vars")</code>.</p>
+<p>Two execution contexts, one command surface:</p>
+<ul>
+<li><strong>From the OS shell</strong> — <code>mix status</code>, <code>mix builtins math</code>, <code>mix what round</code>. The binary keeps an explicit allowlist of meta names and checks it <em>before</em> treating the argument as a script filename — so a script named <code>build</code> in the CWD is shadowed (run it as <code>mix ./build</code>). The session it reports on is the one that binary just started (so <code>mix vars</code> from a cold shell shows only the prelude functions), which makes the build/reference/mesh families useful while the <em>introspection</em> family is most meaningful inside a running REPL. <code>mix stats</code> also works here as a one-shot: every report names its window, and <code>mix stats coverage DIR</code> uses the real parser for static authorship coverage. See <a href="/mix/stats">usage statistics</a>.</li>
+<li><strong>Inside the REPL</strong> — the same plus the <strong>stateful</strong> subcommands that need live REPL state: <code>time</code>, <code>trace</code>, <code>history</code>, <code>reload</code>, <code>diagnose</code> (and <code>stats</code> against the live in-session counters). Those live in the REPL loop, not <code>meta::dispatch</code>, because they need readline history, the trace flag, or the usage-stats handle. From the OS shell these names are <em>not</em> on the allowlist — <code>mix trace on</code> there is read as a script filename (<code>Error reading 'trace': No such file or directory</code>). After checking all meta names, the REPL also treats an existing first token as a script path: <code>mix FILE [args…]</code> runs it in a clean child process and returns to the same prompt. This is deliberately different from <code>source FILE</code>, which executes in and can modify the current session scope.</li>
+</ul>
+<p>Bare <code>mix</code> prints the status overview <strong>inside the REPL</strong>; from the OS shell
+it starts the REPL instead (use <code>mix status</code> there). Meta names win over CWD
+files in both contexts, so <code>mix status</code> remains the status command even when a
+file named <code>status</code> exists; use <code>mix ./status</code> to run that file. An unknown
+non-file token inside the REPL prints
+<code>mix: unknown meta-command '&lt;token&gt;' (and no such file)</code> on stderr and then the
+subcommand overview (the <code>mix meta-commands:</code> listing); from the OS shell an
+unknown name is tried as a script filename.</p>
+<pre><code class="language-mix">mix status
+</code></pre>
+<pre><code class="language-text">mix 0.21.2
+  pid:       50960
+  uptime:    ?
+  memory:    5776 kB
+  variables: 0
+  aliases:   0
+  functions: 5
+  scope:     1 frame(s)
+  trace:     off
+</code></pre>
+<h2 id="introspection--what-is-in-the-session">Introspection — what is in the session</h2>
+<p>These read the live <a href="/mix/variables">scope</a>: variables, <a href="/mix/shell-mode">aliases</a>,
+user <a href="/mix/functions">functions</a>, and the runtime config.</p>
+<pre><code>mix status      version + pid, uptime, RSS, var/alias/func counts, scope depth, trace
+mix vars        every variable as `$name = value` (values over 60 chars truncated)
+mix aliases     every alias as `name = expansion`
+mix functions   every user function as `name(param, param)`
+mix all         vars + aliases + functions under --- section headers ---
+mix type NAME   classify NAME: builtin / keyword / alias / function / variable / PATH command
+mix config      version, $HOME, prelude path, ~/.mixrc path, OS id, arch, pid
+</code></pre>
+<p><code>mix type</code> resolves in the same order the evaluator does — builtin → keyword →
+alias → user function → variable → <code>$PATH</code> command → not found:</p>
+<pre><code class="language-mix">mix type round
+mix type ls
+mix type bogusname
+</code></pre>
+<pre><code class="language-text">round is a builtin function
+ls is a builtin function
+bogusname: not found
+</code></pre>
+<p><code>mix functions</code> and <code>mix all</code> from a cold shell show the <a href="/mix/builtins">prelude</a>
+shims that ship in every session:</p>
+<pre><code class="language-mix">mix functions
+</code></pre>
+<pre><code class="language-text">avg(list)
+chars(s)
+lines(s)
+read_lines(path)
+sum(list)
+</code></pre>
+<p><code>mix config</code> is the quickest way to confirm which interpreter and rc file are in
+play:</p>
+<pre><code class="language-mix">mix config
+</code></pre>
+<pre><code class="language-text">version:  mix 0.21.2
+home:     /home/user
+prelude:  /home/user/.cosmix/crates/cosmix-lib-mix/std/prelude.mix
+rc file:  /home/user/.mixrc
+os:       linux
+arch:     x86_64
+pid:      50955
+</code></pre>
+<blockquote>
+<p><code>mix status</code> shows <code>uptime: ?</code> when run from the OS shell — the process has no
+recorded start instant for a one-shot invocation; inside a long-lived REPL it
+reports real uptime.</p>
+</blockquote>
+<h2 id="reference--learn-the-language">Reference — learn the language</h2>
+<p>The reference family is self-documenting and verified against the binary, so it
+never drifts from training data. Start broad with <code>mix help</code>, narrow with
+<code>mix builtins CATEGORY</code>, pinpoint with <code>mix what NAME</code>, then read the full
+prose with <code>mix man TOPIC</code>.</p>
+<pre><code>mix help              full categorized builtin reference + keyword list + subcommand map
+mix keywords          every reserved word, one per line
+mix builtins [CAT]    list builtins (derived signature + description); with a category, only that one
+mix builtins --json   machine-readable contract table (metadata_schema 1 — see builtins.md)
+mix builtins --data   same table as strict-data Mix source
+mix builtins --names  bare name-per-line list
+mix what NAME         one-line description of a builtin OR a keyword
+mix man [TOPIC]       read a markdown manual page (no arg = the index)
+mix syntax            shortcut for `mix man variables`
+mix operators         shortcut for `mix man operators`
+mix diff bash         bash → Mix translation cheatsheet
+mix tutorial          guided walkthrough of the basics
+mix examples          copy-paste-runnable snippets by category
+</code></pre>
+<p><code>mix builtins</code> takes one of ten categories — <code>string type math list map io system format json hof</code> — and prints each derived signature with its registered
+description (signatures are generated from the structured contracts, 0.29.0):</p>
+<pre><code class="language-mix">mix builtins math
+</code></pre>
+<pre><code class="language-text">math builtins:
+  round(x[, n]) -&gt; number          Round to nearest integer, half away from zero; round(x, n) to n decimal places (n&lt;0 rounds to tens/hundreds) (v0.19.0)
+  floor(x[, n]) -&gt; number          Round down toward -inf; floor(x, n) to n decimal places (v0.19.0)
+  ceil(x[, n]) -&gt; number           Round up toward +inf; ceil(x, n) to n decimal places (v0.19.0)
+  ...
+  pi() -&gt; number                   The constant π (v0.19.0)
+  e() -&gt; number                    Euler's number e (v0.19.0)
+</code></pre>
+<p>A bad category lists the valid set instead of failing silently:</p>
+<pre><code class="language-text">mix builtins: unknown category 'maths'
+Categories: string, type, math, list, map, io, system, format, json, hof
+</code></pre>
+<p>All CLI/meta output is BrokenPipe-tolerant. If a downstream reader closes early,
+Mix treats writes to that closed stream as normal and exits normally; it never
+prints a Rust <code>Broken pipe</code> panic or exits <code>101</code>. For example, this is safe even though
+<code>head</code> consumes only the start of the JSON report:</p>
+<pre><code class="language-text">mix builtins --json | head
+</code></pre>
+<p>The pipeline status remains the last command's status under ordinary shell
+rules, so a successful <code>head</code> makes the pipeline successful.</p>
+<p><code>mix what</code> answers "what does this single name do?" for both builtins and
+keywords from the same lookup:</p>
+<pre><code class="language-mix">mix what round
+mix what send
+mix what map
+</code></pre>
+<pre><code class="language-text">round: Round to nearest integer, half away from zero; round(x, n) to n decimal places (n&lt;0 rounds to tens/hundreds) (v0.19.0)
+send: Send message to Bus port: send PORT "msg"
+map: Return new list of transform(item) results (v0.2.0)
+</code></pre>
+<p><code>mix apropos TERM</code> is the search when you <em>don't</em> know the name yet — one
+case-folding substring pass across builtin names AND descriptions, keyword
+names AND descriptions, and the manual's section headings, each hit saying
+where to read more. It is the answer to "I need to pad a string but I don't
+know it's called <code>lpad</code>":</p>
+<pre><code class="language-mix">mix apropos pad
+</code></pre>
+<pre><code class="language-text">BUILTINS
+  lpad  (string)  — Left-pad string to width (codepoint count; …) (v0.54.0)
+  rpad  (string)  — Right-pad string to width (codepoint count; …) (v0.54.0)
+  …
+MANUAL SECTIONS
+  mix man strings  § Padding with something other than a space
+</code></pre>
+<p><code>mix what NAME</code> also falls through to this search when <code>NAME</code> is not an exact
+builtin or keyword, so a near-miss surfaces the candidates instead of printing
+<code>unknown</code> (v0.80.0).</p>
+<p><code>mix keywords</code> is the canonical reserved-word list — the names you cannot use
+as function or variable <em>names</em> (<code>function step(...)</code> is an error). Since 0.21
+a keyword IS accepted anywhere it is unambiguously a name — bare map keys
+(<code>{label: 1, to: "x"}</code>), field access (<code>$m.to</code>), <code>send</code> kwargs — with the one
+exception of <code>fn</code>, which lexes identically to <code>function</code> and still needs
+quoting as a key. See <a href="/mix/keywords">keywords</a>.</p>
+<pre><code class="language-mix">mix keywords
+</code></pre>
+<pre><code class="language-text">Mix reserved words:
+
+  if
+  else
+  end
+  for
+  in
+  while
+  loop
+  function
+  fn
+  return
+  select
+  ...
+</code></pre>
+<h3 id="mix-man-resolves-online-first-with-a-local-fallback"><code>mix man</code> resolves online-first, with a local fallback</h3>
+<p><code>mix man TOPIC</code> prints the markdown page <code>TOPIC.md</code>. The <strong>canonical source is the
+online documentation service</strong> at <a href="https://cosmix.dev/mix"><code>cosmix.dev/mix</code></a> — the
+same pages this site renders — because no tool can assume <em>where</em> (or whether) a
+local checkout lives. Resolution order in the default <code>auto</code> mode:</p>
+<ol>
+<li><strong>Fresh disk cache</strong> — a copy fetched within the last 24 h short-circuits
+everything (no network, no latency on the common path).</li>
+<li><strong>Online fetch</strong> from <code>cosmix.dev/mix</code> (2 s wall-clock budget, HTTPS-only, no
+downgrade redirects); a good page is cached under your XDG cache dir.</li>
+<li><strong>Local checkout</strong>, tried in this order — an <em>explicit</em> signal beats the
+default: <code>$COSMIX_SRC/mix</code> (when <code>COSMIX_SRC</code> is set) → <code>$COSMIX/docs/mix</code>
+(editing the repo's own pages) → <code>$COSMIX/mix</code> (a default checkout).</li>
+<li><strong>Stale cache</strong>, if the network is down and no checkout is present.</li>
+<li>Otherwise a <em>not-found</em> message naming the paths searched and how to force
+local mode.</li>
+</ol>
+<p>No argument reads the index (<code>README.md</code>); an unknown topic lists the available
+ones (the list excludes <code>README</code> itself):</p>
+<pre><code class="language-mix">mix man math        -- prints the math page (online, cached, or local)
+mix man             -- prints the index
+mix man nope        -- "no manual page for 'nope'" + available topics
+</code></pre>
+<p><strong>Environment controls:</strong></p>
+<ul>
+<li><code>COSMIX_MAN_SOURCE=local</code> — skip the network entirely; resolve only from a
+local checkout (then stale cache). Use it when editing pages and wanting your
+edits to win immediately, or when deliberately offline. Default is <code>auto</code>.</li>
+<li><code>COSMIX_MAN_URL=&lt;base&gt;</code> — override the online base URL (default
+<code>https://cosmix.dev/mix</code>). Points the fetch + cache at an alternate host.</li>
+<li><code>COSMIX_SRC=&lt;dir&gt;</code> — adds <code>&lt;dir&gt;/mix</code> as the highest-priority local checkout.</li>
+</ul>
+<p><code>mix syntax</code> and <code>mix operators</code> are thin aliases — <code>mix man variables</code> and
+<code>mix man operators</code> respectively. To add a topic, drop <code>TOPIC.md</code> into
+<code>docs/_man/</code>; it publishes to <code>cosmix.dev/mix</code> on the next Pages build and is
+reachable as <code>mix man TOPIC</code> with no code change.</p>
+<h3 id="mix-diff-bash"><code>mix diff bash</code></h3>
+<p>A side-by-side translation table for anyone arriving from bash — it captures the
+sharp edges directly (<code>$</code> sigils everywhere, <code>..</code> for concat, <code>end</code>/<code>done</code>/<code>next</code>
+for block close, <code>$rc</code> instead of <code>$?</code>). <code>mix diff sh</code> is accepted as an alias;
+any other language names the available set (<code>available: bash</code>):</p>
+<pre><code class="language-mix">mix diff bash
+</code></pre>
+<pre><code class="language-text">Bash to Mix Translation Cheatsheet
+
+Bash                               Mix
+──────────────────────────────     ──────────────────────────────
+VAR="value"                        $var = "value"
+echo "$VAR"                        print $var
+if [ -f file ]; then               if is_file("file") then
+[[ -z $a ]]                        if $a == "" then
+for i in 1 2 3; do                 for each $i in [1, 2, 3]
+...
+</code></pre>
+<h2 id="build--rebuild-the-interpreter-from-itself">Build — rebuild the interpreter from itself</h2>
+<p>The build family wraps <code>cargo</code> against the Mix source tree (<code>$COSMIX_SRC</code>,
+default <code>$COSMIX</code>) so the REPL can rebuild and re-exec into a fresh binary —
+the self-reconstruction surface. Point <code>$COSMIX_SRC</code> at the directory holding
+the workspace <code>Cargo.toml</code> (in a clone of the public repo that is <code>mix/src</code>).</p>
+<pre><code>mix build       cargo build --release, then install target/release/mix → $COSMIX_BIN/mix
+mix clean       cargo clean (removes the target/ tree)
+mix update      git pull, then build + install
+mix test        cargo test, streaming output
+mix self check  syntax-check ~/.mixrc and std/prelude.mix without executing them
+mix check FILE  syntax-check one .mix file (lex + parse, no execution)
+</code></pre>
+<p><code>mix build</code> removes the destination first (a running ELF can't be written in
+place — <code>ETXTBSY</code>), copies the new binary in, and — when run from the REPL —
+saves history then <code>exec()</code>s into it, so the new interpreter replaces the old
+process live. As a one-shot from the OS shell it installs and simply exits
+(there is no REPL to restart). <code>mix update</code> is <code>git pull</code> then the same build.</p>
+<p><code>mix check</code> is a fast parse-only gate — perfect for a pre-commit hook or
+validating a script before shipping it:</p>
+<pre><code class="language-mix">mix check /tmp/ok.mix      -- a well-formed file
+mix check /tmp/bad.mix     -- an unterminated function header
+</code></pre>
+<pre><code class="language-text">OK: /tmp/ok.mix
+/tmp/bad.mix: Parse error at line 2:1: expected variable, got Eof
+</code></pre>
+<p><code>mix self check</code> validates your two startup files. <code>~/.mixrc</code> is treated as a
+hybrid Mix-plus-shell file (it tolerates bareword shell lines), while
+<code>std/prelude.mix</code> must be strict, whole-file-valid Mix:</p>
+<pre><code class="language-mix">mix self check
+</code></pre>
+<pre><code class="language-text">~/.mixrc: OK
+std/prelude.mix: OK
+</code></pre>
+<p>(A <code>.mixrc</code> that mixes bareword shell lines with Mix reports
+<code>OK (mixed shell+Mix)</code> — the per-line classifier validated every line.)</p>
+<h3 id="mix-watch--the-edit-test-loop"><code>mix watch</code> — the edit-test loop</h3>
+<p><code>mix watch PATTERN COMMAND</code> is a polling file-watcher: every 250 ms it scans
+the current directory for files matching PATTERN and runs COMMAND (via
+<code>sh -c</code>) when one changes, with a 500 ms debounce. Globs are simple — <code>*.ext</code>,
+or <code>**/*.ext</code> to recurse (hidden directories and <code>target/</code> are always
+skipped). Ctrl-C stops it.</p>
+<pre><code class="language-mix">mix watch '*.mix' 'cargo test'
+</code></pre>
+<h2 id="diagnostics--measure-and-trace">Diagnostics — measure and trace</h2>
+<h3 id="mix-doctor--is-this-install-healthy-and-what-am-i-talking-to"><code>mix doctor</code> — is this install healthy, and what am I talking to?</h3>
+<p>One command answering both questions, from the OS shell or the REPL. Each line
+is <code>✓</code> (fine), <code>⚠</code> (a caveat, with the fix), or <code>✗</code> (broken, with the fix):</p>
+<pre><code>mix doctor
+</code></pre>
+<pre><code class="language-text">mix doctor — mix 0.81.0
+
+  ✓ version    0.81.0 · git 1a2b3c4d5e6f · built 2026-09-05T…Z
+  ✓ features   json regex markdown toml serde datetime url crypto http sqlite dkim datastar xml yaml ws
+  ✓ prelude    loaded (2 functions in scope)
+  ✓ manual     33 page(s) readable
+  ✓ stats      writable at /home/you/.local/state/mix
+  ✓ bus        reachable at ws://…/ws
+
+healthy — no ✗ checks
+</code></pre>
+<p>It <strong>exits non-zero if any <code>✗</code> check fails</strong>, so it gates: <code>mix doctor &amp;&amp; deploy</code>.
+The <code>features</code> line is the honest set THIS binary was compiled with (a slimmed
+build reports fewer, never claims a capability it lacks); the <code>bus</code> line is a
+bounded reachability probe — the whole connect runs on a worker thread capped at
+~600 ms, so even a hostname endpoint with a dead resolver cannot hang it. Set
+<code>MIX_DOCTOR_SKIP_BUS</code> to skip the probe entirely (the line then reads <code>—</code>), for
+a hermetic run that touches no broker. The checks are deliberately local —
+version/provenance, compiled features, prelude, manual (checkout <strong>or</strong> <code>mix man</code>
+cache), stats-dir writability, and Bus — with no fleet awareness; that belongs
+to the hub's tools. Only the <code>stats</code> check can fail hard (<code>✗</code>); an unreachable
+Bus is a <code>⚠</code>, never a <code>✗</code>, so <code>mix doctor</code> still passes on a standalone box.</p>
+<p>These need live REPL state (readline history, the trace flag, the stats
+handle), so they are handled in the REPL loop rather than <code>meta::dispatch</code>.
+Apart from <code>mix stats</code> — which also runs one-shot from the OS shell against
+the on-disk data — they are <strong>not</strong> available as <code>mix …</code> from the OS shell.</p>
+<pre><code>mix trace [on|off]    per-statement tracing to stderr (no arg = report state) — see below
+mix history [PAT]     show readline history, optionally filtered to lines containing PAT
+mix reload            re-execute ~/.mixrc in the current session
+mix diagnose [on|off] auto-send REPL errors to Claude for diagnosis (needs the claude CLI)
+mix stats [SUB]       usage tracking — see below
+</code></pre>
+<h3 id="time--the-timing-modifier"><code>time</code> — the timing modifier</h3>
+<p><code>time</code> is a shell-dispatch <strong>modifier</strong>, not a meta-command: it wraps whatever
+follows — an external command, a pipeline, a bareword function, or Mix code —
+and reports elapsed time on stderr. Unlike the rest of this section it is NOT
+REPL-only; it works under <code>-c</code> and over ssh too. Full semantics:
+<a href="/mix/shell-mode">shell-mode</a>.</p>
+<pre><code class="language-mix">time sum([1, 2, 3, 4, 5])
+</code></pre>
+<pre><code class="language-text">15
+Elapsed: 0.012ms
+</code></pre>
+<p><code>mix time EXPR</code> is the same modifier under its older spelling. Before 0.32.0 it
+was a REPL-only meta-command that could time Mix code but not a command, and a
+bare <code>time cmd</code> died with <code>time: No such file or directory</code> — bash's <code>time</code> is a
+keyword, so there is no <code>time</code> binary for the classifier to find.</p>
+<h3 id="mix-trace--the-statement-tracer"><code>mix trace</code> — the statement tracer</h3>
+<p><code>mix trace on</code> prints one line <strong>to stderr</strong> for every statement executed, in
+the form <code>trace &lt;file&gt;:&lt;line&gt; &lt;kind&gt;</code> — in the REPL the file shows as
+<code>&lt;repl&gt;</code>:</p>
+<pre><code class="language-mix">mix trace on
+$x = 41
+print($x + 1)
+</code></pre>
+<pre><code class="language-text">Trace: on
+trace &lt;repl&gt;:1 Assignment
+trace &lt;repl&gt;:1 Print
+42
+</code></pre>
+<p>Shell-dispatch lines are traced too, as <code>trace &lt;repl&gt; shell: &lt;cmd&gt;</code> —
+external binaries, pipelines, <code>cd</code>, and whole <code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chains (a chain
+traces as one line, after alias expansion). The <code>mix …</code> meta-commands
+themselves are excluded as REPL machinery, as is the prompt's own render.</p>
+<p>The tracer is self-contained: no <code>RUST_LOG</code> needed, and <code>RUST_LOG</code> does
+<strong>not</strong> enable it (a <code>tracing</code> subscriber exists only under <code>--serve</code>) — the
+stderr line is the real channel. It is REPL-only: it cannot be armed under
+<code>--serve</code> or from a non-interactive <code>ssh host '&lt;mix&gt;'</code>. Current state shows in
+<code>mix status</code> (<code>trace: on|off</code>) and <code>mix context</code> (<code>"trace": true|false</code>);
+<code>mix trace</code> with no argument reports it.</p>
+<h3 id="mix-stats--usage-tracking"><code>mix stats</code> — usage tracking</h3>
+<p><code>mix stats</code> aggregates which builtins, functions, aliases, commands, keywords,
+meta-commands, and error kinds you actually use — including a <code>never</code> report
+of builtins/keywords you have never invoked. Data lives under
+<code>$XDG_STATE_HOME/mix/</code> (default <code>~/.local/state/mix/</code>) as weekly JSON files,
+mirrored into a <code>mix.db</code> SQLite database when the <code>sqlite3</code> CLI is on <code>$PATH</code>
+(that database backs <code>trend</code>/<code>since</code>/<code>query</code>). <code>MIX_STATS=0</code> disables the
+subsystem. Run <code>mix stats</code> for the top-20 overview, or a subcommand:</p>
+<pre><code>mix stats              top 20 most-used across all categories
+mix stats builtins     per-builtin usage counts          mix stats never      never-used builtins/keywords
+mix stats functions    user-function counts              mix stats sessions   session history
+mix stats aliases      alias expansion counts            mix stats raw        current stats as JSON
+mix stats commands     external-command counts           mix stats reset      reset current counters
+mix stats keywords     keyword counts                    mix stats clear NAME remove NAME from every category
+mix stats meta         meta-command counts               mix stats all        aggregate every weekly file
+mix stats errors       error-kind counts                 mix stats week W     one week (e.g. 2026-W27)
+mix stats trend NAME / since DATE / query SQL            SQLite history
+</code></pre>
+<h2 id="ecosystem--probe-the-bus-mesh">Ecosystem — probe the Bus mesh</h2>
+<p>These query the local <a href="/mix/bus">noded</a> broker for its registered Bus service
+roster (the mesh is TCP noded — <code>ws://&lt;wg-ip&gt;:4200/ws</code> — resolved the same way
+the <a href="/mix/bus"><code>send</code></a> keyword resolves a target). All three fail fast with a 5 s
+timeout so a stale broker address can't hang a diagnostic.</p>
+<pre><code>mix mesh          mesh status + the full list of services the local noded knows
+mix ports         the registered Bus ports/services with a count
+mix ping SERVICE  is SERVICE reachable? (`noded` itself is always the local broker)
+</code></pre>
+<pre><code class="language-mix">mix mesh
+</code></pre>
+<pre><code class="language-text">Bus mesh active via local noded (ws://192.0.2.10:4200/ws)
+  dnsd
+  indexd
+  log
+  webd
+4 service(s) registered
+</code></pre>
+<pre><code class="language-mix">mix ping webd
+mix ping noded
+mix ping nope
+</code></pre>
+<pre><code class="language-text">webd: reachable (registered with noded)
+noded: reachable (local broker)
+nope: not found
+</code></pre>
+<p>When no broker is running the same commands degrade to a clean one-line message
+(<code>No mesh — local noded not reachable (...)</code>) rather than an error.</p>
+<p>There is also a small <strong>orchestration</strong> group: <code>mix deploy SVC</code>
+(<code>systemctl --user restart cosmix-SVC</code>), <code>mix health [SVC]</code> (probe Bus unix
+sockets in <code>/run/bus</code>, falling back to <code>/tmp/bus</code>), and <code>mix logs SVC [-f]</code>
+(<code>journalctl --user -u cosmix-SVC</code>, last 50 lines; <code>-f</code>/<code>--follow</code> to stream).
+These assume a systemd-user-managed Cosmix install.</p>
+<h2 id="ai-powered--agent-driven-workflows">AI-powered — agent-driven workflows</h2>
+<p>The AI family shells out to the Claude Code CLI (<code>claude -p "&lt;prompt&gt;"</code>); each
+constructs a task prompt pointed at the Mix source tree. If <code>claude</code> is not on
+<code>$PATH</code> they print an install hint and stop — they never alter anything on their
+own.</p>
+<pre><code>mix fix DESC      read source, write a fix + test, run cargo test
+mix extend DESC   implement a feature (tests first), run cargo test
+mix review        git log / git diff HEAD~1, then a code review
+mix explain NAME  explain how a builtin works from builtins.rs + evaluator.rs
+mix evolve        pick the highest-value item from MIX_TODO.md and implement it
+mix dogfood       write practical scripts, report awkward syntax / gaps
+mix fuzz          generate random Mix to fuzz the parser/evaluator, report crashes
+mix teach         build a tutorial .mix from the newest features
+</code></pre>
+<p>A related triad — <code>mix ask QUESTION</code> (one-shot Claude query with session context
+injected), <code>mix chat</code> (interactive Claude with a Mix-aware system prompt), and
+<code>mix context</code> / <code>mix snapshot</code> (export vars + functions + aliases + runtime info
+as JSON) — feeds the live session into an agent. <code>mix context</code> is the
+machine-readable companion to <code>mix all</code>:</p>
+<pre><code class="language-mix">mix context
+</code></pre>
+<pre><code class="language-text">{
+  "aliases": { ... },
+  "current_line": 42,
+  "cwd": "/home/user",
+  "extensions": [ ... ],
+  "functions": [ ... ],
+  "pid": 50955,
+  "scope_depth": 1,
+  "trace": false,
+  "variables": { ... }
+}
+</code></pre>
+<p>Finally, <code>mix claude-start</code> / <code>mix claude-stop</code> / <code>mix claude-status</code> manage
+the <code>cosmix-claude</code> Bus port daemon (socket
+<code>/run/user/&lt;uid&gt;/cosmix/ports/claude.sock</code>): <code>start</code> spawns the binary
+(searched in <code>$COSMIX_SRC/target/{release,debug}/</code>, then <code>$PATH</code>), <code>stop</code>
+removes the socket, <code>status</code> probes it and flags a stale socket.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><code>mix</code> is intercepted by the shell, so it never sees <code>$</code>-sigil arguments — write <code>mix what round</code>, not <code>mix what $name</code>.</li>
+<li>The introspection family (<code>vars</code>/<code>aliases</code>/<code>functions</code>/<code>all</code>/<code>context</code>) is most useful <strong>inside a REPL</strong>, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.</li>
+<li>The diagnostics family (<code>time</code>/<code>trace</code>/<code>history</code>/<code>reload</code>/<code>diagnose</code>) is REPL-only — those names are not on the OS-shell allowlist, so <code>mix trace on</code> there is read as a script filename. The one exception is <code>mix stats</code>, which has a dedicated one-shot OS-shell path against the same on-disk data.</li>
+<li>Paths follow the Cosmix layout: source at <code>$COSMIX_SRC</code> (default <code>$COSMIX</code>), installed binaries at <code>$COSMIX_BIN</code> (default <code>~/.local/bin</code>, or <code>/usr/local/bin</code> when running as root).</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/">the manual index</a> — every page <code>mix man TOPIC</code> can read</li>
+<li><a href="/mix/variables">variables</a> — the <code>$</code>-sigil scope <code>mix vars</code> reports on</li>
+<li><a href="/mix/functions">functions</a> — what <code>mix functions</code> lists</li>
+<li><a href="/mix/shell-mode">shell-mode</a> — the alias/classifier layer behind <code>mix aliases</code> and <code>mix reload</code></li>
+<li><a href="/mix/invocation">invocation</a> — the <code>mix -c</code> / <code>mix -</code> / <code>--serve</code> entry points around this command</li>
+<li><a href="/mix/keywords">keywords</a> · <a href="/mix/operators">operators</a> · <a href="/mix/math">math</a> — topics readable via <code>mix man TOPIC</code></li>
+<li><a href="/mix/bus">Bus messaging</a> — the <code>send</code>/<code>emit</code>/<code>address</code> mesh <code>mix mesh</code>/<code>ports</code>/<code>ping</code> probe</li>
+<li><a href="/mix/builtins">builtins index</a> — the full builtin catalogue behind <code>mix builtins</code></li>
+<li>The public repo: <a href="https://github.com/markc/cosmix">github.com/markc/cosmix</a></li>
+</ul>
+<pre><code>mix help          full categorized reference + the complete subcommand map
+mix what NAME     one-line description of any builtin or keyword
+mix man TOPIC     read a full manual page (mix man with no arg = the index)
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +1077,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1131,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1260,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

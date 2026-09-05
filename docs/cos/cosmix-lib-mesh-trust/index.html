@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-mesh-trust/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,121 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-mesh-trust/README.md"><div class="prose"><h1 id="cosmix-lib-mesh-trust">cosmix-lib-mesh-trust</h1>
+<p><code>cosmix-lib-mesh-trust</code> provides the pure verification primitives and optional Cosmix substrate integration used for cross-mesh trust, signed inventories, admission proofs, signed request envelopes, and capability grants. It is a library crate in <code>cos</code>, downstream of <code>bus</code> in the <code>bus &lt;- mix &lt;- cos</code> dependency chain; its core has no Bus or Mix dependency, while the default <code>cosmix</code> feature adds Bus and property-store integration.</p>
+<h2 id="synopsis">Synopsis</h2>
+<ul>
+<li>Cargo package: <code>cosmix-lib-mesh-trust</code></li>
+<li>Rust library: <code>cosmix_mesh_trust</code></li>
+<li>Current crate version: <code>0.4.3</code></li>
+<li>Binary targets: none</li>
+<li>Default posture: core verification plus the <code>cosmix</code> integration feature</li>
+</ul>
+<p>The core is synchronous and carries no I/O. Callers supply trust state, timestamps, member records, grants, and key material. The integration layer adds an in-memory trust cache, a property subscriber, an authorisation-policy combinator, record conversion, and draft property namespace schemas.</p>
+<h2 id="features">Features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Provides</th></tr></thead><tbody>
+<tr><td><code>default</code></td><td style="text-align: right">yes</td><td>Enables <code>cosmix</code>.</td></tr>
+<tr><td><code>cosmix</code></td><td style="text-align: right">yes</td><td>Adds <code>cache</code>, <code>combinator</code>, <code>subscriber</code>, <code>wgd_namespaces</code>, and <code>wgd_records</code>; enables the property store, Bus client and wire crates, Tokio, async traits, streams, and tracing.</td></tr>
+</tbody></table>
+<p>Use <code>--no-default-features</code> for the protocol-level core without Bus, property-store, async-runtime, or tracing dependencies.</p>
+<h2 id="core-modules">Core modules</h2>
+<table><thead><tr><th>Module</th><th>Main API</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>admission</code></td><td><code>AdmissionTranscript</code>, <code>select_d2_pubkeys</code>, <code>select_wg_pubkeys</code>, <code>sign_admission_transcript</code>, <code>admit</code></td><td>Builds and verifies domain-separated D2 session-admission proofs and selects epoch-valid D2 or WireGuard credentials.</td></tr>
+<tr><td><code>canonical</code></td><td><code>to_canonical_bytes</code>, <code>deserialize_strict_value</code></td><td>Produces the shared v1 canonical JSON bytes and rejects duplicate object keys in signed JSON values.</td></tr>
+<tr><td><code>caps</code></td><td><code>Cap</code>, <code>CapabilitySet</code>, <code>TrustedMesh</code>, <code>Grant</code>, <code>TrustStore</code>, <code>resolve_cross_mesh_caps</code></td><td>Models capability bags and resolves the effective cross-mesh capability set.</td></tr>
+<tr><td><code>ctk_caps</code></td><td><code>CTK_NOTIFY</code>, <code>CTK_ACTIONS</code>, <code>CTK_DIALOG</code> and grant helpers</td><td>Pins the canonical CTK capability-token spellings and supplies exact-set predicates and constructors.</td></tr>
+<tr><td><code>envelope</code></td><td><code>SignedEnvelope</code>, <code>Envelope</code>, <code>EnvelopeError</code></td><td>Parses and structurally validates v1 signed cross-mesh request envelopes.</td></tr>
+<tr><td><code>freshness</code></td><td><code>parse_rfc3339</code>, <code>check_freshness</code>, <code>check_envelope_ts</code></td><td>Applies a symmetric timestamp freshness window.</td></tr>
+<tr><td><code>inventory</code></td><td><code>SignedInventory</code>, <code>InventoryPayload</code>, <code>NodeTrustState</code>, <code>AcceptedInventory</code></td><td>Parses and verifies signed mesh inventories against an existing trust-anchor set and rollback baseline.</td></tr>
+<tr><td><code>sig</code></td><td><code>sign_ed25519</code>, <code>verify_ed25519</code>, <code>select_pubkey</code></td><td>Signs and strictly verifies Ed25519 messages and selects a fresh current or rotation-grace key.</td></tr>
+</tbody></table>
+<h2 id="signed-request-envelopes">Signed request envelopes</h2>
+<p><code>SignedEnvelope::parse</code> parses JSON, rejects unknown fields, checks the <code>v1</code> envelope version, requires the identity, target, command, timestamp, and nonce fields to be non-empty, and requires <code>headers</code> to be an object.</p>
+<p>Every <code>Envelope</code> contains twelve signed fields:</p>
+<ul>
+<li>envelope version;</li>
+<li>target mesh, service, and endpoint;</li>
+<li>caller mesh, selector, and node identifier;</li>
+<li>command;</li>
+<li>structured headers and body;</li>
+<li>RFC 3339 timestamp;</li>
+<li>base64 nonce.</li>
+</ul>
+<p>The detached signature covers <code>Envelope::canonical_bytes()</code>, never the received wire bytes. Canonical JSON sorts object keys recursively, emits no whitespace, uses minimal JSON escaping, preserves Unicode without normalisation, and rejects duplicate keys at strict parse boundaries.</p>
+<p>The crate exposes the pieces of the verification pipeline rather than an end-to-end HTTPS verifier. A caller parses the envelope, selects the trusted public key, verifies the signature over canonical bytes, checks freshness, performs replay handling, and resolves capabilities.</p>
+<h2 id="signed-inventories">Signed inventories</h2>
+<p><code>SignedInventory::parse</code> performs structural JSON parsing. <code>SignedInventory::verify</code> then checks the closed canonical-encoding and schema-version values, validates the signed verify-key set, re-canonicalises the payload, and requires a valid signature from a declared key that the node already trusts.</p>
+<p>Verification also enforces:</p>
+<ul>
+<li>monotonic normal epochs;</li>
+<li>genesis-key retention in the adopted key set;</li>
+<li>in-band adoption of the signed verify-key set;</li>
+<li>genesis-authorised recovery with a strictly increasing recovery generation;</li>
+<li>prevention of recovery-floor rollback or unauthorised floor increases;</li>
+<li>one count per signing key identifier.</li>
+</ul>
+<p>Invalid or unknown entries in the unsigned signature bag do not invalidate an otherwise valid payload. Unknown fields and duplicate keys inside signed payload data fail closed.</p>
+<p>On success, <code>AcceptedInventory</code> returns the epoch and recovery generation to persist, whether recovery authorised the result, the trusted keys whose signatures verified, and the verify-key set to adopt. Persistence remains the caller's responsibility.</p>
+<p>Inventory <code>signed_at</code> and <code>valid_until</code> values are advisory. The verifier does not use wall-clock time as a security gate.</p>
+<h2 id="admission">Admission</h2>
+<p><code>AdmissionTranscript::canonical_bytes</code> uses a fixed field order with a domain tag and length-prefixed byte fields. The transcript binds a proof to the mesh, claimed source node, verifying broker, inventory epoch, session identifier, server nonce, client ephemeral value, and channel-binding hash.</p>
+<p><code>select_d2_pubkeys</code> and <code>select_wg_pubkeys</code> return every matching credential in the half-open epoch interval <code>[from_epoch, until_epoch)</code>. Missing or malformed bounds and non-32-byte public keys are skipped.</p>
+<p><code>admit</code> requires an active member with <code>bus: true</code>, an exact claimed-node match, the broker's accepted inventory epoch, a current D2 credential, and a valid Ed25519 signature. Deny-list policy and nonce freshness or single-use state remain caller responsibilities.</p>
+<h2 id="capability-resolution">Capability resolution</h2>
+<p><code>CapabilitySet</code> is backed by a <code>BTreeSet</code>, giving deterministic iteration and serialisation. It provides insertion, membership, iteration, union, and intersection.</p>
+<p><code>resolve_cross_mesh_caps</code> accepts only identities beginning with <code>mesh:</code>. It returns an empty set when trust is missing, disabled, or stale, when no enabled grant is currently valid, or when the granted capabilities do not intersect the target namespace's exposable set.</p>
+<p>Capability tokens are opaque strings. Wildcards are not expanded: a wildcard token intersects a specific token only when the two strings are identical.</p>
+<p>The <code>ctk_caps</code> helpers create and test exact capability bags for passive notifications and application actions. <code>CTK_DIALOG</code> reserves a separate modal capability spelling; the module does not implement policy enforcement.</p>
+<h2 id="cosmix-integration">Cosmix integration</h2>
+<p>With <code>cosmix</code> enabled, <code>TrustGrantsCache</code> stores trusted meshes, grants grouped by mesh, and exposable capability sets grouped by namespace. <code>TrustGrantsCacheHandle</code> implements the core <code>TrustStore</code> trait and performs synchronous in-memory reads.</p>
+<p><code>TrustGrantsCache::start</code> launches one Tokio subscriber task for each of:</p>
+<ul>
+<li><code>wgd.trusted_meshes</code>;</li>
+<li><code>wgd.grants</code>;</li>
+<li><code>wgd.cross_mesh_exposable</code>.</li>
+</ul>
+<p>Each task lists its namespace, opens a watch from the returned sequence watermark, applies replay and live changes, and reseeds after list, watch, or stream failure with bounded exponential backoff. <code>Ready</code> becomes true only after all three watches emit their replay-caught-up marker. Dropping <code>SubscriberHandle</code> aborts the tasks.</p>
+<p><code>WgdClient</code> is the object-safe list/watch abstraction used by the subscriber. <code>parse_trusted_mesh</code>, <code>parse_grant</code>, and <code>parse_exposable_entry</code> convert property records into core values; malformed rows are skipped by the subscriber without discarding the rest of the namespace.</p>
+<p><code>with_cross_mesh_grants</code> wraps an existing property <code>AuthPolicy</code>. Non-mesh identities fall through to the base policy. A <code>mesh:</code> identity is resolved only through cross-mesh trust, grants, and the namespace exposable set; failure does not fall through.</p>
+<h2 id="draft-property-schemas">Draft property schemas</h2>
+<p><code>wgd_namespaces</code> returns collection <code>NamespaceSpec</code> drafts for:</p>
+<table><thead><tr><th>Function</th><th>Namespace</th><th>Primary key</th></tr></thead><tbody>
+<tr><td><code>trusted_meshes_spec</code></td><td><code>wgd.trusted_meshes</code></td><td><code>mesh_fqdn</code></td></tr>
+<tr><td><code>grants_spec</code></td><td><code>wgd.grants</code></td><td><code>grant_id</code></td></tr>
+<tr><td><code>replay_nonces_spec</code></td><td><code>wgd.replay_nonces</code></td><td><code>pk</code></td></tr>
+<tr><td><code>cross_mesh_exposable_spec</code></td><td><code>wgd.cross_mesh_exposable</code></td><td><code>pk</code></td></tr>
+<tr><td><code>cross_mesh_audit_spec</code></td><td><code>wgd.cross_mesh_audit</code></td><td><code>audit_id</code></td></tr>
+</tbody></table>
+<p><code>all_specs</code> returns all five drafts. Each uses collection cardinality, a SQLite-table storage declaration, and deny-all authorisation inherited from <code>NamespaceSpec::new</code>. A registering service must replace that placeholder authorisation with its real policy.</p>
+<h2 id="example">Example</h2>
+<pre><code class="language-rust">use cosmix_mesh_trust::caps::{Cap, CapabilitySet};
+use cosmix_mesh_trust::ctk_caps::{grants_notify, notify_v1_grant};
+
+let granted: CapabilitySet = [
+    Cap::new("ctk.notify"),
+    Cap::new("props.read:example.accounts"),
+]
+.into_iter()
+.collect();
+
+let effective = granted.intersect(&amp;notify_v1_grant());
+assert!(grants_notify(&amp;effective));
+</code></pre>
+<h2 id="limits">Limits</h2>
+<ul>
+<li>The crate does not provide a complete HTTPS verifier.</li>
+<li>Replay protection storage and enforcement are not part of the freshness module.</li>
+<li>The core does not generate keys, perform I/O, or persist accepted inventory state.</li>
+<li>The inventory verifier does not yet enforce the retiring-key promotion rule described in its module contract.</li>
+<li>The property namespace definitions are drafts, not registration side effects.</li>
+<li>The crate has no CLI and no standalone configuration file.</li>
+</ul>
+<h2 id="verification">Verification</h2>
+<p>Run the core and default-feature test suites from the <code>cos</code> workspace:</p>
+<pre><code class="language-text">cargo test -p cosmix-lib-mesh-trust --no-default-features
+cargo test -p cosmix-lib-mesh-trust --all-features
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +733,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +787,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +916,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

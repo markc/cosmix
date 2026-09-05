@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/bus</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,459 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/bus.md"><div class="prose"><h1 id="bus--cosmix-agent-bus-messaging-send--emit--address--on">bus — CosMix Agent Bus messaging (send / emit / address / on)</h1>
+<p><strong>Bus messaging is what makes Mix more than "a better shell."</strong> <code>send</code>, <code>emit</code>,
+<code>address</code>, and <code>on … end</code> are <em>language keywords</em>, not library calls — Mix talks
+to a local message broker (and, over the mesh, to remote brokers) with no SDK,
+no client object, no boilerplate. This is the ARexx lineage made native: every
+service is a named, addressable port; a Mix one-liner can drive any of them.</p>
+<blockquote>
+<p><strong>Most examples on this page need a live broker</strong> (<code>cosmix-noded</code>, from the
+<a href="https://github.com/markc/cosmix">cos repo</a>). Where a broker is running the output
+shown is real, captured from <code>mix 0.21.2</code>. Where no broker is present the Bus
+forms <strong>degrade gracefully</strong> (see <a href="/mix/bus#no-broker-graceful-degradation">No broker</a>) —
+that path is verified separately. Treat the networked examples as illustrative
+of the shape; the language facts (keywords, <code>$result</code>/<code>$rc</code>, RPC vs
+fire-and-forget, target syntax) are exact.</p>
+</blockquote>
+<pre><code class="language-mix">send noded noded.ping            -- RPC to the LOCAL broker
+print("rc=" .. $rc)
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">rc=0
+result={extensions: {core: 1.0, topic: 1.0}, pong: true}
+</code></pre>
+<hr />
+<h2 id="the-model-in-one-paragraph">The model in one paragraph</h2>
+<p>A <strong>broker</strong> (<code>cosmix-noded</code>) runs on the node. Services register a <strong>name</strong>
+(<code>noded</code>, <code>statecache</code>, <code>webd</code>, …). You <strong><code>send</code></strong> a service a <strong>command</strong> (a
+dotted verb like <code>noded.ping</code>) with optional <strong>key=value args</strong>; the reply lands
+in <code>$result</code> and the status code in <code>$rc</code>. That's an RPC. <strong><code>emit</code></strong> is the same
+shape but fire-and-forget — no reply, no wait. <strong><code>address</code></strong> is a block of
+implicit sends to one target. <strong><code>on … end</code></strong> is the other direction: it
+<em>subscribes</em> a handler that fires when a matching message arrives — the basis of
+a Mix <a href="/mix/bus#serve-mode-mix-as-a-daemon">citizen</a> that <em>is</em> an addressable service.</p>
+<p>The win over bash/python: there is no equivalent without a client library. In
+Mix it is grammar.</p>
+<hr />
+<h2 id="send--rpc-requestreply"><code>send</code> — RPC (request/reply)</h2>
+<p><code>send &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches a command and <strong>waits for the
+reply</strong>. Two result variables are set as a side effect:</p>
+<table><thead><tr><th>Var</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>$result</code></td><td>the reply value (a <a href="/mix/collections">map</a>, list, string, … — field-accessible)</td></tr>
+<tr><td><code>$rc</code></td><td>numeric status in signed bands: <code>0</code> delivered+accepted · <code>1..9</code> delivered with a warning (still success) · <code>&gt;= 10</code> peer application error (the exact peer rc is kept) · <code>-1</code> transport failure · <code>-2</code> per-send <code>timeout=</code> exceeded · <code>-3</code> Bus unavailable (no broker). All negatives are non-fatal.</td></tr>
+</tbody></table>
+<pre><code class="language-mix">send noded noded.info
+print("rc=" .. $rc)
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">rc=0
+{node: node1, noded: {binary: cosmix-noded, name: noded, pid: 1342, version: 0.6.10, ...}, schema_version: 1, service_count: 8, uptime_s: 9445, wg_ip: 192.0.2.5}
+</code></pre>
+<p><code>$result</code> is structured data — reach into it with <code>.field</code> access or <code>["key"]</code>
+(see <a href="/mix/collections">collections</a>):</p>
+<pre><code class="language-mix">send noded noded.ping
+if $result.pong then
+  print("pong is true")
+end
+print("core ext: " .. ("" .. $result.extensions.core))
+</code></pre>
+<pre><code class="language-text">pong is true
+core ext: 1.0
+</code></pre>
+<h3 id="send-as-an-expression"><code>send</code> as an expression</h3>
+<p><code>send</code> also returns the reply, so you can capture it directly (it still sets
+<code>$result</code>/<code>$rc</code> too):</p>
+<pre><code class="language-mix">$r = send noded noded.ping
+print("captured: " .. ("" .. $r))
+</code></pre>
+<pre><code class="language-text">captured: {extensions: {core: 1.0, topic: 1.0}, pong: true}
+</code></pre>
+<h3 id="args-scalars-body-and-numbers">Args: scalars, <code>body=</code>, and numbers</h3>
+<p>For <code>send</code>, bare <code>key=value</code> args are serialized as a <strong>JSON body</strong> (RPC
+framing) by default — noded/indexd/maild verbs read their args from it — with
+two exceptions that select <strong>header routing</strong> (scalar args → Bus headers,
+<code>body=</code> → the body channel):</p>
+<ul>
+<li>a <code>body=</code> key is present (the caller is speaking the headers+body shape), or</li>
+<li>the command is a SPEC-12 namespace-mode property call — <code>&lt;svc&gt;.props.&lt;op&gt;</code> (incl. multi-segment ops like <code>props.audit.watch</code>) with a <code>namespace=</code> arg — which reads args from Bus headers, so a kv-only <code>send webd webd.props.get namespace=x key=y</code> works without an explicit <code>body=""</code>. (SPEC-07 flat-path reads — <code>noded.props.get path=…</code> — carry no <code>namespace=</code> and stay JSON-body, as their servers expect. Both triggers apply on the broker path only; the local Unix-port path has no header mode.)</li>
+</ul>
+<p>(<code>emit</code> header-routes <strong>all</strong> map args — RPC-style JSON body is a <code>send</code>/<code>call</code>
+shape.) Whole-number args serialize as JSON <strong>integers</strong>,
+not floats — so <code>limit=2</code> arrives as <code>2</code>, and a peer field typed <code>usize</code>/<code>i64</code>
+accepts it; a fractional value (<code>2.5</code>) stays a float.</p>
+<p>A <code>body=</code>-bearing <code>send</code> <strong>awaits its reply</strong> exactly like a positional or
+scalar-header send — the handler's <code>reply(...)</code> lands in <code>$rc</code>/<code>$result</code>. (Only
+<code>emit</code> is fire-and-forget; the arg shape never changes whether a reply is
+collected.)</p>
+<pre><code class="language-mix">send noded noded.ping limit=2 note="hello"
+print("rc=" .. $rc)
+</code></pre>
+<pre><code class="language-text">rc=0
+</code></pre>
+<h3 id="reading-rc-ok-vs-application-error-vs-transport-failure">Reading <code>$rc</code>: ok vs application error vs transport failure</h3>
+<p>A <code>$rc</code> of <code>&gt;= 10</code> from a <em>reachable</em> broker is an <strong>application</strong> error (e.g.
+unknown service, rejected command) — the peer's exact rc is preserved (a peer
+<code>rc=42</code> stays <code>42</code>, never flattened to <code>10</code>) and it does <strong>not</strong> mean the mesh is
+down. A <code>$rc</code> in <code>1..9</code> is a delivered-with-warning success:</p>
+<pre><code class="language-mix">send nonesuch some.cmd
+print("rc=" .. $rc)
+print("result=" .. ("" .. $result))
+</code></pre>
+<pre><code class="language-text">rc=10
+result=Service 'nonesuch' not found
+</code></pre>
+<p>A <strong>negative</strong> <code>$rc</code> is a <em>local</em>, non-fatal signal — the send never reached a
+peer, so <code>$result</code> carries the reason string and the script continues: <code>-1</code>
+transport failure (a broker was there but the send failed — lost or broken
+connection), <code>-2</code> a per-send <code>timeout=</code> budget exceeded, <code>-3</code> Bus unavailable (no
+broker was ever present, a bare host). See <a href="/mix/bus#per-send-timeout">timeout</a> and
+<a href="/mix/bus#no-broker-graceful-degradation">no broker</a>.</p>
+<hr />
+<h2 id="emit--fire-and-forget"><code>emit</code> — fire-and-forget</h2>
+<p><code>emit &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches and returns immediately. No
+reply is awaited and <strong><code>$rc</code>/<code>$result</code> are not set</strong> by <code>emit</code> — it is a
+statement that yields <code>nil</code>, used when you don't care about (or can't get) an
+answer, e.g. publishing to a topic or notifying a service.</p>
+<pre><code class="language-mix">emit noded noded.ping note=hi
+-- no $rc is written by emit; do not read it after an emit
+print("emitted")
+</code></pre>
+<pre><code class="language-text">emitted
+</code></pre>
+<p>Gotchas:</p>
+<ul>
+<li><code>emit</code> is a <strong>statement</strong>, not an expression — <code>$x = emit …</code> is a parse error. (<code>send</code> <em>can</em> be an expression; <code>emit</code> cannot.)</li>
+<li>Because <code>emit</code> writes neither <code>$rc</code> nor <code>$result</code>, reading <code>$rc</code> right after an <code>emit</code> (with no prior <code>send</code>) raises <em>undefined variable <code>$rc</code></em> — pre-init it or just don't.</li>
+</ul>
+<hr />
+<h2 id="publishtopic-body-opts--one-call-topic-publish-0630"><code>publish(topic, body[, opts])</code> — one-call topic publish (0.63.0)</h2>
+<p>Publishing to a topic used to require two pieces of lore: the body handed
+to <code>noded topic.publish</code> must itself be a <strong>SPEC-02 wire frame</strong>
+(<code>---\ncommand: …\n---\npayload</code>), and the <code>send</code> needed <code>body=</code> spelled
+before <code>name=</code>/<code>retain=</code> would header-route. <code>publish()</code> does both:</p>
+<pre><code class="language-mix">$rc2 = publish("comp.corner.entered", json_encode({corner: "tl"}))
+if $rc2 != 0 then eprint("publish failed: " .. $result) end
+</code></pre>
+<ul>
+<li><code>topic</code> — the noded topic name; by default it is also the inner frame's
+<code>command:</code> header (what subscribers' <code>on</code> matches).</li>
+<li><code>body</code> — the payload <strong>string</strong> (<code>json_encode</code> a map first — the wire
+format is the caller's choice, never hidden). <code>nil</code>/absent → empty.</li>
+<li><code>opts</code> — <code>{retain: bool}</code> (default false); <code>{command: "corner.entered"}</code>
+overrides the inner frame header (the fleet publishes topic
+<code>comp.corner.entered</code> with inner command <code>corner.entered</code>);
+<code>{headers: {event_seq: 1042}}</code> adds frame header lines. Topic, command
+and headers are newline-checked — frame injection raises instead of
+corrupting the wire.</li>
+</ul>
+<p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> and returns the rc, so
+<code>if publish(..) != 0</code> reads naturally. Without a broker it degrades like
+<code>send</code>: <code>$rc = -3</code>, non-fatal.</p>
+<p><strong>Hyphenated targets — quote them.</strong> <code>send comp-nested …</code> parses the bare
+hyphen as subtraction; write <code>send "comp-nested" …</code>. Hyphenated service
+names are the norm on the mesh, so this bites early — quoting is the
+supported spelling (a bare-hyphen grammar change would collide with
+arithmetic and is not planned).</p>
+<hr />
+<h2 id="address--a-block-of-implicit-sends-to-one-target"><code>address</code> — a block of implicit sends to one target</h2>
+<p><code>address &lt;target&gt; … end</code> opens a block where <strong>each line is an implicit send</strong>
+to that target. Drop the <code>send</code> keyword inside the block — writing it is a parse
+error (the runtime catches the typo deliberately). Each line sets <code>$rc</code>/<code>$result</code>
+in turn, so after the block they hold the <strong>last</strong> send's outcome.</p>
+<pre><code class="language-mix">address noded
+  noded.ping
+  noded.info
+end
+print("rc=" .. ("" .. $rc))
+</code></pre>
+<pre><code class="language-text">rc=0
+</code></pre>
+<p><code>address</code> is the ergonomic ARexx-style "talk to one port for a while" form. It is
+purely a shorthand for repeated <code>send &lt;same-target&gt; …</code> lines.</p>
+<hr />
+<h2 id="targets-static-dotted-bus-vs-dynamic-built">Targets: static dotted <code>.bus</code> vs dynamic built</h2>
+<p>The <strong>command position</strong> of <code>send</code>/<code>emit</code>/<code>address</code> accepts an expression, and so
+does the <strong>target</strong>. Two shapes matter:</p>
+<p><strong>1. A bare local service name</strong> — <code>noded</code>, <code>statecache</code>, <code>webd</code>. The broker
+routes it on the local node.</p>
+<pre><code class="language-mix">send statecache INFO
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">{description: Mix supervised Bus citizen (SPEC 18 Phase 1 runtime), name: statecache, version: 0.21.2}
+</code></pre>
+<p><strong>2. A static dotted <code>.bus</code> address</strong> — <code>&lt;service&gt;.&lt;node&gt;.bus</code> addresses a
+<em>remote</em> node's broker directly, mesh-routed, <strong>no ssh and no string building</strong>.
+This literal-address path fires only for a <strong>bare identifier immediately followed
+by a dot</strong> (e.g. <code>noded.node1.bus</code>); a single bareword, a <code>$var</code>, a <code>(paren expr)</code>,
+a bareword call like <code>env("X")</code>, an index, and a <code>..</code> concat all stay ordinary
+expressions.</p>
+<pre><code class="language-mix">-- illustrative (needs the named node to exist on the mesh):
+send noded.node1.bus noded.info
+print("" .. $result)
+</code></pre>
+<p>Self-addressing works — <code>send noded.&lt;thisnode&gt;.bus</code> resolves to the local broker.</p>
+<p><strong>3. A dynamic target from a loop/var</strong> — build the address (or the verb) with
+<code>..</code> concat. This is the path when the node name isn't a literal:</p>
+<pre><code class="language-mix">$node = "node1"
+$target = "noded." .. $node .. ".bus"
+-- send $target noded.info   -- illustrative; routes to that node's broker
+
+-- the verb is an expression too:
+$verb = "noded" .. ".ping"
+send noded $verb
+print("rc=" .. ("" .. $rc) .. " result=" .. ("" .. $result))
+</code></pre>
+<pre><code class="language-text">rc=0 result={extensions: {core: 1.0, topic: 1.0}, pong: true}
+</code></pre>
+<blockquote>
+<p>Edge: if an inline <code>(expr)</code> in command position collides with the parser,
+pre-build the verb into a <code>$var</code> (as above) and pass the var.</p>
+</blockquote>
+<hr />
+<h2 id="per-send-timeout">Per-send <code>timeout=</code></h2>
+<p><code>send … timeout=&lt;seconds&gt;</code> puts a wall-clock budget on the RPC (cooperative
+cancellation; the pending-reply slot is freed on expiry). On timeout you get
+<code>$rc = -2</code> (RC_TIMEOUT) — its <strong>own</strong> numeric band, distinct from <code>-1</code> transport
+— with a <code>timeout: …</code> reason in <code>$result</code>. Non-fatal: the script continues.</p>
+<pre><code class="language-mix">-- against a 2s-slow downstream:
+send slowsvc do.work timeout=0.5
+-- $rc     == -2      (RC_TIMEOUT, numeric)
+-- $result == "timeout: send to slowsvc exceeded 0.5s"
+</code></pre>
+<p>Rules (all raise a <code>RuntimeError</code> if violated): <code>timeout=</code> must be a <strong>finite,
+positive</strong> number; <strong>absence</strong> means "no timeout" (there is no sentinel value);
+<code>nil</code> is treated as absent (so <code>timeout=$t</code> is fine when <code>$t</code> may be unbound);
+duplicate <code>timeout=</code> is last-wins. The <code>timeout=</code> slot is consumed locally and
+does <strong>not</strong> appear in the args delivered to the peer.</p>
+<hr />
+<h2 id="port_existsname--is-a-service-registered"><code>port_exists(name)</code> — is a service registered?</h2>
+<p>A builtin (not a keyword) that asks the broker whether a named service is in its
+registry. Useful as a guard before an RPC.</p>
+<pre><code class="language-mix">print("statecache: " .. ("" .. port_exists("statecache")))
+print("ghost:      " .. ("" .. port_exists("ghostservice")))
+</code></pre>
+<pre><code class="language-text">statecache: true
+ghost:      false
+</code></pre>
+<blockquote>
+<p>Note: the broker need not list <em>itself</em> in its service registry, so
+<code>port_exists("noded")</code> can return <code>false</code> even while <code>send noded noded.ping</code>
+succeeds — <code>port_exists</code> reflects the <strong>registered-services list</strong>, not broker
+reachability.</p>
+</blockquote>
+<hr />
+<h2 id="on--end--receiving-messages-handlers"><code>on … end</code> — receiving messages (handlers)</h2>
+<p><code>on &lt;command&gt; [async] … end</code> registers a <strong>handler</strong> that fires when a matching
+Bus message arrives. The handler body uses newline- or <code>;</code>-separated statements closed by
+<code>end</code> — <strong>no <code>do</code> keyword</strong>. The <code>&lt;command&gt;</code> matches the <em>inner command</em> of the
+inbound message (the verb the publisher sent), <strong>not</strong> the topic/target name —
+check the publisher to know what to match.</p>
+<pre><code class="language-mix">on order.created
+  print("got an order: " .. $event.body)
+  reply("ack")
+end
+</code></pre>
+<p>Legacy <code>done</code> still closes <code>on</code> (with a deprecation warning); prefer <code>end</code>.</p>
+<h3 id="the-event-map">The <code>$event</code> map</h3>
+<p>Inside a handler, the inbound message is available as <code>$event</code>, a map with four
+fields:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Access</th></tr></thead><tbody>
+<tr><td><code>$event.command</code></td><td>string</td><td>the inbound verb</td></tr>
+<tr><td><code>$event.headers</code></td><td>map</td><td>scalar headers, e.g. <code>$event.headers["topic"]</code></td></tr>
+<tr><td><code>$event.body</code></td><td>string</td><td>the raw message body</td></tr>
+<tr><td><code>$event.args</code></td><td>parsed body | nil</td><td>the body pre-parsed as JSON, or <code>nil</code></td></tr>
+</tbody></table>
+<pre><code class="language-mix">on topic.delivery
+  $topic = $event.headers["topic"]
+  print("delivery on " .. $topic .. ": " .. $event.body)
+end
+</code></pre>
+<p><strong><code>$event</code> has dynamic extent</strong> (0.63.0): a <code>fn</code> the handler body calls —
+at any depth — sees the same <code>$event</code>, so helpers like
+<code>fn describe() return $event.headers["topic"] end</code> work. (Before 0.63.0
+the handler→fn hop lost it — function frames only fall through to globals
+— and the resulting <code>NAME_UNDEFINED</code> was swallowed by fault isolation:
+the blind-but-healthy citizen.) A fn's own <code>$event</code> parameter or local
+still shadows it; <code>$event</code> stays read-only inside the dispatch; after the
+dispatch a top-level <code>$event</code> global is restored (or reads <code>nil</code> if there
+was none).</p>
+<p><code>$event.args</code> is a convenience view of the body: when the sender used the
+JSON-body path — a <strong>positional</strong> <code>send svc cmd "a" "b"</code> (which arrives as
+<code>{"_0":"a","_1":"b"}</code>) or a <strong>map</strong> arg — the body is already-parsed JSON, so
+<code>$event.args["_0"]</code> / <code>$event.args.field</code> save you a <code>json_parse($event.body)</code>.
+It is symmetric with the already-parsed <code>$event.headers</code> map; <code>$event.body</code>
+stays the raw string regardless.</p>
+<p><code>$event.args</code> is <code>nil</code> when the body is empty or is <strong>not</strong> JSON — a raw
+<code>body="hi"</code> text payload reads back as <code>nil</code>, so a handler tells "structured
+args" from "raw text" and reaches for <code>$event.body</code> in the latter case:</p>
+<pre><code class="language-mix">on order.submit
+  if $event.args != nil then
+    reply("ok, item " .. ("" .. $event.args["_0"]))   -- send order.submit "widget"
+  else
+    reply(10, "expected structured args, got: " .. $event.body)
+  end
+end
+</code></pre>
+<h3 id="reply--answer-a-request"><code>reply(...)</code> — answer a request</h3>
+<p>From inside an <code>on</code> handler servicing a <strong>request</strong> (one expecting a reply), call
+<code>reply(body)</code> or <code>reply(rc, body)</code>:</p>
+<pre><code class="language-mix">on statecache.get
+  reply($current_value)         -- rc defaults to 0
+end
+
+on do.validate
+  if not $event.body then
+    reply(10, "missing input")  -- non-zero rc = application error to the caller
+  else
+    reply(0, "ok")
+  end
+end
+</code></pre>
+<p><code>reply</code> rules: <code>rc</code> must be an integer <code>0..=255</code>; it may only be called from
+inside an <code>on</code> handler; it errors loudly if the current event is <em>not</em> a request
+(a topic delivery has no caller to answer). A dropped reply would block the
+requester forever, so every <code>reply</code> failure path is a hard error by design.</p>
+<h3 id="async-handlers-class-c"><code>async</code> handlers (Class C)</h3>
+<p>A trailing <code>async</code> on the handler header marks it <strong>Class C</strong> — the dispatch
+<em>yields</em> at every <code>send</code>/<code>reply</code>/<code>sleep_ms</code> so concurrent invocations interleave
+instead of head-of-line-blocking each other behind a slow downstream call. Plain
+(non-<code>async</code>) handlers are <strong>Class S</strong>: run-to-completion, one at a time. Use
+<code>async</code> only when a handler makes a slow/remote downstream <code>send</code> and the citizen
+serves concurrent callers.</p>
+<pre><code class="language-mix">on aggregate.report async
+  send slow.upstream fetch.data          -- yields here; peers can interleave
+  reply($result)
+end
+</code></pre>
+<p><code>async</code> is a <em>contextual</em> modifier, not a reserved word — variables/keys named
+<code>async</code> elsewhere are unaffected. <strong>Synchronous request cycles (A→B→A) are
+prohibited and deadlock</strong> — <code>async</code> does not legalise them; break a cycle with
+fire-and-forget <code>emit</code> + a topic reply instead.</p>
+<h3 id="subscribe--unsubscribe--topic-pubsub"><code>subscribe</code> / <code>unsubscribe</code> — topic pub/sub</h3>
+<p><code>subscribe("topic.name")</code> registers interest in a <a href="/mix/bus">topic</a> so topic
+deliveries reach a matching <code>on</code> handler; <code>unsubscribe("topic.name")</code> drops it.
+Both are builtins that require a live broker — unlike <code>send</code>/<code>emit</code>, they
+<strong>raise</strong> rather than no-op when no broker is reachable (a script must not believe
+it subscribed when it didn't).</p>
+<pre><code class="language-mix">subscribe("metrics.cpu")
+on metrics.cpu
+  print("cpu sample: " .. $event.body)
+end
+-- … then enter serve mode / the event pump to actually receive them
+</code></pre>
+<hr />
+<h2 id="serve-mode--mix-as-a-daemon-citizen">Serve mode — Mix as a daemon (citizen)</h2>
+<p><code>mix --serve &lt;script.mix&gt; [--name &lt;service&gt;]</code> runs a script as a <strong>first-class,
+supervised Bus citizen</strong>: the top-level body executes once as init (open
+resources, <code>subscribe</code>, register <code>on</code> handlers), then the runtime registers the
+service name and enters the event pump, dispatching inbound messages to your <code>on</code>
+handlers. This is the AmigaOS "application with an ARexx port" model — a
+long-lived, addressable Mix process that <em>is</em> a service. The full lifecycle
+contract (registration, reconnect/backoff, handler fault isolation, graceful
+<code>SIGTERM</code>/<code>QUIT</code> shutdown, health properties) is <strong>SPEC 18</strong>.</p>
+<p><strong>Handler faults are isolated but OBSERVABLE</strong> (0.63.0). A raise or panic
+in a handler body never kills the citizen (SPEC 18 §3.4) — but it no
+longer disappears either: one <code>mix: handler fault: &lt;command&gt;[N]: …</code> line
+reaches stderr, <code>lifecycle.health</code> flips to <code>degraded</code>, and
+<code>lifecycle.handler_faults</code> / <code>lifecycle.last_fault</code> count and name it in
+the props surface. Before 0.63.0 a faulting handler looked exactly like a
+healthy one (noded reported <code>delivered=1</code> while its side effects silently
+never happened).</p>
+<p>A live citizen answers the standard verbs like any Rust daemon:</p>
+<pre><code class="language-mix">send statecache HELP
+print("" .. $result)
+</code></pre>
+<pre><code class="language-text">[{args: [], description: List all commands this service accepts, name: HELP}, {args: [], description: Service identity and capabilities, name: INFO}, {args: [], description: Graceful shutdown: deregister, then exit 0 (SPEC 18 §3.5), name: QUIT}, {args: [path?], description: Property snapshot at an optional path, name: statecache.props.get}, ...]
+</code></pre>
+<p>A minimal state-holder citizen:</p>
+<pre><code class="language-mix">-- statecache.mix — run with: mix --serve statecache.mix
+$value = "(none)"
+
+subscribe("config.current")
+
+on config.current               -- a topic delivery updates our state
+  $value = $event.body
+end
+
+on statecache.get               -- a request reads it back
+  reply($value)
+end
+</code></pre>
+<blockquote>
+<p>A <em>transient</em> <code>mix &lt;script&gt;</code> (not <code>--serve</code>) can <code>send</code>/<code>emit</code> and even
+<code>subscribe</code>, but it has no service name, no reconnect, and the process ends when
+the script does — fine for one-shot orchestration drivers, not for a resident
+service.</p>
+</blockquote>
+<hr />
+<h2 id="orchestration--citizen--citizen">Orchestration — citizen ↔ citizen</h2>
+<p>A Mix citizen can <code>send</code>/<code>address</code> other citizens, so multi-service orchestration
+is native: <strong>pipeline</strong> (A→B→C), <strong>scatter-gather</strong> (fan a request to N workers,
+merge replies), <strong>supervisor/worker</strong>, and <strong>review-loop</strong> (a proposer and a
+critic iterating). A driver that is its own sole caller (a cron/oneshot/CLI
+invocation, no registered name) issuing sequential <code>send</code>s is correct under the
+cooperative loop. The hard rule: keep the synchronous-request graph <strong>acyclic</strong>;
+break any cycle with <code>emit</code> + topic replies (see <a href="/mix/bus#async-handlers-class-c">the deadlock note</a>).</p>
+<pre><code class="language-mix">-- scatter-gather sketch (illustrative)
+$replies = []
+for each $w in ["worker.a", "worker.b", "worker.c"]
+  send $w do.task input=$payload
+  push($replies, $result)
+end
+-- merge $replies …
+</code></pre>
+<hr />
+<h2 id="no-broker--graceful-degradation">No broker — graceful degradation</h2>
+<p>The handler uses a <strong>lazy probe</strong> with a small state machine, so Bus forms behave
+predictably on a host that may or may not have a broker:</p>
+<ul>
+<li><strong>Never had a broker (<code>NeverPresent</code>).</strong> <code>send</code> returns <code>nil</code> with <code>$rc = -3</code> (RC_UNAVAILABLE — "Bus unavailable before delivery"), <code>emit</code> is silently dropped, <code>port_exists</code> returns <code>false</code> — <strong>no raise</strong>, and subsequent Bus forms don't re-probe (no per-call boot cost). The same binary becomes mesh-viable the moment a broker appears.</li>
+<li><strong>Had a broker, lost the connection (<code>Lost</code>).</strong> <code>send</code> returns <code>nil</code> with <code>$rc = -1</code> (RC_TRANSPORT) and <code>emit</code> is silently dropped — both <strong>non-fatal</strong>, so a mesh script survives a broker blip instead of crashing. <code>port_exists</code> <strong>raises</strong> <code>mesh unavailable: … (call bus_reconnect() to retry the probe)</code>.</li>
+<li><strong><code>subscribe</code>/<code>unsubscribe</code>/<code>reply</code></strong> raise in <em>both</em> states — these can't be faked; a script must know they didn't happen.</li>
+<li><strong><code>bus_reconnect()</code></strong> resets the probe to <code>Unprobed</code> so the next Bus form re-dials — the recovery primitive after installing a broker or after a broker bounce.</li>
+</ul>
+<p>This is deliberate: <code>send</code>/<code>emit</code> stay <strong>non-fatal in every state</strong> (a bare host
+reads <code>$rc = -3</code>, a lost broker <code>-1</code>), so a script isn't forced to guard Bus it
+may never use — and because the bare-host path no longer fakes <code>rc=0</code>, a
+<code>$rc == 0</code> now strictly means <em>delivered</em>. The forms that can't be faked
+(<code>port_exists</code> once a broker was lost, <code>subscribe</code>/<code>unsubscribe</code>/<code>reply</code> in either
+state) still raise, so a genuine outage is heard.</p>
+<hr />
+<h2 id="quick-reference">Quick reference</h2>
+<table><thead><tr><th>Form</th><th>Direction</th><th>Sets <code>$rc</code>/<code>$result</code>?</th><th>Waits?</th></tr></thead><tbody>
+<tr><td><code>send t cmd k=v</code></td><td>out, RPC</td><td>yes</td><td>yes (reply)</td></tr>
+<tr><td><code>$r = send t cmd</code></td><td>out, RPC (expr)</td><td>yes</td><td>yes</td></tr>
+<tr><td><code>emit t cmd k=v</code></td><td>out, fire-and-forget</td><td><strong>no</strong></td><td>no</td></tr>
+<tr><td><code>address t … end</code></td><td>out, block of sends</td><td>yes (last line)</td><td>yes per line</td></tr>
+<tr><td><code>on cmd … end</code></td><td>in, handler</td><td>—</td><td>event pump</td></tr>
+<tr><td><code>on cmd async … end</code></td><td>in, Class C handler</td><td>—</td><td>yields on <code>send</code></td></tr>
+<tr><td><code>reply(body)</code> / <code>reply(rc, body)</code></td><td>answer a request</td><td>—</td><td>no</td></tr>
+<tr><td><code>subscribe(t)</code> / <code>unsubscribe(t)</code></td><td>topic interest</td><td>—</td><td>yes (raises if no broker)</td></tr>
+<tr><td><code>port_exists(name)</code></td><td>registry query</td><td>—</td><td>yes</td></tr>
+<tr><td><code>bus_reconnect()</code></td><td>reset the probe</td><td>—</td><td>—</td></tr>
+</tbody></table>
+<p>Sharp edges:</p>
+<ul>
+<li>Command position matches the publisher's <strong>inner verb</strong>, not the topic/target.</li>
+<li><code>emit</code> is a statement only (no <code>$x = emit …</code>) and sets <strong>neither</strong> <code>$rc</code> nor <code>$result</code>.</li>
+<li>Inside <code>address</code>, do <strong>not</strong> write <code>send</code> (each line is already a send).</li>
+<li>Synchronous request cycles deadlock — keep the graph acyclic.</li>
+<li><code>send</code>/<code>emit</code> are <strong>non-fatal in every failure state</strong>: <code>send</code> writes a negative <code>$rc</code> (<code>-3</code> no broker, <code>-1</code> lost/transport, <code>-2</code> timeout) and returns <code>nil</code>, <code>emit</code> is silently dropped. <code>port_exists</code> raises once a broker was seen and lost; <code>subscribe</code>/<code>unsubscribe</code>/<code>reply</code> raise whenever the broker is unreachable.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — <code>..</code> concat for building dynamic targets/verbs; <code>${…}</code> vs literal <code>$name</code></li>
+<li><a href="/mix/collections">collections</a> — field access into <code>$result</code> / <code>$event</code> maps</li>
+<li><a href="/mix/functions">functions</a> — handler bodies, lambdas, the pass-in/return/reassign state idiom</li>
+<li><a href="/mix/system">running commands</a> — <code>run</code> / <code>run_rc</code> / <code>ssh_run</code> for non-Bus I/O</li>
+<li><a href="/mix/builtins">builtins index</a> — <code>port_exists</code>, <code>subscribe</code>, <code>reply</code>, <code>bus_reconnect</code>, <code>sleep_ms</code></li>
+<li>The <a href="https://github.com/markc/cosmix">cos repo</a> — <code>cosmix-noded</code>, the Bus broker</li>
+<li>The <a href="https://github.com/markc/cosmix">mix repo</a> — <a href="https://github.com/markc/cosmix/blob/main/AGENTS.md">AGENTS.md</a> is the agent orientation sheet; this manual is the language reference</li>
+<li>ARexx background — <a href="https://en.wikipedia.org/wiki/ARexx">Wikipedia: ARexx</a></li>
+<li><code>mix help</code> · <code>mix what send</code> · <code>mix what emit</code> · <code>mix what address</code> (<code>on</code>/<code>reply</code> are handler forms <code>mix what</code> does not index)</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1071,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1125,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1254,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

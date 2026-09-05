@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-comp</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,647 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-comp.md"><div class="prose"><h1 id="cosmix-comp">cosmix-comp</h1>
+<p><code>cosmix-comp</code> is the Wayland compositor used by the Cosmix desktop. It can run
+nested inside an existing Wayland session with <code>cosmix-comp --nested</code>, or use
+the KMS backend on a system seat.</p>
+<h2 id="bus-control-plane">Bus control plane</h2>
+<p>The default <code>bus</code> feature gives the compositor an L2 Bus control plane.
+The seat/KMS compositor registers as <code>comp</code>; <code>--nested</code> registers as
+<code>comp-nested</code>. <code>--bus-service NAME</code> overrides either name and accepts
+<code>^[a-z][a-z0-9-]{1,30}$</code>. A build without the <code>bus</code> feature rejects that flag
+instead of silently ignoring it. The broker independently enforces the same
+SPEC 10 service-name grammar at registration and rejects an invalid <code>from</code>
+with Bus rc 10.</p>
+<p>The control plane exposes seven verbs:</p>
+<ul>
+<li><code>comp.ping</code> returns <code>{"pong":true}</code> without taking a compositor snapshot.</li>
+<li><code>comp.info</code> returns service/build/backend provenance plus output and surface
+counts and the property event counters.</li>
+<li><code>comp.props.get path?</code> returns one leaf or subtree, or the complete tree when
+<code>path</code> is omitted.</li>
+<li><code>comp.props.list prefix?</code> returns leaf paths. A prefix is matched by complete
+path segments, never by string prefix.</li>
+<li><code>comp.props.describe path</code> returns leaf metadata (<code>type</code>, <code>mutable</code>,
+<code>sensitive</code>, description, optional <code>format</code>/<code>enum</code>/<code>range</code>/<code>persistence</code>, and
+owner) or an object subtree with its immediate children.</li>
+<li><code>comp.props.watch</code> seeds the property-change baseline and returns
+<code>{topic:"&lt;service&gt;.props.changed",event_seq,lost_count}</code>, where <code>service</code> is
+the name this compositor instance actually registered. The reply is truthful
+only for a caller that subscribed to that topic before calling <code>watch</code> and
+remains subscribed.</li>
+<li><code>comp.props.set {path,value}</code> mutates one of the five mutable leaves (the
+four corner properties plus <code>xwayland.enabled</code>) and returns
+<code>{path,old,new}</code>; for the file-persisted <code>xwayland.enabled</code> the reply also
+carries <code>persisted</code> — <code>false</code> means the in-memory change and the changed
+event stand but the write to disk failed and the value will not survive
+restart.</li>
+</ul>
+<p>The complete L2 read tree is:</p>
+<pre><code class="language-text">info.{service,version,backend,engine,instance}
+outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
+                  usable.{x,y,width,height}}
+surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
+                tree_index,parent,output,title,app_id,focused,activated,
+                maximized,minimized,decoration,
+                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
+windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
+               maximized,minimized,output}
+stack
+focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
+decoration.{enabled,style}
+bindings.{enabled,profile,table}
+input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+xwayland.{enabled,persist_path}
+port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
+      slug_collisions,broker}
+</code></pre>
+<p>Surface keys are <code>s</code> plus the decimal session-local surface ID. Output keys are
+<code>o_</code> plus the lower-case output name with each non-alphanumeric character
+replaced by <code>_</code>; the raw output name remains in <code>name</code>. If output names collide
+after slugging, the first output wins, each omitted output increments
+<code>port.slug_collisions</code>, and the compositor logs each collision at debug level.
+<code>band</code> includes <code>background</code>, <code>bottom</code>, <code>normal</code>, <code>top</code>, <code>overlay</code> and <code>lock</code>.
+<code>stack</code> contains mapped roots from top to bottom. <code>windows</code> is a projection of
+mapped XDG toplevels. <code>port.level</code> is <code>L2</code>. <code>port.event_seq</code> is the live global
+sequence watermark across every topic, and <code>port.lost_count</code> is cumulative.
+<code>port.broker</code> is driven by connection-state edges and is <code>connected</code> or
+<code>retrying</code>. <code>port.reply_timeouts</code> and <code>port.publish_timeouts</code> count their
+separate bounded lanes; both abandon a sink wait after two seconds.</p>
+<p>The compositor publishes non-retained messages under the registered service
+namespace. The seat instance therefore uses <code>comp.*</code>, the default nested
+instance uses <code>comp-nested.*</code>, and <code>--bus-service NAME</code> moves the complete
+namespace to <code>NAME.*</code>. Every inner command is the unprefixed suffix shown
+below, so handlers do not depend on the instance name.</p>
+<table><thead><tr><th>Topic</th><th>Inner command</th><th>Exact body</th></tr></thead><tbody>
+<tr><td><code>&lt;service&gt;.props.changed</code></td><td><code>props.changed</code></td><td><code>{path,old,new,ts,cause,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.surface.mapped</code></td><td><code>surface.mapped</code></td><td><code>{id,role,foreign_id?,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.surface.unmapped</code></td><td><code>surface.unmapped</code></td><td><code>{id,role,foreign_id?,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.focus.changed</code></td><td><code>focus.changed</code></td><td><code>{keyboard,previous,exclusive_latch,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.output.changed</code></td><td><code>output.changed</code></td><td><code>{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.corner.entered</code></td><td><code>corner.entered</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.corner.left</code></td><td><code>corner.left</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
+</tbody></table>
+<p>For a reliable property bootstrap: subscribe to the instance topic (for
+example <code>comp.props.changed</code> on the seat or <code>comp-nested.props.changed</code> when
+nested), call <code>comp.props.watch</code>, verify its returned topic, then read the
+required tree or subtree. The watcher is itself the subscriber: while that
+subscription remains active, noded cannot send <code>topic.idle</code> for its subscriber
+generation. An idle delivered in the same control batch as <code>watch</code> therefore
+belongs to a previous generation; the next zero-to-one <code>topic.active</code> re-seeds
+the baseline. Mix handlers match the suffix: <code>on props.changed</code>,
+<code>on surface.mapped</code>, <code>on focus.changed</code>, and so on. Changes are reduced after
+each complete protocol dispatch. A leaf therefore appears at most once per
+cycle, with its cycle-start <code>old</code>, final <code>new</code>, lexical path order and one of
+<code>wayland.map</code>, <code>wayland.unmap</code>, <code>wayland.focus</code>, <code>output.geometry</code>,
+<code>layer.arrange</code>, <code>session.lock</code> or <code>props.set</code> as <code>cause</code>. Operational <code>port.*</code>
+leaves are readable but are not self-published as property changes.</p>
+<p>Keyed row creation and removal are row-granular: an appearing
+<code>surfaces.s&lt;id&gt;</code>, <code>windows.s&lt;id&gt;</code> or <code>outputs.o_&lt;slug&gt;</code> emits one frame at the
+row path with <code>old:null,new:&lt;full row&gt;</code>, and removal emits the inverse.
+Mutations within an existing row remain leaf-granular.</p>
+<p>The sequence is process-global, strictly increasing and shared by property,
+surface, focus, output and corner records. If it reaches <code>u64::MAX</code>, that value
+is offered once and observation enters a terminal exhausted state rather than
+reusing a sequence. The outbox is one bounded 256-entry lane. On overflow the
+producer evicts one oldest record in fixed time and carries that record's loss
+interval inside the next record it sends; if an evicted record already carries
+loss, both intervals coalesce. Once the publisher learns an interval, it emits
+a gap on each affected topic before the next record it publishes on that topic,
+or during the idle flush when the lane drains empty. Survivors produced before
+the carried loss reaches the publisher may therefore be published before its
+gap. The gap's Bus header is <code>event_seq=&lt;last lost seq&gt;</code> (the coalesced
+interval's last-lost sequence), which locates the hole, and its body is
+<code>{gap:true,lost_count,cause:"outbox.overflow"}</code>. <code>lost_count</code> is the same
+cumulative process-wide counter as <code>port.lost_count</code>, not a per-interval tally.
+Consecutive intervals coalesce while pending, bounding gap traffic to at most
+one gap per topic per published record plus the idle flush. A rejected or
+timed-out publication discards its uncertain backlog and recovers under the
+same ordering rule with <code>cause:"publisher.loss"</code>. A failed pending gap retries
+immediately on broker connection-state edges and on a single one-shot backoff
+timer (1 second, doubling to a 30-second cap); that timer exists only while the
+gap remains pending. After either gap, read a fresh property tree.</p>
+<p>Hot-corner detection is compositor-side and uses the current logical output.
+It emits one <code>entered</code>, then one <code>left</code> on deadzone exit, output or geometry
+change, session lock, disable, or config invalidation. <code>corner</code> is <code>tl</code>, <code>tr</code>,
+<code>bl</code> or <code>br</code>; <code>left</code> repeats the dwell measured by <code>entered</code>. Fast transit is
+not accepted until a velocity-qualified dwell, while continued slow outward
+motion constrained by the output edge can enter early. Defaults and inclusive
+ranges are:</p>
+<table><thead><tr><th>Property</th><th style="text-align: right">Default</th><th style="text-align: right">Range</th></tr></thead><tbody>
+<tr><td><code>input.corners.enabled</code></td><td style="text-align: right"><code>true</code></td><td style="text-align: right">boolean</td></tr>
+<tr><td><code>input.corners.deadzone_px</code></td><td style="text-align: right"><code>12.0</code></td><td style="text-align: right"><code>1.0..=256.0</code> logical px</td></tr>
+<tr><td><code>input.corners.dwell_ms</code></td><td style="text-align: right"><code>200</code></td><td style="text-align: right"><code>0..=5000</code> ms</td></tr>
+<tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
+</tbody></table>
+<p>The corner leaves and <code>xwayland.enabled</code> are the only mutable leaves. The
+corner descriptors say <code>mutable:true</code> and <code>persistence:"none"</code> (numeric
+leaves also carry the range above) and those values live for the compositor
+process only. <code>xwayland.enabled</code> is the one exception: its descriptor says
+<code>persistence:"file"</code> — the value is read once at compositor startup (whether
+to spawn XWayland at all; there is no live toggle) and a write persists it
+for the NEXT startup into a per-socket file under the COSMIX etc tree, whose
+resolved absolute path the read-only <code>xwayland.persist_path</code> leaf reports
+and the compositor logs at startup. The <code>COSMIX_COMP_XWAYLAND</code> environment
+variable (<code>0/false/off/no</code> or <code>1/true/on/yes</code>) overrides both the file and
+the default at launch — the no-rebuild back-out that works even when the
+props surface is unreachable. Writes are admitted only when noded supplied
+exactly one case-insensitive <code>broker_origin</code> header whose value is <code>local</code>,
+the caller has a canonical registered service name, and the wire contains no
+<code>source_peer</code>, <code>permissions</code> or <code>signed_ident</code> claim. Otherwise the reply is
+rc 10 <code>{"error":"not_local"}</code> before calloop admission. Unknown and immutable
+paths return <code>unknown_path</code> and <code>read_only</code>; type/range failures return
+<code>{error:"invalid_value",path,expected,range}</code>. All four path/type/range checks
+run on the worker before admission and are repeated on calloop as
+defence-in-depth, so invalid writes consume no ingress or responder permit. A
+no-op write replies normally without a change record.</p>
+<p><code>focus.session_lock</code> is <code>none</code>, <code>locking</code>, <code>locked</code>, <code>orphaned</code> or <code>unlocking</code>.
+While a session lock is active, the read tree applies the same
+<code>WaylandState::session_lock_active</code> presentation boundary as the renderer and
+foreign-toplevel publication: ordinary surfaces retain ids, roles, bands and
+geometry, but report <code>visible=false</code> and null <code>title</code>/<code>app_id</code>; <code>windows</code> is
+empty. During the KMS unlock window (<code>normal_scene_restricted()</code>), the read
+tree stays redacted with <code>focus.session_lock="unlocking"</code> until the
+compositor's own presentation predicate lifts, at the same moment the renderer
+resumes. Unlock then restores the ordinary projection.</p>
+<p>All application errors use Bus rc 10. In addition to the write errors above,
+read/dispatch errors include <code>unknown_path</code>, <code>busy</code> and <code>unknown_verb</code>, plus
+<code>{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}</code> when a
+serialised reply would exceed the effective broker-path ceiling. <code>N</code> is
+8,384,512 bytes: <code>min(16 MiB Bus message, 8 MiB single WebSocket frame)</code> minus
+4 KiB of documented header/framing headroom. Immediately before sending, comp
+also measures the actual canonical response headers, correlation id and
+framing with the body and refuses any reply whose complete wire size would
+exceed that ceiling. Replies are never truncated. An absent broker never
+delays compositor startup: the port thread reports <code>retrying</code> and reconnects
+independently. A registration rejection (collision, invalid SPEC 10 name or
+admission) is logged once, ends the port worker without renaming, and leaves
+the compositor running.</p>
+<p>The broker client lives on the named <code>cosmix-comp-port</code> OS thread with its own
+current-thread Tokio runtime. At most 16 accepted controls/reads cross a bounded calloop
+channel. The calloop callback only stages requests; after the current protocol
+transaction and popup cleanup, one owned snapshot is built and shared by all
+requests in that dispatch. Snapshot admission is released before reply I/O.
+Replies and publications use separate lanes and two-second deadlines, so a
+stalled topic sink does not stop incoming commands. Full-tree JSON is
+serialised once per snapshot on the blocking pool, with only one full-tree
+serialisation active process-wide; requests share the resulting string. Subtree
+reads serialise only the selected value.</p>
+<p>The semantic observation reducer carries typed rows and scalar values across
+the bounded outbox; only the worker constructs topic JSON. Successful offers
+wake the publisher with an event notification, which drains the outbox to
+empty. There is no publisher polling timer or idle tick source. <code>topic.idle</code>
+drops the property baseline and a later <code>topic.active</code> seeds one at the next
+stable service point; both lifecycle directions coalesce latest-wins if the
+ingress is temporarily full.</p>
+<p>The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
+still serialise far beyond the wire allowance, so comp measures the cached
+full-tree bytes once and returns <code>too_large</code>; callers can read a leaf or subtree
+from the same snapshot. Single-flight serialisation prevents same-snapshot
+multiplication.</p>
+<p>Absent by design after P-1:</p>
+<ul>
+<li><code>comp.surface.*</code> control verbs, because focus/raise/close operations arrive in P-2 and
+move/resize in P-3;</li>
+<li>render timings, because they are metrics rather than properties; and</li>
+<li>a Bus screenshot verb, because it is a later control-plane slice; Arc 4's
+capture service is available through the Wayland protocol described below.</li>
+</ul>
+<h2 id="supported-wayland-protocols">Supported Wayland protocols</h2>
+<p>The compositor advertises the core compositor, subcompositor, seat, output,
+shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
+presentation-time, XDG shell and XDG decoration globals needed by its desktop
+clients.</p>
+<table><thead><tr><th>Protocol</th><th style="text-align: right">Version</th><th>Current support</th></tr></thead><tbody>
+<tr><td><code>zwlr_layer_shell_v1</code></td><td style="text-align: right">4</td><td>Layer surfaces and layer popups map, arrange and configure through Smithay's <code>LayerMap</code>; protocol strata, keyboard interactivity, input regions and exclusive usable-area effects are supported.</td></tr>
+<tr><td><code>ext_idle_notifier_v1</code></td><td style="text-align: right">2</td><td>Per-seat notifications use Smithay's calloop timers; real pointer, keyboard, touch, pointer-gesture and tablet-tool activity resets the timeout and resumes an idle notification. Device-removal reconciliation does not count as activity.</td></tr>
+<tr><td><code>ext_foreign_toplevel_list_v1</code></td><td style="text-align: right">1</td><td>Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set.</td></tr>
+<tr><td><code>ext_session_lock_v1</code></td><td style="text-align: right">1</td><td>Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle.</td></tr>
+<tr><td><code>zwlr_screencopy_manager_v1</code></td><td style="text-align: right">3</td><td>Compatibility output capture into exact-layout <code>wl_shm</code> buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion.</td></tr>
+</tbody></table>
+<h2 id="xwayland">XWayland</h2>
+<p>The <code>xwayland</code> cargo feature is in the default set: every default build
+supervises one rootless Xwayland instance and acts as its X11 window
+manager. The runtime control is the <code>xwayland.enabled</code> property described
+above (startup-read, file-persisted per socket) with the
+<code>COSMIX_COMP_XWAYLAND</code> environment variable as the launch-time override —
+the cargo feature is no longer the switch. Normal X11 windows become managed toplevels on the existing
+scene, buffer, focus, stacking and server-side-decoration paths: association
+(via the xwayland-shell serial handshake) creates the window's surface
+record, the map grant makes it eligible, and its first committed buffer
+renders through exactly the renderer path a Wayland toplevel uses — the
+renderer has no X11 branch. Title/class metadata, focus (including the X
+<code>SetInputFocus</code>/<code>WM_TAKE_FOCUS</code> half), interactive and client-requested
+move/resize, maximise/minimise/fullscreen, EWMH state mirroring, close via
+<code>WM_DELETE_WINDOW</code>, and cross-protocol stacking in the normal band are
+supported.</p>
+<p><code>DISPLAY</code> is never set globally. After the XWM owns <code>WM_S0</code>, the compositor
+atomically publishes a mode-0600 per-socket descriptor at
+<code>$XDG_RUNTIME_DIR/cosmix-comp/&lt;WAYLAND_DISPLAY&gt;.xwayland.env</code> containing
+<code>DISPLAY=:N</code> and the XWayland generation; launchers read it once and pass
+<code>DISPLAY</code> explicitly to each X client. A missing <code>Xwayland</code> binary or a
+failed start degrades to a fully working native-Wayland compositor with a
+warning. An unexpected XWayland death destroys that generation's windows,
+removes the descriptor and arms a single 60-second one-shot restart backstop;
+one retry credit exists, and only a generation that then survives five
+minutes restores it. There is no readiness or liveness polling anywhere in
+the path.</p>
+<p><strong>Override-redirect windows</strong> — X11 menus, context menus, tooltips and
+combo-box drop-downs — render (X-2a): they get a surface record on the
+ordinary renderer path at their own absolute client coordinates (negative
+origins included; the compositor never places, clamps, configures, grants
+or decorates them — including for <code>_NET_WM_MOVERESIZE</code>, whose interactive
+move/resize is refused for override-redirect windows), stack in the
+normal band and are raised to its top when mapped (not tethered to a
+parent and not kept on top afterwards), and acquire none of the managed
+behaviours — no focus candidacy, no minimise/maximise, no
+foreign-toplevel export. Keyboard focus deliberately never moves to an
+override-redirect window — focus arbitration itself refuses them, so
+neither a click nor a touchscreen tap on one changes focus: the X
+client's own grab machinery routes keys. In the property tree they appear
+under <code>surfaces.*</code> with <code>role:"x11-override-redirect"</code> (managed X11
+windows are <code>"x11-toplevel"</code>); neither appears in <code>windows.*</code>, which
+remains the xdg-toplevel projection. A window that changes its
+override-redirect flag between map cycles transitions by record
+destruction and rebirth in both directions. Known scope edges: relative
+sibling restacks are ignored, a menu overlapping a layer-shell panel
+draws under the panel, and dismissal is client-owned — a click on a
+pure-Wayland surface is invisible to the X grab and dismissal then
+depends on the client's grab-break handling.</p>
+<p><strong>Still not supported, by design:</strong></p>
+<ul>
+<li><strong>Clipboard and primary selection</strong> are not bridged in either direction;
+selection access is refused at the XWM (X-2b).</li>
+<li><strong>Drag-and-drop</strong> across the X11/Wayland boundary (X-3).</li>
+<li><strong>HiDPI/fractional scaling</strong> for X11 clients: the X11 client scale is held
+at 1 and RandR primary-output changes are only logged (X-3).</li>
+<li><strong>KMS qualification</strong>: X11 rendering is proven on the nested backend; the
+live-KMS proof is a later slice (X-3).</li>
+<li>Relative X restack requests (<code>Above</code>/<code>Below</code>/<code>Bottom</code> siblings) are refused
+with a log; the compositor scene stays the stacking authority and only
+raise-to-top is honoured.</li>
+</ul>
+<h2 id="screen-capture">Screen capture</h2>
+<p>Arc 4 provides <code>wlr-screencopy-unstable-v1</code> output capture for existing
+clients such as <code>grim</code>. A frame advertises one opaque <code>XRGB8888</code> shared-memory
+layout with an exact <code>width * 4</code> stride. Whole-output and logically clipped
+region requests are converted into displayed physical pixels; invalid or stale
+outputs fail rather than falling back to another output. Plain copies are
+force-presented, including on an otherwise idle output. Damage copies wait for
+relevant base-scene damage, or cursor-only damage for a cursor-inclusive copy,
+without forcing a frame. The bounded journal is manager-scoped; its baseline
+advances only after <code>ready</code>, and history overflow conservatively reports the
+full captured region.</p>
+<p>Version 3 frames may additionally advertise a DMA-BUF destination after the
+SHM <code>buffer</code> event and before <code>buffer_done</code>. The advertisement is immutable for
+that frame and exists only for a whole-output request whose transform is
+Normal, whose displayed and storage extents are equal, and whose underlying
+render texture has an exact copy-compatible opaque format. Its modifiers are
+the intersection of linux-dmabuf feedback and an exact Vulkan external-image
+<code>TRANSFER_DST</code> import query at that extent. Versions 1 and 2 never receive the
+DMA-BUF event; regions, transformed outputs and unsupported renderer states
+remain SHM-only.</p>
+<p>A submitted DMA-BUF must have exactly one plane and match the advertised
+fourcc and extent. A kind, fourcc, extent or plane-count mismatch posts
+<code>invalid_buffer</code> on the frame and never enters renderer admission. A modifier
+outside the frame's stored transfer-destination set is instead an operational
+miss and produces recoverable <code>failed</code>: linux-dmabuf feedback can legitimately
+guide a client to a sampled-image modifier which this exact capture use cannot
+import. Other operational misses—fd cloning, import/acquire, capacity,
+deadline, cancellation, resize, completion or FOREIGN release—also produce one
+<code>failed</code>. The compositor never sends damage or flags before discovering such a
+failure.</p>
+<p>A submitted <code>wl_buffer</code> does not carry the DRM device which allocated it.
+Version 4 linux-dmabuf feedback steers compliant allocators to the renderer's
+real <code>main_device</code>, and an import failure fails the frame, but the compositor
+also fail-closes advertisement if bridge and feedback renderer identities ever
+disagree. It does not pretend that <code>Dmabuf::node()</code> proves allocation identity. A
+cross-device import which succeeds is a residual hardware risk and belongs to
+the real-GBM gate.</p>
+<p>Pixel completion and the matching output presentation form a two-part completion
+latch: <code>ready</code> is sent only after both arrive for the same frame. For SHM the
+completion half is mapped readback. For DMA-BUF, FOREIGN acquire is encoded in
+the same wgpu command buffer as the copy; the worker waits for that exact
+<code>SubmissionIndex</code>, submits the release barrier through wgpu's thread-safe queue,
+then waits for the exact release submission. No capture ownership barrier uses
+a raw queue submit or an infinite fence wait. Sampled-image ownership barriers
+also enter wgpu-owned command buffers, so every renderer-queue submission has
+one authority: <code>wgpu::Queue</code>. A single bounded completion
+authority owns those destination jobs. It retries a transient 250 ms GPU wait
+up to four bounded attempts, treats a full/disconnected job queue as terminal,
+and never waits on the render or protocol thread. The shared terminal gate
+closes the sole sender while excluding concurrent submissions, then drains the
+definitively closed channel. Any terminal worker failure fails and safely
+strands every live post-import job and clears future
+screencopy DMA-BUF advertisements. Nested records
+are bound to the exact acquired host window texture-view identity; a missing,
+unconsumed or mismatched acquisition fails that capture instead of rebinding it
+to a later presentation. Nested mode uses the completed host presentation time;
+KMS retains the exact <code>tv_sec</code>/<code>tv_usec</code> from the
+matching kernel page-flip event. The compositor bounds live and in-flight jobs, reserves
+a byte budget before allocation, performs conversion away from the render and
+protocol threads, then copies shared memory in bounded chunks across protocol
+loop iterations. Each client may bind at most eight live screencopy managers,
+with 64 live managers globally; exceeding either implementation limit is a fatal
+protocol error on the new manager object. Cancellation is checked at the
+protocol outbox, ECS queue, renderer-owned map and conversion worker. GPU map
+errors become the frame's <code>failed</code> event. The byte
+reservation remains charged until the last renderer-side request or
+packed-result holder drops. Once the renderer submits its COPY_SRC readback,
+the lease remains with the cancellable map job. Admission also requests a redraw, so a plain
+copy is presented even when the output has no animation or other damage. Every
+admitted copy has a five-second absolute request deadline: this is a deadline on
+that one client operation, not a periodic compositor timer.</p>
+<p>Completion does not depend on a later render tick. The retirement worker sends
+its result directly through the calloop-backed protocol command channel, which
+wakes an idle protocol loop; the destination can therefore reach <code>ready</code> on a
+static desktop without polling or a redraw timer. Teardown first puts every
+live job into failed/strand mode and closes the sole job sender. It performs a
+non-blocking worker acknowledgement check: an already-finished worker is
+joined, while an unacknowledged worker is detached. If a driver call never
+returns, that detached worker retains the in-flight job and all queued jobs,
+including every import, buffer token and reporter, until it returns or the
+process exits. The retained set is bounded by <code>MAX_IN_FLIGHT_CAPTURES</code>; renderer
+teardown itself does not wait.
+A pre-import failure releases the retained buffer token immediately. After an
+acquire/copy submission, only successful copy retirement plus successful
+FOREIGN hand-back may release it; an unprovable hand-back strands both import
+and token. <code>fail_capture</code> cancels publication but cannot release that
+renderer-owned half early. Sending <code>wl_buffer.release</code> after the client has
+already destroyed its object relies on Wayland's inert-object send behaviour.</p>
+<p>The existing SIGUSR1/evidence PNG path shares the renderer-owned RGBA snapshot,
+deadline, cancellation sweep and conversion worker with wire capture. The PNG
+and wire consumers then create their own packed BGRA buffers for their distinct
+outputs. PNG capture retains its filename, atomic-rename and cadence contract;
+an unavailable output or an encode/write task which starts after the deadline
+releases the one-batch-in-flight latch. A genuinely blocked filesystem write
+cannot be cancelled safely and remains outside this deadline guarantee.</p>
+<p>The per-destination fd duplication and Vulkan image creation/bind syscalls run
+on the render thread. This is intentionally retained for S-2: admission is
+bounded to eight destinations per render batch, and moving import into the
+worker would break same-frame copy-out. Hardware-gate runs should continue to
+record this bounded syscall cost. They should also flag the
+<code>failed to release DMA-BUF queue ownership; backing and release use stranded fail-closed</code> log line: it means the sampled path exceeded its 250 ms exact-index
+wait, deliberately withheld <code>wl_buffer.release</code>, and requires a fresh import
+before that client buffer can be used again.</p>
+<p>Live renderer reconstruction currently rebuilds the renderer, capture bridge,
+advertisement registry and retirement worker together, leaving DMA-BUF
+advertisement empty until the new render world republishes it. This whole
+restart path is structurally pinned by <code>run_live_render_pump</code>, but remains an
+explicit untested end-to-end path because the regression would require the
+forbidden real-seat live pump.</p>
+<p><code>overlay_cursor=0</code> selects the cursor-free base. Every non-zero value selects an
+inclusive copy using the retained default, chrome or client cursor asset with
+its hotspot, clipping and hidden state. Nested mode copies its cursor-free scene
+to the host swapchain and composites the capture-only overlay into a separate
+temporary target, avoiding a doubled host cursor. The production cursor camera
+renders into an independent transparent target, so it cannot clear or swap the
+scene camera's base texture. SHM and imported DMA-BUF cursor assets remain
+retained and are sampled from that target on the GPU in both nested and KMS
+capture. KMS base copies precede the GPU overlay into scan-out and inclusive
+copies follow it.</p>
+<p>Nested redirect and cursor-composed textures use an unsuffixed BGRA8/RGBA8 base
+with the matching sRGB view format. Rendering therefore keeps the sRGB view,
+while DMA-BUF copies compare and copy the exact linear base format used by the
+destination import.</p>
+<p>Capture is deliberately default-open, including while the session is locked.
+Lock and unlock change the capture epoch: stale work fails, while newly admitted
+work captures the currently displayed lock surface or compositor-owned black
+fallback. This is an agentic desktop policy rather than a portal permission
+prompt.</p>
+<p>KMS copies select the exact Ready <code>OutputKey</code> and generation, copy out within
+that frame without retaining a slot or storing a destination token in the
+scan-out pool, and latch completion against its
+acquisition token and kernel page-flip timestamp. Pause, unplug, generation
+replacement, cancellation and map failure fail the affected one-shot rather
+than returning another output or stale pixels. <code>--first-light</code> keeps the same
+capture feed and completion path while ignoring client scene content; every
+changed animation frame marks full-output damage, so <code>copy_with_damage</code> wakes.
+The wlr protocol is a compatibility surface; the planned
+<code>ext-image-copy-capture-v1</code> implementation will become another consumer of the
+same capture service. The automated nested acceptance gate uses <code>grim</code>; the
+<code>cosmix-screencopy-probe</code> binary is a deadline-bounded manual diagnostic for the
+advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
+<code>--dmabuf --drm-node PATH</code> mode waits for <code>buffer_done</code>, allocates an advertised
+modifier with GBM, submits that destination, maps it only after <code>ready</code>, and
+prints the presentation timestamp plus a content checksum.
+DMA-BUF advertisements are republished from live view targets after every
+output registration/re-registration and generation change. Reconstructing a
+renderer reconstructs its bridge, completion worker and advertisement registry;
+until that replacement has published fresh capabilities, new frames advertise
+SHM only.
+Automated tests cover readback, transforms, ordering and damage. A real Vulkan
+render-attachment gate uses the production GPU cursor-composite pass, reads back
+base and inclusive bytes, compares both with byte-exact references, and proves
+that channel-swap and shifted-hotspot mutants fail. These gates prefer a Vulkan
+fallback adapter. With <code>COSMIX_REQUIRE_FALLBACK_ADAPTER=1</code>, absence of one fails
+the test (the CI rule); otherwise the gate runs on an available Vulkan adapter
+and prints one line naming the adapter actually used. Physical driver behaviour,
+real kernel page-flip clock provenance and end-to-end <code>grim -o</code> on KMS remain
+manual-hardware-only checks. The automated Vulkan equivalence gate uses an
+ordinary Vulkan COPY_DST texture; it does not prove real GBM allocation,
+DMA-BUF import, cross-device behaviour or FOREIGN ownership on a physical
+driver. Those are explicitly hardware-gated.</p>
+<p>Layer surfaces stack in the protocol order: Background, Bottom, normal XDG
+toplevels and popups, Top, then Overlay. Raising a surface changes its order
+only within its stratum. A layer popup stays in its parent's stratum, including
+when the parent changes layer. Session-lock surfaces use a sixth Lock stratum
+above Overlay. An opaque compositor-owned black element sits below Lock and
+above every client stratum while a lock is active.</p>
+<p><code>keyboard_interactivity=None</code> layers receive pointer and touch input but never
+take keyboard focus or raise; their popups can use pointer/touch grabs but not a
+keyboard grab. <code>OnDemand</code> layers take focus on a pointer press or first touch.
+The highest stacked mapped <code>Exclusive</code> layer latches keyboard focus until it
+unmaps, is destroyed, or commits a non-Exclusive policy. Normal-window clicks
+may still raise their window while that latch is active. Installing or
+transferring an Exclusive latch, changing interactivity, or otherwise moving
+keyboard focus dismisses any active XDG popup keyboard grab before the arbiter
+sets its chosen focus. While an Exclusive latch is held, an unrelated popup
+grab request is denied with <code>popup_done</code>, because xdg-shell requires the
+topmost grabbing popup to own keyboard focus; a popup belonging to the latched
+layer may grab normally. When a focused layer stops being eligible, focus
+moves to the next Exclusive layer, otherwise to the highest visible normal
+toplevel, or to no surface when neither exists. Keyboard focus inside an
+Exclusive layer's own active popup grab satisfies the layer's latch: ordinary
+panel redraws neither pull focus back to the layer root nor dismiss its menu.</p>
+<p>Committed <code>wl_surface</code> input regions participate in hit testing for every
+surface role. An empty region makes a panel click-through, and regions are
+clipped to the surface's presented buffer bounds. A committed region change,
+map or unmap retargets a stationary pointer after its complete Smithay surface
+transaction applies. Committed stack-band, subsurface-order and LayerMap
+geometry changes use the same retargeting path. Synchronized descendants
+therefore produce one atomic leave/enter transition and one hit test for the
+transaction, never intermediate targets from partially applied sibling state.
+If rearrangement moves the currently focused surface without changing its
+identity, the compositor sends one motion with the corrected surface-local
+coordinates. Output resize and KMS topology changes batch layer arrangement,
+usable-area derivation and window clamping before that single reconciliation.
+Up to 256 region operations are retained exactly; larger regions use their
+added rectangles' bounding box so protocol-thread hit testing stays bounded.</p>
+<p>Exclusive zones reduce the usable output rectangle. New-window cascade
+origins, maximised sizes and normal restore clamping all use that rectangle and
+are recalculated after layer map, unmap or destruction and after output size or
+KMS topology changes. Layers are arranged before maximised windows are
+reconfigured, so their wire configure uses the current usable rectangle.</p>
+<p>Layer shell honours the requested output, including an explicit
+<code>wl_output</code>. A request with no output uses the backend's default output; if no
+output exists, the layer surface is closed and is never mapped.</p>
+<h2 id="session-locking">Session locking</h2>
+<p>An accepted lock enters <code>Locking</code>, immediately removes ordinary client
+content from the renderer roster and installs the opaque black security scene.
+The compositor sends <code>locked</code> only after the nested renderer acquires a
+swapchain image containing that epoch, submits the frame, calls the winit/wgpu
+present path, and waits for the submitted GPU work to complete. A Bevy schedule
+turn is not presentation evidence: a minimised, occluded, skipped or failed
+frame leaves the epoch pending and <code>locked</code> withheld. The blank itself satisfies
+the barrier, so a slow or absent client lock surface never delays a frame that
+is actually presented.</p>
+<p>Live KMS uses the corresponding atomic-display authority boundary. The renderer
+captures the security epoch when it acquires the output image, carries the exact
+output key and render generation through the submission, and acknowledges it
+only when atomic presentation returns <code>Displayed</code>. <code>OutputReady</code>, an enqueued
+frame, a frame-clock pulse, cancellation and a failed commit are not security
+presentation evidence. Every output in the epoch must report its exact current
+generation before <code>locked</code> is sent.</p>
+<p>Lock ownership lives on the Wayland protocol thread and is independent of DRM,
+seat and VT authority. Losing authority never unlocks: <code>Locking</code>, <code>Locked</code> and
+<code>OrphanedLocked</code> survive the pause. Resume creates a fresh epoch, installs the
+opaque lock scene before the output becomes usable, and withholds client frame
+callbacks and physical input until that epoch is displayed. Before selecting
+its resume policy, the coordinator asks the protocol thread whether <code>Locking</code>,
+<code>Locked</code> or <code>OrphanedLocked</code> is active. Any active lock disables seamless
+resume on every output: the retained pre-pause framebuffer is discarded rather
+than page-flipped, and the first submitted frame after authority returns is a
+freshly rendered opaque lock surface or black fallback. A lock output with no
+current lock surface remains black. Unlock received while paused changes the
+protocol state exactly once but keeps the black scene and input gate in place;
+after authority returns, the compositor displays an ordinary-scene epoch before
+restoring focus, input and normal client delivery.
+Keys, pointer buttons, scroll sequences and touches held by the lock scene are
+ended before its surfaces are retired. Input arriving behind the display gate
+is quarantined until its matching physical release, so no held gesture or
+release crosses into the restored ordinary focus.</p>
+<p>The live KMS <code>Ctrl-Alt-F1</code> through <code>Ctrl-Alt-F12</code> bindings are evaluated before
+the presentation gate. They are compositor-only and never reach a Wayland
+client; every other key, pointer and touch event remains gated until secure
+presentation completes. Gated key presses advance Smithay's private XKB state
+so the VT chord can be recognised. If the presentation barrier opens before a
+matching release, quarantine still feeds that release through the same
+intercepted XKB path while suppressing client delivery; pressed keys and
+modifiers therefore cannot leak across the barrier. Physical key releases
+matching a synthetic pause release are quarantined by device and keycode, and
+pause clears both physical and suppressed touch-slot state.</p>
+<p>An output removed or replaced while locked does not change lock ownership. Its
+exact Smithay <code>(output, lock-surface, lock)</code> registration is retired, and a new
+output starts with the compositor-owned black scene until the lock client maps a
+new surface through the normal <code>wl_output</code> lifecycle. The KMS transition logs
+stable harness markers: <code>session-lock-kms-resume-blank-first</code>,
+<code>session-lock-kms-normal-exposure-held</code>,
+<code>session-lock-kms-{initial,resume,unlock}-epoch-displayed</code>, and
+<code>session-lock-kms-normal-exposure-restored</code>. The actual display path also emits
+exactly one marker for each output's first successful flip after resume:
+<code>session-lock-kms-resume-first-flip scene=&lt;lock|blank|retained|client&gt; output=&lt;key&gt; epoch=&lt;presentation-epoch|none&gt; generation=&lt;generation&gt;</code>. A locked
+resume is valid only with <code>lock</code> or <code>blank</code> and the epoch announced by that
+resume; <code>retained</code>, <code>client</code>, an absent epoch or a mismatched epoch are
+fail-closed evidence of exposure.</p>
+<p>The private <code>desk_vt_run.mix --arm session-lock-vt</code> arm brackets a real VT run
+with the existing recovery timer and snapshots. It launches the release
+<code>cosmix-lock-probe</code>, which creates a solid SHM lock surface for each output and
+prints <code>COSMIX_LOCK_PROBE checkpoint=...</code> records, then proves initial lock,
+VT away/back blank-first resume, delayed normal exposure and displayed-epoch
+unlock. It requires the safe per-output first-flip marker and requests a KMS
+texture-view PNG through the compositor's SIGUSR1 frame-capture path; the image
+must contain only the solid lock colour or black fallback. The arm scopes
+resume markers after a journal cursor captured while away and matches
+the resume-start epoch as well as the output. It accepts the probe's terminal
+unlock markers after either an active observation or an exact successful exit;
+mid-run lock markers still require the probe to be alive. The arm is
+intentionally a manual hardware gate; ordinary development only builds the
+helper and lints the script.</p>
+<p>Each physical output accepts one lock surface for the current generation.
+Its first configure is immediate and exactly matches the logical output; a
+buffer may map only after acknowledging the current configure and must have
+the acknowledged dimensions. Every responding commit is checked against its
+effective buffer: an empty first commit is a null-buffer error, while an empty
+commit after resize revalidates the retained buffer against the new size. A
+surface with any earlier attach or commit history cannot become a lock surface.
+Lock surfaces and their subsurface trees receive input above any Exclusive
+layer. Ordinary surfaces may continue committing, but receive no renderer
+publication, frame callbacks, focus or input until unlock. Lock entry also
+purges ordinary deltas already queued for the renderer. Unlock or a pre-locked
+abort sends complete upserts for every presentable surface, so unchanged static
+windows are recreated as well as listed in the roster.</p>
+<p>Entering <code>Locking</code> dismisses popups, ends pointer and drag-and-drop grabs,
+cancels touch, reconciles pressed keys, hides the client cursor, clears
+data-device focus and suppresses ordinary compositor bindings. The KMS VT
+switch binding remains the sole exception. Foreign-toplevel handles close at
+entry and neither update nor replay while locked; unlock reannounces mapped
+toplevels with the same identifiers. Physical input still resets idle
+notifications. If the owner dies before <code>locked</code>, locking aborts. If it dies
+after <code>locked</code>, the compositor becomes orphan-locked, removes the dead lock
+surfaces and retains the opaque blank while swallowing input. Blank-only areas
+and holes in a lock surface's input region swallow pointer, keyboard and touch;
+the compositor does not scan hidden window chrome there, start move/resize or
+caption-button grabs, dispatch close, or reveal a chrome cursor.</p>
+<p>The global is deliberately advertised to every connected client: any client
+may request the lock. The accepted generation is nevertheless bound to the
+exact <code>ext_session_lock_v1</code> resource, so a rejected object from the same client
+cannot create surfaces or unlock it. Destroying the accepted resource during
+<code>Locking</code> aborts safely. An orphaned lock never auto-unlocks and persists until
+the compositor exits.</p>
+<h2 id="vendored-changes">Vendored changes</h2>
+<p>The vendored Smithay layer-surface handle has an additive <code>reset_after_unmap</code>
+helper so the compositor can clear Smithay's private configure queue while
+applying layer-shell's protocol-mandated post-unmap state reset. Smithay's
+<code>CompositorHandler</code> also has an additive <code>transaction_applied</code> callback so
+pointer hit testing can observe one complete synchronized-surface transaction
+instead of each surface's intermediate state. Its pointer handle has one
+additive no-focus-restore grab teardown used when a grabbed surface disappears
+inside that transaction, preventing stale cached focus from being replayed
+before the final hit test.
+Smithay's foreign-toplevel list has one additive constructor accepting a
+compositor-provided identifier. This lets the identifier include Cosmix's
+surface identity, mapping generation and an unpredictable per-compositor
+instance nonce while protocol dispatch and replay remain entirely delegated
+to Smithay.
+Smithay's session-lock surface has an additive serial-returning configure
+method. This lets the common Cosmix configure gate record the exact immediate
+and resize serials while Smithay's default initial send observes that the
+pending state was already consumed and does not duplicate it. Its session-lock
+handler also has additive originating-lock, lock-object destruction,
+lock-surface destruction and construction-history hooks. These bind surface
+creation and <code>Locking</code> lifetime to the accepted resource while letting Cosmix's
+attach/commit ledger enforce <code>AlreadyConstructed</code>.
+The session-lock registry also exposes a narrow exact-surface retirement helper
+for KMS output replacement; it removes only the originating protocol object and
+does not alter the accepted lock generation.</p>
+<p>Smithay's <code>X11Surface</code> has one additive test-support setter
+(<code>set_wl_surface_offline</code>) that assigns the associated <code>wl_surface</code> directly.
+The xwayland-shell serial handshake owns the real association; the setter
+exists only so the compositor's deterministic tests can fabricate offline
+X11 surfaces whose focus forwarding and metadata lookups still reach a real
+<code>wl_surface</code>.</p>
+<p>The vendored session-lock implementation also carries five marked fixes:</p>
+<ul>
+<li>invalid <code>unlock_and_destroy</code> returns after posting <code>InvalidUnlock</code>, so a
+rejected object cannot fall through to the compositor's unlock handler;</li>
+<li>a valid <code>unlock_and_destroy</code> consumes its locked state before calling the
+compositor, so the unlock transition can occur only once even while visible
+restoration is deferred across a VT pause;</li>
+<li><code>AlreadyConstructed</code> validation happens before the output is inserted into
+Smithay's duplicate registry, preventing failed constructions from leaking
+entries; and</li>
+<li>each output registration records its owning lock-surface and lock object, so
+abort retires only that generation and a stale destructor cannot erase a
+newer generation's registration; and</li>
+<li>commit validation tracks the effective retained buffer, rejecting null first
+commits and stale-sized buffers after a newly acknowledged resize.</li>
+</ul>
+<p>The associated output resource is retained until lock-surface destruction,
+valid unlock or generation abort so Smithay's resource duplicate registry and
+Cosmix's physical-output ownership map are both released while the
+compositor-owned blank remains.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +1259,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1313,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1442,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/mix-bench/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,137 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/mix-bench/README.md"><div class="prose"><h1 id="mix-bench">mix-bench</h1>
+<p><code>mix-bench</code> is the standalone correctness and performance metric harness for the Mix evaluator. Within the <code>bus &lt;- mix &lt;- cos</code> dependency chain, it sits in the Mix layer: it depends directly on <code>cosmix-lib-mix</code>, installs a mock <code>BusHandler</code> for one test policy, and has no direct Cos dependency or live Bus transport.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>Run the package from the source workspace:</p>
+<pre><code class="language-text">cargo run --release -p mix-bench
+</code></pre>
+<p>The harness locates the sibling <code>cosmix-lib-mix/tests/scripts/</code> directory,
+changes its working directory to <code>cosmix-lib-mix</code>, and runs two phases:</p>
+<ol>
+<li>Check every <code>*.mix</code> script in the test-script directory for correct output.</li>
+<li>Time a fixed corpus of synthetic programs and replayed test scripts.</li>
+</ol>
+<p>The final standard-output line is:</p>
+<pre><code class="language-text">score: &lt;milliseconds&gt;
+</code></pre>
+<p>Lower scores are better.</p>
+<h2 id="metric">Metric</h2>
+<p>The score is:</p>
+<pre><code class="language-text">bench_ms + failed_tests * 60000
+</code></pre>
+<p><code>bench_ms</code> measures only the timed benchmark phase. The correctness phase is
+timed for diagnostics but its duration does not enter the score.</p>
+<p>Each failed correctness script adds 60,000 points. A correctness failure does
+not stop the benchmark phase.</p>
+<h2 id="correctness-corpus">Correctness corpus</h2>
+<p>The harness discovers and sorts every file ending in <code>.mix</code> under
+<code>cosmix-lib-mix/tests/scripts/</code>.</p>
+<p>Each script declares expected standard output in a comment block:</p>
+<pre><code class="language-text">-- Expected output:
+-- first line
+-- second line
+</code></pre>
+<p>An expected-output line starts with <code>-- </code>. A line containing only <code>--</code>
+represents an empty output line. The block ends at the first line with another
+form.</p>
+<p>A script fails when:</p>
+<ul>
+<li>its source cannot be read;</li>
+<li>it has no expected-output block;</li>
+<li>lexing, parsing, or evaluation fails;</li>
+<li>the number of output lines differs; or</li>
+<li>an output line differs byte for byte.</li>
+</ul>
+<p>Trailing newline characters are removed from captured output before comparison.
+Other whitespace remains significant.</p>
+<h2 id="evaluator-policies">Evaluator policies</h2>
+<p>Every run creates a fresh <code>Lexer</code>, <code>Parser</code>, and <code>Evaluator</code>. Standard output
+and standard error are captured in <code>SharedBuf</code> values, so script execution is
+non-interactive.</p>
+<p>The evaluator recursion limit is set to 512. Other evaluation limits retain
+their defaults.</p>
+<p>Most scripts use the plain evaluator policy. Two filenames select additional
+setup:</p>
+<table><thead><tr><th>Script</th><th>Policy</th><th>Added capability</th></tr></thead><tbody>
+<tr><td><code>extensions.mix</code></td><td>Extensions</td><td>Registers <code>add_numbers</code>, <code>greet</code>, and <code>get_list</code></td></tr>
+<tr><td><code>send.mix</code></td><td>Bus</td><td>Installs the mock Bus handler</td></tr>
+</tbody></table>
+<p>The extension functions provide deterministic in-process values:</p>
+<ul>
+<li><code>add_numbers</code> converts its first two arguments to numbers and adds them;</li>
+<li><code>greet</code> returns <code>hello from </code> followed by its first argument; and</li>
+<li><code>get_list</code> returns the strings <code>alpha</code>, <code>bravo</code>, and <code>charlie</code>.</li>
+</ul>
+<p>The mock Bus handler performs no network activity. Its <code>send</code> implementation
+returns status <code>0</code> and a deterministic string value, <code>emit</code> succeeds,
+<code>port_exists</code> returns true, and <code>next_incoming</code> returns no event.</p>
+<h2 id="timed-corpus">Timed corpus</h2>
+<p>The synthetic corpus exercises interpreter hot paths:</p>
+<table><thead><tr><th>Label</th><th>Workload</th><th style="text-align: right">Iterations</th></tr></thead><tbody>
+<tr><td><code>fib</code></td><td>Recursive <code>fib(22)</code></td><td style="text-align: right">8</td></tr>
+<tr><td><code>loop_arith</code></td><td>Numeric loop and arithmetic</td><td style="text-align: right">1</td></tr>
+<tr><td><code>list_build</code></td><td>List construction and traversal</td><td style="text-align: right">1</td></tr>
+<tr><td><code>hofs</code></td><td><code>map</code>, <code>filter</code>, and <code>reduce</code></td><td style="text-align: right">2</td></tr>
+<tr><td><code>strings</code></td><td>String concatenation and search</td><td style="text-align: right">1</td></tr>
+<tr><td><code>table</code></td><td>Table insertion, key traversal, and lookup</td><td style="text-align: right">1</td></tr>
+</tbody></table>
+<p>The harness also replays a fixed set of test scripts 50 times each:</p>
+<pre><code class="language-text">variables.mix       strings.mix         control.mix
+loops.mix           functions.mix       lists.mix
+list_hofs.mix       lambdas.mix         slicing.mix
+printf.mix          tables.mix          terminators.mix
+parse.mix           json.mix            jsonl.mix
+labels.mix          continue_for_each.mix
+</code></pre>
+<p>An unreadable replay script is skipped. A lexing, parsing, or evaluation error
+in a synthetic or replay workload stops the harness with exit status <code>3</code>.</p>
+<p>Timing uses wall-clock elapsed time. Per-workload timings and the total are
+diagnostics rather than a stable machine-independent performance baseline.</p>
+<h2 id="command-line-surface">Command-line surface</h2>
+<p><code>mix-bench</code> has no subcommands and no configuration file or environment-variable
+surface.</p>
+<p>The <code>--json</code> argument is accepted for invocation compatibility, but the harness
+does not emit JSON. All command-line arguments are currently collected and
+otherwise ignored.</p>
+<h2 id="output">Output</h2>
+<p>Progress and diagnostics go to standard error. They include:</p>
+<ul>
+<li>correctness corpus size;</li>
+<li>individual correctness failures;</li>
+<li>passed and failed totals;</li>
+<li>elapsed time for each synthetic and replay workload;</li>
+<li>total benchmark milliseconds; and</li>
+<li>the raw <code>failed_tests</code> and <code>bench_ms</code> components.</li>
+</ul>
+<p>Standard output contains only the final score line during a normal run.</p>
+<h2 id="exit-status">Exit status</h2>
+<table><thead><tr><th style="text-align: right">Status</th><th>Meaning</th></tr></thead><tbody>
+<tr><td style="text-align: right"><code>0</code></td><td>Both phases complete, including runs with correctness failures</td></tr>
+<tr><td style="text-align: right"><code>2</code></td><td>The harness cannot enter the Mix library directory or find the script corpus</td></tr>
+<tr><td style="text-align: right"><code>3</code></td><td>A timed synthetic or replay workload fails</td></tr>
+<tr><td style="text-align: right">Other non-zero</td><td>The process panics or encounters another unhandled failure</td></tr>
+</tbody></table>
+<h2 id="workspace-discovery">Workspace discovery</h2>
+<p>The preferred lookup starts at the compile-time package directory and checks
+for the sibling <code>cosmix-lib-mix/tests/scripts/</code> tree.</p>
+<p>If that lookup fails, the harness walks upwards from its current working
+directory. It selects the first directory containing that same tree. If no
+match exists, later setup fails with exit status <code>2</code>.</p>
+<p>The benchmark therefore targets a Mix source workspace. It is not a general
+script runner or an installed-system benchmark.</p>
+<h2 id="package-dependencies">Package dependencies</h2>
+<table><thead><tr><th>Dependency</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>cosmix-lib-mix</code></td><td>Lexer, parser, evaluator, values, extension adapter, evaluation limits, and Bus handler interface</td></tr>
+<tr><td><code>tokio</code></td><td>Current-thread asynchronous entry point and runtime support</td></tr>
+</tbody></table>
+<p>The package enables the Mix library's <code>json</code>, <code>regex</code>, <code>toml</code>, <code>datetime</code>,
+<code>url</code>, <code>crypto</code>, <code>sqlite</code>, and <code>tokio-sleep</code> features so the discovered script
+corpus runs with those builtins available.</p>
+<p><code>mix-bench</code> declares no package-specific Cargo features and exposes no Rust
+library API.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +749,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +803,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +932,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

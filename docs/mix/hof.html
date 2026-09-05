@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/hof</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,325 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/hof.md"><div class="prose"><h1 id="hof--higher-order-functions">hof — higher-order functions</h1>
+<p>The <code>hof</code> builtin category — twelve functions that take a <strong>function value</strong> as an
+argument and run it over a list: <code>map</code>, <code>filter</code>, <code>reduce</code>, <code>sort_by</code>, <code>any</code>, <code>all</code>,
+<code>count</code>, <code>min_by</code>, <code>max_by</code>, <code>sum_by</code>, <code>group_by</code>, <code>unique_by</code>. They are the idiom for
+transforming and querying lists in Mix — reach for one of these instead of a
+hand-rolled <code>for each … push … end</code> loop whenever the body produces a value.</p>
+<p>List them live with <code>mix builtins hof</code>; one-line help for any single name with
+<code>mix what NAME</code>.</p>
+<pre><code class="language-text">$ mix builtins hof
+hof builtins:
+  sort_by         Return list sorted ascending by key function (stable) (v0.2.0)
+  filter          Return new list of items where predicate returns truthy (v0.2.0)
+  map             Return new list of transform(item) results (v0.2.0)
+  reduce          Fold list left with an explicit init: reduce($xs, $init, function($a, $b) = ...) (v0.2.0)
+  any             Short-circuit: true if any item matches predicate (v0.2.0)
+  all             Short-circuit: true if every item matches predicate (v0.2.0)
+  count           Count items where predicate returns truthy (v0.2.0)
+  min_by          Return the ITEM (not the key) with minimum key-function value (v0.2.0)
+  max_by          Return the ITEM with maximum key-function value (v0.2.0)
+  sum_by          Sum of key(item) across all items, returns number (v0.2.0)
+  group_by        Map of stringified-key → list of items (first-seen key order) (v0.2.0)
+  unique_by       Dedup list by key function, first occurrence wins (v0.2.0)
+</code></pre>
+<h2 id="the-lambda-argument--how-to-pass-a-function">The lambda argument — how to pass a function</h2>
+<p>Every HOF takes a list and a <a href="/mix/functions">function value</a>. The function is <em>called
+per element</em>; Mix runs it on each item and collects/folds the results. There are three
+ways to supply that function, and the rules matter — getting them wrong is the most
+common HOF mistake.</p>
+<h3 id="1-terse-inline-lambda-fnx--expr--the-everyday-form">1. Terse inline lambda <code>fn($x) = expr</code> — the everyday form</h3>
+<p>A single-expression lambda needs no <code>return</code> and no <code>end</code>. This is what you reach for
+99% of the time:</p>
+<pre><code class="language-mix">$xs = [1, 2, 3, 4]
+print(map($xs, fn($x) = $x * $x))
+</code></pre>
+<pre><code class="language-text">[1, 4, 9, 16]
+</code></pre>
+<p><code>fn</code> is just a short alias for <code>function</code> (see <a href="/mix/functions">functions</a>); <code>fn($x) = expr</code>
+and <code>function($x) return expr end</code> are the same thing.</p>
+<p>A <strong>branch fits in a terse lambda</strong> — the ternary <code>cond ? a : b</code> and the
+<code>if … then … else … end</code> <em>expression</em> (see <a href="/mix/control-flow">control-flow</a>) are both
+value-producing, so no block body is needed for a simple conditional:</p>
+<pre><code class="language-mix">print(map([-1, 0, 5], fn($n) = $n &gt; 0 ? "pos" : "nonpos"))
+print(map([-1, 0, 5], fn($n) = if $n &gt; 0 then "pos" else "nonpos" end))
+</code></pre>
+<pre><code class="language-text">[nonpos, nonpos, pos]
+[nonpos, nonpos, pos]
+</code></pre>
+<h3 id="2-a-named-function-cannot-be-passed-by-bare-name">2. A named function CANNOT be passed by bare name</h3>
+<p>A bareword is parsed as a <strong>string</strong>, not a function reference — so <code>map($xs, triple)</code>
+fails:</p>
+<pre><code class="language-mix">function triple($x) return $x * 3 end
+print(map([1, 2, 3], triple))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 2: map: expected function, got string
+</code></pre>
+<p>Wrap it in a lambda (which <em>is</em> an expression that evaluates to a function value) —
+inline is fine, since the wrapper is a single expression:</p>
+<pre><code class="language-mix">function triple($x) return $x * 3 end
+print(map([1, 2, 3], fn($x) = triple($x)))
+</code></pre>
+<pre><code class="language-text">[3, 6, 9]
+</code></pre>
+<h3 id="3-a-multi-statement-lambda-must-be-var-bound-first">3. A multi-statement lambda must be VAR-BOUND first</h3>
+<p>An open call-paren breaks statement separation, so a lambda with a body of more than one
+statement does <strong>not</strong> parse inline inside <code>map(...)</code>:</p>
+<pre><code class="language-mix">print(map([1, 2], function($x)
+  $y = $x * 2
+  return $y
+end))
+</code></pre>
+<pre><code class="language-text">Parse error at line 3:3: expected end of statement, got Return
+</code></pre>
+<p>Bind it to a variable, then pass the variable:</p>
+<pre><code class="language-mix">$probe = function($x)
+  $y = $x * $x
+  return $y + 1
+end
+print(map([1, 2, 3], $probe))
+</code></pre>
+<pre><code class="language-text">[2, 5, 10]
+</code></pre>
+<p>A simple branch does <strong>not</strong> need this — the ternary and the <code>if</code>-expression fit in a
+terse <code>fn($x) = …</code> body (form 1 above). Var-binding is for bodies that genuinely need
+several <em>statements</em>: sequencing intermediate assignments, a loop, <code>try/catch</code>, or a
+<code>send</code> followed by reading <code>$rc</code>. A block body needs an explicit <code>return</code> — it does
+not implicitly return its last value (a <code>function($x) $x * $x end</code> body returns <code>nil</code>;
+see <a href="/mix/functions">functions</a>).</p>
+<h3 id="lambdas-are-closures">Lambdas are closures</h3>
+<p>A lambda captures the scope where it is defined, so it can read outer variables:</p>
+<pre><code class="language-mix">$factor = 10
+print(map([1, 2, 3], fn($x) = $x * $factor))
+</code></pre>
+<pre><code class="language-text">[10, 20, 30]
+</code></pre>
+<p>(A closure can <em>read</em> captured state but a <code>$x = …</code> write inside binds a function-local
+and does not propagate out — thread state via <code>return</code>. See
+<a href="/mix/functions">functions</a> for the full by-value / return-to-escape rules.)</p>
+<h2 id="map--transform-every-element">map — transform every element</h2>
+<p><code>map(list, fn)</code> returns a <strong>new list</strong> of <code>fn(item)</code> for each item, same length, same
+order. It does not mutate the input.</p>
+<pre><code class="language-mix">print(map([1, 2, 3, 4], fn($x) = $x * $x))
+print(map(["a", "b", "c"], fn($s) = $s .. "!"))
+print(map([], fn($x) = $x))
+</code></pre>
+<pre><code class="language-text">[1, 4, 9, 16]
+[a!, b!, c!]
+[]
+</code></pre>
+<p>Pull one field out of a list of maps:</p>
+<pre><code class="language-mix">$nodes = [{name: "alpha", up: true}, {name: "beta", up: false}]
+print(map($nodes, fn($n) = $n["name"]))
+</code></pre>
+<pre><code class="language-text">[alpha, beta]
+</code></pre>
+<h2 id="filter--keep-the-elements-a-predicate-accepts">filter — keep the elements a predicate accepts</h2>
+<p><code>filter(list, pred)</code> returns a new list of the items for which <code>pred(item)</code> is <strong>truthy</strong>
+(non-nil, non-false, non-zero, non-empty). Order is preserved.</p>
+<pre><code class="language-mix">print(filter([1, 2, 3, 4, 5, 6], fn($x) = $x &gt; 3))
+</code></pre>
+<pre><code class="language-text">[4, 5, 6]
+</code></pre>
+<p>Filter maps, then map to a field — the standard "names of the down nodes" one-liner:</p>
+<pre><code class="language-mix">$nodes = [{name: "alpha", up: true}, {name: "beta", up: false}, {name: "gamma", up: true}]
+$down = filter($nodes, fn($n) = not $n["up"])
+print(map($down, fn($n) = $n["name"]))
+</code></pre>
+<pre><code class="language-text">[beta]
+</code></pre>
+<h2 id="reduce--fold-a-list-to-a-single-value">reduce — fold a list to a single value</h2>
+<p><code>reduce(list, init, fn($acc, $item))</code> folds <strong>left</strong>: it starts the accumulator at the
+explicit <code>init</code>, then for each item computes <code>$acc = fn($acc, $item)</code>. Note the argument
+order — list, <strong>then init</strong>, then the combiner — and the combiner takes
+<code>(accumulator, item)</code> in that order.</p>
+<pre><code class="language-mix">print(reduce([1, 2, 3, 4], 0, fn($a, $b) = $a + $b))
+print(reduce([1, 2, 3, 4, 5], 1, fn($a, $b) = $a * $b))
+print(reduce(["a", "b", "c"], "", fn($acc, $x) = $acc .. $x))
+</code></pre>
+<pre><code class="language-text">10
+120
+abc
+</code></pre>
+<p><code>init</code> is mandatory — there is no two-argument <code>reduce</code>:</p>
+<pre><code class="language-mix">print(reduce([1, 2, 3], fn($a, $b) = $a + $b))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: reduce: expects 3 args, got 2
+</code></pre>
+<p>Folding an <strong>empty list</strong> returns <code>init</code> unchanged (<code>reduce([], 42, …)</code> → <code>42</code>).</p>
+<p>For a plain numeric total you usually want <code>sum_by</code> (below). Reach for <code>reduce</code> when the
+accumulator type differs from the element type (building a string, a map, a running max).</p>
+<h2 id="sort_by--stable-sort-by-a-key-function">sort_by — stable sort by a key function</h2>
+<p><code>sort_by(list, key_fn)</code> returns a new list sorted <strong>ascending</strong> by <code>key_fn(item)</code>. The
+key is computed once per element (cached), and the sort is <strong>stable</strong> — items with equal
+keys keep their original relative order.</p>
+<pre><code class="language-mix">print(sort_by([3, 1, 2], fn($x) = $x))
+print(sort_by(["banana", "apple", "cherry"], fn($s) = $s))
+print(sort_by(["ccc", "a", "bb"], fn($s) = length($s)))
+</code></pre>
+<pre><code class="language-text">[1, 2, 3]
+[apple, banana, cherry]
+[a, bb, ccc]
+</code></pre>
+<p>Sorting a list of maps by a field is the workhorse use:</p>
+<pre><code class="language-mix">$rows = [{name: "b", port: 80}, {name: "a", port: 443}, {name: "c", port: 22}]
+$sorted = sort_by($rows, fn($r) = $r["port"])
+for each $r in $sorted
+  print($r["name"] .. " " .. $r["port"])
+end
+</code></pre>
+<pre><code class="language-text">c 22
+b 80
+a 443
+</code></pre>
+<p>Key comparison: numbers compare numerically, strings lexicographically by codepoint,
+bools <code>false</code> before <code>true</code>, <code>nil</code> sorts before everything; a genuinely mixed set of keys
+falls back to string comparison so the sort stays total (it never panics). To sort
+<strong>descending</strong>, negate a numeric key (<code>fn($r) = -$r["port"]</code>) or <code>reverse()</code> the result.</p>
+<h2 id="any--all--count--predicate-queries">any / all / count — predicate queries</h2>
+<p><code>any(list, pred)</code> short-circuits to <code>true</code> on the first match; <code>all(list, pred)</code> short-circuits
+to <code>false</code> on the first miss; <code>count(list, pred)</code> returns how many items match. All three
+test for <strong>truthiness</strong>.</p>
+<pre><code class="language-mix">print(any([1, 2, 3], fn($x) = $x &gt; 2))
+print(all([2, 4, 6], fn($x) = $x &gt; 1))
+print(count([1, 2, 3, 4, 5], fn($x) = $x &gt; 2))
+</code></pre>
+<pre><code class="language-text">true
+true
+3
+</code></pre>
+<p>Empty-list conventions follow standard logic — <code>any([])</code> is <code>false</code> (no match exists),
+<code>all([])</code> is <code>true</code> (vacuously, no counterexample):</p>
+<pre><code class="language-mix">print(any([], fn($x) = true))
+print(all([], fn($x) = false))
+</code></pre>
+<pre><code class="language-text">false
+true
+</code></pre>
+<p><code>count</code> with any truthy test — here, non-empty strings:</p>
+<pre><code class="language-mix">print(count(["", "x", "", "y"], fn($s) = not is_empty($s)))
+</code></pre>
+<pre><code class="language-text">2
+</code></pre>
+<h2 id="min_by--max_by--the-extreme-item">min_by / max_by — the extreme ITEM</h2>
+<p><code>min_by(list, key_fn)</code> and <code>max_by(list, key_fn)</code> return the <strong>item</strong> (not the key) whose
+<code>key_fn</code> value is smallest / largest. This is the point of the <code>_by</code> suffix — you get the
+whole record back, no second lookup needed.</p>
+<pre><code class="language-mix">$rows = [{n: "b", p: 80}, {n: "a", p: 443}, {n: "c", p: 22}]
+$lo = min_by($rows, fn($r) = $r["p"])
+$hi = max_by($rows, fn($r) = $r["p"])
+print($lo["n"] .. " " .. $lo["p"])
+print($hi["n"] .. " " .. $hi["p"])
+</code></pre>
+<pre><code class="language-text">c 22
+a 443
+</code></pre>
+<p>On a <strong>tie</strong>, the first item with the extreme key wins — both <code>min_by</code> and <code>max_by</code>
+replace the running best only on a strictly smaller/larger key.</p>
+<p>An empty list returns <code>nil</code>:</p>
+<pre><code class="language-mix">print(min_by([], fn($x) = $x))
+</code></pre>
+<pre><code class="language-text">nil
+</code></pre>
+<h2 id="sum_by--numeric-total-of-a-key">sum_by — numeric total of a key</h2>
+<p><code>sum_by(list, key_fn)</code> adds up <code>key_fn(item)</code> across the list and returns a <strong>number</strong>.
+It is the right tool for "total of a field" — clearer than a <code>reduce</code>.</p>
+<pre><code class="language-mix">$rows = [{p: 80}, {p: 443}, {p: 22}]
+print(sum_by($rows, fn($r) = $r["p"]))
+</code></pre>
+<pre><code class="language-text">545
+</code></pre>
+<p>The key function must return something numeric — a non-number key <strong>raises</strong>:</p>
+<pre><code class="language-mix">print(sum_by([{n: "x"}], fn($r) = $r["n"]))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: sum_by: key function returned non-number: string
+</code></pre>
+<p>"Numeric" follows Mix's usual coercion: a numeric <strong>string</strong> (<code>"5"</code>) and a bool
+(<code>true</code> = 1) sum fine — <code>sum_by(["5", "6"], fn($x) = $x)</code> is <code>11</code>. Coercion is strict:
+<code>"inf"</code> / <code>"nan"</code> / <code>"1e999"</code> are <strong>not</strong> numeric strings and raise. An empty list
+sums to <code>0</code>.</p>
+<h2 id="group_by--bucket-by-a-key">group_by — bucket by a key</h2>
+<p><code>group_by(list, key_fn)</code> returns a <strong>map</strong> of <code>key → list of items</code>. The key is
+<strong>stringified</strong> (it becomes a map key), and the buckets are in <strong>first-seen key order</strong>
+(backed by an insertion-ordered map), so iterating the result is stable.</p>
+<pre><code class="language-mix">$people = [{name: "al", team: "red"}, {name: "bo", team: "blue"}, {name: "cy", team: "red"}]
+print(group_by($people, fn($p) = $p["team"]))
+</code></pre>
+<pre><code class="language-text">{red: [{name: al, team: red}, {name: cy, team: red}], blue: [{name: bo, team: blue}]}
+</code></pre>
+<p>Because the key is stringified, a numeric key works too:</p>
+<pre><code class="language-mix">print(group_by([1, 2, 3, 4, 5, 6], fn($x) = $x % 2))
+</code></pre>
+<pre><code class="language-text">{1: [1, 3, 5], 0: [2, 4, 6]}
+</code></pre>
+<p>For a labelled even/odd grouping, branch with a ternary right in the terse lambda:</p>
+<pre><code class="language-mix">print(group_by([1, 2, 3, 4, 5, 6], fn($x) = ($x % 2) == 0 ? "even" : "odd"))
+</code></pre>
+<pre><code class="language-text">{odd: [1, 3, 5], even: [2, 4, 6]}
+</code></pre>
+<p>An empty list groups to the empty map <code>{}</code>.</p>
+<h2 id="unique_by--dedup-first-occurrence-wins">unique_by — dedup, first occurrence wins</h2>
+<p><code>unique_by(list, key_fn)</code> removes later items whose stringified <code>key_fn</code> value has already
+been seen. The <strong>first</strong> occurrence of each key is kept, in original order.</p>
+<pre><code class="language-mix">print(unique_by([1, 2, 2, 3, 3, 3, 1], fn($x) = $x))
+</code></pre>
+<pre><code class="language-text">[1, 2, 3]
+</code></pre>
+<p>Dedup a list of maps by a field (e.g. unique by email, keeping the first row seen —
+row 3 duplicates row 1's email and is dropped):</p>
+<pre><code class="language-mix">$rows = [{id: 1, email: "a@example.com"}, {id: 2, email: "b@example.com"}, {id: 3, email: "a@example.com"}]
+$uniq = unique_by($rows, fn($r) = $r["email"])
+print(map($uniq, fn($r) = $r["id"]))
+</code></pre>
+<pre><code class="language-text">[1, 2]
+</code></pre>
+<h2 id="composing--chain-them-like-a-pipeline">Composing — chain them like a pipeline</h2>
+<p>HOFs return plain lists / numbers / maps, so they chain by binding each stage to a
+variable. There is no pipe operator — the variable <em>is</em> the pipe.</p>
+<pre><code class="language-mix">$xs = [1, 2, 3, 4, 5, 6]
+$doubled = map($xs, fn($x) = $x * 2)
+$big = filter($doubled, fn($x) = $x &gt; 5)
+$total = reduce($big, 0, fn($a, $b) = $a + $b)
+print($total)
+</code></pre>
+<pre><code class="language-text">36
+</code></pre>
+<p>Nest a HOF inside a var-bound lambda to operate on a list of lists:</p>
+<pre><code class="language-mix">$grid = [[1, 2], [3, 4]]
+$dbl_row = function($row)
+  return map($row, fn($x) = $x * 2)
+end
+print(map($grid, $dbl_row))
+</code></pre>
+<pre><code class="language-text">[[2, 4], [6, 8]]
+</code></pre>
+<h2 id="notes--gotchas">Notes &amp; gotchas</h2>
+<ul>
+<li><strong><code>map</code>/<code>filter</code>/<code>sort_by</code>/<code>unique_by</code>/<code>group_by</code> return new collections;</strong> they never mutate the input list. (<code>reduce</code>/<code>sum_by</code>/<code>count</code>/<code>any</code>/<code>all</code> return a scalar; <code>min_by</code>/<code>max_by</code> return an item.)</li>
+<li><strong>First argument must be a list</strong> — passing a non-list raises (<code>map: expected list, got …</code>). To HOF over a <strong>map</strong>, go through <code>keys($m)</code> / <code>values($m)</code> (see <a href="/mix/collections">collections</a>). The function argument must be a function value (<code>expected function, got string</code> is the bareword-name mistake above). Arity is strict too — a surplus argument raises (<code>map: expects 2 args, got 3</code>).</li>
+<li><strong><code>reduce</code> takes three args</strong> — list, <strong>init</strong>, combiner — and the combiner is <code>fn($acc, $item)</code> in that order. Easy to misremember as two-arg or <code>(item, acc)</code>.</li>
+<li><strong><code>group_by</code> / <code>unique_by</code> keys are stringified.</strong> Two keys that print the same collapse into one bucket — fine for strings/numbers/bools, but the number <code>1</code> and the string <code>"1"</code> are the SAME key: <code>group_by([1, "1"], fn($x) = $x)</code> is <code>{1: [1, 1]}</code>.</li>
+<li><strong>Truthiness</strong> drives <code>filter</code>/<code>any</code>/<code>all</code>/<code>count</code>: a predicate returning <code>nil</code>, <code>false</code>, <code>0</code>, <code>""</code>, or <code>[]</code> counts as a miss; anything else is a hit.</li>
+<li><strong>An error inside the lambda aborts the HOF and propagates</strong> — a <code>map</code> over a list where one element makes the body raise (say, a division by zero) produces no partial result. Catch it with <code>try/catch</code> (see <a href="/mix/errors">errors</a>).</li>
+<li>Prefer a HOF over a <code>for each … push … end</code> loop for any value-producing body — it is the Mix idiom and avoids the <a href="/mix/functions"><code>push</code> returns nil / list-by-value</a> loop footguns. Use a bare <code>for each</code> only for pure side-effects (<code>print</code>, <code>send</code>).</li>
+<li>These twelve live in a separate evaluator-aware registry (they call back into Mix code), but to a script they are ordinary builtins — same call syntax, same <code>mix what</code> help.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/functions">functions</a> — <code>fn</code>/<code>function</code>, lambdas, closures, the by-value / return-to-escape rules HOF lambdas obey</li>
+<li><a href="/mix/control-flow">control-flow</a> — the ternary <code>?:</code> and <code>if</code>-expression that let a branch live in a terse lambda</li>
+<li><a href="/mix/collections">collections</a> — lists, maps, indexing, <code>push</code>/<code>length</code>/<code>join</code>, <code>keys</code>/<code>values</code></li>
+<li><a href="/mix/math">math</a> — numeric builtins (<code>min</code>/<code>max</code>/<code>floor</code>/<code>round</code>) that pair with the <code>_by</code> family</li>
+<li><a href="/mix/strings">strings</a> — string ops for <code>map</code>/<code>filter</code> over text</li>
+<li><a href="/mix/errors">errors</a> — <code>try/catch</code> for an error raised inside a HOF lambda</li>
+<li><a href="/mix/builtins">builtins index</a> — every builtin by category</li>
+</ul>
+<pre><code class="language-text">mix builtins hof      list every HOF with its one-line description
+mix what NAME         one-line description of a single builtin (e.g. mix what reduce)
+mix help              the full categorized builtin reference
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +937,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +991,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1120,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

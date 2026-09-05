@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/shell-mode</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,510 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/shell-mode.md"><div class="prose"><h1 id="shell-mode--shell-dispatch-mode">shell-mode — shell-dispatch mode</h1>
+<p>Mix is both a scripting language <strong>and</strong> a login shell. When you hand it a line
+that looks like a command rather than Mix code — <code>git status</code>, <code>ls -la | wc -l</code>,
+<code>make &amp;&amp; ./run</code> — it dispatches that line to the system the way a shell does:
+<code>&amp;&amp;</code> / <code>||</code> / <code>;</code> chaining, <code>|</code> pipes, brace expansion, <code>$(...)</code> command
+substitution, redirects. This is <strong>shell-dispatch mode</strong>, the shell half of the
+<code>mix -c</code> / login-shell contract.</p>
+<p>The whole point: a node that runs <code>/opt/cosmix/bin/mix</code> as root's login shell
+must still honour the universal <code>sh -c</code> contract — <code>ssh host 'hostname'</code> and
+<code>ssh host 'systemctl restart foo'</code> have to <em>just work</em>, while <code>print(1 + 1)</code> and
+every other Mix statement still evaluate as <a href="/mix/overview">Mix</a>. One classifier
+decides per line which world you are in.</p>
+<p>Since 0.31, <code>;</code> also separates <strong>Mix statements</strong> on a line classified as Mix
+(<code>$x = 1; print($x)</code>). Classification is still whole-line: shell-dispatch gives
+the glyph the command-list semantics documented here; executable Mix gives it
+the hard statement-boundary semantics documented in <a href="/mix/syntax">syntax</a>.
+It never switches languages midway. In particular, Mix permits <code>&amp;&amp;</code>/<code>||</code>
+continuation across a physical newline, but <code>;</code> always ends that chain.</p>
+<blockquote>
+<p><strong>One sentence to carry:</strong> shell-dispatch handles <strong>one command, a pipeline,
+or a <code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chain</strong> with bash-style brace expansion, <code>$(...)</code>, and
+redirects — it is <em>not</em> a full shell scripting language (no <code>for</code>/<code>while</code>/<code>if</code>
+shell constructs, no functions — those are <a href="/mix/control-flow">Mix</a>).</p>
+</blockquote>
+<p>The two-context split is the thing to internalise: <code>$(...)</code> and <code>{a,b}</code> are
+<strong>LIVE</strong> on a shell-dispatch line but <strong>LITERAL</strong> inside a Mix string. See
+<a href="/mix/shell-mode#the-two-context-split">The two-context split</a> below.</p>
+<h2 id="where-shell-dispatch-happens">Where shell-dispatch happens</h2>
+<p>Three entry points run the same classifier (<code>shell::classify_input</code>) and the
+same executor (<code>exec.rs</code>):</p>
+<pre><code>mix -c '&lt;line&gt;'         one-shot:  classify &lt;line&gt;, dispatch or evaluate
+mix -i -c '&lt;line&gt;'      as -c, but load ~/.mixrc first (aliases + PATH)
+&lt;the REPL prompt&gt;        every line you type interactively
+ssh host '&lt;line&gt;'        if mix is root's login shell there, host runs it as -c
+</code></pre>
+<p>An ordinary <code>.mix</code> script remains whole-file Mix. The narrow exception is an
+explicitly continued command line: its physical lines are spliced first, then
+the complete logical line is classified through the same shell-first path. This
+makes <code>echo one \</code> followed by <code>two</code> agree in a file, <code>-c</code>, and the REPL without
+turning every bareword in every script into a command.</p>
+<p>A login-shell node makes the last one transparent — <code>ssh host 'uptime'</code> is
+evaluated by mix, dispatches <code>uptime</code> to the system, and returns its output and
+exit code. Send Mix <em>source</em> when you want Mix behaviour; send a bare command
+when you want shell dispatch.</p>
+<blockquote>
+<p>Two <em>other</em> paths run commands but are <strong>not normally</strong> this classifier: the
+<a href="/mix/system"><code>run()</code> / <code>run_rc()</code></a> builtins always spawn <code>/bin/sh -c</code>
+(POSIX sh — no brace expansion there), and a <code>.mix</code> script file is parsed
+whole as Mix unless the explicit-command-continuation exception above applies.
+Backslashes inside a <code>run</code>/<code>sh</code> argument string stay untouched and belong to
+that real shell.</p>
+</blockquote>
+<p><code>source</code> first tries to parse the entire file as Mix, then falls back to
+classifying it line by line when that parse fails. An explicitly continued
+logical line classified as shell also forces this fallback, even if the
+half-joined text could have parsed as Mix arithmetic. Consequently, a file
+containing argument-less bareword command lists such as <code>ls; pwd</code> can parse as
+discarded Mix string expressions and do nothing; add command arguments to force
+the shell fallback, or write explicit Mix calls in a pure-Mix file. This is a
+known compatibility edge of whole-file-first sourcing.</p>
+<h2 id="the-classifier--shell-or-mix">The classifier — shell or Mix?</h2>
+<p>Each line is classified <strong>shell-first</strong> by its first word:</p>
+<table><thead><tr><th>First word is…</th><th>Goes to</th></tr></thead><tbody>
+<tr><td>a <a href="/mix/keywords">Mix keyword</a> head (<code>print</code>, <code>if</code>, <code>for</code>, <code>send</code>, <code>try</code>, …)</td><td>Mix (with a shell-chain fallback)</td></tr>
+<tr><td>a <code>$</code>-led line (<code>$x = 1</code>)</td><td>Mix (with a shell-chain fallback)</td></tr>
+<tr><td>a shell builtin (<code>cd</code>, <code>exit</code>, <code>which</code>, <code>mix</code>, …)</td><td>shell dispatch</td></tr>
+<tr><td>a <strong>defined <a href="/mix/functions">function</a></strong> invoked bareword (<code>sc restart nginx</code>)</td><td>Mix — a command-style call <code>sc("restart", "nginx")</code></td></tr>
+<tr><td>a tight-hyphenated command head (<code>cosmix-comp</code>, <code>systemd-nspawn</code>)</td><td>shell dispatch, even when missing from <code>$PATH</code>; a missing command reports its complete name</td></tr>
+<tr><td>found on <code>$PATH</code>, or an absolute/relative path</td><td>shell dispatch</td></tr>
+<tr><td>none of the above, but parses as a Mix expression</td><td>Mix</td></tr>
+<tr><td>none of the above and a command-like head</td><td>shell dispatch (so you get the familiar <code>No such file or directory</code>, exit 127)</td></tr>
+</tbody></table>
+<p>The exact keyword-head set routed to Mix: <code>if</code> <code>for</code> <code>while</code> <code>loop</code> <code>function</code>
+<code>fn</code> <code>return</code> <code>select</code> <code>print</code> <code>eprint</code> <code>die</code> <code>try</code> <code>parse</code> <code>export</code> <code>alias</code>
+<code>break</code> <code>continue</code> <code>send</code> <code>address</code> <code>emit</code> <code>source</code> <code>sh</code> <code>label</code>. Note what is
+<strong>not</strong> in it: <code>true</code>, <code>false</code> and <code>nil</code> (see the next section).</p>
+<h3 id="bareword-function-dispatch--bash-parity-for-your-toolkit">Bareword function dispatch — bash parity for your toolkit</h3>
+<p>A line whose head is a <strong>currently-defined Mix function</strong> dispatches as a
+command-style call, so a ported bash toolkit works with no parens:</p>
+<pre><code class="language-text">$ sc restart nginx          -- runs sc("restart", "nginx")
+$ health                    -- zero-arg call, no parens
+$ newpw 20                  -- newpw("20")
+</code></pre>
+<p>The function check sits <strong>after</strong> Mix keywords and shell builtins but <strong>before</strong>
+the <code>$PATH</code> probe, so a defined function <strong>shadows a same-named binary</strong> — matching
+bash's <code>alias → keyword → builtin → function → PATH</code> order. Only a <em>simple</em>
+command qualifies: plain word arguments, quotes (<code>'…'</code> / <code>"…"</code>) group and are
+stripped, and there is <strong>no variable or glob expansion</strong> — bareword args are
+<strong>literal</strong> (use the paren form <code>sc("restart", $svc)</code> when you need
+interpolation). Anything with a pipe, redirect, <code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chain, <code>$(…)</code>
+substitution, or a <code>KEY=val</code> env prefix falls through to normal shell dispatch,
+so a function in a pipeline is still the shell's job. Inside a <code>.mix</code> <strong>script</strong>
+(the whole-file parse path) there is no shell classifier — call functions the
+Mix way, <code>sc("restart", "nginx")</code>.</p>
+<p>A function is "defined" only when it is in scope at classify time: interactive
+<code>mix -i</code> (which loads <code>~/.mixrc</code> and the <code>~/.rc</code> toolkit) and <code>mix -i -c '…'</code>
+see them; a bare <code>mix -c '…'</code> (no rc) does not, so there the same line stays a
+shell command.</p>
+<p>A line the classifier hands to Mix that then fails to lex/parse reports the
+<strong>real</strong> lexer/parser error and exits 1 — <code>mix -c 'print(0755)'</code> prints the
+leading-zero lex error, not "No such file". A genuine shell typo (<code>gti status</code>)
+still gets <code>mix: gti: No such file or directory</code> and exit 127, and real
+commands keep dispatching.</p>
+<p>The tight-hyphen rule applies only to a command-shaped <strong>statement head</strong>: an
+ASCII letter/<code>_</code> start, at least one unspaced <code>-</code>, an ASCII letter/digit/<code>_</code> end,
+and no other characters. It does not reach into <code>print(a-b)</code>, assignments, or
+parenthesised expressions; <code>a - b</code>, <code>$a-$b</code>, <code>$x-1</code>, and <code>1-2</code> are subtraction.
+Scope does not affect the result: bare <code>a</code> is the string <code>"a"</code>, not <code>$a</code>, so
+head <code>a-b</code> is a command even when <code>$a</code> is live. Exact earlier heads retain
+precedence, so <code>mix not-a-command</code> is still a <code>mix</code> meta-command invocation.</p>
+<pre><code class="language-mix">print(1 + 1)        -- Mix: prints 2
+</code></pre>
+<pre><code class="language-text">2
+</code></pre>
+<pre><code class="language-mix">echo hi             -- shell dispatch: echo is on PATH
+</code></pre>
+<pre><code class="language-text">hi
+</code></pre>
+<h3 id="gotcha-a-bare-true--false-runs-the-shell-binary">Gotcha: a bare <code>true</code> / <code>false</code> runs the shell binary</h3>
+<p>Inside a Mix expression, <code>true</code>, <code>false</code>, and <code>nil</code> are literals (<code>$x = false</code>,
+<code>if $a == nil</code>, <code>[true, false]</code>). But as a bare <strong>line head</strong> <code>true</code> and <code>false</code>
+route to shell dispatch and run the <code>/usr/bin/true</code> / <code>/usr/bin/false</code> binaries —
+so <code>false</code> exits <strong>1</strong> like in every other shell, honouring the universal shell
+idiom:</p>
+<pre><code class="language-text">$ mix -c 'false'; echo "rc=$?"
+rc=1
+$ mix -c 'true'; echo "rc=$?"
+rc=0
+</code></pre>
+<p>This is deliberate: forcing a bare <code>false</code> to the Mix literal made it exit <code>0</code>,
+which broke <code>cmd || false</code>-style scripts. <code>nil</code> has no external binary, so a bare
+<code>nil</code> still falls through to the Mix parse. In a <code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chain they behave
+like the shell too:</p>
+<pre><code class="language-text">$ mix -c 'true &amp;&amp; echo chained'
+chained
+$ mix -c 'false || echo fallback'
+fallback
+</code></pre>
+<h2 id="chaining-----shell-dispatch-lines">Chaining — <code>&amp;&amp;</code>, <code>||</code>, <code>;</code> (shell-dispatch lines)</h2>
+<p>bash semantics, evaluated left to right:</p>
+<pre><code class="language-text">$ mix -c 'echo one ; echo two'
+one
+two
+$ mix -c 'mkdir -p /tmp/d &amp;&amp; echo made'
+made
+$ mix -c 'test -f /nope || echo missing'
+missing
+</code></pre>
+<ul>
+<li><code>;</code> — run unconditionally (sequence).</li>
+<li><code>&amp;&amp;</code> — run only if the previous command <strong>succeeded</strong> (exit 0).</li>
+<li><code>||</code> — run only if the previous command <strong>failed</strong> (non-zero).</li>
+</ul>
+<p>The chain's exit code is the <strong>last command actually executed</strong>. A skipped
+command carries the prior success/failure forward, exactly like bash.</p>
+<p>A short-circuited branch is <strong>never expanded or run</strong> — a <code>$(...)</code> inside it has
+no side effect:</p>
+<pre><code class="language-text">$ mix -c 'false &amp;&amp; /bin/touch /tmp/pwn'
+$ test -f /tmp/pwn &amp;&amp; echo EXISTS || echo absent
+absent
+</code></pre>
+<p>A single trailing <code>;</code> is allowed (<code>echo a ;</code>). A <strong>leading or interior</strong> empty
+piece (<code>&amp;&amp; echo x</code>, <code>echo a ;; echo b</code>) is an error. (Note: a <code>&amp;&amp;</code>-led line is
+tried as Mix first, so <code>mix -c '&amp;&amp; echo x'</code> surfaces a Mix parse error, not the
+shell empty-piece error — start a chain with a real command.)</p>
+<p>That empty-piece rule is shell-specific. On a line already classified as Mix,
+leading/trailing/repeated semicolons are harmless empty statements:
+<code>; print(1);;</code> prints <code>1</code>.</p>
+<h2 id="pipes--">Pipes — <code>|</code></h2>
+<pre><code class="language-text">$ mix -c 'printf "b\na\nc\n" | sort'
+a
+b
+c
+$ mix -c 'ls /etc | wc -l &gt; /tmp/count.txt'
+</code></pre>
+<p>Each pipe segment is its own program; stdout of one feeds stdin of the next.
+The pipeline's exit code is its <strong>last</strong> segment's. Pipes bind tighter than the
+chain operators, so <code>a | b &amp;&amp; c | d</code> is <code>(a | b) &amp;&amp; (c | d)</code>.</p>
+<h2 id="background--trailing-">Background — trailing <code>&amp;</code></h2>
+<p>A <code>&amp;</code> at the very <strong>end</strong> of a line backgrounds the whole pipeline and returns
+immediately (exit 0):</p>
+<pre><code class="language-text">$ mix -c '/bin/sleep 5 &amp;'; echo "rc=$?"
+rc=0
+</code></pre>
+<p>A <code>&amp;</code> that is <em>not</em> at the end is <strong>not</strong> a job separator (Mix has no mid-line
+<code>&amp;</code> job control like bash). To background one command and continue, split with
+<code>;</code>:</p>
+<pre><code class="language-text">$ mix -c '/bin/sleep 5 &amp; ; echo launched'
+launched
+</code></pre>
+<p>In a one-shot <code>mix -c</code>, a backgrounded child is re-parented to init when the
+process exits. In the long-lived REPL it goes into the job table (<code>jobs</code>,
+<code>fg</code>, <code>bg</code>).</p>
+<h2 id="brace-expansion">Brace expansion</h2>
+<p>bash-5.3 brace expansion, expanded <strong>before</strong> variable/<code>$(...)</code> resolution
+(like bash). Alternation <code>{a,b,c}</code> and sequences <code>{x..y[..step]}</code>:</p>
+<pre><code class="language-text">$ mix -c 'echo file.{txt,md,rs}'
+file.txt file.md file.rs
+$ mix -c 'echo {1..5}'
+1 2 3 4 5
+$ mix -c 'echo {a..e}'
+a b c d e
+$ mix -c 'echo {1..10..2}'
+1 3 5 7 9
+$ mix -c 'echo {a,b{1,2}}'
+a b1 b2
+</code></pre>
+<p><strong>Sign-aware zero padding</strong> — an explicit leading zero on an endpoint pads every
+element to the widest endpoint's width:</p>
+<pre><code class="language-text">$ mix -c 'echo {01..03}'
+01 02 03
+$ mix -c 'echo {-03..3..2}'
+-03 -01 001 003
+</code></pre>
+<p>Other bash-5.3 rules that hold: nesting (<code>{a,b{1,2}}</code>), reverse ranges
+(<code>{5..1}</code>), the increment's absolute value is used and <code>0</code> means <code>1</code>. A group
+that is <strong>not</strong> a valid brace expression stays <strong>literal</strong>:</p>
+<pre><code class="language-text">$ mix -c 'echo {a}'
+{a}
+$ mix -c 'echo a{}b'
+a{}b
+</code></pre>
+<p>So <code>find . -exec {} \;</code> is safe — the <code>{}</code> is invalid as a group and passes
+through untouched.</p>
+<p><strong>Hardening (never a partial expansion):</strong> a word expanding past ~10 000
+results, or groups nested/chained past 64 deep, is left <strong>completely
+unexpanded</strong> rather than partially expanded. The injection invariant holds —
+braces are structural only in <strong>raw literal text</strong>: a quoted/escaped <code>{</code>, a
+<code>${X}</code>, and anything a variable's <em>value</em> contains never expand.</p>
+<h2 id="-command-substitution"><code>$(...)</code> command substitution</h2>
+<p>Runs the inner command via <code>/bin/sh -c</code>, splices its stdout into the line with
+trailing newlines stripped:</p>
+<pre><code class="language-text">$ mix -c 'echo today is $(date +%A)'
+today is Monday
+$ mix -c 'echo got-$(echo X)'
+got-X
+</code></pre>
+<p><strong>Unlike bash, the result is ONE word</strong> — it is <em>not</em> re-split on whitespace.
+This is a deliberate safety difference:</p>
+<pre><code class="language-text">$ mix -c 'echo [$(echo a b c)]'
+[a b c]
+</code></pre>
+<p>(In bash, <code>echo [$(echo a b c)]</code> would re-split into three words. Mix keeps the
+captured output intact as a single argument — closer to a quoted <code>"$(...)"</code>.)</p>
+<p>Things that <strong>stay literal</strong> on a shell-dispatch line:</p>
+<pre><code class="language-text">$ mix -c 'echo $((1+2))'          # arithmetic $(( )) is NOT command substitution
+$((1+2))
+$ mix -c "echo '\$(echo X)'"      # single-quoted is fully literal
+$(echo X)
+</code></pre>
+<p>An inner <code>|</code> / <code>;</code> / <code>&amp;&amp;</code> belongs to the <strong>substitution</strong>, not the outer line:
+<code>echo $(ls | wc -l)</code> runs <code>ls | wc -l</code> inside the <code>$(...)</code> and splices the
+count. A lazy detail: a <code>$(...)</code> is run <strong>only</strong> when its chain piece is
+selected for execution (see the short-circuit example above).</p>
+<h2 id="redirects">Redirects</h2>
+<p>In parse order, like bash:</p>
+<pre><code>&gt;  file     1&gt; file    redirect stdout (truncate)
+&gt;&gt; file     1&gt;&gt; file   redirect stdout (append)
+&lt;  file                redirect stdin
+2&gt; file                redirect stderr (truncate)
+2&gt;&gt; file               redirect stderr (append)
+2&gt;&amp;1                   fd 2 := fd 1   (stderr to wherever stdout points)
+1&gt;&amp;2  / &gt;&amp;2            fd 1 := fd 2   (stdout to stderr; &gt;&amp;2 is the common idiom)
+&gt;&amp;1                    1&gt;&amp;1 — stdout onto itself, a no-op
+&amp;&gt; file     &amp;&gt;&gt; file   both streams to file  (≡ &gt;file 2&gt;&amp;1 / &gt;&gt;file 2&gt;&amp;1)
+</code></pre>
+<pre><code class="language-text">$ mix -c 'echo hi &gt; /tmp/out.txt'; cat /tmp/out.txt
+hi
+$ mix -c 'echo l1 &gt; /tmp/log'; mix -c 'echo l2 &gt;&gt; /tmp/log'; cat /tmp/log
+l1
+l2
+$ mix -c 'ls /nope 2&gt;&amp;1' | head -1
+ls: cannot access '/nope': No such file or directory
+$ mix -c 'ls /nope &amp;&gt; /tmp/both.txt'; cat /tmp/both.txt
+ls: cannot access '/nope': No such file or directory
+</code></pre>
+<p>Ordering matters exactly like a shell: <code>&gt;f 2&gt;&amp;1</code> sends both streams to <code>f</code>,
+while the unusual <code>2&gt;&amp;1 &gt;f</code> keeps stderr on the original stdout.</p>
+<p>Mix dups <strong>only fds 1 and 2</strong>. An unsupported fd target (<code>&gt;&amp;3</code>, <code>&gt;&amp;-</code>, <code>3&gt;&amp;1</code>)
+is a clear <strong>error</strong>, never a silent junk file:</p>
+<pre><code class="language-text">$ mix -c 'echo hi &gt;&amp;3'
+unsupported fd in redirect '1&gt;&amp;3' — Mix dups only fds 1 and 2
+</code></pre>
+<p>A bare <code>&amp;</code> is a word-breaking metacharacter only immediately before <code>&gt;</code>
+(<code>cmd arg&amp;&gt;out</code> redirects, no stray <code>arg&amp;</code>); a lone <code>&amp;</code> mid-word is literal, and
+a trailing <code>&amp;</code> is background.</p>
+<h2 id="mix-meta-commands-under-plumbing-interactive-repl"><code>mix</code> meta-commands under plumbing (interactive REPL)</h2>
+<p>A bare <code>mix &lt;sub&gt;</code> line at the REPL is a <strong>meta-command</strong>: it runs in-process
+so it can read this shell's live state (<code>mix vars</code>, <code>mix history</code>, <code>mix trace on</code>, live <code>mix stats</code> counters). In-process output prints straight to the
+terminal, so plumbing on the line — a pipe tail, any redirect, a background
+<code>&amp;</code>, or an env prefix — cannot be honoured by that path.</p>
+<p>Since 0.61.1 a plumbed <code>mix …</code> line is therefore <strong>not intercepted</strong>:</p>
+<ul>
+<li><strong>Stateless subcommands</strong> (<code>stats</code>, <code>builtins</code>, <code>man</code>, <code>keywords</code>, <code>help</code>,
+<code>version</code>, <code>config</code>, <code>what</code>, …) run as a normal external pipeline, so
+<code>mix stats never | wc -l</code>, <code>mix stats never &gt;&gt; log</code>, and
+<code>mix builtins --json | jq .</code> all work. Live stats are flushed to disk first,
+so the external <code>mix stats</code> child reads current data including this session.</li>
+<li><strong>Live-state subcommands</strong> (<code>history</code>, <code>vars</code>, <code>aliases</code>, <code>functions</code>,
+<code>all</code>, <code>type</code>, <code>status</code>, <code>context</code>, <code>snapshot</code>, <code>ask</code>, <code>chat</code>, <code>trace</code>,
+<code>diagnose</code>, <code>reload</code>, <code>build</code>, <code>update</code>, and bare <code>mix</code>) are <strong>refused
+loudly</strong> with exit status 2 — an external child would silently answer from
+different state. <code>mix stats reset</code> / <code>mix stats clear</code> are refused under
+plumbing for the same reason: they mutate the persisted store under an
+invariant that spans this shell's live counters.</li>
+</ul>
+<pre><code class="language-text">alpha ~ mix history | wc -l
+mix history: runs inside the interactive shell — pipes, redirects and &amp; are not supported; run it bare
+</code></pre>
+<p>Before 0.61.1 the plumbing was silently dropped: <code>mix stats never | wc -l</code>
+printed the report and never ran <code>wc</code>; <code>mix stats never &gt; x</code> created nothing.</p>
+<p>All of the above applies to a <strong>single-pipeline</strong> line. A <code>;</code>/<code>&amp;&amp;</code>/<code>||</code>
+<strong>chain</strong> is a different intake with no meta-command interception (shell
+builtins like <code>cd</code> still run in-process there): <code>mix vars; echo hi</code> answers
+<code>vars</code> from a fresh external child (empty), with no refusal and no stats
+flush. Don't put live-state meta-commands — or the mutating
+<code>mix stats reset</code> / <code>mix stats clear</code> — in chains.</p>
+<h2 id="variables-and-the-injection-invariant">Variables and the injection invariant</h2>
+<p>On a shell-dispatch line, <code>$NAME</code> / <code>${NAME}</code> resolve from the Mix scope, then
+the environment:</p>
+<pre><code class="language-text">$ X=hello mix -c '/bin/echo "got: $X"'
+got: hello
+</code></pre>
+<p>The structural decisions — where the operators, redirects, <code>name=</code>
+assignments, fd prefixes, and brace groups are — are fixed from the <strong>literal
+line text</strong> in a pass that never sees a value. So a variable's value can
+<strong>never</strong> inject syntax: it is always a single data word, never a <code>;</code>, a <code>&amp;&amp;</code>,
+a redirect, or an extra argument.</p>
+<pre><code class="language-text">$ X='a; echo PWNED' mix -c '/bin/echo "[$X]"'
+[a; echo PWNED]
+</code></pre>
+<p>The <code>;</code> inside <code>$X</code> is data, not a command separator. The same holds for
+<code>$(...)</code> results — captured stdout is spliced as data and never re-parsed for
+operators.</p>
+<p>A leading <code>name=value</code> (literal key only) sets an env var for that command,
+bash-style:</p>
+<pre><code class="language-text">$ mix -c 'FOO=bar /bin/sh -c "echo \$FOO"'
+bar
+</code></pre>
+<h2 id="in-process-builtins-under--c">In-process builtins under <code>-c</code></h2>
+<p>A handful of builtins are handled <strong>in-process</strong> rather than spawned. <code>cd</code> is
+intercepted as a lone command <strong>and</strong> in a single-segment foreground
+<code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chain, so it changes the directory instead of failing to spawn a
+nonexistent <code>cd</code> binary:</p>
+<pre><code class="language-text">$ mix -c 'cd /tmp &amp;&amp; pwd'; echo "rc=$?"      # cd in a chain: in-process
+/tmp
+rc=0
+$ mix -c 'cd /nope &amp;&amp; pwd'; echo "rc=$?"     # failing target: rc=1, not 127
+cd: /nope: No such file or directory (os error 2)
+rc=1
+</code></pre>
+<p>The narrow exceptions still spawn (and fail) so a redirect or env prefix is never
+silently dropped — a <strong>piped</strong>, <strong>backgrounded</strong>, <strong>redirected</strong>, or
+<strong>env-prefixed</strong> <code>cd</code>:</p>
+<pre><code class="language-text">$ mix -c 'cd /tmp | cat'; echo "rc=$?"       # piped cd: spawns, fails
+mix: cd: No such file or directory (os error 2)
+rc=127
+</code></pre>
+<p><code>exit</code> is intercepted only as a <strong>lone</strong> command; in a chain it spawns like any
+external program and fails. Note the shell-layer <code>exit N</code> parses N as a plain
+i32 (an unparseable N — including a fractional one — silently exits <code>0</code>, and
+the OS truncates a status above 255), while the <em>language</em> builtin <code>exit(n)</code>
+validates <code>0..=255</code> and raises <code>VALUE_OUT_OF_RANGE</code> outside it (since 0.59.0)
+— a known language/shell-layer divergence, queued for its own fix. The bare <code>mix</code> head is self-resolved to the running
+binary (so <code>mix --version</code> re-enters this executable regardless of PATH), and a
+bare <code>mix</code> with no subcommand under <code>-c</code> is refused (it would start a nested
+REPL). The REPL-only builtins (<code>jobs</code>, <code>fg</code>, <code>bg</code>, <code>pushd</code>, <code>popd</code>, <code>history</code>,
+<code>unalias</code>) have no meaning under <code>-c</code>.</p>
+<pre><code class="language-text">$ mix -c 'mix --version'
+mix 0.21.2
+</code></pre>
+<h2 id="the-two-context-split">The two-context split</h2>
+<p>The single most important rule. The <strong>same characters</strong> mean different things
+depending on whether they are on a shell-dispatch line or inside a <strong>Mix
+string</strong>:</p>
+<table><thead><tr><th>Construct</th><th>On a shell-dispatch line</th><th>Inside a Mix <code>"string"</code></th></tr></thead><tbody>
+<tr><td><code>$(cmd)</code></td><td><strong>runs</strong> <code>cmd</code>, splices stdout (one word)</td><td><strong>literal text</strong> <code>$(cmd)</code></td></tr>
+<tr><td><code>{a,b}</code> / <code>{1..5}</code></td><td><strong>brace-expands</strong></td><td><strong>literal text</strong> (a <code>{...}</code> in Mix source is a map literal or literal text)</td></tr>
+<tr><td><code>$((1+2))</code></td><td>literal (arithmetic, unsupported)</td><td>literal text</td></tr>
+<tr><td><code>${NAME}</code></td><td>env/scope interpolation</td><td>scope→env interpolation</td></tr>
+<tr><td>bare <code>$name</code></td><td>env/scope interpolation</td><td><strong>literal text</strong> (the opposite of bash)</td></tr>
+</tbody></table>
+<pre><code class="language-text">$ mix -c 'print("{1..3}")'        # Mix string: braces are literal
+{1..3}
+$ mix -c 'print("$(echo hi)")'    # Mix string: $(...) is literal
+$(echo hi)
+$ mix -c 'echo {1..3}'            # shell line: braces expand
+1 2 3
+</code></pre>
+<p>The trap: you reach for <code>$(...)</code> or <code>{a,b}</code> inside a Mix double-quoted string
+and nothing happens — they are inert data there. To splice a command's output
+<strong>in Mix code</strong>, use <a href="/mix/system"><code>run()</code> / <code>run_rc()</code></a> and <code>..</code>
+concat:</p>
+<pre><code class="language-mix">$count = trim(run("ls /etc | wc -l"))
+print("etc has " .. $count .. " entries")
+</code></pre>
+<p>Two narrow exceptions where <code>$(...)</code> <em>does</em> substitute in Mix source: a
+<strong>heredoc</strong> body, and the standalone <code>$(cmd)</code> <strong>expression</strong> (see
+<a href="/mix/strings">strings</a>). And in a <code>run()</code> / <code>ssh_run()</code> command <strong>string</strong>, a
+<code>$(...)</code> passes through to the <em>target</em> shell that runs the command (local for
+<code>run</code>, remote for <code>ssh_run</code>). For multi-line remote Mix or nested quotes, skip
+that extra parse with the
+<a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + heredoc idiom</a>.</p>
+<h2 id="timing--the-time-modifier">Timing — the <code>time</code> modifier</h2>
+<p><code>time</code> is a <strong>modifier</strong>, not a command — exactly as in bash, where <code>time</code> is a
+shell keyword and not a program. Mix resolves it before dispatch, so it wraps
+whatever the rest of the line turns out to be: an external command, a pipeline,
+a chain, a bareword function, or Mix code.</p>
+<pre><code class="language-text">$ time shwho example.org
+...
+Elapsed: 412.181ms
+
+$ time sum([1, 2, 3, 4, 5])
+15
+Elapsed: 0.012ms
+
+$ time ls | wc -l
+18
+Elapsed: 1.251ms
+</code></pre>
+<p>The elapsed line goes to <strong>stderr</strong>, so a timed command's stdout stays clean for
+a pipe or a redirect. The timed command's exit code is passed through unchanged.
+Sub-second runs report milliseconds; longer ones promote to <code>1.500s</code> / <code>1m5.000s</code>.</p>
+<p><code>time</code> is resolved <strong>before alias expansion</strong>, so the wrapped head still expands
+— <code>time ll</code> times <code>ls -l</code>. A bare <code>time</code> with nothing to run reports usage and
+exits 2.</p>
+<p>Being resolved before dispatch, the modifier <strong>shadows every other <code>time</code></strong>: a
+<code>time</code> binary on PATH (GNU <code>/usr/bin/time</code> — reach it by full path, as Mix has no
+<code>command</code> builtin), an <code>alias time = …</code>, and a user-defined Mix <code>function time</code>.
+Bash's keyword shadows a PATH <code>time</code> the same way. Rename any Mix function you
+want to keep callable bareword; a paren call is unaffected.</p>
+<p><code>time()</code> — with parens — is the unrelated <a href="/mix/datetime"><code>time()</code> builtin</a>
+returning a Unix timestamp, not the modifier: only a bare <code>time</code> HEAD followed by
+something to run is stripped. <code>timeout 5 cmd</code> is likewise untouched (the head must
+be exactly <code>time</code>).</p>
+<p><code>mix time EXPR</code> is the same modifier under its older spelling, kept working.</p>
+<p>The modifier lives in the shell-dispatch layer, so it is available at the prompt,
+under <code>-c</code>, and over ssh (<code>ssh host 'time shwho example.org'</code>) — but NOT in a
+<code>.mix</code> script (parsed as Mix, not dispatched line-by-line) and NOT in a sourced
+line or <code>~/.mixrc</code>. To time a region of a script, subtract two
+<a href="/mix/datetime"><code>time()</code></a> reads, or use the <code>duration_ms</code> field that
+<a href="/mix/system"><code>run_argv()</code></a> already returns.</p>
+<p>Two lines report no elapsed. A backgrounded command (<code>time sleep 5 &amp;</code>) returns at
+spawn, so there is no runtime to measure — it says <code>backgrounded (&amp;) — not timed</code>
+rather than print the spawn latency as if it were the duration. And an <code>exit()</code>
+mid-line (or a <code>mix build</code> that re-execs) never returns, so nothing survives to
+report; bash does print a timing for <code>time exit</code>, Mix does not.</p>
+<p><code>time;</code>, <code>time&amp;</code> and <code>time|</code> have nothing to run and report usage.</p>
+<h2 id="what-shell-dispatch-is-not">What shell-dispatch is NOT</h2>
+<p>Shell-dispatch handles a command, a pipeline, or a chain — <strong>not</strong> shell control
+flow. There is no <code>for</code>/<code>while</code>/<code>if</code>/<code>case</code> shell syntax, no shell functions, no
+<code>$?</code> (use the structured return of <a href="/mix/system"><code>run_rc()</code></a>). Those
+constructs are <a href="/mix/control-flow">Mix</a>:</p>
+<pre><code class="language-text">$ mix -c 'for x in $(echo a b c); do echo "[$x]"; done'
+mix: for: No such file or directory (os error 2)
+mix: do: No such file or directory (os error 2)
+mix: done: No such file or directory (os error 2)
+</code></pre>
+<p>Mix saw <code>for</code> as a keyword, tried to parse Mix, and <code>do</code> is not even a Mix
+keyword — so it fell back to the shell path and tried to <em>run</em> <code>for</code> / <code>do</code> /
+<code>done</code> as programs. Write it as a Mix loop instead:</p>
+<pre><code class="language-mix">for each $x in split(trim(run("echo a b c")), " ")
+  print("[" .. $x .. "]")
+end
+</code></pre>
+<pre><code class="language-text">[a]
+[b]
+[c]
+</code></pre>
+<p>When in doubt: a PATH/bare command head → shell dispatch; a <code>$</code>/Mix-keyword/call
+head → Mix. Operators later on the line—including <code>;</code>—do not override the
+head-first classifier.</p>
+<h2 id="aliases--i-only">Aliases (<code>-i</code> only)</h2>
+<p><code>~/.mixrc</code> aliases and PATH load for <strong>interactive</strong> logins (<code>mix -i</code>,
+<code>mix -i -c</code>, the REPL) — <strong>not</strong> a plain <code>mix -c</code>. So a non-interactive
+<code>ssh host '&lt;line&gt;'</code> runs with no aliases. Aliases are expanded on the first word
+before classification, so an alias expanding to a chain (<code>u = "sudo apt update &amp;&amp; sudo apt upgrade"</code>) lands on the shell path correctly.</p>
+<h2 id="terminal-output-mode-interactive-repl">Terminal output mode (interactive REPL)</h2>
+<p>The interactive REPL owns the terminal's output post-processing: before every
+prompt it re-asserts <code>OPOST | ONLCR</code> on stdout, so a bare <code>\n</code> from an external
+command always arrives as CR-NL and lines start at column 0. This repairs an
+inherited raw tty (Mix started as a login shell on a terminal left with <code>ONLCR</code>
+off) or a foreground child that exited without restoring it — the classic
+"staircase", where each line steps rightward, can't persist across a prompt.</p>
+<p>Consequence: a <code>stty -onlcr</code> you run at the Mix prompt does <strong>not</strong> stick — Mix
+re-enables CR-NL output on the next prompt. Mix touches only those two output
+bits; input flags, control characters, flow control and every other <code>stty</code>
+setting are left alone. Non-interactive modes (<code>mix -c</code>, scripts, <code>mix --serve</code>)
+never touch the tty.</p>
+<h2 id="see-also">See also</h2>
+<pre><code>mix help              the full categorized builtin reference
+mix what run          one-line help for the run() builtin
+mix keywords          every Mix keyword (so you know what the classifier reserves)
+</code></pre>
+<ul>
+<li><a href="/mix/overview">overview</a> — the language at a glance</li>
+<li><a href="/mix/system">running-commands</a> — <code>run</code> / <code>run_rc</code> (via <code>/bin/sh</code>, structured returns), <code>run_argv</code> / <code>run_stream</code> (argv lists, no shell)</li>
+<li><a href="/mix/strings">strings</a> — <code>'raw'</code> vs <code>"${...}"</code>, heredocs, the literal-<code>$(...)</code> rule</li>
+<li><a href="/mix/keywords">keywords</a> — Mix keywords the classifier routes to Mix</li>
+<li><a href="/mix/control-flow">control-flow</a> — <code>if</code> / <code>for each</code> / <code>while</code> (the Mix replacements for shell control flow)</li>
+<li><a href="/mix/bus">bus</a> — <code>send</code> / <code>emit</code> / <code>on … end</code>, the Bus-native side of the language</li>
+<li><a href="https://github.com/markc/cosmix">The Mix repo</a> — <a href="https://github.com/markc/cosmix/blob/main/AGENTS.md">AGENTS.md</a> is the agent orientation sheet on top of this manual</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1122,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1176,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1305,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

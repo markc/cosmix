@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/remote</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,536 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/remote.md"><div class="prose"><h1 id="remote-execution-ssh">Remote execution (SSH)</h1>
+<p>Mix runs commands on other machines through four builtins that wrap the system <code>ssh</code> binary: <strong><code>ssh_run</code></strong> (structured result, never raises), <strong><code>ssh_must</code></strong> (returns stdout or dies), <strong><code>ssh_mix</code></strong> (runs Mix <em>source</em> on a remote node over the ssh stdin channel — zero quoting pain), and <strong><code>ssh_exec</code></strong> (runs an argv list on a remote node with truthful argv semantics via the remote run_argv, v0.30.0). The first two are the remote-host analogue of <a href="/mix/system"><code>run_rc</code>/<code>run</code></a> — same result-as-data philosophy, same "non-zero exit is data, not an exception" stance — extended with ssh-specific fields and a built-in wall-clock timeout.</p>
+<p>All four wrap the real <code>ssh</code> client via <code>std::process::Command</code>. There is <strong>no</strong> native SSH client inside Mix: host alias resolution, <code>~/.ssh/config</code>, identity files, ports, <code>ProxyJump</code>, agents, hardware keys, and certificates are all <code>ssh</code>'s job. Mix passes the host string straight through (after validating it — see §"Host validation") and lets <code>ssh</code> resolve it. By convention pass an ssh <strong>alias</strong> (a bare host name from <code>~/.ssh/config</code>) rather than a raw IP.</p>
+<p>The far-end Mix process records its ordinary <code>stdin</code>, <code>c</code>, or <code>script</code> mode;
+there is no special remote tag. Set <code>MIX_STATS=off</code> in the remote environment
+when fleet execution must perform no collection or stats I/O. See <a href="/mix/stats">usage
+statistics</a>.</p>
+<blockquote>
+<p>All examples here use placeholder hosts (<code>alpha</code>, <code>node1</code>, or <code>192.0.2.x</code>
+from RFC 5737). In real use, substitute an alias from your <code>~/.ssh/config</code>.</p>
+</blockquote>
+<h2 id="headline-idiom-ssh_mix--heredoc">Headline idiom: <code>ssh_mix</code> + heredoc</h2>
+<p>For multi-line remote Mix, pass a heredoc directly as the <code>source</code> argument to
+<code>ssh_mix</code>. The bytes travel over ssh stdin into <code>/opt/cosmix/bin/mix -</code>; no
+shell parses the source on the way.</p>
+<pre><code class="language-mix">$r = ssh_mix("alpha", &lt;&lt;EOF
+$h = run_argv_must(["hostname"])
+print("remote host: " .. trim($h))
+EOF
+)
+print($r["stdout"])
+</code></pre>
+<p>Actual output:</p>
+<pre><code class="language-text">remote host: alpha
+</code></pre>
+<h3 id="heredoc-interpolation-bare-is-remote-braced-is-local">Heredoc interpolation: bare is remote, braced is local</h3>
+<p>This is the safety rule that makes the form useful. A bare <code>$name</code> in a
+heredoc passes through <strong>literally</strong>, so the remote Mix interpreter resolves
+it. Only <code>${name}</code> interpolates locally before the source is sent.</p>
+<pre><code class="language-mix">$local = "LOCAL"
+$r = ssh_mix("alpha", &lt;&lt;EOF
+$who = "REMOTE"
+print("bare=" .. $who)
+print("braced=${local}")
+EOF
+)
+print($r["stdout"])
+</code></pre>
+<p>Actual output:</p>
+<pre><code class="language-text">bare=REMOTE
+braced=LOCAL
+</code></pre>
+<h3 id="pass-local-values-with-bindings">Pass local values with <code>bindings</code></h3>
+<p>Use the <code>bindings</code> option when local data belongs in the remote program.
+<code>ssh_mix(host, source, {bindings: {path: $target}})</code> strict-data-encodes each
+value and prepends a real <code>$name = value</code> assignment. The value remains data;
+it cannot break out into shipped source.</p>
+<pre><code class="language-mix">$target = "/srv/app dir; still-data"
+$r = ssh_mix("alpha", &lt;&lt;EOF
+print("path=" .. $path)
+EOF
+, {bindings: {path: $target}})
+print($r["stdout"])
+</code></pre>
+<p>Actual output:</p>
+<pre><code class="language-text">path=/srv/app dir; still-data
+</code></pre>
+<p>The result map always has these nine keys:</p>
+<pre><code class="language-text">stdout  stderr  exit_code  ok  duration_ms  host
+timed_out  interrupted  utf8_lossy
+</code></pre>
+<p>The exit-status key is <strong><code>exit_code</code></strong>, not <code>rc</code>. Reading <code>$r["rc"]</code> yields
+<code>nil</code> silently, so branch on <code>$r["ok"]</code> or inspect <code>$r["exit_code"]</code>.</p>
+<h3 id="why-not-ssh_run-for-mix-source">Why not <code>ssh_run</code> for Mix source?</h3>
+<p><code>ssh_run</code> sends a command string for the remote shell to parse. Nesting Mix in
+that string creates escape ladders:</p>
+<pre><code class="language-mix">ssh_run("alpha", "print(run(\"/opt/cosmix/bin/mix -c 'print(which(\\\"sh\\\"))'\"))")
+</code></pre>
+<p>The heredoc form ships the intended program directly:</p>
+<pre><code class="language-mix">ssh_mix("alpha", &lt;&lt;EOF
+print(which("sh"))
+EOF
+)
+</code></pre>
+<p>Use <code>ssh_run</code> for an actual remote-shell snippet; use <code>ssh_mix</code> + heredoc for
+remote Mix source.</p>
+<pre><code class="language-mix">$r = ssh_run("node1", "uptime")
+if $r.ok then
+  print($r.stdout)
+else
+  print("failed (" .. ("" .. $r.exit_code) .. "): " .. $r.stderr)
+end
+</code></pre>
+<hr />
+<h2 id="ssh_runhost-command-opts--map"><code>ssh_run(host, command[, opts])</code> → map</h2>
+<p>Runs <code>command</code> on <code>host</code> and returns a result map. <strong>Never raises</strong> on a remote failure — branch on <code>.ok</code> (or <code>.exit_code</code>). The only errors it raises are <em>local argument</em> errors (bad host, bad opts), surfaced before any ssh is spawned.</p>
+<h3 id="signature">Signature</h3>
+<pre><code class="language-mix">ssh_run(host, command)            -- command: a string (a remote-shell snippet)
+ssh_run(host, commands)           -- commands: a list of strings, joined with " &amp;&amp; "
+ssh_run(host, command, opts)      -- opts: a map (see below)
+</code></pre>
+<table><thead><tr><th>Arg</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>host</code></td><td>string</td><td>An ssh alias (<code>node1</code>), <code>user@host</code>, or <code>user@host</code> with a <code>Port</code> from <code>~/.ssh/config</code>. Validated (§"Host validation"), then resolved by <code>ssh</code>, never parsed by Mix.</td></tr>
+<tr><td><code>command</code> / <code>commands</code></td><td>string | list of strings</td><td>Each element is a <strong>remote-shell snippet</strong> (it reaches the remote shell verbatim — §"Quoting"). A list is joined with literal <code>&amp;&amp;</code>; an empty list is an error.</td></tr>
+<tr><td><code>opts</code></td><td>map</td><td>Optional. Unknown keys are rejected. See §"Options".</td></tr>
+</tbody></table>
+<h3 id="host-validation">Host validation</h3>
+<p>The host string must be non-empty, contain no NUL bytes, and <strong>must not begin with <code>-</code></strong>. A dash-leading host would let <code>ssh</code> parse it as an option — <code>-oProxyCommand=&lt;cmd&gt;</code> executes an arbitrary <em>local</em> command before any connection (a local RCE whenever the host value is config- or agent-derived). Defense in depth: the builtin rejects a leading-dash host up front, <em>and</em> the constructed argv always places a literal <code>--</code> (end of options) immediately before the host so ssh can never read it as an option. <code>ssh_must</code> and <code>ssh_mix</code> funnel through the same guards.</p>
+<pre><code class="language-mix">ssh_run("-oProxyCommand=touch /tmp/pwned", "echo hi")
+-- Runtime error: ssh_run: host must not begin with '-' (got "-oProxyCommand=touch /tmp/pwned")
+</code></pre>
+<h3 id="return-map">Return map</h3>
+<pre><code class="language-mix">{
+  stdout:      "...",   -- trimmed (trailing newline stripped); never nil
+  stderr:      "...",   -- trimmed; never nil
+  exit_code:   0,       -- integer; 0 = success
+  ok:          true,    -- convenience: exit_code == 0 (a real bool)
+  duration_ms: 142,     -- wall-clock from spawn to exit
+  host:        "node1", -- echoed back, handy for logging
+  timed_out:   false,   -- true if killed by opts.timeout
+  interrupted: false,   -- true if killed by Ctrl-C
+  utf8_lossy:  false    -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
+}
+</code></pre>
+<p><code>exit_code</code> carries sentinels for local outcomes that aren't a real remote exit status:</p>
+<table><thead><tr><th><code>exit_code</code></th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>0</code></td><td>success (<code>ok == true</code>)</td></tr>
+<tr><td><code>255</code></td><td>ssh-level failure (couldn't connect, auth failed, host-key refused)</td></tr>
+<tr><td><code>-1</code></td><td>local <strong>timeout</strong> fired (<code>timed_out == true</code>)</td></tr>
+<tr><td><code>-2</code></td><td><strong>interrupted</strong> by Ctrl-C (<code>interrupted == true</code>)</td></tr>
+<tr><td><code>-3</code></td><td>exited with no code and no signal (non-Unix fallback / unclassifiable edge)</td></tr>
+<tr><td><code>128 + signo</code></td><td>remote command killed by a signal</td></tr>
+<tr><td>other</td><td>the remote command's own exit status</td></tr>
+</tbody></table>
+<p>Note the field is named <code>exit_code</code>, <strong>not</strong> <code>rc</code> (which is what <a href="/mix/system"><code>run_rc</code></a> uses) — so the two result maps are deliberately not interchangeable, and a remote <code>exit_code</code> doesn't get confused with a local <code>rc</code> when both appear in the same script.</p>
+<h3 id="verified-failure-is-data-not-an-exception">Verified: failure is data, not an exception</h3>
+<p>A connection failure comes back as an ordinary map — the script keeps running.</p>
+<pre><code class="language-mix">$r = ssh_run("192.0.2.1", "echo hi", { connect_timeout: 2, timeout: 4 })
+print("ok="        .. ("" .. $r.ok))
+print("exit_code=" .. ("" .. $r.exit_code))
+print("timed_out=" .. ("" .. $r.timed_out))
+print("host="      .. $r.host)
+print("stdout=["   .. $r.stdout .. "]")
+print("stderr=["   .. $r.stderr .. "]")
+</code></pre>
+<pre><code class="language-text">ok=false
+exit_code=255
+timed_out=false
+host=192.0.2.1
+stdout=[]
+stderr=[ssh: connect to host 192.0.2.1 port 22: Connection timed out]
+</code></pre>
+<p>The full key set (every call returns all nine):</p>
+<pre><code class="language-text">stdout
+stderr
+exit_code
+ok
+duration_ms
+host
+timed_out
+interrupted
+utf8_lossy
+</code></pre>
+<h3 id="the-ok-predicate--there-is-no-ssh_ok--ssh_try">The <code>.ok</code> predicate — there is no <code>ssh_ok</code> / <code>ssh_try</code></h3>
+<p>Mix ships exactly four SSH builtins: <code>ssh_run</code>, <code>ssh_must</code>, <code>ssh_mix</code>, and <code>ssh_exec</code>. Don't reach for <code>ssh_ok</code> or <code>ssh_try</code> — they don't exist. For a boolean test, use <code>ssh_run(...).ok</code>:</p>
+<pre><code class="language-mix">if ssh_run("node1", "systemctl is-active nginx").ok then
+  print("nginx is up")
+end
+</code></pre>
+<p>For fail-fast, use <code>ssh_must</code> (below).</p>
+<hr />
+<h2 id="ssh_musthost-command-opts--stdout-string-or-dies"><code>ssh_must(host, command[, opts])</code> → stdout string (or dies)</h2>
+<p>Same arguments as <code>ssh_run</code>. On success (<code>ok == true</code>) it returns the command's <strong>stdout string</strong>. On <em>any</em> non-success — non-zero exit, timeout, interrupt, or signal-kill — it raises a catchable <code>RuntimeError</code> whose message names the host, the disposition, the <code>exit_code</code>, and the first 512 bytes of stderr.</p>
+<pre><code class="language-mix">$kernel = ssh_must("node1", "uname -r")
+print("remote kernel: " .. $kernel)
+</code></pre>
+<p>Verified failure message (unreachable host):</p>
+<pre><code class="language-mix">$out = ssh_must("192.0.2.1", "echo hi", { connect_timeout: 2, timeout: 4 })
+print($out)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: ssh_must: failed on 192.0.2.1 (exit_code=255): ssh: connect to host 192.0.2.1 port 22: Connection timed out
+</code></pre>
+<p>The disposition word is <code>failed</code>, <code>timed out</code>, or <code>interrupted</code> depending on <code>timed_out</code>/<code>interrupted</code>. Catch it like any other raising builtin:</p>
+<pre><code class="language-mix">try
+  $v = ssh_must("node1", "test -f /etc/myapp.conf")
+  print("config present")
+catch $e
+  print("config missing or host down: " .. ("" .. $e))
+end
+</code></pre>
+<p><strong>Pick the right one:</strong> <code>ssh_must</code> when failure is genuinely fatal and a <code>try</code>/<code>catch</code> would just be noise; <code>ssh_run</code> whenever you need finer control than "succeed or abort" — e.g. a <code>test -f</code> that returns 1 for "absent" is a perfectly valid answer, not an error.</p>
+<hr />
+<h2 id="ssh_mixhost-source-opts--map"><code>ssh_mix(host, source[, opts])</code> → map</h2>
+<p>Runs Mix <strong>source</strong> on a remote node with zero quoting pain. It ships <code>source</code> over ssh's <strong>stdin</strong> byte-channel into <code>/opt/cosmix/bin/mix -</code>, so the source never becomes an argv word and bypasses <em>every</em> shell-quoting layer — the local shell, ssh, and the remote login-shell classifier. Arbitrary quotes, <code>$</code>, backslashes, and newlines survive intact. It is the discoverable, first-class form of the <code>ssh_run(host, "mix -", { stdin: $source })</code> idiom.</p>
+<p>Start with the <a href="/mix/remote#headline-idiom-ssh_mix--heredoc">headline <code>ssh_mix</code> + heredoc pattern</a>
+above. This section supplies the remaining option and decoding contract.</p>
+<blockquote>
+<p><strong><code>mix lint</code> reads the body (0.69.0).</strong> Because <code>source</code> is Mix source,
+lint parses it when it is a <strong>string literal</strong> and reports its diagnostics
+against your file, prefixed <code>[inside ssh_mix body]</code>, at mapped line numbers.
+A body it cannot read — a variable, a concatenation, an interpolated string,
+a <code>read_file</code>, or a literal that does not parse — is reported as
+<strong><code>MIX-D3012</code></strong> rather than passing silently. Prefer a plain single-quoted
+literal and the <a href="/mix/remote#options-map"><code>bindings</code></a> option over interpolation: it is
+both safer (no injection through string building) and the only form lint can
+check. See <a href="/mix/lint#remote-bodies--lint-sees-inside-ssh_mix-0690">lint</a>.</p>
+</blockquote>
+<pre><code class="language-mix">$r = ssh_mix("node1",
+             "print(data_encode({host: hostname(), kernel: trim(run(\"uname -r\"))}))",
+             { decode: "data", timeout: 5 })
+if $r.ok then print($r.value.kernel) end
+</code></pre>
+<p>For source stored in a file, pass caller values separately with <code>bindings</code>:</p>
+<pre><code class="language-mix">$job = {action: "inspect", paths: ["/srv/a", "/srv/b"]}
+$source = read_file("remote-job.mix")
+$r = ssh_mix("example.com", $source, {
+  bindings: {job: $job, dry_run: true},
+  decode: "data"
+})
+</code></pre>
+<ul>
+<li><strong>Returns the same map as <code>ssh_run</code></strong> (all nine keys). With <code>decode</code>, a tenth key <code>value</code> is added on success.</li>
+<li><strong><code>decode: "data"</code> or <code>decode: "json"</code></strong> parses the trimmed stdout into <code>.value</code> (via <code>data_parse</code> / <code>json_parse</code>) — the common "get a structured value back from the remote" case. Pair it with <a href="/mix/data"><code>data_encode</code></a> on the remote side, as above. <code>decode: "json"</code> needs the <code>json</code> feature (the <code>mix</code> binary has it; a bare library build without it errors — use <code>decode: "data"</code>). On failure (<code>ok == false</code>) no <code>value</code> key is added — check <code>.ok</code> first.</li>
+<li><strong><code>bindings</code> is a typed data channel:</strong> it is a map from names to strict-data-encodable Mix values. Each key must match <code>[A-Za-z_][A-Za-z0-9_]*</code>; each value is strict-data-encoded locally and prepended to the shipped source as a <code>$name = value</code> assignment. Strings, numbers, bools, <code>nil</code>, lists, and maps retain their types, including nested values. Bytes and buffers have no strict-data representation and raise <code>OPTION_INVALID</code> locally; encode binary data explicitly (for example with base64) and decode it remotely.</li>
+<li><strong>No binding name is reserved.</strong> Names such as <code>args</code> and <code>argv</code> are legal. Bindings run first, so the caller source may legally rebind any of them; this is convenience and injection safety, not isolation.</li>
+<li><strong>Order of the prepended prefix is <code>env</code> exports, then <code>bindings</code>, then your source.</strong> A binding of the same name therefore shadows the exported <strong>variable</strong> but not the exported <strong>environment</strong>: with <code>{env: {FOO: "x"}, bindings: {FOO: "y"}}</code> the remote sees <code>$FOO == "y"</code> while <code>env("FOO") == "x"</code> and any child process still inherits <code>FOO=x</code>. Your source can rebind either. Give them distinct names unless you mean exactly that.</li>
+<li><strong>Accepts every <code>ssh_run</code> opt except two:</strong> <code>stdin</code> (the source <em>is</em> the stdin — passing it is an error) and <code>env_transport</code> (not applicable — see below).</li>
+<li><strong><code>env</code> works and is secret-safe:</strong> the values are translated into hidden <code>export KEY = "value"</code> lines (strict-data-escaped) <em>prepended to the shipped source</em>, so they travel on stdin and never touch <code>ps</code> argv on either end.</li>
+<li><strong>The remote binary path is hardcoded</strong> to <code>/opt/cosmix/bin/mix</code> — a full path, so it resolves inside the remote <code>/bin/sh</code> even on nodes where a bare <code>mix</code> is not on the non-interactive PATH. The remote must have mix installed there; <code>ssh_mix</code> is for cosmix-managed nodes, not arbitrary POSIX hosts.</li>
+<li><strong>Inherits every <code>ssh_run</code> host guard</strong> (empty, NUL, leading-dash — verified: a <code>-oProxyCommand=</code> host is rejected through <code>ssh_mix</code> too, before any spawn).</li>
+<li><strong><code>timeout</code> is in SECONDS</strong>, like every ssh/run timeout opt (§"Options"). The Bus <code>send … timeout=2000</code> form is the only millisecond surface in Mix — <code>timeout: 5000</code> here is 83 minutes, not 5 seconds.</li>
+</ul>
+<p>For source maintained as a separate program, use <a href="/mix/io"><code>read_file</code></a>. For
+inline multi-line work, prefer the headline heredoc form. Note the stdin
+channel is <em>consumed by the program itself</em>: <code>ssh_mix</code> ships source fine but
+cannot also feed stdin to a <code>run()</code> that the remote script calls (see §"stdin
+caveat").</p>
+<p>Verified argument errors (raised locally, before any ssh):</p>
+<pre><code class="language-mix">ssh_mix("node1")
+-- Runtime error: ssh_mix: expected 2 or 3 args (host, source, [opts]), got 1
+
+ssh_mix("node1", "print(1)", { stdin: "x" })
+-- Runtime error: ssh_mix: `stdin` opt is not allowed — the source argument is the stdin
+
+ssh_mix("node1", "print(1)", { env_transport: "mix" })
+-- Runtime error: ssh_mix: `env_transport` is not applicable — ssh_mix always ships env
+--   as hidden `export` lines inside the stdin source
+
+ssh_mix("node1", "print(1)", { decode: "xml" })
+-- Runtime error: ssh_mix: decode must be "data" or "json", got String("xml")
+
+ssh_mix("example.com", "print(1)", { bindings: {"bad-name": 1} })
+-- OPTION_INVALID: ssh_mix: invalid bindings key "bad-name"
+--   (must match [A-Za-z_][A-Za-z0-9_]*)
+</code></pre>
+<hr />
+<h2 id="ssh_exechost-argv-opts--map-v0300"><code>ssh_exec(host, argv[, opts])</code> → map (v0.30.0)</h2>
+<p>The remote analogue of <a href="/mix/system"><code>run_argv</code></a>: run an <strong>argv list</strong> on a remote
+node with truthful, injection-inert argv semantics. OpenSSH only accepts a remote
+command <em>string</em>, so a naive <code>ssh host &lt;argv joined&gt;</code> can't promise argv-inertness
+across the wire. <code>ssh_exec</code> instead ships a strict-data Mix <strong>driver</strong> over the ssh
+stdin channel that reconstructs the argv + options as data and invokes the remote
+<code>run_argv</code> — no shell, no quoting, on either end.</p>
+<pre><code class="language-mix">$r = ssh_exec("pve3", ["pct", "start", "" .. $vmid], {timeout: 60})
+if not $r.ok then
+  eprint("start failed on " .. $r.host .. ": " .. $r.stderr)
+end
+</code></pre>
+<p>The result is the full <a href="/mix/system"><code>run_argv</code> process_result</a> map (<code>ok</code>,
+<code>exit_code</code>, <code>stdout</code>, <code>stderr</code>, <code>timed_out</code>, <code>signal</code>, <code>duration_ms</code>,
+truncation/lossy flags, …) plus <strong><code>host</code></strong>. Options split into two groups:</p>
+<ul>
+<li><strong>Remote <code>run_argv</code> options</strong> — <code>timeout</code> (the remote command deadline,
+default 30 s, <code>0</code> = unbounded which also lifts the auto transport ceiling),
+<code>cwd</code>, <code>env</code>, <code>clear_env</code>, <code>max_output</code>, plus the protocol-safe stdio routes
+below — are encoded into the driver and applied to the remote <code>run_argv</code>
+call. <code>env</code>/<code>stdin</code> never appear in argv on either end.</li>
+<li><strong>SSH transport options</strong> — <code>connect_timeout</code>, <code>transport_timeout</code> (the ssh wall-clock deadline, default = remote <code>timeout</code> + <code>connect_timeout</code> + 5 s), <code>batch</code>, <code>strict_host_key</code>, <code>multiplex</code>, <code>extra_ssh_args</code>, and <code>remote_mix</code> (the remote binary path, default <code>/opt/cosmix/bin/mix</code>).</li>
+</ul>
+<p>The remote stdio allowlist is deliberately narrower than local <code>run_argv</code>:</p>
+<ul>
+<li><code>stdout</code>: <code>"capture"</code>, <code>"null"</code>, or <code>{file: path, append?, mode?}</code>;</li>
+<li><code>stderr</code>: <code>"capture"</code>, <code>"null"</code>, <code>"stdout"</code>, or the same file map;</li>
+<li><code>stdin</code>: <code>nil</code>, a string, <code>{file: path}</code>, or <code>{null: true}</code> — exactly the local
+grammar minus binary. Bytes/buffer cannot cross the strict-data driver and
+raise <code>OPTION_INVALID</code>.</li>
+</ul>
+<p><code>stdout: "inherit"</code>, <code>stderr: "inherit"</code>, and <code>stream: true</code> raise
+<code>OPTION_INVALID</code> <strong>locally, before ssh is opened</strong>. Inherited remote stdout would
+interleave child bytes with ssh_exec's one strict-data result envelope; inherited
+remote stderr lands in the outer ssh stderr that the success decoder discards;
+and live teeing has the same envelope problem.</p>
+<p>There is <strong>no</strong> <code>stdin: "inherit"</code> route to reject, here or locally: a stdin
+string is always data, including the seven bytes <code>inherit</code>, and <code>nil</code> always
+means closed stdin. The ssh stdin channel carries the driver, and the driver
+carries whatever stdin you asked for as data — so the same value means the same
+thing on both sides of the hop. A path inside any <code>{file: ...}</code> route is
+resolved and opened on the <strong>remote host</strong>, not the machine calling <code>ssh_exec</code>.
+The remote command deadline starts before that open. A FIFO input with no
+writer reaches the deadline as remote <code>PROCESS_STDIO</code>; a FIFO output with no
+reader fails immediately as remote <code>PROCESS_STDIO</code>. Neither case spawns the
+requested command.</p>
+<p>Two limits the allowlist cannot enforce for you:</p>
+<ul>
+<li><strong>A remote-version floor.</strong> Routing options are forwarded to the remote
+<code>run_argv</code>; a remote old enough to have <code>run_argv</code> but not stdio routing
+rejects them inside the driver, which comes back as <code>SSH_PROTOCOL</code> with the
+remote's message. That is truthful but generic — deploy a current <code>mix</code> to a
+host before routing remote stdio on it.</li>
+<li><strong>An explicit path can still reach the envelope.</strong> <code>{file: "/dev/stdout"}</code> or
+<code>{file: "/proc/self/fd/1"}</code> names the driver's own stdout, so the child's
+bytes are interleaved with the strict-data reply and the call comes back
+<code>SSH_PROTOCOL</code> instead of a result. Nothing <em>option-shaped</em> slips past the
+allowlist; a path that deliberately aliases the channel is your choice, and
+it fails loudly rather than silently.</li>
+</ul>
+<p>Failure modes are encoded in the result, never raised (argv/option <em>validation</em>
+does raise, locally, before any ssh):</p>
+<ul>
+<li>transport failure → <code>error_code</code> <code>SSH_TIMEOUT</code> / <code>SSH_INTERRUPTED</code> / <code>SSH_TRANSPORT</code>, <code>exit_code: nil</code>;</li>
+<li>an undecodable remote reply → <code>SSH_PROTOCOL</code>;</li>
+<li>a remote binary <strong>older than 0.29</strong> (no <code>run_argv</code>) → <code>ok:false</code>, <code>error_code: "SSH_REMOTE_UNSUPPORTED"</code>, and the command is <strong>not run</strong> — <code>ssh_exec</code> refuses to silently change injection/capture/timeout guarantees rather than fall back to a shell.</li>
+</ul>
+<p><code>ssh_exec</code> inherits every <code>ssh_run</code> host guard (empty / NUL / leading-dash
+rejected). Use it for structured remote steps where you'd reach for <code>run_argv</code>
+locally; <code>ssh_mix</code> remains the path for arbitrary multi-step remote Mix programs.</p>
+<hr />
+<h2 id="options-map">Options map</h2>
+<p>Every key is optional; unknown keys raise an error. <code>ssh_mix</code> takes the same map minus <code>stdin</code>/<code>env_transport</code>, plus its own <code>decode</code> and <code>bindings</code>; see its section above for the typed binding contract.</p>
+<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>timeout</code></td><td>int (<strong>seconds</strong>)</td><td><code>30</code></td><td>Hard wall-clock deadline. <code>0</code> disables it. On expiry: SIGKILL the process group, <code>timed_out = true</code>, <code>exit_code = -1</code>.</td></tr>
+<tr><td><code>connect_timeout</code></td><td>int (seconds)</td><td><code>10</code></td><td>Passed as ssh's <code>-o ConnectTimeout=</code>. Bounds the connect phase only.</td></tr>
+<tr><td><code>multiplex</code></td><td>bool</td><td><code>false</code></td><td>Connection reuse via <code>ControlMaster=auto</code> / <code>ControlPath=$HOME/.ssh/cm-%C</code> / <code>ControlPersist=60s</code>. See the caveat below.</td></tr>
+<tr><td><code>batch</code></td><td>bool</td><td><code>true</code></td><td><code>-o BatchMode=yes</code> — never prompt for a password/passphrase; fail instead. Keep it on for unattended scripts.</td></tr>
+<tr><td><code>strict_host_key</code></td><td>string</td><td><code>"accept-new"</code></td><td><code>-o StrictHostKeyChecking=</code>. One of <code>yes</code>, <code>no</code>, <code>accept-new</code>, <code>ask</code>.</td></tr>
+<tr><td><code>env</code></td><td>map</td><td><code>{}</code></td><td>Remote env vars. Keys must match <code>[A-Za-z_][A-Za-z0-9_]*</code>; values may be string/number/bool (whole numbers inside i64 render as integers; since 0.59.0 a whole number at or above 2^63, or below −2^63, renders as its own shortest round-trip decimal instead of saturating to an i64 extreme, which is a different number; −2^63 itself is exactly representable and renders as the integer). <strong>How the values travel is <code>env_transport</code>'s job</strong> — by default they go over ssh stdin inside a driver, never in <code>ps</code> argv. See Â§"Remote env".</td></tr>
+<tr><td><code>env_transport</code></td><td>string</td><td><code>"mix"</code></td><td><code>"mix"</code> | <code>"sh"</code> | <code>"argv"</code> — the transport for <code>env</code> values. Inert when <code>env</code> is empty. See §"Remote env".</td></tr>
+<tr><td><code>cwd</code></td><td>string</td><td>—</td><td>Prepends <code>cd '&lt;cwd&gt;' &amp;&amp; </code> to the remote command (quoted for you).</td></tr>
+<tr><td><code>stdin</code></td><td>string</td><td>—</td><td>Fed to the remote command's stdin over the local ssh pipe. May contain NULs (binary payloads). Conflicts with <code>env</code> under the secure transports (§"Remote env").</td></tr>
+<tr><td><code>extra_ssh_args</code></td><td>list of strings</td><td><code>[]</code></td><td>Extra argv inserted before the host: <code>["-p", "2222"]</code>, <code>["-J", "jump"]</code>, <code>["-o", "IdentitiesOnly=yes"]</code>. Always followed by the <code>--</code> host guard.</td></tr>
+</tbody></table>
+<h3 id="verified-option-errors-raised-locally-before-any-ssh">Verified option errors (raised locally, before any ssh)</h3>
+<pre><code class="language-mix">ssh_run("node1", "echo hi", { foo: 1 })
+-- Runtime error: ssh_run: unknown opts key "foo" (allowed: timeout, connect_timeout,
+--   multiplex, batch, strict_host_key, env, env_transport, cwd, stdin, extra_ssh_args)
+
+ssh_run("node1", "echo hi", { timeout: "soon" })
+-- Runtime error: ssh_run: timeout must be a non-negative integer
+
+ssh_run("node1", "echo hi", { strict_host_key: "maybe" })
+-- Runtime error: ssh_run: strict_host_key "maybe" not in ["yes", "no", "accept-new", "ask"]
+
+ssh_run("node1", "echo hi", { env_transport: "ftp" })
+-- Runtime error: ssh_run: env_transport "ftp" not in ["mix", "sh", "argv"]
+
+ssh_run("node1", "echo hi", { env: { K: "v" }, stdin: "x" })
+-- Runtime error: ssh_run: `env` and `stdin` conflict — the secure env driver owns stdin;
+--   pass env_transport: "argv" to combine them (env values then appear in ps argv on both ends)
+
+ssh_run("", "echo hi")
+-- Runtime error: ssh_run: host must not be empty
+
+ssh_run("node1", [])
+-- Runtime error: ssh_run: commands list is empty
+
+ssh_run("node1")
+-- Runtime error: ssh_run: expected 2 or 3 args (host, command, [opts]), got 1
+</code></pre>
+<h3 id="the-built-in-timeout--dont-wrap-ssh-in-your-own">The built-in timeout — don't wrap ssh in your own</h3>
+<p><code>ssh_run</code> enforces a wall-clock deadline itself, so you never need <code>timeout 5 ssh ...</code>. On expiry it SIGKILLs the whole ssh process group (so descendant helpers can't keep the output pipes open and drag the wall clock toward the <em>remote</em> command's lifetime). Ctrl-C is gentler: SIGTERM to the group, up to 2 s of cooperative grace, then SIGKILL — reported as <code>interrupted = true</code>, <code>exit_code = -2</code>.</p>
+<p><strong>Every ssh/run <code>timeout</code> opt is in SECONDS</strong> (so are <code>run</code>/<code>run_rc</code>/<code>http_*</code> — see <a href="/mix/system">system.md</a>). The Bus <code>send … timeout=2000</code> form is the only millisecond surface in Mix.</p>
+<pre><code class="language-mix">$r = ssh_run("192.0.2.2", "sleep 30", { connect_timeout: 30, timeout: 1 })
+print("ok="          .. ("" .. $r.ok))
+print("exit_code="   .. ("" .. $r.exit_code))
+print("timed_out="   .. ("" .. $r.timed_out))
+print("under 3s? "   .. ("" .. ($r.duration_ms &lt; 3000)))
+</code></pre>
+<pre><code class="language-text">ok=false
+exit_code=-1
+timed_out=true
+under 3s? true
+</code></pre>
+<blockquote>
+<p><strong><code>multiplex: true</code> weakens cancellation, not the local wall-clock bound.</strong> A persisted mux master from a previous call lives in a different process group, so Mix cannot kill it or prove that the remote command stopped. Mix still returns at the local deadline: after a short drain window it abandons capture descriptors retained by the master and reports the timeout. The payoff is speed, at the cost of possible remote work continuing after the result. The <code>multiplex: false</code> default passes <code>ControlPath=none</code>, so the fresh ssh client and its helpers normally die with the process group.</p>
+</blockquote>
+<hr />
+<h2 id="remote-env-without-the-ps-leak-env--env_transport">Remote env without the ps leak (<code>env</code> + <code>env_transport</code>)</h2>
+<p>Naively, remote env means prefixing <code>export K='v'; </code> onto the command string — which makes the value one argv element of the local <code>ssh</code> <em>and</em> of the remote shell, so a secret is visible in <code>ps</code> output <strong>on both ends</strong>. That is now the opt-in legacy path, not the default. <code>env_transport</code> selects how <code>env</code> values travel (it is inert when <code>env</code> is empty):</p>
+<table><thead><tr><th>Transport</th><th>Mechanism</th><th>Visible in <code>ps</code>?</th><th>For</th></tr></thead><tbody>
+<tr><td><code>"mix"</code> (default)</td><td>A generated Mix driver ships over ssh <strong>stdin</strong> into <code>/opt/cosmix/bin/mix -</code>: strict-data-escaped <code>export</code> lines, then <code>exit(run_stream(["sh", "-c", &lt;command&gt;]))</code>.</td><td><strong>No</strong> — local <code>ps</code> shows only <code>ssh … /opt/cosmix/bin/mix -</code>; remote <code>ps</code> shows <code>sh -c &lt;command&gt;</code> (the command, never the env).</td><td>Every cosmix-managed node, regardless of login shell. Requires <code>/opt/cosmix/bin/mix</code> on the remote.</td></tr>
+<tr><td><code>"sh"</code></td><td>A POSIX driver (<code>export K='v'</code> lines + the command) ships over stdin into <code>sh -s</code>.</td><td><strong>No</strong> — the script travels on stdin.</td><td>Arbitrary <strong>non-cosmix</strong> POSIX hosts. <strong>Broken on mix-login-shell nodes</strong> — the remote <code>sh -s</code> misroutes through the Mix classifier.</td></tr>
+<tr><td><code>"argv"</code></td><td>The legacy <code>export K='v'; </code> command-string prefix.</td><td><strong>Yes, on both ends.</strong></td><td>Compatibility only. Never for secrets.</td></tr>
+</tbody></table>
+<pre><code class="language-mix">ssh_run("node1", "deploy.sh", { env: { API_TOKEN: $secret } })
+-- the token travels inside the stdin driver; `ps` on either end never shows it
+</code></pre>
+<p>Three consequences to know:</p>
+<ol>
+<li><strong>The secure transports own stdin.</strong> <code>env</code> + <code>stdin</code> together conflict loudly (verified error above) unless you explicitly pass <code>env_transport: "argv"</code>, which restores the combinable-but-visible legacy shape.</li>
+<li><strong>With <code>env</code> set under a secure transport, the command runs under POSIX <code>sh</code>, not the remote login shell.</strong> On a mix-login-shell node, a no-env snippet is evaluated by the remote <em>Mix</em> classifier; the same snippet with <code>env</code> set runs via <code>sh -c</code>. Write POSIX shell in the snippet when you pass <code>env</code>.</li>
+<li><strong><code>ssh_mix</code> handles env its own way</strong> — always as hidden <code>export KEY = "value"</code> lines prepended to the shipped source (stdin, never argv), which is why it rejects <code>env_transport</code> as not applicable.</li>
+</ol>
+<p>The legacy <code>"argv"</code> shape, for reference (values <code>shell_quote</code>-d, but still argv-visible):</p>
+<pre><code class="language-mix">ssh_run("node1", "make build", {
+  cwd: "/srv/project with spaces",
+  env: { CI: true, BUILD_TAG: "v1.2.3" },
+  env_transport: "argv"
+})
+-- remote command becomes:
+--   export CI='true'; export BUILD_TAG='v1.2.3'; cd '/srv/project with spaces' &amp;&amp; make build
+</code></pre>
+<p>(<code>export</code> rather than the <code>K=v cmd</code> one-shot syntax, so every command in a <code>&amp;&amp;</code>-joined chain sees the variable, not just the first.)</p>
+<hr />
+<h2 id="quoting--the-footgun-this-design-removes">Quoting — the footgun this design removes</h2>
+<p>Each <code>command</code> element reaches the <strong>remote shell verbatim</strong> — Mix does <strong>not</strong> wrap it in quotes. That's deliberate: you write normal shell, including pipes, redirects, and globs, and they run remotely.</p>
+<pre><code class="language-mix">ssh_run("node1", "grep -c error /var/log/app.log | tr -d '\\n'")
+</code></pre>
+<p>The danger is <em>interpolated data</em>. If you splice an untrusted value straight into the snippet, you've built a remote-shell-injection hole. Use <a href="/mix/builtins"><code>shell_quote</code></a> on every interpolated value:</p>
+<pre><code class="language-mix">$name = "weird; rm -rf /"            -- hostile input
+$cmd  = "ls -la " .. shell_quote($name)
+$r    = ssh_run("node1", $cmd)
+-- the snippet becomes:  ls -la 'weird; rm -rf /'   → one literal argument, no injection
+</code></pre>
+<p>When you pass a <strong>list</strong>, the elements are joined with <code>&amp;&amp;</code> <em>unquoted</em> — same rule, you <code>shell_quote</code> interpolated pieces inside each element:</p>
+<pre><code class="language-mix">ssh_run("node1", [
+  "mkdir -p " .. shell_quote($dir),
+  "cd " .. shell_quote($dir),
+  "tar xzf -"
+], { stdin: $archive_bytes })
+</code></pre>
+<p>The <code>cwd</code> option <em>is</em> quoted for you (via <code>shell_quote</code> internally), and <code>env</code> values never need caller quoting on any transport — they're the safe path for a remote working dir or environment without hand-rolling shell:</p>
+<pre><code class="language-mix">ssh_run("node1", "make build", { cwd: "/srv/project with spaces" })
+-- remote command becomes:  cd '/srv/project with spaces' &amp;&amp; make build
+</code></pre>
+<p>For threading a <em>Mix value</em> (a map/list, not a shell string) to a remote Mix interpreter safely, see <a href="/mix/data"><code>data_encode</code></a> — it produces inert Mix source the remote lexer rebuilds, never shell commands. And for shipping whole Mix <em>programs</em>, <code>ssh_mix</code> sidesteps quoting entirely (the source travels as stdin bytes, not argv).</p>
+<hr />
+<h2 id="when-the-remote-login-shell-is-mix">When the remote login shell is Mix</h2>
+<p>If a host runs <code>/opt/cosmix/bin/mix</code> as the login shell, then the snippet you send is evaluated by <strong>Mix</strong>, not by a POSIX shell. Two distinct modes:</p>
+<ul>
+<li><strong>Send Mix source for Mix behaviour.</strong> The remote evaluates it as a Mix program.</li>
+</ul>
+<pre><code class="language-mix">ssh_run("node1", "print(run(\"hostname\"))")          -- runs Mix on the far side
+</code></pre>
+<ul>
+<li><strong>Send a bare command for native dispatch.</strong> Mix's shell-first classifier dispatches it like a normal command.</li>
+</ul>
+<pre><code class="language-mix">ssh_run("node1", "hostname")                            -- dispatches natively
+ssh_run("node1", "mix status")                          -- bare `mix` self-resolves remotely
+</code></pre>
+<p>Things to remember on a Mix-shell host:</p>
+<ol>
+<li><strong>For anything with quoting, prefer <code>ssh_mix</code>.</strong> A one-liner as above is fine inline; the moment the payload has nested quotes, <code>$</code>, or newlines, ship it as source over stdin instead of fighting three quoting layers.</li>
+<li><strong>No aliases on the non-interactive path.</strong> <code>~/.mixrc</code> (aliases, PATH tweaks, prompt) loads only for <em>interactive</em> logins. <code>ssh_run</code> is non-interactive, so the remote sees no <code>~/.mixrc</code> — call binaries by full path (<code>/opt/cosmix/bin/...</code>), don't rely on a remote alias.</li>
+<li><strong>Watch your local quoting.</strong> The snippet is a Mix <em>string</em> on your side first. Prefer <code>'single quotes'</code> for the snippet so a <code>${...}</code> or <code>..</code> inside it isn't eaten by <em>local</em> interpolation, then escape only the inner double quotes you need.</li>
+<li><strong>POSIX subshell grouping <code>( … )</code> doesn't survive the remote classifier</strong> — a remote <code>(cmd; cmd) | sort</code> hits the same shell-dispatch limits as a local one (see <a href="/mix/shell-mode">shell-mode.md</a>). Wrap it: <code>ssh_run("node1", "run_rc(\"(cmd; cmd) | sort\")")</code>.</li>
+</ol>
+<p>See <a href="/mix/bus">the Bus page</a> for the usually-better alternative on a meshed host: a static <code>.bus</code> address (<code>send noded.node1.bus noded.info</code>) routes to the remote broker directly — no ssh, no shell at all.</p>
+<hr />
+<h2 id="transferring-files-scp-via-internal-sftp">Transferring files: scp via internal-sftp</h2>
+<p><code>ssh_run</code> runs commands; it does not move files. For that, shell out to <code>scp</code>/<code>sftp</code> (the genuinely-right external tool — these aren't primitives that belong in Mix):</p>
+<pre><code class="language-mix">$rc = run_rc("scp /local/path/build.tar.gz node1:/srv/app/")
+if $rc.rc != 0 then
+  print("upload failed: " .. $rc.stderr)
+end
+</code></pre>
+<blockquote>
+<p>On a host whose login shell is Mix, plain scp/sftp needs the sshd config to enable the SFTP subsystem explicitly (<code>Subsystem sftp internal-sftp</code>) — otherwise the transfer has no server to talk to even though <code>ssh_run</code> works fine. That's a server-side setup detail, not a Mix one.</p>
+</blockquote>
+<h3 id="stdin-caveat">stdin caveat</h3>
+<p>Stdin you write into a Mix-shell host's session does <strong>not</strong> reach a child spawned by the remote's <code>run</code>/<code>run_rc</code>. So for "push these bytes into a remote process", prefer one of:</p>
+<ul>
+<li>the <strong><code>stdin</code> option</strong> on <code>ssh_run</code> (feeds the remote command's own stdin over the ssh pipe), or</li>
+<li>having the remote <strong>pull</strong> the data, or</li>
+<li><strong>scp</strong> the file then act on it.</li>
+</ul>
+<p><code>ssh_mix</code> is the other side of this coin: there, stdin becomes the remote mix <strong>program</strong> itself — it ships <em>source</em> intact, but that same channel can't also feed stdin to a <code>run()</code> the remote script calls.</p>
+<pre><code class="language-mix">-- stdin option: pipe a payload to a remote filter
+$r = ssh_run("node1", "wc -l", { stdin: $multiline_text })
+print("remote line count: " .. $r.stdout)
+</code></pre>
+<hr />
+<h2 id="patterns">Patterns</h2>
+<h3 id="fan-out-across-a-host-list-collect-results">Fan out across a host list, collect results</h3>
+<p>A multi-statement lambda must be <strong>bound to a var</strong> before it's passed to a HOF (it won't parse inline) — see <a href="/mix/functions">functions</a>. For a large sweep, add <code>multiplex: true</code> to reuse connections per host — accepting the softer timeout bound.</p>
+<pre><code class="language-mix">$hosts = ["node1", "node2", "node3"]
+$check = function($h)
+  $r = ssh_run($h, "systemctl is-active nginx", { timeout: 5 })
+  return { host: $h, up: $r.ok, detail: $r.stdout }
+end
+$status = map($hosts, $check)
+for each $s in $status
+  print($s.host .. ": " .. (if $s.up then "up" else "DOWN (" .. $s.detail .. ")" end))
+end
+</code></pre>
+<h3 id="structured-value-back-from-a-remote-node">Structured value back from a remote node</h3>
+<pre><code class="language-mix">$r = ssh_mix("node1", "print(data_encode({disk: trim(run(\"df -h / | tail -1\"))}))",
+             { decode: "data", timeout: 5 })
+if $r.ok then print($r.value.disk) end
+</code></pre>
+<h3 id="deploy-step-that-must-succeed">Deploy step that must succeed</h3>
+<pre><code class="language-mix">ssh_must("node1", "install -m 0755 /tmp/app /opt/app/bin/app")
+ssh_must("node1", "systemctl restart app")
+print("deployed")
+-- either line raises (aborting the script) the moment the remote step fails
+</code></pre>
+<h3 id="custom-port--jump-host-without-touching-sshconfig">Custom port / jump host without touching ~/.ssh/config</h3>
+<pre><code class="language-mix">ssh_run("user@example.com", "uptime", { extra_ssh_args: ["-p", "2222"] })
+ssh_run("backend1",         "uptime", { extra_ssh_args: ["-J", "bastion.example.com"] })
+</code></pre>
+<h3 id="detect-non-utf-8-output">Detect non-UTF-8 output</h3>
+<pre><code class="language-mix">$r = ssh_run("node1", "cat /some/binary")
+if $r.utf8_lossy then
+  print("warning: remote output had invalid UTF-8 (replaced with U+FFFD)")
+end
+</code></pre>
+<hr />
+<h2 id="local-vs-remote--which-builtin">Local vs remote — which builtin</h2>
+<table><thead><tr><th>You want…</th><th>Use</th></tr></thead><tbody>
+<tr><td>run a command <strong>locally</strong>, branch on exit code</td><td><a href="/mix/system"><code>run_rc</code></a> → <code>{rc, stdout, stderr, timed_out, interrupted}</code></td></tr>
+<tr><td>run <strong>locally</strong>, raise on failure</td><td><a href="/mix/system"><code>run</code></a> → stdout string</td></tr>
+<tr><td>run <strong>locally</strong> with live/inherited stdio (interactive, <code>ssh -t</code>)</td><td><a href="/mix/system"><code>run_stream</code></a> → exit code</td></tr>
+<tr><td>run on a <strong>remote</strong> host, branch on outcome</td><td><strong><code>ssh_run</code></strong> → result map</td></tr>
+<tr><td>run on a <strong>remote</strong> host, raise on failure</td><td><strong><code>ssh_must</code></strong> → stdout string</td></tr>
+<tr><td>run Mix <strong>source</strong> on a remote node, no quoting</td><td><strong><code>ssh_mix</code></strong> → result map (+ <code>.value</code> with <code>decode:</code>)</td></tr>
+<tr><td>message a <strong>meshed</strong> node's broker (no shell)</td><td><a href="/mix/bus"><code>send</code> / <code>address</code></a></td></tr>
+</tbody></table>
+<hr />
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/system">system.md</a> — local <code>run</code> / <code>run_rc</code> / <code>run_stream</code>, the structured-return model <code>ssh_run</code> extends, and their (seconds-based) timeouts</li>
+<li><a href="/mix/builtins">builtins.md</a> — full builtins index, including <code>shell_quote</code>, <code>data_encode</code></li>
+<li><a href="/mix/strings">strings.md</a> — single- vs double-quote rules (matters for snippet quoting)</li>
+<li><a href="/mix/functions">functions.md</a> — lambdas + HOFs for fan-out across hosts</li>
+<li><a href="/mix/shell-mode">shell-mode.md</a> — the shell-dispatch classifier a mix-login-shell node applies to your snippet</li>
+<li><a href="/mix/bus">bus.md</a> — the no-ssh alternative on a meshed host: <code>send</code>/<code>emit</code>/<code>address</code></li>
+<li><a href="/mix/data">data.md</a> — <code>data_encode</code>/<code>data_parse</code> for safely shipping Mix <em>values</em> to and from a remote interpreter</li>
+<li><a href="https://man.openbsd.org/ssh_config">OpenSSH <code>ssh_config(5)</code></a> — host aliases, <code>ProxyJump</code>, identities that <code>ssh_run</code> inherits</li>
+<li><code>mix help</code> · <code>mix what ssh_run</code> · <code>mix what ssh_must</code> · <code>mix what ssh_mix</code> — terminal quick reference</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1148,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1202,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1331,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

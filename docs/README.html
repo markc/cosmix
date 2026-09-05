@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — README</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,138 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="README.md"><div class="prose"><h1 id="-cosmix">🖧 CosMix</h1>
+<p><strong>CosMix is an agent-operable computing system: legible, modifiable, and
+reconstructible by design.</strong> Not a desktop with AI features — an AI-first
+foundation that currently <em>manifests</em> as a Linux desktop plus a mesh service
+stack. The intended primary <em>operator</em> is an AI agent; the intended primary
+<em>user</em> is an AI-first developer driving the system through such agents.</p>
+<p>This is the whole project in one repository: the Bus protocol, the Mix
+language, the daemon family, the desktop, and the documentation site
+(<a href="https://cosmix.dev">cosmix.dev</a>).</p>
+<h2 id="get-it-running">Get it running</h2>
+<pre><code class="language-sh">git clone https://github.com/markc/cosmix ~/Projects/cosmix
+~/Projects/cosmix/bootstrap
+. ~/Projects/cosmix/env
+mix man overview
+</code></pre>
+<p>That is the entire install. <code>bootstrap</code> is a small POSIX-sh script — the one
+thing that runs before <code>mix</code> exists — which installs a Rust toolchain via
+rustup if you have none, builds <code>mix</code>, and hands over to <code>setup.mix</code>, which
+builds everything else and installs the binaries. Nothing needs root.</p>
+<ul>
+<li><strong>Clone it anywhere.</strong> The directory <code>bootstrap</code> lives in <em>is</em> <code>$COSMIX</code>;
+<code>~/Projects/cosmix</code> is only the documented default. Every path — source,
+binaries, config, state — derives from that one root, and the binaries
+find it from their own location, so no environment variable is required
+to <em>run</em> them (<code>env</code> is what you source to put <code>bin/</code> on your PATH).</li>
+<li><strong>Remove it by deleting the directory.</strong> <code>rm -rf $COSMIX</code> removes the
+install completely; cloning and running <code>bootstrap</code> again recreates it.</li>
+<li><strong>Update:</strong> <code>git pull &amp;&amp; mix setup.mix</code> — the same script, re-run,
+rebuilds and reinstalls (it is idempotent).</li>
+<li><code>setup.mix --desktop</code> also builds the desktop; <code>--system</code> additionally
+copies the binaries to <code>/opt/cosmix/bin</code> with sudo (the systemd units under
+<code>src/_etc</code> expect them there — installing <em>those</em> is deploy tooling's job).</li>
+</ul>
+<h2 id="layout--everything-keyed-off-cosmix">Layout — everything keyed off <code>$COSMIX</code></h2>
+<pre><code>$COSMIX/
+├── bootstrap        the pre-mix installer (sh); its directory defines $COSMIX
+├── setup.mix        everything after that, in Mix; re-run to rebuild/reinstall
+├── env              generated: `. $COSMIX/env` exports COSMIX and adds bin/ to PATH
+├── bin/             generated: installed binaries          ($COSMIX_BIN)
+├── etc/ var/ run/ log/ tmp/   generated runtime tree       ($COSMIX_ETC …)
+├── src/             ONE Cargo workspace                    ($COSMIX_SRC)
+│   ├── crates/      every crate, flat: bus family, mix, substrate libs, daemons
+│   ├── desktop/     the desktop — its own workspace + toolchain (Bevy/Smithay)
+│   ├── _etc/        systemd units, polkit rules, sysusers, tmpfiles (shipped templates)
+│   └── rust-toolchain.toml   the compiler every clone builds with
+└── docs/            the cosmix.dev site: bus/ cos/ mix/ manuals (source of truth), bugs/, dev/
+</code></pre>
+<p>The runtime tree is resolved by one rule shared by <code>mix</code> and every daemon
+(<code>src/crates/cosmix-lib-config/src/paths.rs</code>): <code>$COSMIX</code> from the
+environment, else self-located from the running binary, else the documented
+default; <code>COSMIX_&lt;KIND&gt;</code> overrides any single directory. A system install at
+<code>/opt/cosmix/bin</code> with no checkout above it keeps the usual FHS/XDG
+locations (<code>/etc/cosmix</code>, <code>/var/lib/cosmix</code>, <code>~/.config/cosmix</code>, …).</p>
+<h2 id="what-is-in-the-workspace">What is in the workspace</h2>
+<p>CosMix is a one-way dependency chain — <strong>bus ← mix ← cos</strong> — that used to be
+three repositories and is now three groups of crates in one workspace. The
+name <em>is</em> the architecture: <strong>Cos</strong> + <strong>Mix</strong>.</p>
+<table><thead><tr><th>Group</th><th>Crates</th><th>What it is</th></tr></thead><tbody>
+<tr><td><strong>Bus</strong></td><td><code>cosmix-lib-bus</code>, <code>-client</code>, <code>-buildinfo</code>, <code>-log</code>, <code>-props-core</code></td><td><strong>The CosMix Agent Bus.</strong> The wire protocol, client, and shared primitives every layer talks over. Depends on nothing. → <a href="https://cosmix.dev/bus/">docs</a></td></tr>
+<tr><td><strong>Mix</strong></td><td><code>cosmix-lib-mix</code>, <code>cosmix-mix</code>, <code>mix-bench</code></td><td><strong>Mesh &amp; Interprocess eXchange.</strong> A pure-Rust, ARexx-inspired shell and scripting language with native keywords for routing messages across the mesh. Depends on bus. → <a href="https://cosmix.dev/mix/">manual</a></td></tr>
+<tr><td><strong>Cos</strong></td><td>everything else under <code>src/crates/</code></td><td><strong>Cooperative Operating System.</strong> The daemon family — broker, mail, web, DNS, knowledge indexer, agent runtime — plus the foundation libraries they share. Depends on bus + mix. → <a href="https://cosmix.dev/cos/">docs</a></td></tr>
+<tr><td><strong>Desktop</strong></td><td><code>src/desktop/</code></td><td>The compositor (<code>cosmix-comp</code>), the <code>ctk</code> toolkit and the apps. A separate workspace because it pins its own toolchain and vendors patched Smithay/wgpu.</td></tr>
+</tbody></table>
+<blockquote>
+<p><em>Origin note:</em> <strong>CoS</strong> was first named for the <strong>Claude</strong> and <strong>Codex</strong> agents
+that co-authored the codebase; it now reads as the <strong>Cooperative Operating
+System</strong> layer.</p>
+</blockquote>
+<h2 id="documentation--cosmixdev">Documentation — <a href="https://cosmix.dev">cosmix.dev</a></h2>
+<p><code>docs/</code> is the GitHub Pages source for <strong><a href="https://cosmix.dev">cosmix.dev</a></strong>.
+The manuals are written there directly — <code>docs/mix/*.md</code> is what <code>mix man</code>
+reads locally <em>and</em> what <code>cosmix.dev/mix/</code> serves — so a doc edit and the code
+it describes land in the same commit.</p>
+<table><thead><tr><th>URL</th><th>Documents</th></tr></thead><tbody>
+<tr><td><strong><a href="https://cosmix.dev/bus/">cosmix.dev/bus/</a></strong></td><td>Bus protocol family — wire protocol, vocabularies, client, per-crate references</td></tr>
+<tr><td><strong><a href="https://cosmix.dev/mix/">cosmix.dev/mix/</a></strong></td><td>Mix language manual — syntax, builtins, man pages, per-crate references</td></tr>
+<tr><td><strong><a href="https://cosmix.dev/cos/">cosmix.dev/cos/</a></strong></td><td>Daemon family + foundation libraries, per-crate references</td></tr>
+<tr><td><strong><a href="https://cosmix.dev/bugs/">cosmix.dev/bugs/</a></strong></td><td>Public bug reports — upstream defects found and root-caused during CosMix development</td></tr>
+<tr><td><strong><a href="https://cosmix.dev/spec/">cosmix.dev/spec/</a></strong></td><td>Draft architecture specifications — evidence-labelled contracts, limitations and conformance gates; publication is not authority cutover</td></tr>
+<tr><td><strong><a href="https://cosmix.dev/history">cosmix.dev/history</a></strong></td><td>The story so far — six months of decisions, reversals and what stuck, in one sitting</td></tr>
+</tbody></table>
+<p>Every doc has a clean URL — <code>cosmix.dev/&lt;section&gt;/&lt;page&gt;</code> — served by a
+pre-generated HTML shell beside each markdown file. The shells are generated,
+not written: after adding, renaming or removing a doc, regenerate and commit
+them with <code>mix docs/build/gen-doc-pages.mix</code>. <code>docs/dev/{bus,mix,cos}/</code> keeps
+each former repository's agent-facing notes (<code>README</code>, <code>CLAUDE.md</code>,
+<code>AGENTS.md</code>), rewritten to the monorepo paths.</p>
+<h2 id="the-thesis">The thesis</h2>
+<p>The system is the project. Everything else — the desktop, the Bus-flavoured
+IPC, the sovereign mesh, the Mix language, the mail stack — is one of its
+<em>surfaces</em>, not its identity.</p>
+<p>Lineage: <strong>AmigaOS / ARexx</strong> (every app is an addressable message port),
+<strong>Smalltalk / Lisp machines</strong> (a live, self-reflective image), <strong>Plan 9</strong>
+(everything is a namespace). The novel contribution is an AI agent as a
+first-class operator of self-observation, self-modification, and
+self-reconstruction — which none of the precedents could have, because the
+agents didn't exist.</p>
+<h3 id="three-design-criteria">Three design criteria</h3>
+<p>Every architectural decision is filtered through three questions:</p>
+<ol>
+<li><strong>More legible to agents?</strong> — state queryable as structured data; code paths
+introspectable; events as accessible log streams; schemas agent-readable.</li>
+<li><strong>More modifiable by agents?</strong> — config mutable through structured channels,
+not ad-hoc file edits; component lifecycle agent-operable; schemas updatable
+at runtime.</li>
+<li><strong>More reconstructible by agents?</strong> — the build system itself agent-operable;
+sources/deps/artifacts navigable as structured data; the system able to
+rebuild parts of itself from source changes.</li>
+</ol>
+<p><code>bootstrap</code> + <code>setup.mix</code> are criterion 3 made literal: the whole system
+rebuilds from one clone with one command, and the only script not written in
+the system's own language is the one that exists to build that language.</p>
+<h2 id="public-repo-vs-private-control">Public repo vs. private control</h2>
+<p>This repository is public and contains no operator-specific state: no real
+host names, addresses, domains, keys or deploy targets (a hygiene gate on the
+maintainer's side refuses commits that carry them). Operational
+command-and-control — deploy scripts, mesh inventory, journals, private specs and
+decision records — lives in a private control repo the maintainer keeps
+beside this one. Contributions go through pull requests here.</p>
+<p>The sanitised replacement specification candidate lives in <code>docs/spec/</code>.
+Its draft publication does not replace the existing authoritative suite or
+reassign runtime specification IDs; see its authority and conformance chapters.</p>
+<h2 id="status">Status</h2>
+<p>CosMix is a research system under active development — a bet that AI-first
+sovereign computing is real and that an agent-operable system is its right
+shape. The code is <em>exploration residue</em>, not frozen canon; where a document
+and the code disagree, the three criteria decide.</p>
+<h2 id="license">License</h2>
+<p>MIT — see <a href="LICENSE">LICENSE</a>.</p>
+<hr />
+<p>🖧 CosMix · an agent-operable computing platform · 2026 © Mark Constable &lt;mc@cosmix.dev&gt;</p></div></div>
     </div>
 
 </main>
@@ -620,6 +750,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +804,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +933,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

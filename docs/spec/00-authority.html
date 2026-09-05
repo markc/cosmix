@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/00-authority</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,79 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/00-authority.md"><div class="prose"><h1 id="authority-evidence-and-change">Authority, evidence and change</h1>
+<h2 id="what-this-suite-means">What this suite means</h2>
+<p><strong>GOV-001 — Separate intent from evidence.</strong> A requirement states intended
+behaviour. An implementation note states observed source behaviour at a named
+revision. Tests demonstrate only their exercised cases. Deployment needs separate
+evidence. None of these may stand in for the others.</p>
+<p>The baseline for this edition is commit
+<code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code> of <code>markc/cosmix</code>. The source
+audit did not execute the Rust test suites or inspect production installations.
+The complete 47-file committed delta through
+<code>4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac</code> was subsequently reconciled.
+Unchanged source references retain their original pin; changed behaviour names
+the newer revision. Uncommitted work is excluded. This is source coverage, not
+a fresh correctness proof or test/deployment attestation.</p>
+<table><thead><tr><th>Label</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>Implemented / source-backed</td><td>Relevant code exists at the cited revision; no fresh execution implied</td></tr>
+<tr><td>Tested</td><td>A named command/test, revision, environment and result are recorded</td></tr>
+<tr><td>Partial</td><td>Some specified behaviour exists; the missing portion is identified</td></tr>
+<tr><td>Proposed / deferred</td><td>Intended future work, not a current capability</td></tr>
+<tr><td>Conflict / discrepancy</td><td>Source and an existing requirement disagree; neither is silently discarded</td></tr>
+<tr><td>Historical / superseded</td><td>Retained for traceability, not an instruction to recreate abandoned architecture</td></tr>
+<tr><td>Unverified</td><td>Available evidence is insufficient</td></tr>
+</tbody></table>
+<p>Chapter <code>status: draft</code> applies to the replacement document. It does not invalidate
+previously accepted requirements quoted within it. Mark Constable is the acceptance
+authority for this pre-GA refactor. Acceptance must explicitly disposition changes
+to those requirements; drafting and reviewing agents cannot ratify their own
+normative amendments.</p>
+<h2 id="authority-and-change-control">Authority and change control</h2>
+<p><strong>GOV-002 — No silent normative changes.</strong> Every changed MUST, wire value,
+identity rule, trust assumption, persistence guarantee or lifecycle transition
+needs an explicit retained/clarified/changed/deferred/superseded disposition and
+compatibility analysis. Editing prose is not evidence that a discrepancy is fixed.</p>
+<p><strong>GOV-003 — Stable references.</strong> Requirement IDs survive file moves. Removed IDs
+remain tombstoned in the change record and are never reassigned. Chapter numbers
+are editorial; legacy runtime identifiers require their own versioned registry.</p>
+<p><strong>GOV-004 — One canonical suite after acceptance.</strong> Public-safe architecture and
+contracts belong in <code>markc/cosmix/docs/spec/</code>, served at <code>/spec/</code> on cosmix.dev.
+Private overlays may configure a deployment,
+record private decisions or restrict actions, but must link to—not fork—the
+public contract. Private archives preserve historical evidence without competing
+for current authority.</p>
+<p>Current authorised task instructions and repository working agreements govern
+what an implementation agent may do. A historical specification is not authority
+to destroy unrelated working-tree changes, reveal secrets or expand task scope.
+Conflicting project mandates must be surfaced rather than silently reconciled.</p>
+<h2 id="names">Names</h2>
+<p><strong>GOV-005 — Naming is not protocol migration.</strong> Use Cosmix for the project,
+Bus for the family, ABP for Agent Bus Protocol, and Mix for the language/shell.
+The August 2026 AMP-to-Bus crate/path rename and ABP expansion correction are
+separate changes. The prose correction alone changed no wire encoding/version.
+Historical quotations, old commit paths and genuine identifiers retain their names.</p>
+<h2 id="evidence-and-publication-gates">Evidence and publication gates</h2>
+<p><strong>GOV-006 — Reviewable evidence.</strong> Every substantive current-state claim names
+the relevant source module and baseline. Claims of tests passing must include the
+actual run, not copy a previous session's report. Unknowns remain visible.</p>
+<p><strong>GOV-007 — Public sanitisation.</strong> Public material must exclude credentials,
+private host/address/domain mappings, operator home paths, deployment overlays,
+private review transcripts and operational logs. Use synthetic examples. A public
+copy must be independently screened; moving a private document is not sanitisation.</p>
+<p><strong>GOV-008 — Bounded review, explicit residuals.</strong> Review the complete candidate
+once independently. Apply one consolidated substantive-fix round. Verify only the
+specific fixes in the final check. An unresolved blocker stays a blocker; the
+review limit is not permission to publish a known-bad normative contract.</p>
+<h2 id="pre-ga-maintenance">Pre-GA maintenance</h2>
+<p>The suite version governs publication; chapter versions identify changed documents
+within it. Neither substitutes for crate, wire or storage versions.
+Use patch revisions for corrections without behavioural change; explain any
+contract change and its compatibility impact explicitly, regardless of version
+number. Before GA, a minor revision can reorganise chapters, but must preserve ID
+mapping and accepted guarantees. Review drift when affected code changes; perform
+a whole-suite checkpoint before release milestones or another broad refactor.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +691,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +745,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +874,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

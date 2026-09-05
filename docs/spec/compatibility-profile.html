@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/compatibility-profile</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,39 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/compatibility-profile.md"><div class="prose"><h1 id="accepted-compatibility-amendment">Accepted compatibility amendment</h1>
+<p>Mark Constable authorised weakening the disputed security and delivery guarantees
+to match current code on 2026-09-05. This is a scoped normative amendment to the
+replacement candidate, not acceptance of the entire suite or a deployment change.</p>
+<table><thead><tr><th>Contract</th><th>Accepted guarantee</th><th>Superseded stronger guarantee</th></tr></thead><tbody>
+<tr><td><a href="/spec/06-properties">PROP-014</a></td><td>Base read plus secrets capability reveals secret values without another selector</td><td>Explicit per-request secret selection and default privileged redaction</td></tr>
+<tr><td><a href="/spec/07-persistence-recovery">PROP-020 / STORE-010</a></td><td>Best-effort live notifications; bounded retained replay can assist recovery</td><td>Contiguous live delivery, at-least-once delivery and durable per-subscriber acknowledgement cursors</td></tr>
+<tr><td><a href="/spec/05-broker-topics">BROKER-012</a></td><td>Full ordinary outbound queues drop the new message and retain the connection</td><td>Drop-oldest and mandatory slow-consumer disconnect in that lane</td></tr>
+<tr><td><a href="/spec/07-persistence-recovery">STORE-008</a></td><td>Independent HMAC over canonical value and nseq</td><td>Chained, complete-history or full-event-metadata authentication</td></tr>
+<tr><td><a href="/spec/08-mesh-trust">MESH-008</a></td><td>Genesis-derived boot trust; no persisted adopted multi-key anchors</td><td>Restart-persistent in-band multi-key trust adoption</td></tr>
+<tr><td><a href="/spec/08-mesh-trust">MESH-018</a></td><td>Never-verified compatibility roster fallback, subject to separate admission posture</td><td>Universal refusal of unverified remote routing</td></tr>
+</tbody></table>
+<p>These stronger guarantees are no longer current-profile conformance obligations.
+They may return as separately approved, versioned enhancements. This is not an
+automatic rule to ratify every bug or future regression as correct behaviour.</p>
+<h2 id="evidence-and-limits">Evidence and limits</h2>
+<p>The original source audit is pinned to <code>96d12fdf</code>. The relevant dispatcher and
+authority changes through <code>4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac</code> were checked:
+dispatcher behaviour is unchanged (only a test actor constructor changed), and
+authority.rs is unchanged. Current mutation routing retains capability-based
+secret inclusion. Source references remain in the linked chapters. This targeted
+check does not advance the entire suite's baseline or certify a deployed system.</p>
+<p>No permission checks, protected-topic rules, accepted-state rollback protection,
+atomic record/history commits or enforced-admission gates are waived. No blanket
+constitutional amendment, unrelated feature reduction, public cutover or runtime
+ID remapping follows from this decision. Existing historical specs remain intact;
+their conflicting clauses are superseded only within this named candidate profile.</p>
+<p>Consumers needing stronger confidentiality, delivery or trust properties cannot
+assume them: choose an appropriate additional mechanism or wait for an explicitly
+specified stronger profile. In particular, a lost final event can remain unnoticed
+without reconciliation, privileged read payloads can contain secrets, and an audit
+digest alone cannot prove complete or untampered event history.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +651,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +705,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +834,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/variables</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,324 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/variables.md"><div class="prose"><h1 id="variables--sigils-assignment--scope">variables — sigils, assignment &amp; scope</h1>
+<p>Every Mix variable carries a <code>$</code> sigil. There is no separate declaration —
+assignment <strong>is</strong> the declaration. Reading an unbound variable raises a runtime
+error; the <code>$</code> sigil is also how Mix tells a variable apart from a bare command
+word at the shell-first classifier. This page covers the sigil, assignment,
+reading (bound and unbound), <code>${...}</code> string interpolation, the <code>env()</code> builtin,
+positional <code>$1</code>/<code>$2</code> script arguments, and the one rule that trips up everyone
+coming from bash or Python — <strong>assignment inside a function does not write
+through to a global</strong>.</p>
+<p>Related: <a href="/mix/strings">strings</a> for the full quoting/interpolation rules,
+<a href="/mix/functions">functions</a> for the deep function-scope detail, and
+<a href="/mix/control-flow">control flow</a> for loop variables.</p>
+<h2 id="the--sigil-is-mandatory">The <code>$</code> sigil is mandatory</h2>
+<p>Read and write a variable with a leading <code>$</code>:</p>
+<pre><code class="language-mix">$x = 42
+print($x)            -- 42
+print($x + 8)        -- 50
+</code></pre>
+<pre><code class="language-text">42
+50
+</code></pre>
+<p>A <strong>bare</strong> <code>x = 1</code> is <em>not</em> a Mix assignment — the classifier is shell-first, so
+it tries to run a command named <code>x</code>:</p>
+<pre><code class="language-text">$ mix -c 'x = 1'
+mix: x: No such file or directory (os error 2)
+</code></pre>
+<p>The fix is always the same: write <code>$x = 1</code>. This is the single most common
+first error. The sigil is what makes <code>$x = 1</code> parse as Mix rather than dispatch
+to the shell.</p>
+<h3 id="variable-names">Variable names</h3>
+<p>A name after the <code>$</code> is ASCII letters, digits and underscores. Names are
+<strong>case-sensitive</strong> — <code>$Foo</code> and <code>$foo</code> are different variables:</p>
+<pre><code class="language-text">$ mix -c '$Foo = 1
+print($foo)'
+Runtime error at line 2: undefined variable '$foo'
+</code></pre>
+<p>Because the sigil already marks the word as a variable, <strong>keyword lexemes are
+fine as variable names</strong> — <code>$to</code>, <code>$end</code>, <code>$step</code>, even <code>$fn</code> all bind and read
+normally. Un-sigiled name positions still reject keywords: <code>function step()</code> is
+a parse error (<code>expected identifier, got Step</code>). See <a href="/mix/keywords">keywords</a>.</p>
+<h2 id="assignment-concatenation--reassignment">Assignment, concatenation &amp; reassignment</h2>
+<p>Assignment creates the variable in the current scope if new, or updates it in
+place if it already exists in a visible scope:</p>
+<pre><code class="language-mix">$n = 1
+$n = $n + 1
+$n = $n + 1
+print($n)            -- 3
+</code></pre>
+<pre><code class="language-text">3
+</code></pre>
+<p><strong>Concatenation is <code>..</code>, never <code>+</code> or <code>.</code></strong> — <code>+</code> is numeric addition, and <code>.</code>
+is field access:</p>
+<pre><code class="language-mix">$name = "world"
+print("hello " .. $name)
+</code></pre>
+<pre><code class="language-text">hello world
+</code></pre>
+<p>Statements are separated by a newline or <code>;</code>. Prefer newlines in script files;
+the compact <code>mix -c '$x = 1; print($x)'</code> form is equivalent.</p>
+<h3 id="indexed--field-assignment">Indexed &amp; field assignment</h3>
+<p>Assignment also targets list elements and map fields:</p>
+<pre><code class="language-mix">$l = [1, 2, 3]
+$l[0] = 9            -- lists are 0-indexed
+$l[-1] = 7           -- a negative index writes from the end
+print($l)
+
+$m = { host: "a" }
+$m.host = "b"        -- field assignment
+$m.to = "kw"         -- keyword field names are fine
+$m["port"] = 80      -- index assignment creates the key
+print($m)
+</code></pre>
+<pre><code class="language-text">[9, 2, 7]
+{host: b, to: kw, port: 80}
+</code></pre>
+<p>Writes are <strong>loud</strong> where reads are forgiving: an out-of-range list <em>write</em>
+(<code>$l[5] = 9</code> on a 1-element list → "list index 5 out of range") and an
+index-assign into a scalar (<code>$s[0] = "H"</code> on a string → "cannot index-assign
+into string") both raise, while the corresponding <em>reads</em> (<code>$l[5]</code>,
+<code>$m["nope"]</code>) return <code>nil</code>. The asymmetry is deliberate — a lost write is data
+loss, a missing read is often just a probe. Full indexing rules:
+<a href="/mix/collections">collections</a>.</p>
+<h2 id="reading-an-unbound-variable-raises">Reading an unbound variable raises</h2>
+<p>Mix has no implicit <code>nil</code> for an unread name. Touching one that was never
+assigned is a hard <code>RuntimeError</code>:</p>
+<pre><code class="language-text">$ mix -c 'print($nope)'
+Runtime error at line 1: undefined variable '$nope'
+</code></pre>
+<p>This is deliberate — a typo in a variable name fails loudly instead of silently
+reading empty. If you genuinely need a "maybe-set" variable (e.g. for an
+<code>if $x == nil</code> guard), <strong>pre-initialise it to <code>nil</code> first</strong>:</p>
+<pre><code class="language-mix">$maybe = nil
+if $maybe == nil then
+  print("was nil")
+end
+</code></pre>
+<pre><code class="language-text">was nil
+</code></pre>
+<p><strong>All-digit names</strong> (<code>$0</code>, <code>$1</code>, <code>$2</code>, … — the positional script arguments) are
+the one exception — an unset positional reads as <code>nil</code> rather than raising (see
+<a href="/mix/variables#positional-arguments">Positional arguments</a>).</p>
+<h2 id="-string-interpolation--scope--env--nil"><code>${...}</code> string interpolation — scope → env → nil</h2>
+<p>Inside <strong>double quotes</strong>, <code>${name}</code> interpolates. The lookup walks
+<strong>scope first, then the process environment, then literal <code>nil</code></strong>:</p>
+<pre><code class="language-mix">$user = "alice"
+print("hi ${user}")          -- scope hit
+</code></pre>
+<pre><code class="language-text">hi alice
+</code></pre>
+<pre><code class="language-text">$ GREETING=howdy mix -c 'print("env says: ${GREETING}")'
+env says: howdy
+</code></pre>
+<p>A scope binding always wins over an environment variable of the same name — the
+env fallback only fires when the name is <strong>truly unbound in scope</strong>. A variable
+bound to <code>nil</code> is still a scope hit, so it shadows the env:</p>
+<pre><code class="language-text">$ ZED=fromenv mix -c '$ZED = nil
+print("[${ZED}]")'
+[nil]
+
+$ ZED=fromenv mix -c 'print("[${ZED}]")'
+[fromenv]
+</code></pre>
+<p>An entirely unknown name interpolates as the text <code>nil</code>:</p>
+<pre><code class="language-text">$ mix -c 'print("[${missing}]")'
+[nil]
+</code></pre>
+<h3 id="a-bare-name-in-double-quotes-is-literal">A bare <code>$name</code> in double quotes is LITERAL</h3>
+<p>This is the opposite of bash, and a prime trap. Only <code>${...}</code> (with braces)
+interpolates; a bare <code>$name</code> is literal text:</p>
+<pre><code class="language-mix">$name = "bob"
+print("literal $name here")
+</code></pre>
+<pre><code class="language-text">literal $name here
+</code></pre>
+<p>To emit a literal <code>$</code> next to braces, escape it: <code>"\$5"</code> → <code>$5</code>. When in doubt,
+prefer <code>..</code> concatenation over interpolation — <code>"hi " .. $name</code> is unambiguous.</p>
+<p><code>${...}</code> is <strong>string-only syntax</strong> — it is not a general expression form.
+<code>print(${x})</code> outside a string is a lexer error:</p>
+<pre><code class="language-text">$ mix -c '$x = 9
+print(${x})'
+Lexer error at line 2:7: expected variable name after '$'
+</code></pre>
+<h3 id="dotted-paths-interpolate-into-maps">Dotted paths interpolate into maps</h3>
+<p><code>${map.field}</code> walks a map by dotted path inside the interpolation:</p>
+<pre><code class="language-mix">$cfg = { host: "node1", port: 8080 }
+print("connect ${cfg.host}:${cfg.port}")
+</code></pre>
+<pre><code class="language-text">connect node1:8080
+</code></pre>
+<p>A missing map, or a missing key on a bound map (<code>${cfg.missing}</code>), interpolates
+as the text <code>nil</code>, same as an entirely unknown name.</p>
+<h3 id="single-quotes-are-fully-raw"><code>'single quotes'</code> are fully raw</h3>
+<p>Single-quoted strings interpolate <strong>nothing</strong> — no <code>${...}</code>, no <code>~</code>, no escapes
+beyond <code>\'</code> and <code>\\</code>. Use them when you want the literal characters:</p>
+<pre><code class="language-text">$ mix -c "\$x = 9
+print('raw \${x} \$x')"
+raw ${x} $x
+</code></pre>
+<p>See <a href="/mix/strings">strings</a> for the complete quoting matrix.</p>
+<h2 id="env--explicit-environment-read"><code>env()</code> — explicit environment read</h2>
+<p><code>${X}</code> consults the environment only as a <em>fallback</em> after scope. When you want
+to read the environment unconditionally — ignoring any same-named Mix variable —
+call the <code>env()</code> builtin. A missing variable returns the <strong>empty string</strong> (it
+never raises):</p>
+<pre><code class="language-text">$ MYVAR=hello mix -c 'print(env("MYVAR"))
+print("[" .. env("NOSUCH") .. "]")'
+hello
+[]
+</code></pre>
+<table><thead><tr><th>Form</th><th>Looks up</th><th>Missing →</th><th>Same-named Mix var</th></tr></thead><tbody>
+<tr><td><code>"${X}"</code></td><td>scope, then env</td><td><code>nil</code> text</td><td>scope <strong>wins</strong></td></tr>
+<tr><td><code>env("X")</code></td><td>env only</td><td><code>""</code> (empty string)</td><td>ignored</td></tr>
+</tbody></table>
+<h2 id="positional-arguments">Positional arguments</h2>
+<p>When you run a script file, its path lands in <code>$0</code> and the command-line
+arguments in <code>$1</code>, <code>$2</code>, … as strings:</p>
+<pre><code class="language-mix">-- pos.mix
+print("script: " .. $0)
+print("first: " .. $1)
+print("second: " .. $2)
+</code></pre>
+<pre><code class="language-text">$ mix pos.mix apple banana
+script: pos.mix
+first: apple
+second: banana
+</code></pre>
+<p>An unset positional reads as <code>nil</code> (not an error — the one exception to the
+unbound-raises rule). The exemption is by <strong>name shape</strong>: any all-digit name
+reads <code>nil</code> when unset — <code>$15</code> is <code>nil</code> even when only two args were passed,
+and <code>$0</code> is <code>nil</code> under <code>mix -c</code> (no script file):</p>
+<pre><code class="language-text">$ mix -c 'print($1)'
+nil
+</code></pre>
+<p>Positionals interpolate in double quotes like any other name —
+<code>"first is ${1}"</code> → <code>first is apple</code>.</p>
+<p>For the whole argument vector as a list, use the <code>args()</code> builtin — the same
+arguments the positionals index, so <code>args()[0]</code> is <code>$1</code>:</p>
+<pre><code class="language-mix">-- argv.mix
+print(args())
+print(length(args()))
+</code></pre>
+<pre><code class="language-text">$ mix argv.mix one two three
+[one, two, three]
+3
+</code></pre>
+<p><code>args()</code> pairs with <code>getopt(args(), spec)</code> for flag parsing — see
+<a href="/mix/builtins">builtins index</a>.</p>
+<h2 id="scope-top-level-vs-functions">Scope: top level vs functions</h2>
+<p>At the <strong>top level</strong> there is one global frame. A variable assigned anywhere at
+the top level is visible everywhere after it, and a loop variable still holds its
+last value after the loop ends:</p>
+<pre><code class="language-mix">for each $x in [1, 2, 3]
+  $last = $x
+end
+print($last)
+</code></pre>
+<pre><code class="language-text">3
+</code></pre>
+<h3 id="assignment-in-a-function-does-not-write-through-to-a-global">Assignment in a function does NOT write through to a global</h3>
+<p>A function gets its <strong>own frame</strong>. It can <em>read</em> an outer/global variable
+(reads fall through to the global frame), but <strong>any <code>$x = …</code> assignment inside a
+function binds a function-local</strong> — it never updates the outer variable:</p>
+<pre><code class="language-mix">$g = 1
+function bump()
+  $g = 99           -- binds a LOCAL $g, does NOT touch the global
+end
+bump()
+print($g)           -- still 1
+</code></pre>
+<pre><code class="language-text">1
+</code></pre>
+<p>Reading through to an outer variable works fine:</p>
+<pre><code class="language-mix">$base = 100
+function show()
+  print($base)      -- reads the global
+end
+show()
+</code></pre>
+<pre><code class="language-text">100
+</code></pre>
+<p>This holds for accumulator patterns — a helper doing <code>$count = $count + 1</code>
+leaves the caller's <code>$count</code> unchanged — and for <code>$rc</code> / <code>$result</code> too: on a
+<code>send</code> the Bus runtime writes them <strong>into the current frame</strong>, so a <code>send</code>
+inside a function updates them for that function's body only. The caller's
+<code>$rc</code> is untouched (and still unbound at the top level if no top-level <code>send</code>
+has run). There is <strong>no <code>global</code> keyword</strong> by design.</p>
+<h3 id="binders-shadow-inside-a-function">Binders shadow inside a function</h3>
+<p>Names a function <em>introduces</em> — a <code>for each $x</code> / <code>for $i = …</code> loop variable, a
+<code>catch $e</code>, a <code>parse … with $a $b</code> target — bind in the function's own frame,
+<strong>shadowing</strong> a same-named caller/global variable rather than clobbering it:</p>
+<pre><code class="language-mix">$x = "outer"
+function f()
+  for each $x in [1, 2, 3]
+    $y = $x           -- $x is function-local here
+  end
+end
+f()
+print($x)             -- still "outer"
+</code></pre>
+<pre><code class="language-text">outer
+</code></pre>
+<p>The same holds for <code>catch $e</code> and <code>parse "one two" with $a $b</code> inside a
+function — the outer <code>$e</code> / <code>$a</code> read unchanged after the call. At the <strong>top
+level</strong> there is no shadowing: everything is one global frame, so a top-level
+loop variable overwrites a same-named global and persists after the loop.</p>
+<h3 id="the-pass-in--return--reassign-triad">The pass-in / return / reassign triad</h3>
+<p>To propagate state out of a function, thread it through three steps:
+<strong>(1) pass the value in</strong> (explicit read), <strong>(2) <code>return</code></strong> the new value, and
+<strong>(3) reassign at the call site</strong> (the write):</p>
+<pre><code class="language-mix">$g = 5
+function inc($n)
+  return $n + 1
+end
+$g = inc($g)        -- pass in, return, reassign
+print($g)           -- 6
+</code></pre>
+<pre><code class="language-text">6
+</code></pre>
+<p>Return a map to update several values at once. Parameters pass <strong>by value</strong>
+(a number/list/map is copied in), so mutating a parameter inside the function
+never reaches the caller either — the <code>return</code> + reassign is always the channel.
+Lambdas and closures follow the same rules (a closure <em>captures</em> its defining
+scope for reads, but a write still binds a local). The full function-scope
+detail — closures, captures, recursion, HOF lambdas — lives in
+<a href="/mix/functions">functions</a>.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table><thead><tr><th>Thing</th><th>Rule</th><th>Example</th></tr></thead><tbody>
+<tr><td>Sigil</td><td>every variable is <code>$name</code></td><td><code>$x = 1</code></td></tr>
+<tr><td>Bare name</td><td>misparsed as a shell command</td><td><code>x = 1</code> → "No such file"</td></tr>
+<tr><td>Names</td><td>ASCII letters/digits/<code>_</code>, case-sensitive</td><td><code>$Foo</code> ≠ <code>$foo</code></td></tr>
+<tr><td>Keyword names</td><td>fine with the sigil</td><td><code>$to = 1</code>, <code>$end = 2</code></td></tr>
+<tr><td>Concat</td><td><code>..</code> (not <code>+</code> or <code>.</code>)</td><td><code>"a " .. $x</code></td></tr>
+<tr><td>Unbound read</td><td>raises <code>RuntimeError</code></td><td><code>$nope</code> → error</td></tr>
+<tr><td>Unbound positional</td><td>all-digit names read as <code>nil</code></td><td><code>$1</code> (unset) → <code>nil</code></td></tr>
+<tr><td><code>${X}</code> in <code>"..."</code></td><td>scope → env → <code>nil</code> text</td><td><code>"${user}"</code></td></tr>
+<tr><td>Bare <code>$X</code> in <code>"..."</code></td><td><strong>literal</strong> text</td><td><code>"$user"</code> → <code>$user</code></td></tr>
+<tr><td><code>'...'</code></td><td>fully raw, no interpolation</td><td><code>'${x}'</code> → <code>${x}</code></td></tr>
+<tr><td><code>env("X")</code></td><td>env only, missing → <code>""</code></td><td><code>env("HOME")</code></td></tr>
+<tr><td>Indexed write</td><td>loud on out-of-range; the read is <code>nil</code></td><td><code>$l[5] = 9</code> → error</td></tr>
+<tr><td>Assign in function</td><td>binds a <strong>local</strong>, never the global</td><td>use return + reassign</td></tr>
+<tr><td>Binders in function</td><td>shadow, never clobber the outer var</td><td>loop var, <code>catch $e</code></td></tr>
+</tbody></table>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — quoting, <code>${...}</code> vs <code>$name</code>, escapes, <code>~</code> expansion</li>
+<li><a href="/mix/functions">functions</a> — function-local binding, closures, the triad in depth</li>
+<li><a href="/mix/control-flow">control flow</a> — loops and the variables they bind</li>
+<li><a href="/mix/collections">collections</a> — lists/maps, indexing, the read-<code>nil</code> / write-error asymmetry</li>
+<li><a href="/mix/keywords">keywords</a> — reserved words and where they are allowed as names</li>
+<li><a href="/mix/builtins">builtins index</a> — <code>env</code>, <code>args</code>, <code>getopt</code>, and the rest</li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>$result</code> / <code>$rc</code> after a <code>send</code></li>
+</ul>
+<pre><code>mix help              the full categorized builtin reference
+mix what env          one-line description of env() (or any name)
+mix what args         one-line description of args()
+mix keywords          list the reserved words
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +936,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +990,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1119,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

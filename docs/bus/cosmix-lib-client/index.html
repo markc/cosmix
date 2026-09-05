@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/cosmix-lib-client/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,165 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/cosmix-lib-client/README.md"><div class="prose"><h1 id="cosmix-lib-client">cosmix-lib-client</h1>
+<p><code>cosmix-lib-client</code> is the async Bus WebSocket client library for connecting
+Cosmix applications to a <code>cosmix-noded</code> broker. It occupies the <code>bus</code> end of
+the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it depends on <code>cosmix-lib-bus</code> for
+wire messages and exposes broker-client primitives without depending on
+<code>mix</code>, <code>cos</code>, storage, or configuration loaders.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The Cargo package is <code>cosmix-lib-client</code>; Rust code imports <code>cosmix_client</code>.</p>
+<p>The crate selects its <code>NodedClient</code> implementation by compilation target:</p>
+<table><thead><tr><th>Target</th><th>Client model</th></tr></thead><tbody>
+<tr><td>Non-WASM</td><td>Named or anonymous Tokio client with incoming commands and replies</td></tr>
+<tr><td><code>wasm32</code></td><td>Anonymous, call-only browser client</td></tr>
+</tbody></table>
+<p>Native builds also export the reconnecting <code>SupervisedClient</code>. The crate has no
+binary, command-line interface, or configuration file format.</p>
+<h2 id="native-client">Native client</h2>
+<p><code>NodedClient</code> is the direct, one-connection client for non-WASM targets.</p>
+<table><thead><tr><th>Method</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>connect</code></td><td>Connect with a caller-supplied URL and register a service name</td></tr>
+<tr><td><code>connect_with_provenance</code></td><td>Register a name and optional build provenance</td></tr>
+<tr><td><code>connect_anonymous</code></td><td>Connect without registering a service name</td></tr>
+<tr><td><code>register_as</code></td><td>Re-register the current connection under a new name</td></tr>
+</tbody></table>
+<p>The caller supplies the broker URL. The native client does not read a config file
+and does not discover a broker URL.</p>
+<p>Request methods:</p>
+<table><thead><tr><th>Method</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>call</code></td><td>Sends JSON arguments and returns a JSON value</td></tr>
+<tr><td><code>call_typed</code></td><td>Separates transport failure from a Bus application error</td></tr>
+<tr><td><code>call_with_headers</code></td><td>Sends caller headers and a verbatim body, then parses the reply</td></tr>
+<tr><td><code>call_with_headers_raw</code></td><td>Returns <code>(rc, body, error_header)</code> without collapsing application errors</td></tr>
+<tr><td><code>send</code></td><td>Sends JSON arguments without waiting for a reply</td></tr>
+<tr><td><code>send_with_headers</code></td><td>Sends explicit Bus headers and a verbatim body without waiting</td></tr>
+<tr><td><code>send_raw</code></td><td>Sends an already-built <code>BusMessage</code></td></tr>
+</tbody></table>
+<p><code>call</code> treats a Bus return code of 10 or greater as an error. <code>call_typed</code>
+instead returns <code>PortReply::AppError</code> for that reply and reserves <code>Err</code> for
+transport failures. Successful typed replies retain the Bus return code,
+including warning codes.</p>
+<p>The native request path correlates replies by message ID. A call waits for at
+most 60 seconds. Cancelling removes its pending entry. Unmatched replies are
+discarded.</p>
+<p><code>call_with_headers</code> protects the framing headers <code>command</code>, <code>from</code>, <code>to</code>, <code>type</code>,
+and <code>id</code> from caller overrides. <code>call_with_headers_raw</code> leaves the response body
+unparsed and preserves its optional <code>error</code> header.</p>
+<h2 id="incoming-commands-and-replies">Incoming commands and replies</h2>
+<p><code>incoming</code> and <code>incoming_async</code> transfer ownership of the client's incoming
+command receiver. The receiver can be taken once.</p>
+<p>Each <code>IncomingCommand</code> contains:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>from</code></td><td>Sending service</td></tr>
+<tr><td><code>command</code></td><td>Bus command name</td></tr>
+<tr><td><code>id</code></td><td>Optional request correlation ID</td></tr>
+<tr><td><code>args</code></td><td>Body parsed as JSON, or <code>null</code> when absent or invalid</td></tr>
+<tr><td><code>body</code></td><td>Original body text</td></tr>
+<tr><td><code>headers</code></td><td>All Bus headers</td></tr>
+</tbody></table>
+<p><code>IncomingCommand::header</code> reads any preserved header. <code>target</code>, <code>parent</code>, and
+<code>source</code> are shortcuts. <code>is_ui_command</code> tests for a <code>ui.</code> command prefix.</p>
+<p>Use <code>respond</code> for an <code>IncomingCommand</code>; use <code>respond_parts</code> with its correlation
+parts.</p>
+<h2 id="discovery-and-lifecycle">Discovery and lifecycle</h2>
+<p><code>list_services</code> returns registered service names. <code>service_inventory</code> returns
+<code>cosmix_bus::ServiceInfo</code> values with the broker's full service metadata.</p>
+<p><code>is_connected</code> reports the connection flag. <code>deregister</code> removes the registered
+name and clears the local name after success. <code>close</code> performs best-effort
+WebSocket shutdown, stops the reader task, marks the client disconnected, and
+releases pending callers.</p>
+<p>Dropping a direct <code>NodedClient</code> does not by itself provide deterministic
+socket teardown. Call <code>close</code> when that guarantee is required.</p>
+<h2 id="supervised-client">Supervised client</h2>
+<p><code>SupervisedClient</code> wraps a native <code>NodedClient</code> for resident services. Create it
+with <code>connect_supervised</code> or <code>connect_supervised_with_provenance</code>.</p>
+<p>The initial connection has a bounded <code>MAX_INITIAL_ATTEMPTS</code> budget of five;
+exhaustion returns <code>SupervisedError::InitialConnectFailed</code>.</p>
+<p>After an established connection is lost, the supervisor reconnects without an
+attempt limit. It uses full-jitter exponential backoff from 250 milliseconds
+to a 30-second ceiling. A successful reconnect re-registers the service,
+re-sends optional provenance, and replays recorded topic subscriptions in
+their original order.</p>
+<p>The outward receiver returned by <code>incoming</code> survives transient reconnects.
+<code>state</code> returns <code>ConnState</code>, and <code>connection_generation</code> increments after each
+fully established connection. The states are <code>Connecting</code>, <code>Connected</code>,
+<code>Disconnected</code>, <code>ShuttingDown</code>, and <code>Fatal</code>.</p>
+<p>That unbounded receiver remains the compatibility default. Opt in to a hard
+subscription memory bound with
+<code>connect_options(...).bounded_incoming(capacity)</code>, then take
+<code>incoming_bounded()</code>. The socket reader and outward supervisor lane both use
+<code>try_send</code>; full lanes drop the new command and expose the loss as a cumulative
+<code>overflow_count()</code> plus a one-shot <code>BoundedIncomingEvent::Overflow</code> marker.
+Consumers can therefore reset derived state instead of silently continuing
+from an incomplete event stream.</p>
+<p>Outbound supervised methods fail immediately unless the state is
+<code>Connected</code>. The client does not queue work while disconnected.
+<code>SupervisedError::Disconnected</code> and <code>SupervisedError::ShuttingDown</code> make
+those states distinguishable from <code>SupervisedError::Transport</code>.</p>
+<p>The supervised client proxies the direct client's call, send, response,
+header, and service-list operations.</p>
+<p><code>shutdown</code> stops the supervisor without deregistering. <code>deregister</code> first
+stops the supervisor, then deregisters over the remaining live connection.</p>
+<h2 id="topic-subscriptions">Topic subscriptions</h2>
+<p><code>subscribe_topic</code> calls <code>topic.subscribe</code> and records the topic only after the
+broker accepts the subscription. <code>unsubscribe_topic</code> calls
+<code>topic.unsubscribe</code> and removes the topic only after broker acceptance.</p>
+<p><code>SubscriptionRegistry</code> is a cloneable, shared, ordered set. It provides
+<code>record</code>, <code>remove</code>, <code>snapshot</code>, <code>len</code>, and <code>is_empty</code>. Duplicate records are
+ignored. Removing and later recording a topic appends it at the end of replay
+order.</p>
+<h2 id="browser-client">Browser client</h2>
+<p>On <code>wasm32</code>, <code>NodedClient</code> is an anonymous call-only client based on the
+browser WebSocket API. It does not register a service and does not receive
+incoming commands.</p>
+<p><code>connect_anonymous</code> accepts an explicit WebSocket URL.
+<code>connect_anonymous_default</code> derives <code>/ws</code> from the current page origin, using
+<code>wss</code> for HTTPS pages and <code>ws</code> otherwise. <code>call</code> sends a JSON request and
+waits for its correlated response. <code>is_connected</code> reports whether the reader
+loop remains live.</p>
+<p>The browser client treats return codes of 10 or greater as errors and expects a
+non-empty successful response body to contain valid JSON.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>native</code></td><td>Yes</td><td>Enables Tokio, Tokio Tungstenite, native futures utilities, jitter generation, and <code>cosmix-lib-bus</code> native support</td></tr>
+</tbody></table>
+<p>The browser backend is selected by the <code>wasm32</code> target, not by a <code>web</code> Cargo
+feature. WASM dependencies include <code>gloo-net</code>, <code>wasm-bindgen-futures</code>,
+<code>web-sys</code>, <code>futures-channel</code>, and <code>futures-util</code>.</p>
+<h2 id="example">Example</h2>
+<pre><code class="language-rust">use cosmix_client::{NodedClient, PortReply};
+
+#[tokio::main]
+async fn main() -&gt; anyhow::Result&lt;()&gt; {
+let client =
+    NodedClient::connect("alpha", "wss://broker.example.com/ws").await?;
+
+match client
+    .call_typed("beta", "status.get", serde_json::Value::Null)
+    .await?
+{
+    PortReply::Ok { rc, value } =&gt; println!("rc={rc} value={value}"),
+    PortReply::AppError { rc, message } =&gt; {
+        eprintln!("application error rc={rc}: {message}");
+    }
+}
+
+client.close().await;
+Ok(())
+}
+</code></pre>
+<p><code>PortReply</code> is re-exported on non-WASM targets. The direct client returns
+<code>anyhow::Result</code>; the supervised client uses <code>SupervisedError</code> for lifecycle
+and transport failures.</p>
+<h2 id="dependency-boundary">Dependency boundary</h2>
+<p>The crate always depends on <code>cosmix-lib-bus</code> with that dependency's default
+features disabled. It also uses <code>serde</code>, <code>serde_json</code>, <code>tracing</code>, and
+<code>anyhow</code>.</p>
+<p>Configuration loading, persistent state, broker deployment, and service
+implementations remain outside this crate. Native callers provide an explicit
+broker URL; browser callers may derive one only from the current page origin.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +777,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +831,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +960,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

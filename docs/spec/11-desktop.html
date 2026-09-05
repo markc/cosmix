@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/11-desktop</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,44 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/11-desktop.md"><div class="prose"><h1 id="desktop-protocol-rendering-and-control">Desktop protocol, rendering and control</h1>
+<p>The Cosmix compositor is a Linux Wayland compositor with Smithay protocol handling and Bevy rendering. This chapter preserves architectural direction while distinguishing it from the implementation inspected at public revision <code>96d12fdf</code>.</p>
+<h2 id="authority-and-the-frame-path">Authority and the frame path</h2>
+<p><strong>DESKTOP-001 — Protocol authority.</strong> The protocol plane owns surfaces, focus, input routing, committed geometry, buffer lifetime and session state. Render entities mirror that state; they do not become a competing source of truth. Presentation owns KMS submission. Keep this seam independent of scenic rendering internals.</p>
+<p><strong>DESKTOP-002 — Bus independence.</strong> Frame production must not wait for a broker response. Control ingress and observation output must be bounded. The overflow policy must match the operation: rejecting a mutating request as busy is different from dropping an observation and reporting a gap. Do not generalise the old “drop-oldest” sketch to every queue.</p>
+<p>The implementation is inside <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/">cosmix-comp</a>: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/protocol/mod.rs">protocol</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/compositor_scene.rs">scene</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/backend/atomic_presentation.rs">presentation</a> and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/port.rs">Bus worker</a>. The earlier name <code>cosmix-comp-port</code> describes a role; there is no separate crate at this baseline.</p>
+<h2 id="implemented-surface-and-limits">Implemented surface and limits</h2>
+<table><thead><tr><th>Surface</th><th>Baseline evidence</th><th>Limit of this audit</th></tr></thead><tbody>
+<tr><td>Bus control</td><td><code>PortCommand</code> variants for snapshots, watches, sets and watch state; bounded admission capacity 16</td><td>Does not imply every old <code>comp.window.*</code>/camera/place sketch is implemented</td></tr>
+<tr><td>Decorations</td><td>Protocol decoration state and scene rendering exist</td><td>Old claim that negotiation always selects client-side decoration is stale</td></tr>
+<tr><td>XWayland</td><td>Feature enabled by default, runtime control present</td><td>Individual guest interoperability requires recorded runs</td></tr>
+<tr><td>Session lock, idle and capture</td><td>Protocol handlers, capture module and probe binaries exist</td><td>Handler presence does not certify all security/lifecycle cases</td></tr>
+<tr><td>Real KMS execution</td><td><code>kms-live</code> feature and backend present</td><td>Feature is not enabled by default; no hardware gate was run here</td></tr>
+<tr><td>Explicit synchronisation</td><td>Acquire/release and buffer-use modules present</td><td>Correctness depends on all paths, including revoke, destroy and reuse</td></tr>
+</tbody></table>
+<p>Feature defaults are in the <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/Cargo.toml">manifest</a>: <code>bus</code>, <code>frame-capture</code>, <code>xwayland</code>. The inspected compositor version is 0.48.0. Version and dependency pins belong in manifests; a later build must record its own values.</p>
+<h2 id="control-observation-and-persistence">Control, observation and persistence</h2>
+<p><strong>DESKTOP-003 — Applied versus durable.</strong> A successful in-memory property change and successful persistence are separate outcomes. The current set reply carries an optional <code>persisted</code> result for file-backed leaves; <code>false</code> must not be presented as durable success. Process-lifetime leaves need no such claim.</p>
+<p><strong>DESKTOP-004 — Snapshot and event consistency.</strong> Consumers must recognise lost observations and reconcile from a fresh snapshot. Sequence/loss information is part of usable observation, not cosmetic telemetry. A command must produce a result or a documented timeout/busy outcome; it must not disappear because an observation queue is lossy.</p>
+<p>The <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/protocol/port_snapshot.rs">snapshot dispatcher</a> and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/protocol/port_observation.rs">observation model</a> define the current supported read and mutation surface. Future verbs must declare input validation, authorisation, ordering and reply semantics before advertising them. Old camera/place property examples remain intended vocabulary until an implementation and compatibility decision confirm them.</p>
+<h2 id="rendering-power-and-containment">Rendering, power and containment</h2>
+<p><strong>DESKTOP-005 — Reactive rendering.</strong> Static scenes should quiesce; damage, animation and client progress drive work. Measure wakeups, frame timing and idle power before claiming the floor complete. An event-driven design does not by itself prove low power.</p>
+<p><strong>DESKTOP-006 — Failure containment.</strong> Session revocation, GPU failure and shutdown require bounded handling with correct buffer/synchronisation cleanup. A failed renderer must not publish fabricated presentation success. Automatic renderer fallback is not promised until an alternate renderer and its transition contract exist.</p>
+<p>Bevy remains the intended primary renderer. Alternate software/utility rendering and direct scanout require a demonstrated deployment, reliability, latency or power need. Preserve renderer-independent geometry and presentation ownership so an alternate can be introduced without changing protocol authority. The old one-wedge-per-month tripwire was a design heuristic, not a measured current service objective.</p>
+<h2 id="window-management-direction">Window management direction</h2>
+<p><strong>DESKTOP-007 — Geometry ownership.</strong> The intended canvas is bounded and elastic per output. Places are semantic regions/bookmarks; a camera selects the view. Layout remains 2D plus semantic layers. Rendered depth may animate the view, but at rest surfaces return to a flat, pixel-correct presentation. Input transformations must follow the authoritative geometry, including motion caused by camera movement.</p>
+<p>This remains a design contract, not a statement that the complete canvas, place lifecycle, session restore or cross-output reparent API has landed. Planned policy includes floating/snap behaviour and optional per-place tiling, with policy exposed through ordinary control operations. Place identity, collisions in imported arrangements, edge gestures and multi-output behaviour need explicit API decisions and live evaluation.</p>
+<p>Retained edge-push policy is default-off and requires a dwell threshold and corner deadzones. Parameter values and integration still need explicit decisions and live evaluation; this is not an implemented-feature claim.</p>
+<p>XR, depth-composited application scenes and scene-switchboard clients are research directions. They impose no requirement to build a new display transport or 3D storage model now. Preserve the phase-3 constraint: no architectural decision may assume exactly one flat camera/output; the camera pose-set model must remain capable of plural views. This is a design constraint, not a requirement to implement XR now.</p>
+<h2 id="trusted-surfaces-and-guests">Trusted surfaces and guests</h2>
+<p><strong>DESKTOP-008 — Trusted presentation.</strong> Session lock and consent require compositor-enforced ordering and input isolation. Ordinary client appearance cannot establish authority. A lock protocol implementation is distinct from the full intended compositor-drawn consent/palette experience. Capture while locked and client disconnect during lock require explicit fail-closed tests.</p>
+<p><strong>DESKTOP-009 — Furniture isolation.</strong> Panels, docks, notifications and pagers must remain separate client processes; furniture must never move in-process into the compositor. Preserve crash isolation and independent release cadence. Shared design tokens provide coherent appearance without removing this boundary. This does not reclassify compositor-owned trusted lock/consent surfaces as furniture. Guest toolkits remain compatible through standard protocols without requiring native CTK styling.</p>
+<p>The old shell-before-compositor sequence and remote <code>ui.*</code> drawing protocol are superseded. Wayland carries desktop protocol interactions; Bus carries semantic control and observation. Existing protocol handlers do not establish complete portal, workspace, multi-seat or guest support. Enumerate support by actual advertised version, implemented semantics and interoperability evidence.</p>
+<h2 id="validation-gates">Validation gates</h2>
+<p><strong>DESKTOP-010 — Environment-specific evidence.</strong> Record revision, features, toolchain, GPU/driver, session backend and client versions for live acceptance. Run protocol/model tests without assuming a GPU; separately test the default, no-default and <code>kms-live</code> feature configurations relevant to a change. Compilation is not a substitute for live presentation.</p>
+<p>Required live scenarios are first presentation, SHM and dmabuf clients, explicit-sync ownership, VT revoke/resume, output change, idle/wake, XWayland lifecycle, locked capture refusal, shutdown and recovery. Flood and disconnect the broker while checking frame progress and bounded resources. Preserve logs and captured evidence; do not call a skipped fixture conformant.</p>
+<p>Source entry points include <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/protocol/tests.rs">protocol tests</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/bin/cosmix-lock-probe.rs">lock probe</a> and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-comp/src/bin/cosmix-screencopy-probe.rs">screencopy probe</a>. These were inspected, not executed. The release ledger must supply actual results before promoting defaults or claiming daily-drive readiness.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +656,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +710,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +839,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

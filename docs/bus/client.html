@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/client</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,100 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/client.md"><div class="prose"><h1 id="cosmix-lib-client--broker-websocket-client">cosmix-lib-client — broker WebSocket client</h1>
+<p><strong><code>cosmix-lib-client</code> connects Rust code to <code>cosmix-noded</code>.</strong> The exported
+<code>NodedClient</code> builds and correlates Bus requests over WebSocket; its exact
+surface depends on whether the target is native or <code>wasm32</code>.</p>
+<p>The caller supplies the broker URL. URL discovery from node configuration is a
+cos substrate concern and is not part of this crate.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>On native targets, <code>NodedClient::connect(service, url)</code> opens the WebSocket and
+registers the service name with <code>noded.register</code>. <code>connect_with_provenance</code>
+also sends a <code>RegisterProvenance</code> record, while <code>connect_anonymous</code> opens a
+call-capable connection without registering a name.</p>
+<p>Named connection setup is cancellation-safe. If an outer timeout or task
+cancellation drops the connect future while <code>noded.register</code> is awaiting its
+reply, the half-built client's socket reader is aborted and the socket closes;
+retries cannot accumulate orphan reader tasks. Once a client has been returned,
+call <code>close()</code> for deterministic teardown because plain drop does not abort its
+long-lived reader.</p>
+<p>Incoming non-response messages become <code>IncomingCommand</code> values. They expose
+<code>from</code>, <code>command</code>, <code>id</code>, parsed JSON <code>args</code>, the original body, and every Bus
+header. A client takes the incoming receiver once with <code>incoming()</code> or
+<code>incoming_async()</code> and replies with <code>respond()</code> or <code>respond_parts()</code>.</p>
+<h2 id="sending-and-calling">Sending and calling</h2>
+<p>The native client exposes:</p>
+<ul>
+<li><code>send(to, command, args)</code> — fire and forget; JSON-serialises non-null arguments.</li>
+<li><code>call(to, command, args)</code> — sends a correlated request and waits up to 60 seconds for its response.</li>
+<li><code>call_typed</code> — keeps application replies (<code>PortReply::AppError</code>) distinct from transport errors.</li>
+<li><code>send_with_headers</code>, <code>call_with_headers</code>, and <code>call_with_headers_raw</code> — explicit header and body forms for protocol-specific verbs.</li>
+<li><code>send_raw</code> — sends an already-built <code>BusMessage</code>.</li>
+<li><code>list_services</code> and <code>service_inventory</code> — broker registry names or full <code>ServiceInfo</code> records.</li>
+<li><code>register_as</code>, <code>deregister</code>, <code>is_connected</code>, and <code>close</code> — connection lifecycle primitives.</li>
+</ul>
+<p><code>call</code> returns a decoded JSON value, <code>Null</code> for an empty body, or a string when
+the native peer returns a non-JSON body. A peer <code>rc &gt;= 10</code> becomes an error;
+use <code>call_typed</code> or <code>call_with_headers_raw</code> when the exact application return
+code or error body matters.</p>
+<h2 id="subscriptions-and-supervision">Subscriptions and supervision</h2>
+<p>The native-only <code>SupervisedClient</code> is the resident-service wrapper. Construct
+it with <code>connect_supervised</code> or <code>connect_supervised_with_provenance</code>. It:</p>
+<ul>
+<li>limits the initial connect-and-register sequence to <code>MAX_INITIAL_ATTEMPTS</code> (five);</li>
+<li>reconnects indefinitely after a later transport loss, using exponential backoff with full jitter;</li>
+<li>keeps one outward incoming receiver alive across reconnects;</li>
+<li>fails outbound work immediately with a typed <code>SupervisedError</code> while disconnected; and</li>
+<li>re-registers and replays confirmed subscriptions in recorded order before returning to <code>ConnState::Connected</code>.</li>
+</ul>
+<p>The compatibility default remains an unbounded reconnect-stable receiver from
+<code>incoming()</code>. A subscriber that needs a hard memory bound can instead use
+<code>connect_options(...).bounded_incoming(capacity)</code> and take
+<code>incoming_bounded()</code>. Both the socket-reader lane and the reconnect-stable
+outward lane then use non-blocking <code>try_send</code>: a full lane drops the new
+command, increments <code>overflow_count()</code>, and emits one
+<code>BoundedIncomingEvent::Overflow { dropped }</code> observation for the accumulated
+loss. State-reconstructing consumers should invalidate conservatively before
+accepting later commands.</p>
+<p>Use <code>subscribe_topic(topic)</code> and <code>unsubscribe_topic(topic)</code> on
+<code>SupervisedClient</code>. These call the broker's <code>topic.subscribe</code> /
+<code>topic.unsubscribe</code> verbs and update the <code>SubscriptionRegistry</code> only after a
+successful reply. Plain <code>NodedClient</code> has no <code>subscribe</code> method; callers using
+it directly must issue the topic verb themselves, normally through
+<code>call_with_headers</code>.</p>
+<p><code>connection_generation()</code> is the reliable reconnect signal. It starts at <code>1</code>
+after the initial connection and increments only after a new socket is
+registered and all recorded subscriptions have been replayed. Comparing this
+monotonic value cannot miss a fast disconnect/reconnect that occurs between
+two samples of <code>state()</code>.</p>
+<h2 id="native-and-browser-targets">Native and browser targets</h2>
+<table><thead><tr><th>Target</th><th>Backend</th><th>Surface</th></tr></thead><tbody>
+<tr><td>native (default)</td><td>Tokio + <code>tokio-tungstenite</code></td><td>Named or anonymous connections, send/call, incoming commands, replies, discovery, subscriptions through <code>SupervisedClient</code>, and supervised reconnect.</td></tr>
+<tr><td><code>wasm32</code></td><td><code>gloo-net</code></td><td>Anonymous, call-only <code>NodedClient</code>; no registration, incoming-command receiver, send, subscriptions, or supervisor.</td></tr>
+</tbody></table>
+<p>The browser client provides <code>connect_anonymous</code>, <code>call</code>, <code>is_connected</code>,
+<code>noded_url_from_origin</code>, and <code>connect_anonymous_default</code>. Its origin helper
+maps HTTP(S) page origins to <code>ws://</code> / <code>wss://</code> on <code>/ws</code>.</p>
+<h2 id="minimal-native-use">Minimal native use</h2>
+<pre><code class="language-rust">use cosmix_client::NodedClient;
+use serde_json::json;
+
+# async fn run() -&gt; anyhow::Result&lt;()&gt; {
+let client = NodedClient::connect(
+    "my-service",
+    "ws://127.0.0.1:4200/ws",
+).await?;
+let pong = client.call("noded", "noded.ping", json!(null)).await?;
+# Ok(())
+# }
+</code></pre>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/bus/wire-format">wire format</a> — <code>BusMessage</code>, addressing, and return codes</li>
+<li><a href="/bus/buildinfo">build information</a> — values used to construct registration provenance</li>
+<li><a href="/bus/overview">overview</a> — where the broker and configuration layers live</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +712,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +766,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +895,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

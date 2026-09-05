@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-agent/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,155 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-agent/README.md"><div class="prose"><h1 id="cosmix-lib-agent">cosmix-lib-agent</h1>
+<p><code>cosmix-lib-agent</code> provides the agent turn loop, persistent conversation sessions,
+and a pluggable tool registry for LLM-driven workflows. It belongs to the <code>cos</code>
+layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain and uses other <code>cos</code> libraries
+for LLM access and Cosmix path resolution; it does not define Bus protocol types
+or Mix language behaviour.</p>
+<p>The Cargo package is named <code>cosmix-lib-agent</code>. Rust code imports it as
+<code>cosmix_agent</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-rust">use cosmix_agent::{BuiltinTools, Session, ToolRegistry};
+
+let mut tools = ToolRegistry::new();
+BuiltinTools::register_all(&amp;mut tools);
+
+let session = Session::new(
+    Some("Answer tersely.".to_string()),
+    Some("default".to_string()),
+);
+
+assert_eq!(tools.len(), 3);
+assert!(session.messages.is_empty());
+</code></pre>
+<p><code>run_turn</code> additionally requires an initialised <code>cosmix_llm::LlmClient</code>.</p>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>runner</code></td><td>Drives one user-to-assistant turn, including repeated model and tool calls.</td></tr>
+<tr><td><code>session</code></td><td>Owns conversation state, usage totals, identifiers, and JSONL persistence.</td></tr>
+<tr><td><code>tools</code></td><td>Defines the tool contract, registry, and bundled file tools.</td></tr>
+</tbody></table>
+<p>The crate root re-exports the main entry points:</p>
+<ul>
+<li><code>run_turn</code> and <code>TurnOutcome</code></li>
+<li><code>Session</code>, <code>SessionId</code>, and <code>sessions_dir</code></li>
+<li><code>Tool</code>, <code>ToolRegistry</code>, and <code>BuiltinTools</code></li>
+</ul>
+<h2 id="agent-turn-loop">Agent turn loop</h2>
+<pre><code class="language-rust">pub async fn run_turn(
+    session: &amp;mut Session,
+    user_text: &amp;str,
+    client: &amp;LlmClient,
+    tools: &amp;ToolRegistry,
+) -&gt; anyhow::Result&lt;TurnOutcome&gt;
+</code></pre>
+<p><code>run_turn</code> appends the user message, sends the complete session history to the
+LLM client, and advertises every schema in the supplied registry. It applies the
+session system prompt when one is present.</p>
+<p>If the response contains tool requests, the function:</p>
+<ol>
+<li>Appends the assistant response to the session.</li>
+<li>Resolves each requested tool by name.</li>
+<li>Runs the calls in response order.</li>
+<li>Appends their results together as a user-role message.</li>
+<li>Calls the model again with the expanded history.</li>
+</ol>
+<p>The loop ends when the model returns no tool requests or reaches
+<code>MAX_ITERATIONS</code>. Tool execution failures and unknown tool names become error
+tool results, allowing the model to react to them. An LLM client error stops the
+turn and is returned to the caller.</p>
+<p>The request limit is <code>DEFAULT_MAX_TOKENS</code>, currently <code>4096</code>. The hard tool-use
+limit is <code>MAX_ITERATIONS</code>, currently <code>50</code>.</p>
+<p><code>TurnOutcome</code> reports:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>text</code></td><td>Text blocks from the last model response, joined with newlines.</td></tr>
+<tr><td><code>iterations</code></td><td>Number of model responses that requested tools.</td></tr>
+<tr><td><code>hit_cap</code></td><td>Whether the hard iteration limit ended the loop.</td></tr>
+</tbody></table>
+<p><code>run_turn</code> updates the in-memory session and token totals. It does not save the
+session; call <code>Session::save</code> when persistence is required.</p>
+<h2 id="sessions">Sessions</h2>
+<p><code>Session::new</code> creates a UUID-based identifier, records the current UTC time,
+stores optional system and backend strings, and starts with empty messages and
+zero usage.</p>
+<p>The public session state is:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td><code>SessionId</code></td><td>String identifier used as the JSONL filename.</td></tr>
+<tr><td><code>created_at</code></td><td><code>DateTime&lt;Utc&gt;</code></td><td>Session creation time.</td></tr>
+<tr><td><code>system</code></td><td><code>Option&lt;String&gt;</code></td><td>Optional system prompt used by <code>run_turn</code>.</td></tr>
+<tr><td><code>backend</code></td><td><code>Option&lt;String&gt;</code></td><td>Optional backend metadata stored with the session.</td></tr>
+<tr><td><code>messages</code></td><td><code>Vec&lt;Message&gt;</code></td><td>Ordered user, assistant, and tool-result history.</td></tr>
+<tr><td><code>total_usage</code></td><td><code>Usage</code></td><td>Saturating input-token and output-token totals.</td></tr>
+</tbody></table>
+<p><code>SessionId</code> is a type alias for <code>String</code>.</p>
+<p>Session methods provide the following operations:</p>
+<table><thead><tr><th>Method</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>append</code></td><td>Adds one message to the history.</td></tr>
+<tr><td><code>add_usage</code></td><td>Adds token usage with saturating arithmetic.</td></tr>
+<tr><td><code>jsonl_path</code></td><td>Returns the session file path.</td></tr>
+<tr><td><code>save</code></td><td>Rewrites the complete JSONL file through a temporary file and rename.</td></tr>
+<tr><td><code>load</code></td><td>Reconstructs a session from its header and message records.</td></tr>
+<tr><td><code>list_ids</code></td><td>Returns sorted identifiers for files ending in <code>.jsonl</code>.</td></tr>
+<tr><td><code>delete</code></td><td>Removes one session file; a missing file is accepted.</td></tr>
+</tbody></table>
+<p><code>sessions_dir</code> resolves the session directory beneath the Cosmix variable-data
+directory as <code>agent/sessions</code>. The crate-level contract describes the resulting
+location as <code>$COSMIX_VAR/agent/sessions/</code>.</p>
+<p>Each session file starts with one JSON header record. The header contains the
+identifier, creation time, optional system and backend values, and accumulated
+usage. Each following non-empty line contains one message record.</p>
+<p>Saving creates the session directory when needed. It writes the complete content
+to a <code>.jsonl.tmp</code> path and renames that path over the session file.</p>
+<h2 id="tool-registry">Tool registry</h2>
+<p>Implement <code>Tool</code> to add a callable operation:</p>
+<pre><code class="language-rust">#[async_trait]
+pub trait Tool: Send + Sync {
+    fn schema(&amp;self) -&gt; ToolSchema;
+    async fn run(&amp;self, input: serde_json::Value) -&gt; anyhow::Result&lt;String&gt;;
+}
+</code></pre>
+<p>The schema supplies the tool name, description, and JSON input schema presented
+to the model. <code>run</code> receives the model-provided JSON value and returns text for
+the tool-result block.</p>
+<p><code>ToolRegistry</code> owns boxed tools keyed by schema name. Registering another tool
+with the same name replaces the previous entry.</p>
+<table><thead><tr><th>Method</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>new</code></td><td>Creates an empty registry.</td></tr>
+<tr><td><code>register</code></td><td>Inserts a boxed tool under its schema name.</td></tr>
+<tr><td><code>get</code></td><td>Returns a borrowed tool by name.</td></tr>
+<tr><td><code>schemas</code></td><td>Returns schemas for all registered tools.</td></tr>
+<tr><td><code>names</code></td><td>Returns all registered names.</td></tr>
+<tr><td><code>len</code></td><td>Returns the tool count.</td></tr>
+<tr><td><code>is_empty</code></td><td>Reports whether the registry has no tools.</td></tr>
+</tbody></table>
+<p>Registry schema and name order is not defined because storage uses a hash map.</p>
+<h2 id="built-in-tools">Built-in tools</h2>
+<p><code>BuiltinTools::register_all</code> installs three file tools:</p>
+<table><thead><tr><th>Tool name</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>read_file</code></td><td>Reads an absolute path or a path relative to the agent process working directory as UTF-8 text.</td></tr>
+<tr><td><code>write_file</code></td><td>Writes UTF-8 text, overwrites an existing file, and creates missing parent directories.</td></tr>
+<tr><td><code>list_files</code></td><td>Lists one directory level, sorts entries, and appends <code>/</code> to directory names.</td></tr>
+</tbody></table>
+<p><code>list_files</code> uses <code>.</code> when its optional <code>path</code> input is omitted.</p>
+<p>The built-in tools do not impose a path sandbox. Callers decide whether these
+tools are suitable for their execution environment and which additional access
+controls surround the agent.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<p>The crate declares no Cargo features.</p>
+<h2 id="errors-and-limits">Errors and limits</h2>
+<p>Public operations use <code>anyhow::Result</code> where failure is possible. File I/O,
+invalid JSON, invalid message records, and LLM client failures are returned to
+the caller.</p>
+<p>Tool failures inside <code>run_turn</code> are different: they are converted to error
+results and sent back to the model. This keeps one failed or unknown tool call
+inside the conversation loop.</p>
+<p>Session usage counters saturate instead of overflowing. Session loading defaults
+missing or invalid stored usage to zero and substitutes the current UTC time
+when the stored creation time cannot be decoded.</p>
+<p>This crate exposes a library API only. It has no command-line interface, daemon
+configuration format, Bus verb surface, or standalone binary.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +767,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +821,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +950,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/06-properties</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,238 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/06-properties.md"><div class="prose"><h1 id="property-model-validation-and-mutation">Property model, validation and mutation</h1>
+<p>This candidate describes baseline <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>.
+<strong>Verified-source</strong> means inspected implementation, not newly executed tests.
+<strong>Intended</strong> retains a requirement awaiting implementation evidence. <strong>Conflict</strong>
+requires an explicit decision; neither implementation nor old prose silently wins.
+The security/delivery exceptions in <a href="/spec/compatibility-profile">the accepted compatibility amendment</a>
+are now resolved in favour of the implemented profile; other conflicts remain open.
+Chapter numbers are reading order, not changes to numeric <code>spec.get</code> identities.</p>
+<h2 id="1-ownership-and-address-model">1. Ownership and address model</h2>
+<p><strong>PROP-001 — Owner.</strong> A property is typed, described state owned by one service.
+Configuration, lifecycle, bounded resource summaries and durable derived state fit
+this model. Per-frame rendering, ephemeral toolkit entity state and per-request
+metrics do not. Persistent application preferences may use namespaces. An owner
+mediates mutation; CLI, GUI, web and agent surfaces should invoke that same path.
+Bootstrap configuration remains outside runtime mutation; see chapter 07.</p>
+<p><strong>PROP-002 — Two address forms.</strong> Flat paths name bounded property-tree leaves or
+subtrees. Structured namespace/key addresses name collection records, including
+keys containing dots or <code>@</code>. Do not recover structured addresses by splitting a
+human-readable expression. <code>path</code> and <code>namespace</code> are mutually exclusive. Missing
+flat <code>get</code> path means root; an empty string is not a valid <code>PropPath</code>.</p>
+<p><strong>PROP-003 — Identifier invariants (verified-source).</strong> <code>PropPath</code> has non-empty
+dot-separated segments containing ASCII lowercase letters, digits or underscore;
+digits and underscore may start a segment. <code>NamespaceName</code> instead requires an
+ASCII lowercase first character in every segment. Both reject empty segments;
+concrete paths reject wildcards. Both constructors and Serde deserialisers enforce
+their grammar, including through nested <code>PropDescribe</code> and <code>RecordKey</code> values.
+This corrects old prose that assigned the namespace grammar to both types.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-core/src/path.rs">PropPath</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/namespace.rs">NamespaceName and registration types</a>.</p>
+<p><strong>PROP-004 — Keys.</strong> Collection keys are opaque UTF-8, bounded to 1 KiB in the
+record-key contract, and must agree with the declared primary-key field. Singleton
+requests omit the key or use empty; responses use the registered canonical key.
+Cardinality is fixed at registration. A singleton-to-collection conversion needs a
+new namespace and explicit migration. Namespaced identity and field selectors are
+distinct: the intended JSON-array <code>field_path</code> selector is currently refused by
+the mutation router, even when empty. It is not a shipped partial-update API.</p>
+<h2 id="2-flat-property-read-surface">2. Flat property read surface</h2>
+<p><strong>PROP-005 — Read contract.</strong> <code>&lt;svc&gt;.props.get</code> returns a tree or addressed value;
+<code>list</code> enumerates leaves; <code>describe</code> accepts leaves and subtrees; <code>watch</code> belongs
+to the event-capable level. Subtree descriptions enumerate direct children.
+Descriptions carry <code>path</code>, <code>type</code>, <code>mutable</code>, <code>sensitive</code>, <code>description</code>, with
+optional <code>format</code>, <code>enum</code>, <code>min</code>, <code>max</code>, <code>default</code>, <code>since</code>, <code>deprecated</code>,
+<code>transient</code> and <code>children</code>. The minimal schema is not full JSON Schema.</p>
+<p><strong>PROP-006 — Encoding.</strong> Property wire bodies use JSON within Bus messages.
+Storage encoding is independent. A schema reader tolerates unknown optional
+fields. The earlier choices between JSON and child messages, dotted paths and
+JSON Pointer, and delta versus snapshot are resolved for this profile as JSON,
+dotted paths and separate delta/snapshot surfaces.</p>
+<h2 id="3-registration-and-schemas">3. Registration and schemas</h2>
+<p><strong>PROP-007 — Registration (verified-source).</strong> Core owns <code>PropTree</code>, <code>PropPath</code>,
+<code>PropValue</code>, <code>PropDescribe</code>, redaction and diff; its Bus integration is opt-in.
+Store owns namespace policy, storage, hooks, audit, runtime and mutation routing.
+There is no separate <code>cosmix-lib-property</code> implementation. Registration uses the
+actual store/runtime/router APIs, not the old illustrative global <code>register()</code>.</p>
+<p><code>NamespaceSpec</code> carries name, schema, cardinality, storage kind, authorisation,
+hooks, validators, delete mode, tombstone TTL, replay window, subscribe payload,
+schema visibility, lifecycle, external-edit policy, conformance level, introduction
+version and <code>require_version</code>. A backend-kind enum does not prove that backend
+exists. Default authorisation is deny-all; <code>schema_public: Allow</code> does not itself
+grant the public-describe capability.</p>
+<p><strong>PROP-008 — Schema contract.</strong> Fields describe name/type, default, <code>secret</code>,
+validator descriptions, help, introduction/deprecation version, and validator
+secrecy. Types include bool, signed/unsigned integer, float, string, bytes, path,
+email, URL, enum, list, map, struct and option. Duration/timestamp encodings remain
+unsettled; owners specify an integer epoch or RFC3339 string explicitly. A derive
+macro remains proposed. Schema metadata is not proof that every predicate runs:
+the runtime executes registered pure validator functions on supplied input before
+hooks. Generic automatic enforcement of every advertised schema constraint needs
+its own evidence. Stored values remain sparse; chapter 07 owns amendment defaults.</p>
+<h2 id="4-structured-verb-profile">4. Structured verb profile</h2>
+<p>The <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/bus/mutation.rs">mutation router</a> separates structured requests from the core flat
+surface. All entries below are <strong>verified-source</strong> unless labelled otherwise.</p>
+<table><thead><tr><th>Verb suffix</th><th>Accepted operation</th><th>Material boundary</th></tr></thead><tbody>
+<tr><td><code>get</code></td><td>Namespace/key; returns namespace, key, version, snapshot nseq, fields</td><td>Field-selection body and subpaths refused</td></tr>
+<tr><td><code>list</code></td><td>Namespace; returns records, snapshot nseq, <code>next_cursor: null</code></td><td>Pagination, filters and projections refused</td></tr>
+<tr><td><code>set</code></td><td>Namespace/key, object body, <code>if_version</code>, <code>merge</code></td><td>Structured whole-record update only; merge defaults true</td></tr>
+<tr><td><code>delete</code></td><td>Collection namespace/key, optional/required <code>if_version</code></td><td>Singleton deletion refused</td></tr>
+<tr><td><code>describe</code></td><td>Namespace, <code>view: public</code> or <code>full</code></td><td>Separate capabilities; public secret fields omitted</td></tr>
+<tr><td><code>watch</code></td><td>Namespace and optional <code>since_nseq</code></td><td>Authorised live grant precedes replay snapshot</td></tr>
+<tr><td><code>audit.watch</code></td><td>Namespace and optional <code>since_nseq</code></td><td>Separate audit capability; no caught-up marker</td></tr>
+<tr><td><code>validate</code></td><td>Intended dry-run set</td><td>Absent from router dispatch; unknown subcommand error</td></tr>
+</tbody></table>
+<p><strong>PROP-009 — Intended extensions and conflict.</strong> The old verb contract promises
+cursor-stable list snapshots, limit 1..1000/default 100, AND-combined exact/regex/
+in/gt/lt filters, JSON <code>fields</code> projections and JSON-array <code>field_path</code> partial
+selection. Preserve these as unmet requirements pending a scope decision; do not
+send them to the current router. Their eventual implementation must validate
+predicate types and authorise secret selection. A typed SDK, multi-get, batches,
+namespace discovery and import/export remain separate proposed extensions.</p>
+<p><strong>PROP-010 — Versions.</strong> Record versions begin at 1; writes and deletes advance
+them. <code>if_version</code> checks occur at commit; mismatch returns actual current version.
+Omitting it is last-write-wins unless namespace <code>require_version</code> requires it.
+Automation performing read-modify-write should use it. A retry after a committed
+write may return mismatch; that is duplicate prevention, not replaying a successful
+response. No cross-record or cross-namespace transaction is promised.</p>
+<p><strong>PROP-011 — Delete.</strong> Soft delete retains key/version tombstones; recreate
+continues the sequence while the tombstone exists. Reads treat tombstones as
+not-found. Hard delete forgets incarnation/version; recreate starts at 1 and
+therefore permits ABA ambiguity for stale writers. <code>require_version</code> and hard
+delete are incompatible. Default TTL intent is seven days; baseline SQLite does
+not expire tombstones, so do not advertise that retention bound as enforced.</p>
+<p><strong>PROP-012 — Dry-run requirement (intended).</strong> <code>validate</code> must require write
+capability, run pure schema/custom validators without hooks, writes or events,
+and report field failures. Success proves only validation against that snapshot,
+not that a later commit or side-effectful hook will succeed. The earlier phrase
+“write would succeed” is too strong. Revalidate on actual mutation.</p>
+<h2 id="5-capabilities-and-errors">5. Capabilities and errors</h2>
+<p><strong>PROP-013 — Authority.</strong> <code>AuthPolicy</code> maps transport-established <code>PeerIdentity</code>
+to capabilities synchronously once per request; policies needing substrate state
+use a separately maintained cache, not blocking Bus calls inside resolution.
+Unknown identity yielding no capability remains intended policy, not a universal
+implemented guarantee: the default policy denies all, but an owner-supplied
+policy can grant unidentified peers. User-supplied identity headers do not prove
+identity. Unix credentials, verified node claims and registered-service identity
+must retain provenance; full transport coverage is not established by these types.</p>
+<p>Conventional tokens are <code>props.&lt;action&gt;:&lt;service&gt;.&lt;namespace&gt;[:&lt;scope&gt;]</code>; actions
+are read/write/describe/audit. The library compares exact strings; it does not
+generically interpret <code>self</code>, <code>public</code> or wildcard scope semantics. In particular
+<code>read:...:public</code> alone is not the base read token checked by the inspected router.
+At reconciled props-store 0.3.0, Capability rejects empty strings and Actor checks
+its supported forms at construction and nested Serde boundaries; see
+<a href="/spec/03-shared-types">shared types</a>. Neither proves provenance or permission.
+The <a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/crates/cosmix-lib-props-store/src/bus/mutation.rs">current mutation router</a>
+checks capabilities, then derives set/delete attribution from service_name,
+otherwise signed_ident as operator, otherwise Unix UID as operator, otherwise
+the owning service. Invalid attribution returns <code>validation_error</code> before writing.
+The owner fallback is not evidence that the caller was authenticated as that owner.</p>
+<p><strong>PROP-014 — Secret views (accepted compatibility profile).</strong> Get/list include secrets when the
+caller holds both base read and secrets capabilities; otherwise redact them. Old
+requirements for explicit secret field selection and privileged default redaction
+are superseded for this profile. There is no additional per-request reveal opt-in:
+a privileged whole-record read can return secret values. Consumers must protect
+the resulting payload from logs, caches and display leakage. Public describe
+omits secret fields and redacts secret validators; full describe needs its own
+capability. Sensitive flat-tree reveal likewise needs an explicit owner policy;
+the old WG-subnet-only policy is not proof of a universal deployed enforcement.</p>
+<p><strong>PROP-015 — Error contract.</strong> Error bodies carry <code>error_code</code>, message and optional
+diagnostics; consumers ignore unknown diagnostic fields. Operational rc 10 covers
+<code>auth_denied</code>, <code>not_found</code>, <code>validation_error</code>, <code>conflict</code>, <code>version_mismatch</code>,
+<code>replay_window_exceeded</code>; rc 20 covers <code>storage_error</code>, <code>hook_error</code>, <code>unavailable</code>.
+The baseline also returns rc 10 <code>grant_failed</code> when live subscription installation
+fails; the old closed taxonomy omits this token, a further contract drift requiring
+recorded amendment. No replay-only success is returned on that grant failure.
+Only an explicit contract amendment adds taxonomy tokens. Flat mutation and
+unsupported selectors must fail visibly rather than silently changing meaning.</p>
+<h2 id="6-changes-snapshots-and-replay">6. Changes, snapshots and replay</h2>
+<p><strong>PROP-016 — Distinct event families.</strong> Flat <code>&lt;svc&gt;.props.changed</code> contains path,
+old, new, timestamp and optional cause. Structured <code>&lt;svc&gt;.props.records.changed</code>
+contains namespace/key, kind, verb, nseq, version, audit epoch, actor, timestamp,
+changed non-secret field names and secret-fields-changed count; completion may
+carry lifecycle/reason. Kinds are created/updated/deleted/completed/reconciled.
+Never send structured events on the flat topic. Sensitive flat changes omit value
+bytes; structured events must not expose secret field names or values.</p>
+<p><strong>PROP-017 — Flat observation (intended per-owner obligation).</strong> L2 owners emit
+changes for listed non-transient paths. Coalesce to final per-request path values;
+bulk operations may emit a summary. Ten Hz per path is a soft steady-state ceiling.
+L3 publishes retained <code>world.&lt;svc&gt;</code> snapshots, normally coalesced to at most 1 Hz.
+Snapshots are last-known state; stale producer metadata and orphan expiry belong
+to the broker. Gaps require a fresh read; never synthesise missing deltas. Prefer
+the originating cause ID when known, while treating optional causal links as hints.</p>
+<p><strong>PROP-018 — Protected subscriptions.</strong> Owners authorise structured watch/audit
+before granting live delivery. Direct subscribe to either reserved topic is
+forbidden, including wildcard bypass; publish/clear/list/count must honour owner
+restrictions. Flat changed remains directly subscribable with safe payloads.
+Current live grants use a broker bridge; absence of a production granter must not
+be represented as successful live watching.</p>
+<p><strong>PROP-019 — Replay boundary.</strong> Read snapshots report namespace nseq. Watch with
+<code>since_nseq=N</code> returns retained events newer than N, followed logically by exactly
+one <code>caught_up</code> boundary at server high-water H, then live events. Current Bus
+framing is one response with homogeneous <code>events</code>, a separate top-level
+<code>caught_up: {event_type, namespace, nseq}</code> and <code>live</code>; subsequent records use the
+grant. Drop duplicate live
+events at or below H when constructing the logical stream. Same-marker redelivery
+is harmless; a different second marker requires reseeding. Audit watch has no
+marker. Flat and whole-surface streams have no namespace watermark guarantee.</p>
+<p><strong>Unresolved cursorless discrepancy:</strong> the retained intent is live-tail-only join
+with no historical replay when <code>since_nseq</code> is absent. At both cited revisions,
+<code>parse_since_nseq(None)</code> supplies zero and the router calls <code>events_since</code> with it.
+Cursorless watch can therefore return retained history or <code>replay_window_exceeded</code>;
+its marker is not proof of a history-free join. This discrepancy is not covered
+by the accepted best-effort live-delivery amendment and needs its own disposition.</p>
+<p><strong>PROP-020 — Best-effort live delivery.</strong> This profile does not promise contiguous
+live nseq, at-least-once delivery or per-subscriber durable watermarks. The
+dispatcher starts at current nseq and advances even after publish failure:
+<strong>live delivery is best-effort</strong>, with retained-history replay for recovery.
+The stronger old live-delivery guarantees are superseded, not implementation
+obligations for this profile. <code>caught_up</code> does not repair future loss. Consumers deduplicate by namespace/key/
+nseq, detect gaps, and re-list on <code>replay_window_exceeded</code>. Default history intent
+is min(1024 events, one hour); no unbounded offline replay is promised.
+If the last notification is lost and no later event arrives, sequence-gap detection
+alone cannot reveal that loss. Applications needing current state must explicitly
+reconcile; applications needing durable workflow delivery need a separate mechanism.</p>
+<h2 id="7-activity-conformance-and-evolution">7. Activity, conformance and evolution</h2>
+<p><strong>PROP-021 — Activity contract (intended; fleet coverage unverified).</strong> Discrete
+actions use activity events rather than fictitious property transitions. Required
+body fields are actor, verb and timestamp; optional cause, outcome (<code>ok</code>, <code>error</code>,
+<code>refused</code>), duration and details. Per-service or shared-family topics declare their
+schemas and ownership; co-publishers must agree. Announce topics through
+<code>lifecycle.activity_topics</code>. Batch high-rate activities; omit sensitive inputs
+instead of inlining them. A plain hash does not make low-entropy secrets safe.</p>
+<p>Actor variants remain daemon process (<code>service[:uuid]</code>), agent session
+(<code>runtime:uuid[:call_seq]</code>), operator (<code>operator:principal</code>), and explicit internal
+completion/reconciliation actors. Instance UUIDs are UUIDv7, not PIDs. Agent/operator
+events name their mediating service in <code>details.via</code>; daemon process events omit
+it. Tool invocation details include provider, params_hash, authority and dry_run;
+proposal/repair families are owned by their respective contracts. Runtime activity
+and commit trailers complement each other, not substitute for each other.</p>
+<p>For agent sessions, the runtime token is the short, stable runtime name, distinct
+from the mediating daemon's filesystem name; a new token requires a spec amendment.
+Mint the UUIDv7 once at process start and retain it across calls. <code>call_seq</code> is
+monotonically increasing per instance, included for call-scoped work (such as MCP)
+and omitted for connection-scoped work (such as agentd). These retained emitter
+obligations are not enforced by Actor's lexical parser.</p>
+<p><strong>PROP-022 — Conformance is evidence.</strong> L0 universals; L1 get/list/describe; L2
+watch+changes; L3 retained world snapshot; L4 mutation+validate; L5 audit. Report
+service and namespace levels separately. A declared enum cannot establish L4 when
+validate is missing, nor L3 without a running snapshot producer. Existing commands
+remain compatible during staged adoption; new structured daemons should design
+observation alongside their state. Global adoption order is roadmap material.</p>
+<p><strong>PROP-023 — Evolution.</strong> Additive descriptions require tolerant readers. Path
+renames retain a deprecated alias for one release cycle; breaking flat type or
+semantic changes require an explicit service-version compatibility decision.
+Namespace migration follows chapter 07. Cross-node world aggregation, generic
+activity retention, a service-wide schema registry and dynamic watch predicates
+remain proposed, not implied features.</p>
+<h2 id="evidence-and-validation">Evidence and validation</h2>
+<p>Baseline sources: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-core/src/path.rs">core path</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/namespace.rs">namespace/schema</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/bus/mutation.rs">mutation router</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/runtime.rs">runtime</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/dispatcher.rs">dispatcher</a>.
+Acceptance requires focused constructor/nested-Serde tests; both feature profiles
+of core; store default, SQLite and Bus tests; owner integration tests for policy,
+replay/grants and failure cases; then relevant workspace gates. No test was run
+for this documentary audit. Fleet claims require per-owner runtime evidence.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +850,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +904,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1033,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

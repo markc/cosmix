@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/control-flow</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,469 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/control-flow.md"><div class="prose"><h1 id="control-flow">Control flow</h1>
+<p>Mix has the control structures you expect — <code>if</code>, <code>while</code>, <code>for</code>, plus an ARexx-style <code>select</code> and a bare <code>loop</code> — with a few rules that bite anyone extrapolating from C, bash, or Python:</p>
+<ul>
+<li><strong>Every block closes with <code>end</code>.</strong> There is no <code>}</code>, no <code>fi</code>/<code>esac</code>. (Legacy <code>next</code>/<code>done</code> still parse but warn — see <a href="/mix/control-flow#legacy-terminators">Legacy terminators</a>.)</li>
+<li><strong>There is no <code>do</code> keyword.</strong> A bareword <code>do</code> after a loop header is just a discarded string: with a statement after it on the same line it's a <em>parse error</em>; alone at the end of the header line it silently does nothing. Drop the <code>do</code>.</li>
+<li><strong>Statements use newline or <code>;</code> separators.</strong> Prefer newlines in files; <code>;</code> is the compact one-line form.</li>
+<li><strong>Conditions use Mix truthiness</strong>, not a bool requirement (see <a href="/mix/control-flow#truthiness">Truthiness</a>).</li>
+<li><strong>A loop var is a normal variable</strong>, not block-scoped — it survives the loop at top level.</li>
+</ul>
+<p>For transforming a list into another list, prefer a <a href="/mix/hof">HOF lambda</a> (<code>map</code>/<code>filter</code>/<code>reduce</code>) over a hand-rolled loop; reach for the loops below for side effects (<code>print</code>, <code>send</code>) and stateful iteration.</p>
+<hr />
+<h2 id="if--elif--else-if--else"><code>if</code> / <code>elif</code> / <code>else if</code> / <code>else</code></h2>
+<pre><code class="language-mix">$x = 7
+if $x &gt; 10 then
+  print("big")
+elif $x &gt; 5 then
+  print("medium")
+else
+  print("small")
+end
+</code></pre>
+<pre><code class="language-text">medium
+</code></pre>
+<p>The header is <code>if &lt;cond&gt; then</code> — the <code>then</code> is <strong>required</strong> (<code>if $x</code> followed by a newline is <code>Parse error … expected Then, got Newline</code>). A middle branch is <code>elif &lt;cond&gt; then</code>, or equivalently the two-word <code>else if &lt;cond&gt; then</code> — both spellings parse into the same flat chain closed by a <strong>single</strong> <code>end</code> (they may even be mixed in one chain), and the final catch-all is a bare <code>else</code>. <code>elif</code> was added in 0.33.3; before that only <code>else if</code> existed. Only <code>end</code> closes an <code>if</code>; a legacy <code>done</code>/<code>next</code> is rejected:</p>
+<pre><code class="language-mix">if true then
+  print("x")
+done
+</code></pre>
+<pre><code class="language-text">Parse error at line 3:1: unexpected token Done
+</code></pre>
+<p><code>if</code> evaluates its branches lazily — only the first truthy condition's body runs, the rest are skipped.</p>
+<h3 id="truthiness">Truthiness</h3>
+<p>The condition does <strong>not</strong> have to be a boolean. <code>is_truthy</code> classifies every value:</p>
+<table><thead><tr><th>Value</th><th>Truthy?</th></tr></thead><tbody>
+<tr><td><code>false</code>, <code>nil</code></td><td>false</td></tr>
+<tr><td><code>0</code> (number)</td><td>false</td></tr>
+<tr><td><code>""</code> (empty string)</td><td>false</td></tr>
+<tr><td><code>"0"</code> (the one-char string)</td><td><strong>false</strong></td></tr>
+<tr><td>any other string (<code>"0.0"</code>, <code>"false"</code>, <code>" "</code>)</td><td>true</td></tr>
+<tr><td><code>[]</code> / <code>{}</code> / empty bytes</td><td>false</td></tr>
+<tr><td>non-empty list/map/bytes</td><td>true</td></tr>
+<tr><td>any number <code>!= 0</code>, any function</td><td>true</td></tr>
+</tbody></table>
+<pre><code class="language-mix">if "" then print("a") else print("empty string is falsy") end
+if 0 then print("b") else print("zero is falsy") end
+if "0" then print("c") else print("the string 0 is falsy") end
+if "0.0" then print("but 0.0 as a string is truthy") end
+if [] then print("d") else print("empty list is falsy") end
+</code></pre>
+<pre><code class="language-text">empty string is falsy
+zero is falsy
+the string 0 is falsy
+but 0.0 as a string is truthy
+empty list is falsy
+</code></pre>
+<p>The <code>"0"</code> case is a deliberate shell-flavoured trap: <code>"0"</code> is falsy, <code>"0.0"</code> is truthy. When in doubt, compare explicitly (<code>if $s != "" then …</code>). For combining conditions use <code>and</code> / <code>or</code> / <code>not</code> (see <a href="/mix/operators">operators</a>).</p>
+<h3 id="if-as-an-expression"><code>if</code> as an expression</h3>
+<p>Since 0.20 <code>if … then … else … end</code> can also be used <strong>in expression position</strong> — anywhere a value goes: an assignment, a call argument, inside a <code>..</code> concatenation. It short-circuits (only the taken branch runs). Each branch is a statement block whose value is its <strong>last statement</strong> (or nil if empty / no branch matched):</p>
+<pre><code class="language-mix">$code = 404
+$msg = if $code == 200 then "ok" else if $code == 404 then "not found" else "?" end
+print($msg)
+print("status: " .. if $code &gt;= 400 then "error" else "fine" end)
+print(length(if false then "ab" else "abcd" end))
+</code></pre>
+<pre><code class="language-text">not found
+status: error
+4
+</code></pre>
+<p>A multi-statement branch yields its last statement's value:</p>
+<pre><code class="language-mix">$v = if true then
+  $a = 10
+  $a * 2
+else
+  0
+end
+print($v)
+</code></pre>
+<pre><code class="language-text">20
+</code></pre>
+<p>A <strong>trailing operator binds to the if's value</strong> — the <code>end</code> closes the expression first:</p>
+<pre><code class="language-mix">$x = if true then 1 else 2 end + 3
+print($x)
+</code></pre>
+<pre><code class="language-text">4
+</code></pre>
+<p>A leading <code>if</code> at the start of a statement is still a plain statement (its value is discarded); the expression form fires only when the <code>if</code> is nested inside an expression. For the terse one-line form, reach for the ternary <code>cond ? a : b</code>, and for "value or default" the nil-coalescing <code>??</code> (see <a href="/mix/operators">operators</a>). Prefer either over the Lua-style <code>cond and a or b</code> idiom — Mix is broadly falsy, so that silently returns <code>b</code> whenever the middle value is falsy.</p>
+<hr />
+<h2 id="while"><code>while</code></h2>
+<p>Runs the body while the condition stays truthy, re-checking before each iteration (zero iterations if false at entry):</p>
+<pre><code class="language-mix">$n = 3
+while $n &gt; 0
+  print($n)
+  $n = $n - 1
+end
+</code></pre>
+<pre><code class="language-text">3
+2
+1
+</code></pre>
+<pre><code class="language-mix">while false
+  print("never")
+end
+print("skipped")
+</code></pre>
+<pre><code class="language-text">skipped
+</code></pre>
+<p>There is no <code>do</code> after the condition — the body simply starts on the next line.</p>
+<hr />
+<h2 id="loop"><code>loop</code></h2>
+<p>An unconditional loop — the ARexx/Smalltalk infinite loop. You exit it with <a href="/mix/control-flow#break-and-continue"><code>break</code></a> (or <code>return</code> from inside a function, or <code>die</code>):</p>
+<pre><code class="language-mix">$i = 0
+loop
+  $i = $i + 1
+  if $i &gt; 3 then
+    break
+  end
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">1
+2
+3
+</code></pre>
+<p><code>loop</code> is the right shape when the exit test is mid-body, not at the top (a <code>do … while</code> in other languages).</p>
+<hr />
+<h2 id="for-i--a-to-b-step-s"><code>for $i = a to b [step s]</code></h2>
+<p>A numeric counter loop. <strong>Both bounds are inclusive</strong>, the default step is <code>+1</code>. (There is no range <em>operator</em> — <code>..</code> is string concatenation; for a range as a list, see <code>range()</code> in <a href="/mix/builtins">builtins</a>.)</p>
+<pre><code class="language-mix">for $i = 1 to 3
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">1
+2
+3
+</code></pre>
+<p>A negative <code>step</code> counts <strong>down</strong> (and the <code>to</code> bound is still inclusive):</p>
+<pre><code class="language-mix">for $i = 10 to 0 step -2
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">10
+8
+6
+4
+2
+0
+</code></pre>
+<p>The step may be fractional (numbers are f64 — see <a href="/mix/math">math</a>):</p>
+<pre><code class="language-mix">for $x = 0 to 1 step 0.25
+  print($x)
+end
+</code></pre>
+<pre><code class="language-text">0
+0.25
+0.5
+0.75
+1
+</code></pre>
+<p>Bounds and step are arbitrary expressions, evaluated <strong>once</strong> before the loop:</p>
+<pre><code class="language-mix">$lo = 2
+$hi = 5
+for $i = $lo to $hi
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">2
+3
+4
+5
+</code></pre>
+<h3 id="direction-and-edge-cases">Direction and edge cases</h3>
+<p>The loop guard is direction-aware: with <code>step &gt; 0</code> it stops once <code>$i &gt; end</code>, with <code>step &lt; 0</code> once <code>$i &lt; end</code>. So a positive step over a descending range runs <strong>zero</strong> times rather than forever. <strong><code>step 0</code> never advances the counter — an infinite loop.</strong> Mix does not promote a zero step to 1 (unlike shell brace expansion); don't compute a step that can reach 0.</p>
+<p>A number or numeric string is accepted for each bound and step. A value that
+<code>to_number</code> cannot parse raises <code>TYPE_MISMATCH</code>, naming whether it was the
+start, end, or step; it never silently becomes <code>0</code>/<code>1</code>. This includes
+<code>"inf"</code>, <code>"nan"</code>, and overflowing <code>"1e999"</code>, which are deliberately not Mix
+numeric strings:</p>
+<pre><code class="language-mix">for $i = 1 to "x"
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">TYPE_MISMATCH: for-loop end must be a number, got "x" (string)
+</code></pre>
+<p>A <code>NaN</code> start/end/step (e.g. from <code>sqrt(-1)</code>) is rejected up front (<code>for-loop start/end/step is NaN</code>) — it would otherwise be an unbounded loop, since every guard against <code>NaN</code> is false.</p>
+<p><code>to</code>, <code>step</code>, and <code>label</code> are keywords: they can never name a function or variable (<code>function step(…)</code> is a parse error — <code>expected identifier, got Step</code>), but since 0.21 a keyword is accepted anywhere it is unambiguously a name — a bare map key, a <code>.field</code> — so <code>for $i = $m.to to 7</code> parses. See <a href="/mix/keywords">keywords</a>.</p>
+<hr />
+<h2 id="for-x-in-list-aka-for-each"><code>for $x in &lt;list&gt;</code> (a.k.a. <code>for each</code>)</h2>
+<p>Iterates the elements of a list — the workhorse for collections. Since
+0.63.0 the <code>each</code> keyword is <strong>optional</strong>: <code>for $x in $xs</code> and
+<code>for each $x in $xs</code> are the same statement, and both stay supported
+indefinitely (<code>each</code> is not deprecated). What disambiguates iteration from
+the <a href="/mix/control-flow#for-i--a-to-b-step-s">counted loop</a> is the token after the variable —
+<code>in</code> (or a <code>,</code>) iterates, <code>=</code> counts:</p>
+<pre><code class="language-mix">for $fruit in ["apple", "pear", "fig"]
+  print($fruit)
+end
+</code></pre>
+<pre><code class="language-text">apple
+pear
+fig
+</code></pre>
+<p>Add an <strong>index variable</strong> with a comma — <code>for $i, $x in …</code> or
+<code>for each $i, $x in …</code> (the index is 0-based):</p>
+<pre><code class="language-mix">for each $i, $x in ["a", "b", "c"]
+  print($i .. ": " .. $x)
+end
+</code></pre>
+<pre><code class="language-text">0: a
+1: b
+2: c
+</code></pre>
+<p><code>for each</code> also accepts a <strong>string</strong> (yields one codepoint per iteration — emoji-correct since strings are codepoint-based, see <a href="/mix/strings">strings</a>) and a <strong>map</strong> (yields the keys, in insertion order):</p>
+<pre><code class="language-mix">for each $ch in "héllo"
+  print($ch)
+end
+</code></pre>
+<pre><code class="language-text">h
+é
+l
+l
+o
+</code></pre>
+<pre><code class="language-mix">$m = { name: "Ada", lang: "Mix" }
+for each $k in $m
+  print($k .. " = " .. $m[$k])
+end
+</code></pre>
+<pre><code class="language-text">name = Ada
+lang = Mix
+</code></pre>
+<h3 id="two-variables-over-a-map-bind-key-value--changed-in-0680">Two variables over a map bind (key, value) — changed in 0.68.0</h3>
+<p>The second variable is what changes by iterable. Over a <strong>list, string or
+bytes</strong> two variables bind <strong>(index, item)</strong>. Over a <strong>map</strong> they bind
+<strong>(key, value)</strong> — so the map form needs no <code>$m[$k]</code> lookup:</p>
+<pre><code class="language-mix">$m = { name: "Ada", lang: "Mix" }
+for each $k, $v in $m
+  print($k .. " = " .. $v)
+end
+</code></pre>
+<pre><code class="language-text">name = Ada
+lang = Mix
+</code></pre>
+<p><strong>Before 0.68.0 this bound (index, key)</strong> — the first variable was a counter
+and the second was the key, which meant the value still had to be looked up
+and the pairs form did not exist. Both spellings changed together
+(<code>for each $k, $v</code> and the bare <code>for $k, $v</code>), and the <strong>one-variable map
+form still yields keys</strong>, unchanged — it is what the release-cycle
+<code>MIX-D3006</code> note pointed code at before the flip landed. (A map has no
+position to bind, so there is no counter form; code that genuinely wanted a
+running index over a map's keys counts one itself.)</p>
+<p>Anything else (a number, nil) raises <code>cannot iterate over &lt;type&gt;</code>. An empty list/map/string runs the body zero times.</p>
+<blockquote>
+<p><strong>Iterating snapshots the source.</strong> <code>for each</code> takes the items up front — for a map, <strong>both the keys and the values</strong> — so mutating the underlying variable mid-loop changes neither the iteration set nor what the remaining iterations bind. (This is also why <code>for each</code> is by-value friendly — see the loop-var scoping note below.)</p>
+</blockquote>
+<h3 id="prefer-a-hof-for-value-producing-bodies">Prefer a HOF for value-producing bodies</h3>
+<p>If the loop body only builds a new collection or folds to a single value, a <a href="/mix/hof">HOF lambda</a> is the idiom — it's shorter and side-effect-free:</p>
+<pre><code class="language-mix">$doubled = map([1, 2, 3, 4], fn($x) = $x * 2)
+print($doubled)
+</code></pre>
+<pre><code class="language-text">[2, 4, 6, 8]
+</code></pre>
+<p>Use <code>for each</code> for genuine side effects (printing, <a href="/mix/bus"><code>send</code></a>, pushing into an accumulator). Reach for <code>map</code> / <code>filter</code> / <code>reduce</code> / <code>sort_by</code> when you're transforming data.</p>
+<hr />
+<h2 id="select--when--otherwise"><code>select</code> / <code>when</code> / <code>otherwise</code></h2>
+<p>ARexx-style multi-way branch — Mix's <code>switch</code>. Each <code>when &lt;expr&gt; then</code> is tested for <strong>equality</strong> (<code>==</code>) against the selector value; the first match runs and the rest are skipped. <code>otherwise</code> is the optional default:</p>
+<pre><code class="language-mix">$x = 2
+select $x
+when 1 then
+  print("one")
+when 2 then
+  print("two")
+when 3 then
+  print("three")
+otherwise
+  print("many")
+end
+</code></pre>
+<pre><code class="language-text">two
+</code></pre>
+<p>It works on strings just as well — a clean command dispatcher:</p>
+<pre><code class="language-mix">$cmd = "list"
+select $cmd
+when "add" then print("adding")
+when "list" then print("listing")
+otherwise print("unknown")
+end
+</code></pre>
+<pre><code class="language-text">listing
+</code></pre>
+<p>The <code>when</code> arms are <strong>arbitrary expressions</strong>, evaluated and compared at match time (not constant labels like C's <code>case</code>):</p>
+<pre><code class="language-mix">$x = 4
+$two = 2
+select $x
+when $two * 2 then print("computed match: 4")
+otherwise print("no")
+end
+</code></pre>
+<pre><code class="language-text">computed match: 4
+</code></pre>
+<p>Match is value equality (<code>==</code>). Be aware of the collection gotcha: <strong><code>List == List</code> is always <code>false</code></strong>, so a list selector never matches a list <code>when</code> — destructure or compare a scalar key instead:</p>
+<pre><code class="language-mix">$x = [1, 2]
+select $x
+when [1, 2] then print("matched list")
+otherwise print("no match - lists never equal")
+end
+</code></pre>
+<pre><code class="language-text">no match - lists never equal
+</code></pre>
+<p>Each <code>when</code> arm takes exactly <strong>one</strong> expression (there is no <code>when 1, 2 then</code> multi-value arm — use <code>otherwise</code> plus an <code>if</code>, or normalise the selector first), and the <code>then</code> after it is required. With no matching <code>when</code> and no <code>otherwise</code>, <code>select</code> does nothing — no error.</p>
+<hr />
+<h2 id="break-and-continue"><code>break</code> and <code>continue</code></h2>
+<p><code>break</code> exits the innermost loop; <code>continue</code> skips to its next iteration. They work in <code>for</code>, <code>for each</code>, <code>while</code>, and <code>loop</code>:</p>
+<pre><code class="language-mix">$i = 0
+loop
+  $i = $i + 1
+  if $i &gt; 3 then
+    break
+  end
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">1
+2
+3
+</code></pre>
+<pre><code class="language-mix">for $i = 1 to 6
+  if $i == 3 then
+    continue
+  end
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">1
+2
+4
+5
+6
+</code></pre>
+<h3 id="conditional-break-if--continue-if">Conditional <code>break if</code> / <code>continue if</code></h3>
+<p>A one-line guarded form — <code>break if &lt;cond&gt;</code> / <code>continue if &lt;cond&gt;</code> — saves a wrapping <code>if … end</code>:</p>
+<pre><code class="language-mix">for $i = 1 to 10
+  continue if $i &lt; 3
+  break if $i &gt; 6
+  print($i)
+end
+</code></pre>
+<pre><code class="language-text">3
+4
+5
+6
+</code></pre>
+<h3 id="labeled-loops--breakcontinue-an-outer-loop">Labeled loops — break/continue an outer loop</h3>
+<p>Tag a loop header with <code>label &lt;name&gt;</code> — all four loop forms accept it (<code>for … label x</code>, <code>for each … label x</code>, <code>while &lt;cond&gt; label x</code>, <code>loop label x</code>) — then <code>break &lt;name&gt;</code> / <code>continue &lt;name&gt;</code> to act on that loop from inside a nested one:</p>
+<pre><code class="language-mix">for $i = 1 to 3 label outer
+  for $j = 1 to 3
+    if $i == 2 and $j == 2 then
+      break outer
+    end
+    print($i .. "," .. $j)
+  end
+end
+</code></pre>
+<pre><code class="language-text">1,1
+1,2
+1,3
+2,1
+</code></pre>
+<pre><code class="language-mix">for $i = 1 to 3 label rows
+  for $j = 1 to 3
+    continue rows if $j == 2
+    print($i .. "," .. $j)
+  end
+end
+</code></pre>
+<pre><code class="language-text">1,1
+2,1
+3,1
+</code></pre>
+<p><code>continue rows</code> abandons the rest of the <em>inner</em> loop and jumps to the next iteration of the labeled <em>outer</em> loop. A <code>break</code>/<code>continue</code> whose label matches no enclosing loop propagates upward until one matches — and if <strong>none</strong> matches, it escapes every loop and aborts the script with a runtime error (<code>unexpected break outside loop</code>). A label typo is a crash, not a silent no-op.</p>
+<hr />
+<h2 id="inline-single-statement-bodies">Inline (single-statement) bodies</h2>
+<p>A loop or <code>if</code> body may be a <strong>single statement on the header line</strong>, with no <code>do</code> and the same trailing <code>end</code>:</p>
+<pre><code class="language-mix">for $i = 1 to 3 print($i) end
+</code></pre>
+<pre><code class="language-text">1
+2
+3
+</code></pre>
+<pre><code class="language-mix">$c = 0
+while $c &lt; 3 $c = $c + 1 end
+print($c)
+</code></pre>
+<pre><code class="language-text">3
+</code></pre>
+<pre><code class="language-mix">$a = []
+for each $x in [1, 2, 3] push($a, $x * 10) end
+print($a)
+</code></pre>
+<pre><code class="language-text">[10, 20, 30]
+</code></pre>
+<p>Use <code>;</code> to put more than one body statement on the same physical line:</p>
+<pre><code class="language-mix">for each $x in [1, 2, 3]; print($x); print($x * 10); end
+</code></pre>
+<p>Critically, <strong><code>do</code> is not a keyword</strong> — a bareword <code>do</code> parses as a discarded
+string. Inline, it becomes the first body statement and the real body breaks the
+parse:</p>
+<pre><code class="language-mix">for each $x in [1, 2, 3] do print($x) end
+</code></pre>
+<pre><code class="language-text">Parse error at line 1:29: expected end of statement, got Print
+</code></pre>
+<p>Sneakier: with a <strong>newline</strong> after the <code>do</code> (the bash-style block header), the loop parses and runs — the <code>do</code> is just a silently discarded first statement. It looks like <code>do</code> is supported; it isn't. Drop it either way.</p>
+<hr />
+<h2 id="legacy-terminators">Legacy terminators</h2>
+<p>The old block terminators still parse but emit a deprecation warning — <strong><code>next</code></strong> closes <code>for</code>/<code>for each</code>, <strong><code>done</code></strong> closes <code>while</code>/<code>loop</code>/<code>on</code> (the warning names the block kind: <code>'done' is deprecated for 'loop' blocks, …</code>). Migrate them to <code>end</code>:</p>
+<pre><code class="language-mix">for $i = 1 to 2
+  print($i)
+next
+</code></pre>
+<pre><code class="language-text">warning: &lt;mix&gt; line 3: 'next' is deprecated for 'for' blocks, use 'end' instead
+1
+2
+</code></pre>
+<pre><code class="language-mix">$n = 2
+while $n &gt; 0
+  print($n)
+  $n = $n - 1
+done
+</code></pre>
+<pre><code class="language-text">warning: &lt;mix&gt; line 5: 'done' is deprecated for 'while' blocks, use 'end' instead
+2
+1
+</code></pre>
+<p><code>if</code> and <code>function</code>/<code>fn</code> accept <strong>only</strong> <code>end</code> — there is no legacy form for them. <strong>Use <code>end</code> everywhere</strong> in new code.</p>
+<hr />
+<h2 id="loop-variable-scope-the-one-footgun">Loop-variable scope (the one footgun)</h2>
+<p>Mix has <strong>no per-iteration block scope</strong> — the loop var is a single slot reused each pass, and it <strong>persists after the loop</strong> at top level:</p>
+<pre><code class="language-mix">for $i = 1 to 3
+  $last = $i
+end
+print("last i was " .. $last)
+</code></pre>
+<pre><code class="language-text">last i was 3
+</code></pre>
+<p>Inside a <a href="/mix/functions">function</a> this is subtler: a loop var (and <code>for each</code> element/index var, and <code>catch $e</code>) binds <strong>function-locally</strong>, so a library's <code>for each $p in …</code> <em>shadows</em> rather than <em>clobbers</em> a same-named caller/global <code>$p</code>. But that also means a body assignment like <code>$total = $total + $x</code> inside a function binds a local and does <strong>not</strong> write through to an outer global — to propagate a result out, <code>return</code> it. See <a href="/mix/functions">functions</a>.</p>
+<hr />
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/functions">functions</a> — <code>function</code>/<code>fn</code>, <code>return</code>, closures, the pass-in/return/reassign triad</li>
+<li><a href="/mix/hof">hof</a> — <code>map</code> / <code>filter</code> / <code>reduce</code> / <code>sort_by</code>: prefer these over value-producing loops</li>
+<li><a href="/mix/operators">operators</a> — <code>and</code> / <code>or</code> / <code>not</code>, comparisons, <code>..</code> concatenation</li>
+<li><a href="/mix/strings">strings</a> — codepoint iteration, interpolation rules</li>
+<li><a href="/mix/collections">collections</a> — lists &amp; maps, <code>push</code>, indexing bases</li>
+<li><a href="/mix/errors">error handling</a> — <code>try</code> / <code>catch</code>, <code>die</code></li>
+<li><a href="/mix/bus">bus</a> — <code>on … end</code> handlers (which also accept the legacy <code>done</code>)</li>
+<li><a href="/mix/keywords">keywords</a> — the reserved-word list; keywords as bare map keys/fields (0.21)</li>
+<li><a href="/mix/builtins">builtins index</a> — full builtin catalogue</li>
+<li>Lineage: <a href="https://en.wikipedia.org/wiki/ARexx">ARexx</a> (<code>select</code>/<code>when</code>/<code>otherwise</code>, <code>do … end</code> blocks)</li>
+<li><code>mix help</code> — one-line builtin summary · <code>mix what for</code> / <code>mix what select</code> — per-keyword help</li>
+</ul>
+<pre><code class="language-text">$ mix what for
+for: Numeric loop: for $i = 1 to 10 ... end; iteration: for $x in LIST ... end ('each' optional: for each $x in LIST)
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +1081,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1135,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1264,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

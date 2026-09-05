@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-filesd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,122 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-filesd/README.md"><div class="prose"><h1 id="cosmix-filesd">cosmix-filesd</h1>
+<p><code>cosmix-filesd</code> serves files as authoritative data. In corpus mode it watches a Markdown tree, maintains a rebuildable SQLite index, reconciles external changes, and exposes document operations over Bus. In <code>fs</code> mode it exposes a configured set of filesystem places without a corpus index. It belongs to the <code>cos</code> daemon layer in the <code>bus &lt;- mix &lt;- cos</code> dependency chain and consumes Bus and Cos substrate crates.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-filesd reconcile [OPTIONS]
+cosmix-filesd serve [OPTIONS]
+</code></pre>
+<p>The package builds the <code>cosmix-filesd</code> binary. It does not expose a Rust library target.</p>
+<h2 id="operating-modes">Operating modes</h2>
+<table><thead><tr><th>Mode</th><th>Purpose</th><th>Runtime state</th><th>Bus namespace</th></tr></thead><tbody>
+<tr><td>Corpus</td><td>Manage and index one Markdown corpus</td><td>Filesystem watcher, periodic reconcile, SQLite store, index writer</td><td><code>filesd.*</code></td></tr>
+<tr><td>Filesystem</td><td>Serve an allowlisted set of file-manager places</td><td>Stateless filesystem layer</td><td><code>fs.*</code></td></tr>
+</tbody></table>
+<p><code>serve</code> selects filesystem mode only when its configuration contains <code>mode: fs</code>. All other invocations use corpus mode.</p>
+<h2 id="commands">Commands</h2>
+<h3 id="reconcile"><code>reconcile</code></h3>
+<p>Walk the corpus once, update its index, print a summary to standard error, and exit.</p>
+<pre><code class="language-text">cosmix-filesd reconcile \
+  --root /var/lib/cosmix/corpora/notes \
+  --corpus notes \
+  --db /var/lib/cosmix/filesd/notes.db
+</code></pre>
+<p>Options:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>-c</code>, <code>--config PATH</code></td><td>Read a flat <code>key: value</code> configuration file</td></tr>
+<tr><td><code>--root PATH</code></td><td>Override the corpus root</td></tr>
+<tr><td><code>--corpus ID</code></td><td>Override the corpus identifier</td></tr>
+<tr><td><code>--db PATH</code></td><td>Override the SQLite index path</td></tr>
+</tbody></table>
+<p><code>reconcile</code> supports corpus configuration only.</p>
+<h3 id="serve"><code>serve</code></h3>
+<p>Run the selected service mode and register a Bus service.</p>
+<pre><code class="language-text">cosmix-filesd serve -c /etc/cosmix/filesd/notes.conf.mix
+</code></pre>
+<p>Options:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>-c</code>, <code>--config PATH</code></td><td>Read the service configuration</td></tr>
+<tr><td><code>--root PATH</code></td><td>Override the corpus root</td></tr>
+<tr><td><code>--corpus ID</code></td><td>Override the corpus identifier</td></tr>
+<tr><td><code>--db PATH</code></td><td>Override the SQLite index path</td></tr>
+<tr><td><code>--interval-secs N</code></td><td>Override the periodic reconcile interval</td></tr>
+<tr><td><code>--bus-service NAME</code></td><td>Override the registered Bus service name</td></tr>
+</tbody></table>
+<p>The corpus flags apply to corpus mode. Filesystem mode requires a configuration file because repeated <code>place:</code> entries are read from the original text.</p>
+<p>See <a href="/cos/cosmix-filesd/configuration">configuration.md</a> for both configuration schemas.</p>
+<h2 id="corpus-service">Corpus service</h2>
+<p>Corpus mode performs a reconcile at startup. A recursive filesystem watcher queues another reconcile after relevant event bursts, and a periodic timer provides a correctness backstop.</p>
+<p>One dedicated writer thread owns the SQLite store. Watch events, timer ticks, and Bus commands send work to that thread, so index mutations are serial.</p>
+<p>The watcher considers non-hidden Markdown paths and whole-file conflict paths. Its debounce window is 250 milliseconds.</p>
+<p>The SQLite index is derived state. Files on disk remain authoritative.</p>
+<p><code>filesd.save</code> is the only operation that mints a missing document ID. It writes atomically, scans the resulting file, and updates the index before replying. Saving ID-less content over an existing document preserves that document's ID.</p>
+<p>Corpus-relative paths reject absolute paths, empty paths, parent traversal, and symlink escapes. <code>filesd.move</code> also refuses to replace an existing destination.</p>
+<p>Corpus changes are pushed to <code>indexd.index_file</code> while the Bus broker is connected. Reconnection replays pending changes and republishes the live corpus. <code>filesd.resync</code> requests a full live republish and tombstone purge.</p>
+<h2 id="filesystem-service">Filesystem service</h2>
+<p>Filesystem mode serves configured places through a stateless filesystem layer. It has no SQLite store, watcher, reconcile timer, or index push.</p>
+<p>Each place has an identifier, display metadata, a root, a writable flag, and optional allow and deny patterns. Bus operations run as blocking filesystem work outside the asynchronous command loop.</p>
+<p>Irreversible operations require <code>confirm: true</code>. Moving a file to trash is the reversible default.</p>
+<h2 id="bus-interface">Bus interface</h2>
+<p>Corpus mode registers these commands:</p>
+<ul>
+<li><code>filesd.list</code></li>
+<li><code>filesd.read</code></li>
+<li><code>filesd.search</code></li>
+<li><code>filesd.changes</code></li>
+<li><code>filesd.save</code></li>
+<li><code>filesd.move</code></li>
+<li><code>filesd.delete</code></li>
+<li><code>filesd.resync</code></li>
+<li><code>filesd.props.get</code></li>
+<li><code>filesd.props.list</code></li>
+<li><code>filesd.props.describe</code></li>
+</ul>
+<p>Filesystem mode registers these commands:</p>
+<ul>
+<li><code>fs.places</code></li>
+<li><code>fs.list</code></li>
+<li><code>fs.stat</code></li>
+<li><code>fs.tree</code></li>
+<li><code>fs.read_blob</code></li>
+<li><code>fs.search</code></li>
+<li><code>fs.mkdir</code></li>
+<li><code>fs.touch</code></li>
+<li><code>fs.write</code></li>
+<li><code>fs.copy</code></li>
+<li><code>fs.move</code></li>
+<li><code>fs.trash</code></li>
+<li><code>fs.trash.list</code></li>
+<li><code>fs.trash.restore</code></li>
+<li><code>fs.trash.empty</code></li>
+<li><code>fs.delete</code></li>
+</ul>
+<p>Successful commands return Bus result code <code>0</code> with a JSON body. Handler, validation, authorisation, and filesystem errors return code <code>10</code> with an <code>error</code> field.</p>
+<p>See <a href="/cos/cosmix-filesd/verbs">verbs.md</a> for arguments, defaults, limits, and response shapes.</p>
+<h2 id="properties">Properties</h2>
+<p>Corpus mode provides a read-only SPEC-07 L1 property tree.</p>
+<table><thead><tr><th>Path</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>config.corpus_id</code></td><td>String</td><td>Corpus identifier</td></tr>
+<tr><td><code>config.root</code></td><td>String</td><td>Watched corpus root</td></tr>
+<tr><td><code>lifecycle.started_at</code></td><td>String</td><td>Process start time in RFC 3339 form</td></tr>
+<tr><td><code>lifecycle.uptime_s</code></td><td>Number</td><td>Process uptime in seconds</td></tr>
+<tr><td><code>lifecycle.props_level</code></td><td>String</td><td>Conformance level, always <code>L1</code></td></tr>
+<tr><td><code>corpus.files</code></td><td>Number</td><td>Live, non-tombstoned documents</td></tr>
+<tr><td><code>corpus.conflicts</code></td><td>Number</td><td>Whole-file conflicts observed</td></tr>
+<tr><td><code>corpus.unmanaged</code></td><td>Number</td><td>Live files without managed IDs</td></tr>
+<tr><td><code>corpus.bytes</code></td><td>Number</td><td>Total size of live documents</td></tr>
+<tr><td><code>corpus.modseq</code></td><td>String</td><td>Current corpus change sequence</td></tr>
+</tbody></table>
+<p>The property surface supports <code>get</code>, <code>list</code>, and <code>describe</code>. It does not publish property change events, watches, or retained <code>world.*</code> state.</p>
+<p>Document IDs, change sequence values, and change cursors cross Bus as strings to avoid JSON number precision loss.</p>
+<h2 id="delegated-calls">Delegated calls</h2>
+<p>Both modes share the same delegated-call gate. A top-level <code>$cosmix_delegation</code> field selects the delegated path. Its presence is decisive: an invalid envelope is rejected and never falls back to the bare path.</p>
+<p>Delegated calls must come from a configured peer and carry envelope version <code>1</code>, role <code>admin</code>, boolean <code>csrf_verified: true</code>, and non-empty <code>actor</code>, <code>vhost</code>, <code>route_id</code>, and <code>request_id</code> fields. The command arguments are read from the envelope's separate <code>args</code> object.</p>
+<p>A configured delegated peer must use an envelope. Other peers use the bare trusted path. Delegated outcomes and security refusals are written to standard error for service logging.</p>
+<h2 id="build">Build</h2>
+<p><code>cosmix-filesd</code> depends on the Cos file, configuration, and property substrates, plus Bus client, protocol, and build-information crates. Its SQLite support is enabled through <code>cosmix-lib-files</code>.</p>
+<p>The crate defines no Cargo feature flags.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +734,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +788,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +917,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

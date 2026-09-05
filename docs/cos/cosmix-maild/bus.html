@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild/bus</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,105 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild/bus.md"><div class="prose"><h1 id="cosmix-maild-bus-surface">cosmix-maild Bus surface</h1>
+<h2 id="service">Service</h2>
+<p>The daemon registers as Bus service <code>maild</code>.</p>
+<p>Broker registration retries with exponential backoff. SMTP, IMAP, JMAP, and DAV continue serving while the broker is unavailable. After a disconnect, the daemon reconnects and registers again.</p>
+<h2 id="request-and-response-convention">Request and response convention</h2>
+<p>Action arguments resolve in this order:</p>
+<ol>
+<li>JSON in the <code>args</code> header</li>
+<li>A non-empty JSON body</li>
+<li>The client library's parsed <code>args</code> value</li>
+</ol>
+<p>Individual verbs may also accept named headers such as <code>email</code>, <code>account</code>, <code>by</code>, <code>limit</code>, or <code>dry_run</code>. Where both forms are accepted, the header wins.</p>
+<p>Success uses <code>rc = 0</code>. Caller, validation, and engine failures use <code>rc = 10</code> with a JSON error body. Property routing preserves its own <code>0</code>, <code>10</code>, and <code>20</code> return codes.</p>
+<h2 id="account-verbs">Account verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>maild.accounts.seed_mailboxes</code></td><td>Optional <code>email</code></td><td>Idempotently create Inbox, Drafts, Sent, Junk, Trash, and Archive</td></tr>
+<tr><td><code>maild.accounts.seed_content</code></td><td>Required <code>email</code></td><td>Idempotently create Posts and Pages content folders</td></tr>
+<tr><td><code>maild.accounts.revoke_tokens</code></td><td>Required <code>email</code></td><td>Revoke all live bearer tokens for the account</td></tr>
+<tr><td><code>maild.accounts.verify</code></td><td><code>email</code>, <code>password</code></td><td>Return <code>valid</code> without exposing the stored hash</td></tr>
+<tr><td><code>maild.accounts.lock</code></td><td>Required <code>email</code></td><td>Disable password authentication and preserve the hash</td></tr>
+<tr><td><code>maild.accounts.unlock</code></td><td>Required <code>email</code></td><td>Restore the preserved password hash</td></tr>
+</tbody></table>
+<p>An unknown account and a wrong password both produce <code>valid: false</code> from <code>verify</code>. Lock and unlock are idempotent.</p>
+<h2 id="rules-and-bayesian-verbs">Rules and Bayesian verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>maild.rules.reload</code></td><td>None</td><td>Reload the configured pack and return load metadata</td></tr>
+<tr><td><code>maild.rules.stats</code></td><td>Optional <code>top_n</code></td><td>Return pack metadata and persistent verdict and rule-hit counters</td></tr>
+<tr><td><code>maild.rules.explain</code></td><td>Envelope and base64 message</td><td>Explain rule evaluation without delivering</td></tr>
+<tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code></td><td>Return per-account corpus statistics</td></tr>
+<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code></td><td>Classify without recording a training label</td></tr>
+</tbody></table>
+<p><code>maild.rules.explain</code> accepts:</p>
+<pre><code class="language-json">{
+  "account_id": 42,
+  "envelope_from": "sender@example.com",
+  "envelope_to": ["admin@example.com"],
+  "peer_ip": "192.0.2.20",
+  "message_b64": "RnJvbTogc2VuZGVyQGV4YW1wbGUuY29tDQoNCkhlbGxvDQo=",
+  "mail_auth": null
+}
+</code></pre>
+<p><code>account_id</code> may be omitted for engine defaults. It may otherwise be a non-negative JSON integer or an all-digit string. <code>mail_auth</code> is reserved; the handler currently synthesises a no-DNS verification result for explanation.</p>
+<p><code>maild.rules.stats</code> returns at most 256 rule entries by default and clamps <code>top_n</code> to 4096. <code>top_n: 0</code> returns rule cardinality without the per-rule map.</p>
+<h2 id="search-and-statistics-verbs">Search and statistics verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>maild.search.rebuild</code></td><td>Optional <code>email</code></td><td>Rebuild search rows for one or all accounts</td></tr>
+<tr><td><code>maild.stats.mailboxes</code></td><td>Required <code>account</code> or <code>email</code></td><td>Per-mailbox totals, unread counts, and bytes</td></tr>
+<tr><td><code>maild.stats.account</code></td><td>Required <code>account</code> or <code>email</code></td><td>Account-wide storage and message roll-up</td></tr>
+<tr><td><code>maild.stats.online</code></td><td>None</td><td>IMAP connection counts and recent JMAP activity</td></tr>
+<tr><td><code>maild.stats.server</code></td><td>None</td><td>Server-wide storage, queue, connection, and uptime data</td></tr>
+<tr><td><code>maild.stats.top</code></td><td>Optional <code>by</code>, <code>limit</code></td><td>Rank accounts by size or message count</td></tr>
+</tbody></table>
+<p><code>maild.stats.top</code> defaults to <code>by: "size"</code> and <code>limit: 10</code>. <code>by</code> also accepts <code>"count"</code>; the limit is clamped to the range 1 through 1000.</p>
+<p>Search rebuilds process accounts sequentially. A failure for one account is reported without preventing attempts for the remaining accounts.</p>
+<h2 id="retention-verbs">Retention verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>maild.retention.status</code></td><td>None</td><td>Current policy and last-sweep state</td></tr>
+<tr><td><code>maild.retention.run</code></td><td>Optional <code>account</code>, <code>dry_run</code></td><td>Run one sweep immediately</td></tr>
+</tbody></table>
+<p>Status is read-only. <code>run</code> requires the Bus sender to appear in <code>retention_operators</code>; an empty allowlist denies every caller.</p>
+<p>The property defaults are inert: Junk and Trash windows are zero, no accounts are armed, and <code>dry_run</code> is true.</p>
+<h2 id="dkim-and-tls-verbs">DKIM and TLS verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>maild.dkim.generate</code></td><td><code>domain</code>, <code>selector</code>, optional <code>algorithm</code></td><td>Write a new key, update domain state, rebuild the signer, and return a DNS record</td></tr>
+<tr><td><code>maild.dkim.rotate</code></td><td><code>domain</code>, <code>selector</code></td><td>Promote an existing substrate-managed selector</td></tr>
+<tr><td><code>maild.dkim.retire</code></td><td><code>domain</code>, <code>selector</code></td><td>Remove a non-active substrate-managed selector</td></tr>
+<tr><td><code>maild.tls.reload</code></td><td>None</td><td>Rebuild and atomically swap the SNI resolver</td></tr>
+</tbody></table>
+<p>DKIM mutations operate on substrate-managed domains. Operator-managed startup rows are not modified. Key writes are atomic and private; domain updates use versioned replacement.</p>
+<p>TLS reload reads startup and substrate identities, validates certificate/key pairs, updates the <code>maild.tls_identities</code> projection, and clears the server-config cache. A rebuild failure leaves the previous resolver serving.</p>
+<h2 id="virtual-token-verbs">Virtual-token verbs</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>maild.vtoken.mint_opaque</code></td><td>Account, sender, verification strength, service, and optional state</td><td>Mint a sender-locked opaque address and return its plaintext token once</td></tr>
+<tr><td><code>maild.vtoken.list_opaque</code></td><td>None</td><td>List stored opaque-token rows without secret PIN fields</td></tr>
+<tr><td><code>maild.vtoken.lookup_opaque</code></td><td><code>token_hmac</code></td><td>Read one stored row</td></tr>
+<tr><td><code>maild.vtoken.disable_opaque</code></td><td><code>token_hmac</code></td><td>Disable a stored token</td></tr>
+</tbody></table>
+<p>The global path requires the Bus sender in <code>vtoken_operators</code>. The delegated path requires a top-level <code>$cosmix_delegation</code> envelope and a sender in <code>vtoken_delegated_peers</code>. A delegated peer cannot fall back to the global path.</p>
+<p>Opaque plaintext tokens are returned only when minted. Storage uses an HMAC derived from a server secret rather than the raw token.</p>
+<h2 id="property-verbs">Property verbs</h2>
+<p>Commands with the <code>maild.props.</code> prefix are bridged to the property router. The crate uses:</p>
+<ul>
+<li><code>maild.props.get</code></li>
+<li><code>maild.props.list</code></li>
+<li><code>maild.props.set</code></li>
+<li><code>maild.props.delete</code></li>
+<li><code>maild.props.watch</code></li>
+</ul>
+<p>The routed namespaces are <code>accounts</code>, <code>account_overrides</code>, <code>aliases</code>, <code>domains</code>, <code>engine_config</code>, <code>retention</code>, <code>tls_identities</code>, and <code>log</code>.</p>
+<p>Namespace schemas and hooks enforce record shape, canonical keys, merge behaviour, cross-record constraints, secret redaction, lifecycle work, and write policy.</p>
+<h2 id="published-topics">Published topics</h2>
+<h3 id="maildverdict"><code>maild.verdict</code></h3>
+<p>One event is emitted after an inbound message is durably delivered. The event carries routing, rules, Bayesian, mail-auth, score, and stamp information used by subscribers.</p>
+<p>Publication is best-effort after commit. Delivery is not rolled back if the topic cannot be published.</p>
+<h3 id="maildpropsrecordschanged"><code>maild.props.records.changed</code></h3>
+<p>Property changes are published without broker retention. <code>maild.props.watch</code> obtains a broker subscription grant before live delivery begins.</p>
+<h2 id="availability">Availability</h2>
+<p>Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +717,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +771,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +900,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

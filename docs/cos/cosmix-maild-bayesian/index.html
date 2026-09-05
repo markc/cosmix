@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild-bayesian/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,129 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild-bayesian/README.md"><div class="prose"><h1 id="cosmix-maild-bayesian">cosmix-maild-bayesian</h1>
+<p><code>cosmix-maild-bayesian</code> is the per-account Bayesian classification library used as the third stage of <code>cosmix-maild</code>'s inbound DATA filter pipeline, after <code>cosmix-maild-rules</code> returns <code>Continue</code>. It tokenises RFC 5322 messages, scores them with a Robinson-Fisher classifier, stores training state in SQLite, and returns a routing verdict. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it is a cos-layer crate: it has no direct Mix dependency, while its optional <code>cosmix</code> feature activates direct dependencies on Bus client libraries.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The Cargo package is <code>cosmix-maild-bayesian</code>. Rust code imports it as <code>cosmix_maild_bayesian</code>.</p>
+<pre><code class="language-rust">use std::sync::Arc;
+
+use cosmix_maild_bayesian::{
+    Classifier, ClassifierConfig, ClassifyContext, DefaultClassifier,
+    storage::SqliteBackend,
+};
+use cosmix_maild_rules::AccountId;
+
+let config = ClassifierConfig::default();
+let storage = Arc::new(SqliteBackend::new(
+    "/var/lib/example-mail/bayesian",
+    None,
+    config.cold_start_floor,
+));
+let classifier = DefaultClassifier::new(config, storage);
+
+let account = AccountId::new("alpha");
+let message = b"From: sender@example.com\r\nSubject: Status\r\n\r\nAll clear.\r\n";
+let verdict = classifier.classify(&amp;ClassifyContext {
+    message,
+    account: &amp;account,
+    rules_score: 0.0,
+    matched_rules: &amp;[],
+    trusted: false,
+}).await?;
+</code></pre>
+<h2 id="classification">Classification</h2>
+<p><code>Classifier</code> is the asynchronous service trait. It defines:</p>
+<ul>
+<li><code>classify</code> to produce a <code>BayesianVerdict</code> for one message and account.</li>
+<li><code>retrain</code> to apply a <code>Spam</code> or <code>Ham</code> label under a stable stamp identifier.</li>
+<li><code>stats</code> to read per-account corpus statistics.</li>
+</ul>
+<p><code>DefaultClassifier</code> implements the trait over an injected <code>StorageBackend</code>.</p>
+<p>Classification tokenises the message, applies <code>max_tokens_per_message</code>, fetches per-token ham and spam counts, applies Robinson correction, selects the most informative tokens, and combines their probabilities with Fisher's method.</p>
+<p>An empty corpus returns <code>Ham</code> with score <code>0.5</code>. A non-empty corpus returns <code>Spam</code> when its score is greater than or equal to the effective threshold, otherwise <code>Ham</code>.</p>
+<p>Cold-start mode applies while the combined ham and spam message count is below <code>cold_start_floor</code>. It changes the threshold without changing the score calculation.</p>
+<p>When <code>rules_score_bias_k</code> is non-zero, the preceding rules score adjusts the classifier score in log-odds space.</p>
+<p><code>BayesianVerdict</code> contains the label, score, effective threshold, cold-start flag, and the selected token contributions. Each <code>TokenContribution</code> reports the token, corpus counts, corrected probability, and signed distance from <code>0.5</code>.</p>
+<h2 id="training">Training</h2>
+<p><code>RetrainRequest</code> carries a stamp identifier, account, raw message, and target <code>Label</code>.</p>
+<p>The SQLite implementation records labels by stamp identifier. Repeating the same label is an idempotent no-op. Applying the opposite label reverses the prior token and message counts before adding the new label.</p>
+<p><code>DefaultClassifier::retrain</code> returns <code>RetrainOutcome::Applied</code> when storage changes and <code>RetrainOutcome::AlreadyLabeled</code> when <code>record_label</code> touches no rows. <code>RetrainOutcome::NoStamp</code> is part of the public enum but is not produced by this implementation.</p>
+<h2 id="public-modules">Public modules</h2>
+<table><thead><tr><th>Module</th><th>Surface</th></tr></thead><tbody>
+<tr><td><code>classifier</code></td><td><code>Classifier</code> and <code>DefaultClassifier</code></td></tr>
+<tr><td><code>config</code></td><td><code>ClassifierConfig</code></td></tr>
+<tr><td><code>error</code></td><td>crate-wide <code>Error</code> and <code>Result</code></td></tr>
+<tr><td><code>scoring</code></td><td><code>Params</code>, <code>CombineMode</code>, <code>Verdict</code>, and <code>RailHit</code>; scoring functions remain crate-visible</td></tr>
+<tr><td><code>storage</code></td><td>storage traits plus SQLite and in-memory implementations</td></tr>
+<tr><td><code>tokenizer</code></td><td>default and configurable RFC 5322 tokenisation</td></tr>
+<tr><td><code>types</code></td><td>classification, verdict, retraining, contribution, and statistics types</td></tr>
+</tbody></table>
+<p>The crate root re-exports <code>Classifier</code>, <code>DefaultClassifier</code>, <code>ClassifierConfig</code>, <code>Error</code>, <code>Result</code>, and all public types from <code>types</code>.</p>
+<h2 id="classifier-configuration">Classifier configuration</h2>
+<p><code>ClassifierConfig</code> is a programmatic Rust configuration surface. The crate does not define a configuration file format.</p>
+<table><thead><tr><th>Field</th><th style="text-align: right">Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>spam_threshold</code></td><td style="text-align: right"><code>0.95</code></td><td>Steady-state spam threshold</td></tr>
+<tr><td><code>cold_start_spam_threshold</code></td><td style="text-align: right"><code>0.85</code></td><td>Threshold used during cold start</td></tr>
+<tr><td><code>cold_start_floor</code></td><td style="text-align: right"><code>100</code></td><td>Combined labelled-message count required to leave cold start</td></tr>
+<tr><td><code>robinson_max_extreme_tokens</code></td><td style="text-align: right"><code>15</code></td><td>Maximum informative tokens used by scoring</td></tr>
+<tr><td><code>smoothing_s</code></td><td style="text-align: right"><code>0.5</code></td><td>Robinson smoothing strength</td></tr>
+<tr><td><code>smoothing_x</code></td><td style="text-align: right"><code>0.5</code></td><td>Fixed unknown-token probability when the base-rate prior is off</td></tr>
+<tr><td><code>explanation_top_k</code></td><td style="text-align: right"><code>15</code></td><td>Maximum token contributions returned</td></tr>
+<tr><td><code>max_tokens_per_message</code></td><td style="text-align: right"><code>200</code></td><td>Maximum token count passed to scoring and retraining</td></tr>
+<tr><td><code>body_scan_bytes</code></td><td style="text-align: right"><code>1,048,576</code></td><td>Reserved body-scan limit; the classifier does not currently read it</td></tr>
+<tr><td><code>rules_score_bias_k</code></td><td style="text-align: right"><code>0.0</code></td><td>Rules-score log-odds multiplier; zero disables adjustment</td></tr>
+<tr><td><code>budget_ms</code></td><td style="text-align: right"><code>25</code></td><td>Reserved classification budget; the classifier does not currently enforce it</td></tr>
+<tr><td><code>seed_from_default</code></td><td style="text-align: right"><code>true</code></td><td>Reserved seed switch; <code>SqliteBackend</code> seeding is controlled by its constructor</td></tr>
+<tr><td><code>base_rate_prior</code></td><td style="text-align: right"><code>false</code></td><td>Use a shrunk and clamped account spam rate as the Robinson centre</td></tr>
+<tr><td><code>base_rate_pseudocount</code></td><td style="text-align: right"><code>20.0</code></td><td>Symmetric pseudo-message weight for the base-rate prior</td></tr>
+<tr><td><code>base_rate_min</code></td><td style="text-align: right"><code>0.2</code></td><td>Lower clamp for the derived base rate</td></tr>
+<tr><td><code>base_rate_max</code></td><td style="text-align: right"><code>0.8</code></td><td>Upper clamp for the derived base rate</td></tr>
+</tbody></table>
+<p>The base-rate prior is experimental and off by default. With the flag off, <code>smoothing_x</code> remains the Robinson centre. With the flag on, the observed spam rate is shrunk towards <code>0.5</code> and clamped to the configured interval. An inverted interval falls back to <code>0.5</code>.</p>
+<h2 id="tokenisation">Tokenisation</h2>
+<p><code>tokenize</code> uses <code>TokenizerConfig::default</code>. <code>tokenize_with_config</code> accepts an explicit configuration.</p>
+<p>The default tokenizer emits namespaced tokens for subject words and bigrams, sender-related headers, the first Received header, plain-text and HTML body words, and normalised URLs. It strips HTML text, drops URL queries and fragments, sorts the result, and deduplicates tokens so each token records presence rather than frequency within one message.</p>
+<p>Unparseable input falls back to raw-text tokenisation. Token lengths are measured in bytes. Defaults accept lengths from <code>3</code> through <code>40</code>, and extraction has a hard pre-deduplication limit of <code>50,000</code> tokens.</p>
+<p><code>TokenizerConfig</code> also exposes expanded recipient and Received-header coverage, sender TLD tokens, Unicode confusable folding, display-name brand mismatch tokens, and authentication-result tokens. These anti-evasion options are off by default. Enabling an option changes the token stream and therefore requires retraining existing corpora.</p>
+<p><code>TokenizerConfig::from_env</code> recognises <code>SPAMLITE_EXPANDED_HEADERS</code>, <code>SPAMLITE_TLD</code>, <code>SPAMLITE_FOLD</code>, <code>SPAMLITE_BRAND</code>, and <code>SPAMLITE_AUTH</code>. Values <code>1</code> and <code>true</code> enable the corresponding option.</p>
+<h2 id="storage">Storage</h2>
+<p><code>StorageBackend</code> opens an <code>AccountConnection</code>. <code>AccountConnection</code> reads token counts, records labels, returns statistics, and returns total ham and spam message counts.</p>
+<p><code>SqliteBackend::new</code> accepts a base directory, an optional seed database path, and the cold-start floor. It stores each account at <code>&lt;base&gt;/&lt;account&gt;/bayes.db</code> and caches open connections.</p>
+<p>For a new account, the backend first promotes an adjacent legacy <code>db.sqlite</code> through SQLite so committed WAL data is included. If no legacy database exists, it copies the configured seed when that file exists. Otherwise it creates an empty database.</p>
+<p>The SQLite schema contains <code>tokens</code>, <code>meta</code>, and <code>labels</code> tables. It preserves the token and metadata layout used by the compatible source database and adds labels for idempotent retraining.</p>
+<p><code>SqliteAccountConnection::open_path</code> opens one database directly, bypassing the backend cache.</p>
+<p><code>InMemoryBackend</code> and <code>InMemoryConnection</code> represent an always-empty corpus. They are suitable for tests and downstream stubs; they do not retain training.</p>
+<p><code>AccountStats</code> reports message totals, approximate token totals, cold-start state, seed label, and model version. The SQLite implementation reports the same unique-token count in both token-total fields and currently returns no seed label.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>core</code></td><td style="text-align: right">Yes</td><td>Empty marker feature for the core library surface</td></tr>
+<tr><td><code>cosmix</code></td><td style="text-align: right">No</td><td>Activates optional <code>cosmix-lib-bus</code> and native <code>cosmix-lib-client</code> dependencies</td></tr>
+</tbody></table>
+<p>The current source has no <code>cfg(feature = ...)</code> sections. Enabling <code>cosmix</code> adds the optional dependencies but does not add Bus verbs or feature-gated Rust items.</p>
+<h2 id="dependencies">Dependencies</h2>
+<table><thead><tr><th>Dependency group</th><th>Crates</th></tr></thead><tbody>
+<tr><td>Mail pipeline</td><td><code>cosmix-maild-rules</code></td></tr>
+<tr><td>Message parsing</td><td><code>mail-parser</code>, <code>nanohtml2text</code></td></tr>
+<tr><td>Storage and async</td><td><code>rusqlite</code>, <code>tokio</code>, <code>async-trait</code></td></tr>
+<tr><td>Data and errors</td><td><code>serde</code>, <code>serde_json</code>, <code>thiserror</code>, <code>chrono</code></td></tr>
+<tr><td>Diagnostics</td><td><code>tracing</code></td></tr>
+<tr><td>Optional Bus integration</td><td><code>cosmix-lib-bus</code>, <code>cosmix-lib-client</code></td></tr>
+</tbody></table>
+<h2 id="migration-binary">Migration binary</h2>
+<p>The package builds <code>cosmix-maild-bayesian-migrate</code>.</p>
+<pre><code class="language-text">cosmix-maild-bayesian-migrate
+</code></pre>
+<p>The binary is currently a placeholder. It prints that the migration is not wired and exits with status <code>2</code>. It does not accept a usable migration command or modify a database.</p>
+<h2 id="errors">Errors</h2>
+<p>The crate error type covers storage failures, SQLite errors, MIME parsing, untrained accounts, migration failures, and internal failures.</p>
+<h2 id="compatibility-and-defaults">Compatibility and defaults</h2>
+<p>The scoring and tokenizer modules preserve the crate's earlier default behaviour while carrying later anti-evasion controls in a default-off state. Golden-score tests pin the default token stream and Robinson-Fisher results. A separate compatibility test can compare an externally provisioned compatible database when its helper binary is available.</p>
+<p>The default classifier uses Fisher combination. <code>scoring::CombineMode::Geometric</code> and the abuse-TLD rail parameter types are public, but <code>DefaultClassifier</code> constructs its scoring parameters internally with Fisher mode and the rail disabled.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/overview">Cos overview</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +741,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +795,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +924,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

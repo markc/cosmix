@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-song/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,153 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-song/README.md"><div class="prose"><h1 id="cosmix-song">cosmix-song</h1>
+<p><code>cosmix-song</code> is the <code>song.v1</code> editable song document model: MIDI tracks and
+notes with tick-based timing, Standard MIDI File import and export, JSON and
+binary persistence, midicomp text conversion, and snapshot undo history. It is
+a library in the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain. It
+does not depend directly on <code>bus</code> or <code>mix</code>; its only local crate dependency is
+<code>cosmix-midicomp</code>, used for <code>.asc</code> conversion.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-rust">use cosmix_song::{Song, TICKS_PER_BEAT};
+
+let mut song = Song::new("Example");
+let track_id = song.create_track("Piano");
+let track = song.get_track_mut(track_id).unwrap();
+
+track.create_note(60, 100, 0, TICKS_PER_BEAT);
+track.create_note(64, 90, TICKS_PER_BEAT, TICKS_PER_BEAT / 2);
+
+assert_eq!(song.track_count(), 1);
+assert_eq!(song.duration_ticks(), TICKS_PER_BEAT + TICKS_PER_BEAT / 2);
+</code></pre>
+<p>The crate is a domain library. It provides no audio engine, user interface,
+daemon, command-line interface, configuration format, or Bus verbs.</p>
+<h2 id="document-model">Document model</h2>
+<h3 id="song"><code>Song</code></h3>
+<p><code>Song</code> is the root document type. It stores:</p>
+<ul>
+<li>A name and tempo in beats per minute.</li>
+<li>A time-signature numerator and denominator.</li>
+<li>An ordered collection of tracks.</li>
+<li>An optional SoundFont path associated with playback.</li>
+</ul>
+<p><code>Song::new</code> creates an empty song at 120 BPM in 4/4 time.
+<code>Song::with_default_track</code> also creates one melodic track.
+<code>Song::default</code> names that document <code>Untitled Song</code>.</p>
+<p>Track operations include:</p>
+<ul>
+<li><code>add_track</code>, <code>create_track</code>, and <code>create_drum_track</code>.</li>
+<li><code>remove_track</code>, <code>move_track</code>, and indexed or ID-based lookup.</li>
+<li><code>tracks</code>, <code>tracks_mut</code>, <code>track_count</code>, and <code>find_note</code>.</li>
+<li><code>playable_tracks</code>, which applies mute and solo state.</li>
+</ul>
+<p>Melodic tracks receive MIDI channels automatically. Channel 9 is reserved for
+drums. Automatic allocation wraps after channel 15, so tracks may share a
+channel.</p>
+<p>Timing operations report song duration, calculate ticks per measure, and
+convert between ticks and one-indexed measure and beat positions.</p>
+<h3 id="track"><code>Track</code></h3>
+<p><code>Track</code> represents one MIDI track. Its public fields hold the stable <code>TrackId</code>,
+name, MIDI channel, program, volume, pan, mute state, and solo state. Its notes
+remain sorted by start tick when inserted through <code>add_note</code> or <code>create_note</code>.</p>
+<p><code>Track::new</code> clamps the channel to 0 through 15 and defaults to program 0,
+volume 100, centred pan 64, and no mute or solo. <code>Track::new_drum_track</code> selects
+General MIDI drum channel 9.</p>
+<p>Track editing and queries include:</p>
+<ul>
+<li>Add, create, remove, and look up notes by <code>NoteId</code>.</li>
+<li>Borrow all notes or scan notes overlapping a half-open tick range.</li>
+<li>Find notes active at one tick.</li>
+<li>Report note count and duration, or clear all notes.</li>
+<li>Quantise note starts to the nearest non-zero tick grid.</li>
+<li>Transpose all notes and report how many could not remain in MIDI range.</li>
+</ul>
+<h3 id="note"><code>Note</code></h3>
+<p><code>Note</code> stores a stable <code>NoteId</code>, pitch, velocity, start tick, and duration.
+<code>Note::new</code> clamps pitch and velocity to the MIDI range 0 through 127.</p>
+<p>The note API calculates a saturating end tick, tests half-open range overlap
+and activity, duplicates a note with a new ID, transposes within MIDI range,
+and shifts its start time with saturation at zero.</p>
+<p><code>NoteId</code> and <code>TrackId</code> are process-global monotonic identifiers. JSON and binary
+load paths advance their counters beyond every loaded identifier before new
+objects are allocated.</p>
+<h2 id="timing-and-note-helpers">Timing and note helpers</h2>
+<p>The internal resolution is <code>TICKS_PER_BEAT</code>, fixed at 480 ticks per quarter
+note. <code>DEFAULT_TEMPO</code> is 120 BPM.</p>
+<p>The crate exports:</p>
+<ul>
+<li><code>ticks_to_seconds</code> and <code>seconds_to_ticks</code> for constant-tempo conversion.</li>
+<li><code>NOTE_NAMES</code>, <code>note_to_name</code>, and <code>name_to_note</code> for MIDI note names.</li>
+<li><code>contains_beat</code> and <code>contains_measure</code> for detecting boundaries in half-open
+tick windows.</li>
+</ul>
+<p>Note naming follows the MIDI octave convention: MIDI note 60 is <code>C4</code>, and note
+0 is <code>C-1</code>. Parsing accepts the sharp names present in <code>NOTE_NAMES</code>; it does not
+normalise flats or letter case.</p>
+<h2 id="persistence">Persistence</h2>
+<p><code>Song</code> derives Serde serialization and supports two native persistence forms.</p>
+<table><thead><tr><th>Form</th><th>Write</th><th>Read</th></tr></thead><tbody>
+<tr><td>Pretty JSON string</td><td><code>Song::to_json</code></td><td><code>Song::from_json</code></td></tr>
+<tr><td>Pretty JSON file</td><td><code>Song::save_to_file</code></td><td><code>Song::load_from_file</code></td></tr>
+<tr><td>Bincode <code>.oxm</code> file</td><td><code>Song::save_to_binary</code></td><td><code>Song::load_from_binary</code></td></tr>
+</tbody></table>
+<p>The binary Serde field sequence is compatible with the <code>.oxm</code> shape inherited
+from miditui. The optional SoundFont field defaults when absent from older JSON
+documents.</p>
+<h2 id="standard-midi-files">Standard MIDI Files</h2>
+<p>SMF operations are available as free functions and, for file paths, as <code>Song</code>
+methods:</p>
+<table><thead><tr><th>Operation</th><th>File API</th><th>Byte API</th></tr></thead><tbody>
+<tr><td>Import</td><td><code>import_smf</code>, <code>Song::import_smf</code></td><td><code>import_smf_bytes</code></td></tr>
+<tr><td>Export</td><td><code>export_smf</code>, <code>Song::export_smf</code></td><td><code>export_smf_bytes</code></td></tr>
+</tbody></table>
+<p>Import accepts SMF Format 0 and Format 1 with metrical timing. It rescales
+source ticks to 480 ticks per beat and splits MIDI data into song tracks by
+channel. It imports note on and note off events, track names, program changes,
+tempo, time signature, volume controller 7, and pan controller 10.</p>
+<p>The importer ignores other MIDI events and drops tracks that contain no notes.
+An unclosed note receives a one-beat duration. Overlapping notes with the same
+channel and pitch are matched in first-in, first-out order. If import produces
+no note-bearing tracks, the resulting song contains one empty default track.</p>
+<p>SMF Format 2 and SMPTE timecode timing return
+<code>SmfImportError::UnsupportedFormat</code>. File I/O and parse failures use the other
+<code>SmfImportError</code> variants.</p>
+<p>Export always writes SMF Format 1:</p>
+<ul>
+<li>Track 0 contains the song name, tempo, and time signature.</li>
+<li>Each song track becomes one MIDI track with its name, program, volume, pan,
+notes, and note-off events.</li>
+<li>The file resolution is 480 ticks per quarter note.</li>
+</ul>
+<p>The exporter stores <code>soundfont_path</code>, mute, and solo state in versioned <code>CSMX</code>
+sequencer-specific meta events because standard SMF has no native fields for
+them. The importer restores recognised <code>CSMX</code> data and ignores unknown versions
+or kinds. Note IDs are regenerated after an SMF round trip.</p>
+<h2 id="midicomp-text">Midicomp text</h2>
+<p>The <code>.asc</code> form is the text representation provided by <code>cosmix-midicomp</code>.
+<code>import_asc</code> and <code>Song::import_asc</code> compile text to SMF bytes before normal
+import. <code>export_asc</code> and <code>Song::export_asc</code> render normal SMF export bytes as
+text.</p>
+<p>ASC therefore has the same model fidelity and limitations as SMF, including
+the <code>CSMX</code> fields. File-based import names the song from the file stem.</p>
+<h2 id="undo-and-redo">Undo and redo</h2>
+<p>The public <code>history</code> module exports <code>HistoryManager</code> and <code>StateSnapshot</code>.
+A snapshot clones the complete <code>Song</code> and carries a short operation
+description. It deliberately excludes user-interface selection state.</p>
+<p><code>HistoryManager</code> maintains bounded undo and redo stacks of eight snapshots
+each. <code>push_undo</code> records the pre-operation state and clears redo history.
+Callers performing redo use <code>push_undo_preserve_redo</code> so remaining redo states
+survive. The manager exposes pop, availability, count, and clear operations;
+the caller remains responsible for applying the returned <code>Song</code>.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<p>The crate defines no Cargo features.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p><code>serde</code> and <code>serde_json</code> provide the document and metadata encodings. <code>bincode</code>
+provides <code>.oxm</code> persistence. <code>midly</code> provides tolerant SMF parsing. The local
+<code>cosmix-midicomp</code> library provides <code>.asc</code> encoding and decoding with its default
+features disabled.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +765,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +819,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +948,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

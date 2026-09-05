@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/mcp</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,63 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/mcp.md"><div class="prose"><h1 id="cosmix-mcp--claude-code-bridge-to-the-mesh">cosmix-mcp — Claude Code bridge to the mesh</h1>
+<p><strong><code>cosmix-mcp</code> is an MCP server that exposes the cosmix mesh to Claude Code as a
+set of tools: call any Bus service, tail logs, run Mix, and drive the
+knowledge/skill learning loop backed by <a href="/cos/indexd">indexd</a>.</strong> It is the seam
+that lets an agent operate the substrate through the Model Context Protocol.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>A per-user helper (not a resident daemon) that speaks MCP over stdio. Claude
+Code launches it; it connects lazily to the local <a href="/cos/noded">cosmix-noded</a>
+broker on the first tool call, so startup never blocks. Each tool call is
+logged (name + redacted arg summary + duration + ok/err) to stderr, a per-user
+log file, and journald (<code>journalctl -t cosmix-mcp</code>).</p>
+<p>Its reason to exist is the <strong>knowledge loop</strong>: retrieve relevant context before
+a task, capture what worked after. Skills, docs, and journals live in
+<a href="/cos/indexd">indexd</a>; the MCP tools are how an agent reads and refines them.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>Bridges Bus</strong> — call any mesh service, list services/peers, read node info, ping the broker, all as MCP tools.</li>
+<li><strong>Exposes logs</strong> — tail and search per-daemon logs from the agent.</li>
+<li><strong>Runs Mix</strong> — evaluate a Mix script/one-liner on the node.</li>
+<li><strong>Drives the knowledge loop</strong> — semantic search, workspace (re)indexing, skill store/retrieve/refine, and retrieval-scoring feedback.</li>
+<li><strong>Redacts by default</strong> — string values are never logged verbatim; full args need an explicit <code>RUST_LOG=cosmix_mcp=trace</code> opt-in.</li>
+</ul>
+<h2 id="running-it">Running it</h2>
+<p>Registered with Claude Code, which spawns it on demand:</p>
+<pre><code class="language-sh">claude mcp add cosmix-mcp -- /opt/cosmix/bin/cosmix-mcp
+</code></pre>
+<p>The binary connects to the local broker for Bus tools and to
+<a href="/cos/indexd">cosmix-indexd</a> for the knowledge tools. No systemd unit — its
+lifecycle is Claude Code's.</p>
+<h2 id="interfaces">Interfaces</h2>
+<p>MCP tools exposed:</p>
+<table><thead><tr><th>Group</th><th>Tools</th></tr></thead><tbody>
+<tr><td>Bus</td><td><code>bus_call</code>, <code>bus_list_services</code>, <code>bus_node_info</code>, <code>bus_list_peers</code>, <code>noded_ping</code></td></tr>
+<tr><td>Logs</td><td><code>log_tail</code>, <code>log_search</code></td></tr>
+<tr><td>Knowledge</td><td><code>context_search</code>, <code>index_workspace</code>, <code>knowledge_digest</code>, <code>knowledge_brief</code></td></tr>
+<tr><td>Skills</td><td><code>skills_retrieve</code>, <code>skills_store</code>, <code>skills_refine</code>, <code>skills_list</code>, <code>skills_delete</code>, <code>skills_graduate</code></td></tr>
+<tr><td>Feedback</td><td><code>docs_feedback</code>, <code>journal_feedback</code>, <code>memory_feedback</code>, <code>journal_supersede</code></td></tr>
+<tr><td>Scripts</td><td><code>mix_execute</code></td></tr>
+<tr><td>Status</td><td><code>mcp_status</code> (uptime, broker state, per-tool call counts, recent calls)</td></tr>
+</tbody></table>
+<p>The knowledge protocol in practice: <code>context_search</code> before a non-trivial task
+→ do the work → <code>skills_store</code> what you learned → <code>skills_refine</code> if you used a
+retrieved skill → <code>*_feedback</code> to score the chunks you used.</p>
+<h2 id="where-it-fits">Where it fits</h2>
+<p>Depends on the Bus client from <a href="https://github.com/markc/cosmix">bus</a>
+(<code>cosmix-lib-client</code>), <code>cosmix-lib-skills</code> for the skill loop, and the embedded
+<a href="https://github.com/markc/cosmix">mix</a> engine for <code>mix_execute</code>. At runtime it
+talks to <a href="/cos/noded">cosmix-noded</a> (Bus surface) and <a href="/cos/indexd">cosmix-indexd</a>
+(semantic recall + skills). It is a client of the mesh, not a member of it.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/indexd">indexd</a> — the vector store behind the knowledge + skill tools</li>
+<li><a href="/cos/noded">noded</a> — the Bus broker mcp calls through</li>
+<li><a href="/cos/overview">overview</a> — the daemon family at a glance</li>
+<li><a href="/cos/libraries">libraries</a> — <code>cosmix-lib-skills</code>, <code>cosmix-lib-agent</code></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +675,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +729,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +858,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-config/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,146 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-config/README.md"><div class="prose"><h1 id="cosmix-lib-config">cosmix-lib-config</h1>
+<p><code>cosmix-lib-config</code> is the shared Rust settings and path-resolution library for
+CosMix applications and daemons. It provides typed configuration structures,
+strict-data Mix parsing, <code>.conf.mix</code> load and save operations, node configuration,
+and ACME policy resolution. The crate belongs to the <code>cos</code> layer of the
+<code>bus &lt;- mix &lt;- cos</code> dependency chain: it uses <code>cosmix-lib-mix</code> for parsing and
+serialisation, and its optional client helpers depend downwards on Bus client and
+wire crates. Bus and Mix do not depend on this crate.</p>
+<p>The Cargo package is named <code>cosmix-lib-config</code>. Rust code imports it as
+<code>cosmix_config</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-rust">use cosmix_config::{DomainsSettings, load_conf_mix_path};
+use cosmix_config::store::load_service;
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    let skills = load_service::&lt;cosmix_config::SkillsSettings&gt;("skills")?;
+    let minimum = skills.min_confidence;
+
+    let domains = load_service::&lt;DomainsSettings&gt;("domains")?;
+    let domain = domains.resolve(std::path::Path::new("/srv/example"));
+
+    let node: cosmix_config::node::NodeConfig =
+        load_conf_mix_path(std::path::Path::new("node.conf.mix"))?;
+
+    println!("{minimum}: {domain:?}: {}", node.node);
+    Ok(())
+}
+</code></pre>
+<p>This crate is a library. It defines no executable, CLI subcommands, or Bus
+verbs.</p>
+<h2 id="configuration-format">Configuration format</h2>
+<p><code>.conf.mix</code> is the only supported configuration format. The serde bridge
+accepts the strict-data subset of Mix and rejects executable constructs such as
+variable references, function calls, shell commands, interpolation, control
+flow, and arithmetic.</p>
+<p>Per-service files use the name <code>{service}.conf.mix</code>. Node-wide identity and
+service configuration uses <code>node.conf.mix</code>. See <a href="/cos/cosmix-lib-config/node-config">Node configuration</a>
+for the node schema, discovery order, listener rules, and ACME policy.</p>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>acme_policy</code></td><td>Validates webd ACME configuration and produces typed issuance plans and a production ToS-acceptance proof.</td></tr>
+<tr><td><code>client_helpers</code></td><td>Resolves the local broker URL and opens named, provenance-bearing, or anonymous Bus client connections.</td></tr>
+<tr><td><code>mix_data</code></td><td>Parses strict-data Mix text or files into an untyped <code>Value</code> tree.</td></tr>
+<tr><td><code>node</code></td><td>Defines <code>node.conf.mix</code> types, loaders, derived addresses, and webd listener synthesis.</td></tr>
+<tr><td><code>paths</code></td><td>Resolves source, configuration, data, binary, runtime, log, and temporary directories.</td></tr>
+<tr><td><code>store</code></td><td>Loads, saves, and materialises typed per-service <code>.conf.mix</code> files.</td></tr>
+</tbody></table>
+<p>The private <code>settings</code> module is re-exported at the crate root.</p>
+<h2 id="per-service-settings">Per-service settings</h2>
+<p>The crate exports these typed settings structures:</p>
+<table><thead><tr><th>Type</th><th>Configuration surface</th></tr></thead><tbody>
+<tr><td><code>DomainsSettings</code></td><td>Maps filesystem path prefixes to domain names; <code>resolve</code> uses the longest matching prefix.</td></tr>
+<tr><td><code>LlmSettings</code></td><td>Selects a default LLM backend and holds named backend definitions.</td></tr>
+<tr><td><code>LlmBackendConfig</code></td><td>Describes HTTP, command, or Bus-backed LLM access.</td></tr>
+<tr><td><code>SkillsSettings</code></td><td>Sets retrieval limits, confidence thresholds, backend selection, and graduation thresholds.</td></tr>
+<tr><td><code>KnowledgeSettings</code></td><td>Sets source trust weights, journal decay, and maximum journal age.</td></tr>
+<tr><td><code>IndexdSettings</code></td><td>Holds schema version, index service settings, and source-type policies.</td></tr>
+<tr><td><code>IndexdServiceSettings</code></td><td>Holds vector database, embedding model, socket, idle timeout, and precision settings.</td></tr>
+<tr><td><code>SourceTypeSpec</code></td><td>Declares required metadata and an optional date field for one indexed source type.</td></tr>
+<tr><td><code>MusicdSettings</code></td><td>Holds SoundFont source and digest, state directory, sample rate, polyphony, and gain.</td></tr>
+</tbody></table>
+<p>The service settings types implement <code>Default</code>. <code>SourceTypeSpec</code> is a nested
+policy value. <code>store::load_service</code> requires
+<code>Default + DeserializeOwned + Serialize</code>.</p>
+<h2 id="store-api">Store API</h2>
+<p><code>store::load_service::&lt;T&gt;(name)</code> reads
+<code>cosmix_path(CosmixDir::Etc)/{name}.conf.mix</code>. When the file does not exist, it
+serialises <code>T::default()</code>, creates the configuration directory, writes the new
+file, and returns the same default value.</p>
+<p><code>store::save_service(settings, name)</code> serialises a typed value to the service
+file. <code>load_conf_mix_path::&lt;T&gt;(path)</code> reads and deserialises an explicit path
+without applying service-name discovery.</p>
+<p><code>store::config_dir()</code> returns the resolved configuration directory.
+<code>cosmix_src()</code> returns the resolved source directory.</p>
+<p>Read and parse failures include the source path in the error chain. The store
+does not read or upgrade legacy TOML files.</p>
+<h2 id="strict-data-api">Strict-data API</h2>
+<p><code>parse_mix_data(source)</code> parses a string and returns <code>MixResult&lt;Value&gt;</code>.
+<code>load_mix_data(path)</code> reads and parses a strict-data file. A read failure is
+reported as <code>MixError::RuntimeError</code>; parser errors pass through unchanged.</p>
+<p>The crate re-exports <code>Value</code>, <code>MixError</code>, and <code>MixResult</code> for callers that walk
+untyped maps and lists. It also re-exports <code>from_conf_mix_str</code> and
+<code>to_conf_mix_string</code> for typed serde conversion.</p>
+<pre><code class="language-rust">use cosmix_config::{Value, parse_mix_data};
+
+fn main() -&gt; cosmix_config::MixResult&lt;()&gt; {
+    let value = parse_mix_data(
+        "name: \"alpha\"\npriority: 2\ntags: [\"config\", \"public\"]\n"
+    )?;
+
+    if let Value::Map(map) = value {
+        assert_eq!(map.get("name"), Some(&amp;Value::String("alpha".into())));
+    }
+    Ok(())
+}
+</code></pre>
+<h2 id="path-resolution">Path resolution</h2>
+<p><code>cosmix_path(CosmixDir)</code> resolves each directory once and caches the complete
+set for the process. An environment override wins over user or system defaults.</p>
+<table><thead><tr><th>Kind</th><th>Environment variable</th><th>User default</th><th>System default</th></tr></thead><tbody>
+<tr><td><code>Src</code></td><td><code>COSMIX_SRC</code></td><td><code>$COSMIX</code></td><td>none</td></tr>
+<tr><td><code>Etc</code></td><td><code>COSMIX_ETC</code></td><td>XDG config directory under <code>cosmix</code></td><td><code>/etc/cosmix</code></td></tr>
+<tr><td><code>Var</code></td><td><code>COSMIX_VAR</code></td><td>XDG data directory under <code>cosmix</code></td><td><code>/var/lib/cosmix</code></td></tr>
+<tr><td><code>Bin</code></td><td><code>COSMIX_BIN</code></td><td><code>~/.local/bin</code></td><td><code>/usr/local/bin</code></td></tr>
+<tr><td><code>Run</code></td><td><code>COSMIX_RUN</code></td><td>XDG runtime directory under <code>cosmix</code></td><td><code>/run/cosmix</code></td></tr>
+<tr><td><code>Log</code></td><td><code>COSMIX_LOG</code></td><td><code>COSMIX_VAR/log</code></td><td><code>/var/log/cosmix</code></td></tr>
+<tr><td><code>Tmp</code></td><td><code>COSMIX_TMP</code></td><td><code>/tmp/cosmix</code></td><td><code>/tmp/cosmix</code></td></tr>
+</tbody></table>
+<p><code>current_uid()</code> is the crate's infallible wrapper around POSIX <code>getuid(2)</code>.
+Path selection uses it to distinguish user and root execution.</p>
+<h2 id="node-and-acme-api">Node and ACME API</h2>
+<p><code>node::load_from</code> parses an explicit node file. <code>node::load_node_config</code>
+performs standard discovery and returns <code>None</code> when no file exists.
+<code>node::require_node_config</code> converts that absence into an error.</p>
+<p><code>NodeConfig</code> derives broker, mail, and web listen addresses from the configured
+node address and service ports. An empty node address makes <code>noded_url</code> use
+loopback. <code>NodeConfig::synthesize_listeners</code> validates explicit web listener
+IDs, binds, wildcard conflicts, vhost ownership, and enabled state.</p>
+<p><code>resolve_webd_acme</code> converts webd vhost ACME blocks into
+<code>ResolvedWebdAcme</code>. It rejects mixed ACME and manual TLS on one vhost,
+unsupported DNS-01 requests, implausible contact addresses, missing HTTP
+listeners, and production use without a valid Let's Encrypt
+Subscriber-Agreement URL. The returned <code>AcmeTosAcceptance</code> can be inspected
+with <code>url()</code> but cannot be constructed by downstream crates.</p>
+<h2 id="features">Features</h2>
+<table><thead><tr><th>Feature</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>default</code></td><td>yes</td><td>Enables no optional functionality.</td></tr>
+<tr><td><code>client-helpers</code></td><td>no</td><td>Adds native-only broker URL resolution and Bus client connection helpers.</td></tr>
+</tbody></table>
+<p><code>client-helpers</code> is not compiled for <code>wasm32</code>, even when enabled. On native
+targets it adds <code>resolve_noded_url</code>, <code>connect_default</code>,
+<code>connect_default_with_provenance</code>, and <code>connect_anonymous_default</code>.</p>
+<p>If node configuration is absent or invalid, <code>resolve_noded_url</code> logs a warning
+and returns <code>ws://127.0.0.1:4200/ws</code>. The fallback stays on the local host.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The core crate uses serde, serde JSON, <code>directories</code>, <code>anyhow</code>, <code>libc</code>,
+<code>tracing</code>, <code>thiserror</code>, and <code>cosmix-lib-mix</code> with serde support. The
+<code>client-helpers</code> feature adds native optional dependencies on
+<code>cosmix-lib-client</code> and <code>cosmix-lib-bus</code>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +758,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +812,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +941,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

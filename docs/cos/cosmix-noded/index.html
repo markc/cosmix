@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-noded/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,92 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-noded/README.md"><div class="prose"><h1 id="cosmix-noded">cosmix-noded</h1>
+<p><code>cosmix-noded</code> is the consolidated CosMix node daemon. It runs a WebSocket Bus broker, a system-monitor service, and a Bus traffic logger in one process. The crate belongs to the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it consumes Bus protocol and client crates from <code>bus</code>, uses daemon and mesh substrate from <code>cos</code>, and has no direct dependency on <code>mix</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-noded [serve] [OPTIONS]
+cosmix-noded --help
+cosmix-noded --version
+</code></pre>
+<p><code>serve</code> is the only subcommand and is also the default when no subcommand is given.</p>
+<h2 id="description">Description</h2>
+<p>The daemon starts the broker first and waits until its listener is bound. It then starts the monitor and logger as independent asynchronous tasks unless either module is disabled.</p>
+<p>The broker accepts WebSocket connections at <code>/ws</code>. It registers local services, routes Bus requests and responses, bridges messages to configured mesh peers, manages retained topics and subscriptions, distributes specification chapters, and exposes node state through Bus property verbs.</p>
+<p>Per-peer outbound queues are bounded. A slow peer loses messages after its queue fills instead of causing unbounded memory growth. Inbound WebSocket messages are limited to 16 MiB and individual frames to 8 MiB.</p>
+<h2 id="components">Components</h2>
+<table><thead><tr><th>Component</th><th>Registered name</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Broker</td><td><code>noded</code></td><td>Routes Bus traffic, owns node and topic verbs, and bridges mesh peers.</td></tr>
+<tr><td>Monitor</td><td><code>mon</code></td><td>Reports host status, processes, and system properties.</td></tr>
+<tr><td>Logger</td><td><code>log</code></td><td>Subscribes to the local traffic tap and appends a compact event record to <code>bus.log</code>.</td></tr>
+</tbody></table>
+<p>The monitor and logger connect back to the broker as ordinary Bus clients. The logger uses a separate anonymous connection for the traffic tap so tap backpressure cannot block its property service.</p>
+<h2 id="command-line-options">Command-line options</h2>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--listen &lt;ADDR&gt;</code></td><td>Override the broker listen address.</td></tr>
+<tr><td><code>--node &lt;NAME&gt;</code></td><td>Override the node name.</td></tr>
+<tr><td><code>--mesh-config &lt;PATH&gt;</code></td><td>Override the mesh configuration file.</td></tr>
+<tr><td><code>--no-monitor</code></td><td>Do not start the <code>mon</code> service.</td></tr>
+<tr><td><code>--no-log</code></td><td>Do not start the <code>log</code> service.</td></tr>
+<tr><td><code>--spec-dir &lt;PATH&gt;</code></td><td>Set the directory containing specification chapters.</td></tr>
+</tbody></table>
+<p>The version string includes the crate version, source revision, and build time.</p>
+<p>See <a href="/cos/cosmix-noded/configuration">configuration.md</a> for precedence, environment variables, and runtime files.</p>
+<h2 id="bus-surface">Bus surface</h2>
+<p>The broker provides these command families:</p>
+<table><thead><tr><th>Family</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>noded.*</code></td><td>Registration, discovery, health, peer inventory, traffic tap, and authority state.</td></tr>
+<tr><td><code>topic.*</code></td><td>Publish, subscribe, unsubscribe, inspect, and clear retained topics.</td></tr>
+<tr><td><code>noded.props.*</code></td><td>Read and describe broker properties.</td></tr>
+<tr><td><code>props.watch</code></td><td>Subscribe to <code>noded.props.changed</code>.</td></tr>
+<tr><td><code>spec.get</code></td><td>Read a specification chapter by number or filename.</td></tr>
+<tr><td><code>mon.*</code></td><td>Read system status and top processes.</td></tr>
+<tr><td><code>mon.props.*</code></td><td>Read and describe monitor properties.</td></tr>
+<tr><td><code>log.props.*</code></td><td>Read and describe logger properties and counters.</td></tr>
+<tr><td><code>ui.subscribe</code>, <code>ui.unsubscribe</code></td><td>Maintain UI-event subscription records; event routing is not implemented.</td></tr>
+</tbody></table>
+<p>See <a href="/cos/cosmix-noded/verbs">verbs.md</a> for the command arguments, results, retained topics, and access restrictions.</p>
+<h2 id="broker-behaviour">Broker behaviour</h2>
+<p>Connections may register one service name with <code>noded.register</code>. Registered names are unique. Re-registering the same connection under a different name removes its old binding, while a collision with another live connection is rejected.</p>
+<p>Requests addressed to a local registered service are forwarded over that service's WebSocket. Request identifiers are replaced with broker-local identifiers while in flight and restored on the response path, so independent callers may reuse their own local identifiers safely.</p>
+<p>Messages addressed through the mesh layer are passed to <code>MeshPeers</code>. Cross-mesh targets are refused because federation transport is not implemented.</p>
+<p>The broker rewrites a registered local sender's <code>from</code> header to its connection-bound service name before forwarding. It removes <code>from</code> from anonymous and mesh-originated traffic.</p>
+<h2 id="topics">Topics</h2>
+<p>Topic payloads are Bus messages carried inside <code>topic.publish</code>. The broker treats their application payload as opaque, but parses the Bus envelope and injects <code>topic</code>, <code>topic_seq</code>, <code>topic_stale</code>, and <code>topic_op</code> headers.</p>
+<p>Retained snapshots default to enabled and are limited to 1 MiB. A new subscriber receives the latest retained snapshot when one exists. A snapshot becomes stale when its publisher disconnects and is removed after a 60-second grace period; the janitor checks every 10 seconds.</p>
+<p>Topic names beginning with <code>$</code> are reserved. Property event topics also have owner and visibility restrictions enforced by the broker.</p>
+<h2 id="properties-and-retained-state">Properties and retained state</h2>
+<p>The <code>noded</code> property tree reports:</p>
+<ul>
+<li>broker bind address, node name, and log level;</li>
+<li>process start time, uptime, health, and property conformance level;</li>
+<li>registered service names and count;</li>
+<li>active topic count and retained snapshot bytes.</li>
+</ul>
+<p>Changes are published on <code>noded.props.changed</code>. A full broker snapshot is retained on <code>world.noded</code>.</p>
+<p>When a specification directory is available, each canonical <code>NN_*.md</code> chapter is retained on <code>world.specs.NN</code>. <code>spec.get</code> returns the same chapter content directly.</p>
+<p>The monitor property tree reports lifecycle data, CPU, memory, swap, load averages, selected disks, and its default process-list limit. The logger property tree reports its log path, tap state, event count, and bytes written.</p>
+<h2 id="authority-and-admission">Authority and admission</h2>
+<p>The authority module verifies a cached signed inventory against a provisioned genesis public key and maintains an anti-rollback baseline. Verification failure produces an <code>unverified</code> posture instead of stopping the broker.</p>
+<p>Inventory changes are watched and hot-reloaded. A failed reload does not replace a previously verified inventory. In enforcement mode, a verified membership revocation closes affected admitted sessions.</p>
+<p>Admission supports <code>off</code>, <code>observe</code>, and <code>enforce</code> modes. Observe mode challenges and records verdicts without refusing a session. Enforce mode requires a valid inter-node proof and fails closed when the listener is not bound to the configured mesh address or no verified trust root is available. Same-node connections are not admission-gated.</p>
+<p>The admission exchange uses broker-issued <code>noded.admit.challenge</code> frames and client <code>noded.admit.response</code> frames. These are session-handshake messages rather than general application RPCs.</p>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>noded</code></td><td>WebSocket broker, routing, registry, mesh ingress and egress, command dispatch, and admission enforcement.</td></tr>
+<tr><td><code>subscription</code></td><td>Topic snapshots, fan-out, replay, subscriber lifecycle, filtering, and UI subscription records.</td></tr>
+<tr><td><code>authority</code></td><td>Signed-inventory verification, accepted member summaries, and rollback baseline handling.</td></tr>
+<tr><td><code>admission</code></td><td>Challenge state and reconstruction of signed admission transcripts.</td></tr>
+<tr><td><code>props</code></td><td>Broker property tree and change publication.</td></tr>
+<tr><td><code>props_reservation</code></td><td>Ownership rules for property event topics.</td></tr>
+<tr><td><code>monitor</code>, <code>mon_props</code></td><td>Host metrics, process reporting, and monitor properties.</td></tr>
+<tr><td><code>logger</code>, <code>log_props</code></td><td>Bus traffic logging and logger properties.</td></tr>
+<tr><td><code>spec</code></td><td>Specification discovery, parsing, lookup, and retained publication.</td></tr>
+</tbody></table>
+<h2 id="cargo-features">Cargo features</h2>
+<p>This crate defines no Cargo feature flags.</p>
+<h2 id="exit-and-shutdown">Exit and shutdown</h2>
+<p>The process waits for a daemon shutdown signal or an unexpected broker exit. On shutdown it aborts the monitor and logger tasks and exits. Failure to load the required node configuration or bind the broker listener is fatal.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +704,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +758,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +887,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

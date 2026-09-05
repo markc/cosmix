@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/10c-package-install-profile</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,1664 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/10c-package-install-profile.md"><div class="prose"><h1 id="package-installation--retained-ns4-profile">Package Installation — Retained NS4 Profile</h1>
+<p><strong>DAEMON-PACKAGE-001 — Retained NS4 installer profile.</strong> The following sections preserve the NS4 package, trust-envelope, manifest, phase ordering, abort/rollback, identity and conformance requirements. Legacy section numbers are local to this profile. Legacy chapter 11 does not acquire a new wire/distribution ID through this editorial filename.</p>
+<p>This is retained intended detail, not the current universal installation workflow, a GA release, or a deployment attestation. The current public entry points are <code>bootstrap</code> and <code>setup.mix</code>; see <a href="/spec/02-composition">composition</a> and <a href="/spec/10-daemon-agent-operation">daemon operation</a>. The named NS4 installer and its tests were not executed or established as delivered in this audit. Dated distribution/libc values, pending/present labels, timing claims and sample rollout statements below remain historical, not current environment facts.</p>
+<p>The <a href="/spec/10a-daemon-identity-profile">identity profile</a> retains the referenced identity/verification rules. <a href="/spec/10b-repair-improvement-profile">Repair and improvement</a> retains the recovery intent. <a href="/spec/08-mesh-trust">Mesh trust</a> describes the present trust boundary. The suite's <a href="/spec/00-authority">authority rules</a> apply: publication neither resolves conflicts by fiat nor grants deployment permission.</p>
+<p>Known conflicts are retained for explicit disposition: the legacy tarball manifest still names <code>usr/local/bin</code>, while current production binaries use <code>/opt/cosmix/bin</code>; the exact staged-installer lifecycle differs from current bootstrap; distro and runtime prerequisites need fresh fixtures. These discrepancies must be resolved before claiming this installer profile conformant. They are not instructions to introduce parallel installs or execute old examples.</p>
+<p>For public readability, former private source paths are represented as <code>deployment-tools/</code> and <code>deployment-config/</code> logical artifact roots. They identify helper/template names, not verified public filesystem paths. Private operational references are descriptive historical labels and host examples use placeholder identities. Preserve all required manifest checks, phase boundaries, authority and rollback conditions when adapting the profile to an implemented installer; convenience is not a waiver.</p>
+<h2 id="1-introduction">1. Introduction</h2>
+<p><strong>Version mapping.</strong> Frontmatter <code>version</code> tracks this editorial chapter only.
+<code>spec11_version: 1.0.0-rc.1</code> preserves the legacy NS4 contract version. All retained
+references to the SPEC 11 version or a contract-version bump mean this separate
+field, including MANIFEST generation, compatibility/downgrade checks and L12.
+Editorial corrections must not change the version consumed by installers.</p>
+<h3 id="11-purpose">1.1 Purpose</h3>
+<p>This SPEC defines:</p>
+<ol>
+<li>The package set NS 4.0 ships (§2).</li>
+<li>The tarball layout, naming, versioning, and integrity envelope (§3).</li>
+<li>Host preconditions on Debian 13 — kernel, systemd, glibc, WireGuard,
+hostname, <code>/etc/hosts</code>, sysadm — that the installer assumes (§4).</li>
+<li>The on-host installation procedure that drives SPEC 10 §6's three
+verification phases through to a running, registered node (§5).</li>
+<li>The Mix installer contract — the canonical script that performs
+§5 — and the Mix-first / never-Python rule it embodies (§6).</li>
+<li>Upgrade, downgrade, rollback, and removal semantics (§7).</li>
+<li>The sysadm boundary — what NS 4.0 expects of UID 1000, what it
+does not configure, and how the substrate daemons coexist with
+the operator account (§8).</li>
+<li>The NS 3.0 vhost coexistence rule — UIDs ≥ 1001 are out of scope
+and SHALL NOT collide with the substrate registry (§9).</li>
+<li>Conformance levels and the CI lint shape that prevent drift (§10,
+§11).</li>
+</ol>
+<h3 id="12-scope">1.2 Scope</h3>
+<p>This SPEC applies to:</p>
+<ul>
+<li>Mesh nodes running Debian 13 (Trixie) as a host or in the live
+systemd-nspawn/<code>cosmix-nspawnd</code> lane (or an externally managed Proxmox CT).</li>
+<li>The cosmix-* daemon set as registered in SPEC 10 Appendix A.</li>
+<li>The base mesh-citizen package (<code>cosmix-base</code>, §2.1) and the
+optional knowledge-tier add-on (<code>cosmix-indexd</code>, §2.2).</li>
+</ul>
+<p>It does not apply to:</p>
+<ul>
+<li><strong>The build environment.</strong> How the binaries are <em>produced</em> is
+governed by the retired infra/build-and-distribution doc (2026-07-23, git history) and is
+intentionally out of scope here. NS 4.0 governs <em>deployed</em>
+artifacts, not the workspace that produced them.</li>
+<li><strong>NetServa vhost provisioning.</strong> Per-tenant vhost users (UID
+≥ 1001, NS 3.0 convention) are governed by NetServa, not by
+this SPEC. NS 4.0 only asserts non-collision (§9).</li>
+<li><strong>Session-scoped components.</strong> <code>cosmix-comp</code>, CTK, and native desktop apps
+components excluded from the SPEC 10 registry per its §7 are
+outside NS 4.0's substrate-daemon scope and SHALL NOT appear in
+NS 4.0 packages.</li>
+<li><strong>Distributions other than Debian 13.</strong> The tarball shape is
+reusable, but conformance is defined against Debian 13 only at
+this version. Other distributions are outside this profile;
+development workspaces do not imply NS 4.0 conformance.</li>
+</ul>
+<h3 id="13-non-goals">1.3 Non-goals</h3>
+<ul>
+<li><strong>A native <code>.deb</code> package.</strong> NS 4.0 v1.0.0 ships as a tarball plus
+a Mix installer (§3, §6), matching the existing example-node deployment.
+A future amendment MAY define a <code>.deb</code> shape with the same
+install ordering. The tarball shape is normative now; <code>.deb</code> is a
+pre-commitment, not a current requirement.</li>
+<li><strong>An operating-system distribution.</strong> NS 4.0 is a package install
+on top of an existing Debian 13 host. The host is provisioned by
+Debian itself (or by systemd-nspawn / Proxmox / cloud-init); NS 4.0 does
+not bootstrap the host.</li>
+<li><strong>Cross-distro abstraction.</strong> NS 4.0 v1.0.0 names paths, package
+managers, and service-manager conventions specific to Debian 13.
+Cross-distro abstraction layers (e.g. distro-detection in the
+installer) are explicitly out of scope until a second target is
+declared.</li>
+<li><strong>Auto-correction of preflight failures.</strong> Per SPEC 10 §6.1 and
+§6.2, NS 4.0 fails closed on any registry conflict and SHALL
+NOT silently work around it. The installer's response to "UID
+500 is held by another package" is to halt with a structured
+diagnostic, not to renumber.</li>
+</ul>
+<h3 id="14-terminology">1.4 Terminology</h3>
+<table><thead><tr><th>Term</th><th>Definition</th></tr></thead><tbody>
+<tr><td><strong>NS 4.0</strong></td><td>This specification's revision of the NetServa package install convention.</td></tr>
+<tr><td><strong>NS 3.0</strong></td><td>The pre-existing daily-driver and vhost convention, continued for sysadm UID 1000 and vhost UIDs ≥ 1001.</td></tr>
+<tr><td><strong>mesh node</strong></td><td>A Debian 13 host (bare metal, VM, or container) that has been admitted to the WireGuard /24 trust domain (roster: the <code>08-mesh-trust.md</code> signed inventory; narrative doc retired 2026-07-23, git history) and runs <code>cosmix-noded</code>.</td></tr>
+<tr><td><strong>package</strong></td><td>A versioned NS 4.0 tarball (<code>cosmix-base</code>, <code>cosmix-indexd</code>) plus its embedded installer.</td></tr>
+<tr><td><strong>package set</strong></td><td>The collection of packages installed on a node: always <code>cosmix-base</code>, optionally <code>cosmix-indexd</code>.</td></tr>
+<tr><td><strong>tarball</strong></td><td>The on-the-wire artifact (<code>cosmix-&lt;package&gt;-&lt;version&gt;-&lt;arch&gt;.tar.zst</code>) shipped to a host, plus its detached integrity envelope (§3.4).</td></tr>
+<tr><td><strong>installer</strong></td><td>The Mix script <code>ns4-install.mix</code> (§6) that drives §5's procedure on the host.</td></tr>
+<tr><td><strong>sysadm</strong></td><td>The administrative human user, UID 1000, NS 3.0 convention, configured by the operator before NS 4.0 runs.</td></tr>
+<tr><td><strong>base package</strong></td><td><code>cosmix-base</code> — <code>cosmix-noded</code> + <code>cosmix-maild</code> + <code>cosmix-webd</code> + Mix runtime + canonical fragments (§2.1).</td></tr>
+<tr><td><strong>knowledge add-on</strong></td><td><code>cosmix-indexd</code> — optional vector / knowledge index daemon, separate package (§2.2).</td></tr>
+<tr><td><strong>roles</strong></td><td>The set of cosmix-* daemons enabled on a node. NS 4.0 v1.0.0 defines two role packs: <code>mesh-citizen</code> (base) and <code>knowledge</code> (base + indexd).</td></tr>
+<tr><td><strong>operator</strong></td><td>The human (or agent) running the installer, addressing the host as sysadm.</td></tr>
+</tbody></table>
+<h3 id="15-why-ns-40-relative-to-ns-30">1.5 Why NS 4.0 (relative to NS 3.0)</h3>
+<p>NS 3.0 was a daily-driver provisioning convention: it bootstrapped a
+COSMIC desktop inside an Alpine container with a sysadm operator and
+a <code>cosmix</code> desktop user, and it allocated UID 1001+ for vhost users.
+That convention is still authoritative for the desktop and vhost
+planes (<code>historical daily-driver setup guide (2026-03-24)</code>, deferred to a future
+NetServa-vhost SPEC).</p>
+<p>NS 4.0 covers a different surface: how a Cosmix substrate daemon set
+lands on a server-class Debian 13 host as a <em>mesh citizen</em>, with
+SPEC 10's identity contract enforced at install time. The two
+conventions coexist on a single host: sysadm UID 1000 from NS 3.0,
+substrate daemons UID 500–507 from SPEC 10 / NS 4.0, vhost users UID
+≥ 1001 from NS 3.0. NS 4.0 does not replace NS 3.0 — it slots the
+substrate plane into the same overall numbering scheme.</p>
+<hr />
+<h2 id="2-package-set">2. Package Set</h2>
+<p>NS 4.0 v1.0.0 defines two packages. A node's role determines which
+packages are installed.</p>
+<h3 id="21-cosmix-base-required">2.1 <code>cosmix-base</code> (REQUIRED)</h3>
+<p>The base mesh-citizen package. Every NS 4.0 mesh node SHALL install
+<code>cosmix-base</code>. It contains:</p>
+<table><thead><tr><th>Component</th><th>Path on disk</th><th>Source / SPEC reference</th></tr></thead><tbody>
+<tr><td><code>cosmix-noded</code> binary</td><td><code>/opt/cosmix/bin/cosmix-noded</code></td><td>SPEC 10 UID 500, ABP service <code>noded</code></td></tr>
+<tr><td><code>cosmix-maild</code> binary</td><td><code>/opt/cosmix/bin/cosmix-maild</code></td><td>SPEC 10 UID 501</td></tr>
+<tr><td><code>cosmix-webd</code> binary</td><td><code>/opt/cosmix/bin/cosmix-webd</code></td><td>SPEC 10 UID 502</td></tr>
+<tr><td><code>mix</code> binary</td><td><code>/opt/cosmix/bin/mix</code></td><td>Mix runtime — required by the installer and by every cosmix-* daemon's lifecycle hooks</td></tr>
+<tr><td>sysusers fragment</td><td><code>/usr/lib/sysusers.d/cosmix.conf</code></td><td>SPEC 10 §4, Appendix A — generated from canonical Markdown</td></tr>
+<tr><td>tmpfiles fragment</td><td><code>/usr/lib/tmpfiles.d/cosmix.conf</code></td><td>SPEC 10 §3.3 — secret-config directories only</td></tr>
+<tr><td>systemd units</td><td><code>/usr/lib/systemd/system/cosmix-{noded,maild,webd}.service</code></td><td>SPEC 10 §5, §9.2 — Level 2 declared</td></tr>
+<tr><td>host snippet</td><td><code>/usr/share/cosmix/etc/hosts-snippet.txt</code></td><td>Mesh <code>/etc/hosts</code> block, operator-applied</td></tr>
+<tr><td>installer script</td><td><code>/usr/share/cosmix/install/ns4-install.mix</code></td><td>§6 — the canonical Mix installer</td></tr>
+<tr><td>audit scripts</td><td><code>/usr/share/cosmix/install/spec10_{preflight,postcheck,audit}.{mix,sh}</code></td><td>SPEC 10 §6.1–§6.3 verification phases</td></tr>
+<tr><td>LICENSE + README</td><td><code>/usr/share/cosmix/LICENSE</code>, <code>/usr/share/cosmix/README.md</code></td><td>Provenance and orientation</td></tr>
+</tbody></table>
+<p>The base package SHALL NOT include any cosmix-* binary outside the
+three named here. SPEC 10 registers <code>cosmix-agentd</code>, <code>cosmix-mcp</code>,
+and <code>cosmix-cron</code> (UIDs 504, 505, 507) but their binaries
+are not in scope for NS 4.0 v1.0.0; future amendments will add them
+as the daemons mature, either as members of <code>cosmix-base</code> or as
+separate add-ons.</p>
+<p><strong>Pending materialisation.</strong> As of v1.0.0-rc.1, the source tree
+contains canonical units only for <code>cosmix-noded.service</code> and
+<code>cosmix-maild.service</code> (<code>deployment-config/systemd/</code>); the <code>cosmix-webd</code>
+binary and <code>cosmix-webd.service</code> unit are normatively in scope for
+this SPEC but not yet committed. A <code>cosmix-base</code> v1.0.0 build
+artifact SHALL NOT be cut until the webd unit and binary land in
+the source tree and pass the §11 CI lints (the SPEC frontmatter
+also bumps from <code>1.0.0-rc.N</code> to <code>1.0.0</code> at that point per
+Appendix D). The first NS 4.0 deployment that ships only
+noded+maild SHALL be tagged as a v0.x preview release, not as
+v1.0.0 conformant.</p>
+<h3 id="22-cosmix-indexd-optional">2.2 <code>cosmix-indexd</code> (OPTIONAL)</h3>
+<p>The knowledge tier add-on. Mesh nodes designated as knowledge-bearing
+SHALL install <code>cosmix-indexd</code> <em>in addition to</em> <code>cosmix-base</code>. It
+contains:</p>
+<table><thead><tr><th>Component</th><th>Path on disk</th><th>Source / SPEC reference</th></tr></thead><tbody>
+<tr><td><code>cosmix-indexd</code> binary</td><td><code>/opt/cosmix/bin/cosmix-indexd</code></td><td>SPEC 10 UID 503</td></tr>
+<tr><td>systemd unit</td><td><code>/usr/lib/systemd/system/cosmix-indexd.service</code></td><td>SPEC 10 §5, Level 2 declared</td></tr>
+<tr><td>Per-daemon read-only data (e.g. embedding model assets)</td><td><code>/usr/share/cosmix/indexd/</code></td><td>Daemon-specific</td></tr>
+</tbody></table>
+<p><code>cosmix-indexd</code> is a strict add-on: it depends on <code>cosmix-base</code>'s
+sysusers fragment and on <code>cosmix-noded</code> being up at start time
+(SPEC 10 §5.4). The installer SHALL refuse to install
+<code>cosmix-indexd</code> on a host where <code>cosmix-base</code> is <strong>not installed
+and is not being installed in the same run</strong>. The single-invocation
+<code>--role knowledge</code> form (§6.2) installs base then indexd in one
+run and satisfies the dependency by ordering, not by pre-existence.</p>
+<h3 id="23-non-packaged-components">2.3 Non-packaged components</h3>
+<p>NS 4.0 v1.0.0 does <strong>not</strong> package:</p>
+<ul>
+<li><code>cosmix-agentd</code>, <code>cosmix-mcp</code>, <code>cosmix-cron</code> —
+registered in SPEC 10 but not yet shipped as mesh-node services.</li>
+<li><code>cosmix-comp</code>, CTK, and native desktop applications — session-scoped or
+workspace-only; covered by NS 3.0 daily-driver conventions where
+applicable.</li>
+<li>The Cosmix source tree, build toolchain, private operational documents, specifications,
+and journals — the source of truth lives in the workspace, not on
+mesh nodes.</li>
+<li>A cargo or rustup toolchain — mesh nodes consume binaries; they
+do not build.</li>
+</ul>
+<p>A future amendment SHALL extend §2.1 / §2.2 / §2.3 as additional
+daemons mature and need a packaged form.</p>
+<h3 id="24-role-packs">2.4 Role packs</h3>
+<p>NS 4.0 v1.0.0 defines two role packs. A node's role determines which
+packages are installed.</p>
+<table><thead><tr><th>Role pack</th><th>Packages</th><th>Typical mesh node</th></tr></thead><tbody>
+<tr><td><code>mesh-citizen</code></td><td><code>cosmix-base</code></td><td>Default for every NS 4.0 mesh node. Provides per-node broker + mail + web.</td></tr>
+<tr><td><code>knowledge</code></td><td><code>cosmix-base</code> + <code>cosmix-indexd</code></td><td>A node designated as a knowledge-tier participant per the planned distributed-indexd architecture.</td></tr>
+</tbody></table>
+<p>Role packs are an installer convenience, not a distinct artifact.
+The installer takes a <code>--role &lt;pack&gt;</code> argument (§6.2) and installs
+the corresponding tarballs.</p>
+<hr />
+<h2 id="3-tarball">3. Tarball</h2>
+<h3 id="31-naming">3.1 Naming</h3>
+<p>A tarball SHALL be named:</p>
+<pre><code>cosmix-&lt;package&gt;-&lt;version&gt;-&lt;arch&gt;.tar.zst
+</code></pre>
+<p>Where:</p>
+<ul>
+<li><code>&lt;package&gt;</code> is one of <code>base</code>, <code>indexd</code> (matching §2 minus the
+<code>cosmix-</code> prefix).</li>
+<li><code>&lt;version&gt;</code> is the package's semver (e.g. <code>1.0.0</code>,
+<code>1.2.3-rc1+gabcdef0</code>). The version SHALL match the embedded
+<code>MANIFEST</code> (§3.3).</li>
+<li><code>&lt;arch&gt;</code> is the Debian architecture identifier — <code>amd64</code>,
+<code>arm64</code>. NS 4.0 v1.0.0 ships <code>amd64</code> only; <code>arm64</code> is a
+pre-commitment and SHALL be added by amendment when a build is
+produced.</li>
+</ul>
+<p>The compression format SHALL be zstd. Other formats (gzip, xz) MAY
+be added by amendment but are not normative at v1.0.0.</p>
+<h3 id="32-on-disk-layout">3.2 On-disk layout</h3>
+<p>A tarball SHALL extract to a single top-level directory matching
+its base name (without <code>.tar.zst</code>). The internal layout SHALL mirror
+the install paths defined in §2:</p>
+<pre><code>cosmix-base-1.0.0-amd64/
+├── MANIFEST
+├── usr/
+│   ├── local/
+│   │   └── bin/
+│   │       ├── cosmix-noded
+│   │       ├── cosmix-maild
+│   │       ├── cosmix-webd
+│   │       └── mix
+│   ├── lib/
+│   │   ├── sysusers.d/
+│   │   │   └── cosmix.conf
+│   │   ├── tmpfiles.d/
+│   │   │   └── cosmix.conf
+│   │   └── systemd/
+│   │       └── system/
+│   │           ├── cosmix-noded.service
+│   │           ├── cosmix-maild.service
+│   │           └── cosmix-webd.service
+│   └── share/
+│       └── cosmix/
+│           ├── LICENSE
+│           ├── README.md
+│           ├── etc/
+│           │   └── hosts-snippet.txt
+│           └── install/
+│               ├── ns4-install.mix
+│               ├── spec10_preflight.mix
+│               ├── spec10_postcheck.mix
+│               └── spec10_audit.sh
+</code></pre>
+<p><code>cosmix-indexd</code> follows the same structure with only the binary,
+unit, and per-daemon assets it owns.</p>
+<p>The installer (§6) SHALL refuse a tarball whose top-level layout
+does not match this shape exactly. Loose or extra files SHALL cause
+fail-closed.</p>
+<h3 id="33-manifest">3.3 MANIFEST</h3>
+<p>Every tarball SHALL contain a top-level <code>MANIFEST</code> file. The
+MANIFEST is the canonical inventory of the tarball; the installer
+verifies the tarball against it before any file is moved into a
+live path.</p>
+<p>The MANIFEST SHALL be a UTF-8 text file with the following
+frontmatter-and-body shape (matching the ABP spec convention so a
+MANIFEST is a valid ABP message body):</p>
+<pre><code>---
+package: cosmix-base
+version: 1.0.0
+arch: amd64
+target_distro: debian-13
+target_glibc_max: 2.41
+spec10_registry_version: 1.0.0
+spec11_version: 1.0.0-rc.1
+build_date: 2026-05-09T08:00:00Z
+build_host_id: &lt;opaque&gt;
+---
+# files: &lt;relative path&gt; &lt;mode&gt; &lt;sha256&gt;
+usr/local/bin/cosmix-noded 0755 &lt;hex&gt;
+usr/local/bin/cosmix-maild 0755 &lt;hex&gt;
+usr/local/bin/cosmix-webd  0755 &lt;hex&gt;
+usr/local/bin/mix          0755 &lt;hex&gt;
+usr/lib/sysusers.d/cosmix.conf 0644 &lt;hex&gt;
+usr/lib/tmpfiles.d/cosmix.conf 0644 &lt;hex&gt;
+usr/lib/systemd/system/cosmix-noded.service 0644 &lt;hex&gt;
+...
+</code></pre>
+<p>Required frontmatter fields:</p>
+<ul>
+<li><code>package</code> — <code>cosmix-base</code> or <code>cosmix-indexd</code>.</li>
+<li><code>version</code> — semver string matching the tarball name.</li>
+<li><code>arch</code> — Debian architecture matching the tarball name.</li>
+<li><code>target_distro</code> — <code>debian-13</code> for v1.0.0. Other values SHALL be
+rejected by the installer at v1.0.0.</li>
+<li><code>target_glibc_max</code> — the <strong>highest</strong> GLIBC symbol version any
+binary in the tarball links against. The installer compares this
+against the host's <code>ldd --version</code> output and fails closed on
+insufficient host glibc (§4.3, §5.1, and the
+<code>feedback_glibc_skew_local_to_container</code> memory).</li>
+<li><code>spec10_registry_version</code> — the SPEC 10 Appendix A registry
+version against which the embedded sysusers fragment was
+generated. The installer cross-checks this against the on-host
+sysusers fragment, if any (§5.5).</li>
+<li><code>spec11_version</code> — this SPEC's version. Read by the installer
+for compatibility decisions.</li>
+<li><code>build_date</code> — RFC 3339 UTC.</li>
+<li><code>build_host_id</code> — opaque identifier of the build host (build
+reproducibility metadata).</li>
+</ul>
+<p>The body SHALL list every file in the tarball, one per line, in
+the form <code>&lt;relpath&gt; &lt;octal-mode&gt; &lt;sha256-hex&gt;</code>. The installer
+SHALL verify each file's mode and digest before any file is
+extracted into a live path.</p>
+<p>The MANIFEST SHALL NOT list itself.</p>
+<h3 id="34-integrity-envelope">3.4 Integrity envelope</h3>
+<p>Each tarball SHALL be accompanied by a detached integrity envelope:</p>
+<pre><code>cosmix-&lt;package&gt;-&lt;version&gt;-&lt;arch&gt;.tar.zst
+cosmix-&lt;package&gt;-&lt;version&gt;-&lt;arch&gt;.tar.zst.sig
+</code></pre>
+<p>The envelope SHALL be a minisign signature (Ed25519, the format used
+by <code>minisign</code> / <code>rsign2</code>). The signing key is operator-managed and
+distributed out of band; key management is out of scope for this
+SPEC.</p>
+<h4 id="341-bootstrap-trust-path">3.4.1 Bootstrap trust path</h4>
+<p>The bootstrap chicken-and-egg — the in-tarball Mix installer
+cannot itself be the trust root for the tarball it ships in —
+SHALL be resolved by the operator's host-side toolchain, not by
+the in-tarball installer:</p>
+<ol>
+<li><strong>Envelope verification (host-trusted).</strong> The operator SHALL
+verify <code>cosmix-&lt;package&gt;-&lt;version&gt;-&lt;arch&gt;.tar.zst.sig</code> against
+their pinned operator public key using a host-installed
+<code>minisign</code> (or <code>rsign2</code>) binary that came from the host's
+distribution package manager — i.e. <strong>not</strong> from the tarball
+being verified. On Debian 13 the canonical install is
+<code>apt-get install minisign</code>. The operator's pinned public key
+SHALL be stored at a host path the operator controls
+(typically <code>/etc/cosmix/keys/release.pub</code>) and SHALL exist
+before the tarball arrives on the host.</li>
+<li><strong>Extract under a quarantine path.</strong> Extraction occurs at
+Phase 1 (§5.2) under <code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code>
+(a root-owned <code>0700</code> directory, self-bootstrapped by the
+installer per §5.2 2a; the parent <code>/var/lib/cosmix/.staging</code>
+is created if absent). The path is private to the install
+and outside any path on the default <code>PATH</code>. Operators MAY
+override via <code>--staging-dir &lt;path&gt;</code>.</li>
+<li><strong>Per-file digest verification.</strong> The installer (now executing
+from the just-extracted tarball) re-verifies every file
+listed in the MANIFEST against its sha256, before any file
+is promoted to a live path. This is defence-in-depth — the
+envelope already proves the tarball was produced by the
+operator's signing key; per-file digest verification catches
+in-flight or on-disk corruption between envelope check and
+promotion.</li>
+<li><strong>No file promotion before all verifications pass.</strong> Phases
+3+ (sysusers, tmpfiles, binaries, units) SHALL NOT promote
+any file out of the quarantine path until both the envelope
+and every MANIFEST digest have verified clean.</li>
+</ol>
+<p>Re-runs of the installer on an already-installed host MAY use
+the previously installed <code>/opt/cosmix/bin/mix</code>, but the envelope
+verification and per-file digest verification SHALL still happen
+against the freshly delivered tarball — the trust chain restarts
+on every install.</p>
+<p>A future amendment MAY add transparency-log or reproducible-build
+attestation; v1.0.0 requires only the host-trusted minisign
+envelope plus the in-tarball MANIFEST and per-file digest
+verification.</p>
+<h3 id="35-versioning">3.5 Versioning</h3>
+<p>Package versions are independent semver strings. <code>cosmix-base</code> and
+<code>cosmix-indexd</code> MAY ship at different versions; the installer
+SHALL accept any combination where:</p>
+<ul>
+<li>Both packages' <code>spec10_registry_version</code> match the host's
+installed sysusers fragment (or, if none yet installed,
+match each other).</li>
+<li><code>cosmix-indexd.MANIFEST.spec11_version &lt;= cosmix-base.MANIFEST.spec11_version</code> (the base package's NS 4.0
+level is the floor for the host).</li>
+</ul>
+<p>Across major NS 4.0 versions (e.g. 2.0.0), a forward amendment
+SHALL define the upgrade path.</p>
+<hr />
+<h2 id="4-host-preconditions">4. Host Preconditions</h2>
+<p>NS 4.0 makes specific assumptions about the Debian 13 host. The
+installer SHALL verify each precondition before any state is
+mutated. Failures are fail-closed (no auto-fix, no silent fallback).</p>
+<p>Preconditions split into two groups by phase:</p>
+<ul>
+<li><strong>Host-intrinsic</strong> (§4.1, §4.2, §4.6, §4.7, §4.8) — verified at
+Phase 0 (§5.1), before the tarball is touched. These checks need
+no MANIFEST and no extracted artifact.</li>
+<li><strong>MANIFEST-derived</strong> (§4.3, §4.4, §4.5) — verified at Phase 1
+(§5.2), after the tarball envelope (§3.4) and per-file digests
+(§3.3) have been verified. These checks compare host facts
+against fields or artifacts inside the verified tarball.</li>
+</ul>
+<p>The split exists because the MANIFEST and the in-tarball snippets
+are not trusted until envelope verification has succeeded. Reading
+them at Phase 0 would mean trusting unverified data; the installer
+SHALL NOT do this.</p>
+<h3 id="41-distribution-and-kernel">4.1 Distribution and kernel</h3>
+<table><thead><tr><th>Property</th><th>Required value</th><th>Verification</th></tr></thead><tbody>
+<tr><td>Distribution ID (<code>/etc/os-release</code> <code>ID=</code>)</td><td><code>debian</code></td><td><code>grep</code> on <code>/etc/os-release</code></td></tr>
+<tr><td>Distribution version (<code>VERSION_ID=</code>)</td><td><code>13</code></td><td>Same</td></tr>
+<tr><td>Kernel</td><td>Linux 6.x (Debian 13's Trixie kernel or backport)</td><td><code>uname -r</code></td></tr>
+<tr><td>systemd</td><td>≥ 256 (Debian 13 default)</td><td><code>systemctl --version</code></td></tr>
+<tr><td>Architecture</td><td>matches tarball <code>arch</code></td><td><code>dpkg --print-architecture</code></td></tr>
+</tbody></table>
+<p>Ubuntu, Alpine, and other distributions are NOT supported
+targets at v1.0.0. The installer SHALL refuse to run on a host
+whose <code>/etc/os-release</code> does not match.</p>
+<h3 id="42-systemd-availability">4.2 systemd availability</h3>
+<p>The host SHALL be running systemd as PID 1, with the following
+facilities available:</p>
+<ul>
+<li><code>systemd-sysusers</code> — for SPEC 10 §4 sysusers application.</li>
+<li><code>systemd-tmpfiles</code> — for SPEC 10 §3.3 secret-config and other
+fragments.</li>
+<li><code>systemctl daemon-reload</code>, <code>systemctl enable</code>, <code>systemctl start</code>.</li>
+</ul>
+<p>Containers without systemd as PID 1 (e.g. minimal Alpine CTs) are
+NOT supported. The installer SHALL detect <code>init</code> as PID 1 and
+refuse if it is not <code>systemd</code>.</p>
+<h3 id="43-glibc-compatibility-manifest-derived-phase-1">4.3 glibc compatibility (MANIFEST-derived, Phase 1)</h3>
+<p>Per the <code>feedback_glibc_skew_local_to_container</code> memory: binaries
+compiled on a host with a newer glibc cannot run on a host with an
+older glibc. NS 4.0 v1.0.0 binaries are built on Debian 13
+(glibc 2.41). The installer SHALL verify, <strong>at Phase 1 after
+MANIFEST validation</strong>:</p>
+<pre><code>host_glibc &gt;= MANIFEST.target_glibc_max
+</code></pre>
+<p>A host with older glibc SHALL fail-closed with a message
+recommending either rebuilding the tarball on a host of equal or
+older glibc, or upgrading the target host. The installer SHALL
+NOT attempt static-fallback or LD_LIBRARY_PATH workarounds.</p>
+<p>This check is intentionally not at Phase 0: <code>target_glibc_max</code>
+lives in the in-tarball MANIFEST and SHALL NOT be consulted before
+the envelope (§3.4) and per-file digests (§3.3) have been verified.</p>
+<h3 id="44-bind-policy-and-edge-node-opt-in">4.4 Bind policy and edge-node opt-in</h3>
+<p>NS 4.0 defines a <strong>layered bind policy</strong> for cosmix-* daemons.
+Every daemon's listen sockets follow the same default-and-opt-in
+shape; the older <code>feedback_wg_only_binding</code> memory's blanket "WG
+only, never 0.0.0.0" claim is superseded by this section, which is
+the new substrate-of-record.</p>
+<h4 id="441-default-bind">4.4.1 Default bind</h4>
+<p>A cosmix-* daemon's default listen address selection SHALL be:</p>
+<ol>
+<li>If a WireGuard interface is present and holds a mesh-/24
+address, bind that address only.</li>
+<li>Otherwise, bind loopback (<code>127.0.0.1</code> and <code>::1</code>) only.</li>
+</ol>
+<p>A daemon SHALL NEVER bind <code>0.0.0.0</code> or <code>::</code> by default. The two
+default cases above are the only legitimate fall-through paths.</p>
+<h4 id="442-edge-node-opt-in">4.4.2 Edge-node opt-in</h4>
+<p>Within a single mesh, <strong>at most one node</strong> MAY be designated the
+<strong>edge node</strong>. The edge node MAY additionally bind the host's
+primary external IPv4 and IPv6 addresses, on a per-port allowlist,
+to serve as the single ingress point for both:</p>
+<ul>
+<li>general internet ingress (incoming SMTP on 25, HTTPS on 443,
+optionally SSH on 22), and</li>
+<li>cross-mesh ingress from peer meshes that route to this node by
+public address rather than over WireGuard.</li>
+</ul>
+<p>The conventional edge-port allowlist is <code>{22, 25, 443, 465, 8443}</code>
+— matching the example-node deployment journal (§12.3 example). The
+allowlist is a per-node configuration value, not a mesh-wide
+constant; an edge node MAY enable a strict subset.</p>
+<p>Edge-node designation SHALL be:</p>
+<ul>
+<li>An explicit per-host configuration value: <code>edge_node = true</code>
+plus <code>edge_ports = [...]</code> in <code>/etc/cosmix/site.toml</code> (§5.9).
+Per-daemon configs that bind public ports SHALL each bind a
+port that appears in <code>site.toml.edge_ports</code>.</li>
+<li>Verified by the installer at Phase 8 (§5.9): if any daemon's
+config binds a public address, <code>site.toml.edge_node</code> SHALL be
+<code>true</code> and every bound public port SHALL appear in
+<code>site.toml.edge_ports</code>. Otherwise the install fails-closed.</li>
+</ul>
+<p>Mesh inventory (the <code>08-mesh-trust.md</code> signed inventory; the old narrative doc was retired 2026-07-23, git history) is
+<em>operator references</em>, not a trusted on-host input — they live
+in the documentation tree and are not part of the installed
+footprint per §2.3. Authoritative on-host edge-node state lives
+in <code>site.toml</code>.</p>
+<p>Mesh-wide invariants — that <strong>at most one</strong> node holds edge-node
+status per mesh — are not directly enforceable by a single-host
+installer and are tracked as a substrate-self-aware concern
+(SPEC 07). The single-host installer SHALL NOT silently allow
+two edges, but cannot itself prove a peer is not also edge.</p>
+<h4 id="443-verifications-at-phase-1">4.4.3 Verifications at Phase 1</h4>
+<p>The installer SHALL verify, after MANIFEST-derived staging:</p>
+<ol>
+<li>A WireGuard interface exists, OR the operator passed the
+explicit <code>--allow-loopback-only</code> flag (§6.2). Default behaviour
+without that flag is to fail-closed when WG is absent.</li>
+<li>When WG is present, the interface holds an address inside the
+<code>mesh_cidr</code> declared in <code>/etc/cosmix/site.toml</code> (§5.9). NS 4.0
+does not consult any in-tree document or out-of-band inventory
+for this check; the <code>site.toml</code> value is the authoritative
+declaration on the host. Mismatch between the live WG address
+and <code>mesh_cidr</code> is a fail-closed condition.</li>
+<li>Edge-node designation is internally consistent: if any daemon
+config asserts <code>edge_node = true</code>, the host's
+<code>/etc/cosmix/site.toml</code> SHALL also assert <code>edge_node = true</code>,
+and the bound public ports SHALL all be in the §4.4.2
+allowlist <code>{22, 25, 443, 465, 8443}</code>. The installer does NOT
+enforce mesh-wide single-edge uniqueness; that is an operator
+policy concern (§4.4.2).</li>
+</ol>
+<p>The mesh inventory and WG configuration are out of scope for NS
+4.0 — they are assumed to have been provisioned before the
+installer runs (typically by a separate operator step or by the
+host's cloud-init / systemd-nspawn profile). NS 4.0 verifies presence and
+internal consistency on the <em>single host</em> it is running on, using
+only host-local trusted inputs (<code>site.toml</code> + live network state);
+it does not consult private operational documents, which is a documentation tree and not
+part of the installed footprint per §2.3.</p>
+<h3 id="45-etchosts-mesh-block">4.5 <code>/etc/hosts</code> mesh block</h3>
+<p>The host SHOULD carry the canonical mesh <code>/etc/hosts</code> block. The
+canonical text lives at <code>deployment-config/hosts-snippet.txt</code> in the source
+tree and is bundled into the tarball at
+<code>usr/share/cosmix/etc/hosts-snippet.txt</code>. The installer SHALL
+diff the live <code>/etc/hosts</code> against the staged-from-tarball copy
+<strong>at Phase 1</strong>, after the tarball has been verified, and SHALL
+warn (not fail) if they disagree — the operator may have
+intentional local overrides.</p>
+<p>This check is informational. It SHALL NOT gate any later phase.</p>
+<h3 id="46-sysadm-operator-account">4.6 sysadm operator account</h3>
+<p>The installer SHALL run as a non-root user in the <code>sudo</code> group, or
+as <code>root</code> directly. The expected operator identity is <code>sysadm</code>
+(NS 3.0 convention, UID 1000, in the <code>sudo</code> or <code>wheel</code> group). If
+the operator is not <code>sysadm</code>, the installer SHALL emit a warning
+but proceed; NS 4.0 does not pin the administrative UID.</p>
+<p>The installer SHALL NOT run as a <code>cosmix-*</code> registry user. SPEC 10
+fail-closed semantics require that registry users be created by
+sysusers, not by the installer running as one of them.</p>
+<h3 id="47-storage-and-filesystem">4.7 Storage and filesystem</h3>
+<table><thead><tr><th>Property</th><th>Required</th><th>Verification</th></tr></thead><tbody>
+<tr><td>Root filesystem writable</td><td>yes</td><td><code>test -w /</code></td></tr>
+<tr><td><code>/opt</code> exists, writable by root</td><td>yes</td><td><code>test -d /opt &amp;&amp; test -w /opt</code></td></tr>
+<tr><td><code>/var/lib</code> exists, writable by root</td><td>yes</td><td><code>test -d /var/lib</code></td></tr>
+<tr><td>Free space on <code>/var</code></td><td>≥ 256 MiB</td><td><code>df</code></td></tr>
+<tr><td><code>/var/lib/cosmix/</code> does not exist OR is owned by <code>root:root 0755</code></td><td>yes</td><td><code>stat</code></td></tr>
+</tbody></table>
+<p>A pre-existing <code>/var/lib/cosmix/</code> not owned <code>root:root 0755</code>
+SHALL fail-closed; the installer SHALL NOT chown the parent tree
+to satisfy the SPEC.</p>
+<h3 id="48-no-conflicting-cosmix-install">4.8 No conflicting Cosmix install</h3>
+<p>Before running, the installer SHALL detect any pre-existing
+Cosmix install:</p>
+<ul>
+<li>Any binary at <code>/opt/cosmix/bin/cosmix-*</code> not matching the
+MANIFEST's expected version is treated as an upgrade or
+conflict (§7).</li>
+<li>Any sysusers fragment at <code>/usr/lib/sysusers.d/cosmix.conf</code> is
+compared against the tarball's. Disagreement on a non-tombstoned
+entry is a fail-closed condition until reconciled.</li>
+<li>An older or pre-NS-4.0 hand-installed configuration (e.g. the
+pre-SPEC-10 <code>cosmix-jmap</code> paths from the example-node deployment
+history) SHALL be flagged for operator migration, not
+auto-migrated.</li>
+</ul>
+<hr />
+<h2 id="5-installation-procedure">5. Installation Procedure</h2>
+<p>NS 4.0's install procedure drives SPEC 10 §6's three verification
+phases through to a running, registered node. The procedure is
+defined as a strictly ordered sequence; the installer (§6) is the
+canonical implementation.</p>
+<p>The procedure is <strong>idempotent</strong>: re-running it on a correctly
+installed node SHALL be a no-op and SHALL exit zero. This is the
+property <code>spec10_audit.sh</code> and the CI lint depend on.</p>
+<h3 id="51-phase-0--host-intrinsic-preconditions">5.1 Phase 0 — host-intrinsic preconditions</h3>
+<p>Run only the <strong>host-intrinsic</strong> preconditions: §4.1 (distro and
+kernel), §4.2 (systemd availability), §4.6 (sysadm operator
+identity), §4.7 (storage and filesystem), §4.8 (no conflicting
+Cosmix install). Fail-closed on any failure. Phase 0 SHALL NOT
+mutate any host state and SHALL NOT consult MANIFEST or any
+in-tarball artifact.</p>
+<p>Required output: a structured precondition report logged to
+journald with <code>cosmix.spec=11 cosmix.spec.version=&lt;spec11-version&gt; cosmix.phase=preconditions cosmix.result=ok|fail</code>, where
+<code>&lt;spec11-version&gt;</code> is the <code>spec11_version</code> field from this SPEC's
+frontmatter at build time (currently <code>1.0.0-rc.1</code>; matches L12).</p>
+<h3 id="52-phase-1--stage-and-manifest-derived-verification">5.2 Phase 1 — stage and MANIFEST-derived verification</h3>
+<p>Phase 1 establishes the trust chain and runs the
+<strong>MANIFEST-derived</strong> preconditions (§4.3, §4.4, §4.5):</p>
+<ol>
+<li>
+<p>Verify the tarball envelope per §3.4.1 step 1 — using a
+host-installed <code>minisign</code>, <strong>not</strong> any binary from the
+tarball. (When invoked via the §12.1 bootstrap sequence the
+operator has already run this step manually; the installer
+re-runs it as defence-in-depth.)</p>
+</li>
+<li>
+<p>Determine and <strong>claim</strong> the staging directory. Throughout
+this SPEC the metavariable <code>&lt;staging&gt;</code> refers to this
+directory — either the default
+<code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code> or, when
+the operator passes <code>--staging-dir &lt;path&gt;</code> (§6.2), that
+path. Every later use of <code>&lt;staging&gt;</code> (in §5.4–5.8 promote
+examples, §6.3 cleanup, §7.3 abort recovery, §12 worked
+examples) resolves to the directory claimed here. The
+trust model is single-principal: only <code>root</code> may write to
+the staging tree at any time, enforced by mode <code>0700</code>
+ownership <code>0:0</code> on the directory itself. All later phases
+trust files read from this tree; defending against a
+root-side attacker is out of scope for this SPEC (a root
+attacker has already won by the time the installer runs).</p>
+<p>2a. <em>Path selection.</em> If <code>--staging-dir &lt;path&gt;</code> was passed,
+use that path; otherwise default to
+<code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code>. The
+ancestor chain <code>/var/lib/cosmix/.staging/</code> is Phase-1
+self-bootstrapped: if <code>/var/lib/cosmix</code> does not exist,
+the installer SHALL <code>install -d -o 0 -g 0 -m 0755 /var/lib/cosmix</code> first; then if <code>/var/lib/cosmix/.staging</code>
+does not exist, the installer SHALL <code>install -d -o 0 -g 0 -m 0700 /var/lib/cosmix/.staging</code>. Both ancestor creations
+precede claiming the per-package staging directory.
+The §5.6 tmpfiles fragment is NOT a precondition for Phase 1
+staging (it cannot be — tmpfiles is promoted by Phase 5,
+which runs after Phase 1). <code>/tmp/...</code> defaults are not
+chosen because stock-Debian <code>/tmp</code> is sticky world-writable
+and protecting a child against pre-mkdir injection there is
+racier than picking a root-only parent.</p>
+<p>2b. <em>Two extraction cases.</em></p>
+<ul>
+<li><strong>Installer-extracts (the §6.2 already-installed form):</strong>
+the installer SHALL <code>mkdir(&lt;staging&gt;, 0700)</code> as root, with
+<code>mkdir</code>'s atomic "fails if exists" semantics — fail-closed
+if <code>&lt;staging&gt;</code> already exists <em>unless</em> <code>--staging-dir</code>
+pointed at it (the operator-pre-extracted bootstrap case
+below). Then extract the tarball into <code>&lt;staging&gt;</code> with
+<code>tar --strip-components=1</code> so the tarball's single
+top-level directory (per §3.2) is collapsed away and
+<code>&lt;staging&gt;</code> is the immediate parent of <code>usr/</code>, <code>MANIFEST</code>,
+etc.</li>
+<li><strong>Operator-pre-extracts (the §6.2 bootstrap form):</strong> the
+operator's <code>mkdir</code> and <code>tar</code> calls SHALL run under <code>sudo</code>
+and SHALL be sequenced as <code>sudo install -d -o 0 -g 0 -m 0700 &lt;staging&gt;</code> immediately followed by <code>sudo tar --strip-components=1 -xf … -C &lt;staging&gt;</code>. The directory is
+therefore root-owned <code>0700</code> <em>before</em> any tarball content
+lands inside it. The installer SHALL verify on entry that
+<code>&lt;staging&gt;</code> is owned <code>0:0</code> mode <code>0700</code>; if not, fail-closed.</li>
+</ul>
+<p>The exec-mountpoint probe (writing and executing a <code>0700</code>
+test file inside <code>&lt;staging&gt;</code>) SHALL run <em>after</em> the staging
+directory exists and is claimed — i.e. after 2b in the
+installer-extracts case, or as the first action on entering
+the installer in the operator-pre-extracts case. In the
+bootstrap case the operator has already executed
+<code>&lt;staging&gt;/opt/cosmix/bin/mix</code>, which serves as a stronger
+pre-installer exec probe than the SPEC could mandate; the
+in-installer probe is therefore defence-in-depth there.</p>
+<p>2c. <em>Sanitize content.</em> After <code>&lt;staging&gt;</code> holds the
+collapsed (<code>--strip-components=1</code>) tarball contents and
+before digest verification (step 4), the installer SHALL
+walk the tree and reject as fail-closed any:</p>
+<ul>
+<li>setuid or setgid file,</li>
+<li>world-writable file or directory (a sanity check; the
+<code>0700</code> parent already prevents non-root traversal into
+the tree),</li>
+<li>symlink whose <code>realpath</code> resolves outside <code>&lt;staging&gt;</code>,</li>
+<li>hard-link whose target inode is outside <code>&lt;staging&gt;</code>,</li>
+<li>special file (block / char / FIFO / socket).</li>
+</ul>
+<p>The walk is one-pass and aborts on first hit.</p>
+<p>2d. <em>Path-based reads, root-only window.</em> All subsequent
+reads of staged files (digest verification in step 4, every
+promotion <code>install</code> call in phases 3–8) are path-based —
+the SPEC does not require <code>O_NOFOLLOW</code>/<code>fstat</code>-identity
+tracking at the Mix layer, and current Mix builtins
+(<code>read_file</code>, <code>hash_sha256</code>, <code>walk</code>, <code>run_rc("install …")</code>)
+are path-based. The path-based primitives are sufficient
+<em>given</em> the root-owned <code>0700</code> staging window: between 2c's
+walk and the last Phase-9 read, only <code>root</code> can mutate the
+tree, and a root-side attacker is already out of scope. A
+future amendment MAY tighten this to fd-relative ops if Mix
+gains the corresponding builtins; v1.0.0 does not depend on
+that.</p>
+<p>2e. <em>Failure semantics.</em> Any failure in 2a–2c SHALL
+fail-closed (exit 2) with an actionable diagnostic naming
+the offending path / mode / owner. The installer SHALL NOT
+silently fall back to a different path or relax any rule.</p>
+</li>
+<li>
+<p>Parse and validate the MANIFEST: required frontmatter fields
+present, <code>target_distro == debian-13</code>, <code>spec10_registry_version</code>
+matches the SPEC 10 Appendix A version this installer was
+built against.</p>
+</li>
+<li>
+<p>Verify every file in the tarball against its MANIFEST mode
+and sha256 entry.</p>
+</li>
+<li>
+<p>Run §4.3 glibc check (<code>host_glibc &gt;= MANIFEST.target_glibc_max</code>).</p>
+</li>
+<li>
+<p>Validate <code>/etc/cosmix/site.toml</code> exists, is owned <code>root:root 0644</code>, and parses as TOML with the §5.9 schema (the keys
+<code>mesh_cidr</code>, <code>edge_node</code>, <code>edge_ports</code> present and
+well-formed). This is read-only — the file is the operator's
+trusted on-host declaration of mesh membership and edge-node
+status. Phase 1 SHALL NOT touch the file.</p>
+</li>
+<li>
+<p>Run §4.4.3 bind-policy and edge-node consistency checks
+against the parsed <code>site.toml</code> from step 6 plus live network
+state.</p>
+</li>
+<li>
+<p>Run §4.5 <code>/etc/hosts</code> snippet diff (warn-only, never gates).</p>
+</li>
+</ol>
+<p>Phase 1 SHALL NOT touch any path under <code>/usr/</code>, <code>/etc/</code>,
+<code>/run/</code>, or <code>/usr/lib/systemd/</code>. The only permitted Phase-1
+writes under <code>/var/lib/</code> are the staging-tree ancestors and
+the staging tree itself: when any of <code>/var/lib/cosmix</code>,
+<code>/var/lib/cosmix/.staging</code>, or the per-package <code>&lt;staging&gt;</code>
+directory does not exist, the installer SHALL create the
+missing ancestor(s) with <code>install -d -o 0 -g 0 -m 0755</code> for
+<code>/var/lib/cosmix</code> and <code>install -d -o 0 -g 0 -m 0700</code> for
+<code>/var/lib/cosmix/.staging</code> and <code>&lt;staging&gt;</code> itself, in that
+order, per §5.2 2a–2b. The installer SHALL NOT touch any
+other path under <code>/var/lib/</code> during Phase 1. Step 2b's
+<code>chmod</code> and <code>chown</code> operate only inside the claimed staging
+tree. Any failure in steps 1–7 SHALL fail-closed (exit 2);
+step 8 SHALL warn but not gate.</p>
+<p>Step ordering is load-bearing:</p>
+<ul>
+<li>2 (claim staging) precedes 4 (per-file digest verify), so
+verification runs against an immutable-to-non-root tree.</li>
+<li>6 (site.toml parse) precedes 7 (bind-policy / edge-node check),
+so the bind check has a parsed <code>mesh_cidr</code> and <code>edge_*</code> fields
+to consult.</li>
+<li>Phase 8 (§5.9) re-uses the already-parsed <code>site.toml</code> to
+consistency-check daemon configs; it does NOT re-validate
+schema/ownership — that is Phase 1's responsibility.</li>
+</ul>
+<h3 id="53-phase-2--spec-10-61-install-preflight">5.3 Phase 2 — SPEC 10 §6.1 install preflight</h3>
+<p>Run <code>spec10_preflight.mix</code> (the canonical preflight script,
+matching SPEC 10 §6.1 pseudocode) against the staged sysusers
+fragment and the host's <code>getent passwd|group</code>. Fail-closed on
+any conflict.</p>
+<p>This phase is the gate before any registry mutation. The
+installer SHALL NOT proceed past phase 2 on any preflight
+warning that maps to a §6.1 fail-closed condition.</p>
+<h3 id="54-phase-3--promote-sysusers-fragment">5.4 Phase 3 — promote sysusers fragment</h3>
+<pre><code>sudo install -o 0 -g 0 -m 0644 \
+  &lt;staging&gt;/usr/lib/sysusers.d/cosmix.conf \
+  /usr/lib/sysusers.d/cosmix.conf
+sudo systemd-sysusers /usr/lib/sysusers.d/cosmix.conf
+</code></pre>
+<p>Phase 3 SHALL be atomic from the point of view of an interrupting
+operator: the fragment is installed, then sysusers is invoked,
+with no intervening state. Failure in either step rolls back the
+fragment to its previous state (or removes it if there was none)
+and fails-closed.</p>
+<h3 id="55-phase-4--spec-10-62-post-sysusers-verification">5.5 Phase 4 — SPEC 10 §6.2 post-sysusers verification</h3>
+<p>Run <code>spec10_postcheck.mix</code> (the canonical post-sysusers script,
+matching SPEC 10 §6.2). Verification is per-class, exactly as
+SPEC 10 §6.2 specifies:</p>
+<ul>
+<li><strong>Daemon-identity entries</strong> SHALL resolve to a user <em>and</em>
+same-numbered group with <code>uid == gid == registered UID</code> and
+<code>name == registered name</code>.</li>
+<li><strong>Shared-credential group entries</strong> SHALL resolve to a group
+with <code>gid == registered GID</code> and <code>name == registered name</code>,
+SHALL have <em>no</em> same-named user, and every declared <code>m &lt;user&gt; &lt;group&gt;</code> line SHALL be present in <code>getent group &lt;group&gt;</code>.</li>
+</ul>
+<p>Fail-closed on any mismatch. This phase is mandatory before any
+tmpfiles fragment is applied or any unit is enabled.</p>
+<h3 id="56-phase-5--promote-tmpfiles-fragment-when-present">5.6 Phase 5 — promote tmpfiles fragment (when present)</h3>
+<p>For packages that include secret-config directories or
+package-created roots (per SPEC 10 §3.3), promote the tmpfiles
+fragment and apply it:</p>
+<pre><code>sudo install -o 0 -g 0 -m 0644 \
+  &lt;staging&gt;/usr/lib/tmpfiles.d/cosmix.conf \
+  /usr/lib/tmpfiles.d/cosmix.conf
+sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/cosmix.conf
+</code></pre>
+<p>Phase 5 SHALL run <em>after</em> phases 3–4. SPEC 10 §3.3 requires that
+the cosmix-* groups exist with the correct GIDs before tmpfiles
+chowns secret-config directories.</p>
+<h3 id="57-phase-6--install-binaries">5.7 Phase 6 — install binaries</h3>
+<p>First, ensure the canonical binary directory exists (a fresh host has
+neither <code>/opt/cosmix/</code> nor <code>/opt/cosmix/bin/</code>):</p>
+<pre><code>sudo install -d -o 0 -g 0 -m 0755 /opt/cosmix/bin
+</code></pre>
+<p>Then for each binary in the MANIFEST:</p>
+<pre><code>sudo install -o 0 -g 0 -m 0755 \
+  &lt;staging&gt;/opt/cosmix/bin/&lt;binary&gt; \
+  /opt/cosmix/bin/&lt;binary&gt;
+</code></pre>
+<p>Per the <code>feedback_copy_release_binary</code> memory, the install command
+SHALL use <code>install -o 0 -g 0 -m 0755</code>, not <code>cp</code>. This guarantees
+ownership and mode regardless of the staging directory's umask.</p>
+<p>Binaries SHALL be installed into <code>/opt/cosmix/bin/</code> — the canonical
+install location for every cosmix daemon binary AND the <code>mix</code>
+interpreter, matching the global Mix-first / never-Python policy.</p>
+<h3 id="58-phase-7--install-systemd-units">5.8 Phase 7 — install systemd units</h3>
+<p>For each unit in the MANIFEST:</p>
+<pre><code>sudo install -o 0 -g 0 -m 0644 \
+  &lt;staging&gt;/usr/lib/systemd/system/&lt;unit&gt; \
+  /usr/lib/systemd/system/&lt;unit&gt;
+</code></pre>
+<p>Then:</p>
+<pre><code>sudo systemctl daemon-reload
+</code></pre>
+<p>Phase 7 SHALL NOT enable or start any unit. Activation is phase 9.</p>
+<h3 id="59-phase-8--install-per-host-configuration-operator-driven">5.9 Phase 8 — install per-host configuration (operator-driven)</h3>
+<p>NS 4.0 v1.0.0 does <strong>not</strong> ship per-host configuration. Per-host
+values (WG bind addresses, mail hostnames, TLS material) are
+operator-supplied and live under <code>/etc/cosmix/&lt;d&gt;/</code>. A single
+host-wide <code>/etc/cosmix/site.toml</code> declares mesh-membership facts
+that are not daemon-specific:</p>
+<pre><code class="language-toml"># /etc/cosmix/site.toml — operator-authored, root:root 0644
+mesh_cidr   = "192.0.2.0/24"
+edge_node   = false                    # true on the nominated edge
+edge_ports  = []                       # MUST be subset of {22, 25, 443, 465, 8443}
+</code></pre>
+<p>The installer SHALL (Phase 8; the <code>site.toml</code> schema/ownership check
+itself runs at Phase 1 step 6, §5.2 — Phase 8 takes that parse as
+input and consistency-checks it against the daemon configs):</p>
+<ol>
+<li>Verify <code>/etc/cosmix/&lt;d&gt;/config.toml</code> exists for each daemon in
+scope, owned <code>root:root 0644</code> for non-secret configs,
+<code>root:cosmix-&lt;d&gt; 0640</code> for configs containing secrets, or
+<code>root:cosmix-tls 0640</code> for TLS keypairs read by ≥2 daemons
+(per SPEC 10 §3.3 v1.1.0; public certificate material MAY remain
+<code>root:root 0644</code>). The shared-keypair pattern relies on the
+<code>cosmix-tls</code> group and its memberships being present on the host;
+that is satisfied automatically when this SPEC's Phase 3 promotes
+the canonical sysusers fragment (which carries the <code>g cosmix-tls</code>
+line plus the <code>m &lt;d&gt; cosmix-tls</code> lines per SPEC 10 v1.1.0
+Appendix A and §9.1).</li>
+<li>Refuse to proceed (fail-closed) if any required daemon config
+file is absent. The operator SHALL author per-host configs
+out of band; NS 4.0 does not template them.</li>
+<li>Validate config bindings against §4.4 using the
+already-parsed <code>site.toml</code>:
+<ul>
+<li><strong>Default case (<code>site.toml.edge_node = false</code>):</strong> every
+listen address SHALL be either the host's WG address (when
+WG is present) or a loopback address (<code>127.0.0.1</code> / <code>::1</code>,
+when <code>--allow-loopback-only</code>). Any literal <code>0.0.0.0</code>,
+<code>[::]</code>, or non-WG public address is fail-closed.</li>
+<li><strong>Edge case (<code>site.toml.edge_node = true</code>):</strong> the default
+listens above are required, AND additional public-interface
+listens are permitted on ports listed in <code>site.toml.edge_ports</code>.
+Every entry in <code>edge_ports</code> SHALL be in the allowlist
+<code>{22, 25, 443, 465, 8443}</code>; any out-of-allowlist port is
+fail-closed. Each public-interface listen in a daemon
+config SHALL bind a port that appears in <code>edge_ports</code>.</li>
+</ul>
+</li>
+</ol>
+<p>A future amendment MAY define a <code>cosmix-config</code> add-on package or
+a templating step; v1.0.0 is operator-authored only.</p>
+<h3 id="510-phase-9--enable-and-start">5.10 Phase 9 — enable and start</h3>
+<p>For each unit in scope:</p>
+<pre><code>sudo systemctl enable --now cosmix-&lt;d&gt;.service
+</code></pre>
+<p><code>cosmix-noded.service</code> SHALL be enabled first (per SPEC 10 §5.4
+unit ordering). The other daemons follow once the broker is up.</p>
+<p>Phase 9 watches each <code>systemctl is-active</code> for ≤ 60 seconds and
+fails-closed if any unit does not reach <code>active (running)</code>.</p>
+<h3 id="511-phase-10--spec-10-63-startup-verification">5.11 Phase 10 — SPEC 10 §6.3 startup verification</h3>
+<p><code>cosmix-noded.service</code>'s startup runs SPEC 10 §6.3 internally
+before binding the ABP socket. The installer SHALL additionally
+run <code>spec10_audit.sh</code> against the live host:</p>
+<ul>
+<li>Every unit in scope is <code>active (running)</code>.</li>
+<li>Every running daemon's <code>User=</code> and <code>Group=</code> resolve to the
+registry name and the registered UID.</li>
+<li>The sysusers fragment on disk matches the canonical Markdown
+registry's projection.</li>
+<li>§5.2 hardening directives are declared on every unit
+(CT-effective degradation in unprivileged containers is
+recorded but not failed-closed; see §10.3).</li>
+</ul>
+<p>Phase 10 emits a structured success report on the <code>preflight</code>
+ABP topic (now that the broker is up), with fields <code>cosmix.spec=11 cosmix.spec.version=&lt;spec11-version&gt; cosmix.phase=audit cosmix.result=ok</code> plus the registry inventory. <code>&lt;spec11-version&gt;</code>
+is the <code>spec11_version</code> from MANIFEST at build time (currently
+<code>1.0.0-rc.1</code>).</p>
+<h3 id="512-phase-11--cleanup">5.12 Phase 11 — cleanup</h3>
+<p>The installer SHALL remove the claimed <code>&lt;staging&gt;</code> directory
+(default <code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code>, or
+the <code>--staging-dir</code> override) and SHALL NOT leave cached
+tarballs or extracted trees on the host. The on-disk record of the installed package set is the
+MANIFEST snapshot at <code>/var/lib/cosmix/.ns4-manifest/&lt;package&gt;-&lt;version&gt;.manifest</code>,
+which the installer copies before cleanup (§7).</p>
+<hr />
+<h2 id="6-mix-installer-contract">6. Mix Installer Contract</h2>
+<p>Per the global Mix-first / never-Python policy
+(<code>feedback_no_python</code>, the workspace <code>CLAUDE.md</code>'s tooling-policy
+section), the NS 4.0 installer is a Mix script.</p>
+<h3 id="61-canonical-name-and-path">6.1 Canonical name and path</h3>
+<p>The installer SHALL be named <code>ns4-install.mix</code> and SHALL be shipped
+inside <code>cosmix-base</code> at:</p>
+<pre><code>/usr/share/cosmix/install/ns4-install.mix
+</code></pre>
+<p>A symlink <code>/usr/local/sbin/ns4-install</code> MAY be installed for
+operator ergonomics; v1.0.0 does not require it.</p>
+<h3 id="62-invocation">6.2 Invocation</h3>
+<p>The installer's command-line <strong>option grammar</strong> is fixed. The
+<em>interpreter path</em> and <em>script path</em> are parameterised by
+install state, since on a fresh host neither <code>/opt/cosmix/bin/mix</code>
+nor <code>/usr/share/cosmix/install/ns4-install.mix</code> exists yet — both
+are first promoted by Phase 6 of the very install being run.</p>
+<p><strong>Bootstrap form</strong> (fresh host, or any install where the live
+<code>mix</code> is about to be replaced):</p>
+<pre><code>sudo &lt;staging&gt;/opt/cosmix/bin/mix \
+    &lt;staging&gt;/usr/share/cosmix/install/ns4-install.mix \
+    &lt;options ...&gt;
+</code></pre>
+<p><strong>Already-installed form</strong> (add-on install on a host where
+<code>cosmix-base</code> is already at the same major-minor version, e.g.
+<code>--role knowledge</code> over an existing <code>mesh-citizen</code>):</p>
+<pre><code>sudo /opt/cosmix/bin/mix /usr/share/cosmix/install/ns4-install.mix \
+    &lt;options ...&gt;
+</code></pre>
+<p>In either form <code>&lt;options ...&gt;</code> SHALL conform to the same option
+grammar:</p>
+<pre><code>    --tarball &lt;path-to-cosmix-base.tar.zst&gt;
+    --pubkey &lt;path-to-minisign-pubkey&gt;
+    --role &lt;pack&gt;
+    [--indexd-tarball &lt;path-to-cosmix-indexd.tar.zst&gt;]
+    [--staging-dir &lt;path&gt;]
+    [--dry-run]
+    [--no-start]
+    [--allow-loopback-only]
+    [--allow-downgrade --justification &lt;reason&gt;]
+</code></pre>
+<p>The bootstrap form SHALL pass <code>--staging-dir &lt;staging&gt;</code>
+explicitly so Phase 1 reuses the operator's pre-extraction
+(§5.2 step 2). The already-installed form MAY omit
+<code>--staging-dir</code>; the installer extracts to its default location.</p>
+<p>Required arguments:</p>
+<ul>
+<li><code>--tarball</code> — absolute path to the <code>cosmix-base</code> tarball.</li>
+<li><code>--pubkey</code> — absolute path to the operator's minisign public key.</li>
+<li><code>--role</code> — one of <code>mesh-citizen</code>, <code>knowledge</code> (§2.4).</li>
+</ul>
+<p>Optional arguments:</p>
+<ul>
+<li><code>--indexd-tarball</code> — absolute path to the <code>cosmix-indexd</code>
+tarball. REQUIRED when <code>--role knowledge</code>. Forbidden otherwise.</li>
+<li><code>--staging-dir &lt;path&gt;</code> — directory the installer SHALL use for
+tarball extraction and quarantined-mix execution. Default is
+<code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code> (the parent
+<code>/var/lib/cosmix/.staging</code> is Phase-1 self-bootstrapped per
+§5.2 2a — created <code>0:0 0700</code> if absent). The path SHALL live
+on an exec-permitted filesystem; the installer probes for
+<code>noexec</code> and fails-closed (exit 2) if it cannot execute from
+the path. The override is required on hardened hosts whose
+<code>/var</code> mount is <code>noexec</code>, or in the §6.2 bootstrap form when
+the operator pre-extracts the tarball outside the default
+parent. If the directory already contains the extracted
+tarball (§12.1 bootstrap case) the installer reuses it after
+re-verifying per-file digests; it does not re-extract.</li>
+<li><code>--dry-run</code> — run phases 0–2 only; do not promote any
+artifact or mutate live package state. Quarantined writes
+to <code>&lt;staging&gt;</code> and its <code>/var/lib/cosmix*</code> ancestors per
+§5.2 2a are permitted (they are how Phase 1 stages content
+for verification). Useful for first-time host audits.</li>
+<li><code>--no-start</code> — run through phase 8 (units installed) but
+SHALL NOT enable or start any service. Reserved for staged
+rollouts.</li>
+<li><code>--allow-loopback-only</code> — permit the §4.4.3 WG-presence check to
+pass when no WireGuard interface exists, falling back to
+loopback-only binds. Intended for development hosts and CI
+fixtures only; SHALL NOT be combined with any <code>edge_node = true</code>
+config (§4.4.2). Default behaviour without this flag is to
+fail-closed when WG is absent.</li>
+<li><code>--allow-downgrade</code> — permit a downgrade across the SPEC 10
+registry-version or SPEC 11 major-version boundary (§7.2).
+REQUIRES the companion <code>--justification "&lt;reason&gt;"</code> argument;
+the installer SHALL fail-closed (exit 64) if <code>--allow-downgrade</code>
+is passed without <code>--justification</code>, and SHALL log the
+justification string to journald per §6.4.</li>
+<li><code>--justification "&lt;reason&gt;"</code> — operator-supplied free-text
+rationale for an exceptional install. REQUIRED with
+<code>--allow-downgrade</code>; ignored (with a warning) otherwise.
+Multi-word justifications SHALL be quoted.</li>
+</ul>
+<p>Unknown arguments SHALL fail-closed (exit 64).</p>
+<h3 id="63-exit-codes">6.3 Exit codes</h3>
+<table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>0</td><td>All phases completed; node is at NS 4.0 conformance for the role pack.</td></tr>
+<tr><td>1</td><td>Phase 0 (preconditions) failure.</td></tr>
+<tr><td>2</td><td>Phase 1 (envelope / MANIFEST) failure.</td></tr>
+<tr><td>3</td><td>Phase 2 (SPEC 10 §6.1) failure.</td></tr>
+<tr><td>4</td><td>Phase 3–5 (sysusers / tmpfiles) failure.</td></tr>
+<tr><td>5</td><td>Phase 6–8 (binary install / unit install / per-host config validation) failure.</td></tr>
+<tr><td>6</td><td>Phase 9 (start) failure.</td></tr>
+<tr><td>7</td><td>Phase 10 (audit) failure.</td></tr>
+<tr><td>64</td><td>Usage error (bad arguments).</td></tr>
+<tr><td>70</td><td>Internal Mix evaluator error.</td></tr>
+</tbody></table>
+<p>Phase 11 (cleanup) failures are non-fatal: the installer SHALL
+log them to journald and SHALL still exit 0 if all earlier
+phases succeeded. A failed cleanup leaves staging files under
+the <code>--staging-dir</code> path (default
+<code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code>) for operator
+review and removal; the install itself is complete.</p>
+<p>The exit code identifies the <em>first</em> failed phase. Subsequent
+phases SHALL NOT run.</p>
+<h3 id="64-logging">6.4 Logging</h3>
+<p>The installer SHALL emit a structured run record to journald
+under syslog identifier <code>ns4-install</code>, with fields:</p>
+<ul>
+<li><code>cosmix.spec=11 cosmix.spec.version=&lt;version&gt;</code></li>
+<li><code>cosmix.phase=&lt;0..11&gt;</code> per phase</li>
+<li><code>cosmix.result=ok|fail</code></li>
+<li><code>cosmix.errors=&lt;list&gt;</code> on failure</li>
+</ul>
+<p>journald is the canonical sink for installer logs. The
+installer SHALL NOT create <code>/var/log/cosmix/</code> for its own use:
+per SPEC 10 §3.5, that parent SHALL exist only when a daemon
+requires it, and the installer is not a daemon. An operator
+who wants a file-based audit trail SHALL <code>journalctl -u ns4-install</code> or <code>journalctl -t ns4-install</code> to materialise it
+out of band.</p>
+<h3 id="65-mix-first-discipline">6.5 Mix-first discipline</h3>
+<p>The installer SHALL be expressible entirely in Mix builtins. Any
+shell-out (<code>sudo</code>, <code>systemctl</code>, <code>getent</code>, <code>install</code>,
+<code>systemd-sysusers</code>, <code>systemd-tmpfiles</code>, <code>wg show</code>, <code>dpkg</code>,
+<code>uname</code>, <code>df</code>, <code>stat</code>) is permitted because these tools are the
+<em>right</em> primitive — the rule is that no Python, no Lua, and no
+home-grown shell loops perform logic that should be a Mix
+builtin.</p>
+<p>When the installer hits a missing Mix capability, the response
+SHALL be to add the builtin to <code>cosmix-lib-mix</code> and rebuild
+(<code>feedback_mix_use_builtins_not_shell</code>,
+<code>project_mix_builtin_gaps</code>). The <code>deployment-tools/spec10_*.mix</code> scripts
+that informed this SPEC are the ground-truth precedent.</p>
+<h3 id="66-source-vs-shipped">6.6 Source vs shipped</h3>
+<p>The installer source SHALL live at:</p>
+<pre><code>deployment-tools/ns4-install.mix
+</code></pre>
+<p>(parallel to the existing <code>deployment-tools/spec10_*.mix</code> scripts).</p>
+<p>The shipped artifact at <code>/usr/share/cosmix/install/ns4-install.mix</code>
+SHALL be byte-identical to the source at the package's build SHA.
+A CI lint (§11 L14) verifies this.</p>
+<p><strong>Materialisation status.</strong> As of this SPEC's first revision the
+installer source is <strong>pending</strong> — it has not yet been authored.
+CI lints <strong>L3, L7, L14</strong> all depend on the file existing and SHALL
+report <code>skipped — installer source pending</code> in their CI output
+until <code>deployment-tools/ns4-install.mix</code> lands; the lint suite as a whole
+SHALL still pass during this window. The remaining lints
+(L1–L2, L4–L6, L8–L13) are independent of the installer source
+and SHALL remain hard gates.</p>
+<p>Once the source lands, the SPEC 11 frontmatter SHALL be bumped to
+<code>1.0.0-rc.2</code> (or directly to <code>1.0.0</code> if no other changes
+accumulate), L3/L7/L14 SHALL become hard gates, and a
+<code>cosmix-base</code> v1.0.0 tarball MAY be cut for production deployment.
+A v1.0.0 tarball SHALL NOT be cut while any of L3/L7/L14 is in
+the skipped state.</p>
+<hr />
+<h2 id="7-upgrade-downgrade-rollback-removal">7. Upgrade, Downgrade, Rollback, Removal</h2>
+<h3 id="71-upgrade">7.1 Upgrade</h3>
+<p>An upgrade is an install of a newer-version tarball over an
+existing installed package. The installer SHALL run the phases in
+the order below; the <strong>stop-before-mutate</strong> discipline (step 3
+preceding all file promotion) is the transaction boundary that
+keeps the live system from running half-replaced binaries against
+unchanged units or vice versa:</p>
+<ol>
+<li>Run §5 phases 0–2 against the new tarball (preconditions,
+stage + MANIFEST verify, SPEC 10 §6.1 preflight). All checks
+that can fail SHALL fail before any service is touched.</li>
+<li>Compare the staged sysusers fragment to the live one. Append-
+only additions (new tombstones, new entries with UIDs &gt; the
+previous next-free) are accepted. Renumbering, renaming, or
+tombstone removal SHALL fail-closed (per SPEC 10 §2.4).</li>
+<li><strong>Stop services</strong> in reverse-dependency order, <strong>before</strong> any
+file is promoted out of staging:
+<code>cosmix-indexd</code> → <code>cosmix-webd</code> → <code>cosmix-maild</code> →
+<code>cosmix-noded</code>.</li>
+<li>Promote new sysusers / tmpfiles fragments (§5.4–§5.6),
+re-running the SPEC 10 §6.2 post-sysusers verification (this
+SPEC's §5.5).</li>
+<li>Replace binaries (§5.7) and units (§5.8) atomically (via
+<code>install</code> over the existing path, which is mv-replace). Each
+<code>install</code> call is itself atomic; the upgrade as a whole is
+<em>not</em> a single transaction (see §7.3).</li>
+<li>Promote per-host config validation (§5.9, no file changes —
+read-only check that the operator's existing configs still
+satisfy §4.4 against the new units).</li>
+<li>Restart services in dependency order (§5.10).</li>
+<li>Run §5.11 audit. Fail-closed on any regression.</li>
+</ol>
+<p>The <code>MANIFEST</code> of the <em>previous</em> installed version SHALL be
+preserved at
+<code>/var/lib/cosmix/.ns4-manifest/&lt;package&gt;-&lt;previous-version&gt;.manifest</code>
+as an audit record. It identifies <em>what</em> was installed before
+(versions, file digests) but does not contain file contents and
+SHALL NOT be used to attempt a content-restoring rollback (see
+§7.3).</p>
+<h3 id="72-downgrade">7.2 Downgrade</h3>
+<p>Downgrade is permitted within the same SPEC 10 registry version
+and the same SPEC 11 major version. The installer SHALL refuse a
+downgrade across either boundary unless given an explicit
+<code>--allow-downgrade</code> flag plus a documented operator justification.</p>
+<p>The reason for the gate: downgrading binaries against a registry
+that has already been extended (new daemons, new tombstones) can
+leave the live system referencing entries the older binaries do
+not understand.</p>
+<h3 id="73-rollback-and-phase-n-abort-recovery">7.3 Rollback and phase-N abort recovery</h3>
+<p>NS 4.0 v1.0.0 does <strong>not</strong> ship an auto-restoring rollback: the
+installer does not retain previous-version file contents on disk.
+Two distinct cases are addressed below.</p>
+<p><strong>Case A — Phase-N abort during an in-progress install/upgrade.</strong>
+The installer's transaction boundaries (§7.1 step 3 stop-before-
+mutate; §5 phases 0–2 perform no promotion or live-package
+mutation — their only writes are the quarantined staging tree
+and its <code>/var/lib/cosmix*</code> ancestors per §5.2 2a) define which
+states are "safe-aborted" vs "mid-mutation":</p>
+<ul>
+<li><strong>Abort at phases 0–2 (no live-package mutation):</strong> no
+registry fragment, binary, unit, or <code>/etc/cosmix/</code> config
+has been promoted; the live package set is untouched. The
+installer MAY have created <code>/var/lib/cosmix</code>,
+<code>/var/lib/cosmix/.staging</code>, and <code>&lt;staging&gt;</code> (per §5.2 2a)
+and populated <code>&lt;staging&gt;</code> with the extracted tarball — these
+are quarantined writes, not live-system mutations. The
+installer SHALL exit non-zero, leave the staging tree
+(default <code>/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/</code>, or
+the <code>--staging-dir</code> override) for inspection, and require
+no recovery action beyond optionally removing the staging
+tree.</li>
+<li><strong>Abort at phases 3–5 (sysusers / tmpfiles):</strong> registry
+fragments are promoted but no binary or unit has been replaced
+yet. SPEC 10 §2.4 append-only semantics guarantee the new
+fragment is forward-compatible with the still-running old
+binaries. The installer SHALL exit non-zero and SHALL log the
+half-promoted state; the operator MAY safely restart the install
+with the same tarball after addressing the cause.</li>
+<li><strong>Abort at phases 6–8 (binaries / units / per-host config) on
+a fresh install:</strong> services have not yet been started (phase 9
+is not reached). The installer SHALL exit non-zero; the
+operator SHALL re-run the installer to completion, or remove
+the partially installed package via §7.4.</li>
+<li><strong>Abort at phases 6–8 on an upgrade:</strong> services were stopped at
+§7.1 step 3 and are still down. Some binaries / units may have
+been replaced and others not. The live system is in a
+service-down mixed state. Recovery: the operator SHALL re-run
+the installer with the <em>previous</em> tarball using the §7.3 Case B
+procedure below to restore a coherent set, OR re-run with the
+current tarball after addressing the cause.</li>
+<li><strong>Abort at phase 9 (start) or phase 10 (audit):</strong> all files
+have been promoted; the failure is a runtime problem (unit
+refused to start, audit caught a regression). The previous
+binaries are gone; there is no in-installer rollback. The
+operator SHALL diagnose the start/audit failure or invoke
+Case B with the previous tarball.</li>
+</ul>
+<p>In every Case A path the §7.1 step 3 stop-before-mutate ordering
+guarantees that a mid-upgrade abort does NOT leave a daemon
+running against a partially replaced unit + binary pair: the
+worst case is "all daemons stopped, files in a mix" — recoverable
+by re-running an installer (current or previous tarball) to
+completion.</p>
+<p><strong>Case B — Operator-driven rollback to a previous version.</strong>
+Rollback is performed by:</p>
+<ol>
+<li>
+<p>Locating the previously installed package's tarball
+(<code>cosmix-&lt;package&gt;-&lt;previous-version&gt;-&lt;arch&gt;.tar.zst</code> plus its
+<code>.sig</code> envelope), which the operator SHALL have retained out
+of band as part of release management. The
+<code>/var/lib/cosmix/.ns4-manifest/&lt;package&gt;-&lt;previous-version&gt;.manifest</code>
+audit record identifies exactly which prior version is needed.</p>
+</li>
+<li>
+<p>Re-running the installer with that tarball. Rollback of the
+<code>cosmix-base</code> package SHALL use the §6.2 <strong>bootstrap form</strong>
+(extract the <em>previous</em> tarball into a fresh root-owned <code>0700</code>
+staging directory, invoke the previous tarball's quarantined
+mix and <code>ns4-install.mix</code>) — even though a live <code>mix</code> already
+exists on the host, the live binary is about to be replaced
+with the older one and SHALL NOT be used to drive its own
+replacement. Rollback of <code>cosmix-indexd</code> only (the live
+<code>mix</code>/<code>ns4-install.mix</code> are not being replaced) MAY use the
+§6.2 <strong>already-installed form</strong>. Either form takes the same
+options:</p>
+<pre><code>--tarball &lt;previous&gt;.tar.zst
+--pubkey /etc/cosmix/keys/release.pub
+--role &lt;pack&gt;
+--allow-downgrade --justification "&lt;reason&gt;"
+</code></pre>
+</li>
+<li>
+<p>The §7.2 downgrade gate applies: across SPEC 10 registry-version
+or NS 4.0 major-version boundaries the installer fails-closed
+without <code>--allow-downgrade</code> and the operator's
+<code>--justification</code> string.</p>
+</li>
+</ol>
+<p>The <code>.ns4-manifest/&lt;package&gt;-&lt;previous-version&gt;.manifest</code> audit
+record is the <em>identifier</em> (versions, file digests) of what was
+previously installed; it is not a content backup. A future
+amendment MAY add an auto-rolling <code>--rollback</code> mode backed by a
+content-preserving package cache (e.g. retaining the previous
+tarball under <code>/var/cache/cosmix/</code>); v1.0.0 explicitly does not.</p>
+<h3 id="74-removal">7.4 Removal</h3>
+<p>Removal of a package SHALL:</p>
+<ol>
+<li>Stop and disable every unit in scope.</li>
+<li>Remove binaries, units, and per-package data under
+<code>/usr/share/cosmix/</code>.</li>
+<li>Remove the package's sysusers entries via a new fragment that
+tombstones them (rather than deleting them), per SPEC 10 §2.4.</li>
+<li><strong>NOT</strong> remove <code>/etc/cosmix/&lt;d&gt;/</code> (operator may have local
+secrets) or <code>/var/lib/cosmix/&lt;d&gt;/</code> (state may be valuable).</li>
+</ol>
+<p>A separate <code>--purge</code> flag SHALL extend removal to also delete
+<code>/etc/cosmix/&lt;d&gt;/</code> and <code>/var/lib/cosmix/&lt;d&gt;/</code>. <code>--purge</code> is
+explicit, never default.</p>
+<p>Removal of <code>cosmix-base</code> while <code>cosmix-indexd</code> is installed
+SHALL fail-closed: the operator SHALL remove <code>cosmix-indexd</code>
+first.</p>
+<hr />
+<h2 id="8-the-sysadm-boundary">8. The sysadm Boundary</h2>
+<p>NS 4.0 expects but does not configure the host's administrative
+account.</p>
+<h3 id="81-expected-operator-identity">8.1 Expected operator identity</h3>
+<p>The host SHALL carry a non-root administrative user. By NS 3.0
+convention this user is <code>sysadm</code> at UID 1000, in the <code>sudo</code> group,
+with passwordless sudo. NS 4.0 v1.0.0 does NOT pin the UID and
+does NOT enforce the <code>sudo</code> membership; it only requires that the
+installer's invoking user can elevate to root via <code>sudo</code>.</p>
+<p>The recommended configuration matches <code>historical daily-driver setup guide (2026-03-24)</code>
+§4 (NS 3.0 user setup), but that document is not normative for
+NS 4.0.</p>
+<h3 id="82-what-ns-40-does-and-does-not-configure-on-sysadm">8.2 What NS 4.0 does and does not configure on sysadm</h3>
+<p>NS 4.0 SHALL NOT:</p>
+<ul>
+<li>Create the sysadm account.</li>
+<li>Modify sysadm's groups, shell, or home directory.</li>
+<li>Install SSH keys for sysadm.</li>
+<li>Configure sudoers fragments.</li>
+</ul>
+<p>NS 4.0 SHALL:</p>
+<ul>
+<li>Verify sudo capability of the invoking user (§4.6).</li>
+<li>Refuse to run as a <code>cosmix-*</code> registry user (§4.6).</li>
+<li>Log the operator's username and UID into the §6.4 install
+record.</li>
+</ul>
+<h3 id="83-cohabitation-with-ns-30-desktop-convention">8.3 Cohabitation with NS 3.0 desktop convention</h3>
+<p>A host MAY simultaneously be an NS 3.0 daily-driver workspace
+(per <code>historical daily-driver setup guide (2026-03-24)</code>) and an NS 4.0 mesh
+node. The UID space NS 4.0 cares about is partitioned as:</p>
+<ul>
+<li>500–599 — substrate daemons (SPEC 10, NS 4.0; the only range
+this SPEC normatively owns).</li>
+<li>1000 — sysadm administrative user (NS 3.0 convention; not
+pinned by NS 4.0 but the install procedure assumes a
+sudo-capable non-root operator at this UID by convention).</li>
+<li>≥ 1000 — local interactive users and NS 3.0 NetServa vhost
+users (SPEC 10 §1.2 boundary). The exact partition between
+named human users and vhost users inside this range is an
+NS 3.0 / NetServa concern outside NS 4.0's scope.</li>
+</ul>
+<p>NS 4.0 only owns 500–599. The other ranges are referenced for
+collision-avoidance (§9) and SHALL be respected.</p>
+<hr />
+<h2 id="9-ns-30-vhost-coexistence">9. NS 3.0 Vhost Coexistence</h2>
+<p>NetServa vhost users (per SPEC 10 §1.2: UID ≥ 1000 by NS 3.0
+convention) are out of scope for this SPEC. NS 4.0 makes one normative claim about them:</p>
+<p><strong>Vhost UIDs SHALL NOT collide with the SPEC 10 substrate
+registry (500–599).</strong></p>
+<p>Per SPEC 10 §6.1, the install preflight already detects this
+case: a vhost user holding UID 500–599 is a fail-closed
+condition. NS 4.0's installer surfaces such conflicts with a
+specific message naming the conflicting vhost user, the substrate
+entry it collides with, and a recommended manual remediation
+(typically: rename or renumber the vhost user, since the
+substrate registry is append-only and cannot move).</p>
+<p>NS 4.0 does NOT:</p>
+<ul>
+<li>Allocate vhost UIDs.</li>
+<li>Document the vhost UID range or naming.</li>
+<li>Provision vhost user accounts, groups, home directories, or
+per-vhost services.</li>
+<li>Configure NetServa virtual hosts in any web/mail/proxy server.</li>
+</ul>
+<p>Future SPECs (working title: "NetServa Vhost") may address those
+concerns. Until then, NS 3.0 conventions (<code>historical daily-driver setup guide (2026-03-24)</code>
+plus historical NetServa documentation) are the operator's
+reference.</p>
+<hr />
+<h2 id="10-conformance">10. Conformance</h2>
+<h3 id="101-conformance-levels">10.1 Conformance levels</h3>
+<p>A node conforms to NS 4.0 at one of three levels.</p>
+<p><strong>Level 0 (Pre-conformance).</strong> Binaries copied by hand,
+sysusers fragment authored ad hoc, units written by hand, no
+preflight run. Permitted only as a transitional state during
+SPEC 10 / NS 4.0 bootstrap. Not permitted on any production
+mesh node.</p>
+<p><strong>Level 1 (Installed).</strong> The node was installed by <code>ns4-install.mix</code>
+through phase 10 (which includes the §5.11 audit) succeeding, and
+SPEC 10 conformance Level 1 holds. Required for every NS 4.0 mesh
+node.</p>
+<p><strong>Level 2 (Hardened).</strong> Level 1 plus SPEC 10 conformance Level 2
+(§5.2 mandatory hardening directives present on every unit) plus
+the phase 10 audit emitted a <code>preflight.ok</code> event with the §5.11
+inventory. Required for any internet-exposed mesh node.</p>
+<h3 id="102-per-package-conformance">10.2 Per-package conformance</h3>
+<p>Each installed package independently asserts a conformance level.
+A <code>cosmix-base</code> Level 2 install plus a hand-installed
+<code>cosmix-indexd</code> is a <code>mesh-citizen Level 2</code> + <code>knowledge Level 0</code>
+node. Whole-node conformance is the <strong>minimum</strong> of installed
+packages' conformance levels; a <code>Level 0</code> add-on prevents the
+node as a whole from claiming <code>Level 2</code>.</p>
+<h3 id="103-ct-effective-degradation-historical-incus-evidence">10.3 CT-effective degradation (historical Incus evidence)</h3>
+<blockquote>
+<p><strong>Port note (2026-08-31):</strong> Incus left the live system on 2026-08-09.
+The evidence below explains the old exception but does not define current
+nspawnd/systemd-nspawn degradation semantics; those are not verifiable from
+this chapter.</p>
+</blockquote>
+<p>Per the example-node first-deployment finding (<code>historical first-deployment evidence (2026-05-09)</code>
+F2), the then-current unprivileged Incus / LXC containers carried an auto-injected
+drop-in that relaxes a subset of §5.2 hardening directives. NS
+4.0 v1.0.0 records this as a known degradation:</p>
+<ul>
+<li>The unit declarations SHALL still be Level 2 (CI lint enforces).</li>
+<li>The runtime is recognized as "Level 2 declared / CT-effective
+degraded" by the §5.11 audit and the §6.4 install record.</li>
+<li>Userspace-only directives (<code>MemoryDenyWriteExecute</code>,
+<code>RestrictAddressFamilies</code>, <code>SystemCallFilter</code>,
+<code>CapabilityBoundingSet</code>/<code>AmbientCapabilities</code>,
+<code>StateDirectory</code>, <code>ProtectSystem=strict</code>) are confirmed
+in-effect via <code>systemctl show</code> and remain Level 2 in the
+audit's effective view.</li>
+</ul>
+<p>This is documented behaviour, not a fail-closed condition.
+Internet-exposed mesh nodes SHOULD run on a kernel and container
+configuration that does not require this degradation.</p>
+<h3 id="104-re-attestation-cadence">10.4 Re-attestation cadence</h3>
+<p>A node's NS 4.0 conformance attestation SHALL be re-run:</p>
+<ul>
+<li>On every NS 4.0 install or upgrade (via the §5.11 phase).</li>
+<li>On every <code>cosmix-noded</code> cold start (via SPEC 10 §6.3).</li>
+<li>On operator demand via <code>spec10_audit.sh</code> (no-op if the node
+is conformant).</li>
+</ul>
+<p>Continuous attestation (e.g. on every <code>daemon-reload</code> or every
+<code>systemctl restart</code>) is OPTIONAL and is a substrate-self-aware
+concern (SPEC 07), not an NS 4.0 requirement.</p>
+<hr />
+<h2 id="11-ci-lint-shape">11. CI Lint Shape</h2>
+<p>A CI lint SHALL be runnable in the source tree and SHALL verify
+all of the following invariants. The lint is part of the
+substrate's self-observation surface (per the Three Design
+Criteria) and is itself agent-operable.</p>
+<table><thead><tr><th>ID</th><th>Invariant</th></tr></thead><tbody>
+<tr><td>L1</td><td>The canonical <code>deployment-config/sysusers/cosmix.conf</code> matches the projection of SPEC 10 Appendix A (regenerate, diff, fail on diff). This is a re-statement of SPEC 10 lint L7 from the NS 4.0 packaging side.</td></tr>
+<tr><td>L2</td><td>Every shipped <code>deployment-config/systemd/cosmix-*.service</code> carries the SPEC 10 §5.1 + §5.2 directives (incorporates SPEC 10 lints L8, L13).</td></tr>
+<tr><td>L3</td><td>The <code>ns4-install.mix</code> source at <code>deployment-tools/ns4-install.mix</code> parses and runs <code>--dry-run</code> in CI against a synthetic Debian 13 host fixture. (Pending materialisation: SHALL report <code>skipped — installer source pending</code> until the file lands; see §6.6.)</td></tr>
+<tr><td>L4</td><td>The installer's <code>MANIFEST</code> reader rejects synthetic-bad fixtures: missing required frontmatter field, MANIFEST hash mismatch, MANIFEST mode mismatch, MANIFEST extra-file (file in tarball not in MANIFEST), MANIFEST missing-file (file in MANIFEST not in tarball), envelope signature failure. (Six cases; each SHALL fail-closed in CI.)</td></tr>
+<tr><td>L5</td><td>The §3.1 tarball naming regex matches every artifact produced by the build: `^cosmix-(base</td></tr>
+<tr><td>L6</td><td>The installer's <code>--role</code> matrix is exhaustive: every value in §2.4 is handled, no value not in §2.4 is accepted.</td></tr>
+<tr><td>L7</td><td>The phase ordering of §5 is encoded as a constant in the installer source and is referenced (rather than re-inlined) by every phase function. The SPEC table and the source constant SHALL match exactly. (Pending materialisation: SHALL report <code>skipped — installer source pending</code> until the file lands; see §6.6.)</td></tr>
+<tr><td>L8</td><td>Glibc-skew check: <code>MANIFEST.target_glibc_max &lt;= host_glibc_max</code> is enforced in §5.2 / §4.3 (Phase 1, <em>after</em> MANIFEST is trusted), exits 2 on failure (§6.3). CI runs the check against a synthetic too-old-glibc fixture and verifies fail-closed at Phase 1.</td></tr>
+<tr><td>L9</td><td>Layered-bind check (§4.4): every shipped <em>default</em> config (the templates referenced by <code>deployment-config/systemd/cosmix-*.service</code>) binds WG-or-loopback only — no <code>0.0.0.0</code>, no <code>[::]</code>, no public address literal. A unit MAY bind a public address only when its per-host config sets <code>edge_node = true</code> AND the bound port is in the §4.4.2 allowlist <code>{22, 25, 443, 465, 8443}</code>; CI verifies this by parsing default-config templates (substring-rejecting <code>0.0.0.0</code> / <code>[::]</code>) and, separately, parsing per-host edge-node fixtures (rejecting any bound port not in the allowlist). Supersedes the prior blanket "no <code>0.0.0.0</code> substring" rule and re-scopes <code>feedback_wg_only_binding</code> accordingly.</td></tr>
+<tr><td>L10</td><td>No <code>python</code> or <code>python3</code> invocation appears in any shipped install artifact (<code>ns4-install.mix</code>, <code>spec10_*.{mix,sh}</code>, MANIFEST files, units). (<code>feedback_no_python</code> enforcement.)</td></tr>
+<tr><td>L11</td><td>Tarball MANIFEST's <code>spec10_registry_version</code> matches <code>10a-daemon-identity-profile.md</code> Appendix A's version field. The lint extracts both and compares.</td></tr>
+<tr><td>L12</td><td>Tarball MANIFEST's <code>spec11_version</code> matches the <code>spec11_version:</code> contract field in this profile's frontmatter at build time, not its editorial <code>version:</code>.</td></tr>
+<tr><td>L13</td><td>Conformance levels in §10 are pairwise consistent with SPEC 10 §8.1: NS 4.0 Level N requires SPEC 10 Level N for every installed package.</td></tr>
+<tr><td>L14</td><td>The shipped <code>ns4-install.mix</code> is byte-identical to <code>deployment-tools/ns4-install.mix</code> at the build SHA (regenerate from source on every CI run, diff, fail on diff). (Pending materialisation: SHALL report <code>skipped — installer source pending</code> until the file lands; see §6.6.)</td></tr>
+</tbody></table>
+<p>The lint SHALL be invoked by CI on every pull request that
+touches <code>10c-package-install-profile.md</code>, <code>deployment-tools/ns4-install.mix</code>,
+<code>deployment-config/sysusers/cosmix.conf</code>, <code>deployment-config/systemd/cosmix-*.service</code>,
+or any file in <code>$COSMIX/src/crates/cosmix-{noded,maild,webd,indexd}/</code>.
+Failure SHALL block merge.</p>
+<hr />
+<h2 id="12-examples">12. Examples</h2>
+<h3 id="121-first-time-install-on-a-fresh-debian-13-mesh-node">12.1 First-time install on a fresh Debian 13 mesh node</h3>
+<p>The first action SHALL be a host-side envelope verification using a
+<code>minisign</code> binary installed by the host's package manager (per §3.4.1
+clause 1) — <strong>before</strong> the tarball is extracted. Only after that
+verification passes does the installer get extracted and run:</p>
+<pre><code># 0. Host-side trust anchor: install minisign from the OS package
+#    manager (one-time, before the first tarball ever arrives).
+sysadm@example-node:~$ sudo apt-get install -y minisign
+
+# 1. Host-side envelope verification of the tarball using the
+#    operator's pinned pubkey. This is the trusted action that
+#    permits extraction; it MUST happen before tar/zstd touches
+#    the archive.
+sysadm@example-node:~$ minisign -Vm /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    -p /etc/cosmix/keys/release.pub
+Signature and comment signature verified
+
+# 2. Only now extract under a quarantine path. The trust gate
+#    above is what authorises this step. The staging directory
+#    SHALL be root-owned mode 0700 from the moment any tarball
+#    content lands inside it (§5.2 step 2). The default location
+#    is `/var/lib/cosmix/.staging/&lt;package&gt;-&lt;version&gt;/` (root-only
+#    parent, self-bootstrapped by Phase 1 if absent — §5.2 2a);
+#    a sibling under `/tmp` such as `/tmp/cosmix-stage-XXXX` is
+#    also acceptable provided the directory itself is created
+#    root-owned 0700 *before* tar runs. The example below uses
+#    /tmp for visibility (a single mkdir + tar pair on a fresh
+#    host); operators may equally pre-create
+#    `/var/lib/cosmix/.staging/cosmix-base-1.0.0` so the
+#    chosen path matches the installer's default. The
+#    bootstrap form still passes `--staging-dir "$STAGING"`
+#    regardless of whether `$STAGING` is the default path or
+#    an override — without it the installer would treat the
+#    pre-extracted directory as a fail-closed collision per
+#    §5.2 2b. Hardened hosts mounting the chosen filesystem
+#    noexec SHALL pass `--staging-dir &lt;path&gt;` pointing to an
+#    exec-permitted parent.
+sysadm@example-node:~$ STAGING=/tmp/cosmix-stage-base-1.0.0
+sysadm@example-node:~$ sudo install -d -o 0 -g 0 -m 0700 "$STAGING"
+sysadm@example-node:~$ sudo tar --zstd \
+    -xf /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    --strip-components=1 \
+    -C "$STAGING"
+
+# 3. Invoke the in-tarball installer using the **quarantined**
+#    Mix binary from the just-extracted tarball — NOT a
+#    preinstalled `/opt/cosmix/bin/mix` (a fresh Debian host has
+#    none; on a base upgrade the live mix is about to be replaced
+#    by Phase 6). After --strip-components=1 the tarball's single
+#    top-level directory (§3.2) has been collapsed away and the
+#    interpreter lives at $STAGING/opt/cosmix/bin/mix. The installer
+#    re-runs envelope and per-file digest verification as
+#    defence-in-depth (§3.4.1 clauses 2–3); on success it promotes
+#    the quarantined mix to /opt/cosmix/bin/mix as part of Phase 6.
+#    The installer is given the same $STAGING path so Phase 1
+#    reuses this extraction rather than re-extracting.
+sysadm@example-node:~$ sudo "$STAGING/opt/cosmix/bin/mix" \
+    "$STAGING/usr/share/cosmix/install/ns4-install.mix" \
+    --tarball /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    --pubkey /etc/cosmix/keys/release.pub \
+    --staging-dir "$STAGING" \
+    --role mesh-citizen
+</code></pre>
+<p>This is the §6.2 <strong>bootstrap form</strong> — used on fresh hosts AND on any
+base-package upgrade where the live <code>mix</code> is about to be replaced.
+Add-on installs against an already-running <code>cosmix-base</code> use the
+§6.2 already-installed form (§12.2).</p>
+<p>Expected timeline (example-node-class CT, ~50 ms tarball, AMD64):</p>
+<table><thead><tr><th style="text-align: right">Phase</th><th style="text-align: right">Duration</th><th>Effect</th></tr></thead><tbody>
+<tr><td style="text-align: right">0</td><td style="text-align: right">&lt; 1 s</td><td>Preconditions logged</td></tr>
+<tr><td style="text-align: right">1</td><td style="text-align: right">&lt; 1 s</td><td>Tarball verified, MANIFEST validated</td></tr>
+<tr><td style="text-align: right">2</td><td style="text-align: right">&lt; 1 s</td><td>SPEC 10 §6.1 OK to create (8 entries)</td></tr>
+<tr><td style="text-align: right">3</td><td style="text-align: right">~ 1 s</td><td>sysusers fragment promoted, sysusers run, 8 users created</td></tr>
+<tr><td style="text-align: right">4</td><td style="text-align: right">&lt; 1 s</td><td>SPEC 10 §6.2 verification OK</td></tr>
+<tr><td style="text-align: right">5</td><td style="text-align: right">&lt; 1 s</td><td>tmpfiles promoted (none secret-config in v1.0.0 base, fragment may be empty)</td></tr>
+<tr><td style="text-align: right">6</td><td style="text-align: right">~ 1 s</td><td>4 binaries installed</td></tr>
+<tr><td style="text-align: right">7</td><td style="text-align: right">&lt; 1 s</td><td>3 units installed, daemon-reload run</td></tr>
+<tr><td style="text-align: right">8</td><td style="text-align: right">&lt; 1 s</td><td>Per-host configs verified</td></tr>
+<tr><td style="text-align: right">9</td><td style="text-align: right">~ 5 s</td><td>noded → maild → webd enabled-and-started</td></tr>
+<tr><td style="text-align: right">10</td><td style="text-align: right">&lt; 1 s</td><td>Audit OK, <code>preflight.ok</code> emitted</td></tr>
+<tr><td style="text-align: right">11</td><td style="text-align: right">&lt; 1 s</td><td>Cleanup</td></tr>
+</tbody></table>
+<p>Total: ~ 12 s on a warm cache.</p>
+<h3 id="122-adding-the-knowledge-add-on">12.2 Adding the knowledge add-on</h3>
+<p>Both tarballs SHALL be envelope-verified host-side (§12.1 step 1)
+before invocation:</p>
+<pre><code>sysadm@example-node:~$ minisign -Vm /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    -p /etc/cosmix/keys/release.pub
+sysadm@example-node:~$ minisign -Vm /tmp/cosmix-indexd-1.0.0-amd64.tar.zst \
+    -p /etc/cosmix/keys/release.pub
+
+# Add-on installs run on a host where cosmix-base is already
+# installed, so `/opt/cosmix/bin/mix` and the shipped installer at
+# `/usr/share/cosmix/install/ns4-install.mix` already exist as
+# Phase-6-promoted artifacts; the live mix is acceptable here
+# because no mix-replacing phase runs against the indexd tarball.
+sysadm@example-node:~$ sudo /opt/cosmix/bin/mix \
+    /usr/share/cosmix/install/ns4-install.mix \
+    --tarball /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    --indexd-tarball /tmp/cosmix-indexd-1.0.0-amd64.tar.zst \
+    --pubkey /etc/cosmix/keys/release.pub \
+    --role knowledge
+</code></pre>
+<p>In this dated worked example (2026-05-09), the installer detects
+<code>cosmix-base 1.0.0</code> is already installed,
+skips its phases, and runs phases 1–11 against the indexd
+tarball only. The indexd unit is enabled and started after the
+base set is confirmed live.</p>
+<h3 id="123-first-time-install--fail-closed-on-uid-conflict">12.3 First-time install — fail-closed on UID conflict</h3>
+<p>This is the §12.1 bootstrap path on a fresh host (quarantined mix,
+not preinstalled mix), failing at Phase 2 because the host already
+has a non-cosmix user occupying a SPEC 10 reserved UID. The
+operator's pre-extraction step (§12.1 step 2) is elided here for
+brevity; assume <code>$STAGING</code> was created root-owned 0700 and the
+tarball was extracted into it with <code>--strip-components=1</code>.</p>
+<pre><code>sysadm@example-host:~$ STAGING=/tmp/cosmix-stage-base-1.0.0
+sysadm@example-host:~$ sudo "$STAGING/opt/cosmix/bin/mix" \
+    "$STAGING/usr/share/cosmix/install/ns4-install.mix" \
+    --tarball /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    --pubkey /etc/cosmix/keys/release.pub \
+    --staging-dir "$STAGING" \
+    --role mesh-citizen
+ERROR: SPEC 10 §6.1 preflight failed.
+  - registry entry cosmix-noded (uid 500) conflicts with existing
+    user 'somepkg' (uid 500). Resolve manually before re-running:
+    rename or renumber 'somepkg' to a UID outside 500-599.
+ns4-install: phase 2 failed; halting at preflight.
+exit 3
+</code></pre>
+<p>The installer makes no live-package changes — no registry
+fragment, binary, unit, or <code>/etc/cosmix/</code> config has been
+promoted (§7.3 Case A, phases 0–2). The pre-extracted staging
+tree at <code>$STAGING</code> (an operator-controlled path here, not
+under <code>/var/lib/cosmix/.staging/</code>) remains for inspection and
+reuse. The operator inspects the diagnostic, removes or
+renumbers the conflicting user, and re-runs from the same
+<code>$STAGING</code> path.</p>
+<h3 id="124-failed-install--glibc-skew">12.4 Failed install — glibc skew</h3>
+<pre><code>sysadm@example-old-host:~$ STAGING=/tmp/cosmix-stage-base-1.0.0
+sysadm@example-old-host:~$ sudo "$STAGING/opt/cosmix/bin/mix" \
+    "$STAGING/usr/share/cosmix/install/ns4-install.mix" \
+    --tarball /tmp/cosmix-base-1.0.0-amd64.tar.zst \
+    --pubkey /etc/cosmix/keys/release.pub \
+    --staging-dir "$STAGING" \
+    --role mesh-citizen
+ERROR: phase 1 MANIFEST-derived check failed.
+  host glibc 2.31 &lt; MANIFEST.target_glibc_max 2.41.
+  Either rebuild this tarball on a host of glibc &lt;= 2.31, or
+  upgrade this host to a Debian release with glibc &gt;= 2.41.
+ns4-install: phase 1 failed.
+exit 2
+</code></pre>
+<p>This is the case the <code>feedback_glibc_skew_local_to_container</code>
+memory was written to prevent re-discovering. The check runs at
+Phase 1 (after MANIFEST is trusted, §4.3) — not Phase 0 — so the
+operator sees a glibc-skew error before any file is promoted.</p>
+<hr />
+<h2 id="appendix-a-package-manifest-initial-draft">Appendix A. Package Manifest (initial draft)</h2>
+<p>This appendix records the v1.0.0 package contents as committed
+<em>shape</em>. The CI lint (§11 L1–L4) regenerates and diffs against
+this appendix; drift is a build error once every listed source
+file lands.</p>
+<p><strong>Materialisation status (informative).</strong> Each entry below carries
+a <code>[present]</code> / <code>[pending]</code> marker reflecting the state of the
+corresponding source file in the tree at this SPEC revision.
+Pending entries SHALL land in the source tree before a
+<code>cosmix-base</code> v1.0.0 production tarball is cut; the SPEC's
+frontmatter version SHALL bump (e.g. to <code>1.0.0-rc.2</code>) when each
+pending entry materialises. CI lints L1–L4 SHALL treat pending
+entries as informational (skip their per-file check) and SHALL
+hard-gate present entries.</p>
+<h3 id="a1-cosmix-base-100-amd64tarzst">A.1 <code>cosmix-base-1.0.0-amd64.tar.zst</code></h3>
+<pre><code># tarball-path                                        mode    source-status
+MANIFEST                                              (frontmatter + one line per packaged file below)
+usr/local/bin/cosmix-noded                            0755    [present, $COSMIX/src/crates/cosmix-noded]
+usr/local/bin/cosmix-maild                            0755    [present, $COSMIX/src/crates/cosmix-maild]
+usr/local/bin/cosmix-webd                             0755    [present in tree, $COSMIX/src/crates/cosmix-webd]
+usr/local/bin/mix                                     0755    [present, $COSMIX/src/crates/cosmix-mix]
+usr/lib/sysusers.d/cosmix.conf                        0644    [present, deployment-config/sysusers/cosmix.conf]
+usr/lib/tmpfiles.d/cosmix.conf                        0644    [pending, deployment-config/tmpfiles/cosmix.conf]
+usr/lib/systemd/system/cosmix-noded.service           0644    [present, deployment-config/systemd/cosmix-noded.service]
+usr/lib/systemd/system/cosmix-maild.service           0644    [present, deployment-config/systemd/cosmix-maild.service]
+usr/lib/systemd/system/cosmix-webd.service            0644    [pending, deployment-config/systemd/cosmix-webd.service]
+usr/share/cosmix/LICENSE                              0644    [present, ./LICENSE]
+usr/share/cosmix/README.md                            0644    [present, ./README.md]
+usr/share/cosmix/etc/hosts-snippet.txt                0644    [present, deployment-config/hosts-snippet.txt]
+usr/share/cosmix/install/ns4-install.mix              0755    [pending, deployment-tools/ns4-install.mix — see §6.6]
+usr/share/cosmix/install/spec10_preflight.mix         0755    [present, deployment-tools/spec10_preflight.mix]
+usr/share/cosmix/install/spec10_postcheck.mix         0755    [present, deployment-tools/spec10_postcheck.mix]
+usr/share/cosmix/install/spec10_audit.sh              0755    [present, deployment-tools/spec10_audit.sh]
+</code></pre>
+<h3 id="a2-cosmix-indexd-100-amd64tarzst">A.2 <code>cosmix-indexd-1.0.0-amd64.tar.zst</code></h3>
+<pre><code># tarball-path                                        mode    source-status
+MANIFEST                                              (frontmatter + one line per packaged file below)
+usr/local/bin/cosmix-indexd                           0755    [present, $COSMIX/src/crates/cosmix-indexd]
+usr/lib/systemd/system/cosmix-indexd.service          0644    [pending, deployment-config/systemd/cosmix-indexd.service]
+usr/share/cosmix/indexd/                              (per-daemon read-only data, contents TBD)
+</code></pre>
+<p>The <code>cosmix-indexd</code> package's per-daemon data layout is left
+under-specified at v1.0.0 because the daemon's model assets are
+not yet finalised. A future amendment SHALL nail this down.</p>
+<p><strong>Pending → present checklist (must clear before v1.0.0 cut):</strong></p>
+<ul>
+<li><code>deployment-config/systemd/cosmix-webd.service</code></li>
+<li><code>deployment-config/systemd/cosmix-indexd.service</code></li>
+<li><code>deployment-config/tmpfiles/cosmix.conf</code></li>
+<li><code>deployment-tools/ns4-install.mix</code> (§6.6)</li>
+<li>A buildable <code>cosmix-webd</code> binary build target wired into the
+workspace's release-build matrix (the <code>$COSMIX/src/crates/cosmix-webd</code>
+crate exists in tree but is not yet listed as a release artifact
+on every mesh node per <code>feedback_copy_release_binary</code>).</li>
+</ul>
+<p>The <code>[present]</code> markers in this appendix were verified against
+the working tree at SPEC 11 v1.0.0-rc.1; if a marker disagrees
+with the tree at a later revision, the appendix is the bug, not
+the tree — file a fix before relying on the lint.</p>
+<hr />
+<h2 id="appendix-b-glibc-skew-reference-table">Appendix B. Glibc Skew Reference Table</h2>
+<p>Informational. Records the glibc baselines for distributions
+relevant to NS 4.0's build / target boundary.</p>
+<table><thead><tr><th>Distribution</th><th>glibc</th><th>Role</th></tr></thead><tbody>
+<tr><td>Debian 13 Trixie</td><td>2.41</td><td>NS 4.0 v1.0.0 build host AND target</td></tr>
+<tr><td>Debian 12 Bookworm</td><td>2.36</td><td>Below v1.0.0 target — fail-closed if installer attempts</td></tr>
+<tr><td>Ubuntu 24.04 LTS</td><td>2.39</td><td>Below v1.0.0 target — fail-closed</td></tr>
+<tr><td>Alpine Linux</td><td>musl, no glibc</td><td>Out of scope (NS 3.0 daily-driver only)</td></tr>
+</tbody></table>
+<p>The build host's glibc SHALL be ≤ every target host's glibc.
+The former recommendation was to build inside a Debian 13 Incus CT. Incus is
+no longer live; this chapter does not verify a replacement build fixture.
+Use the current monorepo build/deploy guidance before producing artefacts.</p>
+<hr />
+<h2 id="appendix-c-ns-30--ns-40-transition-notes">Appendix C. NS 3.0 ↔ NS 4.0 transition notes</h2>
+<p>Informational. Records the migration expectations for an
+existing NS 3.0 host being brought to NS 4.0 substrate plane.</p>
+<h3 id="c1-what-carries-over">C.1 What carries over</h3>
+<ul>
+<li><code>sysadm</code> UID 1000 — unchanged.</li>
+<li>vhost users UID ≥ 1000 (NS 3.0 numbering, per SPEC 10 §1.2) — unchanged, per §9.</li>
+<li><code>/etc/hosts</code> mesh block — unchanged shape; the NS 4.0 snippet
+is the same content as <code>deployment-config/hosts-snippet.txt</code>.</li>
+<li>WireGuard configuration — unchanged; NS 4.0 verifies but does
+not provision.</li>
+</ul>
+<h3 id="c2-what-changes">C.2 What changes</h3>
+<ul>
+<li>Substrate daemons (any pre-NS-4.0 hand-installed
+<code>cosmix-noded</code>, <code>cosmix-maild</code>, <code>cosmix-jmap</code> from the
+pre-SPEC-10 era) SHALL be migrated to the SPEC 10 identity
+registry. The example-node first-deployment journal documents the
+worked example.</li>
+<li>Pre-SPEC-10 paths (e.g. <code>/var/lib/cosmix-jmap/</code>) SHALL be
+moved to SPEC 10 paths (<code>/var/lib/cosmix/maild/</code>) with chown
+to the registry user.</li>
+<li>Hand-rolled systemd units SHALL be replaced by the canonical
+units from the tarball.</li>
+</ul>
+<h3 id="c3-what-is-not-migrated-by-ns-40">C.3 What is NOT migrated by NS 4.0</h3>
+<ul>
+<li>The cosmix desktop user (NS 3.0 <code>cosmix</code> UID 1001 in the
+daily-driver convention) — out of scope.</li>
+<li>NetServa vhost users — out of scope.</li>
+<li>COSMIC desktop, fonts, themes, etc. — out of scope.</li>
+<li>Operator SSH key material — operator-managed.</li>
+</ul>
+<hr />
+<h2 id="appendix-d-changes-to-this-specification">Appendix D. Changes to this Specification</h2>
+<h3 id="100-rc1--2026-05-09">1.0.0-rc.1 — 2026-05-09</h3>
+<p>Initial publication, release-candidate 1. Establishes the NS 4.0
+package set, tarball layout, MANIFEST and integrity envelope,
+host preconditions (including the host-side minisign-first
+bootstrap-trust path in §3.4.1 and the layered WG-or-loopback
+bind policy with single-edge opt-in in §4.4), the 12-phase
+install procedure with stop-before-mutate transaction boundary
+in §7.1, the Mix installer contract (<code>ns4-install.mix</code>, §6),
+upgrade / rollback / phase-N abort recovery semantics (§7),
+sysadm boundary, NS 3.0 vhost coexistence rule, three
+conformance levels with CT-effective degradation handling, and
+14 CI lint invariants (L3 / L7 / L14 deferred until installer
+source materialises per §6.6).</p>
+<p>Target distribution: Debian 13 Trixie, amd64.</p>
+<p><code>1.0.0</code> (production cut) is reserved for the revision in which
+the §6.6 / Appendix A pending list is fully cleared and L3 / L7 /
+L14 become hard gates. Release-candidate revisions
+(<code>1.0.0-rc.N</code>) accumulate fixes from the cooperation-loop review
+cycle until that condition holds.</p>
+<hr />
+<p>© 2026 the project maintainer / Cosmix Project. Licensed under the same terms
+as the Cosmix repository (LICENSE).</p></div></div>
     </div>
 
 </main>
@@ -620,6 +2276,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +2330,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +2459,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

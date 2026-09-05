@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/cosmix-lib-mix/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,124 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/cosmix-lib-mix/README.md"><div class="prose"><h1 id="cosmix-lib-mix">cosmix-lib-mix</h1>
+<p><code>cosmix-lib-mix</code> is the embeddable Rust implementation of the Mix language: it tokenises, parses, analyses, and evaluates Mix source, exposes the Mix value and error models, and supplies host seams for Bus and other mediated services. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it is the Mix execution layer: Bus-facing behaviour enters through injected traits, while higher-level Cos components can embed the evaluator without moving protocol or daemon dependencies into this crate.</p>
+<p>The Cargo package is <code>cosmix-lib-mix</code>. The Rust library name is <code>cosmix_mix</code>.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-rust">use cosmix_mix::{MixResult, run_capturing};
+
+async fn evaluate() -&gt; MixResult&lt;()&gt; {
+    let (_value, stdout, stderr) =
+        run_capturing("print(1 + 2)\n").await?;
+
+    assert_eq!(stdout, "3\n");
+    assert!(stderr.is_empty());
+    Ok(())
+}
+</code></pre>
+<p>For strict Mix data:</p>
+<pre><code class="language-rust">use cosmix_mix::{MixResult, parse_data};
+
+fn load_data() -&gt; MixResult&lt;String&gt; {
+    let value = parse_data(r#"{service: "alpha", retries: 3}"#)?;
+    value.to_mix_data_string()
+}
+</code></pre>
+<h2 id="entry-points">Entry points</h2>
+<table><thead><tr><th>Item</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>run(source)</code></td><td>Tokenises, parses, and evaluates Mix source with a new default <code>Evaluator</code>.</td></tr>
+<tr><td><code>run_capturing(source)</code></td><td>Evaluates source and returns the result value plus captured stdout and stderr.</td></tr>
+<tr><td><code>parse_data(source)</code></td><td>Parses only the literal-data subset and returns a <code>Value</code>.</td></tr>
+<tr><td><code>parse_data_file(path)</code></td><td>Reads a Mix data file and applies <code>parse_data</code>.</td></tr>
+<tr><td><code>Lexer::tokenize</code></td><td>Converts source text into spanned tokens.</td></tr>
+<tr><td><code>Parser::parse_program</code></td><td>Converts tokens into a statement AST.</td></tr>
+<tr><td><code>Parser::parse_data</code></td><td>Parses tokens under strict-data rules.</td></tr>
+<tr><td><code>analyzer::analyze</code></td><td>Produces conservative semantic diagnostics and a capability inventory.</td></tr>
+<tr><td><code>Evaluator::execute</code></td><td>Executes parsed statements in a configured evaluator.</td></tr>
+</tbody></table>
+<p><code>parse_data</code> accepts scalar literals, lists, maps, and nested combinations. It rejects variable reads, calls, messaging, shell execution, interpolation, control flow, and arithmetic with <code>MixError::StrictDataViolation</code>.</p>
+<p><code>Value::to_mix_data_string</code> and <code>Value::to_mix_data_string_pretty</code> emit strict-data text that can be parsed again. Human-oriented <code>Value::write_mix</code> output is a separate format and is not the strict-data round-trip path.</p>
+<h2 id="evaluator">Evaluator</h2>
+<p><code>Evaluator</code> is the configurable interpreter host. <code>Evaluator::new</code> uses normal process output; <code>Evaluator::with_output</code> accepts separate <code>Write</code> sinks. <code>SharedBuf</code> provides an in-memory sink for captured bytes.</p>
+<p>The evaluator supports:</p>
+<ul>
+<li>async native extensions through <code>ExtFn</code>, <code>sync_ext</code>, and <code>Evaluator::register</code>;</li>
+<li>global injection and lookup through <code>set_global</code> and <code>get_global</code>;</li>
+<li>source identity, tracing, usage statistics, and prelude loading;</li>
+<li>compatible or strict function arity through <code>ArityMode</code>;</li>
+<li>recursion, wall-clock, list, map, and string limits through <code>EvalLimits</code>;</li>
+<li>builtin authority checks through <code>CapabilityPolicy</code>;</li>
+<li>Bus, database, JMAP, delegated Bus-call, shell, and serve-runtime host traits;</li>
+<li>direct event dispatch and an incoming Bus event pump.</li>
+</ul>
+<p>The default capability policy is permissive. <code>CategoryAllowList</code> allows pure builtins plus selected <code>CapabilityClass</code> values: <code>fs-read</code>, <code>fs-write</code>, <code>network</code>, <code>process</code>, <code>env</code>, <code>db</code>, <code>jmap</code>, and <code>bus</code>.</p>
+<p>The capability policy is an in-process robustness boundary for trusted embedded scripts. It is not process isolation for untrusted code.</p>
+<p><code>EvalLimits</code> checks wall-clock time at statement polls. A single blocking builtin cannot be interrupted in the middle of its blocking operation.</p>
+<h2 id="host-seams">Host seams</h2>
+<p><code>BusHandler</code> connects language-level messaging to a host. It covers request/reply sends, fire-and-forget emits, port checks, incoming events, service registration, topic subscription, correlated replies, and reconnect requests.</p>
+<p><code>BusCallHandler</code> backs the scoped <code>bus_call(verb, args)</code> builtin. The host chooses the reachable verbs and supplies trusted delegation context; the script supplies only the verb and arguments.</p>
+<p><code>DbHandler</code> backs <code>db_query</code> and <code>db_exec</code> with positional bind values. Queries return lists of row maps. Executions return a map containing affected-row and last-insert information.</p>
+<p><code>JmapHandler</code> backs JMAP method batches and blob uploads without exposing network credentials or an arbitrary destination to the script.</p>
+<p><code>ShellHandler</code> classifies, validates, and executes shell lines when a host enables mixed <code>source</code> handling. Without a registered handler, sourced files retain strict Mix semantics.</p>
+<p><code>ServeRuntime</code> handles runtime-reserved Bus verbs before author-defined handlers. It returns <code>ReservedOutcome</code> values containing a Bus return code, response body, and graceful-quit flag.</p>
+<p>The evaluator and its boxed host futures use single-threaded <code>Rc</code> and <code>RefCell</code> state. Host implementations are therefore not required to return <code>Send</code> futures.</p>
+<h2 id="values-and-errors">Values and errors</h2>
+<p><code>Value</code> represents strings, numbers, booleans, lists, maps, functions, raw bytes, mutable byte buffers, and <code>nil</code>. Lists, maps, and raw bytes use reference-counted copy-on-write storage. Buffers use shared reference semantics, so mutations are visible through aliases.</p>
+<p><code>MixError</code> covers lexing, parsing, strict-data, and runtime failures. <code>MixResult&lt;T&gt;</code> is the crate result alias. Structured runtime errors use stable codes, optional details, source spans, and traceback frames through <code>ErrorInfo</code>.</p>
+<p><code>IndexMap</code> is re-exported so embedders can construct the ordered map used by <code>Value::Map</code> without coupling to a separate <code>indexmap</code> version.</p>
+<h2 id="builtin-discovery-and-policy">Builtin discovery and policy</h2>
+<p><code>builtins</code> contains the builtin registry and dispatch implementation. <code>builtins_hof</code> contains async higher-order builtins that can call back into Mix functions.</p>
+<p>Every builtin has a <code>BuiltinInfo</code> and <code>BuiltinContract</code>. The contract records arguments, return shape, effect flags, operational-failure behaviour, conditional capabilities, and any non-contiguous accepted arities. <code>BuiltinInfo::signature</code> derives a human-readable signature from this metadata.</p>
+<p><code>capability_category</code>, <code>conditional_capabilities</code>, <code>conditional_cap_engaged</code>, and <code>builtin_info_of</code> expose the registry to embedders. <code>CategoryAllowList</code> is the supplied class-based policy.</p>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Surface</th></tr></thead><tbody>
+<tr><td><code>analyzer</code></td><td>Semantic diagnostics, analyzer configuration, and script capability inventory.</td></tr>
+<tr><td><code>ast</code></td><td>Expression, statement, function-body, operator, and assignment-path nodes.</td></tr>
+<tr><td><code>builtin_info</code></td><td>Builtin metadata, contracts, type shapes, effects, and signature rendering.</td></tr>
+<tr><td><code>builtins</code></td><td>Core builtin dispatch, metadata tables, capability classes, and helpers.</td></tr>
+<tr><td><code>builtins_hof</code></td><td>Higher-order builtin registry with evaluator callbacks.</td></tr>
+<tr><td><code>error</code></td><td>Source spans, structured error information, traceback frames, and <code>MixError</code>.</td></tr>
+<tr><td><code>evaluator</code></td><td>Interpreter, limits, extensions, host traits, event handling, and output capture.</td></tr>
+<tr><td><code>interrupt</code></td><td>Process-wide SIGINT cooperation for evaluator and blocking builtin polling.</td></tr>
+<tr><td><code>lexer</code></td><td>Source tokenizer.</td></tr>
+<tr><td><code>parser</code></td><td>Program and strict-data parser.</td></tr>
+<tr><td><code>scope</code></td><td>Variables, functions, call frames, and scope storage.</td></tr>
+<tr><td><code>stats</code></td><td>Session and language-usage counters.</td></tr>
+<tr><td><code>token</code></td><td>Tokens, spanned tokens, and interpolated string parts.</td></tr>
+<tr><td><code>value</code></td><td>Runtime value representation and Mix data serialisation.</td></tr>
+<tr><td><code>json</code></td><td>JSON conversion when the <code>json</code> feature is enabled.</td></tr>
+<tr><td><code>jq</code></td><td>Embedded jq-compatible filtering when the <code>json</code> feature is enabled.</td></tr>
+<tr><td><code>serde_de</code></td><td>Serde deserialisation from <code>Value</code> when the <code>serde</code> feature is enabled.</td></tr>
+<tr><td><code>serde_ser</code></td><td>Serde serialisation to <code>Value</code> and <code>.conf.mix</code> text when <code>serde</code> is enabled.</td></tr>
+</tbody></table>
+<h2 id="cargo-features">Cargo features</h2>
+<p>The default feature set is empty. Tokio remains an unconditional dependency because evaluator task, synchronisation, timer, and macro APIs are part of the core implementation.</p>
+<table><thead><tr><th>Feature</th><th>Adds</th></tr></thead><tbody>
+<tr><td><code>default</code></td><td>No optional features.</td></tr>
+<tr><td><code>json</code></td><td>JSON conversion, JSON and JSONL builtins, jq filtering, and JSON-backed stats helpers.</td></tr>
+<tr><td><code>regex</code></td><td><code>re_match</code>, <code>re_find</code>, <code>re_replace</code>, and <code>re_split</code> (subject first); without it <code>grep_lines</code> falls back to a per-line substring test. The pattern-first regex_* names were deleted in 0.73.0.</td></tr>
+<tr><td><code>markdown</code></td><td>Safe CommonMark and GFM rendering through <code>markdown</code>; raw HTML is escaped and dangerous URL schemes are neutralised.</td></tr>
+<tr><td><code>toml</code></td><td><code>toml_parse</code> and <code>toml_encode</code>.</td></tr>
+<tr><td><code>serde</code></td><td>Serde <code>Deserializer</code> and <code>Serializer</code> bridges for <code>Value</code> and strict <code>.conf.mix</code> text.</td></tr>
+<tr><td><code>datetime</code></td><td>Date parsing and formatting, ISO timestamps, duration formatting, and relative time.</td></tr>
+<tr><td><code>url</code></td><td>Structured URL parsing through <code>url_parse</code>.</td></tr>
+<tr><td><code>crypto</code></td><td>Base64, BLAKE3, SHA-256, HMAC-SHA-256, constant-time comparison, file hashing, and UUID generation.</td></tr>
+<tr><td><code>http</code></td><td>HTTP GET, POST, and general request builtins with web roots and optional PEM CA loading.</td></tr>
+<tr><td><code>sqlite</code></td><td>Direct SQLite open, execute, and close builtins.</td></tr>
+<tr><td><code>tokio-sleep</code></td><td>Backwards-compatible feature alias; it adds no dependency or code gate.</td></tr>
+<tr><td><code>dkim</code></td><td>RSA-2048 and Ed25519 DKIM key generation plus DNS TXT record text.</td></tr>
+<tr><td><code>datastar</code></td><td>Datastar element patches, signal patches, and SSE serialisation; also enables <code>json</code>.</td></tr>
+<tr><td><code>xml</code></td><td>Strict XML parsing in simple or full-fidelity tree mode. It is not an HTML parser.</td></tr>
+</tbody></table>
+<h2 id="analysis">Analysis</h2>
+<p>The semantic analyzer sits between parsing and evaluation and can be used without the command-line frontend. It reports definitely undefined variables and callables, arity mismatches, duplicate declarations, unreachable statements, discarded must-use results, and statically resolvable <code>require</code> failures.</p>
+<p><code>AnalyzerConfig</code> declares host-provided globals and functions. <code>Analysis</code> returns diagnostics plus the capability classes used by the script. The analyzer favours very low false-positive rates for dynamic language constructs.</p>
+<h2 id="testing-support">Testing support</h2>
+<p>The crate contains unit and integration coverage for parsing, evaluation, strict data, limits, capabilities, host seams, structured errors, and optional builtins.</p>
+<p>The nested <code>fuzz</code> workspace supplies <code>fuzz_lex</code> and <code>fuzz_parse</code> libFuzzer targets. It runs on demand with a nightly Rust toolchain and is not part of the parent workspace's normal test gate.</p>
+<h2 id="package-limits">Package limits</h2>
+<p>This package defines no binary target, command-line subcommands, command-line configuration, daemon process, or standalone configuration loader. Those surfaces belong to hosts that embed <code>cosmix_mix</code>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +736,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +790,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +919,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

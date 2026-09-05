@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/indexd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,66 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/indexd.md"><div class="prose"><h1 id="cosmix-indexd--vector-knowledge-base--indexer">cosmix-indexd — vector knowledge base + indexer</h1>
+<p><strong><code>cosmix-indexd</code> is the mesh's semantic memory: it embeds markdown into
+vectors, stores them in SQLite, and answers similarity search — so an agent can
+recall docs, journals, and skills by meaning rather than keyword.</strong> It
+auto-indexes workspaces on commit, keeping recall fresh without a manual step.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>A long-running Rust daemon that runs a text-embedding model
+(<code>nomic-embed-text-v1.5</code>, via <a href="https://github.com/huggingface/candle">candle</a>)
+in-process and keeps a vector store in SQLite. It is the retrieval backend
+behind the knowledge loop: the <code>context_search</code> an agent runs before a task,
+and the skills/docs/journal recall the <a href="/cos/mcp">mcp</a> bridge exposes.</p>
+<p>Content is chunked by markdown section, embedded, and stored with source
+metadata (<code>_doc</code>, <code>_journal</code>, <code>_memory</code>, <code>_plan</code>, <code>_spec</code>). Search embeds the
+query the same way and returns the nearest chunks by cosine distance.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>Embed + store</strong> markdown chunks as L2-normalised vectors in SQLite.</li>
+<li><strong>Semantic search</strong> — nearest-neighbour recall over stored chunks, filtered by source type or metadata, top-<code>k</code> by distance.</li>
+<li><strong>Auto-index on commit</strong> — a git post-commit hook calls <code>indexd.index_file</code> per changed file, so a workspace re-indexes incrementally as it changes (never a full re-index).</li>
+<li><strong>Incremental single-file indexing</strong> — <code>index_file</code> splits, embeds, and upserts one file; a background mode enqueues it fire-and-forget.</li>
+<li><strong>Model lifecycle</strong> — loads the embedding model on demand and can unload to return RSS to the OS.</li>
+</ul>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-indexd
+</code></pre>
+<p>Runs under systemd as <code>cosmix-indexd.service</code> (identity <code>User=cosmix-indexd</code>).
+Config loads from <code>/etc/cosmix/indexd/config.conf.mix</code> (system) or the XDG
+user path (the legacy <code>.toml</code> fallback was removed). The daemon also listens on
+a Unix socket (<code>embed.sock</code>, path from config) for a raw embedding API used by
+in-process consumers, alongside the Bus surface. The embedding model is fetched
+and cached via the Hugging Face hub cache on first use.</p>
+<h2 id="interfaces">Interfaces</h2>
+<ul>
+<li><strong>Bus service <code>indexd</code></strong> — registered on the local broker.</li>
+</ul>
+<table><thead><tr><th>Verb</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>indexd.search</code></td><td>semantic search: <code>{query, limit, ...}</code> → ranked chunks</td></tr>
+<tr><td><code>indexd.index_file</code></td><td>embed + store one file: <code>{path}</code></td></tr>
+<tr><td><code>indexd.props.{list,get,watch}</code></td><td>SPEC-12 property surface</td></tr>
+</tbody></table>
+<ul>
+<li><strong>Unix socket</strong> (<code>embed.sock</code>) — a local embedding API for direct consumers.</li>
+</ul>
+<p>Example Bus call:</p>
+<pre><code class="language-text">bus_call("indexd", "indexd.search", {"query": "mesh DNS zones", "limit": 5})
+</code></pre>
+<h2 id="where-it-fits">Where it fits</h2>
+<p>Depends on <code>cosmix-lib-config</code>, <code>cosmix-lib-props-store</code> (SPEC-12 state), and
+<code>cosmix-lib-daemon</code>, plus candle + a SQLite backend. It registers on the local
+<a href="/cos/noded">cosmix-noded</a> broker. The <a href="/cos/mcp">cosmix-mcp</a> bridge is its main
+client — <code>context_search</code>, <code>skills_*</code>, and the <code>*_feedback</code> tools all route
+through indexd — and git hooks in indexed workspaces call it directly.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/mcp">mcp</a> — the Claude Code bridge that drives indexd's recall + skills</li>
+<li><a href="/cos/noded">noded</a> — the Bus broker indexd registers with</li>
+<li><a href="/cos/libraries">libraries</a> — <code>cosmix-lib-skills</code>, <code>cosmix-lib-props-store</code></li>
+<li><a href="/cos/overview">overview</a> — the daemon family at a glance</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +678,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +732,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +861,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

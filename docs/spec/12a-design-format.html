@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/12a-design-format</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,1038 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/12a-design-format.md"><div class="prose"><h1 id="resolved-design-format--retained-contract">Resolved Design Format — Retained Contract</h1>
+<p><strong>UI-FORMAT-001 — Retained design-format contract.</strong> The following sections preserve the exact v1 source, crosswalk, colour, mapping, typography, state, ownership, override, derivation, apply and conformance rules from the design-system contract. Section numbers are local and remain stable for existing clause references. This appendix supplies the detailed requirements behind the <a href="/spec/12-toolkit-apps">toolkit chapter</a>; its rules are not waived by that chapter's shorter summary.</p>
+<p>Baseline source inspected: <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. Retained intent and implementation evidence are separate: claims below about required gates, migration slices, entire-desktop scope and older shipped versions do not establish that all are implemented or passed at this baseline. In particular the CTK adapter pins normal contrast/no app overlay, and complete non-button family migration has not been attested. No test run is claimed by this publication.</p>
+<p>The historical chapter number is 19; it is not remapped to numeric distribution ID 12. Original decision numbers identify prior accepted design choices, not missing runtime fields. Internal project decision links were omitted from the introduction; the format requirements themselves are preserved. Reassessing a requirement requires an explicit amendment, not an inference from current code.</p>
+<h2 id="1-source-format-and-versioning">§1 Source format and versioning</h2>
+<p>1.1 The design source is <code>.mix</code> strict-data. It is DTCG-<em>shaped</em> —
+groups, aliases, explicit types, composite records — but the encoding is
+ours (Adobe precedent: borrow the shape, own the encoding). No JSON, no
+CSS, no new DSL; the existing strict-data loader parses it.</p>
+<p>1.2 The source MUST carry an explicit integer schema version field.
+Today's <code>ThemeFile</code> has none and ignores unknown fields; that behaviour
+is grandfathered as <strong>v0</strong>. All content defined by this chapter is <strong>v1</strong>
+and MUST live under versioned sections that a v0 reader never parses.</p>
+<p>1.3 <strong>Mixed-version policy (honest by construction).</strong> A genuinely old
+v0 reader cannot report a version gap — it predates the version field.
+The policy therefore leans on structure, not detection:</p>
+<ul>
+<li>the v0 subset stays present and authored for the whole compatibility
+window (decision 7 — no flag-day);</li>
+<li>readers roll out before writers;</li>
+<li>only upgraded readers report the version gap (via §11's
+<code>DesignCompileStatus</code>).</li>
+</ul>
+<p>1.4 <strong>v0↔v1 equivalence gate.</strong> The compiler MUST verify, fatally on
+drift, that the v0 subset and the v1 source resolve to the same values.
+The equivalence relation is normative and fully computable:</p>
+<ul>
+<li><strong>Compared field set (frozen here):</strong> every field the shipped v0
+reader consumes — the colour fields <code>surface</code>, <code>panel</code>,
+<code>master_panel</code>, <code>track</code>, <code>control</code>, <code>control_active</code>, <code>thumb</code>,
+<code>meter_green</code>, <code>meter_amber</code>, <code>meter_red</code>, <code>text</code>, <code>text_dim</code>,
+<code>border</code>, <code>row_hover</code>, <code>row_selected</code>, <code>row_selected_text</code>,
+<code>row_selected_text_dim</code>, <code>scrim</code>, <code>danger_surface</code>; the metric fields
+<code>control_gap</code>, <code>corner_radius</code>, <code>fader_width</code>, <code>fader_height</code>,
+<code>knob_size</code>, <code>meter_width</code>; and the selection/typography fields
+<code>scheme</code>, <code>mode</code>, <code>typography.family</code>, <code>typography.body_px</code>. Fields a
+v0 reader ignores are outside the relation.</li>
+<li><strong>Crosswalk (source-authored, compiler-enforced):</strong> the v1 source
+carries a <code>v0_crosswalk</code> section mapping <strong>every</strong> field above to one
+v1 expression — a token reference, one half of a pair, a component
+mapping cell, a metric reference, or (for <code>scheme</code> and <code>mode</code>) a
+<strong>modifier-axis selection</strong> naming the §11.2 axis whose selected
+value the v0 string must match (e.g. whether v0 <code>surface</code> equals v1
+<code>base</code> or <code>card</code> is decided <em>in that section</em>, not by implementation
+judgement). A compared field with no crosswalk row, or a crosswalk
+row naming a field outside the set, is <strong>fatal</strong>. The crosswalk is
+comparison data only — it is not a token tier and nothing may
+reference it.</li>
+<li><strong><code>corner_radius</code> is not a radius step.</strong> v0's <code>corner_radius</code> is
+5 px and §2.2's derived scale at the shipped base is <code>2/4/6/10</code>, so
+no step equals it. That is not a defect in either: v0 carries
+<code>corner_radius</code> alongside its radius scale as a separate knob, and
+the compatibility window demands the old value exactly. Its crosswalk
+row therefore names a v1 metric of its own for the duration of the
+window; a crosswalk that reaches for the nearest step would move a
+shipped dimension in the name of tidiness.</li>
+<li><strong>Absence rule:</strong> the v0 subset MUST be fully authored for the whole
+window — a compared field absent from the v0 block is <strong>fatal</strong> (an
+absent field would fall back to a v0 reader's compiled-in default,
+which the gate cannot see).</li>
+<li><strong>Compared context:</strong> v0 predates the contrast axis and per-app
+overlays, so the gate compares the v0 block against the v1 resolution
+under the crosswalked <code>scheme</code> + <code>mode</code> with <code>contrast: normal</code> and
+<strong>no</strong> per-app overlay — the only context v0 can represent. Other
+contexts are outside the relation.</li>
+<li><strong>Conversion pipeline:</strong> v1 OKLCH → gamut-map → sRGB → quantise to
+the 8-bit representation v0 stores (§3.2's order).</li>
+<li><strong>Tolerance:</strong> colours byte-exact after quantisation; metrics —
+<code>typography.body_px</code> included — exact in px; <code>typography.family</code>
+byte-equal as a string; <code>scheme</code> and <code>mode</code> byte-equal between the v0
+string and the identifier of the selected v1 modifier-axis value
+(§11.2's axes).</li>
+</ul>
+<p>"Equivalent" is thereby a computable predicate, not judgement:
+independent implementations of this relation agree by construction.
+Conformance is one implementation plus a fixture suite covering every
+crosswalk row, both sides of at least one quantisation boundary, and —
+proving the compared-context pin — at least one fixture in which high
+contrast and at least one in which a per-app overlay <em>would</em> alter a
+compared field, passing only because the gate compares the normal,
+unoverlaid context.</p>
+<p>1.5 The v0 block is legacy-format and exempt from v1 authoring rules
+(including §3.1's hex prohibition). The exemption dies with the window.</p>
+<p>1.6 <strong>Modifier blocks — the authoring form of §11.2's axes.</strong> The base
+source declares unmodified values; each context is authored as a
+<strong>modifier block</strong> whose <code>when</code> names one or more axis values it applies
+under, carrying only the token paths it changes. Blocks are sparse by
+construction: a modifier that restates a base value unchanged is a lint
+warning — §2.5's no-ceremonial-indirection rule applied to contexts.</p>
+<ul>
+<li>The axes and their values are fixed by §11.2 and are not open for a
+source to extend: <code>scheme</code> (ocean|crimson|stone|forest|sunset|mono),
+<code>mode</code> (light|dark), <code>contrast</code> (normal|high), and the per-app
+overlay.</li>
+<li><code>resolution_order</code> lists the axes in the order they layer, and the
+compiler MUST hold the source to it. An axis named in
+<code>resolution_order</code> by no <code>when</code> anywhere is <strong>fatal</strong>; a <code>when</code>
+naming an axis absent from <code>resolution_order</code> is <strong>fatal</strong>. A source
+may not claim an axis it does not implement — §1.3's
+honest-by-construction rule applied to contexts, and the reason it is
+fatal rather than a warning is that a claimed-but-unauthored axis
+resolves silently to the base values and so looks like a working
+theme.</li>
+<li><strong>A <code>when</code> MAY name a conjunction of axis values, and for the shipped
+palettes it MUST.</strong> The 6 × 2 <code>scheme</code> × <code>mode</code> product is not
+factorable: dark <code>palette.background.1</code> is not one value across the
+six schemes, light is not one value across the two modes, and
+splitting the colour into per-component paths does not rescue it
+either. Single-axis layering therefore cannot express the palettes
+§11.2 requires be shared verbatim with the web design system, which
+is a property of the palettes rather than of any encoding chosen for
+them.</li>
+<li><strong>Precedence is by specificity, not by document order.</strong> Every block
+selected by the compiled context applies in ascending order of its
+<strong>specificity key</strong> — the number of axis values its <code>when</code> names,
+then the position in <code>resolution_order</code> of the last axis it names —
+each later block overwriting only the paths it names. Two selected
+blocks with the same key writing the same token path are a <strong>compile
+error</strong>: the same more-specific-wins, ambiguity-is-fatal rule §4.3
+states for mappings, so the system has one specificity law and not
+two. Because ties are fatal, the sort is total and the resolved value
+never depends on where a block sits in the file.</li>
+<li>Modifiers compose by layering — a mode layers on a scheme, a
+scheme × mode block on both, high contrast above those, a per-app
+overlay last. Composition is total: every point of the axis product
+MUST resolve, and §3.4's gate ranges over every reachable point, not
+merely the default one.</li>
+<li>Only the primitive and semantic tiers are modifiable. A modifier
+block MUST NOT alter a family mapping: variant/size structure is
+Rust-owned (§4) and does not vary by context. Dark mode changes what
+a token is worth, never which variants exist.</li>
+</ul>
+<h2 id="2-token-tiers-pairs-and-reference-rules">§2 Token tiers, pairs, and reference rules</h2>
+<p>2.1 <strong>Two tiers, mandatory:</strong> primitive and semantic. A component <em>token</em>
+tier exists only by written exception recorded in the source (the
+component <strong>mapping</strong> tier of §4 is not a token tier).</p>
+<p>2.2 <strong>Primitives</strong> are the palette anchors and the metric scale bases.
+Revision-1 colour primitives are the web-shared <strong>role anchors</strong> —
+<code>palette.background.1</code>, <code>palette.background.2</code>, <code>palette.background.3</code>,
+<code>palette.foreground.default</code>, <code>palette.foreground.muted</code>,
+<code>palette.accent.default</code>, <code>palette.accent.hover</code>, the mode-dependent
+<code>status.success</code>, <code>status.warning</code>, <code>status.danger</code>, and <code>transparent</code>
+— authored in OKLCH (§3) and shared <strong>verbatim</strong> with the web design
+system (§11.2). The names are a source-format wire contract on the same
+footing as §2.4's semantic vocabulary: an authored theme references them
+by string, so renaming one is a format break. A later source revision
+MAY introduce Radix-model 12-step hue ramps with semantically assigned
+step roles (1–2 backgrounds, 3–5 fills, 6–8 borders, 9–10 solids, 11–12
+text); revision 1 MUST NOT synthesise unshared intermediate values,
+because the web palette publishes seven role anchors per context and a
+synthesised eighth is a desktop-only colour that the verbatim claim
+would then silently cover.</p>
+<p>Metric primitives comprise an <strong>authored</strong> spacing scale, an <strong>authored</strong>
+type scale, and a required <code>px</code> base metric named <code>radius</code>. After
+modifier flattening (§11.2) and before any <code>step</code> is resolved, the
+compiler derives the <code>radius</code> scale in <code>sm, md, lg, xl</code> order as
+<code>max(base−4, 0) / max(base−2, 0) / base / base+4</code> — the shipped
+<code>RadiusScale</code> arithmetic, clamp included. A source MUST NOT author a
+scale named <code>radius</code>, in its base or in any modifier block: authoring
+both the knob and the scale is precisely the desynchronisation the
+single knob exists to prevent, and a source that names both has stated
+two answers with no rule to choose between them. Single-knob derivation
+is normative <strong>for radius</strong>; it is not a general law over scales, and
+the authored spacing and type scales are not defects awaiting a knob. A
+scale earns a knob only by amendment to this chapter, which must state
+the knob's name, the exact multipliers and their order, whether
+authoring the scale becomes forbidden, and the §15 gate that holds it.</p>
+<p>2.3 <strong>Semantic tokens that carry text are authored as atomic pairs</strong>:
+surface and foreground declared together, repointed together, validated
+together (§3.4). There is no free-standing "background" semantic token
+where text can sit on it.</p>
+<p>2.4 <strong>The v1 semantic vocabulary is closed</strong> and is <em>shadcn-derived</em>
+(standing rule: CTK follows shadcn semantics), with two documented
+deviations — <code>base</code> replaces shadcn's <code>background</code> (so every pair is
+uniformly <code>&lt;name&gt;</code> + <code>&lt;name&gt;.foreground</code>), and <code>destructive</code> carries an
+explicit authored foreground rather than an implied one (§2.3 admits no
+foreground-less text surface):</p>
+<ul>
+<li>pairs: <code>base</code>, <code>card</code>, <code>popover</code>, <code>primary</code>, <code>secondary</code>, <code>muted</code>,
+<code>accent</code>, <code>destructive</code> (each <code>&lt;name&gt;</code> + <code>&lt;name&gt;.foreground</code>);</li>
+<li><strong>non-text colour tokens:</strong> <code>border</code>, <code>input</code>, <code>ring</code> — lone colours
+by design, carrying no text-contrast claim. The compiler MUST reject
+a non-text token in any text-bearing position (§10.3's positional
+discipline applies to tokens, not just derivations); <code>ring</code> carries
+its own non-text contrast obligation (§3.5);</li>
+<li>metric bases: <code>radius</code> (the single knob, whose scale the compiler
+derives — §2.2), the authored spacing scale, the authored type scale
+(§5).</li>
+</ul>
+<p>Extension is by exception process (source-recorded rationale + this
+chapter amended), never ad hoc. The audio-console <code>ctk.*</code> names migrate
+onto this vocabulary with an alias window through migration slice 3
+(decision 4); console names survive only as mapping-internal names where
+genuinely domain-specific.</p>
+<p>2.5 <strong>References flow strictly downward:</strong> component mapping → semantic
+→ primitive. A semantic token MUST NOT reference a mapping; a primitive
+MUST NOT reference anything. §2.2's radius derivation is not a
+counter-example: the generated scale's dependency on the <code>radius</code> metric
+is compiler law, not an authored reference, and no source expresses it. A semantic token that merely renames one
+primitive one-for-one is a lint warning (no ceremonial indirection).</p>
+<p>2.6 Aliases resolve only after modifier-context flattening (§11.2).
+Cycles are fatal.</p>
+<p>2.7 <strong>Every metric value carries an explicit unit.</strong> A bare number is
+<strong>fatal</strong> wherever a metric is authored. Three kinds ship, and the set
+is closed — it extends only by amending this chapter:</p>
+<ul>
+<li><code>px</code> — a device-independent pixel length (control heights, padding,
+border widths, radii);</li>
+<li><code>step</code> — an index into a named scale (the type scale, the spacing
+scale, the derived radius scale), resolved to <code>px</code> through that scale
+at compile time;</li>
+<li><code>ratio</code> — a dimensionless multiplier or fraction, such as the lift
+amounts §10's derivations consume.</li>
+</ul>
+<p>Without the tag §9.6's type-preservation rule is unenforceable: an
+untyped metric map cannot tell a 28 px control height from a 0.04 lift
+fraction, so nothing can reject an override that swaps one for the
+other, and the failure is silent — a fraction read as a length yields a
+zero-height control, not an error. The compiler MUST reject a reference
+that uses a metric where a different kind is expected, with one
+consequence of the definitions above rather than an exception to them: a
+<strong>length</strong> position accepts <code>px</code> or <code>step</code>, because a <code>step</code> <em>is</em> a px
+length once its scale has resolved it, and a scale step is the authoring
+form §9.5 asks metric overrides to prefer. Refusing it there would
+forbid the scale from reaching the dimensions it exists to set. <code>ratio</code>
+never satisfies a length position and no length ever satisfies a
+position that requires a <code>step</code> — those are the confusions the closed
+set is for. The compiler MUST also reject
+an override whose replacement carries a different kind from the value
+it overrides. The resolved artifact stores px; provenance records the
+step or ratio the px came from, so §14 introspection can still name the
+authored quantity.</p>
+<p>A <strong>source number denotes its parsed double</strong>, not its decimal lexeme.
+Every rule in this specification that constrains a numeric value —
+non-negative, finite, integral, within a bound — is a rule about the
+double the source parsed to, and a compiler MUST NOT be expected to
+distinguish two lexemes that parse to it alike. So <code>5.0000000000000001</code>
+in a step index <em>is</em> the index 5 and is accepted; <code>-1e-400</code> <em>is</em> zero
+and satisfies non-negative; and any decimal at or above 2^53 is refused
+outright, because above that bound a double no longer separates
+consecutive integers and the compiler cannot know which index was
+written. That last one is a refusal to guess, not a judgement that the
+index is implausible.</p>
+<p>This is what the substrate's strict-data format already does — <code>*.mix</code>
+numbers are doubles and nothing downstream retains the lexeme — so the
+rule is written down rather than introduced. The alternative, carrying
+the authored spelling through parsing so the compiler could reject a
+number that means exactly what a legal number means, would buy a
+diagnostic nobody wants at the cost of a numeric tower the rest of the
+substrate does not have.</p>
+<h2 id="3-colour-policy">§3 Colour policy</h2>
+<p>3.1 <strong>Authoring space is OKLCH</strong> with explicit colour-space annotation.
+Hex is never a v1 source value (v0 exempt per §1.5). Conversion to each
+delivery space happens per emitter; truth is stored once, in author
+space.</p>
+<p>3.2 <strong>Evaluation space is the delivery space.</strong> Contrast is measured
+after conversion and gamut-mapping into sRGB, in that defined order —
+never in author space. Gamut-mapping happens before any contrast
+measurement so the gate sees what the screen shows.</p>
+<p>3.3 <strong>Compositing honesty:</strong> a text-bearing pair MUST be opaque or MUST
+declare the backdrop it composites over; the declared composite is what
+the contrast gate measures. Translucency MUST NOT quietly lower rendered
+contrast below the measured value. Intentional-alpha tokens (scrims)
+remain legal where no text contrast claim attaches.</p>
+<p>3.4 <strong>The WCAG gate is a compile gate.</strong> Every authored pair, every
+reachable cell, and every <strong>admitted</strong> member of the override product
+(§9.4) <strong>whose output is a text-bearing pair</strong> MUST pass AA at compile
+time. That qualifier is not a loophole: §9.4's product walk is total
+over admitted substitutions, and each member is held to the
+postcondition its output kind declares, so a non-text member excused
+here is a member §9.4 sends to §3.5's 3:1 gate instead — not one that
+escapes. Text AA is the wrong measure for a focus ring, and a clause
+that demanded it of one would be failed by every conforming
+implementation. Failure is fatal per §11.5 — there
+is no silent substitution; the diagnostic <em>suggests</em> the guaranteed-AA
+black/white pair, and a human or agent applies it to the source. A
+declared §9.3 exclusion is not a failed contrast check, because the
+resolver cannot select it.</p>
+<p>3.5 <strong>Non-text contrast (the focus indicator is load-bearing).</strong> §3.4
+measures text pairs; <code>border</code>, <code>input</code>, and <code>ring</code> carry no text and
+need a different gate. <code>ring</code> declares its <strong>adjacency set</strong> in the
+source — the pairs whose surfaces it is drawn against — and MUST meet
+WCAG 1.4.11 non-text contrast (≥ 3:1) against every declared adjacent
+surface, measured in the same §3.2 pipeline; failure is <strong>fatal</strong> (an
+invisible focus indicator is an accessibility failure, not a taste
+choice). A family mapping using <code>ring</code> on a surface outside its
+declared adjacency set is a compile error. <code>border</code> and <code>input</code> SHOULD
+meet the same 3:1 against their adjacent surfaces; shortfall is a
+<strong>warning</strong> (decorative borders are legitimate; invisible focus is
+not).</p>
+<p>3.5.1 <strong>Adjacency is scoped to the authored mapping, not the override
+product.</strong> Ranging ring adjacency over every <code>PairRef</code> a §9 override
+could name would force every adjacency set to be universal, at which
+point declaring one carries no information. The rule runs the other way
+instead: the compiler checks <code>ring</code> against the surfaces the authored
+mapping actually draws it on, and treats a surface override landing on
+a ring-bearing cell as the checked object — an override that would
+place <code>ring</code> on a surface outside its declared adjacency set is
+rejected, at the same compile time and with the same fatality.
+Reachable coverage is identical either way; the difference is that the
+diagnostic points at the override that broke the contract rather than
+at an adjacency set no author could satisfy.</p>
+<p>3.5.2 <strong>Derived focus indicators.</strong> One lone <code>ring</code> value cannot satisfy
+§3.5 across the shipped contexts. A button family draws focus on at
+least four surfaces — secondary/control, primary, destructive, and the
+muted composite — and in every dark context the luminance window that
+clears 3:1 against the near-black background is disjoint from the one
+that clears it against the light accent: the requirement is infeasible,
+not merely unauthored, and no choice of hue changes that because
+contrast depends only on luminance. A family mapping's ring property
+therefore MAY name a registered <strong>non-text derivation</strong> —
+<code>focus_ring(colour, pair)</code>, the seed and the surface — in place of a
+lone token. The seed is an <strong>explicit typed argument</strong> (§10.4),
+conventionally the <code>ring</code> token itself, and deliberately not a hidden
+read of it: §10.5 admits exactly one compiler-supplied implicit input
+(<code>mode</code>), and a derivation whose result depended on an undeclared token
+could not be re-executed from the retained recipe under §10.2, because
+the resolver would have to consult a dependency the recipe never
+recorded. Naming the seed also puts it where an agent reading the
+mapping can see what the indicator walks away from. Such a derivation
+carries a <strong>non-text contrast postcondition</strong>: ≥ 3:1 against the
+resolved surface of the pair it is called with, measured in the §3.2
+pipeline, evaluated eagerly into its cell per §10.2. A derived ring
+declares no adjacency set; the postcondition is its obligation,
+discharged per cell where the value is produced rather than per
+declaration. Lone <code>ring</code> tokens remain legal and remain governed by
+§3.5 and §3.5.1.</p>
+<p><strong>The pair is the sole substitutable slot; the seed is fixed.</strong> §10.2
+allows a signature zero or one substitutable slot, and for <code>focus_ring</code>
+that slot MUST be the pair. The two wrong answers are both reachable by
+a legal registry entry and both silently wrong. Declaring <em>no</em> slot
+means an override that moves a cell from <code>secondary</code> to <code>primary</code> does
+not re-execute the ring: the indicator stays the one computed against
+<code>secondary</code>, is never re-checked, and can sit below 3:1 on the surface
+actually painted. Declaring the <em>seed</em> as the slot lets an override
+repoint what the indicator is derived from while leaving the surface it
+must contrast with untouched, which inverts the derivation's purpose.
+The seed is therefore a retained fixed binding, not a substitution
+target. §9.3 classifies every pair as admitted or excluded for that
+slot; §9.4 then evaluates every admitted substitution and holds it to
+the postcondition this derivation's output kind declares — the non-text
+3:1 one, not the text one, which is why §9.4 names the postcondition by
+output kind rather than fixing it at text.</p>
+<p><strong>The observable is distance from the authored seed</strong>, not from the
+accent as such. <code>colour</code> is a legal argument kind and any opaque seed
+preserves totality, so <code>focus_ring(status.danger, primary)</code> is
+well-formed and is not restricted here; the convention of seeding from
+<code>ring</code> is what makes the indicator read as the brand accent, and it is
+a convention rather than a rule. The provenance therefore <strong>names the
+seed it walked from</strong> alongside the distance, so a distance figure is
+never silently attributed to a token that was not the seed.</p>
+<p>3.5.2.1 <strong>The walk carries no distance cap, and the gate is on
+distance.</strong> <code>focus_ring</code> moves its seed in <strong>lightness only</strong>, holding
+chroma and hue at their nominal values so a ring seeded from the accent
+still reads as the accent. The walk takes the <strong>nearer</strong> of the two
+directions and carries <strong>no cap of its own</strong> — it is bounded only by
+the lightness interval itself, which is where the endpoints that make
+it total live.</p>
+<p><strong>Chroma is nominal, not delivered.</strong> Holding chroma while lightness
+saturates would leave sRGB, so §3.2's conversion gamut-maps by reducing
+chroma toward zero until the colour is representable — and the endpoints
+of the walk are therefore achromatic, not saturated. This is stated
+because the totality argument depends on it: an implementation that
+genuinely fixed delivered chroma could not reach the endpoints and would
+not be total. Identity is preserved where the gamut permits it and
+surrendered where it does not, which is the correct order of priority
+for a focus indicator.</p>
+<p><strong>The seed MUST be opaque — a precondition — and the output opaque as
+an invariant.</strong> Totality is a claim about the ring's own luminance, and
+a translucent ring has none of its own: at alpha 0.5 over a surface of
+luminance 0.5, white composites to 0.75 and black to 0.25, giving
+1.45:1 and 1.83:1 — both directions fail, and no walk recovers them.
+§3.3's compositing honesty governs text pairs; this is its non-text
+counterpart. The two are not the same kind of obligation, and saying so
+matters: seed opacity is a genuine <strong>precondition</strong> on an authored
+value, which an authored palette can violate and which no amount of
+walking can discharge; output opacity is an <strong>invariant</strong> that a
+lightness-only walk from an opaque seed cannot break, so violating it
+takes an evaluator defect, not a palette.</p>
+<p>The registry <strong>declares</strong> both; it cannot check either there.
+Registration sees a signature, not a value: the seed is a context-
+resolved colour that differs across the twelve contexts and after any
+modifier resolution, and the output does not exist until the derivation
+runs. Enforcement is therefore <strong>per cell</strong>, on §10.7's terms — seed
+opacity checked at each call once the seed has resolved, output opacity
+checked after every execution, eager or override-triggered, and a
+violation fatal <em>at the cell that provoked it</em>, naming the cell. This
+is the same lifecycle §10.7 already requires for the postcondition, and
+the output check earns its place the same way that section's does: an
+invariant nothing verifies is documentation.</p>
+<p>Under those two conditions the derivation is <strong>total</strong> and the
+postcondition unfailable: white falls below 3:1 only against a surface
+whose relative luminance exceeds 0.30, and black only below 0.10. Those
+conditions are disjoint, so every surface is served by at least one
+direction, and no reachable cell can fail. §3.5's fatality is
+<strong>discharged by construction</strong> for a derived ring, not relocated to it;
+it continues to govern lone <code>ring</code> tokens, which are authored values
+with no walk to save them. Discharged by construction is not unchecked:
+§10.7 requires a derivation that meets its postcondition by construction
+to be verified against its actual output anyway, and that check is what
+§15's negative fixture exists to prove.</p>
+<p><strong>The walk is specified tightly enough to be reimplementable.</strong> In each
+direction the candidates are, in order, <code>seed_L ± n/1000</code> for
+n = 0, 1, 2, … while the result stays inside the closed interval
+[0, 1], <strong>followed by that direction's endpoint</strong> — 1.0 going up, 0.0
+going down — as a final terminal candidate whenever the lattice has not
+already landed on it exactly. The endpoint is not an optional extra: a
+seed at L = 0.4237 walks up through 0.9997 and no further, so without
+the terminal candidate the discrete search never evaluates white and
+the endpoint proof above would be a claim about a continuum the
+implementation does not search. The terminal candidate takes step index
+N+1, where N is the last lattice step inside the interval, which is
+also its true ordering — it is strictly further from the seed than any
+lattice candidate in that direction.</p>
+<p>Ordering, ties, and the threshold are all compared in <strong>integer step
+units</strong>, never on subtracted <code>f64</code> lightnesses. The result is the
+<strong>nearest passing</strong> candidate: the lowest step index at which the
+composited ratio reaches 3:1, with the ratio compared at or above 3.0
+exactly and no tolerance band. When both directions first pass at the
+same step index — reachable whenever the seed sits symmetrically
+between two qualifying bands — the <strong>lighter</strong> candidate wins. The
+recorded distance is that integer step count, so "300 is silent, 301
+warns" is a decision about two integers and cannot drift with floating-
+point representation. Every part of the choice is thereby a function of
+the inputs rather than of iteration order or arithmetic order.</p>
+<p>What a bound was protecting is preserved as an <strong>observable</strong> instead.
+Every derived ring records <strong>two distinct numbers</strong> in its cell's
+provenance, and conflating them is how a reader would later mistake an
+ordinal for a measurement: <code>step_index</code>, the integer step count that
+every decision above is made on, and <code>delta_l</code>, the actual lightness
+travelled. They are not the same figure — a seed at L = 0.4237 reaching
+the upper endpoint has <code>step_index</code> 577 and <code>delta_l</code> 0.5763 — and the
+gate fires on <code>step_index</code> alone. Where this section quotes distances
+in lightness (0.057, 0.437, …) it is quoting <code>delta_l</code>, because that is
+the figure a palette author reasons about; the compiler compares
+integers. A <code>step_index</code> strictly above the threshold raises a
+<strong>warning</strong>, never an error: a
+ring that must travel far from its seed is a fact about the palette —
+that pair's surface sits in the seed's own luminance band, which for
+revision-1's ring-seeded calls means the accent's — and the
+honest response is to say so, not to refuse to compile. The threshold is
+<strong>300 steps</strong> (0.30 in lightness). It was <strong>chosen from measurement</strong>
+rather than picked, and the measurement is this: across the ninety-six
+pair-context cells of revision-1, seventy-two need
+no walk at all, twenty-one land between 0.057 and 0.30, and exactly
+three exceed it — <code>mono</code>/dark/destructive at 0.437, <code>stone</code>/dark/
+destructive at 0.385, and <code>ocean</code>/dark/destructive at 0.342. Only
+<code>primary</code> and <code>destructive</code> ever require a walk, which is §3.5.2's own
+prediction confirmed: they are the saturated surfaces that sit closest
+to the accent in luminance. A threshold that fires on those three and
+stays silent on the twenty-one routine walks reports outliers rather
+than narrating the normal case.</p>
+<p>The same measurement retires the bounded alternative on evidence: a
+±0.25 bound would have been <strong>fatal on eighteen of the ninety-six
+cells</strong>, including <code>primary</code> and <code>destructive</code> in nearly every context.
+It was never satisfiable by the shipped palette.</p>
+<p>Being chosen, 0.30 is a <strong>calibration against revision-1</strong>, not an
+invariant of the algorithm: a later palette that legitimately walks
+further will fire it, and the correct response then is to re-measure and
+re-state the threshold with its evidence, exactly as this one is stated.
+The threshold's own behaviour is therefore tested synthetically, at and
+just above the boundary, and not only through the revision-1 counts
+(§15) — a test that asserts "three cells warn" is a regression test for
+the palette; a test that asserts "0.300 is silent and 0.301 warns" is a
+test of the gate.</p>
+<h2 id="4-component-mapping-algebra">§4 Component mapping algebra</h2>
+<p>4.1 Per family, the source declares a cva-shaped table:
+<code>base + variants{variant, size} + states + compoundVariants</code>. Values are
+token references, pair references, and registered-derivation calls
+(§10) only.</p>
+<p>4.2 <strong>What data MUST NOT express:</strong> ECS component names, entity
+selectors, arbitrary expressions, or variant axes not declared in the
+family's schema (§8.2). Data chooses values; Rust owns structure.</p>
+<p>4.3 <strong>Specificity, degenerate and closed:</strong> within a table,
+more-non-default-axes wins (Spectrum's count rule). Two rules of equal
+specificity setting the same property for any reachable cell is a
+<strong>compile error</strong> — ambiguity is never an iteration-order outcome.</p>
+<p>4.4 <strong>Mandatory family base:</strong> every resolver-owned presentation
+property of a family MUST have a <code>.mix</code>-authored base value; a family
+declaration that omits one is a compile error. Rust spawn-time component
+values are transient placeholders that exist only until the resolver's
+first pass — they are never a styling authority and never part of any
+fallback chain.</p>
+<p>4.5 <strong>Explicit <code>null</code></strong> participates in the specificity/conflict check
+and means <em>revert to the family base</em>. On a transition into a null cell
+the resolver <strong>writes</strong> the base value — it never skips the write and
+never removes a component. A cell with no matching rule takes the base
+the same way.</p>
+<p>4.6 <strong>Totality vs coverage.</strong> Lookups are total by construction
+(enum-indexed tables over the shared family schema, §8.2): a new enum
+variant's cells fill from base and are never a runtime hole. That fill
+MUST NOT be silent: the compiler emits <code>new-variant-uncovered</code> for any
+axis value with no authored rows — a warning by default, <strong>fatal</strong> for a
+family declaring <code>coverage: explicit</code>. Discharge is authoring the rows
+or declaring <code>inherit: base</code> on the axis value; either way the fill is a
+written decision.</p>
+<h2 id="5-typography">§5 Typography</h2>
+<p>5.1 The artifact carries a resolved family/weight/size scale <strong>plus</strong> a
+compiled <code>family × part × (variant × size)</code> → typed type-record
+assignment table. The record (<code>{type_step, weight, …}</code>) holds everything
+the mapping may author for a text part — the IR is never narrower than
+the authoring contract.</p>
+<p>5.2 Text-part typography is authored in the family mapping under §4's
+rules (base / variants / null / coverage). No Rust match arm carries a
+size.</p>
+<p>5.3 <strong>Typography is barred from state:</strong> a <code>states</code> or
+<code>compoundVariants</code> rule that sets a typography property is a <strong>compile
+error</strong>. Font changes on interaction reflow text; state may change text
+<em>colour</em> only (family-resolver-owned). The assignment table's missing
+state axis is a rule, not a gap.</p>
+<p>5.4 <strong>One <code>TextFont</code> writer.</strong> The typography resolver (the evolved
+<code>apply_ctk_typography</code>) is the registry's sole owner of <code>TextFont</code>
+across managed text. The shipped second writer
+(<code>reconcile_button_label_fonts</code>) is absorbed: per-part sizing becomes
+the typography resolver's job, keyed by part marker + owning
+family/size context, resolved against §5.1's table. Its discipline
+survives internally: part sizing applies after generic family
+resolution; writes stay change-tick honest.</p>
+<p>5.5 The bundled-font + glyph-coverage contract of the 2026-07-22 ADR
+carries forward. Fonts cross the feathers seam as asset handles, never
+tokens (§13.1).</p>
+<h2 id="6-state-model">§6 State model</h2>
+<p>6.1 One generic normaliser system writes one component:</p>
+<pre><code class="language-rust">CtkStyleState {
+    interaction: Resting | Hovered | Pressed | Disabled,
+                        // precedence: Disabled &gt; Pressed &gt; Hovered &gt; Resting
+    checked: bool,      // orthogonal axes, not extra enum arms
+    selected: bool,
+    focus_visible: bool,
+}
+</code></pre>
+<p>6.2 The normaliser <strong>never paints</strong>. It reads modern state components
+only — never legacy <code>Interaction</code> — ending dual-input ambiguity.</p>
+<p>6.3 <strong>Focus is resource-driven:</strong> visible focus is computed from
+<code>InputFocus</code> + <code>InputFocusVisible</code>. On resource change the normaliser
+rewrites <code>focus_visible</code> on <strong>both</strong> the previously and newly focused
+entities (it tracks the prior holder; a component-only contract would
+leave one entity stale).</p>
+<p>6.4 <strong>Removal-aware:</strong> the inputs it summarises are frequently removed,
+not changed (<code>Pressed</code>/<code>Checked</code>/<code>InteractionDisabled</code> markers). Its
+triggers MUST include removal observation (<code>On&lt;Remove&gt;</code> /
+<code>RemovedComponents</code>), not <code>Changed&lt;&gt;</code> alone.</p>
+<p>6.5 Resolvers take state as an <strong>argument</strong> into the family table. There
+is no state selector, no pseudo-class, no per-state component insertion.
+The state enum is closed in Rust; data can map styling <em>for</em> a state,
+never invent one.</p>
+<h2 id="7-invalidation-matrix">§7 Invalidation matrix</h2>
+<p>A family resolver MUST repaint on every row; each row carries a named
+regression test:</p>
+<table><thead><tr><th>Trigger</th><th>Contract</th></tr></thead><tbody>
+<tr><td><code>Changed&lt;CtkStyleState&gt;</code></td><td>repaint the widget's cells</td></tr>
+<tr><td>Owning-family axis change (variant/size component)</td><td>dirties the family resolver <strong>and</strong>, for text parts, the typography resolver (the Medium→Large label case)</td></tr>
+<tr><td>Override component added / changed / <strong>removed</strong></td><td>removal restores table values (feathers' removal trap, owned)</td></tr>
+<tr><td>Focus-resource change</td><td>via the normaliser's two-entity rewrite (§6.3)</td></tr>
+<tr><td>Part entity inserted late</td><td><code>On&lt;Insert&gt;</code> on part markers — an asynchronously materialised label styles itself on arrival</td></tr>
+<tr><td>Reparenting / relationship change</td><td>re-resolve membership-derived styling</td></tr>
+<tr><td><code>ResolvedDesign</code> revision bump</td><td>repaint all managed entities</td></tr>
+</tbody></table>
+<p><strong>Cost model (normative honesty):</strong> settled widgets incur no writes and
+no text-rerender re-entry (change-tick honesty:
+<code>bypass_change_detection()</code> + <code>set_changed()</code> only on real writes).
+<code>Changed&lt;&gt;</code> filtering still scans matching entities each frame — the
+floor is a change-tick scan, not zero. The sanctioned escape hatch, if
+profiling ever demands one, is observers/an explicit dirty queue — not a
+new architecture.</p>
+<h2 id="8-ownership">§8 Ownership</h2>
+<p>8.1 <strong>Single-writer is audited policy, not structure</strong> — Bevy cannot
+make <code>BackgroundColor</code> privately writable. Three mechanisms of stated
+strength enforce it:</p>
+<ol>
+<li><strong>The ownership registry (normative):</strong> a table of
+<code>family × part × component → owning resolver</code>, covering CTK and
+app-defined families alike. Every present-day styling writer is
+either absorbed into a family resolver or listed with an explicit
+boundary (the typography resolver, §5.4). App presentation writers
+(filemgr's browser painter, studio's settings styler, and peers)
+register as app family resolvers under the same rules and audit.</li>
+<li><strong>Writer-attribution audit (the enforcement):</strong> per-writer mutation
+counters + schedule-boundary sentinels assert, over scripted
+interaction scenarios, that only the owning resolver's counter moves
+for registry-owned components. Change ticks and final values cannot
+attribute writers; counters can.</li>
+<li><strong>Removal test (necessity only):</strong> removing a family's resolver MUST
+leave its entities visibly unstyled at rest. This proves
+load-bearing, not uniqueness — uniqueness is the audit's job.</li>
+</ol>
+<p>8.2 <strong>Family schemas are centrally registered:</strong> variant/size enums and
+part sets are defined once in the shared headless compiler crate
+(§11.1); ctk and apps depend on it, never the reverse. Desktop-wide
+scope therefore makes that crate a <strong>closed central family-schema
+registry</strong> — an app adding a private family edits the shared crate
+(decision 8; an app-owned type-keyed extension mechanism preserving
+totality is deferred follow-up, §15).</p>
+<p>8.3 <strong>Multi-entity widgets use part markers, not selectors:</strong>
+<code>ButtonRoot</code>/<code>ButtonLabel</code>, <code>MeterChrome</code>/<code>MeterFillProcedural</code>.
+Membership is a component relationship, never a tree query by name.</p>
+<p>8.4 <strong>Procedural boundary is entity-structural:</strong> value-driven geometry
+(meter lanes, knob rotation, waveforms) lives on procedural entities
+(widget-owned, resolver-forbidden) split from chrome entities
+(resolver-owned). Both are listed in the registry.</p>
+<h2 id="9-overrides">§9 Overrides</h2>
+<p>9.1 Overrides are <strong>closed, typed, per-family components</strong>,
+Option-per-field (e.g. <code>ButtonStyleOverride { min_width: Option&lt;MetricRef&gt;, …, surface: Option&lt;PairRef&gt; }</code>). No open property
+bag, no stringly-typed keys.</p>
+<p>9.2 <strong>Two-step chain, nothing else:</strong> <code>instance override ?? resolved table</code>, per property, at resolver time, against the artifact's
+dictionary. <code>None</code> means the table's value. No ancestor lookup, no
+specificity, no stacking of override components. Per-app variation is a
+compile-time overlay (§11.2), never a third runtime link.</p>
+<p>9.3 <strong>Contrast-bearing overrides repoint domain-constrained pairs</strong>,
+never lone colours: a surface override names a <code>PairRef</code> from the
+closed pair set, moving background and foreground together. Where the
+target cell retains a recipe with an override-substitutable slot, the
+resolved artifact MUST classify every member of §2.4's pair set as
+either <strong>admitted</strong> or <strong>excluded</strong> for that slot in that resolved
+context. An exclusion MUST carry the registered domain constraint that
+caused it. The resolver MUST refuse an excluded <code>PairRef</code> before recipe
+execution and MUST NOT silently substitute the cell's eager value.
+Where no substitutable slot exists, the override replaces the computed
+pair whole under §9.2; every resolved pair is admitted by the text
+gate.</p>
+<p>9.4 <strong>Exhaustive permitted-product validation:</strong> the pair set, cells,
+and recipes are finite, so the compiler MUST contrast-check the whole
+<strong>admitted</strong> <code>PairRef × cell × recipe</code> product at compile time. The
+authored binding of a recipe MUST itself be admitted. Every admitted
+substitution MUST evaluate successfully and satisfy <strong>the postcondition
+its own output kind declares</strong> — the §3.4 text-contrast postcondition
+for a pair-output recipe, the §3.5.2 non-text 3:1 postcondition for a
+non-text-output one. Failure is fatal. Naming the postcondition by the
+recipe's output kind rather than fixing it at "text" is load-bearing: a
+derived ring's whole obligation is to contrast with the surface
+<em>actually painted</em>, and a product walk that checked only text
+postconditions would walk right past an admitted override that repoints
+a ring's surface. A declared domain
+exclusion is neither an evaluation failure nor a diagnostic: it is
+availability data retained under §9.3. The classification MUST be total
+over the closed pair set. No runtime combination <strong>permitted by the
+artifact</strong> may exist that the WCAG gate never saw.</p>
+<p>§3.5.1's override-scoping is an exception to this product walk, and it
+is narrow: it applies to a <strong>lone adjacency-bearing <code>ring</code> token</strong>,
+where checking the override rather than the product reaches the same
+combinations without collapsing every adjacency set to universal. It
+does not apply to a derived ring, which declares no adjacency set
+(§3.5.2) and is therefore covered by the product walk above like any
+other admitted substitution.</p>
+<p>The totality this replaces was unsatisfiable as written, and the
+distinction it now draws is the whole reason. A surface-moving recipe
+can never change a fully transparent surface's delivered bytes, in any
+palette, by construction — so a dictionary containing a transparent
+pair could not satisfy the old clause at all. The shipped dictionary
+contains one (<code>muted</code>), and the Ghost variant's resting identity <em>is</em>
+that transparency, so the choice was never between a strict rule and a
+lax one: it was between dropping transparent pairs from the vocabulary
+and degrading the failure to a warning nobody reads. Making
+unavailability first-class and machine-readable keeps AA totality of
+<em>meaning</em> — every combination the artifact permits was checked — while
+letting a slot's admissible subset be smaller than the closed set, and
+saying so in the artifact rather than in a diagnostic beside it.</p>
+<p>9.5 <strong>Metric overrides reference the scale</strong> (<code>MetricRef</code> — a scale step
+or metric token); every rendered dimension stays reconstructible from
+source. <strong>Declared exception (decision 6):</strong> raw-pixel instance geometry
+is allowed only through explicit sized-constructor APIs and is stamped
+<code>entity-local</code> in provenance.</p>
+<p>9.6 <strong>Type preservation (Spectrum's rule):</strong> an override MUST NOT change
+the value type of what it overrides.</p>
+<h2 id="10-derivations">§10 Derivations</h2>
+<p>10.1 Data may <strong>call</strong> registered derivation functions by name with
+token arguments (<code>derive: contrast_safe_lift(background, text.dim)</code>);
+it may never define expressions. Membership of the registry is an
+implementation matter, governed by rules rather than by a list here:
+every registered function MUST be deterministic, testable in isolation,
+and declare its postconditions (§10.3), its substitutable slot (§10.2),
+and that slot's substitution domain (§9.3) as data the compiler can
+read. This chapter names individual derivations only as examples; the
+registry is the crate's, and an enumeration in normative text would be
+stale the first time one is added.</p>
+<p>10.2 <strong>Eager evaluation, mechanical split:</strong> state is a finite axis, so
+every derivation evaluates at compile time into its cell for the
+no-override path. Each derived cell retains its <strong>recipe</strong> — registered
+fn + typed input bindings marking its <strong>zero or one</strong>
+override-substitutable slot + that slot's <strong>substitution domain</strong> +
+output property. The family resolver re-executes a recipe only when an
+instance override repoints that slot; the override operand is the
+<em>only</em> dynamic input in the system. Resolver-time execution never
+consults raw source.</p>
+<p>The retained recipe also carries §9.3's complete pair classification
+for its substitutable slot. The resolver MUST consult that
+classification before re-execution and MUST NOT reconstruct it from
+registry metadata or raw source. Two computations of one rule drift;
+the compiler's product walk and the resolver's availability query MUST
+therefore read the same stored classification rather than each deriving
+it from the domain constraint.</p>
+<p>A recipe with <strong>no</strong> substitutable slot is one whose every input is
+fixed by the compile-time context — it is evaluated once and never
+re-executed, and its eager output is the no-override table value. This
+does not place the cell beyond override: §9.2's direct property
+override still replaces the whole computed value, exactly as it
+replaces an authored one. The slot marks <em>re-execution</em>, not
+<em>mutability</em>, and the two must not be conflated — a derivation from
+primitives has nothing an override could repoint, which is a statement
+about its inputs, not a promise about its output. Where a slot is
+present it MUST be an authored argument (never an implicit input,
+§10.5), MUST be in range, and MUST be the only one.</p>
+<p>10.3 <strong>Contrast is never a runtime outcome:</strong> a property in a
+<strong>text-bearing</strong> contrast role accepts only pair refs or derivations
+carrying a text-contrast postcondition. A derivation that carries no
+such postcondition MUST be rejected by the compiler in those positions
+— whether it is unregistered, or registered for use elsewhere and
+simply makes no contrast claim (an unchecked lift is the obvious case)
+— as are the non-text tokens (§2.4). Both arms are obligations: an
+unknown name and a known name without the claim fail alike, and neither
+may be waved through on the grounds that the author probably meant
+something safe. A property in a
+<strong>non-text</strong> contrast role (§3.5) accepts a lone non-text token or a
+derivation carrying the <strong>non-text</strong> postcondition of §3.5.2; a
+derivation with no postcondition is rejected there for the same reason
+it is rejected in a text position. The two postconditions are distinct
+obligations and neither substitutes for the other: 3:1 against one
+surface is not the AA claim, and an AA pair says nothing about a ring
+drawn beside it. §9.4's product validation covers <strong>admitted</strong>
+override-substituted executions.</p>
+<p>10.4 <strong>Arguments are typed at the authoring site.</strong> §10.1's
+<code>contrast_safe_lift(background, text.dim)</code> is a display form; the v1
+source encoding is a list of tagged arguments, each naming its kind —
+<code>pair</code>, <code>colour</code>, <code>colour_list</code>, <code>ratio</code> — alongside the token path or
+paths it references. A bare string cannot carry this: <code>"primary"</code> is a
+legal pair name, a legal colour name, and a legal one-element list, and
+the position it sits in is not enough to disambiguate a registry whose
+rows differ only in argument kind. Tagging the argument makes the
+authored intent checkable against the signature rather than inferred
+from it, and makes a mis-typed call a diagnostic at the call rather
+than a surprising value downstream. Arity and kind are both checked
+against the registered signature; neither is negotiable, and a
+positional mismatch is fatal.</p>
+<p>10.5 <strong>Implicit inputs are supplied by the compiler, not authored.</strong> A
+derivation MAY declare inputs that the compile-time context already
+determines — presently the context's <code>mode</code> (§11.2). These are not
+arguments: they are not written at the call site, do not count toward
+its arity, and can never be the substitutable slot, because there is no
+authored operand for an override to repoint. They ARE part of the
+retained recipe: §10.2 requires resolver-time re-execution to consult
+no raw source, so a recipe whose result depends on mode must carry the
+mode it was compiled under. The alternative — re-deriving the context
+at resolve time — would make a resolved artifact's meaning depend on
+where it is read, which §11.2's two-stage split exists to prevent.</p>
+<p>10.6 <strong>Derivations are legal wherever data supplies a value</strong>, which
+includes the semantic tier (§2.3's atomic pairs) and not only family
+mapping cells. §10.1 already implies this — its own example calls a
+derivation on semantic and primitive tokens rather than on a cell — but
+the consequence is worth stating: a derivation used only in a mapping
+computes that cell while leaving the semantic token it stands for
+pointing at whatever was authored, so a <code>PairRef</code> naming that token and
+the cell that "is" it resolve to two different colours. A derived
+semantic pair is validated exactly as an authored one (§3.4), and
+remains a legal <code>PairRef</code> target and override operand: the tier is
+defined by what a token <em>is</em>, not by how its value was arrived at.</p>
+<p>10.7 <strong>Evaluation is per cell, and may fail.</strong> §10.2's eager evaluation
+happens where the value is <em>produced</em> — the cell — not where the rule
+that supplied it is compiled. The distinction is invisible while every
+derivation is total and becomes load-bearing the moment one is not: a
+recipe evaluated once per rule and cloned into every matching cell can
+neither discharge a per-cell postcondition (§3.5.2) nor name the cell
+in its diagnostic. A registered derivation MAY therefore fail, and a
+failure is fatal at the cell that provoked it. A derivation that meets
+its postcondition by construction is checked anyway, against its actual
+output: a registry that asserts a postcondition it never verifies is
+documentation, and the whole point of §10.3's typing is that the
+assertion is load-bearing.</p>
+<p>Per cell is where evaluation <em>happens</em>; it is not a licence to report
+the same fact ninety-six times. Two evaluations whose recipe and whose
+every bound input are identical have one outcome by determinism
+(§10.1), so the compiler MUST evaluate them once and report a failure
+once. This is not diagnostic de-duplication after the fact — the
+identity is in the inputs, so a recipe that genuinely varies per cell
+has distinct inputs and keeps its distinct per-cell diagnostics. A
+compiler that emitted one line per cell for a fault that has one cause
+would be reporting the shape of its own loop.</p>
+<p>10.8 <strong>Derivations read delivered colours, not authored anchors.</strong> A
+recipe's colour inputs are the resolved primitives as they will ship —
+after §2.1's gamut mapping — never the pre-mapping authored OKLCH. The
+reason is §3: every contrast gate in this spec measures delivered
+colours, so a derivation seeded from a colour no display can show could
+not have its postcondition meaningfully verified, and the surface it
+computed would be related to nothing the user sees. The consequence is
+real and MUST NOT be papered over: for an authored anchor outside sRGB,
+a chroma-proportional derivation yields less chroma than the same
+arithmetic applied to the authored value, because the proportion is
+taken of the reduced chroma. That is the intended reading — the anchor
+that survived is the anchor. A future wide-gamut output space changes
+what gamut mapping does, not this rule.</p>
+<p>A <strong>pair</strong> argument denotes the complete resolved pair record — its
+surface and foreground, its declared backdrop (§3.3), and the delivered
+composites measured from them. Those values are fixed inputs of the
+retained recipe in that artifact revision; they are not independent
+runtime operands. A <code>PairRef</code> therefore selects a pair <em>together with</em>
+its backdrop, which is why §9.4's product ranges over pairs and not
+over pair × backdrop: a modifier that moves a backdrop produces a
+different resolved context, and §11's compile rebuilds every reachable
+context's pairs, recipe outputs, and availability classification
+together. This matters for a recipe whose delivered movement is in the
+foreground over a transparent surface, where the contrast claim is
+measured against the backdrop composite: the dependency is real, and it
+is discharged by the artifact being rebuilt as a whole rather than by
+the recipe naming the backdrop a second time.</p>
+<h2 id="11-compile-and-apply">§11 Compile and apply</h2>
+<p>11.1 The compiler is a <strong>dependency-light headless crate</strong> — no Bevy, no
+ctk; ctk depends on it. It also hosts the family schemas (§8.2).</p>
+<p>11.2 <strong>Two-stage resolution, defined once:</strong></p>
+<ol>
+<li><em>Compile time:</em> flatten modifier contexts in declared
+<code>resolution_order</code> over the shipped axes — <code>scheme</code>
+ocean|crimson|stone|forest|sunset|mono (the six palettes, shared
+verbatim with the web design system), <code>mode</code> light|dark, <code>contrast</code>
+normal|high, per-app overlay — DTCG-resolver-shaped; contexts
+compose by §1.6's specificity key (a mode layers on a scheme, a
+scheme × mode block on both, high-contrast above those); apply
+per-app overlays as <strong>compile-time inputs</strong> (visible in every cell
+and diagnostic — never a runtime fallback layer); resolve aliases
+only after flattening; generate §2.2's derived scales from the
+flattened metric bases, then resolve every <code>step</code> through the
+combined scale set; evaluate every derivation eagerly into its
+cell.</li>
+<li><em>Resolver time:</em> table lookup; recipe re-execution only under an
+instance override (§10.2), against the artifact's dictionary.</li>
+</ol>
+<p>11.3 The artifact:</p>
+<pre><code class="language-rust">ResolvedDesign {
+    revision: u64,     // monotonic; every successful apply bumps it
+    tables,            // per-family variant×size×state cells (linear RGB, px)
+    dictionary,        // resolved token + pair map — override authority
+    recipes,           // per-cell derivation recipes (§10.2)
+    typography,        // scale + family×part×(variant×size) → type-record (§5)
+    provenance,        // per value: token path + producing rule
+}
+</code></pre>
+<p>11.4 Validation is total at compile time: unknown refs, type mismatches,
+contrast failures, mapping ambiguities, coverage diagnostics, cycles —
+all before anything touches the ECS.</p>
+<p>11.5 <strong>Failure semantics — one model:</strong> outcomes are <strong>fatal</strong> (artifact
+not produced) or <strong>warning</strong> (artifact produced, diagnostic attached).
+Diagnostics live in a separate <code>DesignCompileStatus</code> resource (source
+identity, outcome, diagnostics, timestamp) — never inside the artifact —
+so a failed compile is fully reportable while the previous
+<code>ResolvedDesign</code> stays live (<strong>last-known-good</strong>).</p>
+<p>11.6 <strong>Boot order:</strong> an embedded default source, compiled at build time
+and proven valid by a unit test, always produces revision 1; user/app
+sources compile on top. A broken user file on first launch renders the
+default theme and reports the failure — never unstyled, never a crash,
+never fuchsia.</p>
+<p>11.7 <strong>Apply is an atomic resource swap</strong> of the whole artifact.</p>
+<h2 id="12-wake-and-reload">§12 Wake and reload</h2>
+<p>12.1 Source <strong>content</strong> mutation flows through authoritative paths.
+None ships today: the shipped theme editor writes <em>selection only</em>
+(<code>ThemeWriteRequest</code> persists scheme + mode — §12.3's other lane), not
+source content. Content-mutation paths arrive with this chapter
+(authoring tooling; a <code>designd</code> verb later), and whatever mutates the
+source MUST publish a <strong>design-source-changed</strong> wake on the bus,
+debounced/coalesced.</p>
+<p>12.2 The wake triggers <code>compile → swap → resolver pass</code> in one defined
+schedule order.</p>
+<p>12.3 Selection wakes and content wakes are distinct lanes and stay
+distinct. The v1 selection is <strong>scheme + mode + contrast</strong> — all three
+§11.2 user axes; a change to any of them is a selection change and
+triggers §12.2's pass for the newly selected context. The shipped
+legacy <code>ThemeChanged</code> (scheme + mode only) implies <code>contrast: normal</code>
+for the length of the v0 window; the wake <strong>and the persisted
+selection</strong> grow the contrast field together in migration slice 4 — a
+selection lane that persists fewer axes than it applies is a defect: a
+live contrast choice MUST survive restart and focus-gained re-read. An
+already-persisted two-axis record (today's writer has produced them)
+MUST load as <code>contrast: normal</code> — never rejected, never left implying
+a stale prior contrast — on both startup and focus-gained re-read.
+Focus-gained re-read remains the lazy backstop for a missed wake.</p>
+<p>12.4 Sub-minute polling is banned (standing no-poll law). There is no
+file-watcher requirement; the wake is the mechanism.</p>
+<h2 id="13-adapters">§13 Adapters</h2>
+<p>13.1 <strong>Feathers adapter — one-way:</strong> <code>ResolvedDesign</code> → <code>UiTheme</code> token
+map (<code>cosmix.*</code>-prefixed keys coexisting with upstream's), never read
+back. Fonts cross as asset handles per §5.5. Vendored feathers widgets
+migrate their markers to family resolvers at vendoring time.</p>
+<p>13.2 <strong>Web emitter — shared context only:</strong> emitted at deploy time as
+CSS custom properties with live <code>var()</code> links (outputReferences) and
+per scheme×mode×contrast permutation wrappers, written atomically, invoked
+only by the web deploy path. The emitter API accepts <strong>only the named
+shared-context artifact</strong> — per-app overlays are structurally absent
+from its input.</p>
+<p>13.3 <strong>Web tier scope (decision 5):</strong> primitive tier + colour method +
+scheme structure only. Semantic-tier emission requires amending the
+2026-07-22 ADR first. Component mappings are toolkit business and are
+never emitted.</p>
+<p>13.4 <strong>Drift test:</strong> both adapters are validated against the same
+shared-context artifact; divergence is a test failure.</p>
+<h2 id="14-introspection">§14 Introspection</h2>
+<p>14.1 <strong><code>AppliedStyleStamp</code></strong> on every resolver-styled entity: family,
+variant, size, state, and the <code>ResolvedDesign.revision</code> it was painted
+from.</p>
+<p>14.2 <strong><code>StyleTrace</code></strong> (dev/debug): for any entity + property, the full
+chain — table cell → tokens/pair → derivation → override — from
+provenance. "Why is this pixel this colour" is a lookup, not
+archaeology.</p>
+<p>14.3 <code>DesignCompileStatus</code> and provenance are queryable structured data.
+A <code>designd</code> ABP verb surface over the source (query tokens as data,
+property writes → source-changed wake, regenerate emitters) is the
+natural follow-on: deferred, but the compiler's data model MUST NOT
+preclude it.</p>
+<h2 id="15-conformance-gates-deferrals-and-migration">§15 Conformance gates, deferrals, and migration</h2>
+<p><strong>Named gates</strong> (each MUST exist as a test or compiler rejection before
+the relevant slice ships): §1.2 versioned-section isolation (a v0
+reader demonstrably never parses v1 sections) <strong>and</strong> schema-version
+rejection — fatal for missing, non-integer, or any integer outside the
+reader's supported-version set (v0 is the <em>absence</em> of the field, never
+<code>0</code>); of these, only versions above the reader's maximum are classified
+and reported as §1.3's version gap, and none is ever interpreted under
+older rules; §1.4 equivalence gate
+(incl. crosswalk completeness + absence rule); §1.6 modifier-block
+rejections (an axis in <code>resolution_order</code> named by no <code>when</code>; a <code>when</code>
+naming an axis absent from <code>resolution_order</code>; a block altering a
+family mapping) plus a total-composition test covering every point of
+the axis product, a <strong>precedence</strong> test (a compound <code>when</code> beats each
+single-axis block it subsumes, and the resolved value is invariant
+under reordering the blocks in the file) and a <code>modifier-conflict</code>
+rejection (two selected blocks of equal specificity key writing one
+token path); §2.2 <code>web-anchor-verbatim</code> — the compiled anchors of all
+twelve contexts equal the web palette; the compiler crate cannot see
+the web table, so this gate lives where both sides are visible (the ctk
+port, slice 1), and until it exists the transcription is unproven, not
+merely untested; §2.2 <code>radius-single-knob</code> — the derived scale equals
+<code>max(base−4, 0) / max(base−2, 0) / base / base+4</code> at the shipped base,
+<strong>both</strong> clamps proven by a base low enough to drive <code>sm</code> and <code>md</code>
+negative (a single clamped entry leaves the other arm untested), a
+missing <code>radius</code> base rejected, a non-<code>px</code> <code>radius</code> base rejected, an
+authored <code>radius</code> scale rejected in base <em>and</em> in a modifier block, the
+scale regenerated from the winning value when a modifier overrides the
+knob, and the generated entries' provenance naming the generator and
+the source path of that winning base rather than a fabricated authored
+path; §2.4/§10.3 non-text-token
+positional rejection; §2.5 reference-direction rejection; §2.7
+metric-unit rejection (a bare number; a metric used where another kind
+is expected; an override changing a metric's kind); §3.3
+compositing-declaration rejection (undeclared translucency under text);
+§3.4 WCAG compile gate; §3.5 ring non-text contrast gate (+
+adjacency-set rejection), with §3.5.1's scoping proven by a fixture in
+which an override moves <code>ring</code> onto a surface outside the declared
+adjacency set and is rejected <em>as an override</em>; §3.5.2's postcondition
+proven by a derived ring meeting 3:1 on <strong>every</strong> reachable cell it is
+called on, across all twelve contexts, <strong>and</strong> by a negative fixture in
+which a ring value that misses 3:1 is rejected. The walk being total
+(§3.5.2.1) means the positive arm can never fail on a legal input — but
+that is precisely why the negative arm is required: §10.7 obliges the
+compiler to <em>check</em> a by-construction postcondition against actual
+output, and an implementation that omitted the check entirely would pass
+every positive fixture. The negative fixture proves the checker exists;
+it does not claim the failure is reachable by an authored palette. Its
+two opacity siblings are of <strong>different kinds</strong>, and §15 says which is
+which rather than flattening them: the translucent <em>seed</em> is a
+genuinely reachable authored rejection — an authored palette can supply
+one — rejected at the cell that resolved it and naming that cell, while
+the translucent <em>output</em> is a checker fixture like the contrast one,
+since a lightness-only walk from an opaque seed cannot produce it
+without an evaluator defect. Both are proven <strong>per cell</strong> rather than
+at registration, per §3.5.2.1, and the output check is proven under an
+override-triggered re-execution as well as an eager one, since a check
+on only the eager path is a check the override path does not have.
+§3.5.2's substitution contract is proven by an override that moves a
+cell's pair from <code>secondary</code> to <code>primary</code> and re-executing the ring
+against the surface <strong>actually painted</strong>, with a fixture in which the
+un-re-executed ring would have missed 3:1 — the whole point of the pair
+being the sole substitutable slot — and by rejection of a registry that
+declares the seed slot substitutable. Endpoint reachability is proven
+directly: a seed whose
+lightness is not a multiple of 1/1000 (0.4237) still evaluates the
+terminal candidate at exactly 1.0, so the discrete search covers the
+endpoint the totality proof depends on — and that fixture asserts
+<strong>both</strong> provenance numbers, <code>step_index</code> 577 <em>and</em> <code>delta_l</code> 0.5763,
+because a <code>step_index</code> assertion alone would pass an implementation
+that recorded the terminal walk as 0.577; the zero-step cells likewise
+assert <code>delta_l</code> of exactly 0, not merely <code>step_index</code> 0; §3.5.2.1
+<code>ring-walk-distance</code> — the recorded distance is the real gate. Its
+threshold behaviour is proven <strong>synthetically</strong>, on surfaces constructed
+to place the walk at exactly 300 steps (silent) and at 301 (warns), so
+the test binds the gate rather than the palette; the tie-break is proven
+the same way, on a seed placed symmetrically between two qualifying
+bands so that both directions first pass at the same step index and the
+lighter candidate must win; the revision-1
+counts are then asserted separately as a <em>palette</em> regression — the
+three cells above the threshold each warn and name both their
+<code>step_index</code> and the seed they walked from, the twenty-one routine
+walks at or below it stay silent (the threshold is strict, so 300 is
+itself silent), and the seventy-two zero-distance cells record a
+<code>step_index</code> of zero rather than no distance at all. A <em>warning</em>, never
+a rejection, so a compile that emits it still succeeds. Plus totality asserted directly — for every cell of every
+context, <strong>at least one direction reaches 3:1</strong>;
+<code>focus-visible-covered</code> — every
+reachable focus-visible cell of a family carries an indicator (lone
+token or derivation), with <code>disabled</code> exempt because a disabled control
+takes no focus and the shipped button suppresses its indicator there,
+so requiring one would gate a state the user cannot reach; §4.2
+forbidden-construct rejection (component
+names / selectors / expressions / undeclared axes in data); §4.3
+ambiguity rejection; §4.4 mandatory-base rejection; §4.6 coverage
+diagnostics; §5.3 typography-state rejection; §6.4 removal-aware
+normaliser test (marker removal observed, not just <code>Changed&lt;&gt;</code>); §7's
+per-row invalidation tests; §8.1's audit + removal tests; §9.3/§9.4
+domain-constrained override validation — every pair classified for
+every substitutable recipe; exclusions surviving in the artifact with
+typed reasons and refused by the model-side query; every admitted
+substitution evaluated; an admitted evaluation or postcondition failure
+fatal; and the compiler's product walk and the resolver's availability
+query proven to consult the same stored classification rather than two
+derivations of one rule; §9.6 type-preservation rejection; §10.3
+contrast-position rejection; §11.6 embedded-default unit test; §12.1
+wake-publication test (every content-mutation path publishes
+design-source-changed); §12.3 selection-lane test (a contrast-only
+change triggers the pass; persistence + re-read round-trips all three
+axes; a legacy two-field selection event defaults to
+<code>contrast: normal</code>; a legacy two-axis <em>persisted record</em> loads as
+<code>contrast: normal</code> through both startup and focus-gained re-read);
+§13.4 drift test.</p>
+<p><strong>Review obligation (mechanically untestable):</strong> §14.3's
+must-not-preclude-<code>designd</code> constraint is checked at design review of
+any compiler data-model change, not by a test.</p>
+<p><strong>Deferred by decision</strong> (data model must not preclude; adoption needs
+its own decision): <code>SurfaceLevel</code>-style ambient context axis (one enum
+component + one table axis, never a cascade); app-owned family-schema
+extension; <code>designd</code> ABP surface; animation/transition tokens.</p>
+<p><strong>Migration</strong> proceeds in the proposal's six slices (button-first per
+decision 9): 1 — compiler + button family + audit (metrics enter the
+live lane); 2 — state normaliser + toggle/checkbox; 3 — remaining
+chrome + registry + typography transition + vocabulary alias-window
+close; 4 — wake + web emitter + feathers adapter + drift test; 5 — app
+family adoption; later — the deferrals above. Each slice ships value
+alone; none is authorised by this chapter itself.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +1650,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1704,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1833,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

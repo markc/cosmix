@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/05-broker-topics</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,192 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/05-broker-topics.md"><div class="prose"><h1 id="broker-routing-discovery-and-topics">Broker routing, discovery and topics</h1>
+<h2 id="routing-and-registered-identity">Routing and registered identity</h2>
+<p>This chapter distinguishes requirements, the source profile at <code>96d12fdf</code>,
+and unresolved differences. No live deployment or test-run claim is made.</p>
+<p><strong>BROKER-001:</strong> The node broker routes local service names and in-mesh
+addresses over registered connections and mesh peers. Cross-mesh <code>@FQDN</code>
+targets remain parser-reserved and router-refused. Request IDs may be replaced
+internally to avoid caller collisions; replies must be returned to the
+correct originating connection with its correlation restored. Delivery to a
+socket queue is not acknowledgement of application execution.</p>
+<p><strong>BROKER-002:</strong> <code>noded.register</code> takes the requested service name from <code>from</code>
+and optional <code>RegisterProvenance</code> JSON from the body, not a <code>body:</code> header:</p>
+<pre><code class="language-text">---
+command: noded.register
+from: exampled
+id: 0192b3a4-5e6f-7890-abcd-ef1234567890
+---
+{"version":"0.1.0","binary":"cosmix-exampled","pid":4242}
+</code></pre>
+<p>The checked broker validates <code>^[a-z][a-z0-9-]{1,30}$</code>, binds the name to the
+connection and refuses an occupied live name. It stamps <code>registered_at</code>.
+Malformed provenance currently produces a warning and name-only registration,
+not total rejection. <code>noded.deregister</code> operates on the calling connection's
+name and is idempotent. Disconnect cleanup must not remove a newer connection
+that acquired the same name.</p>
+<p><strong>BROKER-003:</strong> Forwarded <code>from</code> MUST be derived from the registered connection;
+anonymous caller assertions must not impersonate a service. Anonymous topic
+participants receive broker-local connection identities; these are neither
+persistent principals nor federation credentials. Broker admission and signed
+mesh identity have their own contract; a registered name alone does not prove
+an external principal.</p>
+<p><strong>BROKER-004:</strong> The recipient broker MUST remove every case-insensitive spelling
+of caller-supplied <code>broker_origin</code>, then stamp <code>local</code> only for its same-node
+socket classifier and <code>mesh</code> otherwise. This applies to delivered requests,
+events and correlated responses. A topic retains publish-time origin, not
+subscriber-time origin. An authorisation consumer MUST require exactly one
+<code>local</code> value where local delivery is required; missing/unknown/mesh fails
+closed. Direct broker notifications are outside this authorisation contract.</p>
+<h2 id="discovery">Discovery</h2>
+<p><strong>BROKER-005:</strong> <code>noded.list</code> returns service records; <code>noded.info</code> returns live
+node information; <code>noded.peers</code> describes peer configuration; <code>noded.ping</code>
+reports liveness and extension versions. The checked ping advertises
+<code>core: "1.0"</code>, <code>topic: "1.0"</code>, <code>observe: "1.0"</code>. An absent extension is not
+assumed available. <code>core</code> is not a claim of renderer conformance. Clients
+MUST tolerate unknown fields and read record fields by key.</p>
+<p><code>ServiceInfo</code> has required <code>name</code>, optional binary/version/git SHA/dirty/build
+time/PID/start time/registration time/schema version and <code>meta</code>. It is stored
+identity/provenance, not a live health snapshot. Its deserialiser also accepts
+legacy bare-name strings. <code>NodeInfo</code> computes uptime and service count on read.
+Source: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-bus/src/service_info.rs">discovery records</a>.</p>
+<h2 id="topic-operations">Topic operations</h2>
+<p><strong>BROKER-006:</strong> A topic is a named latest-value channel, not durable history.
+State is in memory and disappears on broker restart. The broker parses the
+inner envelope for routing annotations and can inspect namespace metadata for
+property filters; it does not own application state or promise byte identity.</p>
+<table><thead><tr><th>Command</th><th>Input</th><th>Successful response / effect</th></tr></thead><tbody>
+<tr><td><code>topic.publish</code></td><td><code>name</code> header, inner ABP envelope in body; <code>retain</code> defaults true</td><td><code>{seq, delivered}</code>; count is successful queue insertions</td></tr>
+<tr><td><code>topic.subscribe</code></td><td><code>name</code> header</td><td><code>{subscription_id, replayed, seq}</code>; replay can precede acknowledgement</td></tr>
+<tr><td><code>topic.unsubscribe</code></td><td><code>name</code> header</td><td><code>{}</code>; removes the peer's filter variants too</td></tr>
+<tr><td><code>topic.subscriber_count</code></td><td><code>name</code> header</td><td><code>{count}</code>; absent topic gives zero</td></tr>
+<tr><td><code>topic.list</code></td><td>optional <code>prefix</code> header</td><td>metadata array; prefix is literal, not glob</td></tr>
+<tr><td><code>topic.clear</code></td><td><code>name</code>, optional <code>notify</code> default true</td><td>clears snapshot; optional delete delivery</td></tr>
+</tbody></table>
+<p><strong>BROKER-007:</strong> Publish bodies MUST be complete single-message ABP envelopes.
+The checked broker rejects input above 1,048,576 bytes with RC 10
+<code>payload_too_large</code> and <code>limit: 1048576</code>; invalid framing gets
+<code>malformed_payload</code>. It currently uses lenient compatibility parsing, so this
+error does not prove full header/schema validation. <code>$</code>-prefixed publication
+is rejected as <code>reserved_name</code> by the checked implementation. Inputs MUST use
+canonical boolean <code>true</code>/<code>false</code>; the implementation treats only exact <code>false</code>
+as false for <code>retain</code> and <code>notify</code>.</p>
+<pre><code class="language-text">---
+command: topic.publish
+to: noded
+name: example.state
+retain: true
+---
+---
+command: example.state.changed
+type: event
+---
+{"ready":true}
+</code></pre>
+<p><strong>BROKER-008:</strong> For accepted publications the broker allocates the topic's
+sequence and replaces producer <code>topic</code>, <code>topic_seq</code>, <code>topic_stale</code>, <code>topic_op</code>
+annotations with broker-owned values. Live subscribers receive the annotated
+inner command. Retention caches that envelope; <code>retain: false</code> does not replace
+an existing snapshot, but increments the sequence and can clear staleness for
+the same publisher. Sequence is monotonic within one topic-state lifetime,
+not across deletion/purge/recreation or broker restart. No global ordering,
+exactly-once delivery, persistence or multi-producer exclusion is promised.</p>
+<p><strong>BROKER-009:</strong> Ordinary subscription is idempotent per connection/topic.
+An existing identical subscription is not replayed twice. Property watch
+grants can add namespace-filtered variants; the underlying identity is then
+peer/topic/filter, and counts can count variants rather than distinct peers.
+Subscribers MUST accept gaps and resynchronise from the owning service where
+correctness depends on complete history. Queued deliveries can outlive an
+unsubscribe acknowledgement; topic unsubscribe has no observation-style purge
+fence. Concurrent publisher ordering/replay atomicity requires dedicated
+testing before any stronger claim.</p>
+<p><strong>BROKER-010:</strong> Publisher disconnect marks its retained snapshot stale; replay
+adds <code>topic_stale: true</code>. The source uses a 60-second grace and 10-second
+janitor interval. Re-publication refreshes state. No-snapshot/no-subscriber
+entries are removed, so sequence can restart. <code>topic.clear</code> with notification
+sends <code>topic_op: delete</code>; consumers decide how invalidation affects their own
+state. The broker does not remove application windows.</p>
+<p><code>topic.active</code> and <code>topic.idle</code> notify the last publisher of zero/non-zero
+subscriber transitions. They are best-effort advisory notifications, including
+for anonymous connections; racing publishers do not each receive a notice.</p>
+<p><strong>BROKER-011:</strong> Reserved property topics enforce owning-service publication
+and restricted subscription/grant paths. Direct subscription to records/audit
+topics is rejected; callers use owner <code>props.watch</code>/<code>props.audit.watch</code> for
+authorisation and namespace filtering. This disproves the old blanket claim
+that all topic ACLs are future work. The property chapter owns the detailed
+grant and canonicalisation contract.</p>
+<h2 id="backpressure-and-delivery-limits">Backpressure and delivery limits</h2>
+<p><strong>BROKER-012:</strong> Routing MUST remain bounded under slow consumers. The current
+per-peer outbound channel holds 256 messages; <code>try_send</code> on full drops the
+new message and retains the connection. Closed channels are pruned. The old
+drop-oldest plus slow-consumer-disconnect design is <strong>superseded for this
+profile</strong> by the accepted <a href="/spec/compatibility-profile">compatibility amendment</a>.
+Clients must allow notification loss without a disconnect. A message-count bound is not a small memory
+bound: payload limits and aggregate topic/subscription counts also matter.</p>
+<p>Neither publish success nor <code>replayed: true</code> is a receipt from the subscriber
+application. Brokers and clients need queue-pressure tests, including replay
+under a full outbound queue and concurrent publish/re-subscribe, before
+claiming stronger semantics. Retained topics are unsuitable as the sole audit
+history or guaranteed workflow-delivery mechanism.</p>
+<h2 id="observation">Observation</h2>
+<p><strong>BROKER-013:</strong> <code>noded.observe.start/stop</code> is a separate bounded observation
+extension over canonicalised accepted envelopes and route outcomes. Control
+and observation-event frames are excluded to prevent recursion. Start requires
+a registered, same-node, configured allowlisted service; the default allowlist
+is empty. Subscription ownership is connection-scoped. <code>noded.tap</code> remains a
+deprecated, unredacted legacy surface, not the recommended substitute.</p>
+<p>Start body carries optional <code>filter</code> (<code>verbs</code>, <code>services</code>, <code>directions</code>),
+<code>body: "none"|"redacted"</code>, and capacity. Defaults/bounds: 1024 events,
+64–4096 allowed, 8 MiB per subscription, 4 subscriptions per connection,
+16 per broker, 32 verb globs of at most 128 bytes and 64 service filters
+of at most 128 bytes each.
+Payloads above 64 KiB become metadata only. Unlike ordinary routing, the
+observation ring evicts oldest; a 2 ms drainer has a 1 MiB per-subscription
+wire budget per wake. Routing never waits for an observer.</p>
+<p><strong>BROKER-014:</strong> Observation redaction MUST run before enqueue: first omit
+policy-sensitive verbs (registration/admission/auth/login/token families),
+then recursively redact credential-like keys from structured data; opaque
+payloads are omitted. Events carry subscription ID, sequence, time, direction,
+outcome, message type, canonical endpoints/verb, byte size, correlation ID,
+RC and drop count, plus permitted payload and omission reason. Start ACK
+precedes events; stop purges pending events before ACK and forms a fence.
+Non-owned/absent stop IDs return <code>{stopped:false}</code> without an existence oracle.
+Errors are RC 10 <code>observe_unauthorised</code>, <code>observe_invalid_args</code>,
+<code>observe_filter_invalid</code>, <code>observe_limit_exceeded</code>, or RC 20
+<code>observe_unavailable</code>.</p>
+<p>Source: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/observe.rs">observation</a>.</p>
+<h2 id="specification-distribution-and-migration">Specification distribution and migration</h2>
+<p><strong>BROKER-015:</strong> A served specification MUST identify the suite revision and
+contract it represents. Reading-order chapter numbers MUST NOT silently reuse
+legacy <code>spec.get chapter=N</code> or <code>world.specs.NN</code> identities for different content.
+Migration requires an explicit old-ID registry and compatibility policy.</p>
+<p>At the baseline, <code>spec.get</code> accepts <code>args.chapter</code> or exact <code>args.name</code> and
+returns document headers/body; errors use RC 10 with available chapters where
+appropriate. Discovery accepts only <code>NN_*.md</code> numeric prefixes, not this
+candidate's hyphen names or the old dated filenames. Explicit <code>--spec-dir</code>
+and <code>COSMIX_SPEC_DIR</code> select a directory, followed by legacy discovery.
+Exact-name lookup rejects path separators and parent traversal. This does
+not establish symlink confinement for an untrusted directory.</p>
+<p><code>world.specs.NN</code> is seeded at startup. Automatic edit-triggered republish is
+not established. Merely placing files under <code>docs/spec/</code> does not switch the
+broker's discovery or topics. Candidate exact-name access is possible only
+with an explicitly configured directory; production cutover remains gated on
+the registry/discovery migration and end-to-end checks. Optional service
+<code>SPEC</code> and a wildcard <code>world.*</code> subscription are not universal implemented
+bootstrap assumptions. Topic subscriptions are exact names.</p>
+<h2 id="evidence-and-acceptance">Evidence and acceptance</h2>
+<p>Source: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/noded.rs">broker</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/subscription.rs">topics</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-noded/src/spec.rs">spec distribution</a>.</p>
+<p>Acceptance requires isolated-broker tests for spoofed identities/origin,
+registration collisions, correlation, reserved topics, replay/clear/stale
+expiry, full/closed queues, filtered counts, observation redaction and stop
+fencing. Distribution cutover must exercise every legacy ID and new name,
+file selection, startup publication, revision metadata and confidentiality.
+External federation, wildcard topics, producer ownership locks, persistent
+topic history and automatic producer launch remain outside this profile.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +804,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +858,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +987,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

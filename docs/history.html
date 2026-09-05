@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — history</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,266 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="history.md"><div class="prose"><h1 id="the-cosmix-story-so-far">The CosMix story so far</h1>
+<p><em>March → August 2026, in one sitting. Written 2026-08-30, the day the project
+became a single repository with a fresh history — this page is what that
+history would have told you.</em></p>
+<p>CosMix is a bet that an AI agent can be the first-class operator of a
+computing system: that legibility, modifiability and reconstructibility <em>by
+agents</em> are the right design criteria, and that a system built on them ends up
+being a better system for people too. Six months in, the bet has produced a
+protocol family (the Bus), a language (Mix), a family of daemons, a sovereign
+WireGuard mesh, a compositor and toolkit, and a working method. This is how
+each of those came to be, what was tried and thrown away, and why the tree
+you are looking at is shaped the way it is. Two words of vocabulary: a <em>node</em>
+is a machine on the mesh; a <em>citizen</em> is a daemon or script registered on a
+node's bus. "Shipped" means landed on the main branch — and, where it says
+so, deployed to the fleet. The numbered SPECs are the project's specification
+suite, kept in the control hub. The standing laws quoted in italics come from
+the project mandate (<code>CLAUDE.md</code> in the starter control folder); the journals
+show them being learned.</p>
+<h2 id="marchapril-from-a-pile-of-services-to-a-substrate">March–April: from a pile of services to a substrate</h2>
+<p>The project did not start as an operating system. It started as a mail server
+being hardened (STARTTLS, TLS-before-AUTH, bcrypt, DKIM) and a container
+image that could provision a WireGuard node with zero touch. What made it
+CosMix was the decision, in late March, to stop scripting the system in
+several languages and build one of its own.</p>
+<p><strong>Mix had first light on 2026-03-29</strong>: a working interpreter with a
+test-first core, an extension API, a shell, and the first message-bus
+foundations — the ARexx idea (AmigaOS's scripting language, where every
+program is an addressable message port) in a Rust body. Two days later it was
+the <em>sole</em> scripting language: Lua and TOML scripting were removed and four
+small services were folded into one node daemon; by 2026-04-10 the Bash
+dispatch and test harnesses had been ported too, leaving Bash only for genuine
+orchestration. The design rules set then: Mix keeps a synchronous, WASM-clean core, embedders absorb async
+bridging through extensions, scripts orchestrate startup explicitly, and the
+hub stays a dumb router.</p>
+<p>April was about making that substrate real. Every mesh service was bound to
+WireGuard addresses only — <em>network binding, not repository privacy, is the
+primary security boundary</em> was decided on 2026-04-09 and still stands. The
+workspace shrank to a lean daemon-centred set. Mix gained reactive handlers
+(<code>on … end</code>, event-yielding sleep, topic lifecycle notifications) and the
+first live dashboard that reacted to the mesh instead of polling it. The
+knowledge layer arrived — an indexer with model circuit-breaking, a
+self-scheduling memory system with trust, decay and superseded-history — and
+the first agent daemon ran persistent sessions with tool loops against both
+hosted and local models.</p>
+<p>Two moments from this period set the tone. A <em>completed</em> Dioxus
+application mesh with eighteen UI crates was abandoned on 2026-04-09 for a
+daemons-plus-display architecture. And on 2026-04-27 an autonomous optimisation loop took the
+interpreter's benchmarks from seconds to roughly fifty milliseconds — a
+~130× speed-up — under a rule that was kept: a performance change
+lives only if it passes paired benchmarks <em>and</em> the full suite, and
+architectural wins outrank clever peepholes. By the end of April a
+10,000-message saturation flood had been reproduced and survived, and the
+project's method was recognisable: source-grounded design, real production
+data as the acceptance gate, layered verification, and autonomous loops that
+stay bounded when they fail.</p>
+<h2 id="may-contracts-instead-of-conventions">May: contracts instead of conventions</h2>
+<p>May turned local habits into explicit contracts. The internal hub was
+renamed to <code>noded</code> in a hard cutover with no compatibility aliases — <em>the
+wire identity and the prose role are different things</em> — and every daemon got
+a dedicated identity and hardened unit. The <strong>property substrate</strong> (SPEC 12)
+shipped, with mail accounts as its first consumer and live engine
+configuration as its third: <em>the property row is the sole source of truth, and
+corrupt durable state aborts startup rather than being repaired in place</em>.
+Mail moved from legacy SQL to a message-store-backed JMAP implementation, and
+on 2026-05-19 two independent mail daemons held a full bidirectional
+conversation over the mesh through an ordinary desktop client.</p>
+<p>Mesh DNS went generic: every node routes to its own loopback authoritative
+daemon from one byte-identical resolver configuration, replacing per-link
+routing. Mix gained SSH execution, quoting, timeouts and — in place of a
+bespoke <code>json_path</code> builtin — embedded <code>jq</code> semantics. A fifth citizen joined the
+mesh and an obsolete gateway identity retired.</p>
+<p>Two structural decisions bracketed the month. Substrate-owned structured data
+would use strict, static Mix syntax rather than YAML (a bulk migration was
+rejected; each format moved when its consumer did). And the source was
+<strong>split into three public repositories</strong> — protocol, language, daemons — with
+a private control repository holding deployment scripts, because publishing
+them would publish the operational topology. That split was the right call for
+a public/private boundary and, as August would show, the wrong shape for a
+newcomer's first build.</p>
+<p>The month's operational lessons were the ones every fleet learns the hard
+way and then writes down: <code>enable --now</code> does not refresh a running daemon;
+<code>Requires=</code> propagates stops but not restarts; verify the daemon's own log,
+not journald; validate every name, address and owning process independently,
+because aggregate substring checks mask partial failure. And the discipline
+that would later be named <em>convergence</em>: re-review every fix as fully fixed,
+partially fixed, or unaddressed, because the first repair often leaves the
+root cause elsewhere.</p>
+<h2 id="june-enforced-trust-and-a-product-surface">June: enforced trust, and a product surface</h2>
+<p>June made the mesh trustworthy and gave it a face. <strong>SPEC 13</strong> landed on
+2026-06-03: one generated inventory, signed, rollback-protected and
+fail-closed, became the trust root for the whole mesh, with live recovery
+proven. Broker admission followed the next day — challenge, proof,
+identity-bound registration, close-on-refuse, hot-reload revocation — rolled
+out <em>off → observe → enforce</em>, with cryptographic identity as the proof and
+IP addresses used only for correlation. Observe-before-enforce paid for
+itself immediately: it caught root-only seed files that would have made every
+daemon unable to prove itself, as telemetry instead of an outage.</p>
+<p>Generated DNS zones and WireGuard configuration removed duplicated address
+maintenance. Fleet logging settled on journal-upload leaves feeding
+one central reader (a per-node collector was too heavy at this scale). The
+indexer stopped wedging on bulk work. The <code>vhostd</code> idea — one process for
+mail and web — was rejected because merging them collapsed the fault,
+compromise and TLS-key boundaries; <em>maild and webd stay separate processes,
+trusted Mix may embed in-process, untrusted scripts go to pooled workers</em>.</p>
+<p>Then the surface. An embedded-Mix CMS proved <code>webd</code> could host server-rendered
+applications and shook four evaluator defects out of Mix in the process. A
+shared multi-vhost handler set, an SSR personal-information suite (contacts,
+calendar, mail), CalDAV/CardDAV over the existing stores, a legacy WordPress
+archive imported with slugs and media intact, email-to-post publishing with
+sender-locked opaque tokens, shared forms, one button system, one datatable
+model with right-click actions and bulk selection — the second half of June
+converged separate experiments into one coherent product surface.
+<code>filesd</code> extended the same substrate model to durable markdown corpora
+(<em>disk files are truth, the database is a rebuildable projection</em>), and a
+dual-pane file manager ran on its sandboxed backend. Mix reached 0.19 with
+math primitives and a source-verified manual; a seventh node joined the mesh
+with enforced admission.</p>
+<p>Deployment learned its most important rule on 2026-06-27: fleet rollout gates
+on <em>semantic version</em>, because identical source rebuilds to different bytes;
+SHA-based detection was abandoned. Nightly self-deployment stayed on, with
+ordered rollout and health gates as the safety boundary.</p>
+<h2 id="july-appliances-agents-at-the-controls-and-the-method">July: appliances, agents at the controls, and the method</h2>
+<p>July's centre of gravity moved from laboratory proofs to real workloads. A
+lean Arch-based appliance self-provisioned from one image on two container
+platforms, running the node daemon, mail and web with Mix as its shell; it
+got reproducible manifests and signed releases, and stayed a <em>normally
+updatable</em> system rather than an immutable image swap (that model was
+dropped as premature). Customer container provisioning worked end to end —
+preseed, certificates, DNS, web, mail, reboot verification, rollback — and
+<code>provisiond</code> finished a nine-brick arc of fenced jobs, crash reconciliation
+and fault injection: <em>design and fault-inject recovery around every external
+commit boundary rather than inferring it from happy-path tests</em>. The public edge
+moved behind fail-closed SNI demultiplexing. A cloud-suite replacement run
+proved DAV migration, webmail parity and a native photo pipeline.</p>
+<p>Mix crossed from shell to safe orchestration language: 0.28 brought builtin
+introspection, isolated modules and copy-on-write collections; 0.30 brought
+structured errors with tracebacks, validation at job boundaries, a linter,
+argv-safe execution, private-CA HTTP and remote <code>ssh_exec</code>. <em>When Mix lacks a
+primitive, add the primitive and dogfood it</em> became a standing rule; every
+shell workaround is a missed test of the substrate.</p>
+<p>Then the toolkit. On 2026-07-16 <strong>CTK</strong>, the CosMix toolkit, controlled a live audio mixer strip
+over the Bus; a day later it exposed an app-generic control surface so an
+agent could enumerate, inspect and drive native controls <em>without screen
+scraping</em> — the thesis, demonstrated. A fused-versus-split benchmark measured
+the Bus's cost as inaudible, so the split architecture stayed. CTK was folded
+into the main tree; <strong>CosMix Desktop</strong> became one family with slug-derived
+identities. Tower shipped as mesh mission control; an interaction daemon took
+ownership of every system-to-human surface (all eleven dialog kinds, end to
+end, from a registered Mix citizen). On 2026-07-30 the first CosMix
+<strong>compositor</strong> ran nested — Smithay protocol handling, Bevy rendering,
+shared-memory clients, DMA-BUF zero-copy — and by month's end it had pure KMS
+topology and live identity probes.</p>
+<p>The method was formalised on 2026-07-17: <strong>workflow-as-code</strong> as the default
+for non-trivial work, and — retained explicitly — <em>cold review, fix by
+severity, re-review until every finding is dispositioned</em>; round-two catches
+are the norm. The same month the project pruned its own
+memory: plans are deleted when they ship, decisions survive shipped work, and
+on 2026-07-25 a <strong>public-repository hygiene gate</strong> shipped — a scanner and
+git hooks that refuse any commit or push carrying a real host, address,
+domain or home path — after exposed values were found and sanitised. Its
+lesson: <em>before importing history into a public repository, scan every
+commit, not just the final tree.</em></p>
+<h2 id="august-first-light-signed-routing-and-the-harness-that-ate-the-month">August: first light, signed routing, and the harness that ate the month</h2>
+<p>August belonged to the compositor. Explicit sync (advertised in production,
+then withdrawn after permanent faults, then completed end to end), a single
+input core for nested and live transports, the first live input run on real
+hardware, the first steady KMS frames on 2026-08-05, a supervised render
+pump, resume as a <em>cyclic</em> release/reacquire authority rather than a restart,
+first live client content on 2026-08-06, exact fractional scaling,
+server-side decorations on by default. Then the decisive reversal: on
+2026-08-18 <strong>atomic KMS presentation replaced Vulkan direct-display</strong>,
+because its page-flip wait is cancellable and deadline-bound — and
+direct-display, its feature graph and public API were deleted once the soak
+matrix passed. A Quoin shell skeleton and a disposable GPU-capable desktop
+container passed their bring-up gates alongside.</p>
+<p>The mesh finished its trust story: the <strong>signed inventory became the sole
+routing authority</strong> (noded 0.13.0, 2026-08-16) with signed broker endpoints
+and outbound hot-reload fencing across seven nodes; in prose the protocol's
+uppercase name changed from <em>AMP</em> to <em>ABP</em> (Agent Bus Protocol), while <em>Bus</em>
+stayed the transport and the lowercase wire and API names did not change. The
+knowledge memory system that had scheduled itself since April was <strong>removed</strong>
+on 2026-08-19 — polling, auto-graduation and observer-driven deployment had
+become noisy, circular and unsafe — and post-commit events became the only
+indexing trigger, in line with the standing law that <em>a backend is woken by a
+bus event, with a timer only as a slow backstop for a missed wake</em>.</p>
+<p>And then the harness. <strong>Foreman</strong> shipped on 2026-08-17: agent drivers, a
+ledger, governed execution, verification tiers, merge authority, an
+escalation ladder that climbed across the project's model families — an
+unattended fleet that landed ninety-seven changes. It also taught the project
+more about verification than anything before it:</p>
+<ul>
+<li><em>the tested tree is part of the artefact</em> — verification means nothing
+while another writer can still edit it;</li>
+<li>shared build directories launder binaries across worktrees;</li>
+<li>a green gate is a hypothesis until a mutation on the production path fails
+it;</li>
+<li>unknown-host failures must never be charged to a branch;</li>
+<li>a sandbox that blocks the agent's own gate trains it to commit blind;</li>
+<li>reviewer families disagree, so charges must key to code-owned causes.</li>
+</ul>
+<p>Two build workers carried
+real gates by 2026-08-29. By then the harness was consuming more attention
+than the compositor and desktop it existed to accelerate, so on 2026-08-30 it
+was <strong>decommissioned</strong> — ledger, unpublished branches and worktree patches
+retained — in favour of the inline loop it had been built to automate:
+implement, verify independently, cold-review on two arms (two model
+families), converge.</p>
+<p>Meanwhile the substrate kept moving: Mix 0.60/0.61 made corrupt control-flow
+values raise instead of fabricate and moved usage statistics into the
+evaluator; the Bayesian mail classifier was carved out as a standalone engine
+with exact untrain/relabel and byte-identical classification, and mail gained
+shadow-trained, atomically-swapped per-account rebuilds.</p>
+<h2 id="2026-08-30-one-repository-one-root-one-command">2026-08-30: one repository, one root, one command</h2>
+<p>The decision that produced this tree came last. The
+three-repository split, right for the public/private boundary, meant that
+<code>git clone</code> of any single repository could not build — every crate reached
+its siblings through relative paths into hidden directories no README
+mentioned. So the code became <strong>one repository</strong>: one Cargo workspace for the
+substrate and a separate one for the desktop (which pins its own toolchain),
+the manuals living in the site
+they are served from, and a <code>bootstrap</code> script (the only non-Mix script,
+because it exists to build Mix) that turns a clone into an install in one
+command. Everything is keyed off one root, <code>$COSMIX</code>; the binaries find it
+from their own location; <code>/opt/cosmix/bin</code> remains the system tier for nodes.
+A starter control folder ships in the tree so a new user gets a private hub
+by copying a directory — no account with anyone required.</p>
+<p>The old repositories, with their 1,361 commits, went to archival storage.
+Preserving them was the first plan; it was reversed the same day when
+the hygiene gate had to scan every one of them on every push, and because
+the point of the fresh start was to have <em>no history to lean on</em>. This page
+is the exception: the shape of the decisions, without the weight of the
+commits.</p>
+<h2 id="what-stuck">What stuck</h2>
+<ul>
+<li><strong>Three criteria as the frame.</strong> More legible, more modifiable, more
+reconstructible by agents — the stated test for every design call. The
+reversals above each fell for a concrete reason (the immutable appliance was
+premature, the fused mixer lost to addressability and independent daemon
+lifetime, the harness cost more attention than it saved), and each is a
+case the criteria call the same way.</li>
+<li><strong>Agentic-first; ceremony opt-in.</strong> Correctness invariants — signed
+inventory, admission, fail-closed trust — stay unconditional. What becomes
+a flag is the human-in-the-loop ceremony: a mandatory prompt on a path an
+agent must drive is a bug.</li>
+<li><strong>The binary is the oracle.</strong> Mix's manual is verified against the
+interpreter, and the interpreter documents its own builtins; a doc that
+disagrees with the code is fixed in the code.</li>
+<li><strong>Events, not polls.</strong> A backend is woken by a bus event; a timer is at most
+a slow backstop for a missed wake. Nightly deployment is a schedule, not a
+poll.</li>
+<li><strong>Fix the language, not the script.</strong> A missing Mix primitive is a Mix bug.</li>
+<li><strong>Convergence.</strong> Cold review on two model families, fix by severity,
+re-review until every finding is dispositioned.</li>
+<li><strong>Verify the artefact, not the report.</strong> The installed binary, the live
+behaviour, the unit's own invocation — never the build log, the summary, or
+"active".</li>
+<li><strong>Publish shapes, not identities.</strong> The hygiene gate decides what may be
+public; the private hub holds the rest.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +878,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +932,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1061,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-daemon/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,131 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-daemon/README.md"><div class="prose"><h1 id="cosmix-lib-daemon">cosmix-lib-daemon</h1>
+<p><code>cosmix-lib-daemon</code> supplies shared runtime infrastructure for Cosmix daemon services. It is a substrate library in the <code>bus &lt;- mix &lt;- cos</code> dependency chain: the package belongs to the <code>cos</code> layer and is imported in Rust as <code>cosmix_daemon</code>. It provides process-lifecycle helpers, strict HTTP host parsing, protocol-neutral listener management, connection guards, and optional TLS, SNI, Let's Encrypt validation, ACME, and self-signed certificate support.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-toml">[dependencies]
+cosmix-lib-daemon = { version = "0.6.0" }
+</code></pre>
+<pre><code class="language-rust">use cosmix_daemon::{log_dir, shutdown_signal};
+
+let path = log_dir();
+shutdown_signal().await;
+</code></pre>
+<p>TLS consumers enable the <code>tls</code> feature:</p>
+<pre><code class="language-toml">[dependencies]
+cosmix-lib-daemon = { version = "0.6.0", features = ["tls"] }
+</code></pre>
+<h2 id="process-helpers">Process helpers</h2>
+<p><code>log_dir()</code> returns the conventional daemon log directory under the current user's home directory. It falls back to <code>/tmp/cosmix-log</code> when <code>HOME</code> is unavailable.</p>
+<p><code>shutdown_signal()</code> waits for Ctrl+C. On Unix it also waits for <code>SIGTERM</code>. It returns after either signal and emits a shutdown trace event.</p>
+<p><code>load_tls_config(cert_path, key_path)</code> is available with <code>tls</code>. It reads a PEM certificate chain and private key, installs the rustls <code>ring</code> provider if needed, and returns a <code>tokio_rustls::TlsAcceptor</code> configured without client authentication.</p>
+<p>Tracing initialisation is outside this crate.</p>
+<h2 id="http-host-parsing">HTTP host parsing</h2>
+<p>The <code>http_host</code> module provides:</p>
+<ul>
+<li><code>parse_request_host(raw)</code> parses an HTTP <code>Host</code> value.</li>
+</ul>
+<p>The parser returns a lower-case bare hostname or <code>None</code>. It accepts a trailing numeric port and strips it. It rejects empty values, hostnames longer than 253 bytes, non-LDH bytes, non-numeric or overlong ports, extra colons, IPv6 literals, and CR/LF input. Response policy remains with the caller.</p>
+<h2 id="listener-sets">Listener sets</h2>
+<p>The <code>listen</code> module manages logical listeners across one or more resolved socket addresses. It binds sockets, runs one accept loop per bind, applies connection guards, optionally terminates TLS, attaches connection metadata, and dispatches accepted streams to a daemon-supplied handler.</p>
+<p>Configuration deserialisation and address resolution remain outside this module. <code>ListenerSpec</code> accepts resolved <code>SocketAddr</code> values.</p>
+<p>Key specification types are:</p>
+<table><thead><tr><th>Type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ListenerSpec</code></td><td>Stable listener ID, bind addresses, enable state, external flag, TLS mode, guard policy, and partial-bind policy</td></tr>
+<tr><td><code>TlsMode</code></td><td><code>Plain</code>; with <code>tls</code>, also <code>Terminate</code> and <code>StartTlsPassthrough</code></td></tr>
+<tr><td><code>BindPolicy</code></td><td><code>FailAll</code> or <code>BestEffort</code> for partial multi-bind failures</td></tr>
+<tr><td><code>GuardPolicy</code></td><td>Optional rate limit, connection caps, strict-SNI intent, and IP ACL</td></tr>
+</tbody></table>
+<p><code>ListenerSpec::new()</code> creates an enabled, internal, plain-TCP listener with no guards and <code>BindPolicy::FailAll</code>. Builder-style setters attach the remaining policy.</p>
+<p>Key runtime types are:</p>
+<table><thead><tr><th>Type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ListenerSetBuilder</code></td><td>Adds listener specifications and handlers, then builds a set</td></tr>
+<tr><td><code>ListenerSet</code></td><td>Owns configured listeners and starts enabled entries</td></tr>
+<tr><td><code>ListenerSetControl</code></td><td>Cloneable live control handle</td></tr>
+<tr><td><code>ListenerStatus</code></td><td>Listener ID, running state, reported binds, external flag, and active connection count</td></tr>
+<tr><td><code>ConnHandler</code></td><td>Asynchronous per-connection handler trait</td></tr>
+<tr><td><code>AcceptedStream</code></td><td>Raw TCP stream or, with <code>tls</code>, a terminated TLS stream</td></tr>
+<tr><td><code>ConnCtx</code></td><td>Listener ID, local and peer addresses, external flag, SNI, and optional TLS handle</td></tr>
+</tbody></table>
+<p><code>ListenerSet::start_all()</code> starts enabled listeners. Individual bind failures are logged; it returns an error when listeners were requested but none started.</p>
+<p><code>ListenerSetControl</code> provides:</p>
+<ul>
+<li><code>enable(id)</code> binds and starts a listener. Repeated enable calls are no-ops.</li>
+<li><code>disable(id, drain)</code> stops accepting, releases listening sockets, and optionally waits for active connections up to a deadline.</li>
+<li><code>is_running(id)</code> reports whether the listener is bound.</li>
+<li><code>status()</code> returns ID-sorted snapshots for all configured listeners.</li>
+<li><code>swap_guard(id, policy)</code> changes admission policy for subsequent connections without resetting live counters or rate buckets.</li>
+<li><code>swap_tls(id, resolver)</code> changes TLS identities for subsequent handshakes when <code>tls</code> is enabled.</li>
+</ul>
+<p><code>BindPolicy::FailAll</code> releases successful partial binds if any address fails. <code>BindPolicy::BestEffort</code> keeps successful binds but still fails when no address binds.</p>
+<h2 id="connection-guards">Connection guards</h2>
+<p>Listener guards are protocol-neutral and apply before the connection handler. Admission checks run in this order:</p>
+<ol>
+<li>IP ACL.</li>
+<li>Per-IP token-bucket rate limit.</li>
+<li>Listener-wide concurrent-connection cap.</li>
+<li>Per-IP concurrent-connection cap.</li>
+</ol>
+<p><code>RateLimit</code> defines the maximum admissions in a time window.</p>
+<p><code>Cidr</code> parses IPv4 or IPv6 CIDR strings and bare host addresses. Bare addresses use <code>/32</code> for IPv4 and <code>/128</code> for IPv6.</p>
+<p><code>IpAcl</code> contains allow and deny CIDRs. Deny entries win. An empty allow list permits all addresses not denied.</p>
+<p><code>Guards::admit()</code> returns a <code>ConnPermit</code> on success. Dropping the permit releases global and per-IP connection counts. Guard policies default to off.</p>
+<h2 id="tls-and-sni">TLS and SNI</h2>
+<p>The <code>tls</code> module is present only with the <code>tls</code> feature. It provides multi-identity SNI selection and Let's Encrypt chain validation.</p>
+<p><code>SniCertResolver::from_config()</code> loads certificate and key files described by <code>cosmix_config::node::TlsIdentityConfig</code>. Server names are normalised to lower case and duplicate names are rejected case-insensitively.</p>
+<p><code>TlsIdentity</code> exposes the normalised name, rustls <code>CertifiedKey</code>, default flag, and no-SNI fallback flag.</p>
+<p><code>pick_identity()</code> contains the shared selection policy:</p>
+<ul>
+<li>An exact SNI match wins.</li>
+<li>An unknown SNI falls back to the default identity unless strict SNI is active.</li>
+<li>Missing SNI uses the no-SNI fallback, then the default identity.</li>
+<li>Strict SNI rejects unknown and missing SNI.</li>
+</ul>
+<p>If no identity has either fallback flag, the first configured identity acts as both fallbacks.</p>
+<p><code>ListenerTls</code> holds a hot-swappable resolver and caches rustls server configurations by resolver identity. A missing or empty resolver disables TLS. Resolver swaps leave in-flight handshakes using their existing configuration.</p>
+<p>TLS termination has a 15-second handshake timeout. <code>Terminate</code> listeners refuse to bind without a usable resolver. <code>StartTlsPassthrough</code> passes raw TCP plus the listener's TLS handle to the connection handler.</p>
+<h2 id="lets-encrypt-validation">Let's Encrypt validation</h2>
+<p><code>validate_le_chain()</code> validates a PEM chain against the production Let's Encrypt trust set.</p>
+<p><code>validate_le_chain_for_environment()</code> validates against an explicit <code>ChainEnvironment::Production</code> or <code>ChainEnvironment::Staging</code> trust set.</p>
+<p>Validation requires all of the following:</p>
+<ol>
+<li>X.509 path validation for the selected environment and validation time.</li>
+<li>A permitted SPKI-SHA-256 pin for the leaf's issuing intermediate.</li>
+<li>Subject Alternative Name coverage for every expected DNS name.</li>
+</ol>
+<p>The expected-name list must not be empty. Production and staging trust anchors and intermediate pin tables are separate. <code>IntermediateState::Active</code> and <code>Backup</code> pins are accepted; <code>Retired</code> is a kill switch.</p>
+<p>The module exports the production and staging intermediate tables, the staging trust-root DER set, and their associated environment and pin metadata types.</p>
+<h2 id="acme">ACME</h2>
+<p>The <code>acme</code> module is present with <code>tls</code>. It wraps <code>instant-acme</code> for Let's Encrypt HTTP-01 issuance.</p>
+<p><code>AcmeProvider</code> admits only <code>LetsencryptStaging</code> and <code>LetsencryptProd</code>. It maps each provider to its directory URL, stable file-name component, and chain-validation environment.</p>
+<p><code>WebdAcmeClient</code> provides:</p>
+<ul>
+<li><code>load_or_create_staging(account_dir, contact_email)</code> for staging accounts.</li>
+<li><code>load_or_create_prod(account_dir, contact_email, tos)</code> for production accounts with a typed <code>AcmeTosAcceptance</code>.</li>
+<li><code>order(domain, solver)</code> for a single-domain HTTP-01 order.</li>
+<li><code>provider()</code> and <code>account_dir()</code> accessors.</li>
+</ul>
+<p><code>Http01Solver</code> is the caller-implemented asynchronous interface for publishing and removing challenge tokens. Cleanup is attempted after both successful and failed orders.</p>
+<p><code>IssuedChain</code> returns the full PEM chain, a locally generated PKCS#8 private key, the provider, and the parsed leaf validity window. The caller must validate the returned chain with the matching chain environment before installation.</p>
+<p>Account credentials and metadata use provider-specific JSON files in the supplied account directory. File writes use a temporary file, file synchronisation, atomic rename, and parent-directory synchronisation. Missing halves of an account file pair, provider changes, directory URL changes, and production terms-of-service URL changes return <code>AcmeError::AccountMetaMismatch</code>.</p>
+<p><code>verify_account_meta_local()</code> checks stored provider metadata without loading credentials or contacting the ACME directory.</p>
+<h2 id="self-signed-certificates">Self-signed certificates</h2>
+<p>The <code>selfcert</code> module is present with <code>tls</code>.</p>
+<p><code>write_self_signed(fqdn, cert_path, key_path)</code> generates a P-256 self-signed leaf with the requested DNS name and loopback IP in its Subject Alternative Names. It writes the certificate as mode <code>0644</code> and the private key as mode <code>0600</code>.</p>
+<p>Writes use a same-directory exclusive temporary file, synchronisation, and atomic rename. The caller remains responsible for any ownership changes.</p>
+<h2 id="features">Features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>tls</code></td><td style="text-align: right">No</td><td>Enables rustls and tokio-rustls support, the <code>tls</code>, <code>acme</code>, and <code>selfcert</code> modules, TLS listener modes, SNI routing, Let's Encrypt validation, ACME issuance, and self-signed certificate generation</td></tr>
+</tbody></table>
+<p>The default feature set is empty. Plain-TCP listener management, connection guards, host parsing, log-directory lookup, and shutdown signalling remain available without TLS dependencies.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The base crate uses Tokio for signals, sockets, tasks, and listener control; tracing for runtime events; anyhow for fallible operations; async-trait for handler dispatch; and arc-swap for live policy replacement.</p>
+<p>The <code>tls</code> feature adds the Cosmix configuration library and the certificate, cryptography, serialisation, ACME, time, temporary-file, and typed-error dependencies required by the optional modules.</p>
+<h2 id="scope">Scope</h2>
+<p>This crate has no binary target, command-line interface, subcommands, or Bus verbs. Daemons supply protocol handlers and expose any runtime controls through their own surfaces.</p>
+<p>It does not deserialize daemon listener configuration. It operates on resolved listener specifications and TLS identity configuration supplied by its callers.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +743,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +797,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +926,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/cosmix-mix/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,155 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/cosmix-mix/cli.md"><div class="prose"><h1 id="command-line-interface">Command-line interface</h1>
+<p>The <code>cosmix-mix</code> package installs the <code>mix</code> command. The command is an
+interactive shell, a Mix program runner, a shell-compatible <code>-c</code> dispatcher,
+and a collection of reference, diagnostic, and maintenance subcommands.</p>
+<h2 id="usage">Usage</h2>
+<pre><code class="language-text">mix
+mix [GLOBAL-OPTIONS] FILE [ARG...]
+mix [GLOBAL-OPTIONS] -c CODE [ARG...]
+mix -i -c CODE [ARG...]
+mix [GLOBAL-OPTIONS] - [ARG...]
+mix --check FILE
+mix lint [LINT-OPTIONS] FILE...
+mix SUBCOMMAND [ARG...]
+mix --serve FILE [--name SERVICE] [--no-prelude]
+</code></pre>
+<p>Global options precede a script path. Arguments after a normal script path,
+<code>-c</code> code string, or <code>-</code> are positional arguments for the Mix program.</p>
+<h2 id="primary-options">Primary options</h2>
+<table><thead><tr><th>Option</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>-h</code>, <code>--help</code></td><td>Prints the capability overview.</td></tr>
+<tr><td><code>-V</code>, <code>--version</code></td><td>Prints the <code>mix</code> version line.</td></tr>
+<tr><td><code>--builtins</code></td><td>Prints the full builtin catalogue.</td></tr>
+<tr><td><code>--no-prelude</code></td><td>Skips the standard prelude in script, command, or serve evaluation.</td></tr>
+<tr><td><code>--no-traceback</code></td><td>Uses legacy single-line rendering for uncaught file and command-mode errors.</td></tr>
+<tr><td><code>--strict-arity</code></td><td>Makes wrong-arity function and builtin calls raise <code>ARITY_MISMATCH</code>.</td></tr>
+<tr><td><code>--check FILE</code></td><td>Lexes and parses a file without executing it.</td></tr>
+<tr><td><code>-c CODE</code></td><td>Runs one classified command line.</td></tr>
+<tr><td><code>-i</code></td><td>When used with <code>-c</code>, loads <code>~/.mixrc</code> before running the code.</td></tr>
+<tr><td><code>-ci</code>, <code>-ic</code></td><td>Combined spellings of <code>-i -c</code>.</td></tr>
+<tr><td><code>--serve FILE</code></td><td>Starts the supervised Bus citizen mode described in <a href="/mix/cosmix-mix/serve-mode">Serve mode</a>.</td></tr>
+</tbody></table>
+<p>Without <code>--strict-arity</code>, missing arguments bind to <code>nil</code> and extra arguments
+are ignored. Tracebacks remain the default when an error crosses a function or
+builtin boundary.</p>
+<h2 id="script-arguments">Script arguments</h2>
+<p>For a file, <code>$0</code> is the script path and <code>$1</code>, <code>$2</code>, and later variables hold
+the remaining arguments. For <code>mix -</code>, <code>$0</code> is <code>-</code>. Command mode assigns its
+arguments from <code>$1</code>; it does not set a script filename.</p>
+<p><code>include</code> resolves relative content using the active script file. The
+standard-input form has no temporary remote file and is executed only when the
+explicit <code>-</code> operand is present.</p>
+<h2 id="command-mode">Command mode</h2>
+<p><code>mix -c CODE</code> uses the REPL classifier rather than assuming that <code>CODE</code> is Mix
+source. It may execute:</p>
+<ul>
+<li>Mix statements or expressions.</li>
+<li>A simple bareword call to a user-defined Mix function.</li>
+<li>An external command, pipeline, redirection, background launch, or command
+list.</li>
+<li>The in-process <code>cd</code> and <code>exit</code> builtins.</li>
+</ul>
+<p>The exit status of an external command becomes the <code>mix</code> exit status. Spawn
+failure returns 127. A signal result is converted to <code>128 + signal</code> on Unix.
+Mix parse or runtime errors return 1.</p>
+<p><code>-i</code> sources <code>~/.mixrc</code> before classification, making its aliases, functions,
+and <code>PATH</code> changes available. Command mode otherwise loads the prelude but does
+not load the rc file.</p>
+<h2 id="interactive-shell">Interactive shell</h2>
+<p>The REPL loads the prelude, then loads a regular-file <code>~/.mixrc</code> when <code>HOME</code> is
+available. It stores readline history in <code>~/.mix_history</code>.</p>
+<p>Input classification follows this broad order:</p>
+<ol>
+<li>Expand the first-word alias.</li>
+<li>Route Mix keywords and variable-led forms to the Mix parser.</li>
+<li>Route a simple call whose head names a Mix function to that function.</li>
+<li>Route shell builtins and commands found on <code>PATH</code> to shell execution.</li>
+<li>Surface a Mix parse error or command-not-found result for the remaining
+input.</li>
+</ol>
+<p>The shell recognises pipelines, file-descriptor redirections, environment
+prefixes, variable and tilde expansion, brace and glob expansion, command
+substitution, background <code>&amp;</code>, and <code>&amp;&amp;</code>, <code>||</code>, and <code>;</code> lists. Expansions cannot
+inject new structural command-list operators.</p>
+<p>REPL shell builtins are <code>cd</code>, <code>pushd</code>, <code>popd</code>, <code>history</code>, <code>exit</code>, <code>which</code>,
+<code>type</code>, <code>unalias</code>, <code>jobs</code>, <code>fg</code>, <code>bg</code>, and <code>mix</code>. Files executed by <code>source</code>
+support <code>cd</code> and <code>exit</code>; stateful REPL-only builtins are rejected there.</p>
+<p><code>time LINE</code> and <code>mix time LINE</code> time either Mix or shell input in the REPL.
+<code>trace</code>, <code>history</code>, and <code>reload</code> are also REPL-only meta-command surfaces.</p>
+<h2 id="one-shot-subcommands">One-shot subcommands</h2>
+<p>The following names are recognised before the command attempts to open a
+same-named script. Use an explicit path such as <code>./build</code> for a script that
+collides with a subcommand name.</p>
+<table><thead><tr><th>Group</th><th>Commands</th></tr></thead><tbody>
+<tr><td>Session inspection</td><td><code>vars</code>, <code>aliases</code>, <code>functions</code>, <code>all</code>, <code>type</code>, <code>config</code>, <code>status</code>, <code>context</code>, <code>snapshot</code></td></tr>
+<tr><td>Reference</td><td><code>help</code>, <code>tutorial</code>, <code>examples</code>, <code>man</code>, <code>keywords</code>, <code>builtins</code>, <code>what</code>, <code>syntax</code>, <code>operators</code>, <code>diff</code></td></tr>
+<tr><td>Project maintenance</td><td><code>build</code>, <code>clean</code>, <code>update</code>, <code>test</code>, <code>self</code></td></tr>
+<tr><td>Validation</td><td><code>check</code>, <code>lint</code></td></tr>
+<tr><td>Bus discovery</td><td><code>mesh</code>, <code>ports</code>, <code>ping</code></td></tr>
+<tr><td>AI integration</td><td><code>fix</code>, <code>extend</code>, <code>review</code>, <code>explain</code>, <code>evolve</code>, <code>dogfood</code>, <code>fuzz</code>, <code>teach</code>, <code>ask</code>, <code>chat</code></td></tr>
+<tr><td>Service tools</td><td><code>deploy</code>, <code>health</code>, <code>logs</code></td></tr>
+<tr><td>Claude port tools</td><td><code>claude-start</code>, <code>claude-stop</code>, <code>claude-status</code></td></tr>
+<tr><td>Automation</td><td><code>watch</code></td></tr>
+<tr><td>Usage data</td><td><code>stats</code></td></tr>
+</tbody></table>
+<p>One-shot session inspection uses a fresh evaluator. It therefore has no user
+variables, aliases, or functions unless the command itself loads them.</p>
+<p><code>builtins</code> accepts <code>--json</code>, <code>--data</code>, <code>--names</code>, one builtin name, or one
+category. <code>syntax</code> opens the variables manual page and <code>operators</code> opens the
+operators page.</p>
+<p>The AI commands and the <code>ai</code>, <code>ai_diagnose</code>, and <code>context</code> extension functions
+invoke an external Claude command-line program. Build and maintenance commands
+invoke tools such as Cargo and Git. Service commands invoke local service and
+logging tools.</p>
+<h2 id="lint">Lint</h2>
+<pre><code class="language-text">mix lint [--json | --data] [--deny-warnings]
+         [--allow-global NAME]... [--allow-function NAME]...
+         FILE...
+</code></pre>
+<p><code>-</code> reads standard input and may appear once. Human diagnostics and structured
+reports go to standard output. Usage and internal errors go to standard error.</p>
+<table><thead><tr><th>Status</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>0</td><td>No errors; warnings are allowed unless denied.</td></tr>
+<tr><td>1</td><td>Error diagnostics, or warnings with <code>--deny-warnings</code>.</td></tr>
+<tr><td>2</td><td>Invalid usage, unreadable input, or internal analyser failure.</td></tr>
+</tbody></table>
+<p>JSON and strict-data reports include schema version 1, tool and Mix versions,
+input files, diagnostics, capabilities, and an error/warning summary.</p>
+<h2 id="statistics">Statistics</h2>
+<p><code>mix stats</code> reports tracked builtins, functions, aliases, external commands,
+keywords, meta-commands, errors, and sessions. Its subcommands are:</p>
+<pre><code class="language-text">builtins functions aliases commands keywords meta errors sessions
+never all raw reset clear week query trend since help
+</code></pre>
+<p>Current data is stored as <code>current.json</code> under the stats directory and rotates
+by ISO week. The implementation can batch data into <code>mix.db</code> and delegates SQL
+queries to an external <code>sqlite3</code> command when it is present.</p>
+<h2 id="files-and-environment">Files and environment</h2>
+<table><thead><tr><th>Name</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>~/.mixrc</code></td><td>Interactive and <code>-i -c</code> startup file.</td></tr>
+<tr><td><code>~/.mix_history</code></td><td>Readline history.</td></tr>
+<tr><td><code>node.conf.mix</code></td><td>Read-only broker address input; see <a href="/mix/cosmix-mix/serve-mode">Serve mode</a>.</td></tr>
+<tr><td><code>COSMIX_NODE_CONFIG</code></td><td>Overrides the node configuration file path.</td></tr>
+<tr><td><code>COSMIX_SRC</code></td><td>Overrides the Cosmix source/documentation root used by project and manual commands.</td></tr>
+<tr><td><code>COSMIX_ETC</code></td><td>Overrides the Cosmix configuration directory.</td></tr>
+<tr><td><code>COSMIX_BIN</code></td><td>Overrides the install directory used by <code>mix build</code>.</td></tr>
+<tr><td><code>COSMIX_MAN_SOURCE</code></td><td>Selects <code>auto</code> or <code>local</code> manual resolution.</td></tr>
+<tr><td><code>COSMIX_MAN_URL</code></td><td>Overrides the canonical manual base URL.</td></tr>
+<tr><td><code>XDG_CACHE_HOME</code></td><td>Sets the manual cache root; it must be absolute to be used as an XDG path.</td></tr>
+<tr><td><code>XDG_STATE_HOME</code></td><td>Sets the usage-statistics root; it must be absolute.</td></tr>
+<tr><td><code>MIX_STATS=0</code></td><td>Disables statistics for the process.</td></tr>
+<tr><td><code>MIX_DEBUG</code></td><td>Enables warnings for statistics path and persistence failures.</td></tr>
+<tr><td><code>HOME</code></td><td>Supplies rc, history, cache, state, and user-mode defaults.</td></tr>
+<tr><td><code>PATH</code></td><td>Supplies external-command discovery and completion.</td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Overrides serve-mode log filtering.</td></tr>
+</tbody></table>
+<p>Manual pages are fetched in automatic mode, cached for 24 hours, and fall back
+to a local checkout or stale cache when the network request fails. Local mode
+does not fetch from the network.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +767,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +821,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +950,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

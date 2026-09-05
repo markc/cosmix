@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/cosmix-mix/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,127 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/cosmix-mix/README.md"><div class="prose"><h1 id="cosmix-mix">cosmix-mix</h1>
+<p><code>cosmix-mix</code> builds the <code>mix</code> executable: the interactive shell, script runner,
+command dispatcher, linter, and supervised Bus citizen host for Mix programs.
+In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it occupies the Mix layer: it
+depends on Bus protocol, client, logging, build-information, and property
+crates, and on the <code>cosmix-lib-mix</code> language runtime, but it does not depend on
+the Cos daemon layer.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">mix
+mix script.mix [args...]
+mix -c 'CODE' [args...]
+mix -i -c 'CODE' [args...]
+mix - [args...]
+mix --check script.mix
+mix lint [OPTIONS] FILE...
+mix --serve script.mix [--name SERVICE] [--no-prelude]
+</code></pre>
+<p>The Cargo package produces one binary named <code>mix</code>. It does not expose a Rust
+library target. References to <code>cosmix_mix</code> in its source name the
+<code>cosmix-lib-mix</code> dependency, not this package.</p>
+<p>See <a href="/mix/cosmix-mix/cli">Command-line interface</a> for modes, options, subcommands, files,
+and environment variables. See <a href="/mix/cosmix-mix/serve-mode">Serve mode</a> for the supervised
+Bus runtime and its reserved verbs.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<ul>
+<li>An interactive readline shell with history, completion, aliases, job
+control, directory stacks, and a Mix-or-shell input classifier.</li>
+<li>A <code>.mix</code> script runner with positional arguments, traceback rendering,
+strict-arity selection, interrupt handling, and an optional standard
+prelude.</li>
+<li>A <code>-c</code> mode that applies the same classifier as the REPL, so the input may be
+Mix source or an external command line.</li>
+<li>Shell execution for pipelines, redirections, environment prefixes,
+expansions, command substitution, background jobs, and <code>&amp;&amp;</code>, <code>||</code>, and <code>;</code>
+command lists.</li>
+<li>Reference and introspection commands for help, manuals, builtins, keywords,
+operators, runtime state, and Bus services.</li>
+<li><code>mix lint</code>, a semantic-analysis CLI with human, JSON, and strict-data output.</li>
+<li>Usage statistics stored under the XDG state directory, with JSON rotation
+and optional SQLite queries.</li>
+<li>Bus adapters for transient scripts and supervised <code>--serve</code> citizens.</li>
+<li>Runtime-owned <code>HELP</code>, <code>INFO</code>, <code>QUIT</code>, and L1 property verbs for every served
+citizen.</li>
+</ul>
+<h2 id="execution-modes">Execution modes</h2>
+<table><thead><tr><th>Mode</th><th>Entry point</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td>Interactive</td><td><code>mix</code></td><td>Starts the REPL, loads the prelude and <code>~/.mixrc</code>, and maintains history and jobs.</td></tr>
+<tr><td>Script</td><td><code>mix FILE</code></td><td>Parses and executes a file, then runs its event pump when handlers are registered.</td></tr>
+<tr><td>Command</td><td><code>mix -c CODE</code></td><td>Classifies and runs Mix code, a Mix function command, or an external command line.</td></tr>
+<tr><td>Configured command</td><td><code>mix -i -c CODE</code></td><td>Loads <code>~/.mixrc</code> before classification and execution.</td></tr>
+<tr><td>Standard input</td><td><code>mix -</code></td><td>Reads Mix source from standard input; bare piped input does not execute implicitly.</td></tr>
+<tr><td>Check</td><td><code>mix --check FILE</code></td><td>Lexes and parses without evaluating.</td></tr>
+<tr><td>Lint</td><td><code>mix lint ...</code></td><td>Lexes, parses, and performs semantic analysis.</td></tr>
+<tr><td>Serve</td><td><code>mix --serve FILE</code></td><td>Registers a named citizen and runs a permanent supervised Bus event pump.</td></tr>
+</tbody></table>
+<p>The REPL, <code>-c</code>, file, and serve evaluators use a recursion limit of 128. Time
+and collection limits remain unset. The process runs evaluation on a dedicated
+64 MiB stack.</p>
+<h2 id="module-map">Module map</h2>
+<table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>main</code></td><td>Process entry, option parsing, script execution, syntax checking, and serve lifecycle.</td></tr>
+<tr><td><code>bus</code></td><td>Transient and supervised implementations of the language runtime's <code>BusHandler</code>.</td></tr>
+<tr><td><code>completion</code></td><td>Readline completion for variables, aliases, Mix words, subcommands, and commands on <code>PATH</code>.</td></tr>
+<tr><td><code>cosmix_paths</code></td><td>Cached resolution of source, configuration, and binary directories.</td></tr>
+<tr><td><code>exec</code></td><td>Shell tokenisation, expansion, pipelines, redirection, command lists, process launch, and <code>cd</code>.</td></tr>
+<tr><td><code>jobs</code></td><td>REPL background-job tracking and foreground selection.</td></tr>
+<tr><td><code>lint</code></td><td><code>mix lint</code> argument parsing, report formatting, and analyser invocation.</td></tr>
+<tr><td><code>meta</code></td><td>Help, manuals, introspection, build, diagnostics, mesh, AI, and orchestration commands.</td></tr>
+<tr><td><code>node_config</code></td><td>Read-only broker URL resolution from <code>node.conf.mix</code>.</td></tr>
+<tr><td><code>repl</code></td><td>Interactive loop, history, prompt, tracing, directory stack, jobs, and <code>.mixrc</code> loading.</td></tr>
+<tr><td><code>serve_runtime</code></td><td>Reserved Bus verbs and the lifecycle property tree for served citizens.</td></tr>
+<tr><td><code>shell</code></td><td>REPL and <code>-c</code> classification between Mix, functions, builtins, and external commands.</td></tr>
+<tr><td><code>shell_handler</code></td><td>Per-line shell fallback for files loaded through <code>source</code>.</td></tr>
+<tr><td><code>stats_io</code></td><td>XDG state paths, weekly JSON statistics, SQLite batches, and stats reports.</td></tr>
+</tbody></table>
+<p>These modules are private implementation modules of the binary.</p>
+<h2 id="bus-integration">Bus integration</h2>
+<p>Normal REPL and script execution use <code>MixAmpHandler</code>. It checks a local port
+socket first for simple target names, then lazily probes the configured broker.
+The handler supports request/reply calls, fire-and-forget emits, port checks,
+incoming events, registration, topic subscription, replies, and an explicit
+reconnect.</p>
+<p>The first failed broker probe marks the process as a host on which the broker
+was never present. Calls then report Bus unavailable without repeatedly
+probing, emits remain no-ops, and port checks return false. A connection that
+was established and later fails is reported as a mesh error. Calling
+<code>bus_reconnect()</code> resets the transient handler for a fresh probe.</p>
+<p>Serve mode uses <code>MixServeHandler</code> instead. It keeps one supervised broker
+connection and registered identity, reconnects after transient broker loss,
+and replays its topic subscriptions. It does not use the local-socket shortcut.</p>
+<h2 id="cargo-surface">Cargo surface</h2>
+<p>The package declares no Cargo features. It ships one binary flavour with Bus
+client and citizen support always enabled.</p>
+<p>The <code>cosmix-lib-mix</code> dependency enables its JSON, regular-expression, TOML,
+date/time, URL, cryptography, HTTP, SQLite, Tokio sleep, DKIM, serde, Markdown,
+Datastar, and XML capabilities. Other direct dependencies provide:</p>
+<table><thead><tr><th>Group</th><th>Crates</th></tr></thead><tbody>
+<tr><td>Bus</td><td><code>cosmix-lib-bus</code>, <code>cosmix-lib-client</code>, <code>cosmix-lib-buildinfo</code>, <code>cosmix-lib-props-core</code>, <code>cosmix-lib-log</code></td></tr>
+<tr><td>Interactive shell</td><td><code>rustyline</code>, <code>dirs</code>, <code>libc</code></td></tr>
+<tr><td>Async runtime</td><td><code>tokio</code>, <code>tokio-util</code></td></tr>
+<tr><td>Data and utilities</td><td><code>serde</code>, <code>serde_json</code>, <code>glob</code>, <code>indexmap</code>, <code>chrono</code>, <code>ureq</code>, <code>tracing</code></td></tr>
+<tr><td>Tests</td><td><code>proptest</code></td></tr>
+</tbody></table>
+<p><code>cosmix-lib-props-core</code> is built with its <code>bus</code> feature and without default
+features. <code>cosmix-lib-client</code> is built with its <code>native</code> feature.</p>
+<h2 id="build-information">Build information</h2>
+<p>The build script emits the repository revision, dirty state, and build time.
+Serve mode supplies that provenance when it registers the citizen. <code>INFO</code>
+reports the <code>mix</code> package version because a served script has no separate
+binary version.</p>
+<h2 id="limits">Limits</h2>
+<ul>
+<li>The package has no embeddable library API; use <code>cosmix-lib-mix</code> to embed the
+language.</li>
+<li>The local node configuration reader is deliberately narrow and read-only.</li>
+<li>Serve mode provides property conformance through L1. It does not provide
+runtime-owned property watch, mutation, or world aggregation.</li>
+<li>Serve-mode log filtering is configured through <code>RUST_LOG</code> and a restart; the
+package does not include the Cos-side mutable property store.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +739,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +793,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +922,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

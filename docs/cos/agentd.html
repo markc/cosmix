@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/agentd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,76 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/agentd.md"><div class="prose"><h1 id="cosmix-agentd--agent-supervision-daemon">cosmix-agentd — agent supervision daemon</h1>
+<p><code>cosmix-agentd</code> runs multi-turn LLM agent loops as an Bus port. A caller opens a
+session, sends messages, and the daemon drives the model — dispatching any tool
+calls it requests — until the turn completes. Sessions persist to disk so they
+survive a restart.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>A thin Bus daemon over the agent runtime library. The loop, session model, and
+tool registry live in <a href="/cos/libraries"><code>cosmix-lib-agent</code></a>; the LLM backend
+abstraction lives in <a href="/cos/libraries"><code>cosmix-lib-llm</code></a>. <code>agentd</code> binds a Unix
+socket, decodes Bus requests, and calls into those libraries.</p>
+<p>Because agent loops need tool-calling models, the default <code>claude-cli</code> backend
+will not work. The backend is selected in order: <code>$COSMIX_AGENT_BACKEND</code> →
+<code>llm_backend</code> in <code>skills.conf.mix</code> → a hardcoded <code>claude-api</code> fallback. Set it
+to <code>ollama</code> for zero-cost local tool calling once a tool-capable model is pulled.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>session.new</strong> — create a new agent session (optional system prompt and per-session backend override).</li>
+<li><strong>message</strong> — send a user message and drive the loop to completion; returns the final text, iteration count, whether the iteration cap was hit, message count, and token usage.</li>
+<li><strong>session.list</strong> — list persisted session IDs.</li>
+<li><strong>session.close</strong> — evict a session from memory (the on-disk JSONL is kept).</li>
+<li><strong>tools.list</strong> — return the registered tool schemas.</li>
+<li><strong>help / info</strong> — standard cosmix daemon verbs; <code>info</code> reports port name, version, tool count, and active session count.</li>
+</ul>
+<p>Sessions persist as JSONL under <code>$COSMIX_VAR/agent/sessions/{id}.jsonl</code>; a
+<code>message</code> for a session not in memory transparently reloads it from disk.</p>
+<h2 id="running-it">Running it</h2>
+<p>Installs to <code>/opt/cosmix/bin/cosmix-agentd</code>. It listens on a per-user socket:</p>
+<pre><code>/run/user/{uid}/cosmix/ports/agentd.sock
+</code></pre>
+<p>Start it directly (or under a systemd unit); it logs to journald under the
+<code>cosmix-agentd</code> tag and shuts down cleanly on Ctrl-C, removing its socket:</p>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-agentd
+</code></pre>
+<p>Drive it from Mix over the broker:</p>
+<pre><code class="language-mix">send agentd session.new
+$sid = $result.session_id
+send agentd message session_id=$sid text="List the files in /tmp"
+print($result.text)
+</code></pre>
+<h2 id="interfaces">Interfaces</h2>
+<ul>
+<li><strong>Transport:</strong> Bus over a Unix domain socket at <code>/run/user/{uid}/cosmix/ports/agentd.sock</code>.</li>
+<li><strong>Commands:</strong> <code>session.new</code>, <code>message</code>, <code>session.list</code>, <code>session.close</code>, <code>tools.list</code>, <code>help</code>, <code>info</code>.</li>
+<li><strong>State:</strong> JSONL session logs under <code>$COSMIX_VAR/agent/sessions/</code>.</li>
+<li><strong>Backend:</strong> any backend <code>cosmix-lib-llm</code> supports (Anthropic, OpenAI-compatible, Ollama, or Bus-routed) — must be tool-capable.</li>
+</ul>
+<h2 id="related-cosmix-claud">Related: cosmix-claud</h2>
+<p><code>cosmix-claud</code> is a sibling Bus port focused on a single Claude-backed
+request/response surface with knowledge-augmented generation. It listens on
+<code>/run/user/{uid}/cosmix/ports/claud.sock</code> and exposes <code>ask</code> (prompt
+auto-enriched with context retrieved from the cosmix knowledge base — skills,
+docs, journals), <code>ask_raw</code> (no injection), <code>analyze</code>, <code>generate</code>, and — because
+it links <code>cosmix-lib-mix</code> — <code>mix.execute</code> / <code>mix.expr</code> to run Mix scripts or
+evaluate expressions. After a successful <code>ask</code> it evaluates the interaction for
+reusable-skill extraction (async, non-blocking). Where <code>agentd</code> is a general
+tool-driven agent loop, <code>claud</code> is the knowledge-loop LLM port the mesh routes
+<code>llm-backend = bus</code> calls to.</p>
+<h2 id="where-it-fits">Where it fits</h2>
+<p><code>agentd</code> makes an agent loop a first-class mesh service: any node can delegate a
+tool-using task to it by sending one Bus message, rather than embedding an agent
+runtime of its own. It is a building block for the substrate's
+self-observation / self-modification loops, not an end-user chat product.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/overview">overview</a> — the substrate at a glance</li>
+<li><a href="/cos/noded">noded</a> — the Bus broker</li>
+<li><a href="/cos/libraries">libraries</a> — <code>cosmix-lib-agent</code>, <code>cosmix-lib-llm</code>, <code>cosmix-lib-skills</code></li>
+<li><a href="/cos/desktop">desktop</a> — the CosMix desktop (compositor, toolkit, apps)</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +688,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +742,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +871,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

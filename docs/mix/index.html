@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,79 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/README.md"><div class="prose"><h1 id="mix--manual">Mix — manual</h1>
+<p>The reference manual for the <strong>Mix</strong> language, one page per topic. The canonical
+home of these pages is
+<a href="https://github.com/markc/cosmix/tree/main/docs/mix"><code>docs/_man/</code></a> in the public
+<a href="https://github.com/markc/cosmix">markc/mix</a> repo; add a page by dropping <code>TOPIC.md</code>
+there. The same files render everywhere:</p>
+<ul>
+<li><strong>Terminal</strong> — <code>mix man TOPIC</code> (<code>mix man</code> alone prints this index).</li>
+<li><strong><code>mix man</code></strong> — reads <a href="https://cosmix.dev/mix/overview">cosmix.dev/mix</a>, a mirror of this directory in the <code>cosmix</code> repo (<code>$COSMIX/mix/</code>). It is kept in step automatically: the mix repo's post-commit hook runs <code>$COSMIX/build/sync-man.mix</code> whenever a page here is committed (copy, prune, regenerate HTML stubs, commit, push). If <code>mix man</code> looks stale, run that script by hand and check <code>~/.cache/cosmix/man/</code> (24 h cache).</li>
+<li><strong>Web</strong> — <a href="https://markc.github.io/mix/#_man/overview.md">markc.github.io/mix</a> serves the manual in the site's left-hand <strong>Manual</strong> pane; any page deep-links as <code>#_man/PAGE.md</code>.</li>
+<li><strong>GitHub</strong> — browse <a href="https://github.com/markc/cosmix/tree/main/docs/mix"><code>docs/_man/</code></a> directly; this file doubles as the directory README.</li>
+<li><strong>Local clone</strong> — plain markdown with relative links; any editor or viewer works.</li>
+</ul>
+<h2 id="start-here">Start here</h2>
+<ul>
+<li><strong><a href="/mix/overview">overview</a></strong> — what Mix is, why it exists, where it came from.</li>
+<li><strong><a href="/mix/invocation">invocation &amp; CLI</a></strong> — <code>mix file</code>, <code>-c</code>, <code>-</code>, <code>-i</code>, login shell, <code>--serve</code>, flags.</li>
+<li><strong><a href="/mix/cli">the mix command</a></strong> — <code>mix help</code>/<code>man</code>/<code>builtins</code>/<code>what</code>/<code>status</code>/<code>trace</code>/… meta-commands.</li>
+<li><strong><a href="/mix/syntax">syntax &amp; the classifier</a></strong> — tokens, the newline rule, shell-vs-Mix dispatch.</li>
+</ul>
+<h2 id="the-language">The language</h2>
+<ul>
+<li><strong><a href="/mix/variables">variables, sigils &amp; scope</a></strong> — <code>$</code> sigils, <code>${...}</code>, function-local binding.</li>
+<li><strong><a href="/mix/strings">strings</a></strong> — <code>'raw'</code> vs <code>"interp"</code>, <code>..</code> concat, codepoint/byte/grapheme ops.</li>
+<li><strong><a href="/mix/numbers">numbers</a></strong> — f64, radix literals, ordering, coercion.</li>
+<li><strong><a href="/mix/operators">operators</a></strong> — arithmetic, comparison, <code>and</code>/<code>or</code>/<code>not</code>, <code>..</code>, <code>?:</code>, <code>??</code>.</li>
+<li><strong><a href="/mix/control-flow">control flow</a></strong> — <code>if</code>/<code>while</code>/<code>for</code>/<code>loop</code>, if-as-expression, <code>break</code>/<code>continue</code>.</li>
+<li><strong><a href="/mix/functions">functions, lambdas &amp; modules</a></strong> — <code>fn</code>, closures, the pass-in/return/reassign triad.</li>
+<li><strong><a href="/mix/modules">modules — require/include/source</a></strong> — <code>require()</code> isolated module loading vs the splice loaders.</li>
+<li><strong><a href="/mix/collections">lists &amp; maps</a></strong> — literals, indexing, <code>push</code>/<code>pop</code>, the base footguns.</li>
+<li><strong><a href="/mix/hof">higher-order functions</a></strong> — <code>map</code>/<code>filter</code>/<code>reduce</code>/<code>sort_by</code>/<code>group_by</code>/…</li>
+<li><strong><a href="/mix/errors">errors &amp; exit handling</a></strong> — <code>try</code>/<code>catch</code>/<code>die</code>/<code>panic</code>, <code>run_rc().rc</code>, timeouts.</li>
+</ul>
+<h2 id="builtins--io">Builtins &amp; I/O</h2>
+<ul>
+<li><strong><a href="/mix/math">math</a></strong> — rounding, powers, logs, trig, <code>min</code>/<code>max</code>/<code>clamp</code>, constants.</li>
+<li><strong><a href="/mix/io">files &amp; I/O</a></strong> — <code>read_file</code>/<code>write_file</code>/<code>glob</code>/<code>stat</code>/<code>chmod</code>/<code>walk</code>/…</li>
+<li><strong><a href="/mix/system">processes &amp; system</a></strong> — <code>run</code>/<code>run_rc</code>/<code>run_stream</code>/<code>spawn</code>/<code>env</code>/<code>exit</code>/…</li>
+<li><strong><a href="/mix/data">data &amp; serialization</a></strong> — JSON, TOML, <code>jq</code>, <code>data_encode</code>, strict-data <code>.mix</code>.</li>
+<li><strong><a href="/mix/buffer">byte buffers</a></strong> — <code>buffer</code>/<code>buffer_push</code>/<code>freeze</code>, the one reference-semantic type.</li>
+<li><strong><a href="/mix/regex">regular expressions</a></strong> — <code>re_match</code>/<code>re_find</code>/<code>re_replace</code>/<code>re_split</code>/<code>grep_lines</code> (subject first).</li>
+<li><strong><a href="/mix/datetime">dates &amp; time</a></strong> — <code>time</code>/<code>date_format</code>/<code>now_iso</code>/<code>duration_format</code>.</li>
+<li><strong><a href="/mix/http">http</a></strong> — <code>http_get</code>/<code>http_post</code>/<code>http_request</code>, deadlines.</li>
+<li><strong><a href="/mix/datastar">datastar</a></strong> — <code>ds_*</code> SSE event framing.</li>
+</ul>
+<h2 id="mesh--runtime">Mesh &amp; runtime</h2>
+<ul>
+<li><strong><a href="/mix/bus">Bus messaging</a></strong> — <code>send</code>/<code>emit</code>/<code>address</code>/<code>on</code>, <code>$result</code>/<code>$rc</code> bands, the mesh.</li>
+<li><strong><a href="/mix/serve">serving as a citizen</a></strong> — <code>mix --serve service.mix</code>, the supervised runtime.</li>
+<li><strong><a href="/mix/remote">remote execution (ssh)</a></strong> — <code>ssh_run</code>/<code>ssh_must</code>/<code>ssh_mix</code>, env transports.</li>
+<li><strong><a href="/mix/capabilities">capabilities &amp; embedding</a></strong> — the capability classes + sandbox model.</li>
+</ul>
+<h2 id="reference">Reference</h2>
+<ul>
+<li><strong><a href="/mix/builtins">builtin index</a></strong> — every builtin by category.</li>
+<li><strong><a href="/mix/keywords">reserved words</a></strong> — the keyword set, keywords-as-names.</li>
+<li><strong><a href="/mix/shell-mode">shell-dispatch mode</a></strong> — pipes, <code>&amp;&amp;</code>, brace expansion, <code>$(...)</code>, redirects.</li>
+<li><strong><a href="/mix/stats">usage statistics</a></strong> — runtime modes, report windows, persistence, kill switch, static coverage.</li>
+</ul>
+<h2 id="design-docs--specs">Design docs &amp; specs</h2>
+<p>Design docs, background rationale, and the formal specs (04 language
+reference, 18 citizen runtime) all live in the operator control repo since
+2026-07-23; this manual is the complete public reference.</p>
+<h2 id="see-also">See also</h2>
+<pre><code>mix help              the full categorized builtin reference
+mix builtins [CAT]    list builtins, optionally by category
+mix what NAME         one-line description of a builtin or keyword
+mix man TOPIC         read any of the pages above in the terminal
+</code></pre>
+<p>For AI agents: <a href="https://github.com/markc/cosmix/blob/main/AGENTS.md"><code>AGENTS.md</code></a> at
+the repo root is a short orientation sheet whose canonical reference is this
+manual.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +691,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +745,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +874,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

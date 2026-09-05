@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-dns/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,132 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-dns/README.md"><div class="prose"><h1 id="cosmix-lib-dns">cosmix-lib-dns</h1>
+<p><code>cosmix-lib-dns</code> is the pure Rust core of the authoritative mesh DNS service. It defines the zone model, strict-data loader, candidate validation and adoption path, snapshot storage, deterministic resolver, DNS wire codec, and Tokio UDP/TCP serve loops. It lives in the <code>cos</code> repository at the <code>cos</code> end of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it depends on <code>cosmix-lib-mix</code> for parsing zone data, but has no direct Bus, mesh, daemon-configuration, or citizen dependency.</p>
+<p>The package version is <code>0.2.0</code>. The library target is imported as <code>cosmix_dns</code>.</p>
+<h2 id="scope">Scope</h2>
+<p>The crate provides library APIs only. It has no binary, CLI, subcommands, or Bus verbs.</p>
+<p>The core accepts hand-maintained <code>zones.mix</code> data and produces immutable answer snapshots. The query path reads only the flattened snapshot. Owner identity, bundle serials, persistence, transport size, and reload state do not enter the resolver.</p>
+<p><code>hickory-proto</code> is used as a DNS message and record codec. The crate does not use Hickory server, resolver, recursor, catalogue, or authority implementations, and it has no forwarding or recursive lookup path.</p>
+<h2 id="data-model">Data model</h2>
+<p>The model has two layers.</p>
+<ul>
+<li>Layer 1 is owner-aware source and candidate state. Its main types are <code>OwnerId</code>, <code>ZoneName</code>, <code>RecordAssertion</code>, <code>Bundle</code>, <code>ZoneSource</code>, <code>ParsedZones</code>, and <code>CandidateSnapshot</code>. This layer carries owners, bundle serials, configured serial floors, and withdrawn records. It is validated and consumed, never served.</li>
+<li>Layer 2 is flattened answer state. Its main types are <code>RrsetKey</code>, <code>RrsetValue</code>, <code>ZoneAnswerState</code>, and <code>ZoneSnapshot</code>. It contains answerable RRsets, apex SOA and NS data, existing-name indexes, emitted serials, and a configuration hash. It contains no owner attribution.</li>
+</ul>
+<p><code>Serial</code> implements RFC 1982 comparison through <code>Serial::compare</code>. The exactly half-range case returns <code>SerialCmp::Undefined</code>; callers reject it rather than imposing a total order. <code>Serial::successor</code> wraps modulo 2³², and <code>Serial::rfc1982_max</code> returns <code>None</code> for an undefined comparison.</p>
+<h2 id="zone-loading">Zone loading</h2>
+<p><code>strict_data</code> parses the pinned map/list <code>zones.mix</code> schema through <code>cosmix_mix::parse_data</code>.</p>
+<ul>
+<li><code>parse_zones(&amp;str)</code> parses source text into <code>ParsedZones</code>.</li>
+<li><code>parse_zones_file(&amp;Path)</code> reads and parses a file.</li>
+<li><code>ZonesParseError</code> reports schema, name, number, and RDATA errors.</li>
+</ul>
+<p>A minimal zone has this shape:</p>
+<pre><code class="language-mix">zones: {
+  "example.com": {
+    soa: {
+      primary: "ns1.example.com",
+      mbox: "hostmaster.example.com",
+      ttl: 300,
+      minimum: 60
+    },
+    ns: [ "ns1.example.com" ],
+    serial_floor: 1,
+    bundles: [
+      {
+        owner: "alpha",
+        serial: 1,
+        records: [
+          {
+            name: "alpha.example.com",
+            type: "A",
+            ttl: 300,
+            data: "192.0.2.10"
+          }
+        ]
+      }
+    ]
+  }
+}
+</code></pre>
+<p>Maps inside braces require commas between entries. The top-level <code>zones</code> map must contain at least one zone. Each zone requires <code>soa</code>, <code>ns</code>, <code>serial_floor</code>, and <code>bundles</code>. Each bundle requires <code>owner</code>, <code>serial</code>, and <code>records</code>. Duplicate bundles for one owner in one zone are rejected.</p>
+<p>Each record requires <code>name</code>, <code>type</code>, <code>ttl</code>, and <code>data</code>. <code>withdrawn</code> is an optional boolean and defaults to <code>false</code>. A withdrawn record remains representable in Layer 1 but does not create an RRset or existing name in Layer 2.</p>
+<p>Supported record data forms are:</p>
+<table><thead><tr><th>Type</th><th><code>data</code> form</th></tr></thead><tbody>
+<tr><td><code>A</code></td><td>Dotted IPv4 address</td></tr>
+<tr><td><code>AAAA</code></td><td>IPv6 address</td></tr>
+<tr><td><code>NS</code></td><td>DNS name</td></tr>
+<tr><td><code>MX</code></td><td><code>"&lt;preference&gt; &lt;exchange&gt;"</code></td></tr>
+<tr><td><code>SRV</code></td><td><code>"&lt;priority&gt; &lt;weight&gt; &lt;port&gt; &lt;target&gt;"</code></td></tr>
+<tr><td><code>TXT</code></td><td>String or list of strings</td></tr>
+<tr><td><code>PTR</code></td><td>DNS name</td></tr>
+</tbody></table>
+<p>SOA records come only from the zone <code>soa</code> map. <code>SOA</code>, <code>CNAME</code>, <code>HINFO</code>, and unknown types are rejected in <code>records</code>.</p>
+<h2 id="names-and-records">Names and records</h2>
+<p><code>canonical::Name</code> is canonical by construction. <code>Name::parse</code> accepts an optional trailing dot, lower-cases labels, and returns an absolute name. Labels accept ASCII letters, digits, hyphen, and underscore. Empty labels, over-length names, and other characters are rejected.</p>
+<p><code>Name::parse_owner</code> additionally accepts one leftmost <code>*</code> label for a wildcard record owner. Wildcards remain invalid in zone apexes, SOA names, NS names, and RDATA targets.</p>
+<p><code>rr::RecordType</code> and <code>RData</code> form a closed vocabulary for <code>SOA</code>, <code>NS</code>, <code>A</code>, <code>AAAA</code>, <code>MX</code>, <code>SRV</code>, <code>TXT</code>, and <code>PTR</code>. <code>RecordType::parse</code> accepts record types valid in the <code>records</code> list; <code>RecordType::from_hickory</code> and <code>to_hickory</code> map query and wire types. <code>RData::to_hickory_record</code> performs model-to-wire conversion. Long TXT strings are split into DNS character strings of at most 255 bytes on UTF-8 boundaries.</p>
+<h2 id="candidate-pipeline">Candidate pipeline</h2>
+<p>The reload pipeline is:</p>
+<pre><code class="language-text">parse -&gt; canonicalise -&gt; build -&gt; validate -&gt; adopt
+</code></pre>
+<p>Canonicalisation occurs during parsing. The public candidate functions are:</p>
+<ul>
+<li><code>build_candidate(ParsedZones, &amp;dyn Persistence)</code> applies per-owner replay floors and produces an owner-aware <code>CandidateSnapshot</code>.</li>
+<li><code>validate_candidate(&amp;CandidateSnapshot)</code> rejects cross-owner RRset collisions and duplicate canonical RDATA.</li>
+<li><code>adopt_candidate(current, CandidateSnapshot, &amp;mut dyn Persistence)</code> flattens the candidate, ticks emitted SOA serials, persists advancing floors, and returns <code>Arc&lt;ZoneSnapshot&gt;</code>.</li>
+</ul>
+<p>One owner must use one serial across all zones in a candidate. A serial older than its persisted owner floor is rejected. An equal serial is accepted idempotently without advancing the floor. A newer serial advances it.</p>
+<p>Within one zone, two owners cannot assert the same <code>(name, type)</code> RRset. One owner may contribute multiple distinct RDATA values to one RRset; the resulting RRset uses the minimum asserted TTL. Duplicate canonical RDATA is rejected.</p>
+<p><code>RejectReason</code> distinguishes stale replay, undefined serial comparison, cross-owner collision, duplicate RDATA, cross-zone owner serial conflict, malformed input, and persistence failure.</p>
+<h2 id="snapshots-and-persistence">Snapshots and persistence</h2>
+<p><code>snapshot::SnapshotHash</code> is a deterministic FNV-1a hash over canonical, sorted flattened configuration. It includes zones, SOA data, NS data, configured serial floors, RRset keys, TTLs, and RDATA. It excludes daemon-owned emitted serials. <code>snapshot::compute_config_hash</code> accepts borrowed <code>ZoneConfigView</code> values.</p>
+<p><code>Persistence</code> stores two independent monotone high-water maps: a global per-owner replay floor and a per-zone emitted-SOA floor. Its readers are infallible and return <code>None</code> when no prior floor exists. Its mutators return <code>PersistenceError</code> and must persist and synchronise before returning success.</p>
+<p><code>InMemoryPersistence</code> provides an in-memory implementation and a write-failure switch for tests. <code>FilePersistence</code> rewrites a versioned state file through a temporary file, file <code>fsync</code>, rename, and best-effort directory <code>fsync</code>. <code>FilePersistence::open</code> returns <code>StateLoad::Ok</code> for a valid or absent file and <code>StateLoad::Corrupt</code> with empty floors for unreadable, unparseable, or wrong-version state.</p>
+<p>The two floor kinds are not updated as a two-phase transaction. Each floor is independently monotone and does not regress.</p>
+<h2 id="store">Store</h2>
+<p><code>ZoneStore</code> exposes <code>snapshot() -&gt; Arc&lt;ZoneSnapshot&gt;</code>.</p>
+<p><code>StaticZoneStore</code> holds the current snapshot in <code>ArcSwap</code>. <code>load_initial</code> parses, builds, validates, adopts, and returns <code>StoreInitError</code> when no initial snapshot can be established. <code>reload</code> repeats the pipeline and replaces the snapshot only after successful adoption. Parse, validation, or persistence failure leaves the last-known-good snapshot in service.</p>
+<p>Each query takes one snapshot <code>Arc</code>, so a response observes one consistent generation.</p>
+<h2 id="resolver">Resolver</h2>
+<p><code>resolve(&amp;ZoneSnapshot, &amp;hickory_proto::op::Message) -&gt; Message</code> is pure and deterministic. It performs longest-suffix authoritative zone selection and never performs I/O, recursion, or forwarding.</p>
+<table><thead><tr><th>Request or lookup result</th><th>Response</th></tr></thead><tbody>
+<tr><td>Opcode other than <code>QUERY</code></td><td><code>NOTIMP</code>, not authoritative</td></tr>
+<tr><td>Question count other than one</td><td><code>FORMERR</code>, not authoritative</td></tr>
+<tr><td>Class other than <code>IN</code> or <code>ANY</code></td><td><code>REFUSED</code>, not authoritative</td></tr>
+<tr><td>Name outside all served zones</td><td><code>REFUSED</code>, not authoritative</td></tr>
+<tr><td>Existing name with no requested type</td><td><code>NOERROR</code> with SOA in authority</td></tr>
+<tr><td>Missing name without wildcard coverage</td><td><code>NXDOMAIN</code> with SOA in authority</td></tr>
+<tr><td>Existing or wildcard-covered name queried as <code>ANY</code></td><td>Authoritative <code>NOERROR</code> with an empty answer</td></tr>
+</tbody></table>
+<p>Apex SOA and NS answers come from dedicated zone fields. Negative answers carry the emitted SOA serial. Wildcard synthesis follows the closest existing encloser and does not override an existing node or empty non-terminal. In-zone MX exchanges and SRV targets receive available A and AAAA glue in the additional section.</p>
+<p>When a request contains EDNS, the response advertises a 1232-byte payload. Resolution remains transport-blind; truncation occurs during UDP encoding.</p>
+<h2 id="wire-and-serve-apis">Wire and serve APIs</h2>
+<p><code>wire::decode</code> parses a bare DNS message. <code>encode_udp</code> serialises against a supplied payload limit, drops additional and then answer data as needed, and sets <code>TC</code>. <code>encode_tcp</code> returns a two-byte big-endian length prefix followed by an untruncated DNS message.</p>
+<p><code>serve_udp</code> and <code>serve_tcp</code> run Tokio serve loops over supplied sockets and a shared <code>ZoneStore</code>. Fatal socket or listener errors are returned. Malformed queries and per-query I/O errors are logged and do not stop the loop.</p>
+<p><code>serve_udp_observed</code> and <code>serve_tcp_observed</code> additionally call a <code>ResponseObserver</code> exactly once with the resolver-built response before encoding and sending. Observers run inline, receive an immutable message reference, and must not block.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>default</code></td><td style="text-align: right">Yes</td><td>Empty feature set; the default build and <code>--no-default-features</code> build are equivalent</td></tr>
+</tbody></table>
+<p>There is no <code>cosmix</code> feature in this library.</p>
+<h2 id="dependencies">Dependencies</h2>
+<table><thead><tr><th>Dependency</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>hickory-proto</code></td><td>DNS messages, record types, and binary codec</td></tr>
+<tr><td><code>cosmix-lib-mix</code></td><td>Strict-data parsing for <code>zones.mix</code></td></tr>
+<tr><td><code>indexmap</code></td><td>Map type exposed by Mix strict-data values</td></tr>
+<tr><td><code>tokio</code></td><td>UDP and TCP asynchronous serve loops</td></tr>
+<tr><td><code>arc-swap</code></td><td>Lock-free replacement of immutable snapshots</td></tr>
+<tr><td><code>tracing</code></td><td>Reload and serve-path diagnostics</td></tr>
+<tr><td><code>tempfile</code></td><td>Development-only persistence and store tests</td></tr>
+</tbody></table>
+<h2 id="testing">Testing</h2>
+<p>The crate has an empty default feature set, so its documented core gate is:</p>
+<pre><code class="language-sh">cargo test -p cosmix-lib-dns --no-default-features
+</code></pre>
+<p>The test suite covers canonical names, RFC 1982 arithmetic, strict-data parsing, candidate rejection and adoption, persistence monotonicity, last-known-good reloads, resolver response codes, wildcard and empty-non-terminal behaviour, glue, EDNS and truncation, TCP framing, record round trips, and observed/unobserved serve-loop parity.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +744,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +798,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +927,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

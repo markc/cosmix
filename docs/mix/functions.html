@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/functions</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,441 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/functions.md"><div class="prose"><h1 id="functions-lambdas--modules">Functions, lambdas &amp; modules</h1>
+<p>Mix functions come in two shapes that look almost identical but mean different things:</p>
+<ul>
+<li><strong><code>function name(...)</code></strong> — a <em>statement</em> that registers a named function in the current scope.</li>
+<li><strong><code>function(...)</code> / <code>fn(...)</code></strong> — an <em>expression</em> that evaluates to a first-class function <strong>value</strong> (a lambda) you can store, pass, return, or stash in a map.</li>
+</ul>
+<p>Both share one tail grammar (<code>($params) ... end</code> or <code>($params) = expr</code>), one binding model (args by value, writes function-local), and one capture rule (closures see their defining scope for <em>reads</em>). Get those four facts straight and everything else follows.</p>
+<blockquote>
+<p>Verified against <strong>mix 0.21.2</strong>. Every example below was run with <code>mix -c</code> and shows its real output. The binary is the oracle — if anything here disagrees with live behaviour, the binary wins.</p>
+</blockquote>
+<h2 id="named-functions--the-statement-form">Named functions — the statement form</h2>
+<pre><code class="language-mix">function add($a, $b)
+  return $a + $b
+end
+print(add(2, 3))
+</code></pre>
+<pre><code class="language-text">5
+</code></pre>
+<p>A named <code>function</code> is a <strong>statement</strong>: evaluating it registers <code>add</code> in scope and returns nil. The body contains newline- or <code>;</code>-separated statements closed by <code>end</code> (there is no <code>do</code>; see <a href="/mix/control-flow">control flow</a>). Use <code>return</code> to hand a value back; a block body that never returns yields nil (more on that below).</p>
+<h3 id="fn-alias-and-the--expr-short-form"><code>fn</code> alias and the <code>= expr</code> short form</h3>
+<p><code>fn</code> is a Rust-style short alias for <code>function</code> — it works everywhere <code>function</code> does, and both spellings accept both body forms (block <code>... end</code> or <code>= expr</code>, named or anonymous — all eight combinations parse). The <code>= expr</code> form is a <strong>single-expression body</strong>: no <code>return</code>, no <code>end</code>, the expression's value <em>is</em> the result.</p>
+<pre><code class="language-mix">fn square($x) = $x * $x
+print(square(7))
+</code></pre>
+<pre><code class="language-text">49
+</code></pre>
+<p>This is the form to reach for in <a href="/mix/functions#higher-order-functions">HOFs</a>: <code>map($xs, fn($x) = $x*2)</code>.</p>
+<p>The body is one <em>expression</em> — which includes the value-producing conditionals (ternary <code>?:</code>, <code>if ... end</code> expressions, <code>??</code> — see <a href="/mix/operators">operators</a> and <a href="/mix/control-flow">control flow</a>), so a conditional one-liner needs no block:</p>
+<pre><code class="language-mix">$sgn = fn($x) = $x &gt; 0 ? "pos" : "neg"
+print($sgn(3))
+print($sgn(-3))
+</code></pre>
+<pre><code class="language-text">pos
+neg
+</code></pre>
+<blockquote>
+<p><strong><code>fn</code> needs quoting as a map key.</strong> A keyword is accepted anywhere it is unambiguously a NAME — bare map keys (<code>{label: 1, to: "x"}</code>), field access and assignment (<code>$m.to</code>, <code>$cfg.label = 2</code>). The ONE exception is <code>fn</code>: it lexes to the same token as <code>function</code>, so <code>{fn: 1}</code> and <code>$m.fn</code> are parse errors — use a quoted key (<code>{"fn": 1}</code>) and index access (<code>$m["fn"]</code>).</p>
+</blockquote>
+<h3 id="top-level-functions-hoist-0630">Top-level functions hoist (0.63.0)</h3>
+<p>Every <code>function</code>/<code>fn</code> declared at the <strong>direct top level of a script</strong> is
+bound before the first statement runs, so a forward call works — a script
+can put its entry point first and its helpers last:</p>
+<pre><code class="language-mix">print(f())
+function f()
+  return 1
+end
+</code></pre>
+<pre><code class="language-text">1
+</code></pre>
+<p>The hoist is <strong>top level only</strong>. A function nested inside a block (an <code>if</code>
+branch, a loop body) still binds when — and only when — its branch
+executes; hoisting those would make a conditional definition
+unconditional. Function <em>bodies</em> are not pre-scanned either: a nested
+definition inside a body binds when its statement runs, as before. Safe by
+construction: a Mix <code>fn</code> <a href="/mix/functions#the-binding-model--by-value-local-writes">captures nothing</a>
+from the enclosing scope, so an early binding cannot close over a
+not-yet-defined value.</p>
+<p>The hoist applies to every <strong>invocation root</strong>: a script run directly, a
+<a href="/mix/functions#grouping-functions-across-files--require-vs-include-vs-source"><code>require</code></a>d
+module's top level (the same file forward-calls identically either way), a
+<code>source</code>d file, and a serve-mode <code>on</code> handler body — in a handler the
+binding happens on entry, so a top-level <code>fn</code> below an early <code>return</code> is
+still defined.</p>
+<p>Redefinition: with two same-named top-level definitions, a call <strong>before
+both</strong> sees the <em>last</em> one (the hoist binds them in order); code <em>between</em>
+them still sees the earlier one, exactly as before 0.63.0 — the definition
+statement re-binds when reached. This includes <strong>prelude names</strong>: a script
+that defines its own <code>fn lines(…)</code> shadows the prelude's <code>lines</code> from the
+first statement, even at call sites above the definition.</p>
+<p><em>Mutual</em> recursion no longer needs both definitions to precede the first
+call — calls resolve at call-time, and hoisting has already bound every
+top-level name:</p>
+<pre><code class="language-mix">function is_even($n)
+  if $n == 0 then return true end
+  return is_odd($n - 1)
+end
+function is_odd($n)
+  if $n == 0 then return false end
+  return is_even($n - 1)
+end
+print(is_even(10))
+print(is_odd(7))
+</code></pre>
+<pre><code class="language-text">true
+true
+</code></pre>
+<h3 id="recursion-is-capped-at-128-frames">Recursion is capped at 128 frames</h3>
+<p>Recursion works, but the evaluator caps nesting at <strong>128</strong> calls deep (127 nested recursive calls pass, 128 fail). Exceeding it is a clean, catchable runtime error — not a stack-overflow abort:</p>
+<pre><code class="language-mix">function f($n)
+  if $n == 0 then return 0 end
+  return f($n - 1)
+end
+print(f(100000))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 3: recursion depth exceeded (limit 128)
+</code></pre>
+<p>For deep counts, use a loop or a <a href="/mix/hof">HOF</a> instead of recursion.</p>
+<h3 id="default-parameters">Default parameters</h3>
+<p>A parameter can carry a default expression, used when the caller omits that argument:</p>
+<pre><code class="language-mix">function greet($name = "world")
+  return "hello " .. $name
+end
+print(greet())
+print(greet("mix"))
+</code></pre>
+<pre><code class="language-text">hello world
+hello mix
+</code></pre>
+<p>A missing argument with no default binds nil. Extra arguments are silently ignored (<code>f(1, 2, 3)</code> against <code>function f($a)</code> just binds <code>$a = 1</code>).</p>
+<p>Since 0.29.0 that tolerance is a <strong>mode</strong>: <code>mix --strict-arity script.mix</code> (or an embedder's <code>ArityMode::Strict</code>) raises a catchable <code>ARITY_MISMATCH</code> structured error instead — before the function body runs — whenever a call's argument count falls outside <code>min..=max</code> (min = parameters without defaults). Strict mode also enforces every builtin's contract arity from the machine metadata, so <code>run_stream(["true"], {}, 5)</code>'s silently-ignored surplus argument becomes an error. (That example read <code>run_stream(argv, {timeout: 5})</code> until 0.51.0, when run_stream gained an options map and began refusing <code>timeout</code> <strong>by name</strong> as <code>OPTION_INVALID</code> — in every mode, not just this one.) The compatible binding stays the default; exact arity would only ever become the language default at an announced major compatibility boundary, after explicit variadic syntax lands. <code>mix lint</code> flags statically provable mismatches in either mode.</p>
+<blockquote>
+<p><strong>A keyword can't be a function name.</strong> <code>function step(...)</code> and <code>fn to(...)</code> are parse errors (<code>expected identifier, got Step</code>) — and that includes non-obvious <a href="/mix/keywords">reserved words</a> like <code>step</code>, <code>to</code>, <code>label</code>. Pick <code>phase</code>, <code>say_step</code>, etc. <code>$</code>-sigil <em>variable</em> and <em>parameter</em> names are unaffected — the sigil disambiguates, so <code>$step = 1</code> and <code>function f($to)</code> both work.</p>
+</blockquote>
+<blockquote>
+<p><strong>You can't shadow a builtin.</strong> <code>function abs($x) return 999 end</code> parses fine, but calls still resolve to the builtin: <code>abs(-5)</code> is <code>5</code>, never <code>999</code>. A builtin always wins over a same-named Mix function — pick another name.</p>
+</blockquote>
+<h2 id="lambdas--the-expression-form-first-class-values">Lambdas — the expression form (first-class values)</h2>
+<p>Drop the name and <code>function(...)</code> becomes an <strong>expression</strong> that evaluates to a function value. Store it, call it, pass it around:</p>
+<pre><code class="language-mix">$sq = function($x) return $x * $x end
+print($sq(9))
+</code></pre>
+<pre><code class="language-text">81
+</code></pre>
+<p>The terse form (<code>fn($x) = expr</code>) is a lambda too — anonymous, single-expression, no <code>end</code>:</p>
+<pre><code class="language-mix">$dbl = fn($x) = $x * 2
+print($dbl(21))
+</code></pre>
+<pre><code class="language-text">42
+</code></pre>
+<p>A lambda is an ordinary <code>Value</code>: put it in a list or map, return it from another function, hand it to a <a href="/mix/builtins">builtin</a>. That is the whole point — see <a href="/mix/functions#modules--a-map-of-lambdas">modules</a> and <a href="/mix/functions#higher-order-functions">HOFs</a>. Stringified, a function value shows its parameter count: <code>"" .. $dbl</code> is <code>&lt;function/1&gt;</code>, a two-param lambda is <code>&lt;function/2&gt;</code>.</p>
+<h3 id="block-bodies-do-not-implicitly-return">Block bodies do not implicitly return</h3>
+<p>A <code>function ... end</code> <strong>block</strong> body does <em>not</em> return its last expression. If you want a value out of a block body, you must <code>return</code> it:</p>
+<pre><code class="language-mix">$f = function($x) $x * $x end
+print("result: " .. ("" .. $f(5)))
+</code></pre>
+<pre><code class="language-text">result: nil
+</code></pre>
+<p>The <code>= expr</code> short form is the opposite — it returns the expression directly. So <code>fn($x) = $x*$x</code> gives <code>25</code>, but <code>function($x) $x*$x end</code> gives <code>nil</code>. Reach for <code>= expr</code> whenever the body is one expression.</p>
+<h2 id="the-binding-model--by-value-local-writes">The binding model — by value, local writes</h2>
+<p>Three rules govern how data flows in and out of a function. They are the most common source of surprise for anyone arriving from bash/python, so verify them against your own code.</p>
+<h3 id="arguments-pass-by-value">Arguments pass by value</h3>
+<p>Numbers, lists, and maps are <strong>copied in</strong>. Mutating a parameter — even <code>push()</code> on a list param — does not reach the caller:</p>
+<pre><code class="language-mix">function addit($p)
+  push($p, 99)
+  return length($p)
+end
+$l = [1, 2, 3]
+print("inside len: " .. ("" .. addit($l)))
+print("caller len: " .. ("" .. length($l)))
+</code></pre>
+<pre><code class="language-text">inside len: 4
+caller len: 3
+</code></pre>
+<p>Because this silently discards work, Mix <strong>warns</strong> (to stderr, once, when the
+function is defined) about the provably-lost case — a <code>push($p, …)</code> statement
+whose result is thrown away where <code>$p</code> is a parameter the body never reads again:</p>
+<pre><code class="language-text">mix: warning: in fat_snare() at line 2: push($drums, …) discards its result but
+$drums is a by-value parameter never read again — the mutation is lost to the
+caller (Mix lists pass by value). Return the list or use concat().
+</code></pre>
+<p>The warning is deliberately conservative (zero false positives): it stays silent
+the moment <code>$p</code> is genuinely used — <code>return $p</code>, <code>length($p)</code>, <code>$p[i]</code>, capturing
+<code>$y = push($p, …)</code>, <code>pop($p)</code>, or passing <code>$p</code> on — so <code>addit</code> above (which reads
+<code>$p</code> via <code>length</code>) does <strong>not</strong> warn. It only fires when a push into a parameter
+can have no observable effect at all.</p>
+<blockquote>
+<p><strong>Building a sequence across helpers</strong> (e.g. accumulating MIDI events for a
+<code>.asc</code> score) is where this bites hardest — a helper that <code>push</code>es onto a
+list parameter silently drops every event onto the copy. Under by-value
+semantics, have the helper <strong>return</strong> its items and combine them at the call
+site with <a href="/mix/collections#concat"><code>concat</code></a> (<code>concat($a, $b, …)</code>
+joins lists into one new list, one level deep, O(total)):</p>
+</blockquote>
+<pre><code class="language-mix">function bar_events($b)
+  return [$b * 10, $b * 10 + 1]   -- RETURN a list, never push a param
+end
+$track = []
+for each $b in [0, 1, 2]
+  $track = concat($track, bar_events($b))   -- combine at the caller
+end
+print("" .. $track)
+</code></pre>
+<pre><code class="language-text">[0, 1, 10, 11, 20, 21]
+</code></pre>
+<h3 id="writes-inside-a-function-are-function-local">Writes inside a function are function-local</h3>
+<p>Any <code>$x = ...</code> <em>assignment</em> inside a function binds a <strong>function-local</strong> variable. It does not write through to an outer/global of the same name — and that includes <code>$rc</code>/<code>$result</code>: when those change after a <code>send</code>, it is the Bus runtime writing them natively, not a Mix assignment (see <a href="/mix/bus">Bus messaging</a>); a literal <code>$rc = ...</code> inside a function is as local as any other write.</p>
+<pre><code class="language-mix">$g = 1
+function w()
+  $g = 99
+end
+w()
+print($g)
+</code></pre>
+<pre><code class="language-text">1
+</code></pre>
+<p>This includes the accumulator trap: a helper doing <code>$count = $count + 1</code> leaves the caller's <code>$count</code> untouched. A function cannot tick a shared global counter.</p>
+<h3 id="reads-fall-through-globals-fallback">Reads fall through (globals fallback)</h3>
+<p>A function may <em>read</em> an outer/global variable fine — lookups fall through to the global frame:</p>
+<pre><code class="language-mix">$g = 42
+function r()
+  return $g + 1
+end
+print(r())
+</code></pre>
+<pre><code class="language-text">43
+</code></pre>
+<h3 id="the-pass-in--return--reassign-triad">The pass-in / return / reassign triad</h3>
+<p>Because writes are local and args are by value, the way to thread state <em>through</em> a function is the triad: <strong>(1) pass the value in</strong> (explicit read) → <strong>(2) <code>return</code></strong> the new value (compute) → <strong>(3) reassign at the call site</strong> (write). There is no <code>global</code> keyword — this is the idiom by design.</p>
+<pre><code class="language-mix">function inc($n)
+  return $n + 1
+end
+$count = 0
+$count = inc($count)
+$count = inc($count)
+print($count)
+</code></pre>
+<pre><code class="language-text">2
+</code></pre>
+<p>Return a <strong>map</strong> to update several values at once, then destructure at the call site. Net result: pure, self-contained functions — a helper can't accidentally read or stomp a caller's same-named variable.</p>
+<h2 id="closures--capture-for-reads">Closures — capture for reads</h2>
+<p>A lambda <strong>captures its defining scope</strong> for reads, so it carries state. Define a lambda where <code>$base</code> is in scope and it stays bound to <code>$base</code> even after the lambda escapes:</p>
+<pre><code class="language-mix">$base = 100
+$add = function($x) return $x + $base end
+print($add(5))
+</code></pre>
+<pre><code class="language-text">105
+</code></pre>
+<p>This is what makes a <strong>closure factory</strong> work — each call to <code>adder</code> produces a lambda closed over that call's own <code>$n</code>:</p>
+<pre><code class="language-mix">function adder($n)
+  return function($x) return $x + $n end
+end
+$add10 = adder(10)
+$add100 = adder(100)
+print($add10(5))
+print($add100(5))
+</code></pre>
+<pre><code class="language-text">15
+105
+</code></pre>
+<p>A closure captures <strong>only the variables its body actually references</strong>, not the whole enclosing frame. So defining a key/predicate lambda inline inside a function that also holds a large value — a multi-thousand-element list, a whole generated score — costs nothing per call for the data it doesn't touch. That is what keeps <code>sort_by</code>/<code>map</code>/<code>filter</code> over big data <code>O(n log n)</code>/<code>O(n)</code> even when the lambda is written inside a heavy scope: <code>sort_by($track, fn($e) = $e["t"])</code> closes over <code>$e</code> alone, never the surrounding tracks.</p>
+<h3 id="a-closure-can-read-captured-state-but-not-accumulate-into-it">A closure can read captured state but not accumulate into it</h3>
+<p>The same local-write rule applies: a <strong>write</strong> to a captured/outer name binds a <em>local</em> and does <strong>not</strong> mutate the captured variable:</p>
+<pre><code class="language-mix">$c = 0
+$bump = function() $c = $c + 1 end
+$bump()
+$bump()
+print($c)
+</code></pre>
+<pre><code class="language-text">0
+</code></pre>
+<p>So a closure can <em>read</em> shared state but can't <em>accumulate</em> into it. To carry a counter forward, thread it through the triad (<code>$n = $inc($n)</code>):</p>
+<pre><code class="language-mix">$inc = fn($x) = $x + 1
+$n = 0
+$n = $inc($n)
+$n = $inc($n)
+$n = $inc($n)
+print($n)
+</code></pre>
+<pre><code class="language-text">3
+</code></pre>
+<h3 id="binders-shadow-they-dont-clobber">Binders shadow, they don't clobber</h3>
+<p>Names a function <em>introduces</em> — a <code>for each $x</code> / <code>for $i = ...</code> loop var, a <code>catch $e</code>, a <code>parse ... with $a $b</code> target — bind in the function's own frame, so they <strong>shadow</strong> a same-named caller/global rather than overwriting it:</p>
+<pre><code class="language-mix">$x = "caller"
+function loops()
+  for each $x in [1, 2, 3]
+    $unused = $x
+  end
+  return "done"
+end
+print(loops())
+print($x)
+</code></pre>
+<pre><code class="language-text">done
+caller
+</code></pre>
+<h2 id="higher-order-functions">Higher-order functions</h2>
+<p>The payoff of first-class lambdas is the HOF builtins — no hand-rolled <code>for each ... push ... end</code> loops. Pass a lambda (inline or stored) as the transform:</p>
+<pre><code class="language-mix">$out = map([1, 2, 3], function($x) return $x * $x end)
+print("" .. $out)
+</code></pre>
+<pre><code class="language-text">[1, 4, 9]
+</code></pre>
+<pre><code class="language-mix">$out = filter([1, 2, 3, 4, 5], fn($n) = $n &gt; 2)
+print("" .. $out)
+</code></pre>
+<pre><code class="language-text">[3, 4, 5]
+</code></pre>
+<p><code>reduce</code> takes the list, an <strong>explicit init</strong>, then <code>fn(acc, item)</code> — mind that order:</p>
+<pre><code class="language-mix">$sum = reduce([1, 2, 3, 4], 0, function($a, $b) return $a + $b end)
+print($sum)
+</code></pre>
+<pre><code class="language-text">10
+</code></pre>
+<p>The full HOF set (<code>mix what &lt;name&gt;</code> for each): <code>map</code> <code>filter</code> <code>reduce</code> <code>sort_by</code> <code>any</code> <code>all</code> <code>count</code> <code>min_by</code> <code>max_by</code> <code>sum_by</code> <code>group_by</code> <code>unique_by</code>. Each one is covered on the dedicated <a href="/mix/hof">hof</a> page.</p>
+<h3 id="two-hof-gotchas">Two HOF gotchas</h3>
+<p><strong>(1) You can't pass a named function by bare name.</strong> A bareword is parsed as a string, not a function value:</p>
+<pre><code class="language-mix">function triple($x) return $x * 3 end
+$out = map([1, 2, 3], triple)
+print("" .. $out)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 2: map: expected function, got string
+</code></pre>
+<p>Wrap it in a lambda — <code>$f = function($x) return triple($x) end</code> — or define it as a lambda var in the first place.</p>
+<p><strong>(2) A multi-statement lambda won't parse <em>inline</em> inside a HOF call.</strong> The open call-paren breaks statement separation:</p>
+<pre><code class="language-mix">$out = map([1, 2, 3], function($x)
+  $y = $x * 2
+  return $y + 1
+end)
+print("" .. $out)
+</code></pre>
+<pre><code class="language-text">Parse error at line 3:3: expected end of statement, got Return
+</code></pre>
+<p>Bind the lambda to a var first, then pass the var:</p>
+<pre><code class="language-mix">$f = function($x)
+  $y = $x * 2
+  return $y + 1
+end
+$out = map([1, 2, 3], $f)
+print("" .. $out)
+</code></pre>
+<pre><code class="language-text">[3, 5, 7]
+</code></pre>
+<p>A <em>single-expression</em> lambda (<code>function($x) return $x*$x end</code> or <code>fn($x) = ...</code>) is fine inline — only multi-statement bodies need the var-bind. A stored-var lambda also reads cleanly with <code>sort_by</code> and friends:</p>
+<pre><code class="language-mix">$ports = [{ port: 80 }, { port: 22 }, { port: 443 }]
+$by_port = function($r) return $r["port"] end
+$sorted = sort_by($ports, $by_port)
+print("" .. $sorted)
+</code></pre>
+<pre><code class="language-text">[{port: 22}, {port: 80}, {port: 443}]
+</code></pre>
+<h2 id="modules--a-map-of-lambdas">Modules — a map of lambdas</h2>
+<p>Mix has no module keyword, but a map of lambdas <em>is</em> a namespace. Functions are values, so you can group them:</p>
+<pre><code class="language-mix">$math = { square: function($x) return $x * $x end, cube: function($x) return $x * $x * $x end }
+print($math["square"](5))
+print($math["cube"](3))
+</code></pre>
+<pre><code class="language-text">25
+27
+</code></pre>
+<p><strong>Dot-call works — member-first for function members</strong> (0.72.0; 0.27.0–0.71 dispatched name-first). <code>$math.square(5)</code> calls the map's own <code>square</code> whenever the member exists <strong>and holds a function</strong> — even when a free/prelude function of the same name also exists (before 0.72.0 the free name won, which made a module export named <code>sum</code> or <code>lines</code> silently unreachable via dot-call). When the map has no function-valued member of that name, the call is ordinary UFCS sugar (<code>$list.map($f)</code>, <code>$s.upper()</code> — unchanged). Two residual collisions to know: a member named after a <strong>builtin</strong> is still unreachable via dot (the desugar happens at parse time), and serve-mode <strong>extension</strong> verbs still outrank members by design. <code>$math["square"](5)</code> calls the member unconditionally — the index form remains the collision-proof spelling:</p>
+<pre><code class="language-mix">$math = { square: function($x) return $x * $x end }
+print($math.square(5))     -- 25 (member — no free 'square' exists)
+print($math["square"](5))  -- 25 (index form: collision-proof)
+</code></pre>
+<p>Each lambda still closes over the defining scope for reads, so a module can share read-only state across its members:</p>
+<pre><code class="language-mix">$prefix = "&gt;&gt; "
+$log = { line: function($s) return $prefix .. $s end }
+print($log["line"]("hello"))
+</code></pre>
+<pre><code class="language-text">&gt;&gt; hello
+</code></pre>
+<p>See <a href="/mix/collections">data structures</a> for indexing details.</p>
+<h2 id="grouping-functions-across-files--require-vs-include-vs-source">Grouping functions across files — <code>require</code> vs <code>include</code> vs <code>source</code></h2>
+<p>For libraries, split functions into their own <code>.mix</code> file and pull them in. Mix has three file-loaders with different semantics (full comparison + module semantics: <a href="/mix/modules">modules</a>):</p>
+<ul>
+<li><strong><code>$m = require("lib.mix")</code></strong> (0.27.0+) — evaluates the file in an <strong>isolated scope</strong> and returns its exports as a map (<code>$m.fn(...)</code>, <code>$m.var</code>). Cached once per file, cycle-safe, cannot clobber (or see) your scope. Use this for anything library-shaped.</li>
+<li><strong><code>include "lib.mix"</code></strong> — <strong>script-relative path</strong>, <strong>load-once</strong> (re-<code>include</code> is a no-op), splices the file's fns + <code>$vars</code> INTO your scope. Use when you want the names unprefixed and own both files.</li>
+<li><strong><code>source "lib.mix"</code></strong> — <strong>CWD-relative path</strong>, runs <strong>every time</strong>. Use this for re-running setup.</li>
+</ul>
+<p>Given <code>util.mix</code>:</p>
+<pre><code class="language-mix">function lib_double($x)
+  return $x * 2
+end
+print("[lib loaded]")
+</code></pre>
+<p><code>include</code> runs the lib body <strong>once</strong> even if included twice:</p>
+<pre><code class="language-mix">include "util.mix"
+include "util.mix"
+print(lib_double(21))
+</code></pre>
+<pre><code class="language-text">[lib loaded]
+42
+</code></pre>
+<p><code>source</code> re-runs it each time:</p>
+<pre><code class="language-mix">source "util.mix"
+source "util.mix"
+print(lib_double(21))
+</code></pre>
+<pre><code class="language-text">[lib loaded]
+[lib loaded]
+42
+</code></pre>
+<h3 id="include-drops-names-into-a-flat-namespace"><code>include</code> drops names into a flat namespace</h3>
+<p><code>include</code> injects the lib's functions straight into the caller's scope — the namespace is <strong>flat</strong>. A name collision across two libs <strong>silently last-loaded-wins</strong> (no warning). Prefix your function names, or use the module idiom to scope them.</p>
+<p>Note <code>include</code> is <strong>not expression-valued</strong> — you can't capture its result:</p>
+<pre><code class="language-mix">$m = include "lib.mix"
+</code></pre>
+<pre><code class="language-text">Parse error at line 1:6: unexpected token Include
+</code></pre>
+<p>So a "module library" assigns a well-known var name and the caller uses <em>that</em> after the <code>include</code>. Given <code>mathlib.mix</code>:</p>
+<pre><code class="language-mix">$mathlib = {
+  add: function($a, $b) return $a + $b end,
+  mul: function($a, $b) return $a * $b end
+}
+</code></pre>
+<p>The caller:</p>
+<pre><code class="language-mix">include "mathlib.mix"
+print($mathlib["add"](3, 4))
+print($mathlib["mul"](3, 4))
+</code></pre>
+<pre><code class="language-text">7
+12
+</code></pre>
+<h2 id="quick-reference">Quick reference</h2>
+<table><thead><tr><th>Form</th><th>Kind</th><th>Body</th><th>Returns</th></tr></thead><tbody>
+<tr><td><code>function f($a) ... end</code></td><td>statement (registers <code>f</code>)</td><td>block</td><td>nil unless <code>return</code></td></tr>
+<tr><td><code>fn f($a) = expr</code></td><td>statement (registers <code>f</code>)</td><td>one expression</td><td>the expression</td></tr>
+<tr><td><code>function($a) ... end</code></td><td>expression (a value)</td><td>block</td><td>nil unless <code>return</code></td></tr>
+<tr><td><code>fn($a) = expr</code></td><td>expression (a value)</td><td>one expression</td><td>the expression</td></tr>
+</tbody></table>
+<p><code>fn</code> ≡ <code>function</code> in every row — either keyword takes either body form, named or anonymous.</p>
+<ul>
+<li><strong>Sigil everywhere:</strong> <code>$x</code>, params <code>$a</code>/<code>$b</code>. Bare <code>x = 1</code> is misparsed as a shell command.</li>
+<li><strong>Concat is <code>..</code></strong> (never <code>+</code>/<code>.</code>): <code>"hi " .. $name</code>.</li>
+<li><strong>Top-level <code>fn</code>s hoist</strong> (0.63.0) — forward calls work at the script's top level; a <code>fn</code> nested in a block still binds when its branch runs. Recursion caps at <strong>128</strong> frames (clean runtime error).</li>
+<li><strong>A keyword can't be a function name</strong> (<code>function step(...)</code> errors; <code>$step = 1</code> is fine) and <strong>a builtin can't be shadowed</strong> (calls always resolve to the builtin).</li>
+<li><strong>Args by value; writes function-local; closures capture for reads only.</strong> Propagate state with the pass-in/return/reassign triad — there is no <code>global</code>.</li>
+<li><strong>Modules = map of lambdas, index-called</strong> (<code>$mod["fn"](args)</code>), not dot-called.</li>
+<li><strong><code>include</code></strong> = script-relative, load-once (libs); <strong><code>source</code></strong> = CWD, every-time.</li>
+<li>Multi-statement lambdas must be <strong>var-bound</strong> before going into a HOF; named functions <strong>can't</strong> be passed by bare name.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/hof">hof</a> — the twelve HOF builtins in depth (<code>map</code>/<code>filter</code>/<code>reduce</code>/<code>sort_by</code>/…)</li>
+<li><a href="/mix/strings">strings</a> — <code>..</code> concat, interpolation, the <code>'raw'</code> vs <code>"${...}"</code> split</li>
+<li><a href="/mix/control-flow">control flow</a> — <code>if</code>/<code>for</code>/<code>while</code>, <code>end</code>, why there is no <code>do</code></li>
+<li><a href="/mix/operators">operators</a> — ternary <code>?:</code> and <code>??</code>, the expressions a <code>= expr</code> body can hold</li>
+<li><a href="/mix/collections">maps</a> / <a href="/mix/collections">lists</a> — indexing, the data behind the module idiom</li>
+<li><a href="/mix/keywords">keywords</a> — the reserved words that can't be function names</li>
+<li><a href="/mix/builtins">builtins index</a> — everything callable out of the box</li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>send</code>/<code>on</code>/<code>emit</code> keywords (where <code>$rc</code>/<code>$result</code> come from)</li>
+<li>The <a href="https://github.com/markc/cosmix">mix repo</a> · <a href="https://github.com/markc/cosmix">bus</a> · <a href="https://github.com/markc/cosmix">cos</a></li>
+<li><code>mix help</code> — command overview · <code>mix what map</code> (and any builtin) — one-line signature + version</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1053,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1107,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1236,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

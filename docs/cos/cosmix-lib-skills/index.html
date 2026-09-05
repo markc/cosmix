@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-skills/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,118 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-skills/README.md"><div class="prose"><h1 id="cosmix-lib-skills">cosmix-lib-skills</h1>
+<p><code>cosmix-lib-skills</code> implements a Hermes-style learning loop for evaluating completed agent tasks, extracting reusable skills, retrieving them by relevance, refining them from later outcomes, and graduating proven guidance into project instructions. It is a substrate library in the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain and also builds the <code>cosmix-skills-cli</code> maintenance and inspection tool.</p>
+<p>The Rust library name is <code>cosmix_skills</code>.</p>
+<h2 id="scope">Scope</h2>
+<p>The crate provides:</p>
+<ul>
+<li>serialisable records for transcripts, evaluations, skills, and outcomes;</li>
+<li>LLM-driven task evaluation, skill extraction, and skill refinement;</li>
+<li>domain detection from configured path prefixes or a nearby <code>CLAUDE.md</code>;</li>
+<li>storage and semantic retrieval through an indexd Unix socket;</li>
+<li>confidence filtering and prompt-section formatting;</li>
+<li>supersede-don't-delete skill versioning;</li>
+<li>threshold-based graduation into a dedicated section of <code>CLAUDE.md</code>;</li>
+<li>a CLI for exercising the loop and maintaining the knowledge index.</li>
+</ul>
+<p>The detailed command reference is in <a href="/cos/cosmix-lib-skills/cli">cli.md</a>.</p>
+<h2 id="package-targets">Package targets</h2>
+<table><thead><tr><th>Target</th><th>Kind</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>cosmix_skills</code></td><td>library</td><td>Public data types, clients, and learning-loop functions</td></tr>
+<tr><td><code>cosmix-skills-cli</code></td><td>binary</td><td>Learning-loop, indexing, audit, and reporting commands</td></tr>
+</tbody></table>
+<p>The package declares no Cargo features.</p>
+<h2 id="public-data-types">Public data types</h2>
+<h3 id="skilldocument"><code>SkillDocument</code></h3>
+<p><code>SkillDocument</code> is the stored form of a reusable skill. It records:</p>
+<ul>
+<li>identity, version, domain, trigger, and approach;</li>
+<li>required tools and known failure modes;</li>
+<li>confidence, use count, success count, and last-use date;</li>
+<li>creation and update dates;</li>
+<li>graduation state;</li>
+<li>optional source commit and source file provenance;</li>
+<li>an optional replacement chunk ID when the version is superseded.</li>
+</ul>
+<p><code>SkillDocument::to_markdown</code> renders the searchable content stored in indexd. The complete structure is also serialised as JSON metadata.</p>
+<h3 id="tasktranscript"><code>TaskTranscript</code></h3>
+<p><code>TaskTranscript</code> captures the input to evaluation and extraction:</p>
+<ul>
+<li>task description and system prompt;</li>
+<li>ordered <code>Message</code> values;</li>
+<li>recorded <code>ToolCall</code> values;</li>
+<li>final output;</li>
+<li>duration, token count, and success state.</li>
+</ul>
+<p><code>Message</code> contains a role and content. <code>ToolCall</code> contains a name, input, and output.</p>
+<h3 id="evalscore"><code>EvalScore</code></h3>
+<p><code>EvalScore</code> contains <code>success</code> and <code>novelty</code> ratings on a 1–5 scale plus the evaluator's reasoning.</p>
+<p><code>EvalScore::worth_extracting</code> returns true only when both ratings are at least 3.</p>
+<h3 id="taskoutcome"><code>TaskOutcome</code></h3>
+<p><code>TaskOutcome</code> reports whether a stored skill helped a later task. It carries the skill ID, success state, notes, and task duration.</p>
+<h3 id="index-responses">Index responses</h3>
+<p><code>StatsResponse</code> and <code>SourceCount</code> describe index size, model state, cache counters, and counts by source.</p>
+<p><code>StaleResponse</code> groups <code>StaleChunk</code> values into never-retrieved, low-value, and long-dormant buckets.</p>
+<h2 id="learning-loop-functions">Learning-loop functions</h2>
+<h3 id="evaluate_task"><code>evaluate_task</code></h3>
+<p><code>evaluate_task</code> sends a truncated task summary to an <code>LlmClient</code>. It returns <code>Some(EvalScore)</code> only when the response meets the extraction threshold; routine or unsuccessful work returns <code>None</code>.</p>
+<h3 id="extract_skill"><code>extract_skill</code></h3>
+<p><code>extract_skill</code> asks the LLM to convert a successful transcript into a <code>SkillDocument</code>. A new skill starts at version 1 with confidence <code>0.5</code>, one use, one success, and the domain detected from the current directory.</p>
+<h3 id="retrieve_skills"><code>retrieve_skills</code></h3>
+<p><code>retrieve_skills</code> searches within the current detected domain. It applies the configured minimum-confidence threshold before returning skill IDs and documents.</p>
+<p><code>retrieve_skills_domain</code> accepts an explicit domain. Passing <code>None</code> searches all domains.</p>
+<h3 id="format_skills_for_prompt"><code>format_skills_for_prompt</code></h3>
+<p><code>format_skills_for_prompt</code> renders retrieved skills as a Markdown system-prompt section. An empty input produces an empty string.</p>
+<h3 id="refine_skill"><code>refine_skill</code></h3>
+<p><code>refine_skill</code> sends the existing skill and a later outcome to the LLM. It increments the version and usage counters, preserves provenance and creation time, and stores the result as a new index chunk.</p>
+<p>The previous chunk remains stored with its <code>superseded_by</code> field set to the new chunk ID. Normal searches omit superseded versions.</p>
+<h3 id="check_graduation"><code>check_graduation</code></h3>
+<p><code>check_graduation</code> compares confidence, use count, and success count with configured thresholds. An eligible skill is appended to the <code>Graduated Skills (auto-generated)</code> section of the domain's <code>CLAUDE.md</code>, then marked as graduated in indexd.</p>
+<p>The function does not rewrite the human-authored section above that marker. It returns false for an already-graduated or below-threshold skill.</p>
+<h2 id="domain-detection">Domain detection</h2>
+<p><code>detect_domain</code> resolves a path in this order:</p>
+<ol>
+<li>Load configured domain-prefix mappings and choose the matching mapping.</li>
+<li>Walk towards the user's home directory looking for <code>CLAUDE.md</code>.</li>
+<li>Derive a slash-separated domain from the project path.</li>
+<li>Return <code>general</code> when no project domain can be found.</li>
+</ol>
+<p><code>detect_domain_cwd</code> applies the same process to the current working directory. Failure to read the current directory also returns <code>general</code>.</p>
+<h2 id="indexdclient"><code>IndexdClient</code></h2>
+<p><code>IndexdClient</code> is an asynchronous, newline-delimited JSON client over a Unix socket.</p>
+<p><code>IndexdClient::from_config</code> uses the configured indexd socket. <code>IndexdClient::connect</code> accepts an optional socket path.</p>
+<p>The typed operations are:</p>
+<ul>
+<li><code>store_skill</code>;</li>
+<li><code>search_skills</code> and <code>search_skills_domain</code>;</li>
+<li><code>update_skill</code> and <code>supersede_skill</code>;</li>
+<li><code>list_skills</code> and <code>delete_skill</code>;</li>
+<li><code>stats</code> and <code>stale</code>;</li>
+<li><code>embed</code>.</li>
+</ul>
+<p><code>raw_request</code> exposes indexd actions that have no typed wrapper.</p>
+<h2 id="llm-client">LLM client</h2>
+<p>The crate re-exports <code>cosmix_llm::LlmClient</code> as <code>cosmix_skills::LlmClient</code> for backwards compatibility. Evaluation, extraction, and refinement use its <code>complete</code> operation and require JSON-shaped LLM responses.</p>
+<p>The response parser accepts plain JSON and JSON wrapped in a Markdown code fence.</p>
+<h2 id="error-behaviour">Error behaviour</h2>
+<p>Fallible public operations return <code>anyhow::Result</code>.</p>
+<p>Index requests fail when the socket cannot be opened, indexd returns an error object, the response is missing required fields, or response JSON cannot be decoded.</p>
+<p>LLM loop operations add context for evaluation, extraction, refinement, and JSON-decoding failures.</p>
+<p>Graduation also fails when the target <code>CLAUDE.md</code> cannot be found, read, or written.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The crate uses:</p>
+<ul>
+<li><code>cosmix-lib-config</code> for service settings, runtime paths, and domain mappings;</li>
+<li><code>cosmix-lib-llm</code> for configured LLM completion;</li>
+<li>Tokio for asynchronous Unix-socket I/O;</li>
+<li>Serde and <code>serde_json</code> for transcripts, skill metadata, and protocol messages;</li>
+<li>Chrono for skill dates;</li>
+<li>Clap for the CLI;</li>
+<li>Tracing and <code>tracing-subscriber</code> for diagnostics;</li>
+<li><code>directories</code> for the user home directory.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +730,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +784,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +913,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

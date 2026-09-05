@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/mprisd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,244 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/mprisd.md"><div class="prose"><h1 id="cosmix-mprisd--mpris2-media-player-state">cosmix-mprisd — MPRIS2 media-player state</h1>
+<p><strong><code>cosmix-mprisd</code> is the event-driven MPRIS2 citizen for local media-player
+state and delegated playback controls.</strong> It turns the session D-Bus view into
+the <code>mpris.*</code> Bus namespace, keyed state topics and ordered lifecycle events.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li>Enumerates session-bus names below <code>org.mpris.MediaPlayer2.*</code> and tracks
+<code>org.freedesktop.DBus.NameOwnerChanged</code> appearance, disappearance and owner
+turnover.</li>
+<li>Reads the <code>org.mpris.MediaPlayer2</code> root properties <code>Identity</code> and
+<code>DesktopEntry</code>.</li>
+<li>Reads <code>org.mpris.MediaPlayer2.Player</code> playback status, metadata, rate,
+volume and control capabilities, and watches its <code>PropertiesChanged</code> and
+<code>Seeked</code> signals.</li>
+<li>Selects one active player. The current active remains selected while it
+exists in <code>Playing</code>, <code>Paused</code> or <code>Stopped</code>; a player that was already playing
+does not retake active merely because the current active pauses. Only a new
+transition into <code>Playing</code> selects another player. When the active vanishes,
+the surviving player with the most recent <code>Playing</code> transition wins,
+regardless of its current playback state. Encoded-key (<code>p_&lt;hex&gt;</code>) order is
+used only when no surviving player has playing history. If several are
+already playing on first observation, that same order breaks the initial
+tie. Selection and Playing history identify an instance by encoded key plus
+owner epoch, not by key alone. Owner turnover therefore removes the old
+instance and applies the normal fallback before the replacement appears; a
+replacement first observed as <code>Playing</code> records a fresh Playing transition
+and can immediately become active.</li>
+<li>Keeps serving when no player exists. The players list is empty and active is
+<code>null</code>; no player process or D-Bus activation is required.</li>
+</ul>
+<p>The signal matches are installed before the first snapshot. Player reads run
+with at most eight in flight. Each completed player is published while slower
+reads remain in flight, so one request reaching its 15-second deadline does not
+delay quiet peers. This deadline bounds one request/reply exchange; it is not a
+polling, retry or scheduling timer. If a request reaches that deadline, the
+player is published with <code>unresponsive=true</code> and its remaining reads are
+skipped; a player whose bounded scan otherwise cannot be constructed is also
+published as unresponsive. <code>players.scan_revision</code> identifies the logical
+scan. It is published with <code>players.scan_complete=false</code> before player reads
+begin and remains the same through every incremental player publication;
+completion publishes the same revision with <code>scan_complete=true</code>. Consumers
+can therefore distinguish a mixed A-new/B-old player tree from a complete
+generation.</p>
+<p>Incremental publications affect only per-player property snapshots. Active
+selection, most-recently-playing history, and <code>player.appeared</code>,
+<code>player.vanished</code>, and active-change lifecycle edges are derived only when the
+scan is complete. A partial map cannot clear or change <code>active</code>, and the final
+lifecycle diff uses the previous complete scan rather than an incremental map.</p>
+<p>The tracker drains the bounded raw signal stream alongside every D-Bus scan
+and final owner query, but after 64 consecutive signals it polls the pending
+reply first so a signal flood cannot starve scan completion or its request
+deadline. No signal is discarded by that scheduling bound. Scan fencing is per
+player: a signal from player A during A's read invalidates and retries A only,
+while a quiet player B from the same scan can publish. Every retry rechecks all
+players already accepted for that batch; an accepted player that raced during
+a later retry becomes unresolved and is read again. After three consecutive
+races, a player retains its previous complete snapshot with <code>stale=true</code>; its
+next quiet scan replaces that snapshot and clears the flag. Owner changes still
+fence the ownership view. Signals on the MPRIS path/interfaces are accepted
+only from currently known MPRIS unique owners; unknown senders are ignored with
+episode-limited logging, and departed-owner signal epochs are pruned after
+their final events are processed. The full rescan interval is five minutes and
+exists only as a missed-signal backstop. Owner-change arguments are retained in
+a bounded FIFO, so even an appearance and disappearance completed between
+clean scans remains an ordered lifecycle edge. Queue overflow enters the
+publisher-loss gap contract below.</p>
+<p>MPRIS signals <code>Position</code> only through <code>Seeked</code>; mprisd has no position timer and
+does not poll it. At property-projection time, for either a read or a
+publication, the daemon exposes the transient <code>computed_position_us</code> estimate
+and <code>position_observation_age_us</code>, both in microseconds. The latter is the
+monotonic age of the raw <code>Position</code> scan or <code>Seeked</code> basis, not a cross-process
+timestamp. To project after receipt, start from <code>computed_position_us</code>; while
+<code>playback_status=playing</code>, add local elapsed monotonic microseconds multiplied
+by <code>rate</code>, and clamp to zero and <code>length_us</code> when present. The five-minute
+backstop is a full-snapshot rescan, and refreshing <code>Position</code> as part of that
+snapshot is not polling. Consumers must treat the result as an estimate, not a
+timeline clock.</p>
+<p><code>PropertiesChanged</code> is decoded rather than treated only as a rescan wake. A
+Player-interface body carrying <code>PlaybackStatus="Playing"</code> records a monotonic
+Playing observation for that unique owner. The complete scan merges those
+observations in signal-observation order into most-recently-playing history,
+even if the sampled current status has returned to <code>Paused</code>; the sampled read
+still determines the current <code>playback_status</code>.</p>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-mprisd serve
+</code></pre>
+<p>The supplied <code>cosmix-mprisd.service</code> is a systemd user unit because MPRIS and
+the Cosmix Bus client belong to the graphical session. The SPEC-10
+<code>cosmix-mprisd</code> UID/GID row reserves daemon and namespace identity; it is not
+the runtime user of this session service.</p>
+<p>On graceful shutdown the broker loop stops admitting commands but continues
+polling the Bus command receiver while admitted replies drain. Every command
+received during that drain is dropped without a reply and counted in
+<code>controls.dropped</code>. The control worker continues jobs whose absolute deadline
+has not passed and returns <code>org.cosmix.Mpris.Expired</code> for queued jobs whose
+deadline has passed.
+All command replies, including validation, no-player, busy and admitted-job
+replies, run in one supervised set capped at 64 tasks; one slot is reserved so
+capacity overflow itself can receive a counted <code>org.cosmix.Mpris.Busy</code> reply.
+While serving and during the shutdown reply drain, Bus command intake is
+drained unconditionally. While serving, overflow beyond 64 in-flight replies is
+dropped immediately without a task or reply and counted in <code>controls.dropped</code>.
+The Bus client's command channel is unbounded, so this daemon intake policy
+enforces the memory bound. Drop logs appear once when an episode starts, at most
+once per 60 seconds while it continues, and once when admission resumes.
+The responder drains for at most 60 seconds inside the unit's 75-second stop
+budget. Each final non-blocking intake sweep stops at the same deadline or
+after 4096 commands, whichever comes first, then drops the receiver; because
+the unbounded channel's remaining length can change concurrently, the daemon
+logs that the count freed with the receiver is unknown. Only after that drain
+does mprisd close the broker client and await the control worker; a task still
+present after the bounded drain is aborted.</p>
+<h2 id="bus-verbs">Bus verbs</h2>
+<p>The service name is <code>mpris</code>. Read verbs are:</p>
+<table><thead><tr><th>Verb</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>mpris.info</code></td><td>Build identity, player names, active player and cumulative publisher loss</td></tr>
+<tr><td><code>mpris.ping</code></td><td>Liveness reply (<code>{"pong":true}</code>)</td></tr>
+<tr><td><code>mpris.props.get</code></td><td>Full snapshot, or one path supplied as <code>args.path</code></td></tr>
+<tr><td><code>mpris.props.list</code></td><td>Current leaf paths</td></tr>
+<tr><td><code>mpris.props.describe</code></td><td>Schema for one path supplied as <code>args.path</code></td></tr>
+<tr><td><code>mpris.props.watch</code></td><td>Topic discovery and subscribe-before-read bootstrap instructions</td></tr>
+</tbody></table>
+<p>Control verbs delegate to MPRIS and do not mutate the tracked snapshot. Supply
+<code>args.player</code> as either the complete well-known name or encoded player key; if
+omitted, the active player is used. Admission uses a bounded queue, response
+waiting runs outside Bus intake in the bounded supervised responder, and the
+control worker checks the well-known name, unique owner, owner epoch and
+tracker generation before calling the captured unique owner. If all regular
+responder slots are occupied, the reserved slot returns
+<code>org.cosmix.Mpris.Busy</code>. Once that slot is occupied, intake keeps draining and
+drops further commands without reply until a response slot clears.
+Admission gives every job one absolute 50-second
+deadline. The worker drops a job dequeued after that deadline as
+<code>org.cosmix.Mpris.Expired</code>. The owner lookup and delegated control call each use
+the smaller of 15 seconds and the job's remaining budget; no second full
+50-second budget is created. The response waiter ends at 52 seconds from
+admission: two seconds after the job deadline so the worker's <code>Expired</code> or
+<code>Timeout</code> verdict wins over a generic response timeout, but still inside
+<code>NodedClient</code>'s 60-second caller-side outer bound measured before daemon
+receipt. Every dispatched timeout carries <code>executed_by</code>;
+otherwise it is the unique owner that received the call, or <code>null</code> when no call
+was dispatched. Invalid <code>offset_us</code>, <code>volume</code> and player selectors return
+<code>ok=false</code> with <code>org.freedesktop.DBus.Error.InvalidArgs</code>.</p>
+<p>Owner fencing before dispatch is best-effort. D-Bus cannot make the owner
+check and method call atomic; consumers that care about turnover must compare
+<code>executed_by</code> with the owner they intended to control.</p>
+<table><thead><tr><th>Verb</th><th>MPRIS operation and arguments</th></tr></thead><tbody>
+<tr><td><code>mpris.player.play</code></td><td><code>Play()</code></td></tr>
+<tr><td><code>mpris.player.pause</code></td><td><code>Pause()</code></td></tr>
+<tr><td><code>mpris.player.playpause</code></td><td><code>PlayPause()</code></td></tr>
+<tr><td><code>mpris.player.next</code></td><td><code>Next()</code></td></tr>
+<tr><td><code>mpris.player.previous</code></td><td><code>Previous()</code></td></tr>
+<tr><td><code>mpris.player.stop</code></td><td><code>Stop()</code></td></tr>
+<tr><td><code>mpris.player.seek</code></td><td><code>Seek(offset_us)</code>, requiring integer <code>args.offset_us</code></td></tr>
+<tr><td><code>mpris.player.set_volume</code></td><td>Set <code>Volume</code>, requiring finite non-negative <code>args.volume</code></td></tr>
+</tbody></table>
+<h2 id="property-namespace">Property namespace</h2>
+<p>All properties are read-only. Optional metadata leaves are absent when the
+player does not provide them.</p>
+<table><thead><tr><th>Path</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>players.list</code></td><td>Currently published MPRIS well-known names in stable key order; consult the scan markers for completeness</td></tr>
+<tr><td><code>players.scan_revision</code></td><td>Daemon-session monotonic logical scan revision; unchanged across its partial and complete publications</td></tr>
+<tr><td><code>players.scan_complete</code></td><td><code>false</code> while that revision contains mixed incremental player generations; <code>true</code> once every player is resolved, unresponsive or explicitly stale</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.key</code></td><td>Stable encoded player key</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.name</code></td><td>Complete MPRIS well-known name</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.identity</code></td><td>Root-interface <code>Identity</code></td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.desktop_entry</code></td><td>Optional root-interface <code>DesktopEntry</code></td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.owner_epoch</code></td><td>Daemon-session epoch for this name's unique owner</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.unresponsive</code></td><td>The bounded player scan could not complete; a 15-second request deadline skips remaining reads</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.stale</code></td><td>Previous complete snapshot retained after three consecutive per-player scan races</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.playback_status</code></td><td><code>playing</code>, <code>paused</code>, <code>stopped</code> or <code>unknown</code></td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.title</code></td><td><code>xesam:title</code></td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.artists</code></td><td><code>xesam:artist</code> list</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.album</code></td><td><code>xesam:album</code></td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.length_us</code></td><td><code>mpris:length</code> in microseconds</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.art_url</code></td><td><code>mpris:artUrl</code>; mprisd does not fetch the resource</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.computed_position_us</code></td><td>Transient estimated position; not polled</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.position_observation_age_us</code></td><td>Transient age of the position basis</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.rate</code></td><td>Playback rate used by the estimate</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.volume</code></td><td>MPRIS volume, where 1.0 is normal</td></tr>
+<tr><td><code>players.by_id.&lt;key&gt;.can_*</code></td><td><code>CanPlay</code>, <code>CanPause</code>, <code>CanGoNext</code>, <code>CanGoPrevious</code>, <code>CanSeek</code>, <code>CanControl</code></td></tr>
+<tr><td><code>active.name</code></td><td>Selected well-known name, or <code>null</code></td></tr>
+<tr><td><code>active.key</code></td><td>Selected encoded key, or <code>null</code></td></tr>
+<tr><td><code>controls.dropped</code></td><td>Cumulative commands individually observed and dropped without reply because response capacity was exhausted or shutdown draining was in progress</td></tr>
+<tr><td><code>lifecycle.props_level</code></td><td><code>L2</code></td></tr>
+<tr><td><code>lifecycle.event_seq</code></td><td>Daemon-session monotonic event sequence</td></tr>
+<tr><td><code>lifecycle.publisher_loss</code></td><td>Cumulative publications lost during this daemon session</td></tr>
+</tbody></table>
+<p><code>&lt;key&gt;</code> is a collision-free lowercase <code>p_&lt;hex&gt;</code> encoding of every byte in the
+complete well-known name. It fits the SPEC-07 segment grammar and keeps
+multiple instances distinct.</p>
+<h2 id="topics">Topics</h2>
+<table><thead><tr><th>Topic</th><th>Class</th><th>Published for</th></tr></thead><tbody>
+<tr><td><code>mpris.props.changed</code></td><td>keyed state</td><td>Standard SPEC-07 old/new property deltas, keyed per player path</td></tr>
+<tr><td><code>mpris.player.appeared</code></td><td>FIFO event</td><td>A well-known player name acquired an owner</td></tr>
+<tr><td><code>mpris.player.vanished</code></td><td>FIFO event</td><td>A tracked player name lost its owner</td></tr>
+<tr><td><code>mpris.active.changed</code></td><td>FIFO event</td><td>Active-player selection changed</td></tr>
+</tbody></table>
+<p>Domain-topic payloads contain <code>event</code>, <code>event_seq</code> and <code>data</code>;
+<code>mpris.props.changed</code> uses the standard <code>{path,old,new,ts,cause}</code> shape plus an
+<code>event_seq</code> header. A <code>Seeked</code> signal produces an explicit
+<code>mpris.props.changed</code> position edge with <code>cause=mpris.seeked</code>; ordinary
+computed-position passage is transient and produces no traffic. Consumers
+subscribe on their Bus connection and then call <code>mpris.props.get</code>.
+Lifecycle <code>data</code> includes <code>name</code>, <code>key</code>, the unique <code>owner</code>, and <code>player</code> when
+a complete snapshot for that edge was observable. <code>player</code> is <code>null</code> for a
+transient edge completed between scans; consumers should refresh state rather
+than treating the event payload as authoritative.</p>
+<p>Publication never back-pressures the D-Bus tracker. State topics coalesce
+latest-wins by topic and full property path, with at most 1024 paths. A
+multi-property <code>PropertiesChanged</code> batch therefore retains one update per
+changed property without creating loss itself.
+<code>mpris.player.appeared</code>, <code>mpris.player.vanished</code> and <code>mpris.active.changed</code>
+share a bounded 64-item FIFO and remain ordered while loss-free. This preserves
+the vanish → fallback-active → replacement-appearance → newly-Playing-active
+edge sequence during active-owner turnover.</p>
+<p>Any publication loss—latest-wins replacement, key cap, FIFO overflow, stale
+generation, broker send error or timeout—advances the cumulative session loss
+counter. The publisher discards its older backlog and emits one
+<code>mpris.props.changed</code> control frame using interactd's convention: <code>gap=true</code>,
+<code>lost_count</code>, and <code>cause=publisher.loss</code>. On a gap, discard projected state and
+re-read <code>mpris.props.get</code>. Loss logs appear once when an episode starts and at
+most once per 60 seconds while it continues; a successful publication ends the
+episode.</p>
+<p>Every outgoing item carries the tracker generation. The publisher checks it
+immediately before its single send await and turns stale work into the same gap
+contract. At most one accepted old-generation frame can already be in flight.
+If the D-Bus tracker restarts, every dropped pending owner edge, <code>Seeked</code> or
+Playing observation, and already-counted adapter loss advances cumulative
+publisher loss; one gap frame is queued after reconnect and logged through the
+same loss-episode limiter. Unique-owner epochs come from one process-global
+counter that is monotonic for the process lifetime and saturates at
+<code>u64::MAX</code>.</p>
+<h2 id="feature-boundary">Feature boundary</h2>
+<p>The default <code>cosmix</code> feature builds the zbus adapter and Bus citizen.
+<code>cargo test -p cosmix-mprisd --no-default-features</code> builds and tests only the
+pure snapshot/diff core, without zbus, Tokio or Cosmix transport dependencies.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +856,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +910,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1039,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

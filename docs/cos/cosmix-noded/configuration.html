@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-noded/configuration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,83 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-noded/configuration.md"><div class="prose"><h1 id="cosmix-noded-configuration">cosmix-noded configuration</h1>
+<p><code>cosmix-noded</code> loads the required node configuration, applies command-line overrides, and then starts its broker and optional client modules.</p>
+<h2 id="startup">Startup</h2>
+<pre><code class="language-text">cosmix-noded
+cosmix-noded serve [OPTIONS]
+</code></pre>
+<p>Omitting <code>serve</code> has the same effect as specifying it.</p>
+<p>The daemon fails if the required node configuration cannot be loaded, an explicit mesh configuration cannot be read, or the broker address cannot be bound.</p>
+<h2 id="effective-settings">Effective settings</h2>
+<p>The crate reads these values from the node configuration:</p>
+<table><thead><tr><th>Value</th><th>Use</th></tr></thead><tbody>
+<tr><td>Node name</td><td>Broker identity and the default mesh configuration selector.</td></tr>
+<tr><td>WireGuard or mesh address</td><td>Admission boundary self-check.</td></tr>
+<tr><td>Noded listen address</td><td>WebSocket bind address when <code>--listen</code> is absent.</td></tr>
+<tr><td>Noded mesh configuration path</td><td>Mesh peer configuration when <code>--mesh-config</code> is absent.</td></tr>
+<tr><td>Noded admission mode</td><td>Selects <code>off</code>, <code>observe</code>, or <code>enforce</code>.</td></tr>
+</tbody></table>
+<p>The node configuration loader is required even when command-line overrides provide the node name and listen address.</p>
+<p>The exact node configuration grammar belongs to the configuration substrate. This crate consumes the loaded values but does not define that grammar.</p>
+<h2 id="command-line-precedence">Command-line precedence</h2>
+<table><thead><tr><th>Effective value</th><th>First choice</th><th>Fallback</th></tr></thead><tbody>
+<tr><td>Listen address</td><td><code>--listen</code></td><td>Derived noded listen address from node configuration.</td></tr>
+<tr><td>Node name</td><td><code>--node</code></td><td>Node configuration node name.</td></tr>
+<tr><td>Mesh configuration path</td><td><code>--mesh-config</code></td><td>Optional noded mesh path from node configuration.</td></tr>
+<tr><td>Specification directory</td><td><code>--spec-dir</code></td><td>Environment and working-directory discovery.</td></tr>
+</tbody></table>
+<p><code>--no-monitor</code> and <code>--no-log</code> are process-local switches. They do not alter the loaded node configuration.</p>
+<h2 id="listen-address">Listen address</h2>
+<p>The listen value is a socket address such as:</p>
+<pre><code class="language-text">192.0.2.10:4200
+</code></pre>
+<p>The broker serves WebSockets at:</p>
+<pre><code class="language-text">ws://192.0.2.10:4200/ws
+</code></pre>
+<p>The built-in monitor and logger connect to that local URL after the listener reports readiness.</p>
+<p>Admission enforcement checks that the listen address uses the node's configured mesh address. A wildcard, loopback, malformed, or different address causes enforcement to adopt a refuse-all posture for inter-node sessions. The process still starts so the posture remains observable.</p>
+<h2 id="mesh-configuration">Mesh configuration</h2>
+<p>When a mesh configuration path is present, the daemon loads that file. Otherwise it asks the mesh substrate for the default configuration associated with the effective node name.</p>
+<p>The resulting configuration supplies the local mesh identity and peer roster used for message routing and <code>noded.peers</code>.</p>
+<h2 id="admission-mode">Admission mode</h2>
+<table><thead><tr><th>Mode</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>off</code></td><td>Sends no admission challenge and preserves open registration behaviour.</td></tr>
+<tr><td><code>observe</code></td><td>Challenges peers, verifies available proofs, and records verdicts without refusing registration.</td></tr>
+<tr><td><code>enforce</code></td><td>Requires valid proof for inter-node registration and checks the proven node against the registered bridge identity.</td></tr>
+</tbody></table>
+<p>Same-node connections are not proof-gated.</p>
+<p>Enforce mode refuses all inter-node registrations if no verified trust root is loaded or the listener is not bound to the configured mesh address.</p>
+<h2 id="authority-files">Authority files</h2>
+<p>The authority plane uses fixed runtime paths:</p>
+<table><thead><tr><th>Path</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>/etc/cosmix/noded/genesis.pub</code></td><td>Provisioned Ed25519 genesis verification key.</td></tr>
+<tr><td><code>/var/lib/cosmix/noded/inventory.signed</code></td><td>Cached signed authority inventory.</td></tr>
+<tr><td><code>/var/lib/cosmix/noded/inventory.baseline</code></td><td>Persisted anti-rollback baseline.</td></tr>
+<tr><td><code>/etc/cosmix/noded/d2.seed</code></td><td>Base64-encoded 32-byte admission signing seed.</td></tr>
+</tbody></table>
+<p>Missing, malformed, stale, or unverifiable authority data produces an unverified posture. It does not stop broker startup.</p>
+<p>The daemon watches the directory containing <code>inventory.signed</code>. A verified reload replaces the live authority snapshot. A bad or partial reload does not replace a previously verified snapshot.</p>
+<p>A missing admission seed leaves the node unable to prove itself to a peer. An unreadable or malformed seed also disables proving and produces a warning.</p>
+<h2 id="specification-directory">Specification directory</h2>
+<p>The specification directory is resolved in this order:</p>
+<ol>
+<li><code>--spec-dir &lt;PATH&gt;</code>.</li>
+<li><code>COSMIX_SPEC_DIR</code>.</li>
+<li><code>_spec</code> below <code>COSMIX_SRC</code>.</li>
+<li>An <code>_spec</code> directory found while walking from the current directory towards its parents.</li>
+</ol>
+<p>If no directory is found, the broker still starts. <code>spec.get</code> reports that the directory is not configured, and no <code>world.specs.NN</code> retained topics are seeded.</p>
+<p>Canonical chapter files use the <code>NN_*.md</code> form. Files with letters after the numeric prefix, such as <code>01b_*.md</code>, are not used as canonical chapter entries.</p>
+<h2 id="logging">Logging</h2>
+<p>The broker reports <code>RUST_LOG</code> as <code>config.log_level</code> on its property surface. When the variable is unset, that property reports <code>cosmix_noded=info</code>.</p>
+<p>The logger module creates the daemon log directory supplied by the daemon substrate and appends traffic records to <code>bus.log</code>. Each record contains a local timestamp, sender, command, and body length. It does not write the message body to that file.</p>
+<p>Use <code>--no-log</code> to prevent the logger module and its traffic-tap subscription from starting.</p>
+<h2 id="monitor">Monitor</h2>
+<p>Use <code>--no-monitor</code> to prevent the monitor module from starting. The broker continues to run, but the <code>mon</code> service and all <code>mon.*</code> verbs are unavailable.</p>
+<h2 id="shutdown">Shutdown</h2>
+<p>The daemon listens for the shared daemon shutdown signal. It also treats an unexpected broker task exit as a reason to stop. Shutdown aborts the monitor and logger tasks before the process exits.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +695,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +749,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +878,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

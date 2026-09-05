@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-davproto/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,144 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-davproto/README.md"><div class="prose"><h1 id="cosmix-lib-davproto">cosmix-lib-davproto</h1>
+<p><code>cosmix-lib-davproto</code> provides shared Rust codecs and representation helpers for
+CalDAV and CardDAV data. It belongs to the <code>cos</code> library layer in the
+<code>bus &lt;- mix &lt;- cos</code> dependency chain and has no direct dependency on a Bus or
+Mix crate.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The crate converts between structured calendar or contact data and the text
+formats used by DAV clients. It also derives strong content ETags for
+conditional requests.</p>
+<p>The public API covers:</p>
+<ul>
+<li>JSCalendar event fields to iCalendar <code>VCALENDAR</code> and <code>VEVENT</code> text.</li>
+<li>iCalendar parsing into indexed event fields and stored JSON data.</li>
+<li>In-place patching of selected iCalendar event properties.</li>
+<li>JSContact fields to vCard 4.0 text.</li>
+<li>vCard parsing into indexed contact fields and stored JSON data.</li>
+<li>In-place patching of selected vCard properties.</li>
+<li>Quoted BLAKE3 ETags over bytes, events, and contacts.</li>
+</ul>
+<p>This is a library crate. It has no executable, command-line interface,
+configuration format, subcommands, or Bus verbs.</p>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>etag</code></td><td>Builds strong, deterministic content ETags.</td></tr>
+<tr><td><code>ical</code></td><td>Emits, parses, and patches iCalendar event representations.</td></tr>
+<tr><td><code>vcard</code></td><td>Emits, parses, and patches vCard contact representations.</td></tr>
+</tbody></table>
+<h2 id="icalendar">iCalendar</h2>
+<p>The <code>ical</code> module handles a single <code>VEVENT</code> inside a <code>VCALENDAR</code>.</p>
+<h3 id="emission">Emission</h3>
+<p><code>event_to_ics</code> builds iCalendar text from:</p>
+<ul>
+<li><code>uid</code> as <code>UID</code>.</li>
+<li><code>title</code> as <code>SUMMARY</code>.</li>
+<li>UTC <code>start</code> and <code>end</code> values as <code>DTSTART</code> and <code>DTEND</code>.</li>
+<li><code>updated</code> as <code>LAST-MODIFIED</code>.</li>
+<li>JSON <code>description</code> as <code>DESCRIPTION</code>.</li>
+<li>The first JSON <code>locations</code> entry with a <code>name</code> as <code>LOCATION</code>.</li>
+</ul>
+<p>The emitted event always receives a deterministic <code>DTSTAMP</code>. The function uses
+<code>updated</code>, then <code>start</code>, then the Unix epoch. It does not use the current time,
+so repeated reads of unchanged inputs produce the same representation.</p>
+<p><code>RAW_ICAL_KEY</code> is <code>cosmix:rawICalendar</code>. When the JSON data contains a string
+under this key, <code>event_to_ics</code> returns that string unchanged instead of
+rebuilding the event. This preserves fields that the structured mapper does not
+model.</p>
+<h3 id="parsing">Parsing</h3>
+<p><code>parse_ics</code> parses iCalendar text and returns <code>ParsedEvent</code>. The result exposes:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>uid</code></td><td>The first event's optional <code>UID</code>.</td></tr>
+<tr><td><code>title</code></td><td>The first event's optional <code>SUMMARY</code>.</td></tr>
+<tr><td><code>start</code></td><td>The first event's optional indexed start time in UTC.</td></tr>
+<tr><td><code>end</code></td><td>The first event's optional indexed end time in UTC.</td></tr>
+<tr><td><code>data</code></td><td>A JSCalendar-shaped JSON object containing mapped fields and the raw input.</td></tr>
+</tbody></table>
+<p>The parser selects the first <code>VEVENT</code> and returns an error when none exists.
+UTC date-times remain UTC. Floating and timezone-qualified local date-times are
+treated as UTC for indexing. Date-only values become midnight UTC.</p>
+<p>The original input is stored under <code>RAW_ICAL_KEY</code>. A later emit therefore
+round-trips the complete client representation, including recurrence rules,
+alarms, timezone components, and extension properties.</p>
+<h3 id="patching">Patching</h3>
+<p><code>patch_ics</code> updates <code>SUMMARY</code>, <code>DTSTART</code>, and <code>DTEND</code> in an existing iCalendar
+body. It unfolds continued lines before matching properties and changes only
+properties inside <code>VEVENT</code>.</p>
+<p>Requested properties that are absent are inserted before <code>END:VEVENT</code>.
+Untouched lines remain present. Updated date-times use basic UTC form:
+<code>YYYYMMDDTHHMMSSZ</code>.</p>
+<p>Passing <code>None</code> for a property leaves it unchanged. Rewritten start and end
+properties lose existing <code>TZID</code> and <code>VALUE</code> parameters.</p>
+<h2 id="vcard">vCard</h2>
+<p>The <code>vcard</code> module handles vCard 4.0 contact text.</p>
+<h3 id="emission-1">Emission</h3>
+<p><code>contact_to_vcf</code> maps:</p>
+<ul>
+<li><code>uid</code> to <code>UID</code>.</li>
+<li><code>full_name</code> to the required <code>FN</code>.</li>
+<li><code>email</code> to <code>EMAIL</code>.</li>
+<li><code>company</code> to <code>ORG</code>.</li>
+<li>The primary phone in JSON data to <code>TEL</code>.</li>
+</ul>
+<p>When <code>full_name</code> is absent, <code>FN</code> falls back to JSContact <code>name.full</code>, then to
+the UID. Output lines use CRLF termination.</p>
+<p><code>RAW_VCARD_KEY</code> is <code>cosmix:rawVCard</code>. When the JSON data contains a string under
+this key, <code>contact_to_vcf</code> returns it unchanged.</p>
+<h3 id="parsing-1">Parsing</h3>
+<p><code>parse_vcf</code> unfolds continued lines and reads the first <code>UID</code>, <code>FN</code>, <code>EMAIL</code>,
+<code>ORG</code>, and <code>TEL</code>. It returns <code>ParsedContact</code> with:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>uid</code></td><td>The optional <code>UID</code>.</td></tr>
+<tr><td><code>full_name</code></td><td>The required formatted name from <code>FN</code>.</td></tr>
+<tr><td><code>email</code></td><td>The optional first email address.</td></tr>
+<tr><td><code>company</code></td><td>The first component of the optional <code>ORG</code> value.</td></tr>
+<tr><td><code>data</code></td><td>A JSContact-shaped JSON object containing mapped fields and the raw input.</td></tr>
+</tbody></table>
+<p>The parser returns an error when <code>FN</code> is absent. A parsed phone is placed at
+<code>phones.default.number</code>. The complete original vCard is stored under
+<code>RAW_VCARD_KEY</code>, preserving unmodelled properties for later reads.</p>
+<h3 id="patching-and-phone-helpers">Patching and phone helpers</h3>
+<p><code>patch_vcf</code> updates <code>FN</code>, <code>EMAIL</code>, <code>ORG</code>, and <code>TEL</code>. It preserves each matched
+property's parameter prefix, such as <code>EMAIL;TYPE=work</code>, and retains all other
+lines. A requested property that is absent is inserted before the closing
+<code>END</code> line.</p>
+<p>Only non-empty replacement values are applied. <code>None</code> and empty strings leave
+the corresponding property unchanged.</p>
+<p><code>primary_phone</code> reads the first phone number from the JSContact <code>phones</code> map.
+If that map has no usable number, it reads the first <code>TEL</code> value from a stashed
+raw vCard.</p>
+<p><code>set_primary_phone</code> updates the first existing <code>phones</code> entry while preserving
+its sibling fields and other phone entries. If no entry exists, it creates
+<code>phones.default.number</code>.</p>
+<h2 id="etags">ETags</h2>
+<p><code>etag::strong</code> returns a quoted hexadecimal BLAKE3 digest:</p>
+<pre><code class="language-text">"&lt;blake3-hex&gt;"
+</code></pre>
+<p><code>etag::for_event</code> hashes the event UID, title, start, end, updated value, and
+JSON data as one deterministic JSON value.</p>
+<p><code>etag::for_contact</code> hashes the contact UID, full name, email, company, and JSON
+data in the same way.</p>
+<p>These helpers hash source fields rather than emitted iCalendar or vCard text.
+An emitted-field change changes the ETag, while representation formatting
+changes alone do not.</p>
+<h2 id="scope-and-limitations">Scope and limitations</h2>
+<p>The structured iCalendar emitter does not model recurrence, alarms,
+participants, or <code>VTIMEZONE</code>. The raw iCalendar path preserves them.</p>
+<p>The structured vCard emitter handles one formatted name, email, organisation,
+and primary phone. It does not emit structured <code>N</code> values or multiple values
+for these fields. The raw vCard path preserves richer client data.</p>
+<p>The crate declares no Cargo features.</p>
+<h2 id="dependencies">Dependencies</h2>
+<table><thead><tr><th>Dependency</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>serde_json</code></td><td>Structured JSCalendar and JSContact values and deterministic ETag inputs.</td></tr>
+<tr><td><code>chrono</code></td><td>UTC calendar date-times.</td></tr>
+<tr><td><code>anyhow</code></td><td>Parse errors returned by the public parsing functions.</td></tr>
+<tr><td><code>icalendar</code></td><td>iCalendar parsing and event emission.</td></tr>
+<tr><td><code>blake3</code></td><td>Strong content hashing.</td></tr>
+</tbody></table></div></div>
     </div>
 
 </main>
@@ -620,6 +756,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +810,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +939,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-interaction-broker/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,141 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-interaction-broker/README.md"><div class="prose"><h1 id="cosmix-interaction-broker">cosmix-interaction-broker</h1>
+<p><code>cosmix-interaction-broker</code> is the headless decision core for <code>notify.v1</code> notifications handled by an <code>interact.*</code> broker. It validates requests, stamps caller provenance, applies per-origin throttling, coalesces repeated notifications, clamps remote urgency, and enforces action dispatch registration. It belongs to the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain and has no direct Bus, Mix, mesh, Bevy, clock, or random-number dependency.</p>
+<h2 id="role">Role</h2>
+<p>The crate contains policy only. It accepts a validated notification request, caller information, a timestamp, a fresh handle, and optionally a service-registry view. It returns a decision for a wrapper binary to execute.</p>
+<p>The crate does not:</p>
+<ul>
+<li>register Bus services or verbs;</li>
+<li>deliver desktop notifications;</li>
+<li>perform mesh capability checks;</li>
+<li>store interaction records;</li>
+<li>mint notification handles;</li>
+<li>read a clock;</li>
+<li>render user interface elements.</li>
+</ul>
+<p>Those operations remain the responsibility of the wrapper. Injecting time, handles, and registry state keeps the decision engine deterministic and unit-testable.</p>
+<h2 id="dependency-position">Dependency position</h2>
+<p>The only runtime dependency is the sibling <code>cosmix-interaction-schema</code> crate. That crate supplies the request, record, handle, state, urgency, and validation types used by this broker.</p>
+<p><code>serde_json</code> is a development dependency only.</p>
+<p>The crate defines no Cargo features.</p>
+<h2 id="decision-flow">Decision flow</h2>
+<p><code>NotifyBroker::accept</code> processes a notification in this order:</p>
+<ol>
+<li>Validate the <code>NotifyRequest</code> through the schema crate.</li>
+<li>Reject actions which dispatch to an unregistered service.</li>
+<li>Stamp the origin from the caller identity.</li>
+<li>Look up an existing per-origin deduplication slot.</li>
+<li>Consume one token from the origin's rate-limit bucket.</li>
+<li>Clamp a remote <code>Critical</code> request to <code>Normal</code>.</li>
+<li>Build a queued <code>NotifyRecord</code>.</li>
+<li>Return a delivery, throttle, or rejection decision.</li>
+</ol>
+<p><code>NotifyBroker::accept_queued</code> omits the service-registry lookup. It is intended for callers which validate dispatch targets later on a delivery worker.</p>
+<p>Fresh notifications and coalescing replacements consume the same per-origin rate budget.</p>
+<h2 id="broker">Broker</h2>
+<h3 id="notifybroker"><code>NotifyBroker</code></h3>
+<p><code>NotifyBroker</code> owns the origin policy, rate limiter, and deduplication table.</p>
+<p><code>NotifyBroker::v1()</code> creates the version 1 policy:</p>
+<ul>
+<li>reserved-origin allowlist empty;</li>
+<li>burst capacity of five notifications per origin;</li>
+<li>refill rate of one token per second per origin;</li>
+<li>empty deduplication state.</li>
+</ul>
+<p><code>NotifyBroker::new(origin, rate)</code> accepts an explicit <code>OriginPolicy</code> and <code>RateConfig</code>.</p>
+<p><code>origin_policy()</code> returns a read-only view of the active origin policy.</p>
+<p><code>accept(req, caller, now_ms, fresh_handle, registry)</code> performs synchronous schema and dispatch-target validation before applying broker policy.</p>
+<p><code>accept_queued(req, caller, now_ms, fresh_handle)</code> applies queue-time policy without consulting a service registry.</p>
+<p><code>try_consume(origin, now_ms)</code> spends one token for a mutation of an existing notification. Updates and notification deliveries can therefore share one budget.</p>
+<p><code>retire(handle)</code> releases any deduplication slot associated with a terminal notification. It deliberately leaves rate-limit state intact.</p>
+<h2 id="callers-and-origin-labels">Callers and origin labels</h2>
+<h3 id="caller"><code>Caller</code></h3>
+<p><code>Caller</code> describes the registered caller identity and whether the request came from a remote mesh peer.</p>
+<ul>
+<li><code>Caller::local(from)</code> identifies a registered local caller.</li>
+<li><code>Caller::anonymous()</code> identifies a local caller without a durable principal.</li>
+<li><code>Caller::remote(from)</code> identifies a registered remote caller.</li>
+</ul>
+<p>The request cannot supply its own origin label.</p>
+<h3 id="originpolicy"><code>OriginPolicy</code></h3>
+<p><code>OriginPolicy::resolve</code> derives the displayed origin from the registered caller identity. Missing, empty, and whitespace-only identities resolve to <code>anonymous</code>.</p>
+<p>The reserved labels are:</p>
+<ul>
+<li><code>system</code></li>
+<li><code>cosmix</code></li>
+<li><code>root</code></li>
+</ul>
+<p>Reserved-label comparison is case-insensitive. Under <code>OriginPolicy::v1()</code>, a caller whose identity collides with a reserved label is stamped <code>anonymous</code>.</p>
+<p><code>grant_reserved(identity, label)</code> provides a post-version-1 path for granting a specific identity one reserved label. It rejects non-reserved labels.</p>
+<p><code>may_present_as(identity, label)</code> tests whether an identity may use a label. Non-reserved labels require no grant.</p>
+<p>The crate exports <code>ANONYMOUS</code>, <code>RESERVED_LABELS</code>, and <code>is_reserved</code>.</p>
+<h2 id="decisions-and-rejection">Decisions and rejection</h2>
+<h3 id="notifydecision"><code>NotifyDecision</code></h3>
+<p><code>NotifyDecision</code> has three variants:</p>
+<table><thead><tr><th>Variant</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Deliver { record, replaces }</code></td><td>Deliver and store the queued record. <code>replaces</code> identifies an existing notification to replace.</td></tr>
+<tr><td><code>Throttled { origin }</code></td><td>Drop an over-budget delivery attempt and report the stamped origin.</td></tr>
+<tr><td><code>Rejected(reason)</code></td><td>Refuse the request before delivery.</td></tr>
+</tbody></table>
+<p>A delivered record contains the broker-selected handle, stamped origin, <code>Queued</code> state, supplied creation timestamp, summary, effective urgency, optional urgency override, and optional deduplication key.</p>
+<h3 id="rejectreason"><code>RejectReason</code></h3>
+<p><code>RejectReason::Invalid</code> wraps a schema <code>ValidationError</code>.</p>
+<p><code>RejectReason::UnregisteredDispatch</code> reports the zero-based action index and target service for the first action whose dispatch target is absent from the registry view.</p>
+<h3 id="serviceregistry"><code>ServiceRegistry</code></h3>
+<p><code>ServiceRegistry</code> contains one method:</p>
+<pre><code class="language-rust">fn is_registered(&amp;self, service: &amp;str) -&gt; bool;
+</code></pre>
+<p>Any <code>Fn(&amp;str) -&gt; bool</code> implements the trait.</p>
+<p><code>validate_dispatch_targets(req, registry)</code> exposes dispatch-target validation separately. Actions without an <code>on_invoke</code> dispatch require no service registration.</p>
+<h2 id="deduplication">Deduplication</h2>
+<p><code>DedupeTable</code> maps each <code>(origin, dedupe_key)</code> pair to one live <code>NotifyHandle</code>.</p>
+<ul>
+<li><code>new()</code> creates an empty table.</li>
+<li><code>lookup(origin, key)</code> returns the current handle for a slot.</li>
+<li><code>record(origin, key, handle)</code> records a handle and returns any displaced handle.</li>
+<li><code>forget_handle(handle)</code> removes every slot containing that handle.</li>
+</ul>
+<p>The same deduplication key used by two origins occupies two independent slots.</p>
+<p>When <code>NotifyBroker</code> coalesces a notification, the existing handle remains stable. The supplied fresh handle is ignored, and <code>NotifyDecision::Deliver.replaces</code> contains the existing handle.</p>
+<p>Retiring the handle frees the slot. A later request with the same origin and key is then a fresh delivery.</p>
+<h2 id="rate-limiting">Rate limiting</h2>
+<p><code>RateLimiter</code> maintains independent token buckets by origin.</p>
+<p><code>RateConfig</code> contains:</p>
+<table><thead><tr><th>Field</th><th>Meaning</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>capacity</code></td><td>Maximum tokens held by one bucket</td><td><code>5.0</code></td></tr>
+<tr><td><code>refill_per_sec</code></td><td>Tokens restored per second</td><td><code>1.0</code></td></tr>
+</tbody></table>
+<p><code>RateLimiter::new(config)</code> creates an empty limiter with the supplied parameters.</p>
+<p><code>try_consume(origin, now_ms)</code> spends one token and returns whether delivery may proceed. A new origin starts with a full bucket.</p>
+<p>Timestamp regressions contribute no refill and do not move the bucket's high-water mark backwards.</p>
+<p>Buckets idle for more than 15 minutes are removed. The limiter retains at most 4,096 buckets and evicts the oldest bucket, with origin name as the deterministic tie-breaker, when a new origin would exceed that bound.</p>
+<p><code>forget(origin)</code> removes one bucket. Its next request starts with a full bucket.</p>
+<h2 id="remote-urgency">Remote urgency</h2>
+<p>A local request retains its requested urgency.</p>
+<p>A remote request with <code>Critical</code> urgency is delivered as <code>Normal</code>. The record sets both <code>effective_urgency</code> and <code>urgency_override</code> so the wrapper can preserve the policy result.</p>
+<p>Other remote urgency values pass through unchanged.</p>
+<h2 id="example">Example</h2>
+<pre><code class="language-rust">use cosmix_interaction_broker::{Caller, NotifyBroker, NotifyDecision};
+use cosmix_interaction_schema::{NotifyHandle, NotifyRequest};
+
+let mut broker = NotifyBroker::v1();
+let request = NotifyRequest::new("Build complete");
+let registry = |service: &amp;str| service == "alpha";
+
+let decision = broker.accept(
+    &amp;request,
+    Caller::local("alpha"),
+    1_000,
+    NotifyHandle("notification-1".into()),
+    &amp;registry,
+);
+
+assert!(matches!(decision, NotifyDecision::Deliver { .. }));
+</code></pre>
+<p>The caller supplies the timestamp and freshly minted opaque handle. Production wrappers should supply their live service-registry view when using <code>accept</code>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +753,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +807,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +936,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

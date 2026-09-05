@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/io</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,1031 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/io.md"><div class="prose"><h1 id="io--files--io-builtins">io — files &amp; I/O builtins</h1>
+<p>The <strong>io</strong> builtin category — read, write, walk, and stat the filesystem, plus
+stdin, path-string helpers, and the embedded SQLite client. Every example below
+was run against <strong>mix 0.21.2</strong> and shows real output, except the sub-second
+timestamp section, which was run against <strong>mix 0.44.0</strong> — the release that added
+the field it demonstrates. List the category live with
+<code>mix builtins io</code>; one-line help for any name with <code>mix what NAME</code>. (That listing
+also shows <code>print</code> / <code>eprint</code> — those are <em>statements</em>, not builtin calls; see
+<a href="/mix/keywords">keywords</a>.)</p>
+<p>Mix's filesystem builtins are <em>native</em> <code>std::fs</code>/<code>std::os::unix</code> calls — there is
+no <code>/bin/sh</code> in the loop. Reach for them instead of shelling out: <code>stat(p)</code> not
+<code>run_rc("stat -c …")</code>, <code>chmod(p, 0o755)</code> not <code>run("chmod 755 …")</code>. They are
+structured-return by design — <code>stat</code> hands back a map, <code>read_lines</code> a list, <code>walk</code>
+a flat list of paths — so the result is data you index into, never string soup you
+re-parse.</p>
+<h2 id="common-semantics">Common semantics</h2>
+<ul>
+<li><strong>Paths are plain strings.</strong> A relative path resolves against the process CWD. No tilde expansion happens <em>inside</em> a builtin — <code>"~/x"</code> only expands at lex time in a double-quoted <a href="/mix/strings">string</a> literal, so <code>read_file("~/.mixrc")</code> works because the lexer rewrites <code>~</code> to <code>$HOME</code>, but <code>read_file($p)</code> where <code>$p</code> holds a literal <code>"~/x"</code> does not.</li>
+<li><strong>Errors raise, they don't return a sentinel.</strong> A failed <code>read_file</code> / <code>ls</code> / <code>mkdir</code> raises a catchable runtime error (the message names the call and path). Wrap a must-succeed step in <code>try/catch</code>, or pre-check with <code>exists</code> / <code>access</code> / <code>is_file</code> / <code>is_dir</code>. The exceptions are the predicates themselves (<code>exists</code>/<code>access</code>/<code>is_dir</code>/<code>is_file</code> return a <code>bool</code> for ordinary absence or denial) and <code>glob</code>, which returns an empty list for "no match", never an error.</li>
+<li><strong>Mode arguments take the VALUE, not the digits.</strong> <code>chmod</code>/<code>write_new</code> want an octal <em>literal</em> — <code>0o755</code> (= 493), <code>0o600</code> (= 384) — or an octal <em>string</em> (<code>"0755"</code>). A bare <code>755</code> is the decimal number 755, not the mode (see <a href="/mix/numbers">numbers</a> for why <code>0755</code> is a lex error and <code>0o755</code> is the value). That lex error is a Mix-<em>expression</em> hazard only — <code>0755</code> inside a command string handed to <code>run</code> (<code>run("install -m 0755 a b")</code>) is plain text for <code>/bin/sh</code> and works fine.</li>
+<li><strong><code>stat</code>'s <code>ino</code>/<code>dev</code> are STRINGS.</strong> They are <code>u64</code> and Mix numbers are f64, which loses precision above 2^53 — so they come back as text, ready to use verbatim as a dedupe key. Don't <code>to_number()</code> them.</li>
+<li><strong>Bytes vs strings.</strong> <code>read_file</code>/<code>read_lines</code> require valid UTF-8 (they error on a bad byte); <code>read_file_bytes</code> carries the raw buffer through <code>Value::Bytes</code>. <code>write_file</code>/<code>append_file</code>/<code>write_new</code> write a <code>Value::Bytes</code> argument verbatim and stringify anything else.</li>
+</ul>
+<h2 id="reading-files">Reading files</h2>
+<pre><code>read_file(path)          -&gt; string   (whole file; errors if not UTF-8)
+read_lines(path)         -&gt; list      (lines, trailing \n stripped, trailing empty dropped)
+head(path[, n])          -&gt; list      (first n lines, default 10 — stops reading at n)
+tail(path[, n])          -&gt; list      (last n lines, default 10 — reads backwards from EOF)
+line_count(path)         -&gt; number   (count lines by streaming; works on non-UTF-8 files)
+read_file_bytes(path)    -&gt; bytes     (raw; binary-safe)
+read_file_bytes(p, max)  -&gt; bytes     (read at most `max` bytes — header-sniff)
+</code></pre>
+<pre><code class="language-mix">write_file("/tmp/io/hello.txt", "line one\nline two\nline three\n")
+
+print(read_file("/tmp/io/hello.txt"))
+$lines = read_lines("/tmp/io/hello.txt")
+print("count: " .. length($lines))
+print("first: " .. $lines[0])
+print("line_count: " .. line_count("/tmp/io/hello.txt"))
+</code></pre>
+<pre><code class="language-text">line one
+line two
+line three
+
+count: 3
+first: line one
+line_count: 3
+</code></pre>
+<p><code>read_lines</code> strips each trailing newline (<code>\r\n</code> too — the <code>\r</code> is stripped
+with it) and <strong>drops the empty last line</strong> a file ending in <code>\n</code> would otherwise
+produce — so <code>"x\ny\n"</code> is two lines, not three. <code>line_count</code> streams the file
+in blocks and never materializes a list — the right call when you only want the
+count. It is byte-oriented (counts <code>\n</code>), so unlike the readers it works on
+non-UTF-8 files too.</p>
+<p><code>head</code> and <code>tail</code> (v0.28.1) are the <strong>no-slurp</strong> twins of
+<code>take(read_lines(p), n)</code> and <code>take(read_lines(p), -n)</code>: same line semantics,
+same list result, but <code>head</code> stops reading after <code>n</code> lines and <code>tail</code> reads
+64 KiB blocks backwards from EOF — the last 10 lines of a multi-GB log cost
+kilobytes, not the file's size in RAM. <code>n</code> defaults to 10 and must be a
+non-negative integer <em>number</em>; a numeric string or bool is a loud error, same
+discipline as <code>read_file_bytes</code>'s cap. Reach for <code>read_lines</code>+<code>take</code> only when
+you need the whole file anyway.</p>
+<p>A missing file raises:</p>
+<pre><code class="language-mix">try
+  read_file("/tmp/does-not-exist-xyz")
+catch $e
+  print("caught: " .. ("" .. $e))
+end
+</code></pre>
+<pre><code class="language-text">caught: read_file '/tmp/does-not-exist-xyz': No such file or directory (os error 2)
+</code></pre>
+<h3 id="reading-bytes-binary-safe">Reading bytes (binary-safe)</h3>
+<p><code>read_file_bytes</code> is the binary companion. The optional second argument caps the
+read at <em>max</em> bytes via <code>File::take</code>, so you can sniff a header out of a
+multi-megabyte file without slurping it all. The cap must be a real <code>Number</code>
+(a numeric string or bool is rejected — a silent surprise on a read cap would be
+a footgun). Pair it with the <a href="/mix/io#bytes-helpers">bytes helpers</a>:</p>
+<pre><code class="language-mix">-- a file whose first bytes are the JPEG magic \xFF\xD8\xFF
+$all = read_file_bytes("/tmp/io/img.bin")
+print("full: " .. bytes_len($all))
+
+$head = read_file_bytes("/tmp/io/img.bin", 4)
+print("capped: " .. bytes_len($head))
+</code></pre>
+<pre><code class="language-text">full: 34
+capped: 4
+</code></pre>
+<p>To pull an ASCII header out of a not-quite-UTF-8 block, decode the capped buffer
+with the explicit lossy escape hatch — <code>bytes_to_string($head, {lossy: true})</code>
+(see below). For a strict-data <code>.mix</code> file, use <code>load_data(path)</code> — the
+non-executing twin of <a href="/mix/functions"><code>include</code></a> that parses bare-key <code>key: value</code>
+data without running it.</p>
+<h2 id="writing-files">Writing files</h2>
+<pre><code>write_file(path, content)        overwrite (or create); follows symlinks
+append_file(path, content)       create-if-missing, then append
+write_new(path, content, mode)   atomically create; FAILS if path exists
+</code></pre>
+<pre><code class="language-mix">write_file("/tmp/io/log.txt", "first\n")
+append_file("/tmp/io/log.txt", "second\n")
+print(read_file("/tmp/io/log.txt"))
+</code></pre>
+<pre><code class="language-text">first
+second
+</code></pre>
+<h3 id="write_new--atomic-mode-at-creation-secret-safe"><code>write_new</code> — atomic, mode-at-creation, secret-safe</h3>
+<p><code>write_new</code> is <code>O_EXCL</code> at the syscall level (<code>create_new(true)</code>): it <strong>fails if
+the path already exists</strong>, with no TOCTOU window between a check and the write.
+The mode is applied <em>at creation</em> via <code>OpenOptions::mode()</code>, so the file is never
+briefly umask-permissioned — secret material hits disk at the configured mode
+from the very first byte. This is the call for DKIM keys and similar single-shot
+secrets; for ordinary mutable writes use <code>write_file</code>.</p>
+<pre><code class="language-mix">write_new("/tmp/io/secret.key", "TOPSECRET\n", 0o600)
+print("perm: " .. stat("/tmp/io/secret.key")["perm"])    -- 0o600 == 384
+
+try
+  write_new("/tmp/io/secret.key", "x", 0o600)            -- already exists
+catch $e
+  print("second write_new: refused (exists)")
+end
+</code></pre>
+<pre><code class="language-text">perm: 384
+second write_new: refused (exists)
+</code></pre>
+<blockquote>
+<p><code>0o600</code> prints as <code>384</code> because Mix numbers are decimal f64 — <code>0o600</code> is just a
+source spelling of the value 384. <code>stat</code>'s <code>perm</code> field is that same number;
+feed it straight back into <code>chmod</code>.</p>
+</blockquote>
+<h2 id="existence--type-tests">Existence &amp; type tests</h2>
+<pre><code>exists(path[, opts])  -&gt; bool   opts: {follow_symlinks: true|false}  (default true)
+access(path, mode)     -&gt; bool   mode: non-empty combination of r, w, x, f
+is_dir(path)          -&gt; bool
+is_file(path)         -&gt; bool   (regular file only — false for a dir or a dangling link)
+</code></pre>
+<pre><code class="language-mix">print("" .. exists("/etc/hosts"))     -- true
+print("" .. is_dir("/etc"))           -- true
+print("" .. is_file("/etc/hosts"))    -- true
+print("" .. is_file("/etc"))          -- false  (it's a dir)
+print("" .. is_file("/no/such"))      -- false  (missing — no error)
+</code></pre>
+<pre><code class="language-text">true
+true
+true
+false
+false
+</code></pre>
+<h3 id="kernel-permission-checks--access">Kernel permission checks — <code>access</code></h3>
+<p><code>access(path, mode)</code> asks the kernel whether this process can access a path
+<em>right now</em>. <code>mode</code> is a non-empty string containing any combination of <code>r</code>,
+<code>w</code>, and <code>x</code>, in any order. <code>f</code> means existence (<code>F_OK</code>): it may appear alone,
+and is redundant when combined with another letter. A repeated letter, an empty
+string, or any other character raises rather than turning a typo into a
+permissive check.</p>
+<pre><code class="language-mix">if access(".git/hooks/pre-commit", "x") then
+  print("the kernel will not refuse to execute this on permission grounds")
+end
+
+print("" .. access("/etc/hosts", "f"))       -- existence
+print("" .. access("/no/such/path", "r"))    -- false, no catch needed
+</code></pre>
+<p>This is the sound answer to a question that <code>stat(path)["perm"]</code> cannot answer.
+Mode bits are only part of the kernel's permission calculation: a POSIX ACL can
+grant or deny a named user independently of what <code>0o755</code> appears to say.
+<code>access</code> uses <code>faccessat(AT_FDCWD, path, mask, AT_EACCESS)</code>, so ACLs are honoured
+and the check uses the process's <strong>effective</strong> uid/gid — the identity under which
+this process would actually do the thing.</p>
+<p>On Linux that is issued as the <strong><code>faccessat2(2)</code> syscall directly</strong>, not through
+the C library's <code>faccessat</code> wrapper, and the difference is not academic. The
+older kernel call takes no flags, so glibc implements <code>AT_EACCESS</code> itself — and
+where <code>faccessat2</code> is unavailable (glibc ≤ 2.32, or a kernel before Linux 5.8)
+that emulation decides from <code>fstatat(2)</code> mode bits and, in the man page's own
+words, <em>"does not take ACLs into account"</em>. That is exactly the arithmetic this
+builtin exists to replace, so rather than fall back to it silently, <code>access</code>
+<strong>raises</strong> on such a kernel. The answer is the kernel's or there is no answer. A
+caller that genuinely wants mode arithmetic can read <code>stat(path)["perm"]</code> and own
+that choice out loud.</p>
+<p>That is deliberately <em>not</em> the same rule as POSIX <code>access(2)</code>, which uses the
+<strong>real</strong> ids; some programs (git's hook lookup among them) use that older call.
+The two agree except under a setuid or setgid binary, where real and effective
+diverge. Mix is neither, and neither is a shell, a daemon, or a <code>sudo</code>ed
+command, so predicting such a program's answer with this builtin is sound
+wherever the two ids match — which is everywhere Mix normally runs, but is an
+assumption worth naming rather than one the builtin can enforce.</p>
+<p>On Linux <code>x</code> also accounts for a <strong><code>noexec</code> mount</strong>, which no combination of
+mode bits reveals: a 0755 file on a <code>noexec</code> filesystem answers <code>false</code>, exactly
+as <code>execve</code> would. On a <em>directory</em>, <code>x</code> means search permission rather than
+execute, so it does not answer "can programs be run from here" — for that, ask
+about a file inside it.</p>
+<p>Symlinks are followed deliberately: the question is whether the thing they
+resolve to can be read, written, or executed. Ordinary negative answers return
+<code>false</code>, including a missing path, a denied permission, a non-directory path
+component, a symlink loop, an overlong path, a read-only filesystem on a write
+query, a <code>w</code> query against a file currently being executed, and a <code>w</code> query
+against an immutable file. Malformed input (including an interior NUL in the
+path) and an unexpected syscall failure raise.</p>
+<p>That last case is the one genuinely ambiguous errno: a seccomp filter or an LSM
+that blocks the syscall itself also reports <code>EPERM</code>, and is reported here as an
+ordinary "no". That is the safe direction — a caller asking "may I?" is better
+served by a false than by an exception thrown at code that was only trying to
+describe a file — but on a sandboxed system a blanket <code>false</code> from <code>access</code> is
+worth reading as <em>"the question could not be put"</em> rather than as a fact about
+the file.</p>
+<p>The answer is a snapshot, not a lease: a mode change, an ACL change or a remount
+between the check and the use invalidates it. For a step that must succeed,
+attempt it inside <code>try</code>/<code>catch</code> and let the failure be authoritative; <code>access</code> is
+for reporting, for choosing a branch, and for saying <em>why</em> something will not
+work before trying it.</p>
+<p><strong><code>exists</code> answers two different questions and you have to pick.</strong> By default it
+<strong>follows symlinks</strong>, so it means <em>"can I open something here"</em> — and a dangling
+link reads as <strong>absent</strong>. <code>exists(path, {follow_symlinks: false})</code> is the <code>lstat</code>
+form: <em>"is there an entry at this name"</em>, which sees the link itself (v0.39.0;
+same option name and default as <code>stat</code>).</p>
+<pre><code class="language-mix">symlink("nowhere", "/tmp/io/dangling")
+print("" .. exists("/tmp/io/dangling"))                            -- false
+print("" .. exists("/tmp/io/dangling", {follow_symlinks: false}))  -- true
+</code></pre>
+<pre><code class="language-text">false
+true
+</code></pre>
+<p>Use the default for <em>"is there a file I can read or run"</em>. Use the <code>lstat</code> form
+for <em>"is this name free"</em>, <em>"is there something here I must not destroy"</em>, and
+<em>"is there something here I must not silently ignore"</em> — those three all have to
+see a dangling link, and the default hides it. (The same distinction, one layer
+down, is why <code>write_new</code> is the right way to claim a pathname: see
+<a href="/mix/io#atomic-replace--rename">Claim the temp name before you write into it</a>.)</p>
+<p><code>realpath</code> canonicalises a path — it resolves every symlink and <code>.</code>/<code>..</code> to the absolute real path (like <code>readlink -f</code> / <code>realpath(3)</code>). The path <strong>must exist</strong>; a missing component, a symlink loop, or a non-UTF-8 resolved path returns <code>nil</code> (never an error), so the caller decides. It is the same canonicalisation <code>require</code>/<code>include</code> use for their per-path module cache. It is <strong>normalisation only, not a race-free authorization primitive</strong> — canonicalise-then-use is not atomic. For an exec/open safety check, operate on the <strong>returned canonical path</strong> (which has no symlinks left to re-traverse), not the original, so a symlink hop can't be repointed between the check and the use.</p>
+<pre><code>realpath(path)  -&gt; string | nil   (absolute real path, or nil if unresolvable)
+</code></pre>
+<pre><code class="language-mix">print("" .. realpath("/usr/bin/traceroute"))  -- e.g. /usr/bin/traceroute.db (Debian alt-link)
+print("" .. realpath("/etc/../etc/hosts"))    -- /etc/hosts
+print("" .. realpath("/no/such/path"))        -- nil  (missing — no error)
+</code></pre>
+<p>These never raise — they answer a question, so a missing path is simply <code>false</code>.
+Use them to guard a read that <em>would</em> raise.</p>
+<h2 id="listing-directories--ls-glob-walk">Listing directories — <code>ls</code>, <code>glob</code>, <code>walk</code></h2>
+<pre><code>ls([dir])                     one level, names only (sorted; default ".")
+glob(pattern)                 paths matching a glob (* ? and ** globstar)
+walk(dir[, opts])             recursive list of paths under dir (sorted)
+</code></pre>
+<p><code>ls</code> returns the <strong>entry names</strong> in a single directory, sorted, with no path
+prefix. It raises on a missing or unreadable directory.</p>
+<pre><code class="language-mix">for each $e in ls("/tmp/io")
+  print($e)
+end
+</code></pre>
+<pre><code class="language-text">a.txt
+b.log
+sub
+</code></pre>
+<p><code>glob</code> matches a shell-style pattern and returns <strong>full matching paths</strong>, sorted.
+<code>*</code> and <code>?</code> match within one path component; <code>**</code> is a globstar that descends
+through zero or more directory levels. No match → an empty list (not an error).
+A relative pattern starts from <code>.</code> (with no stray <code>./</code> prefix on results); an
+absolute pattern starts from <code>/</code>.</p>
+<pre><code class="language-mix">-- top level only
+for each $g in glob("/tmp/io/*.txt")
+  print($g)
+end
+print("---")
+-- recurse with **
+for each $g in glob("/tmp/io/**/*.txt")
+  print($g)
+end
+</code></pre>
+<pre><code class="language-text">/tmp/io/a.txt
+---
+/tmp/io/a.txt
+/tmp/io/sub/c.txt
+/tmp/io/sub/deep/d.txt
+</code></pre>
+<p><code>walk</code> is the depth-first recursive walk. By default it returns <strong>files only</strong>;
+the options map flips the defaults:</p>
+<ul>
+<li><code>max_depth</code> (number, default unlimited) — nesting depth relative to <code>dir</code>; <code>max_depth: 0</code> returns only the direct children.</li>
+<li><code>include_dirs</code> (bool, default <code>false</code>) — include directory entries too.</li>
+<li><code>follow_symlinks</code> (bool, default <code>false</code>) — follow symlink dirs (loop-safe; the walker tracks visited inodes).</li>
+</ul>
+<p><code>max_depth</code> accepts a number or numeric string. If the option is present but
+cannot be parsed as a number, <code>walk</code> raises <code>TYPE_MISMATCH</code>; it never silently
+discards the limit and performs an unlimited traversal.</p>
+<p><code>walk</code> errors only on a <strong>missing</strong> top-level <code>dir</code>. Everything else is
+best-effort: an unreadable directory is silently skipped — even the top-level
+one (it exists, so the walk proceeds and simply finds nothing, returning <code>[]</code>) —
+and so is an individual entry that fails to stat. One bad file deep in a subtree
+shouldn't abort the whole walk.</p>
+<pre><code class="language-mix">print("--- files only, full depth ---")
+for each $p in walk("/tmp/io")
+  print($p)
+end
+print("--- direct children, include dirs ---")
+for each $p in walk("/tmp/io", {max_depth: 0, include_dirs: true})
+  print($p)
+end
+</code></pre>
+<pre><code class="language-text">--- files only, full depth ---
+/tmp/io/a.txt
+/tmp/io/b.log
+/tmp/io/sub/c.txt
+/tmp/io/sub/deep/d.txt
+--- direct children, include dirs ---
+/tmp/io/a.txt
+/tmp/io/b.log
+/tmp/io/sub
+</code></pre>
+<p>The split: <code>ls</code> = one level / names, <code>glob</code> = pattern / full paths, <code>walk</code> =
+recurse / full paths. Reach for <code>walk</code> over a hand-rolled <code>glob("**")</code> loop when
+you need depth limits or directory entries.</p>
+<h2 id="creating-directories--mkdir">Creating directories — <code>mkdir</code></h2>
+<p><code>mkdir(path)</code> creates the directory <strong>and any missing parents</strong> (it is
+<code>create_dir_all</code>, i.e. <code>mkdir -p</code>), and is idempotent — calling it on an existing
+directory is a no-op, not an error.</p>
+<pre><code class="language-mix">mkdir("/tmp/io/a/b/c")
+print("" .. is_dir("/tmp/io/a/b/c"))   -- true
+mkdir("/tmp/io/a/b/c")                 -- again: fine, no error
+print("idempotent ok")
+</code></pre>
+<pre><code class="language-text">true
+idempotent ok
+</code></pre>
+<p><code>mkdir(path, {parents: false})</code> creates <strong>only the final component</strong> (plain
+<code>create_dir</code>) and raises if the parent is missing. Reach for it when the parent
+was placed deliberately and its disappearance is news: the recursive default
+would quietly re-create it — and every level above it — so a script that checked
+<code>is_dir($TMPDIR)</code> a moment earlier ends up manufacturing the very directory it
+meant to refuse, and its cleanup removes only the leaf it knows about.</p>
+<pre><code class="language-mix">mkdir("/tmp/io/exists")
+mkdir("/tmp/io/exists/leaf", {parents: false})     -- fine: the parent is there
+print("" .. is_dir("/tmp/io/exists/leaf"))
+try
+  mkdir("/tmp/io/absent/leaf", {parents: false})
+catch $e
+  print("refused")
+end
+print("" .. exists("/tmp/io/absent"))              -- the parent was NOT created
+</code></pre>
+<pre><code class="language-text">true
+refused
+false
+</code></pre>
+<p>The option map is checked strictly, because every way of misspelling a safety
+switch would otherwise select the unsafe default in silence. <code>parents</code> is the
+only key <code>mkdir</code> accepts and it must be a boolean; <code>{parent: false}</code> (singular)
+and <code>{parents: "false"}</code> (a string, which is truthy) both raise rather than
+recursing.</p>
+<pre><code class="language-mix">try
+  mkdir("/tmp/io/x/y", {parent: false})
+catch $e
+  print("unknown key refused")
+end
+try
+  mkdir("/tmp/io/x/y", {parents: "false"})
+catch $e
+  print("non-boolean refused")
+end
+print("" .. exists("/tmp/io/x"))                   -- neither call created it
+</code></pre>
+<pre><code class="language-text">unknown key refused
+non-boolean refused
+false
+</code></pre>
+<h2 id="advisory-locks--flock-funlock">Advisory locks — <code>flock</code>, <code>funlock</code></h2>
+<pre><code>flock(path)                              exclusive, non-blocking
+flock(path, {shared: true})              shared, non-blocking
+flock(path, {wait: 2.5})                 wait for up to 2.5 seconds
+funlock(path)                            release this process's lock
+</code></pre>
+<p><code>flock</code> opens the file read/write, creating it with mode <code>0644</code> (subject to the
+process umask), then takes a kernel advisory lock with <code>flock(2)</code>. The default is
+exclusive and non-blocking: <code>true</code> means acquired and <code>false</code> means another
+process currently holds an incompatible lock. Contention is normal control flow,
+not an exception. A positive <code>wait</code> retries without busy-spinning until the
+deadline, then returns <code>false</code>; genuine open or locking failures raise.</p>
+<pre><code class="language-mix">$lock = "/tmp/deploy.lock"
+if not flock($lock, {wait: 5}) then
+  die "another deploy is running"
+end
+
+try
+  print("deploy while the kernel owns the lock lifetime")
+catch $e
+  funlock($lock)
+  die $e
+end
+funlock($lock)
+</code></pre>
+<p>The fd lives in a process-global registry under the file's canonical path, so it
+stays open after <code>flock</code> returns and the kernel releases it automatically when
+the process exits — including signal death. Calling <code>flock</code> again for the same
+canonical path in the same process returns <code>true</code> without opening a second
+retained fd. The first acquisition fixes shared versus exclusive mode until
+<code>funlock</code>; a repeated call is idempotent, not an upgrade or downgrade — so
+<code>flock(p)</code> followed by <code>flock(p, {shared: true})</code> answers <code>true</code> while the
+held lock stays exclusive (the same rule applies to <code>fcntl_lock</code> below).</p>
+<p><code>funlock</code> returns <code>true</code> when it released a held fd and <code>false</code> when this process
+held no lock for that path. The not-held case never raises.</p>
+<p>These are <strong>advisory</strong> locks: every cooperating process must use <code>flock</code> on the
+same file. Do not remove, rename, or replace a live lock file. A path can then
+name a new inode while an older process still holds the old inode locked, letting
+both processes proceed. Leave the lock file in place permanently; only acquire
+and release its kernel lock.</p>
+<h3 id="posix-record-locks--fcntl_lock-fcntl_unlock-v0710">POSIX record locks — <code>fcntl_lock</code>, <code>fcntl_unlock</code> (v0.71.0)</h3>
+<pre><code>fcntl_lock(path)                         exclusive, non-blocking
+fcntl_lock(path, {shared: true, wait: 2.5})
+fcntl_unlock(path)                       release this process's record lock
+</code></pre>
+<p>Linux keeps <strong>two separate advisory-lock families</strong> that never see each
+other: <code>flock(2)</code> locks (above) and POSIX <code>fcntl(2)</code> record locks — the
+family C/Rust daemons use for pidfiles and lock files (<code>F_SETLK</code>/<code>F_SETLKW</code>).
+A Mix <code>flock()</code> cannot contend with a daemon's fcntl lock; <code>fcntl_lock()</code>
+can. <strong>Pick the family the other side of the coordination uses</strong>; for
+Mix-to-Mix locking either works, and <code>flock</code> is the established default.</p>
+<p>The caller contract is identical to <code>flock</code>/<code>funlock</code> in every respect:
+exclusive + non-blocking by default, contention returns <code>false</code>, real errors
+raise, repeated acquisition in one process is idempotent-<code>true</code> by canonical
+path, the fd lives in a process-global registry and the kernel cleans up on
+exit, and the do-not-delete-a-live-lock-file rule applies unchanged. The
+lock always covers the <strong>whole file</strong>.</p>
+<p>One implementation detail worth knowing: these are <em>open-file-description</em>
+locks (<code>F_OFD_SETLK</code>). They conflict with other processes' traditional
+record locks exactly as required — but unlike traditional records they are
+<strong>not</strong> dropped when this process opens and closes the same path elsewhere.
+A traditional fcntl lock would be silently released by a mere <code>read_file</code>
+of the locked path (POSIX drops a process's record locks when <em>any</em> fd for
+the file closes); the OFD form removes that footgun.</p>
+<h2 id="copying--removing--copy-copy_tree-remove-remove_dir">Copying &amp; removing — <code>copy</code>, <code>copy_tree</code>, <code>remove</code>, <code>remove_dir</code></h2>
+<pre><code>copy(src, dst)          copy a single file; overwrites dst, preserves the source mode
+copy_tree(src, dst)     recursive dir copy — files (mode kept) + symlinks (as symlinks);
+                        creates dst and merges into an existing one
+remove(path)            remove a file/symlink; no-op if already gone (rm -f)
+remove_dir(path)        recursive remove of a dir + contents; no-op if gone (rm -rf)
+</code></pre>
+<p><code>copy_tree</code> mirrors the parts of <code>cp -a</code> scripts actually need: it recreates the
+tree, copies files with <code>std::fs::copy</code> (which carries the permission bits), and
+recreates symlinks <strong>as symlinks</strong> (target verbatim — no dereference). <code>remove</code> and
+<code>remove_dir</code> follow <code>rm -f</code> / <code>rm -rf</code> semantics: an already-missing path is a no-op,
+not an error (so a "clear then rebuild" step needs no <code>exists()</code> pre-check), while a
+real failure (a permission error, or <code>remove</code> aimed at a directory) still raises.</p>
+<pre><code class="language-mix">mkdir("/tmp/io/rc/sub")
+write_file("/tmp/io/rc/a.mix", "-- alias file\n")
+copy_tree("/tmp/io/rc", "/root/.rc")   -- e.g. bundling ~/.rc into an image rootfs
+remove_dir("/tmp/io/rc")               -- rm -rf the staging copy
+remove_dir("/tmp/io/rc")               -- again: fine, already gone
+print("copied + cleaned")
+</code></pre>
+<pre><code class="language-text">copied + cleaned
+</code></pre>
+<h2 id="atomic-replace--rename">Atomic replace — <code>rename</code></h2>
+<pre><code>rename(src, dst)        rename(2) — moves src onto dst within one filesystem
+</code></pre>
+<p><code>rename</code> exists for the one guarantee <code>copy</code> cannot give: replacing an existing
+<code>dst</code> is <strong>atomic</strong>. A concurrent reader — or a <code>git</code> about to <code>exec</code> a hook, or a
+daemon re-reading its config — sees either the old file or the new one, never a
+half-written one. That makes it the second half of the safe in-place update:
+<strong>write a temp file beside the target, <code>chmod</code> it, then <code>rename</code> it over the
+target.</strong> <code>write_file</code> alone truncates first, so a crash or a permission failure
+mid-write leaves the target destroyed.</p>
+<p>Errors surface verbatim rather than being papered over. <code>EXDEV</code> (a cross-filesystem
+move) raises — that is a genuinely different operation with different failure
+modes, and silently falling back to copy + remove would hand back the
+non-atomicity the caller came here to avoid. A missing <code>src</code> raises <code>ENOENT</code>;
+unlike <code>remove</code>, this is never a no-op, because renaming something that isn't
+there is always a caller bug.</p>
+<pre><code class="language-mix">$live = "/tmp/io/hooks/pre-commit"
+$tmp  = $live .. ".tmp"
+write_file($tmp, "#!/bin/sh\nexec my-gate\n")
+chmod($tmp, 0o755)
+rename($tmp, $live)                    -- the swap is all-or-nothing
+print(read_file($live))
+</code></pre>
+<pre><code class="language-text">#!/bin/sh
+exec my-gate
+</code></pre>
+<p><strong>Claim the temp name before you write into it.</strong> A <em>fixed</em> staging name like
+<code>pre-commit.tmp</code> is a pathname anyone can get to first, and <code>write_file</code> follows
+a symlink sitting there — so <code>pre-commit.tmp -&gt; pre-commit</code> turns the "safe"
+temp write into a write straight through the live target, and the <code>rename</code> then
+points the target at itself. <code>write_new</code> is <code>O_EXCL</code>: it fails on <em>any</em> existing
+entry, including a dangling symlink, and never follows one. Use it to take the
+name, and the rest of the sequence is honest.</p>
+<pre><code class="language-mix">write_new($tmp, "", 0o755)             -- refuses if anything is already there
+write_file($tmp, $body)
+rename($tmp, $live)
+</code></pre>
+<p>Also note <code>rename</code> reports the <em>client's</em> view. On NFS a client can be told the
+rename failed after a server crash even though the server performed it, so
+"raised" is not proof the old file survived; re-read the target if you must know.</p>
+<h2 id="symbolic-links--symlink-read_link">Symbolic links — <code>symlink</code>, <code>read_link</code></h2>
+<pre><code>symlink(target, linkpath)   symlink(2) — creates linkpath pointing at target
+read_link(path) -&gt; string   readlink(2) — the target exactly as stored
+</code></pre>
+<p>Argument order is <code>symlink(2)</code>'s, <strong>not</strong> <code>ln</code>'s reading order: the target comes
+first, the link to create second. <code>target</code> is stored verbatim and is neither
+resolved nor validated, so a relative target resolves against the <em>link's own</em>
+directory, and creating a dangling link is legal — both are usually the point.
+<code>linkpath</code> must not exist (<code>EEXIST</code>); <code>remove</code> deletes a symlink itself rather
+than what it points at.</p>
+<p><code>read_link</code> is not <code>realpath</code>. It hands back what the link literally says,
+relative or dangling and unresolved; <code>realpath</code> answers "where does this land".
+Auditing a link — <em>is this temp file secretly aimed at the file next to it?</em> —
+needs the unresolved answer. It raises <code>EINVAL</code> on anything that is not a
+symlink, so test first with <code>stat(path, {follow_symlinks: false})</code>, which is the
+<code>lstat</code> form and the only way to <code>stat</code> the link rather than its target.</p>
+<pre><code class="language-mix">symlink("../elsewhere/absent", "/tmp/io/link")
+print(read_link("/tmp/io/link"))
+print(stat("/tmp/io/link", {follow_symlinks: false})["is_symlink"])
+print(exists("/tmp/io/link"))          -- follows: a dangling link reads as absent
+</code></pre>
+<pre><code class="language-text">../elsewhere/absent
+true
+false
+</code></pre>
+<p>That last line is the trap worth remembering: plain <code>exists</code> follows the link, so
+a dangling symlink answers "nothing is here" while very much being something. Ask
+the other question — <code>exists(path, {follow_symlinks: false})</code> — whenever you mean
+"is this name taken" rather than "can I open this".</p>
+<h2 id="permissions--ownership--chmod-chown">Permissions &amp; ownership — <code>chmod</code>, <code>chown</code></h2>
+<pre><code>chmod(path, mode)            mode as octal literal 0o755 or string "0755"
+chown(path, uid, gid)        numeric uid/gid only; follows symlinks
+</code></pre>
+<p>Native syscalls — don't <code>run("chmod …")</code>. Both follow symlinks (the mode/owner is
+applied to the link's <em>target</em>, standard shell semantics). <code>chmod</code>'s mode is the
+<strong>value</strong> (<code>0o755</code>, range <code>0..=0o7777</code>); a number out of range or with a fraction
+is rejected. <code>chown</code> takes numeric uid/gid only — no name resolution — and
+requires real <code>Number</code> arguments (a bool or numeric string is refused, so
+<code>chown(p, true, false)</code> can't silently become uid 1 / gid 0).</p>
+<pre><code class="language-mix">write_new("/tmp/io/f", "x\n", 0o600)
+print("before: " .. stat("/tmp/io/f")["perm"])   -- 384  (0o600)
+chmod("/tmp/io/f", 0o644)
+print("after:  " .. stat("/tmp/io/f")["perm"])   -- 420  (0o644)
+</code></pre>
+<pre><code class="language-text">before: 384
+after:  420
+</code></pre>
+<table><thead><tr><th>octal literal</th><th>decimal value (what <code>perm</code>/<code>mode</code> print)</th></tr></thead><tbody>
+<tr><td><code>0o600</code></td><td>384</td></tr>
+<tr><td><code>0o644</code></td><td>420</td></tr>
+<tr><td><code>0o755</code></td><td>493</td></tr>
+</tbody></table>
+<h2 id="inspecting-metadata--stat">Inspecting metadata — <code>stat</code></h2>
+<p><code>stat(path)</code> returns a map; <code>stat(path, {follow_symlinks: false})</code> is <code>lstat</code>
+(reports the link itself). Fields (a frozen surface — scripts index into them):</p>
+<table><thead><tr><th>field</th><th>type</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>uid</code> <code>gid</code> <code>nlink</code> <code>size</code></td><td>number</td><td>owner / group / hard-link count / bytes</td></tr>
+<tr><td><code>mode</code></td><td>number</td><td>full <code>st_mode</code> (type bits included)</td></tr>
+<tr><td><code>perm</code></td><td>number</td><td><code>mode &amp; 0o7777</code> — round-trips into <code>chmod</code></td></tr>
+<tr><td><code>ino</code> <code>dev</code></td><td><strong>string</strong></td><td>inode / device (u64 → text, see semantics)</td></tr>
+<tr><td><code>ctime</code> <code>mtime</code> <code>atime</code></td><td>number</td><td>epoch <strong>seconds</strong> (f64, whole-second)</td></tr>
+<tr><td><code>ctime_nsec</code> <code>mtime_nsec</code> <code>atime_nsec</code></td><td>number</td><td>sub-second part, <code>0..=999999999</code> (v0.44.0)</td></tr>
+<tr><td><code>is_file</code> <code>is_dir</code> <code>is_symlink</code></td><td>bool</td><td>type flags</td></tr>
+</tbody></table>
+<pre><code class="language-mix">write_new("/tmp/io/k", "hello\n", 0o600)
+$st = stat("/tmp/io/k")
+print("size:  " .. $st["size"])
+print("perm:  " .. $st["perm"])
+print("ino:   " .. $st["ino"])           -- a STRING
+print("file?: " .. ("" .. $st["is_file"]))
+</code></pre>
+<pre><code class="language-text">size:  6
+perm:  384
+ino:   1909
+file?: true
+</code></pre>
+<h3 id="did-this-file-change-needs-the-timestamp-pair">"Did this file change?" needs the timestamp <em>pair</em></h3>
+<p>Whole seconds cannot answer that question. A rewrite that puts <em>equal</em> bytes
+back inside the same second is invisible to a content comparison (the bytes
+match) <strong>and</strong> to an <code>mtime</code> comparison (the second matches) — so a tamper check
+built on those two reads it as untouched. This is not hypothetical: a hook
+installer was rewriting live git hooks on every run and the check stayed green.</p>
+<p>Compare <code>(mtime, mtime_nsec)</code> together:</p>
+<pre><code class="language-mix">fn changed($path, $was)
+  $now = stat($path)
+  return $now["mtime"] != $was["mtime"] or $now["mtime_nsec"] != $was["mtime_nsec"]
+end
+</code></pre>
+<p>The sub-second part is a <strong>separate</strong> field rather than one combined nanosecond
+timestamp on purpose. Mix numbers are <code>f64</code>, exact for integers only up to
+2^53; a nanosecond epoch passed that about 104 days after 1970, so a combined
+value would silently round. Split, both halves are exact.</p>
+<p><strong>The pair narrows the blind spot; it does not close it.</strong> <code>mtime_nsec</code> reports
+what the filesystem recorded, and timestamp granularity is a filesystem
+property, not a guarantee — a filesystem that stores whole seconds reports <code>0</code>,
+and even one that stores nanoseconds is not obliged to give two writes distinct
+values.</p>
+<p>Which field catches a change depends on <em>how</em> the writer writes:</p>
+<ul>
+<li>A writer that <strong>replaces</strong> the file — new file, then <code>rename()</code> over the old
+one, the way any careful writer updates a live file — gets a <strong>new inode</strong>.
+<code>ino</code>/<code>dev</code> catch that on their own, whether or not the timestamps are
+compared. This is the common case, and a check that compares only timestamps
+is doing less work than it looks like it is.</li>
+<li>A writer that rewrites <strong>in place</strong> keeps the inode, so <code>ino</code>/<code>dev</code> say
+nothing. If the new bytes differ, <code>size</code> or the content still show it. The
+case that needs the timestamps is the byte-identical one — same inode, same
+size, same bytes — where <code>(mtime, mtime_nsec)</code> is the field pair a caller
+normally compares, and only helps if the sub-second half is compared too when
+the rewrite lands inside one second. <code>ctime</code> moves as well; see below for what
+that is worth.</li>
+</ul>
+<p>So compare identity <em>and</em> the timestamp pair; neither subsumes the other.</p>
+<p>Both are still read-side signals, and neither survives a deliberate adversary:
+<code>mtime</code> is writable — <code>utimensat</code> lets a file's owner set any value it likes,
+including the previous one — so a change can be made and its evidence put back.</p>
+<p><code>ctime</code> is the exception worth knowing. It records when the <em>inode</em> last
+changed, and no syscall accepts a caller-supplied value for it: a write marks
+it, and the <code>utimensat</code> used to put <code>mtime</code> back marks it again, so the cover-up
+signs itself. That is why "no <code>stat</code> field sees a byte-identical in-place
+rewrite" would be wrong, and why <code>(ctime, ctime_nsec)</code> is worth comparing
+alongside the <code>mtime</code> pair.</p>
+<p>It is not proof, in two separate ways. It is a <em>timestamp</em>, so the granularity
+paragraph above applies to it unchanged — a coarse filesystem, or two events
+inside one tick, record the same pair for both, and an unchanged <code>ctime</code> is
+therefore evidence of nothing having <em>been recorded</em>, not of nothing having
+happened. And it is the <em>inode's</em> clock rather than the content's, so a <code>chmod</code>,
+a <code>chown</code> or a new hard link moves it with no content change at all, while
+anyone who can set the system clock or write the raw device moves it wherever
+they like. Read it as tamper-<em>evidence</em> at best: a changed <code>ctime</code> says
+something touched the inode, and does not say what.</p>
+<p>A check that has to be sound needs evidence from the write side — the
+writer announcing its intent before it writes, or an append-only log. A kernel
+watch (<code>inotify</code>) is better than polling but is not proof either: it can miss
+what happened before the watch was established, and its queue can overflow
+(<code>IN_Q_OVERFLOW</code>) and drop events. Treat <code>stat</code> as the cheap first filter, not
+the proof.</p>
+<h3 id="the-symlink-mixed-view">The symlink mixed view</h3>
+<p><code>stat</code> follows symlinks by default, but <code>is_symlink</code> is <strong>always</strong> derived from
+<code>lstat</code>, so it flags the path itself regardless of the follow mode. When
+following, the <em>other</em> fields describe the target while <code>is_symlink</code> flags the
+link — a deliberate mixed view matching how callers reason about links:</p>
+<pre><code class="language-mix">-- /tmp/io/link.txt -&gt; /tmp/io/target.txt (a regular file)
+$lnk = stat("/tmp/io/link.txt", {follow_symlinks: false})   -- lstat
+print("lstat:  is_symlink=" .. ("" .. $lnk["is_symlink"]) .. " is_file=" .. ("" .. $lnk["is_file"]))
+
+$tgt = stat("/tmp/io/link.txt")                             -- follow
+print("follow: is_symlink=" .. ("" .. $tgt["is_symlink"]) .. " is_file=" .. ("" .. $tgt["is_file"]))
+</code></pre>
+<pre><code class="language-text">lstat:  is_symlink=true is_file=false
+follow: is_symlink=true is_file=true
+</code></pre>
+<p>Use <code>ino</code>/<code>dev</code> straight as a dedupe-set key for a <code>walk</code> that should visit each
+real file once — never <code>to_number()</code> them:</p>
+<pre><code class="language-mix">$seen = {}
+for each $p in walk("/srv")
+  $st = stat($p)
+  $key = $st["ino"]
+  if $seen[$key] == nil then
+    $seen[$key] = true
+    -- ... process $p once ...
+  end
+end
+</code></pre>
+<h2 id="path-string-helpers-pure-no-filesystem">Path-string helpers (pure, no filesystem)</h2>
+<p>These operate purely on the path <em>string</em> — they never touch disk, so they work
+on a path that doesn't exist.</p>
+<pre><code>basename(path)    filename component                ("/a/b/x.eml" -&gt; "x.eml")
+dirname(path)     directory component               ("/a/b/x.eml" -&gt; "/a/b")
+extname(path)     extension WITH the leading dot     ("/a/x.eml"   -&gt; ".eml")
+path_join(a, b)   join with the native separator     ("/a", "x")   -&gt; "/a/x"
+path_parts(path)  -&gt; {dir, base, stem, ext}          (ext has NO dot)
+</code></pre>
+<pre><code class="language-mix">$p = "/srv/mail/inbox/msg.2.eml"
+print("basename: " .. basename($p))
+print("dirname:  " .. dirname($p))
+print("extname:  " .. extname($p))
+print("join:     " .. path_join("/srv/mail", "new.eml"))
+
+$pp = path_parts($p)
+print("dir=" .. $pp["dir"] .. " base=" .. $pp["base"] .. " stem=" .. $pp["stem"] .. " ext=" .. $pp["ext"])
+</code></pre>
+<pre><code class="language-text">basename: msg.2.eml
+dirname:  /srv/mail/inbox
+extname:  .eml
+join:     /srv/mail/new.eml
+dir=/srv/mail/inbox base=msg.2.eml stem=msg.2 ext=eml
+</code></pre>
+<blockquote>
+<p><strong><code>extname</code> keeps the dot, <code>path_parts.ext</code> drops it</strong> — different consumers, a
+deliberate split. A path with no extension gives <code>""</code> from <code>extname</code>, and
+<code>basename</code> of a trailing-slash path returns the last real component
+(<code>basename("/srv/mail/")</code> → <code>"mail"</code>).</p>
+</blockquote>
+<h2 id="standard-input--readline-read_stdin-read_stdin_bytes">Standard input — <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code></h2>
+<pre><code>readline([prompt])      read one line from stdin (trailing \n stripped); optional prompt
+read_stdin()            read ALL of stdin to EOF as one string (strict UTF-8)
+read_stdin_bytes([max]) read ALL of stdin to EOF as raw bytes (v0.65.0)
+read_stdin_bytes(8192)  read at most 8192 bytes — same cap as read_file_bytes
+</code></pre>
+<p><code>read_stdin</code> is the call for a pipe or a hook payload — it slurps the whole stream
+to EOF. <code>readline</code> reads a single line and, if given a prompt argument, writes it
+to stdout (flushed) first — the interactive-input path. Both read UTF-8 <em>text</em>
+and both <strong>raise</strong> on a stream that will not decode, matching <code>read_file</code>.</p>
+<p><code>read_stdin_bytes</code> is the binary twin, and it is the only way to read a stream
+that is not valid UTF-8:</p>
+<pre><code>$ printf '\x00\x01\xff\xfe binary' | mix -c 'print(read_stdin())'
+Runtime error at line 1: read_stdin: stream did not contain valid UTF-8
+$ printf '\x00\x01\xff\xfe binary' | mix -c 'print(bytes_len(read_stdin_bytes()))'
+11
+</code></pre>
+<p>That is not an edge case for mail: 8-bit transfer encodings and legacy charsets
+routinely produce bodies that never decode, which is why <code>read_stdin</code> alone left
+Mix unable to be a mail filter. The cap is <code>read_file_bytes</code>'s — a non-negative
+whole number, applied with <code>Read::take</code>, strictly a Number (a numeric string or
+a bool is refused, not coerced) — so <code>read_stdin_bytes(8192)</code> sniffs a header
+without slurping a stream of unknown size, and <code>read_stdin_bytes(0)</code> reads
+nothing. <strong>One deliberate difference:</strong> an explicit <code>nil</code> means <em>no cap</em> here
+(<code>read_stdin_bytes(nil)</code> reads everything, so <code>read_stdin_bytes($limit)</code> works
+when <code>$limit</code> may be unset), whereas <code>read_file_bytes(path, nil)</code> raises. Nil-as-
+absent is the convention <code>slice</code> and <code>bytes_to_string</code> already use for a trailing
+optional argument.</p>
+<p>It reads fd 0 with no decode step at all, so nothing can be substituted or lost;
+pair it with <a href="/mix/io#byte-exact-output--write_stdout-write_stderr"><code>write_stdout</code></a> for
+a filter that is byte-exact end to end.</p>
+<p>Until 0.33.0 an undecodable stream returned an <strong>empty string</strong> instead. That is
+indistinguishable from EOF, and it is silent: a <code>pre-push</code> hook reading git's ref
+list saw one non-UTF-8 ref name as no refs at all, iterated nothing, and exited 0
+having checked nothing. Catch it with <code>try</code> if a caller genuinely wants to
+continue past undecodable input.</p>
+<pre><code class="language-mix">-- echo 'piped line 1\npiped line 2' | mix script.mix
+$in = read_stdin()
+print("got " .. length($in) .. " chars")
+print("first line: " .. split($in, "\n")[0])
+</code></pre>
+<p>Piped in (<code>printf 'piped input line 1\npiped input line 2\n' | mix -c '…'</code>):</p>
+<pre><code class="language-text">got 38 chars
+first line: piped input line 1
+</code></pre>
+<p>For richer stdin handling see <a href="/mix/strings">strings</a> (<code>split</code>, <code>trim</code>) — a common
+pattern is <code>for each $line in split(read_stdin(), "\n")</code>.</p>
+<h2 id="byte-exact-output--write_stdout-write_stderr">Byte-exact output — <code>write_stdout</code>, <code>write_stderr</code></h2>
+<pre><code>write_stdout(v, ...)   write to fd 1 as it is: no newline, no separator, flushed
+write_stderr(v, ...)   the same, to fd 2
+print_raw(v, ...)      ALIAS of write_stdout
+eprint_raw(v, ...)     ALIAS of write_stderr
+</code></pre>
+<p><code>print</code> always appends a newline and joins its arguments with a space, so before
+0.65.0 there was no way to write <strong>exactly these bytes and stop</strong>. That is
+disqualifying for any program whose stdout <em>is</em> the interface — dovecot's sieve
+<code>execute :pipe :output "VAR"</code> captures stdout verbatim into a sieve variable, and
+one trailing newline corrupts the variable parsing.</p>
+<p><code>printf</code> is not this. It also omits the trailing newline, but it takes a <em>format
+template</em> (so <code>%</code> is significant and a literal one has to be escaped) and it
+formats through a string, so it cannot carry a byte that is not valid UTF-8.
+Reach for <code>printf</code> to lay out text and <code>write_stdout</code> to emit exact bytes.</p>
+<p><strong>One family, one contract, four names.</strong> <code>print_raw</code>/<code>eprint_raw</code> are aliases of
+<code>write_stdout</code>/<code>write_stderr</code>, not variants: the same builtin under the spelling
+that matches whichever family you are thinking in. If they ever behave
+differently that is a bug, and a test pins the equality.</p>
+<p>The contract is <code>print</code>'s, minus the newline and the separator:</p>
+<ul>
+<li><strong><code>bytes</code> and <code>buffer</code> go out verbatim.</strong> This is the one place <code>print</code> is
+actively wrong — it renders a bytes value as the <code>&lt;bytes:N&gt;</code> placeholder.</li>
+<li><strong>Every other value renders exactly as <code>print</code> renders it</strong>, including a
+list as <code>[1, 2]</code> and a map as <code>{k: v}</code>. There is no stricter type rule to
+learn. (If you meant those numbers as bytes, that is
+<a href="/mix/io#bytes-as-a-sequence-v0640"><code>bytes_from([...])</code></a>.)</li>
+<li><strong>fd 1 and fd 2 as they are</strong> — never a re-opened path. <code>write_file("/dev/stdout", $s)</code>
+issues an <code>openat("/dev/stdout", O_WRONLY|O_CREAT|O_TRUNC)</code> and therefore dies
+with <code>Permission denied</code> whenever fd 1 belongs to another user (a <code>runuser -u vmail</code>
+dry run, and every message under sieve). <code>write_stdout</code> opens nothing.</li>
+<li><strong>Flushed on every call.</strong> The default stdout is line-buffered and this family
+exists to emit output with no newline in it, so an unflushed write would sit in
+the buffer past the moment the consumer reads. In a hot loop, build a
+<a href="/mix/buffer"><code>buffer</code></a> and write it once rather than writing per iteration.</li>
+<li><strong>It writes to the same sink <code>print</code> writes to.</strong> For the <code>mix</code> binary that
+sink <em>is</em> the process's fd 1/2, which is the whole point. Inside an <strong>embedder</strong>
+that redirects output — webd rendering a response, a test harness capturing it
+— <code>write_stdout</code> goes to that redirected sink like <code>print</code> does, not around it
+to the real descriptor. There is deliberately no way to bypass the host's
+output policy; a program that must reach the process descriptor regardless is
+not a Mix script.</li>
+</ul>
+<h3 id="a-failed-write-raises--the-one-difference-from-print">A failed write RAISES — the one difference from <code>print</code></h3>
+<p><code>print</code> and <code>printf</code> discard write errors. This family must not: its whole
+contract is that the named bytes reached the consumer, so a dropped write
+reported as success is the single failure mode it cannot have. The error is
+catchable and code-distinguished:</p>
+<table><thead><tr><th>code</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>IO_BROKEN_PIPE</code></td><td>the consumer closed the pipe (<code>| head -1</code>, a reader that exited)</td></tr>
+<tr><td><code>IO_WRITE_FAILED</code></td><td>anything else — a full disk, a closed descriptor</td></tr>
+</tbody></table>
+<p>The <code>mix</code> binary does not change the process SIGPIPE disposition — Rust ignores
+SIGPIPE at startup — so a closed pipe arrives as this error rather than as a
+signal. That is a property of the <em>process</em>, not of the library: an <strong>embedder</strong>
+whose host has restored the default SIGPIPE disposition would get signal 13
+instead of a catchable error, because nothing in Mix asserts the disposition.</p>
+<p>The quiet-exit idiom, when a filter should behave like <code>head</code> and stop:</p>
+<pre><code class="language-mix">try
+  write_stdout($body)
+catch $msg, $err
+  if $err.code == "IO_BROKEN_PIPE" then
+    exit(0)
+  end
+  raise($err.code, $msg)
+end
+</code></pre>
+<h3 id="the-filter-end-to-end">The filter, end to end</h3>
+<pre><code class="language-mix">-- byte-for-byte: whatever arrives on fd 0 leaves on fd 1 unchanged
+write_stdout(read_stdin_bytes())
+</code></pre>
+<pre><code>$ printf '\x00\x01\xff\xfe mix \xc3\x28' &gt; in.bin
+$ mix -c 'write_stdout(read_stdin_bytes())' &lt; in.bin &gt; out.bin
+$ cmp in.bin out.bin &amp;&amp; echo identical
+identical
+</code></pre>
+<p><code>cmp</code>, not eyes: a lossy decode substitutes U+FFFD for each undecodable byte and
+so <em>grows</em> the output — <strong>11 bytes in, 17 out</strong> for the input above, where
+<code>write_stdout(read_stdin_bytes())</code> gives 11. A visual check will not catch that;
+a byte comparison always will, and a digest taken over the 17 bytes is a digest
+of a message that never arrived. Dropping a header line
+before hashing a body is
+<a href="/mix/io#bytes-as-a-sequence-v0640"><code>slice</code></a> on the bytes, never a string round trip.</p>
+<h2 id="bytes-helpers">Bytes helpers</h2>
+<p>The bytes type (<code>Value::Bytes</code>) carries raw 8-bit data without a UTF-8
+round-trip. These convert to and from it (they live in the <code>system</code> category but
+are the natural companions to <code>read_file_bytes</code>):</p>
+<pre><code>bytes_len(b)               byte length of a Value::Bytes buffer
+string_to_bytes(s)         UTF-8 encode a string -&gt; bytes
+bytes_to_string(b)         decode bytes -&gt; string (strict UTF-8; errors on bad byte)
+bytes_to_string(b, {lossy: true})   from_utf8_lossy decode (bad bytes -&gt; U+FFFD)
+</code></pre>
+<p>All three are <strong>strict about their argument type</strong> — <code>string_to_bytes</code> rejects a
+non-string, <code>bytes_to_string</code>/<code>bytes_len</code> reject a non-bytes — so a <code>to_mix_string</code>
+placeholder like <code>&lt;bytes:N&gt;</code> can never silently leak in.</p>
+<pre><code class="language-mix">$b = string_to_bytes("héllo")
+print("byte length: " .. bytes_len($b))     -- 6 (é is 2 UTF-8 bytes)
+print("round-trip:  " .. bytes_to_string($b))
+
+-- sniff an ASCII header out of a non-UTF-8 head with the lossy escape hatch
+$head = read_file_bytes("/tmp/io/img.bin", 4)
+print("lossy: " .. length(bytes_to_string($head, {lossy: true})))
+</code></pre>
+<pre><code class="language-text">byte length: 6
+round-trip:  héllo
+lossy: 4
+</code></pre>
+<p>Note <code>bytes_len</code> counts <strong>bytes</strong>, while <code>length</code> on a string counts <strong>codepoints</strong>
+(<code>length("héllo")</code> is 5) — see <a href="/mix/strings">strings</a> for the codepoint / byte /
+grapheme split.</p>
+<h2 id="bytes-as-a-sequence-v0640">bytes as a sequence (v0.64.0)</h2>
+<p>Before 0.64.0 a <code>bytes</code> value was something you could hold but not look
+inside: <code>$b[3]</code> said <em>cannot index bytes with number</em>, <code>length($b)</code> said <em>len()
+not supported for bytes</em>, <code>slice</code> refused it, and <code>for each</code> refused it. The only
+way in was <code>bytes_to_string({lossy: true})</code>, which <strong>destroys the very bytes you
+are inspecting</strong> — a lossy decode replaces every invalid sequence with U+FFFD, so
+a digest taken afterwards is a digest of something that never arrived.</p>
+<p>The generic sequence operations now accept <code>bytes</code> <strong>and</strong> <code>buffer</code>, in
+byte units — four since 0.64.0, five more since 0.70.0:</p>
+<pre><code>$b[i]                      the byte at i as a NUMBER 0-255
+length($b) / len($b)       byte count (same answer as bytes_len)
+slice($b, start[, end])    a new value-semantic `bytes`
+for each $x in $b          iterates NUMBERS 0-255
+take($b, n) / drop($b, n)  first n / all-but-first n bytes (negative n from the
+                           end, like the list forms) → a new `bytes` (v0.70.0)
+reverse($b)                byte-wise → a new `bytes` (v0.70.0)
+index_of($b, needle)       0-based BYTE offset, -1 absent — bytes_find's answer
+                           through the generic name (v0.70.0)
+contains($b, needle)       bool (v0.70.0)
+</code></pre>
+<p><code>index_of</code> and <code>contains</code> take their needle in the <code>bytes_*</code> family's
+vocabulary — bytes, buffer, string, or a single byte number 0-255 — and, like
+<code>bytes_find</code>, <strong>refuse an empty needle</strong> on a bytes/buffer subject (an empty
+needle is almost always an empty variable, and a trivially-true answer for it
+is a silent wrong answer). ⚠ The vocabulary follows the <strong>subject</strong>, not the
+needle: a bytes needle on a <em>string</em> subject is stringified to its
+<code>&lt;bytes:N&gt;</code> placeholder and searched as that literal text — silently absent.
+Searching a string for raw bytes means converting one side first
+(<code>string_to_bytes($s)</code> or <code>bytes_to_string($needle)</code>). This is a deliberate divergence from the string
+arms, where <code>contains($s, "")</code> remains <code>true</code>. That is the complete list of
+generic operations bytes participates in — anything else (<code>sort</code>, <code>unique</code>,
+<code>join</code>, …) still refuses bytes with a clean error.</p>
+<p>The boundary rules are the list's, not new ones:</p>
+<ul>
+<li><strong>Negative indices count from the end.</strong> <code>$b[-1]</code> is the last byte;
+<code>slice($b, -5, -1)</code> is the last five minus one.</li>
+<li><strong>An out-of-range <code>$b[i]</code> is <code>nil</code>, not a raise</strong> — the same answer
+<code>[1,2][9]</code>, <code>"ab"[9]</code> and <code>buffer_get</code> already give. There is no
+bounds-check exception in Mix's indexing to be consistent with.</li>
+<li><strong><code>slice</code> clamps and never raises</strong>: <code>slice($b, -100, 100)</code> is the whole
+value, and a <strong>reversed</strong> range (<code>slice($b, 4, 1)</code>) is empty bytes, not a
+wrap-around and not an error.</li>
+<li><strong>Slicing a <code>buffer</code> returns an independent <code>bytes</code> snapshot</strong>, never an
+alias — a later <code>buffer_push</code> cannot change a slice you already took.</li>
+<li><strong><code>for each</code> is pinned at entry</strong>: growing a <code>buffer</code> inside the loop body
+does not extend that loop, exactly as mutating a list inside <code>for each</code>
+does not.</li>
+<li><strong>Index-assignment is still refused</strong> (<code>$b[0] = 65</code> → <em>cannot index-assign
+into bytes</em>). <code>bytes</code> is value-semantic; the mutable type is <code>buffer</code>, and
+the in-place write is <a href="/mix/buffer"><code>buffer_set</code></a>.</li>
+</ul>
+<p>The framing case this was built for — drop a leading header line from a raw
+mail body without a lossy round-trip, so the digest is over the bytes that
+actually arrived:</p>
+<pre><code class="language-mix">$framed = read_file_bytes("/tmp/io/body.raw")   -- "text:\n" .. raw 8-bit body
+$body = slice($framed, 6)
+print(bytes_to_hex($body))
+</code></pre>
+<h3 id="the-bytes_-family">The <code>bytes_*</code> family</h3>
+<pre><code>bytes_find(b, needle[, from])   0-based offset, -1 absent; `from` is signed+clamped
+bytes_starts_with(b, prefix)    bool (an empty prefix is true)
+bytes_ends_with(b, suffix)      bool (an empty suffix is true) (v0.70.0)
+bytes_split(b, sep)             -&gt; list of bytes
+bytes_concat(a, b, ...)         1+ bytes/buffer/string -&gt; one new bytes
+bytes_from(list)                int 0-255 / string / bytes / buffer, flat-spliced
+bytes_to_hex(b)                 lowercase hex, 2 chars per byte, no separator
+bytes_from_hex(s)               strict decode: even length, [0-9a-fA-F] only
+</code></pre>
+<p><code>needle</code>, <code>sep</code>, <code>prefix</code> and <code>suffix</code> may each be a <code>bytes</code>, a <code>buffer</code>, a
+<strong>string</strong> (taken as its own UTF-8) or a <strong>single byte number 0-255</strong> — so
+<code>bytes_split($b, 0)</code> splits on NUL, which no string separator could express.
+The <strong>subject</strong> (argument 1) is always strict bytes/buffer.</p>
+<p><strong>Scanning a <code>buffer</code> repeatedly? <code>freeze()</code> it first.</strong> Every <code>bytes_*</code> call
+(and every v0.70.0 generic-op arm) on a <em>buffer</em> subject snapshots the whole
+buffer for the duration of the call — correct (the needle may alias the
+subject), and invisible for one-shot calls, but a marching parse
+(<code>bytes_find($buf, $sep, $cursor)</code> stepping through a large buffer) copies the
+entire buffer at every step and turns a linear scan into O(n²) of memcpy.
+The same loop over <code>freeze($buf)</code>'s value-semantic <code>bytes</code> borrows without
+copying (measured ~3× on a 4 MB subject with short scans).</p>
+<p><code>bytes_find</code> uses <code>index_of</code>'s convention, <strong>not</strong> <code>pos</code>'s: 0-based, <code>-1</code> when
+absent. ⚠ A bare <code>bytes_find(...)</code> in a condition is therefore backwards on both
+branches (<code>-1</code> is truthy, <code>0</code> is falsy) — <code>mix lint</code> flags it as <strong>MIX-W2305</strong>.
+Compare explicitly: <code>bytes_find($b, "\r\n\r\n") &gt;= 0</code>. The optional <code>from</code> is
+what keeps a scanning parser linear; the index it returns is <strong>absolute</strong> into
+<code>$b</code>, never relative to <code>from</code>.</p>
+<p><code>bytes_split</code> follows <code>split</code>'s piece rules exactly — an absent separator yields
+one whole piece, a leading or trailing separator yields an empty piece at that
+end, and an empty input yields one empty piece. The single divergence is that an
+<strong>empty separator raises</strong> rather than splitting between every byte.</p>
+<p><code>bytes_to_hex</code> is deliberately option-free (no uppercase flag, no separator) so
+that <code>bytes_from_hex(bytes_to_hex($b))</code> is an exact round trip and a separated
+form — one <code>join</code> away — can never be fed back in by mistake. <code>bytes_from_hex</code>
+accepts either case but refuses whitespace, <code>:</code> and <code>-</code>: a lenient decoder would
+silently accept a truncated digest.</p>
+<pre><code class="language-mix">$b = string_to_bytes("hello, world")
+print(bytes_find($b, "world"))              -- 7
+print(bytes_find($b, "l", 4))               -- 10 (absolute, not 6)
+print(bytes_starts_with($b, "hell"))        -- true
+$parts = bytes_split($b, ", ")
+print(bytes_to_string($parts[1]))           -- world
+print(bytes_to_hex(bytes_from([222, 173, 190, 239])))   -- deadbeef
+</code></pre>
+<h3 id="naming-byte_-vs-bytes_">Naming: <code>byte_*</code> vs <code>bytes_*</code></h3>
+<p>Two families, one letter apart, and they are <strong>not duplicates</strong>:</p>
+<table><thead><tr><th>prefix</th><th>subject</th><th>argument handling</th><th>members</th></tr></thead><tbody>
+<tr><td><code>byte_*</code></td><td>a <strong>string</strong></td><td>coerced via <code>to_mix_string</code>, like <code>pos</code>/<code>substr</code></td><td><code>byte_length</code> <code>byte_pos</code> <code>byte_lastpos</code> <code>byte_index_of</code></td></tr>
+<tr><td><code>bytes_*</code></td><td>a <strong><code>bytes</code>/<code>buffer</code> value</strong></td><td>strict — a wrong type raises</td><td><code>bytes_len</code> <code>bytes_to_string</code> <code>bytes_find</code> <code>bytes_starts_with</code> <code>bytes_ends_with</code> <code>bytes_split</code> <code>bytes_concat</code> <code>bytes_from</code> <code>bytes_to_hex</code> <code>bytes_from_hex</code></td></tr>
+</tbody></table>
+<p><code>byte_*</code> answers <em>"where is this, measured in UTF-8 bytes rather than
+codepoints?"</em> about <strong>text</strong>. <code>bytes_*</code> operates on a <strong>byte sequence</strong>.</p>
+<p>The pair that looks most like a duplicate, <code>byte_length</code> and <code>bytes_len</code>, is the
+sharpest example of why the split matters:</p>
+<pre><code class="language-mix">$b = string_to_bytes("héllo")
+print(bytes_len($b))        -- 6   the bytes
+print(byte_length($b))      -- 9   the length of the string "&lt;bytes:6&gt;"
+print(byte_length("héllo")) -- 6   the same 6, but only because the subject is text
+</code></pre>
+<p><code>byte_length</code> stringifies its argument first, so on a <code>bytes</code> value it measures
+the <strong><code>&lt;bytes:N&gt;</code> placeholder</strong>. They agree on strings and disagree on
+everything else. Neither is going away — the fleet runs both — and neither
+should be "unified".</p>
+<p><strong>Going forward:</strong></p>
+<ul>
+<li>A new operation on a <code>bytes</code>/<code>buffer</code> value is <code>bytes_&lt;verb&gt;</code> and must
+<strong>reject</strong> a non-bytes subject rather than stringify it.</li>
+<li>A new byte-offset operation on text is <code>byte_&lt;verb&gt;</code> and takes a string.</li>
+<li>Conversions use the direction in the name: <code>bytes_to_&lt;x&gt;</code> out of bytes,
+<code>bytes_from_&lt;x&gt;</code> into bytes. <code>string_to_bytes</code> predates that rule (it would be
+<code>bytes_from_string</code> today) and stays as-is.</li>
+<li>Never add a <code>byte_*</code> that takes bytes, or a <code>bytes_*</code> whose subject is text.</li>
+</ul>
+<h2 id="sqlite--sqlopen-sqlexec-sqlclose">SQLite — <code>sqlopen</code>, <code>sqlexec</code>, <code>sqlclose</code></h2>
+<p>The io category includes an embedded SQLite client (feature-gated <code>sqlite</code>; the
+<code>mix</code> binary turns it on). Handles are plain numbers:</p>
+<pre><code>sqlopen(path)              open READ-ONLY               -&gt; numeric handle
+sqlopen(path, "rw")        open read-write (WAL mode, 5s busy timeout)
+sqlexec(h, sql[, params])  run one statement            -&gt; rows or {affected}
+sqlclose(h)                close the handle (errors on an unknown handle)
+</code></pre>
+<p><code>sqlexec</code> returns a <strong>list of row maps</strong> for anything that produces columns
+(<code>SELECT</code>, row-returning <code>PRAGMA</code>s) and <code>{affected: n}</code> for a write — decided by
+SQLite itself (<code>sqlite3_stmt_readonly</code>), not by keyword-sniffing the SQL, so
+<code>REPLACE</code> and <code>WITH … INSERT</code> take the write path correctly. Column values map
+NULL → <code>nil</code>, INTEGER/REAL → number, TEXT → string; a BLOB comes back as the
+placeholder string <code>&lt;blob N bytes&gt;</code>, not bytes.</p>
+<p><code>params</code> binds <code>?</code> placeholders — a list binds positionally, a single non-list
+value is one bind. Binds are <strong>TYPED</strong> (since 0.21): <code>nil</code> → NULL, bool →
+INTEGER 0/1, whole number → INTEGER, fractional → REAL, string → TEXT, bytes →
+BLOB; a list/map param is a loud error. (Before 0.21 every param was bound as
+TEXT, so <code>nil</code> arrived as the 3-char string <code>"nil"</code>.) Always bind data — never
+splice values into the SQL string.</p>
+<pre><code class="language-mix">$db = sqlopen("/tmp/io/t.db", "rw")
+sqlexec($db, "CREATE TABLE t (id INTEGER, name TEXT, score REAL)")
+print("insert: " .. json_encode(sqlexec($db, "INSERT INTO t VALUES (?, ?, ?)", [1, "alice", 2.5])))
+print("rows:   " .. json_encode(sqlexec($db, "SELECT * FROM t WHERE id = ?", 1)))
+sqlclose($db)
+</code></pre>
+<pre><code class="language-text">insert: {"affected":1}
+rows:   [{"id":1,"name":"alice","score":2.5}]
+</code></pre>
+<p>A write against a read-only (default) handle raises <code>attempt to write a readonly database</code> — open with <code>"rw"</code> when you mean to mutate.</p>
+<h2 id="when-to-shell-out-instead">When to shell out instead</h2>
+<p>The native builtins cover read/write/list/stat/perms. For an operation Mix has no
+builtin for — <code>cp -a</code>, <code>rsync</code>, <code>tar</code>, <code>mv</code> across filesystems — call the real
+tool via <a href="/mix/system"><code>run</code>/<code>run_rc</code></a> (both take an optional <code>{timeout: seconds}</code>
+opts map since 0.21, so a hung copy can't wedge the script), remembering the
+PATH is minimal inside <code>/bin/sh</code>, so use a full binary path:</p>
+<pre><code class="language-mix">$r = run_rc("/usr/bin/install -m 0755 /tmp/io/a.txt /tmp/io/b.txt")
+if $r.rc != 0 then
+  print("install failed: " .. $r.stderr)
+end
+</code></pre>
+<h2 id="see-also">See also</h2>
+<pre><code>mix builtins io       list every io builtin with its one-line description
+mix what NAME         one-line description of a single builtin (e.g. mix what stat)
+mix help              the full categorized builtin reference
+</code></pre>
+<ul>
+<li><a href="/mix/strings">strings</a> — codepoint vs byte vs grapheme; <code>split</code>, <code>trim</code>, <code>~</code> expansion</li>
+<li><a href="/mix/numbers">numbers</a> — why <code>0o755</code> is the mode value and <code>0755</code> is a lex error</li>
+<li><a href="/mix/system">running-commands</a> — <code>run</code>/<code>run_rc</code>/<code>run_stream</code> for shelling out</li>
+<li><a href="/mix/data">data</a> — <code>json_parse</code>, <code>load_data</code>, <code>data_encode</code> for structured files</li>
+<li><a href="/mix/functions">modules</a> — <code>source</code> / <code>include</code> for loading <code>.mix</code> code (vs <code>load_data</code> for inert data)</li>
+<li><a href="/mix/capabilities">capabilities</a> — the FsRead/FsWrite gating an embedder can apply to these builtins</li>
+<li><a href="/mix/builtins">builtins index</a> · <a href="https://github.com/markc/cosmix">mix repo</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +1643,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1697,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1826,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/04-bus-wire</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,142 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/04-bus-wire.md"><div class="prose"><h1 id="bus-wire-format-and-command-contracts">Bus wire format and command contracts</h1>
+<h2 id="scope-and-authority">Scope and authority</h2>
+<p>ABP means <strong>Agent Bus Protocol</strong>. Bus names the protocol family and its
+implementation packages; AMP is the historical name. This terminology follows
+the accepted naming decision and does not introduce a wire-version change.
+ABP carries semantic control messages, discovery and structured events. It is
+not a desktop frame, input-event or bulk media transport.</p>
+<p>This candidate separates requirements from the source profile checked at
+<code>96d12fdf</code>. Source inspection is not an integration-test result. Requirements
+marked <strong>intended</strong> have not been established as enforced at every ingress.</p>
+<h2 id="single-message-framing">Single-message framing</h2>
+<p><strong>BUS-001:</strong> Producers MUST encode ABP as UTF-8, with an opening <code>---\n</code>,
+flat header lines, a closing <code>---\n</code>, and an optional body:</p>
+<pre><code class="language-text">---
+bus: 1
+type: request
+id: 0192b3a4-5e6f-7890-abcd-ef1234567890
+to: noded
+command: noded.ping
+---
+</code></pre>
+<p>In the current WebSocket profile, one text message is one ABP message. The
+serializer does not emit <code>---\nEOM\n</code>. The native Unix-stream helper reads one
+message until EOF; the sender must close its write side. Neither is a parser
+for concatenated EOM-delimited messages. A body may contain markdown horizontal
+rules or another ABP envelope without changing the outer WebSocket boundary.</p>
+<p><strong>BUS-002:</strong> Consumers MUST NOT advertise the old proposed EOM streaming,
+resynchronisation or arbitrary log-concatenation behaviour as implemented.
+A future streaming profile needs explicit escaping, truncation and size-limit
+rules before use; the old claim that an EOM sentinel cannot collide with
+arbitrary body text is not a sufficient framing contract.</p>
+<p><strong>BUS-003:</strong> Canonical header lines MUST use <code>key: value</code>, including the space
+after the colon for an empty value. Keys MUST be non-empty and contain neither
+whitespace nor a colon. Producers MUST NOT put newlines in keys or values or
+repeat a key. Header names are case-sensitive; new standard headers SHOULD use
+lowercase. Values remain strings unless the receiving contract assigns a type.
+Inline arrays and objects MUST be valid JSON in the canonical profile. Bodies
+are interpreted by the command contract, not by their first character.</p>
+<p>The implementation uses a <code>BTreeMap&lt;String, String&gt;</code>: serialisation orders keys,
+parsing trims header values and trailing body whitespace, and duplicate keys
+overwrite earlier values. It does not preserve exact original bytes. Signing
+or hashing an original document MUST use the original bytes or a separately
+specified canonicalisation, not a parse/serialise round-trip.</p>
+<h2 id="parser-and-envelope-validation">Parser and envelope validation</h2>
+<p><strong>BUS-004 (intended at canonical ingress):</strong> Canonical consumers MUST reject a
+non-empty parsing diagnostic report. Legacy-document import MAY accept a report
+but MUST expose the rejected material. <code>parse_lenient</code> returns a message plus
+<code>skipped_lines</code> and <code>json_parse_errors</code>; <code>parse_strict</code> rejects either report;
+compatibility <code>parse</code> discards both. The broker and native client still call
+compatibility <code>parse</code> at the checked baseline.</p>
+<p>Strict parsing is not full envelope validation: it does not reject duplicate
+keys, require a closed header block in every case, validate all key characters,
+or establish identity, command arguments or authorisation. The shared
+<code>validate</code> helper is diagnostic and must not be mistaken for an ingress gate.</p>
+<p><strong>BUS-005:</strong> A routed request contract MUST identify its <code>command</code>, <code>to</code>, and
+correlation <code>id</code>; a response MUST correlate with the request and carry an
+unambiguous result. Producers SHOULD include <code>bus: 1</code> and an appropriate
+<code>type</code> (<code>request</code>, <code>response</code>, <code>event</code>, <code>stream</code>). UUID v7 is the preferred
+external ID. Current minimal messages omit some of these headers and are
+accepted; the generic parser does not enforce UUIDs or required fields.</p>
+<table><thead><tr><th>Header</th><th>Contract</th></tr></thead><tbody>
+<tr><td><code>from</code></td><td>Broker-canonicalised connection identity; not caller authentication by itself</td></tr>
+<tr><td><code>to</code></td><td>Local service shorthand or parsed address</td></tr>
+<tr><td><code>command</code></td><td>Exact handler command; namespace conventions below</td></tr>
+<tr><td><code>id</code>, <code>reply-to</code></td><td>Request/response correlation; broker may rewrite its internal routing ID</td></tr>
+<tr><td><code>args</code>, <code>json</code></td><td>Inline JSON where the receiving command defines it</td></tr>
+<tr><td><code>rc</code>, <code>error</code></td><td>Result code and diagnostic; absent <code>rc</code> means success in the compatibility profile</td></tr>
+<tr><td><code>ttl</code></td><td>Historical proposed request deadline; broker enforcement is not verified and MUST NOT be assumed</td></tr>
+<tr><td><code>broker_origin</code></td><td>Recipient-broker delivery class, defined in chapter 05</td></tr>
+</tbody></table>
+<p><strong>BUS-006:</strong> Prefer <code>rc</code> values 0 (success), 5 (warning), 10 (application
+error), 20 (severe failure). Consumers MUST preserve a peer's returned code;
+the implemented Mix client distinguishes warning band 1–9 and errors ≥10.
+Negative Mix statuses are local transport/timeout results, not ABP peer codes.
+An RPC timeout does not prove that the recipient did not perform the operation.</p>
+<h2 id="addresses">Addresses</h2>
+<p><strong>BUS-007:</strong> The local address grammar is:</p>
+<pre><code class="language-text">sub.service.node[.bus]
+service.node[.bus]
+node.bus
+</code></pre>
+<p>Each label contains 1–63 lowercase ASCII letters, digits or hyphens, with no
+leading/trailing hyphen. Total target length, including a federation suffix,
+is at most 253 bytes. More than three labels before <code>.bus</code> are invalid.
+The broker interprets <code>sub</code> only enough to route to <code>service</code>; the service
+owns its meaning. Bare <code>service</code> is a local registry shortcut, not a
+<code>BusAddress</code>. Registered-name rules are narrower than address-label rules.</p>
+<p><strong>BUS-008:</strong> <code>local-address@mesh.example</code> is a reserved cross-mesh target.
+The suffix MUST be a lowercase ASCII FQDN with at least two labels, no
+trailing dot and no <code>xn--</code> label under the current policy. The parser accepts
+this syntax, but the current router MUST refuse it with RC 10 and
+<code>cross-mesh routing not implemented</code>. Cross-node routing inside a mesh is a
+different facility. <code>&lt;service&gt;@&lt;node&gt;</code> is not the current shorthand.
+DNS/SRV projection of <code>.bus</code> remains optional operational tooling; registry
+routing does not depend on public DNS delegation.</p>
+<h2 id="command-contracts">Command contracts</h2>
+<p><strong>BUS-009:</strong> New domain commands SHOULD use a service namespace followed by
+documented resource/action segments, for example <code>maild.account.list</code>.
+Existing contracts are exact strings, not an inferred universal grammar.
+The broker extensions <code>topic.*</code>, <code>spec.get</code>, and runtime universals
+<code>HELP</code>, <code>INFO</code>, <code>QUIT</code> are explicit exceptions. The old simultaneous claims
+of lowercase-only commands and uppercase universals are replaced by these
+scoped rules. <code>ui.*</code> and <code>menu.*</code> rendering vocabulary is historical.</p>
+<p><strong>BUS-010:</strong> Command documentation MUST specify where arguments live, their
+schema, validation, result shape, side effects, idempotency and errors. JSON
+bodies are legitimate: there is no rule forcing every command's parameters
+into the <code>args</code> header. Missing, malformed and valid payloads SHOULD be
+distinguished before mutation. The current generic native-client DTO can map
+malformed JSON bodies to null; this remains a boundary-hardening gap.</p>
+<p>Content verbs <code>open/close/get/set/list</code>, lifecycle verbs
+<code>status/refresh/save/add/remove</code>, and operation verbs <code>start/stop/pause/resume</code>
+are naming guidance. They do not grant a service undeclared capabilities.
+Rust daemons commonly expose namespaced introspection; bare runtime
+universals are guaranteed only by Mix serve mode. Do not fabricate a
+<code>&lt;service&gt;.HELP</code> alias from the existence of <code>HELP</code>.</p>
+<h2 id="resource-and-confidentiality-limits">Resource and confidentiality limits</h2>
+<p><strong>BUS-011:</strong> Receivers MUST bound allocation before consuming arbitrary
+input. The checked library has a 16 MiB message constant, an 8 MiB WebSocket
+frame constant and a 4096 processed non-empty header-line cap. Repeated keys
+and malformed lines count towards that cap. The native EOF helper enforces
+16 MiB and a 10-second read deadline; the broker sets a 16 MiB WebSocket
+message limit. Effective limits depend on the transport endpoint; the text
+parser alone is not a message-byte gate. Topic payloads have a separate
+1 MiB input cap.</p>
+<p><strong>BUS-012:</strong> Public examples and general diagnostic traffic MUST omit secrets.
+Sensitive operations MUST define redaction and protected transport explicitly;
+the textual format itself offers no confidentiality. WireGuard membership
+does not validate request content or replace per-command authorisation.</p>
+<h2 id="evidence-and-acceptance">Evidence and acceptance</h2>
+<p>Source: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-bus/src/bus.rs">wire types, parsers, validators and address tests</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-client/src/native.rs">native client</a>.</p>
+<p>Acceptance must cover canonical round-trips, malformed delimiters, duplicate
+and overflowing headers, JSON diagnostics, address grammar and router refusal,
+transport byte caps, and command-level rejection before mutation. Existing
+unit tests are evidence locations; no test run is asserted by this chapter.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +754,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +808,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +937,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

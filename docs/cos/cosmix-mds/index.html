@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-mds/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,140 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-mds/README.md"><div class="prose"><h1 id="cosmix-mds">cosmix-mds</h1>
+<p><code>cosmix-mds</code> is a metadata-store library and operator binary for immutable content, mutable multi-container metadata, ordered container membership, and change logs. It stores each container set in SQLite and stores content in a shared BLAKE3-addressed blob store. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it belongs to the <code>cos</code> layer; the default build has no Bus or Mix dependency, while the optional <code>cosmix</code> feature connects its event stream directly to Bus libraries.</p>
+<h2 id="package">Package</h2>
+<table><thead><tr><th>Item</th><th>Name</th></tr></thead><tbody>
+<tr><td>Cargo package</td><td><code>cosmix-mds</code></td></tr>
+<tr><td>Rust library</td><td><code>cosmix_mds</code></td></tr>
+<tr><td>Operator binary</td><td><code>cosmix-mds</code></td></tr>
+<tr><td>Current crate version</td><td><code>0.1.5</code></td></tr>
+<tr><td>Licence</td><td>MIT</td></tr>
+</tbody></table>
+<p>The package also declares <code>cosmix-mds-stress-writer</code>. That binary is an internal crash-recovery test helper, is gated by <code>_stress-helper</code>, and is not part of the operator surface.</p>
+<h2 id="storage-model">Storage model</h2>
+<p><code>SqliteCasMds</code> uses one metadata database per set and one shared derived blob index:</p>
+<pre><code class="language-text">&lt;root&gt;/
+├── containers/
+│   └── &lt;set-uuid&gt;/
+│       └── data.sqlite
+├── blobs.sqlite
+└── blobs/
+    ├── .tmp/
+    └── &lt;hh&gt;/&lt;hh&gt;/&lt;blake3-hex&gt;
+</code></pre>
+<p><code>data.sqlite</code> is the source of truth for containers, items, memberships, and change streams. <code>blobs.sqlite</code> tracks blob rows, item references, refcounts, and verification results. The blob index is rebuildable from the per-set databases and the content-addressable store.</p>
+<p><code>SqliteCasMds::open</code> creates the storage directories, applies blob-index migrations, discovers existing sets, and applies each set's schema migrations. Migrations use <code>PRAGMA user_version</code> and reject databases with the wrong application identifier or a schema newer than the crate understands.</p>
+<p>Blob writes hash bytes with BLAKE3, stage them under <code>blobs/.tmp</code>, fsync the file, and hard-link the result into the sharded CAS path. Repeated writes of identical bytes are idempotent.</p>
+<h2 id="library-surface">Library surface</h2>
+<p>The crate root re-exports:</p>
+<ul>
+<li><code>Mds</code>, the thread-safe storage trait.</li>
+<li><code>SqliteCasMds</code>, the production SQLite and CAS implementation.</li>
+<li><code>SqliteSetTx</code>, the per-set transaction handle.</li>
+<li><code>Error</code> and <code>Result</code>.</li>
+<li>All public identifiers, records, events, tokens, scopes, and report types from <code>types</code>.</li>
+</ul>
+<p><code>Mds</code> is <code>Send + Sync</code>. Calls that use the same set serialize through a per-set lock. Calls on different sets can proceed independently. Events are published only after the transaction that created them commits.</p>
+<h3 id="trait-operations">Trait operations</h3>
+<table><thead><tr><th>Group</th><th>Methods</th></tr></thead><tbody>
+<tr><td>Set lifecycle</td><td><code>create_set</code>, <code>delete_set</code>, <code>list_sets</code></td></tr>
+<tr><td>Container lifecycle</td><td><code>create_container</code>, <code>rename_container</code>, <code>delete_container</code>, <code>list_containers</code>, <code>container_status</code></td></tr>
+<tr><td>Blob CAS</td><td><code>put_blob</code>, <code>get_blob</code>, <code>blob_size</code>, <code>blob_exists</code></td></tr>
+<tr><td>Item mutation</td><td><code>add_item</code>, <code>copy_item</code>, <code>move_item</code>, <code>remove_membership</code>, <code>store_flags</code></td></tr>
+<tr><td>Keywords</td><td><code>store_membership_keywords</code>, <code>store_item_keywords</code>, <code>item_memberships</code></td></tr>
+<tr><td>Item lookup</td><td><code>fetch_item</code>, <code>fetch_item_meta</code>, <code>find_items_by_blob_hash</code>, <code>search_items</code>, <code>list_items</code></td></tr>
+<tr><td>Change streams</td><td><code>changes_since</code>, <code>changes_since_set</code>, <code>prune_changelog</code>, <code>changelog_floor</code></td></tr>
+<tr><td>Notification</td><td><code>subscribe</code>, <code>subscribe_existing</code></td></tr>
+<tr><td>Maintenance</td><td><code>rebuild_index</code>, <code>verify_blobs</code>, <code>gc</code>, <code>stats</code>, <code>stats_per_set</code></td></tr>
+<tr><td>Transfer</td><td><code>export_set</code>, <code>import_set</code></td></tr>
+</tbody></table>
+<p>The principal identifier wrappers are <code>SetId</code>, <code>ContainerId</code>, <code>ItemId</code>, and <code>BlobHash</code>. Ordering and change tracking use the distinct <code>Seq</code>, <code>ChangeToken</code>, <code>SetChangeToken</code>, and <code>ContainerChangeSetToken</code> types.</p>
+<p><code>Flags</code> stores the system-flag bitmap. Allocated bits represent seen, flagged, answered, draft, and deleted states. <code>Tags</code> stores sorted, unique user keywords.</p>
+<p><code>ItemRecord</code> is a per-membership view joining item metadata with its container sequence, flags, tags, and change token. It is constructed from SQLite on reads and is not a persisted wire snapshot.</p>
+<h2 id="transaction-scope">Transaction scope</h2>
+<p><code>SqliteCasMds::with_set_tx</code> runs a closure inside one <code>BEGIN IMMEDIATE</code> transaction for a set. The set database already has <code>blobs.sqlite</code> attached, so metadata, sidecar tables, and blob references can commit atomically.</p>
+<p><code>SqliteSetTx</code> provides typed operations for:</p>
+<ul>
+<li>Ensuring, creating, renaming, deleting, and updating containers.</li>
+<li>Adding a staging item or an item with multiple memberships.</li>
+<li>Adding, moving, and removing memberships.</li>
+<li>Storing item or membership flags and keywords.</li>
+<li>Reading memberships, sequence validity, and set-wide changes.</li>
+<li>Accessing the underlying <code>rusqlite::Transaction</code> when a typed method is unavailable.</li>
+</ul>
+<p>Do not call an <code>Mds</code> mutation method from inside <code>with_set_tx</code>. It attempts to re-enter the same per-set lock and opens a separate transaction. Use <code>SqliteSetTx</code> methods or its raw transaction handle.</p>
+<p>Typed transaction operations buffer notifier and Bus events. The buffer drains after commit and is discarded on error or panic. Raw SQL through <code>SqliteSetTx::tx</code> does not create events automatically.</p>
+<h2 id="change-notification">Change notification</h2>
+<p><code>subscribe</code> and <code>subscribe_existing</code> return bounded Tokio broadcast receivers keyed by set and container. <code>subscribe_existing</code> checks that both objects exist while holding the same set lock used by container deletion.</p>
+<p>The in-process <code>ContainerEvent</code> variants are:</p>
+<ul>
+<li><code>ItemAdded</code></li>
+<li><code>FlagsChanged</code></li>
+<li><code>ItemRemoved</code></li>
+<li><code>ItemMoved</code></li>
+</ul>
+<p>Slow receivers can observe Tokio's <code>Lagged</code> error. Notifications wake consumers; they do not provide an unbounded event log. Durable consumers use the SQLite change streams.</p>
+<h2 id="bus-events">Bus events</h2>
+<p>The <code>bus</code> module always defines <code>MdsEvent</code>, typed payload structures, topic constants, and <code>EventSink</code>. These types can be used as an in-process broadcast surface without enabling the Bus transport dependencies.</p>
+<table><thead><tr><th>Topic</th><th>Transition</th></tr></thead><tbody>
+<tr><td><code>mds.set.created</code></td><td>Set created</td></tr>
+<tr><td><code>mds.set.deleted</code></td><td>Set deleted</td></tr>
+<tr><td><code>mds.container.created</code></td><td>Container created</td></tr>
+<tr><td><code>mds.container.renamed</code></td><td>Container renamed or moved</td></tr>
+<tr><td><code>mds.container.deleted</code></td><td>Container deleted</td></tr>
+<tr><td><code>mds.item.added</code></td><td>Item added</td></tr>
+<tr><td><code>mds.item.flagged</code></td><td>Item flags changed</td></tr>
+<tr><td><code>mds.item.copied</code></td><td>Membership copied</td></tr>
+<tr><td><code>mds.item.moved</code></td><td>Membership moved</td></tr>
+<tr><td><code>mds.item.removed</code></td><td>Membership removed</td></tr>
+<tr><td><code>mds.gc.completed</code></td><td>Garbage collection completed</td></tr>
+<tr><td><code>mds.verify.completed</code></td><td>Verification completed</td></tr>
+<tr><td><code>mds.verify.failed</code></td><td>One blob failed verification</td></tr>
+<tr><td><code>mds.changelog.pruned</code></td><td>A retained change stream was pruned</td></tr>
+</tbody></table>
+<p>With the <code>cosmix</code> feature, <code>spawn_publisher_task</code> drains an <code>MdsEvent</code> receiver and sends non-retained <code>topic.publish</code> requests through <code>NodedClient</code>. <code>SqliteCasMds::with_bus_events</code> installs a default-capacity event sink and returns its first receiver.</p>
+<p>The crate exposes events, not a Bus command or verb service.</p>
+<h2 id="maintenance">Maintenance</h2>
+<p><code>verify_blobs</code> supports full verification, verification since a time, or verification of blobs referenced by a container. It recomputes BLAKE3 and records success, hash mismatch, or missing-file status in the verification ledger.</p>
+<p><code>gc</code> performs two passes over unreferenced blobs with a quiescence interval between passes. It rechecks refcounts and last-seen timestamps before deletion. Dry-run mode reports the work without unlinking files or deleting rows.</p>
+<p><code>rebuild_index</code> reconstructs the shared blob index from every per-set database and the CAS. It preserves the verification ledger and reports valid CAS files that are not represented in the rebuilt index.</p>
+<p><code>export_set</code> writes a tar archive containing <code>manifest.json</code>, a WAL-free <code>data.sqlite</code> snapshot, and each distinct referenced CAS blob. It does not export <code>blobs.sqlite</code>.</p>
+<p><code>import_set</code> validates the archive layout, manifest, schema version, entry paths, and every blob hash before installing the set. It refuses an existing set UUID and reconstructs the imported set's blob references.</p>
+<p>See <a href="/cos/cosmix-mds/cli">CLI reference</a> for the operator commands.</p>
+<h2 id="configuration">Configuration</h2>
+<table><thead><tr><th>Setting</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>COSMIX_MDS_ROOT</code></td><td>Storage root used by the CLI when <code>--root</code> is absent</td></tr>
+<tr><td><code>COSMIX_MDS_GC_QUIESCENCE_SECS</code></td><td>GC pass interval in integer seconds</td></tr>
+</tbody></table>
+<p>The GC interval defaults to 60 seconds. Values below 5 seconds in <code>COSMIX_MDS_GC_QUIESCENCE_SECS</code> are ignored and the default remains in effect. <code>with_gc_quiescence</code> bypasses that floor for tests.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>core</code></td><td style="text-align: right">Yes</td><td>Default storage profile; this marker adds no dependencies</td></tr>
+<tr><td><code>cosmix</code></td><td style="text-align: right">No</td><td>Adds <code>cosmix-lib-bus</code> and native <code>cosmix-lib-client</code>, and exposes <code>spawn_publisher_task</code></td></tr>
+<tr><td><code>mem-store</code></td><td style="text-align: right">No</td><td>Exposes <code>MemMds</code>; its current <code>Mds</code> methods are stubs that panic with <code>unimplemented!()</code></td></tr>
+<tr><td><code>_stress-helper</code></td><td style="text-align: right">No</td><td>Internal only; builds <code>cosmix-mds-stress-writer</code> for crash-recovery tests</td></tr>
+</tbody></table>
+<h2 id="modules">Modules</h2>
+<table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>store</code></td><td><code>Mds</code>, <code>SqliteCasMds</code>, per-set locking, transactions, and maintenance orchestration</td></tr>
+<tr><td><code>types</code></td><td>Identifiers, flags, tags, records, events, scopes, and reports</td></tr>
+<tr><td><code>container</code></td><td>Container, item, membership, search, and changelog SQL operations</td></tr>
+<tr><td><code>blob</code></td><td>BLAKE3 hashing and atomic CAS file operations</td></tr>
+<tr><td><code>blob_index</code></td><td>Shared blob index, references, refcounts, and verification ledger</td></tr>
+<tr><td><code>schema</code></td><td>Versioned SQLite migration runners</td></tr>
+<tr><td><code>notifier</code></td><td>Per-container in-process broadcast channels</td></tr>
+<tr><td><code>bus</code></td><td>Typed event taxonomy, event sink, and optional Bus publisher</td></tr>
+<tr><td><code>verify</code></td><td>Blob integrity verification</td></tr>
+<tr><td><code>rebuild</code></td><td>Derived blob-index reconstruction</td></tr>
+<tr><td><code>export</code>, <code>import</code></td><td>Set archive transfer</td></tr>
+<tr><td><code>gc</code></td><td>Garbage-collection module boundary</td></tr>
+<tr><td><code>error</code></td><td>Typed crate errors</td></tr>
+<tr><td><code>mem</code></td><td>Feature-gated in-memory stub</td></tr>
+</tbody></table>
+<h2 id="dependencies">Dependencies</h2>
+<p>SQLite persistence uses <code>rusqlite</code>; hashing uses <code>blake3</code>; identifiers use UUID v7 support. Tokio provides broadcast channels, <code>parking_lot</code> provides locks, and Serde supplies typed JSON payloads. The operator binary uses Clap and <code>humantime</code>; archive transfer uses <code>tar</code> and <code>chrono</code>. Bus dependencies remain optional.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +752,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +806,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +935,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

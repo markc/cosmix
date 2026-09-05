@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-interactd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,139 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-interactd/README.md"><div class="prose"><h1 id="cosmix-interactd">cosmix-interactd</h1>
+<p><code>cosmix-interactd</code> is the headless CTK interaction daemon for passive
+notifications. It registers the Bus <code>interact</code> service, applies notify.v1
+policy, queues accepted work, and delivers notifications through a desktop or
+recording sink without rendering its own interface. In the
+<code>bus &lt;- mix &lt;- cos</code> dependency chain it is a <code>cos</code> daemon: it depends directly
+on Bus crates and other <code>cos</code> crates, with no direct dependency on Mix.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-interactd serve [--bus-service &lt;name&gt;] [--sink &lt;sink&gt;]
+</code></pre>
+<h2 id="description">Description</h2>
+<p>The daemon owns Bus transport, wall-clock sampling, opaque handle creation,
+owner-token creation, asynchronous delivery, action dispatch, and the live
+interaction state.</p>
+<p>Notification policy is delegated to <code>cosmix-interaction-broker</code>. Wire request
+and response types come from <code>cosmix-interaction-schema</code>.</p>
+<p>The daemon is renderless. It does not depend on Bevy and does not draw a CTK
+surface.</p>
+<p>The request path records accepted notifications as <code>queued</code> and returns before
+desktop delivery. Registry lookup, sink I/O, and action-listener setup run on a
+bounded worker.</p>
+<p>The daemon reconnects to the Bus broker after connection loss. Backoff starts
+at one second and is capped at 60 seconds.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<table><thead><tr><th>Component</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Bus command loop</td><td>Registers a service and routes notify.v1 and property commands.</td></tr>
+<tr><td>Interaction state</td><td>Stores live and terminal records, ownership, revisions, routes, and lifecycle transitions.</td></tr>
+<tr><td>Delivery worker</td><td>Serialises sink operations and performs deferred action-target validation.</td></tr>
+<tr><td><code>FreedesktopSink</code></td><td>Sends desktop notifications through <code>org.freedesktop.Notifications</code>.</td></tr>
+<tr><td><code>RecordingSink</code></td><td>Logs delivery intent without requiring a desktop notification daemon.</td></tr>
+<tr><td>Property surface</td><td>Exposes an L2 read-only view under <code>interact.props.*</code>.</td></tr>
+<tr><td>Action worker</td><td>Delivers selected action callbacks through Bus.</td></tr>
+</tbody></table>
+<p>The crate is a binary package. Its <code>state</code>, <code>sink</code>, and <code>props</code> modules are
+internal implementation modules rather than a public Rust library API.</p>
+<h2 id="bus-surface">Bus surface</h2>
+<p>The default Bus service name is <code>interact</code>.</p>
+<table><thead><tr><th>Command</th><th>Operation</th></tr></thead><tbody>
+<tr><td><code>interact.notify</code></td><td>Accept and queue a new notification or an owned dedupe replacement.</td></tr>
+<tr><td><code>interact.update</code></td><td>Re-render an owned live notification.</td></tr>
+<tr><td><code>interact.dismiss</code></td><td>Close an owned notification and mark it terminal.</td></tr>
+<tr><td><code>interact.props.get</code></td><td>Read the full property snapshot or one path.</td></tr>
+<tr><td><code>interact.props.list</code></td><td>List readable property paths.</td></tr>
+<tr><td><code>interact.props.describe</code></td><td>Describe a property path.</td></tr>
+<tr><td><code>interact.props.watch</code></td><td>Discover the lifecycle event topic and sequence watermark.</td></tr>
+</tbody></table>
+<p>See <a href="/cos/cosmix-interactd/verbs">Bus verbs and properties</a> for request, response, lifecycle, and
+watch details.</p>
+<h2 id="command-line-interface">Command-line interface</h2>
+<h3 id="serve"><code>serve</code></h3>
+<p>Registers the Bus service and runs until the process is stopped.</p>
+<table><thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--bus-service &lt;name&gt;</code></td><td><code>interact</code></td><td>Bus service name registered by the daemon.</td></tr>
+<tr><td><code>--sink &lt;sink&gt;</code></td><td><code>freedesktop</code></td><td>Delivery backend: <code>freedesktop</code> or <code>recording</code>.</td></tr>
+</tbody></table>
+<p>The crate declares no daemon-specific configuration file, environment
+variable, or Cargo feature. Bus connection selection is delegated to
+<code>cosmix-lib-config</code> client helpers.</p>
+<h2 id="delivery-sinks">Delivery sinks</h2>
+<p>The <code>freedesktop</code> sink is the normal delivery path. It sends summary, body,
+effective urgency, category, timeout, resolved icon, and action buttons to the
+desktop notification service.</p>
+<p>It retains the sending connection for each live notification. This permits
+same-connection action and close signals, in-place replacement by desktop ID,
+and explicit close by handle.</p>
+<p>The <code>recording</code> sink writes show, replace, and close intent to standard error.
+It reports delivery as shown but has no desktop ID and therefore creates no
+action listener.</p>
+<p>A missing desktop notification daemon marks the record <code>failed</code>; it does not
+stop <code>cosmix-interactd</code>.</p>
+<h2 id="notification-lifecycle">Notification lifecycle</h2>
+<p>A record starts in <code>queued</code>. Successful sink delivery changes it to <code>shown</code>.
+It then reaches one terminal state:</p>
+<ul>
+<li><code>dismissed</code></li>
+<li><code>expired</code></li>
+<li><code>action_invoked</code></li>
+<li><code>failed</code></li>
+</ul>
+<p>Updates move a live record back to <code>queued</code> while the replacement is pending.
+Delivery completions and desktop signals carry a revision, so stale work cannot
+rewrite or invoke a newer generation.</p>
+<p>The state retains at most 256 terminal records for property snapshots. Live and
+queued records are not evicted by that limit.</p>
+<h2 id="ownership-and-callers">Ownership and callers</h2>
+<p>New notifications receive an opaque handle and an independent owner token.
+The owner token is required for update, dismiss, and dedupe replacement. The
+creating local Bus service must also match.</p>
+<p>Owner tokens are compared at fixed width and are not published through the
+property surface.</p>
+<p>Only requests from a canonical, registered local Bus service are admitted.
+Anonymous callers and requests carrying wire-asserted remote identity or
+permission headers are rejected.</p>
+<h2 id="actions">Actions</h2>
+<p>Each action has a key and label. An optional dispatch target names a Bus
+service and verb.</p>
+<p>Dispatch targets are checked against the service registry after a notification
+has been queued and before it is shown. An invalid or unavailable target marks
+delivery <code>failed</code>.</p>
+<p>Selecting an action marks the notification <code>action_invoked</code>. If the action has
+a dispatch target, the daemon sends the target:</p>
+<pre><code class="language-json">{
+  "handle": "&lt;opaque-handle&gt;",
+  "key": "&lt;action-key&gt;"
+}
+</code></pre>
+<p>An ambiguous action send is not retried, preserving at-most-once dispatch.</p>
+<h2 id="icons-and-timeouts">Icons and timeouts</h2>
+<p>notify.v1 accepts Lucide catalogue keys that the daemon can map to
+freedesktop theme icon names. Unknown Lucide keys and emoji icons are rejected.</p>
+<p>An omitted timeout uses the desktop default. A timeout of zero, or a timeout
+above one hour, is clamped to one hour.</p>
+<h2 id="capacity-and-failure-behaviour">Capacity and failure behaviour</h2>
+<table><thead><tr><th>Resource</th><th>Capacity or deadline</th></tr></thead><tbody>
+<tr><td>Delivery command queue</td><td>256</td></tr>
+<tr><td>Desktop signal queues</td><td>128 each</td></tr>
+<tr><td>Action delivery queue</td><td>128</td></tr>
+<tr><td>Property event queues</td><td>256</td></tr>
+<tr><td>Ambiguous show tombstones</td><td>256</td></tr>
+<tr><td>External I/O deadline</td><td>5 seconds</td></tr>
+<tr><td>Maximum presentation timeout</td><td>1 hour</td></tr>
+</tbody></table>
+<p>Queue admission failure returns an application error and does not mutate
+notification state.</p>
+<p>Property event loss is explicit. The publisher emits a gap frame with a
+sequence watermark and loss count, allowing watchers to discard stale events
+and reseed from a snapshot.</p>
+<h2 id="build">Build</h2>
+<pre><code class="language-text">cargo build -p cosmix-interactd
+</code></pre>
+<p>The build script emits standard Cosmix build provenance through
+<code>cosmix-lib-buildinfo</code>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +751,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +805,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +934,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

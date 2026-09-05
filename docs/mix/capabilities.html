@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/capabilities</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,200 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/capabilities.md"><div class="prose"><h1 id="capabilities--embedding">Capabilities &amp; embedding</h1>
+<p>Mix is two things at once: a <strong>standalone shell</strong> (where every builtin is allowed and the only limits are the self-protection caps) and an <strong>embeddable interpreter</strong> that daemons like <code>webd</code> and <code>maild</code> link as a library to run operator-authored scripts in-process. The second use case is why Mix has a <strong>capability model</strong>: a way to declare, per builtin, what <em>host authority</em> it exercises, so an embedder can hand a script a sandbox — "you may read the database and call JMAP, but not write files or spawn processes" — and have the evaluator enforce it before each call.</p>
+<p>This page covers the <code>CapabilityClass</code> taxonomy (the exact enum), the <code>CategoryAllowList</code> policy embedders use, how shell syntax is gated, the resource caps that bound any single run, and the in-proc-trusted vs out-of-proc-untrusted embedding model. It is accurate to the Rust source at <code>cosmix-lib-mix/src/builtins.rs</code> and <code>evaluator.rs</code> as of Mix 0.21.x.</p>
+<blockquote>
+<p>If you are just <strong>writing scripts for the <code>mix</code> CLI</strong>, you never see any of this — the standalone binary allows every class. The capability gate only fires when Mix is <em>embedded</em> and the embedder installs a policy. Read on if you author scripts that run inside a daemon, or if you embed Mix yourself.</p>
+</blockquote>
+<h2 id="the-nine-capability-classes">The nine capability classes</h2>
+<p>Every builtin carries exactly one <code>CapabilityClass</code>, <strong>declared at its table entry</strong> in <code>BUILTINS</code> / <code>HOFS</code> (the <code>builtin_table!</code> macro) — a single source of truth. Adding a builtin without naming its class is a <em>compile error</em>, not a silent <code>Pure</code>-default that would open a sandbox hole. (An older hand-maintained <code>match</code> failed open; the table-declared form fails closed.)</p>
+<pre><code class="language-rust">// cosmix-lib-mix/src/builtins.rs
+pub enum CapabilityClass {
+    Pure,     // no host authority: string/number/collection/in-memory ops
+    FsRead,   // reads the filesystem
+    FsWrite,  // mutates the filesystem
+    Network,  // talks to the network
+    Process,  // controls other processes
+    Env,      // reads host/environment info or stdin
+    Db,       // host-injected database seam (mediated)
+    Jmap,     // host-injected JMAP seam (mediated)
+    Bus,      // host-injected delegated-Bus seam (mediated)
+}
+</code></pre>
+<p>There are <strong>nine</strong> classes, no more — <code>Bus</code> is the newest, added in 0.20.3 for the delegated-Bus seam (below). (Mix has no separate <code>Random</code>, <code>Crypto</code>, or <code>Time</code> capability — <code>time</code>, <code>uuid</code>, <code>random_password</code>, <code>sleep</code>, and the hash/base64 builtins are all <code>Pure</code>: they compute over their arguments and carry no host authority worth gating.)</p>
+<table><thead><tr><th>Class</th><th>Meaning</th><th>Representative builtins</th></tr></thead><tbody>
+<tr><td><strong>Pure</strong></td><td>No host authority — pure functions over their arguments. <strong>Always allowed.</strong></td><td><code>length</code> <code>upper</code> <code>split</code> <code>join</code> <code>replace</code> <code>round</code> <code>sqrt</code> <code>json_parse</code> <code>markdown</code> <code>html_escape</code> <code>time</code> <code>uuid</code> <code>random_password</code> <code>sleep</code> <code>hash_sha256</code> and all the <code>map</code>/<code>filter</code>/<code>reduce</code> HOFs</td></tr>
+<tr><td><strong>FsRead</strong></td><td>Reads the filesystem.</td><td><code>read_file</code> <code>read_file_bytes</code> <code>read_lines</code> <code>read_json</code> <code>read_jsonl</code> <code>load_data</code> <code>exists</code> <code>is_file</code> <code>is_dir</code> <code>ls</code> <code>glob</code> <code>walk</code> <code>stat</code> <code>line_count</code></td></tr>
+<tr><td><strong>FsWrite</strong></td><td>Mutates the filesystem.</td><td><code>write_file</code> <code>write_new</code> <code>append_file</code> <code>mkdir</code> <code>flock</code> <code>funlock</code> <code>chmod</code> <code>chown</code> <code>sqlopen</code> <code>sqlexec</code> <code>sqlclose</code></td></tr>
+<tr><td><strong>Network</strong></td><td>Talks to the network (arbitrary outbound).</td><td><code>http_get</code> <code>http_post</code> <code>http_request</code> <code>dns_lookup</code> <code>ssh_run</code> <code>ssh_must</code> <code>ssh_mix</code></td></tr>
+<tr><td><strong>Process</strong></td><td>Controls other processes / process lifecycle.</td><td><code>run</code> <code>run_rc</code> <code>run_stream</code> <code>spawn</code> <code>kill</code> <code>process_alive</code> <code>chdir</code> <code>exit</code> <code>panic</code></td></tr>
+<tr><td><strong>Env</strong></td><td>Reads host/environment info or stdin.</td><td><code>env</code> <code>cwd</code> <code>hostname</code> <code>pid</code> <code>platform</code> <code>which</code> <code>readline</code> <code>read_stdin</code></td></tr>
+<tr><td><strong>Db</strong></td><td>Host-injected, <em>mediated</em> database seam.</td><td><code>db_query</code> <code>db_exec</code></td></tr>
+<tr><td><strong>Jmap</strong></td><td>Host-injected, <em>mediated</em> JMAP seam.</td><td><code>jmap</code> <code>jmap_upload</code></td></tr>
+<tr><td><strong>Bus</strong></td><td>Host-injected, <em>mediated</em> delegated-Bus seam.</td><td><code>bus_call</code></td></tr>
+</tbody></table>
+<p>A few classifications are deliberate and worth knowing:</p>
+<ul>
+<li><strong><code>panic</code> is <code>Process</code>,</strong> not <code>Pure</code>. It is a real Rust <code>panic!</code>, <strong>uncatchable</strong> by Mix <code>try</code>/<code>catch</code> — a termination primitive a sandbox must be able to deny, exactly like <code>exit</code>. (In <code>--serve</code> mode the SPEC 18 §3.4 handler boundary isolates a panicking handler from the rest of the citizen.)</li>
+<li><strong><code>chdir</code> is <code>Process</code></strong> (it mutates the process's working directory), not <code>FsRead</code>.</li>
+</ul>
+<h3 id="why-db-jmap-and-bus-are-separate-from-fswrite--network">Why <code>Db</code>, <code>Jmap</code>, and <code>Bus</code> are separate from <code>FsWrite</code> / <code>Network</code></h3>
+<p>You could imagine folding <code>db_query</code> into <code>FsWrite</code> (it touches a SQLite file) and <code>jmap</code> into <code>Network</code> (it makes an HTTP call). They are kept distinct on purpose, because each is a <strong>scoped, mediated seam the embedder controls</strong> — not raw authority the script wields itself:</p>
+<ul>
+<li>The <strong><code>Db</code> seam</strong> (<code>DbHandler</code>) is a database connection the <em>embedder opens and hands in</em>. Granting <code>Db</code> lets a CMS handler run <code>db_query</code>/<code>db_exec</code> against that one store <strong>without</strong> granting raw <code>FsWrite</code> (which would let it <code>write_file</code> anywhere). The raw file-level SQLite builtins (<code>sqlopen</code>/<code>sqlexec</code>) stay <code>FsWrite</code> — those <em>are</em> arbitrary filesystem authority.</li>
+<li>The <strong><code>Jmap</code> seam</strong> (<code>JmapHandler</code>) is a single upstream the embedder configured. The script <strong>never names a host</strong>; its reach is only the embedder's one configured endpoint. Granting <code>Jmap</code> to a PIM handler lets it talk to <em>that</em> mail server without granting <code>Network</code> (arbitrary outbound HTTP to anywhere). This is the whole point of the seam — <code>jmap</code> is host-agnostic by construction.</li>
+<li>The <strong><code>Bus</code> seam</strong> (<code>BusCallHandler</code>, installed via <code>set_bus_call_handler</code>) is a <strong>delegated</strong> Bus control-plane channel — deliberately <strong>not</strong> the raw broker (<code>BusHandler</code>, the <code>send</code>/<code>emit</code> keywords, which a sandboxed handler never gets). The embedder bounds <strong>which verbs</strong> are reachable (a per-route exact-verb allowlist) and injects the <strong>delegation envelope</strong> — the authenticated actor, vhost, route — from <em>trusted request state</em>. The script calls <code>bus_call(verb, args)</code> and names <strong>no host, peer, or actor</strong>: it cannot forge identity or reach an unlisted verb. This is how a sandboxed webd handler calls a maild verb under the requesting user's delegated identity without holding broker authority.</li>
+</ul>
+<p>This is the legibility win: an embedder grants the <em>narrow, mediated</em> thing (<code>Db</code>, <code>Jmap</code>, <code>Bus</code>) instead of the <em>broad, raw</em> thing (<code>FsWrite</code>, <code>Network</code>, the broker).</p>
+<h3 id="the-bus_call-builtin">The <code>bus_call</code> builtin</h3>
+<p><code>bus_call(verb, args)</code> returns the verb's reply as a Mix value. Its checks run in a fixed order: the <strong>capability gate fires first</strong> (a policy that doesn't allow <code>Bus</code> denies the call before the handler is even consulted), then argument validation — <code>verb</code> must be a non-empty string; <code>args</code> is an optional map (omitted or <code>nil</code> means an empty map); the args must be JSON-encodable, so a function or raw-bytes value anywhere inside is rejected up front (the same footgun guard as <code>jmap</code>) — then the handler runs. A handler refusal (a verb not in the route's allowlist, an unreachable broker, an error rc from the peer) raises a <strong>catchable</strong> error, and the reply is bounded by the collection-size caps below.</p>
+<p>With no handler installed — the standalone <code>mix</code> binary, a plain library embed — all three seam builtins exist but raise a catchable "not available" error:</p>
+<pre><code class="language-mix">try
+  bus_call("mail.send", {to: "x"})
+catch $e
+  print("" .. $e)
+end
+</code></pre>
+<pre><code class="language-text">bus_call not available (no bus_call handler registered)
+</code></pre>
+<p>(<code>db_query</code> and <code>jmap</code> behave the same way: <code>database not available (no db handler registered)</code>, <code>jmap not available (no jmap handler registered)</code>. A seam builtin never silently no-ops.)</p>
+<h3 id="inspecting-a-builtins-class">Inspecting a builtin's class</h3>
+<p>The <code>capability_category(name)</code> function returns the class for any name (a non-builtin name returns <code>Pure</code> — it has no authority of its own, and the <code>is_builtin</code> gate rejects non-builtins before dispatch anyway). The descriptive <em>doc category</em> shown by <code>mix what</code> / <code>mix builtins</code> (string/math/io/system) is a <strong>different axis</strong> — it organises the help output and does not map 1:1 to <code>CapabilityClass</code>:</p>
+<pre><code class="language-text">$ mix what env
+env: Get environment variable value
+
+$ mix builtins system | head -3
+system builtins:
+  env             Get environment variable value
+  time            Return current Unix timestamp as float
+</code></pre>
+<p><code>time</code> and <code>env</code> are both in the <code>system</code> doc category, but their capability classes differ (<code>Pure</code> vs <code>Env</code>). The doc category is for humans browsing; the <code>CapabilityClass</code> is for the sandbox. The three seam builtins carry their own doc categories (<code>db</code>, <code>jmap</code>, <code>bus</code>) that are deliberately <strong>absent</strong> from the <code>mix builtins</code> category list — they are embedder-only surface, so <code>mix builtins db</code> reports an unknown category — but <code>mix what db_query</code> / <code>mix what bus_call</code> still describe them.</p>
+<h2 id="categoryallowlist--the-ready-made-policy">CategoryAllowList — the ready-made policy</h2>
+<p>An embedder gates a script by installing a <code>CapabilityPolicy</code>. The shipped, batteries-included one is <code>CategoryAllowList</code>: it <strong>always allows <code>Pure</code></strong>, plus an explicit allow-set of other classes, and <strong>denies everything else</strong>.</p>
+<pre><code class="language-rust">// cosmix-lib-mix/src/builtins.rs
+use std::rc::Rc;
+use cosmix_lib_mix::{CategoryAllowList, CapabilityClass};
+
+// A CMS handler: may read files + use the mediated DB seam, nothing else.
+let policy = CategoryAllowList::new(&amp;[
+    CapabilityClass::FsRead,
+    CapabilityClass::Db,
+]);
+evaluator.set_capability_policy(Rc::new(policy));   // stored as Rc&lt;dyn CapabilityPolicy&gt;
+</code></pre>
+<p>With that policy installed, the evaluator consults <code>check_builtin(name)</code> <strong>once per builtin/HOF dispatch, before the builtin runs</strong>:</p>
+<pre><code class="language-rust">fn check_builtin(&amp;self, name: &amp;str) -&gt; Result&lt;(), String&gt; {
+    let class = capability_category(name);
+    if class == CapabilityClass::Pure || self.allowed.contains(&amp;class) {
+        Ok(())
+    } else {
+        Err(format!("{name} requires {class:?} capability"))
+    }
+}
+</code></pre>
+<p>So under the policy above, <code>read_file(...)</code> and <code>db_query(...)</code> run, <code>upper(...)</code> runs (Pure is free), but <code>write_file(...)</code> fails with <code>capability denied: write_file requires FsWrite capability</code> and <code>http_get(...)</code> with <code>capability denied: http_get requires Network capability</code> — the evaluator prefixes <code>capability denied:</code> to whatever reason the policy returns, and raises it as a normal catchable runtime error. A daemon that wants finer control than "by class" — e.g. allow <code>read_file</code> but not <code>glob</code>, both <code>FsRead</code> — writes its own <code>CapabilityPolicy</code> and matches exact builtin names.</p>
+<p>The trait is intentionally tiny — two methods, one with a default:</p>
+<pre><code class="language-rust">pub trait CapabilityPolicy {
+    fn check_builtin(&amp;self, name: &amp;str) -&gt; Result&lt;(), String&gt;;
+    fn check_class(&amp;self, class: CapabilityClass) -&gt; Result&lt;(), String&gt; { /* default */ }
+}
+</code></pre>
+<p>The standalone <code>mix</code> CLI installs <strong>no</strong> policy — every class is allowed and the only bounds are the resource caps below. That is correct: the operator running <code>mix script.mix</code> already has full authority on the host; gating it would be theatre.</p>
+<h2 id="gating-shell-syntax-the-check_class-escape-hatch">Gating shell syntax (the <code>check_class</code> escape hatch)</h2>
+<p>Here is the trap an embedder must not fall into: Mix's <strong>shell syntax does not go through the builtin table</strong>. <code>sh "..."</code>, the <code>$(...)</code> command substitution, <code>... | cmd</code> pipes, and a bare shell-dispatch line all spawn <code>/bin/sh</code> directly. A policy that only implemented <code>check_builtin</code> would gate <code>run(...)</code> but let <code>$(rm -rf /)</code> straight through — a sandbox escape.</p>
+<p>So those constructs are gated through a <strong>second seam, <code>check_class(CapabilityClass::Process)</code></strong>, before the shell runs. The evaluator calls it at every site that reaches process authority without a builtin name: <code>sh</code>, the <code>$()</code> command substitution, <code>… | cmd</code> pipes, a bare shell-dispatch line executed from a <code>source</code>d file, and the <code>export</code> statement (it mutates the process-global environment that every thread reads). A denial reads <code>capability denied: &lt;construct&gt;: &lt;reason&gt;</code> — e.g. <code>capability denied: sh: Process capability not allowed</code>. The trait's <em>default</em> <code>check_class</code> maps each class to a representative builtin (<code>Process</code> → <code>"run"</code>, <code>FsRead</code> → <code>"read_file"</code>, <code>FsWrite</code> → <code>"write_file"</code>, <code>Network</code> → <code>"http_get"</code>, <code>Env</code> → <code>"env"</code>, <code>Db</code> → <code>"db_query"</code>, <code>Jmap</code> → <code>"jmap"</code>, <code>Bus</code> → <code>"bus_call"</code>; <code>Pure</code> is always allowed) and reuses <code>check_builtin</code>, so a policy that only implements <code>check_builtin</code> <strong>still gates shell execution correctly</strong> — it can't accidentally leave the hole open. <code>CategoryAllowList</code> overrides <code>check_class</code> to gate against its allow-set directly:</p>
+<pre><code class="language-rust">fn check_class(&amp;self, class: CapabilityClass) -&gt; Result&lt;(), String&gt; {
+    if class == CapabilityClass::Pure || self.allowed.contains(&amp;class) {
+        Ok(())
+    } else {
+        Err(format!("{class:?} capability not allowed"))
+    }
+}
+</code></pre>
+<p><code>include</code> and <code>source</code> (which read a file off disk) are likewise gated as <code>FsRead</code> at the evaluator, not left ungated. The principle: <strong>every path that reaches host authority is gated</strong>, whether it is a named builtin or a piece of syntax. See <a href="/mix/shell-mode">shell dispatch</a> for what <code>sh</code>/<code>$()</code>/pipes do and <a href="/mix/bus">Bus messaging</a> for <code>send</code>/<code>emit</code>/<code>on</code> (gated separately by their own handler seams, not the capability policy).</p>
+<h2 id="resource-caps--the-self-protection-limits">Resource caps — the self-protection limits</h2>
+<p>Capabilities answer <em>what authority</em>; resource caps answer <em>how much</em>. These are enforced <strong>natively in the tree-walking evaluator</strong> — there is no external sandbox engine, no added dependency. They protect even a naive embedder that never installs a policy, and they protect the standalone <code>mix</code> binary from a runaway script taking down the host. Three categories, plus a parser cap and per-builtin output caps.</p>
+<h3 id="call-recursion-depth">Call-recursion depth</h3>
+<p>Unbounded Mix recursion overflows the <strong>native Rust stack</strong> before any cooperative check can fire — an uncatchable SIGSEGV that takes the whole host process down. So unlike the others this knob is <strong>finite by default</strong> (<code>DEFAULT_RECURSION_LIMIT = 16</code>) — it must protect a naive embedder. Each consumer raises it for its own stack: the <code>mix</code> binary uses <strong>128</strong> on its ~8 MB main thread.</p>
+<pre><code class="language-mix">function f($n)
+  if $n &lt;= 0 then return 0 end
+  return f($n - 1)
+end
+print(f(500))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 3: recursion depth exceeded (limit 128)
+</code></pre>
+<p>A clean catchable error, never a crash. An embedder running on a smaller stack (e.g. maild's per-message inbound filter on a tokio worker, where the async call path burns tens of KB per level and overflows around depth ~32) keeps the lower default so it fails <em>reliably</em> with this error rather than flakily overflowing.</p>
+<h3 id="wall-clock-time-list--map--string-size">Wall-clock time, list / map / string size</h3>
+<p><code>EvalLimits</code> carries the other knobs, all <code>None</code> (uncapped) by default and set via <code>set_limits</code>:</p>
+<pre><code class="language-rust">pub struct EvalLimits {
+    pub recursion_limit: usize,            // depth knob (above)
+    pub time_limit: Option&lt;Duration&gt;,      // wall-clock budget for one run
+    pub max_list_len: Option&lt;usize&gt;,       // cap on any single list's length
+    pub max_map_len: Option&lt;usize&gt;,        // cap on any single map's entries
+    pub max_string_len: Option&lt;usize&gt;,     // cap on any single string's bytes
+}
+</code></pre>
+<p>The <strong>time budget</strong> is checked at the per-statement poll, so a loop-based runaway is bounded; but a single blocking builtin (<code>run</code>, <code>ssh_run</code>, <code>http_*</code>) <strong>cannot be interrupted mid-syscall</strong> — the deadline fires at the next statement, not inside the syscall. Keep that in mind when budgeting an embedded handler that shells out.</p>
+<h3 id="parser-nesting-cap">Parser nesting cap</h3>
+<p>The parser caps expression/statement nesting at <strong>depth 200</strong>, so deeply-nested input is a clean <code>ParseError</code>, not a stack-overflow abort — neither a login-shell line nor an embedded daemon can be crashed by <code>((((((...</code>:</p>
+<pre><code class="language-text">$ mix -c 'print(((( ... 210 deep ... ))))'
+Parse error at line 1:202: nesting too deep (limit 200)
+</code></pre>
+<h3 id="per-builtin-output-caps-always-on">Per-builtin output caps (always on)</h3>
+<p>Several builtins reject an oversized result with a normal runtime error rather than OOMing the process — independent of any policy, in the standalone binary too:</p>
+<pre><code class="language-mix">print(repeat("x", 300000000))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: repeat() result would exceed 268435456 bytes (256 MiB cap)
+</code></pre>
+<pre><code class="language-mix">$r = range(1, 20000000)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: range() would produce 20000000 elements (cap 10000000)
+</code></pre>
+<ul>
+<li><code>repeat</code> / <code>lpad</code> / <code>rpad</code> (and the <code>_w</code> twins): <strong>256 MiB</strong> result cap.</li>
+<li><code>range</code>: <strong>10,000,000</strong> elements.</li>
+<li><code>http_get</code> / <code>http_post</code> / <code>http_request</code>: <strong>64 MiB</strong> response body (over-cap → <code>{status: 0, error}</code>).</li>
+<li><code>substr</code> clamps an out-of-range length/offset rather than panicking.</li>
+</ul>
+<h2 id="the-embedding-model--trusted-in-proc-vs-untrusted-out-of-proc">The embedding model — trusted in-proc vs untrusted out-of-proc</h2>
+<p>This is the load-bearing distinction, and the capability gate's honest scope.</p>
+<blockquote>
+<p><strong>An in-process capability gate is a <em>robustness</em> boundary for trusted scripts, not a <em>containment</em> boundary for untrusted code.</strong> A compromise owns the address space the gate runs in. This is stated plainly in the source and in SPEC 18 §6: <em>"Not a sandbox."</em></p>
+</blockquote>
+<p>What that means in practice:</p>
+<ul>
+<li>
+<p><strong>In-proc, trusted (the supported embedding).</strong> A daemon links <code>cosmix-lib-mix</code> and runs <strong>operator- or agent-authored, reviewed</strong> scripts in its own process — a webd CMS handler, a maild inbound filter, a Mix citizen daemon (SPEC 18). These scripts are the <strong>same trust class as the Rust daemon itself</strong>; they run under a real SPEC-10 UID (a registered serve-mode citizen takes a 600–699 identity UID; an unregistered transient citizen inherits its supervisor's 500–599 daemon UID). The <code>CategoryAllowList</code> here is <strong>defence in depth</strong> — it stops a <em>buggy</em> trusted script from doing something surprising (a filter that accidentally calls <code>run</code>), and it makes the script's authority <strong>legible</strong> ("this handler is FsRead + Db only"). It is not, and is not claimed to be, a wall against a malicious script.</p>
+</li>
+<li>
+<p><strong>Out-of-proc, untrusted (the only safe path for arbitrary code).</strong> Genuinely untrusted or multi-tenant Mix must run in a <strong>separate process</strong> under OS-level isolation (its own UID, namespaces, cgroups, seccomp) — the maild/webd trust-split ADR. SPEC 18 §6 is explicit: <em>no in-process untrusted eval mode is specified or permitted.</em> The capability classes still apply inside that worker as defence in depth, but the real boundary is the process and the kernel, not the <code>CapabilityPolicy</code>.</p>
+</li>
+</ul>
+<p>And the standing rule for either mode — <strong>WG-trusted ≠ caller-benign</strong>: a Mix citizen reached over the trusted WireGuard mesh must still <strong>validate inbound Bus request fields</strong> before they parameterise a path, an exec, SQL, or an outbound call. Trust-domain membership bounds <em>who</em> can reach the handler; it does not make the request <em>content</em> safe. External exposure is mediated only — a citizen never binds a public port; it is reached from outside its broker solely through an explicit <code>webd</code> route + authz entry, default-deny. See <a href="/mix/bus">Bus messaging</a> for the citizen runtime and <code>send</code>/<code>emit</code>/<code>on</code>.</p>
+<h3 id="choosing-what-to-grant">Choosing what to grant</h3>
+<p>A short decision guide for an embedder wiring up a <code>CategoryAllowList</code>:</p>
+<ul>
+<li>Start from <strong><code>Pure</code> only</strong> (the default allow-set is empty) and add the <em>narrowest</em> class that lets the handler do its job.</li>
+<li>Prefer the <strong>mediated seams</strong> (<code>Db</code>, <code>Jmap</code>) over the <strong>raw</strong> classes (<code>FsWrite</code>, <code>Network</code>) wherever the handler's real need is "talk to <em>my</em> store / <em>my</em> upstream", not "arbitrary filesystem / arbitrary outbound".</li>
+<li>Grant <strong><code>Process</code> last and reluctantly</strong> — it implies <code>run</code>, <code>spawn</code>, <code>kill</code>, <code>exit</code>, <em>and</em> all shell syntax (<code>sh</code>/<code>$()</code>/pipes). A handler that needs to shell out is a candidate for moving its logic into a builtin or out-of-proc worker.</li>
+<li>Remember <code>Process</code> also covers <code>panic</code> and <code>exit</code> — denying <code>Process</code> is what keeps a handler from terminating the host daemon.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/shell-mode">shell dispatch</a> — <code>sh</code>, <code>$(...)</code>, pipes; gated as <code>Process</code></li>
+<li><a href="/mix/bus">Bus messaging</a> — <code>send</code>/<code>emit</code>/<code>on</code>, the citizen runtime, handler seams</li>
+<li><a href="/mix/builtins">builtins index</a> — every builtin and its doc category</li>
+<li><a href="/mix/functions">functions</a> · <a href="/mix/strings">strings</a> · <a href="/mix/system">running commands</a></li>
+<li><code>mix what NAME</code> — one-line description of a builtin or keyword</li>
+<li><code>mix builtins [CATEGORY]</code> — list builtins by (doc) category</li>
+<li><code>mix help</code> — the <code>mix</code> command surface and CLI flags</li>
+<li>Source of truth: <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/builtins.rs"><code>builtins.rs</code></a> (<code>CapabilityClass</code>, <code>CategoryAllowList</code>, <code>capability_category</code>), <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs"><code>evaluator.rs</code></a> (<code>CapabilityPolicy</code>, <code>EvalLimits</code>)</li>
+<li><a href="https://github.com/markc/cosmix/blob/main/AGENTS.md">AGENTS.md</a> — the agent orientation sheet (this manual is the language reference)</li>
+<li>The <a href="https://github.com/markc/cosmix">mix</a> · <a href="https://github.com/markc/cosmix">bus</a> · <a href="https://github.com/markc/cosmix">cos</a> repos</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +812,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +866,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +995,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

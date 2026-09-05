@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-lib-log-props/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,120 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-lib-log-props/README.md"><div class="prose"><h1 id="cosmix-lib-log-props">cosmix-lib-log-props</h1>
+<p><code>cosmix-lib-log-props</code> provides the SPEC-12 <code>&lt;service&gt;.log</code> property namespace and a live-reload watcher for the <code>cosmix_log</code> logging core. It belongs to the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: the crate extends the logging core from <code>bus</code> with the daemon-facing property substrate supplied by <code>cos</code>, and does not depend on <code>mix</code>.</p>
+<p>The Cargo package is <code>cosmix-lib-log-props</code>. Rust code imports it as <code>cosmix_log_props</code>.</p>
+<h2 id="purpose">Purpose</h2>
+<p>The crate gives a service an agent-operable logging surface.</p>
+<p>A service registers the reserved <code>log</code> namespace with its <code>PropsRouter</code> and <code>SqliteStore</code>. It then attaches the returned runtime to an initialised <code>cosmix_log::LogHandle</code>.</p>
+<p>Writes through <code>&lt;service&gt;.props.set</code> update the stored singleton. Accepted changes wake a background task, which reads the committed row and replaces the subscriber's active <code>tracing_subscriber::EnvFilter</code>.</p>
+<p>The crate does not initialise the logging subscriber or create logging sinks. Those responsibilities remain in <code>cosmix_log</code>.</p>
+<h2 id="namespace">Namespace</h2>
+<p>The unqualified namespace is <code>log</code>. The host router supplies the service prefix, producing <code>&lt;service&gt;.log</code>.</p>
+<p>The namespace has singleton cardinality. Wire requests use an empty key and responses use the canonical key <code>current</code>.</p>
+<p>The namespace uses the property store's SQLite backend and simple lifecycle.</p>
+<table><thead><tr><th>Property</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>level</code></td><td>enum</td><td><code>info</code></td><td>Sets the global default filter level.</td></tr>
+<tr><td><code>filter</code></td><td>string</td><td>empty</td><td>Adds per-target <code>EnvFilter</code> directives.</td></tr>
+<tr><td><code>format</code></td><td>enum</td><td><code>human</code></td><td>Records the selected output format; changing it does not reinitialise sinks.</td></tr>
+<tr><td><code>applied_at</code></td><td>string</td><td>empty</td><td>Holds an RFC 3339 UTC timestamp value.</td></tr>
+<tr><td><code>applied_by</code></td><td>enum</td><td><code>default</code></td><td>Records an origin value.</td></tr>
+<tr><td><code>source</code></td><td>string</td><td>empty</td><td>Holds the literal accepted directive.</td></tr>
+</tbody></table>
+<p>Valid <code>level</code> values are:</p>
+<ul>
+<li><code>none</code></li>
+<li><code>error</code></li>
+<li><code>warn</code></li>
+<li><code>info</code></li>
+<li><code>debug</code></li>
+</ul>
+<p>Valid <code>format</code> values are:</p>
+<ul>
+<li><code>human</code></li>
+<li><code>json</code></li>
+</ul>
+<p>Valid <code>applied_by</code> values are:</p>
+<ul>
+<li><code>cli</code></li>
+<li><code>env</code></li>
+<li><code>props</code></li>
+<li><code>default</code></li>
+</ul>
+<p>All six fields are substrate-mutable in version 0.1. The watcher only derives the live filter from <code>level</code> and <code>filter</code>. It does not write <code>applied_at</code>, <code>applied_by</code>, or <code>source</code> after applying a change.</p>
+<h2 id="filter-behaviour">Filter behaviour</h2>
+<p>The watcher combines <code>level</code> and <code>filter</code> into one <code>EnvFilter</code> directive.</p>
+<p>An empty <code>filter</code> leaves only the global level. A non-empty value is appended after the global level with a comma.</p>
+<p><code>level=none</code> maps to the <code>off</code> directive. This drops all events while leaving the subscriber installed.</p>
+<p>Missing or non-string <code>level</code> and <code>filter</code> fields fall back to <code>info</code> and an empty filter when a stored row is read. This permits a patch containing only one of those fields to produce a usable live filter.</p>
+<p>Malformed filter text is rejected before the property write commits. The currently installed filter remains unchanged.</p>
+<h2 id="validation-and-deletion">Validation and deletion</h2>
+<p><code>LogNamespaceHooks</code> implements the namespace hooks.</p>
+<p>Before a set, it:</p>
+<ul>
+<li>requires the body to be an object;</li>
+<li>checks <code>level</code>, <code>format</code>, and <code>applied_by</code> against their fixed variants;</li>
+<li>requires enum and filter values to be strings;</li>
+<li>parses every non-empty <code>filter</code> with <code>EnvFilter::try_new</code>.</li>
+</ul>
+<p>After a successful set, it signals the namespace's private <code>Notify</code>. The watcher then reads the committed row and converges on the latest value.</p>
+<p>Every delete is rejected. Reset the singleton with <code>&lt;service&gt;.props.set</code> using replacement values instead.</p>
+<p>The exported error prefixes are:</p>
+<table><thead><tr><th>Constant</th><th>Prefix</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>INVALID_FILTER_PREFIX</code></td><td><code>log_filter_invalid:</code></td><td>The filter does not parse.</td></tr>
+<tr><td><code>UNKNOWN_ENUM_VARIANT_PREFIX</code></td><td><code>log_unknown_enum_variant:</code></td><td>An enum field contains an unsupported value.</td></tr>
+<tr><td><code>UNDELETABLE_PREFIX</code></td><td><code>log_undeletable:</code></td><td>A delete was attempted.</td></tr>
+</tbody></table>
+<h2 id="public-api">Public API</h2>
+<h3 id="registration-and-attachment">Registration and attachment</h3>
+<p><code>register_log_namespace(router, store) -&gt; Result&lt;LogPropsRuntime&gt;</code> registers the schema and mapping with the SQLite store, creates its runtime, and registers that runtime with the router.</p>
+<p><code>attach_props(handle, runtime) -&gt; Result&lt;()&gt;</code> reads and applies the current row, then starts the live watcher. It returns after the initial read and swap.</p>
+<p>If the log handle has no reload handle, <code>attach_props</code> returns successfully without starting the watcher.</p>
+<p>The spawned watcher owns an <code>Arc</code> clone of the property runtime. It runs until the Tokio runtime shuts down. Dropping the caller's <code>LogPropsRuntime</code> does not retire it.</p>
+<h3 id="types">Types</h3>
+<p><code>LogPropsRuntime</code> bundles the namespace property runtime with its private wake signal. Pass it from <code>register_log_namespace</code> to <code>attach_props</code>. The <code>runtime()</code> accessor exposes the underlying <code>Arc&lt;Runtime&gt;</code>.</p>
+<p><code>LogNamespaceHooks</code> validates sets, refuses deletes, and signals accepted changes. <code>LogNamespaceHooks::new</code> accepts the private <code>Arc&lt;Notify&gt;</code>.</p>
+<h3 id="schema-helpers">Schema helpers</h3>
+<p><code>namespace_name()</code> returns the validated <code>log</code> namespace name.</p>
+<p><code>schema()</code> returns the six-field <code>PropertySchema</code>.</p>
+<p><code>auth_policy(service)</code> returns the capability policy for the fully qualified namespace.</p>
+<p><code>spec(service, hooks)</code> builds the singleton <code>NamespaceSpec</code>.</p>
+<p><code>level_variants()</code>, <code>format_variants()</code>, and <code>applied_by_variants()</code> return the fixed enum values used by the schema and hooks.</p>
+<h3 id="constants">Constants</h3>
+<p><code>NAMESPACE</code> is <code>log</code>.</p>
+<p><code>CANONICAL_KEY</code> is <code>current</code>.</p>
+<p>The three validation error-prefix constants are described above.</p>
+<h2 id="capabilities">Capabilities</h2>
+<p>The policy builds five capabilities scoped to <code>&lt;service&gt;.log</code>:</p>
+<ul>
+<li><code>props.read:&lt;service&gt;.log</code></li>
+<li><code>props.describe:&lt;service&gt;.log:public</code></li>
+<li><code>props.describe:&lt;service&gt;.log:full</code></li>
+<li><code>props.write:&lt;service&gt;.log</code></li>
+<li><code>props.audit:&lt;service&gt;.log</code></li>
+</ul>
+<p>Version 0.1 grants this complete set to every peer resolved by the policy.</p>
+<p>Write access is sensitive. A writer can set <code>level=none</code> and silence the service's logging. Deployments must treat <code>props.write:&lt;service&gt;.log</code> as a log-control capability.</p>
+<h2 id="runtime-semantics">Runtime semantics</h2>
+<p>The initial read has two outcomes:</p>
+<ul>
+<li>If the singleton exists and yields a filter, the watcher installs it before <code>attach_props</code> returns.</li>
+<li>If the singleton does not exist, the bootstrap filter remains installed.</li>
+</ul>
+<p>Each committed set wakes the watcher through a namespace-private signal. The signal is separate from the property runtime's event signal so the property dispatcher cannot consume the watcher's notification.</p>
+<p>Transient read failures and filter-reload failures do not terminate the watcher. A read failure is retried after the next accepted write. A reload failure leaves the previous filter installed.</p>
+<h2 id="dependencies">Dependencies</h2>
+<p>The crate uses:</p>
+<ul>
+<li><code>cosmix-lib-log</code> as <code>cosmix_log</code> for the subscriber reload handle;</li>
+<li><code>cosmix-lib-props-store</code> for the router, namespace schema, hooks, runtime, values, and SQLite store;</li>
+<li><code>tracing</code> for watcher diagnostics;</li>
+<li><code>tracing-subscriber</code> with <code>env-filter</code> support;</li>
+<li><code>tokio</code> for the wake signal and background task;</li>
+<li><code>anyhow</code> for public operation errors.</li>
+</ul>
+<p>The crate declares no Cargo features.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +732,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +786,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +915,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

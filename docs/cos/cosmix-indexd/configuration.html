@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-indexd/configuration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,101 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-indexd/configuration.md"><div class="prose"><h1 id="cosmix-indexd-configuration">cosmix-indexd configuration</h1>
+<p><code>cosmix-indexd</code> loads one <code>IndexdSettings</code> document at startup. The document uses the <code>.conf.mix</code> format. The daemon does not reload it while running.</p>
+<h2 id="lookup-order">Lookup order</h2>
+<p>Without <code>--config</code>, lookup proceeds in this order:</p>
+<ol>
+<li><code>/etc/cosmix/indexd/config.conf.mix</code></li>
+<li><code>~/.config/cosmix/indexd.conf.mix</code></li>
+</ol>
+<p>The CosMix configuration store materialises default settings when the user-mode file is missing.</p>
+<p>With <code>--config PATH</code>, the daemon loads only <code>PATH</code>.</p>
+<p>Only a missing system-mode file falls through to user mode. Permission errors, other I/O errors, and parse errors are fatal. A missing explicit file is also fatal.</p>
+<p>The legacy <code>config.toml</code> name is not read.</p>
+<h2 id="top-level-surface">Top-level surface</h2>
+<p>The source uses these top-level settings:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>schema_version</code></td><td>integer</td><td>Configuration schema version.</td></tr>
+<tr><td><code>service</code></td><td>object</td><td>Runtime settings for the daemon.</td></tr>
+<tr><td><code>source_types</code></td><td>map</td><td>Accepted source names and their metadata contracts.</td></tr>
+</tbody></table>
+<p>The crate's configuration test demonstrates the <code>.conf.mix</code> object form:</p>
+<pre><code class="language-text">schema_version: 7
+service: { socket_path: "/run/cosmix/indexd.sock" }
+</code></pre>
+<p>Other fields may be supplied by the configuration type's defaults. This crate reads only the fields documented below.</p>
+<h2 id="service-settings">Service settings</h2>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>service.socket_path</code></td><td>string</td><td>Unix socket path used when socket activation does not provide a listener.</td></tr>
+<tr><td><code>service.vectors_db</code></td><td>string</td><td>SQLite vector database path.</td></tr>
+<tr><td><code>service.model_id</code></td><td>string</td><td>Hugging Face model repository identifier.</td></tr>
+<tr><td><code>service.dtype</code></td><td>string</td><td>Model precision. The value <code>f32</code> selects <code>f32</code>; other values select <code>f16</code>.</td></tr>
+<tr><td><code>service.idle_timeout_secs</code></td><td>integer</td><td>Seconds after embedding activity before unloading the model. Zero disables idle unload.</td></tr>
+</tbody></table>
+<p>The daemon creates the database parent directory when needed.</p>
+<p>When it creates its own Unix socket, it creates the parent directory, removes a stale socket path, binds the listener, and sets mode <code>0666</code>.</p>
+<h2 id="source-type-policy">Source-type policy</h2>
+<p><code>source_types</code> maps each accepted non-empty source name to a policy with:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>required</code></td><td>array of strings</td><td>Metadata fields that must exist and must not be null.</td></tr>
+<tr><td><code>date_field</code></td><td>optional string</td><td>Metadata field that must contain a <code>YYYY-MM-DD</code> date.</td></tr>
+</tbody></table>
+<p><code>store</code> applies the policy to every non-empty metadata string when the request also has a non-empty source.</p>
+<p>Validation behaves as follows:</p>
+<ul>
+<li>empty metadata or an empty source bypasses source-type validation;</li>
+<li>metadata must parse as JSON;</li>
+<li>an unknown source is rejected and the error names the loaded configuration path;</li>
+<li>every configured required field must exist and be non-null;</li>
+<li>a configured date field must be a string shaped as a valid year, month, and day.</li>
+</ul>
+<p>The date validator accepts years from 1970 through 9999, months from 1 through 12, and days from 1 through 31. It does not validate the day against the selected month.</p>
+<p>Changing a source-type policy requires a daemon restart because the parsed settings are stored once at startup.</p>
+<h2 id="index_file-source-and-domain-selection"><code>index_file</code> source and domain selection</h2>
+<p>When an <code>index_file</code> request omits <code>source</code>, the daemon selects:</p>
+<ul>
+<li><code>doc</code> for a path containing <code>/_doc/</code>;</li>
+<li><code>journal</code> for a path containing <code>/_journal/</code>;</li>
+<li><code>doc</code> for any other path.</li>
+</ul>
+<p>An automatically detected journal whose filename does not start with a date-shaped <code>YYYY-MM-DD</code> prefix is changed to <code>doc</code>. A date-shaped but invalid prefix remains a journal so metadata validation reports the error. An explicitly supplied source is never changed.</p>
+<p>When <code>domain</code> is absent, the daemon loads the separate <code>domains</code> service settings and resolves the file path through its domain map. It uses <code>general</code> when no mapping resolves.</p>
+<h2 id="overrides">Overrides</h2>
+<p>Precedence for model precision is:</p>
+<ol>
+<li><code>--f32</code></li>
+<li><code>service.dtype</code></li>
+</ol>
+<p>The <code>COSMIX_VECTORS_DB</code> environment variable overrides <code>service.vectors_db</code>.</p>
+<h2 id="socket-activation">Socket activation</h2>
+<p>The daemon first attempts systemd-compatible socket activation.</p>
+<p>It accepts file descriptor 3 when:</p>
+<ul>
+<li><code>LISTEN_PID</code> equals the daemon's process identifier;</li>
+<li><code>LISTEN_FDS</code> parses as an integer of at least one.</li>
+</ul>
+<p>If those conditions are not met, it binds <code>service.socket_path</code> itself.</p>
+<h2 id="model-files-and-cache">Model files and cache</h2>
+<p>The configured model repository must provide:</p>
+<ul>
+<li><code>config.json</code>;</li>
+<li><code>tokenizer.json</code>;</li>
+<li><code>model.safetensors</code>.</li>
+</ul>
+<p>The daemon first checks the local Hugging Face cache for all three files. If any file is absent, it uses <code>hf-hub</code> to fetch the required files.</p>
+<p>The model runs on the CPU. The tokenizer's model-specific position count provides a hard maximum sequence length; direct inputs beyond that length are truncated before inference. Markdown indexing splits oversized content earlier to keep chunks below the trained range.</p>
+<h2 id="observable-configuration">Observable configuration</h2>
+<p>The property surface exposes the effective runtime values:</p>
+<ul>
+<li><code>config.socket_path</code>;</li>
+<li><code>config.model_id</code>;</li>
+<li><code>config.dtype</code>;</li>
+<li><code>config.idle_timeout_secs</code>;</li>
+<li><code>config.embed_dim</code>.</li>
+</ul>
+<p><code>config.embed_dim</code> is fixed at 768 by the daemon and is not read from the configuration file.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +713,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +767,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +896,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

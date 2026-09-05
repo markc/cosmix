@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — bus/buildinfo</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,51 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="bus/buildinfo.md"><div class="prose"><h1 id="cosmix-lib-buildinfo--build-provenance">cosmix-lib-buildinfo — build provenance</h1>
+<p><strong><code>cosmix-lib-buildinfo</code> embeds a consumer's compile-time identity without
+adding runtime dependencies.</strong> It records the package and version, git
+revision, dirty-tree state, and build timestamp used for fleet inventory and
+Bus service registration.</p>
+<h2 id="what-it-is">What it is</h2>
+<p><code>BuildInfo</code> contains five compile-time fields:</p>
+<ul>
+<li><code>pkg</code> and <code>version</code> from the crate where <code>build_info!()</code> expands;</li>
+<li><code>git_sha</code>, a 12-character revision captured from the consumer repository;</li>
+<li><code>git_dirty</code>, reporting uncommitted repository content at build time; and</li>
+<li><code>build_time</code>, an RFC3339 UTC timestamp.</li>
+</ul>
+<p><code>BuildInfo::line()</code> renders the standard one-line form. <code>now_rfc3339()</code> is the
+separate runtime helper used for a citizen's process start timestamp.</p>
+<h2 id="how-consumers-use-it">How consumers use it</h2>
+<p>Add the crate as both a normal dependency and a build dependency. The
+consumer's <code>build.rs</code> calls <code>emit()</code>:</p>
+<pre><code class="language-rust">fn main() {
+    cosmix_lib_buildinfo::emit();
+}
+</code></pre>
+<p>The consumer then expands the macro in its own crate:</p>
+<pre><code class="language-rust">let build = cosmix_lib_buildinfo::build_info!();
+println!("{}", build.line());
+</code></pre>
+<p>This two-stage arrangement is deliberate. <code>emit()</code> runs git in the consumer's
+repository and exports <code>COSMIX_GIT_SHA</code>, <code>COSMIX_GIT_DIRTY</code>, and
+<code>COSMIX_BUILD_TIME</code>; <code>build_info!()</code> combines them with that consumer crate's
+<code>CARGO_PKG_*</code> values. It therefore describes the binary being built, not the
+bus checkout that supplies the helper.</p>
+<p>Missing git or a missing <code>emit()</code> call degrades provenance to <code>unknown</code> rather
+than failing the build. <code>SOURCE_DATE_EPOCH</code> pins the build timestamp for
+reproducible builds.</p>
+<p>For broker inventory, consumers pass these fields and one process-start
+timestamp to <code>RegisterProvenance::from_parts</code> from
+<a href="/bus/wire-format">cosmix-lib-bus</a>, then connect with
+<code>NodedClient::connect_with_provenance</code> or the supervised equivalent.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/bus/wire-format">wire format</a> — <code>RegisterProvenance</code>, <code>ServiceInfo</code>, and <code>NodeInfo</code></li>
+<li><a href="/bus/client">client</a> — provenance-aware registration and reconnect</li>
+<li><a href="/bus/overview">overview</a> — the crate family</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +663,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +717,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +846,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

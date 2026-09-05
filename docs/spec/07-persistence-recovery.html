@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/07-persistence-recovery</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,158 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/07-persistence-recovery.md"><div class="prose"><h1 id="persistence-lifecycle-recovery-and-migration">Persistence, lifecycle, recovery and migration</h1>
+<p>Baseline <code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>; verified-source observations
+are not fresh test results. Intended requirements remain binding candidates where
+implementation is incomplete; conflicts are not resolved by this editorial rewrite.
+Exception: <a href="/spec/compatibility-profile">the accepted compatibility amendment</a> resolves
+the audit-integrity and live-delivery guarantees below to the implemented profile.</p>
+<h2 id="1-storage-ownership-and-formats">1. Storage ownership and formats</h2>
+<p><strong>STORE-001 — One writer.</strong> The namespace owner controls records and operation
+semantics. Mutable state belongs under <code>/var/lib/cosmix/&lt;service&gt;/properties/</code>
+or the owner's database; bootstrap identity/listener/key material belongs in
+root-managed <code>/etc/cosmix/&lt;service&gt;/</code>, read-only to the daemon. Properties must
+not become an alternate privileged writer of bootstrap files. Existing service
+config migrations require per-service evidence; old TOML-only path examples do
+not override the newer Mix config format convention.</p>
+<p><strong>STORE-002 — Data-format boundary.</strong> Newly authored substrate-read structured
+files use inert Mix literal data; third-party formats remain their native format,
+and prose remains Markdown. Strict data parsing rejects calls, variables,
+interpolation and executable statements. Scripts and data may both end in <code>.mix</code>
+but require different parsers. Recognised roles include <code>.conf.mix</code>, <code>.spec.mix</code>,
+<code>.journal.mix</code>, <code>.verdict.mix</code>, <code>.call.mix</code>, <code>.state.mix</code>. Existing foreign formats
+convert when touched. This rule does not imply replacing SQLite databases or
+changing JSON protocol/canonical cryptographic bytes.</p>
+<p><strong>STORE-003 — Backend availability.</strong> Memory and SQLite backends are present.
+Memory is ephemeral; SQLite stores business data and substrate metadata together
+through <code>SqliteTableMapping</code>. <code>MixData</code>/<code>Toml</code> enum variants and whole-file+sidecar
+designs are intended, not implemented backends. A future file backend must prove
+crash-consistent multi-file commit; two independent atomic renames are not a
+transaction. One namespace chooses one backend.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/store.rs">store trait</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/sqlite.rs">SQLite</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/memory.rs">memory</a>.</p>
+<h2 id="2-atomic-writes-and-hooks">2. Atomic writes and hooks</h2>
+<p><strong>STORE-004 — Commit invariant.</strong> A successful transition commits record state,
+record version, namespace nseq and immutable event history together. SQLite uses
+one SQL transaction; Memory supplies process-local consistency without durability.
+History carries event kind/verb, actor, key, version, nseq, audit epoch, timestamp,
+changed-field metadata and digest. Set/delete/complete/reconcile are distinct
+transitions; complete and reconcile are internal event verbs, not callable CRUD
+commands. No atomicity across services or namespaces is claimed.</p>
+<p><strong>STORE-005 — Hook ordering (verified-source).</strong> Validate key/cardinality and
+required version presence; read prior context; check primary key; run registered
+pure validators; call <code>before_set</code>; commit; notify dispatcher; call <code>after_set</code>.
+At reconciled props-store 0.3.0, Saga completion attribution is additionally
+validated before hooks and the initial Provisioning write; an invalid owning
+service therefore fails before those effects. See the
+<a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/crates/cosmix-lib-props-store/src/runtime.rs">current runtime</a>.
+Pre-hook failure prevents commit, but a hook can itself have external side effects,
+so do not infer that nothing outside storage happened. The backend checks expected
+version at commit, after pre-hooks. Validation success cannot promise commit success.</p>
+<p>For Simple lifecycle, post-hook failure leaves the commit successful and returns
+warnings. For Saga, commit the initial record as Provisioning, run post-hook, then
+commit Active or Failed as a second version/nseq transition. The caller receives
+set and complete sequence pairs plus terminal lifecycle; failed domain provisioning
+can therefore be a successful substrate response. Completion is pinned to the
+initial committed version: concurrent changes may cause completion mismatch after
+the first write already succeeded. Do not promise rollback of that initial write.</p>
+<p><strong>STORE-006 — Managed lifecycle.</strong> Callers must not write reserved lifecycle state.
+Consumers needing externally usable resources filter Active records. Post-hooks
+must be idempotent for recovery. Hooks implement business operations; an account
+creation involving external mailbox provisioning is a saga, not a fake database
+transaction. Schema-aware secret sanitisation of failure text remains an evidence
+gap: the inspected runtime sanitizer strips controls and bounds length, which is
+not comprehensive secret redaction. Owners must not put secrets in hook errors.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/runtime.rs">runtime</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/lifecycle.rs">lifecycle helpers</a>.</p>
+<h2 id="3-audit-and-retained-history">3. Audit and retained history</h2>
+<p><strong>STORE-007 — Digest (verified-source).</strong> Each row independently computes
+<code>HMAC-SHA256(namespace_key, canonical_record || nseq_be_u64)</code> and exposes lowercase
+hex. The namespace key is 32 random bytes, retained privately by its backend.
+Canonical form is deterministic UTF-8 JSON with sorted object keys. Deletes use
+the literal <code>null</code>; non-finite floats also canonicalise to null, matching the
+wire projection. Signed/unsigned equivalent integers share decimal bytes.</p>
+<p><strong>STORE-008 — Integrity scope (accepted compatibility profile).</strong> There is <strong>no previous-digest
+chain</strong>. Earlier “HMAC-chained” wording is superseded; it overclaimed the implementation and its own
+formula. The digest covers value and nseq, not all event metadata; it does not
+alone authenticate actor/key/verb/epoch nor prove absence of deleted history.
+Privileged verification requires the key and the exact historical unredacted
+value and event nseq. A later current <code>get</code> or a redacted response cannot verify
+an older row. Do not substitute snapshot-wide observed nseq for that row's nseq.
+Stronger provenance authentication needs an explicit versioned design decision.</p>
+<p><strong>STORE-009 — Public audit projection.</strong> Audit events contain namespace, key,
+verb, version, nseq, epoch, actor, timestamp, changed-field metadata and digest;
+never raw secret values. Audit/watch share retained history and projection helpers.
+Access is capability-gated through the owner and protected broker grants. Keys
+must not leave private storage through any property response. Rotation with key IDs
+and retained verification keys is deferred; namespace recreation is not a seamless
+key-rotation procedure.</p>
+<p><strong>STORE-010 — Best-effort delivery.</strong> Atomic event production is separate from delivery.
+The current dispatcher starts at the observed tail and advances after publish
+errors; it has no durable per-subscriber acknowledgement cursor. The old
+at-least-once/contiguous-live promise is superseded for this profile. Recovery uses
+retained replay and re-list on expired history. Neither a successful commit nor
+a caught-up marker proves all future notifications will arrive.</p>
+<p>At 0.3.0, <a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/crates/cosmix-lib-props-store/src/sqlite.rs">SQLite history decoding</a>
+validates persisted Actor values. A batch containing a malformed actor fails with
+<code>StoreError::Storage</code>; replay/read fails rather than skipping or quarantining that
+row. The dispatcher retries failed history reads, distinct from advancing after
+publish errors. Writes are not automatically disabled by this decoding failure.
+Compatibility with an existing database requires inspecting stored values; this
+audit did not do so. Actor metadata is outside the row HMAC and editing it alone
+does not establish a digest mismatch.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/audit.rs">audit implementation</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/dispatcher.rs">dispatcher</a>.</p>
+<h2 id="4-recovery">4. Recovery</h2>
+<p><strong>STORE-011 — Owner unavailable.</strong> A down owner means unavailable properties.
+There is no normal alternate CLI path that bypasses owner validation/audit.
+Out-of-band bootstrap provisions initial authority. Future human-readable file
+backends permit deliberate daemon-down edits; this is an exceptional recovery path.
+Do not claim those files exist for SQLite namespaces.</p>
+<p><strong>STORE-012 — Reconciliation intent.</strong> Before saga replay, detect divergence
+between record bytes and last recorded state. ReconcileAndContinue records a
+synthetic reconcile event, advances nseq/version and increments audit epoch;
+RefuseStartup blocks that namespace pending explicit local acknowledgement.
+Acknowledgement must bind the observed discrepancy and cannot be a wire reconcile
+verb on a daemon that is not serving. The event actor is <code>daemon:reconciliation</code>,
+cause <code>external_edit_detected</code>. Secret bytes must stay out of public old/new
+diagnostics. Epoch records discontinuity; it does not repair lost audit history.</p>
+<p><strong>STORE-013 — Recovery implementation boundary.</strong> <code>commit_reconcile</code> exists in
+the stores, and commit/completion primitives can support provisioning replay; that is not evidence
+of a universal file-hash scanner, acknowledgement CLI or full daemon startup wiring.
+Owners must establish reconcile-before-replay sequencing, replay against the
+post-reconcile record, and leave failed replay visible as Failed with an actionable
+reason. The old “provisioning nseq older than most recent Complete” selection is
+not a sufficient restart predicate by itself; surviving Provisioning state and
+version-pinned completion must govern replay, including subsequent re-provisioning.</p>
+<h2 id="5-schema-and-backend-migration">5. Schema and backend migration</h2>
+<p><strong>STORE-014 — Separate versions.</strong> Spec version, crate version, namespace schema
+version, record version, namespace nseq and audit epoch are different quantities.
+Never use one as a substitute for another. Baseline <code>SchemaVersion</code> validates its
+string deserialisation. Versions describe contract changes, not fleet verification.</p>
+<p><strong>STORE-015 — Defaults.</strong> Add fields with defaults; typed namespace readers supply
+defaults for older sparse records. Wire get/list project stored fields (subject
+to redaction), without silently materialising defaults. A full Replace may densify
+storage; a Patch updates only supplied fields. This preserves reproducible audit
+input. Each owner documents the typed read helper supplying amendment defaults.</p>
+<p><strong>STORE-016 — Compatibility intent.</strong> Deprecation via <code>until</code> preserves old reads
+but rejects new writes of retired fields; type changes use a new field name.
+Namespace renames require an explicit alias/migration interval. Changes to secret,
+validator-secret or public-schema visibility are behavioural compatibility changes:
+version them, invalidate cached descriptions, and document exposure effects.
+The old simultaneous “v0.x additive-only” and “visibility changes are breaking but
+additive” statements conflict; this draft records the conflict and does not infer
+a free pre-GA permission to break consumers silently.</p>
+<p><strong>STORE-017 — Deferred extensions.</strong> Portable export/import, backend migration,
+field encryption, transaction batches and automatic schema derivation require
+separate acceptance evidence. Until a portable export exists, each backend migration
+must preserve records, versions, history, audit keys and recovery semantics or
+explicitly declare the losses; a data-only dump is not an audit-preserving backup.</p>
+<h2 id="validation-requirements">Validation requirements</h2>
+<p>Run backend contract tests for set/delete/recreate, CAS mismatch, event atomicity,
+secret projection, replay expiry and digest vectors; runtime tests for pre/post-hook
+failure, Saga completion races and replay; broker integration for protected grants.
+SQLite restart and failure-injection evidence is required before claiming durable
+recovery. File backends need crash points across every persistence step before
+promotion. This audit ran none of those tests.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +770,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +824,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +953,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

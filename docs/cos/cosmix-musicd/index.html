@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-musicd/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,111 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-musicd/README.md"><div class="prose"><h1 id="cosmix-musicd">cosmix-musicd</h1>
+<p><code>cosmix-musicd</code> renders Standard MIDI Files through SoundFonts, plays rendered or live MIDI audio, manipulates SoundFont banks, and supplies a 32-channel mixer engine and Bus citizen daemon. It belongs to the <code>cos</code> daemon and substrate layer in the <code>bus &lt;- mix &lt;- cos</code> dependency chain: the core audio code is in <code>cos</code>, while the optional daemon uses Bus libraries and the optional mixer host uses Mix strict-data support.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The package builds both the <code>cosmix_musicd</code> library and the <code>cosmix-musicd</code> binary.</p>
+<p>The binary provides headless rendering and SoundFont tools without daemon support. Default features also provide local audio playback, live MIDI input, SF3 decoding, and SFZ conversion. The <code>cosmix</code> feature adds the Bus daemon modes.</p>
+<p>See:</p>
+<ul>
+<li><a href="/cos/cosmix-musicd/cli">Command-line interface</a></li>
+<li><a href="/cos/cosmix-musicd/bus">Bus service and configuration</a></li>
+</ul>
+<h2 id="processing-layers">Processing layers</h2>
+<p>The crate separates its processing paths by Cargo feature:</p>
+<ol>
+<li>The render core loads MIDI and SoundFont data, synthesises stereo floating-point buffers, and writes WAV or FLAC output.</li>
+<li>The <code>playback</code> layer sends file playback or live MIDI synthesis to the host audio device.</li>
+<li>The <code>mixer-host</code> layer hosts the fixed 32-channel mixer on a real-time thread and adds session loading, revisioned controls, and telemetry.</li>
+<li>The <code>cosmix</code> layer registers the <code>musicd</code> Bus citizen and exposes render, playback, property, and mixer services.</li>
+</ol>
+<p>Offline rendering does not require an audio device.</p>
+<h2 id="library-modules">Library modules</h2>
+<table><thead><tr><th>Module</th><th>Availability</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>render</code></td><td>Always</td><td>Offline MIDI-to-audio rendering and WAV or FLAC writing.</td></tr>
+<tr><td><code>synth</code></td><td>Always</td><td>SoundFont, MIDI, and synthesiser settings helpers.</td></tr>
+<tr><td><code>smf</code></td><td>Always</td><td>Minimal Standard MIDI File parsing, scanning, track assembly, and conductor extraction.</td></tr>
+<tr><td><code>stems</code></td><td>Always</td><td>Per-track rendering and in-memory orchestra-bank assembly.</td></tr>
+<tr><td><code>sf2split</code></td><td>Always</td><td>Splits an SF2 bank into one SF2 image per preset.</td></tr>
+<tr><td><code>sf2merge</code></td><td>Always</td><td>Merges selected single-preset SF2 images into one bank.</td></tr>
+<tr><td><code>sf2gain</code></td><td>Always</td><td>Measures rendered preset loudness and applies down-only PCM gain.</td></tr>
+<tr><td><code>sf3</code></td><td><code>sf3</code></td><td>Decodes Ogg-compressed SF3 sample data into an in-memory SF2 image.</td></tr>
+<tr><td><code>sfz</code></td><td><code>sfz</code></td><td>Converts a supported SFZ subset and WAV or FLAC samples into SF2.</td></tr>
+<tr><td><code>mixer</code></td><td>Always</td><td>Fixed 32-channel mixer, source profiles, metering, and headless simulator.</td></tr>
+<tr><td><code>play</code></td><td><code>playback</code></td><td>SoundFont MIDI playback and the daemon playback engine.</td></tr>
+<tr><td><code>live</code></td><td><code>playback</code></td><td>Live MIDI keyboard input through a built-in sine synthesiser.</td></tr>
+<tr><td><code>mixer_host</code></td><td><code>mixer-host</code></td><td>Real-time mixer hosting, revisioned writes, sessions, song schedules, and export.</td></tr>
+<tr><td><code>daemon</code>, <code>fetch</code>, <code>props</code>, <code>world</code></td><td><code>cosmix</code></td><td>Main Bus citizen, first-run SoundFont fetch, properties, and world publication.</td></tr>
+<tr><td><code>mixer_daemon</code></td><td><code>cosmix</code></td><td>Bus mixer control and telemetry service.</td></tr>
+</tbody></table>
+<h2 id="render-api">Render API</h2>
+<p><code>render::RenderOptions</code> selects sample rate, gain, maximum polyphony, effects, channel layout, and output format. Its defaults use 44.1 kHz, unity gain, and enabled reverb and chorus.</p>
+<p><code>render::Channels</code> selects:</p>
+<ul>
+<li><code>Stereo</code></li>
+<li><code>Mono</code>, using the average of left and right</li>
+<li><code>Left</code></li>
+<li><code>Right</code></li>
+</ul>
+<p><code>render::RenderFormat</code> selects 16-bit WAV, 24-bit WAV, 32-bit floating-point WAV, or 24-bit FLAC.</p>
+<p>The principal render functions are:</p>
+<ul>
+<li><code>render_to_buffers</code>, which returns separate left and right buffers plus a <code>RenderReport</code></li>
+<li><code>render_midi_to_file</code>, which loads inputs and writes the selected format</li>
+<li><code>write_render</code>, which writes existing buffers in the selected container</li>
+<li><code>write_wav</code> and <code>write_flac24</code>, which expose the container-specific writers</li>
+</ul>
+<p><code>RenderReport</code> reports duration, frame count, sample rate, peak level, and whether integer output was clipped.</p>
+<p>The renderer is deterministic for identical inputs and options. Floating-point WAV preserves samples above unity; integer formats clamp samples to their representable range.</p>
+<h2 id="midi-and-stems">MIDI and stems</h2>
+<p><code>smf::parse</code> reads the SMF header and raw track chunks. <code>smf::scan</code> identifies track names, sounding notes, bank and program state, and percussion use. <code>smf::scan_song</code> resolves effective bank and program identities across all tracks in time order.</p>
+<p><code>smf::conductor_only</code> retains tempo, time-signature, and end-of-track events while preserving their absolute timing.</p>
+<p><code>stems::render_per_track</code> renders each note-bearing track as a separate audio file. Each stem receives the conductor timing data without inheriting track 0 note events.</p>
+<p><code>stems::assemble_orchestra</code> scans the song, resolves required presets from a split library, fills gaps from a fallback bank, and merges the selected presets in memory. It declines identities that SF2 cannot represent exactly.</p>
+<h2 id="soundfont-tools">SoundFont tools</h2>
+<p><code>sf2split::list_presets</code> lists preset identities and names.</p>
+<p><code>sf2split::split_presets</code> copies the preset, instrument, generator, modulator, and referenced sample records into standalone SF2 images. It can filter by bank or program and retag a single extracted preset.</p>
+<p><code>sf2merge::merge_images</code> combines extracted presets and rejects duplicate bank and program identities.</p>
+<p><code>sf2gain::measure_dbfs</code> renders probe notes and reports audible RMS level. <code>sf2gain::scale_pcm</code> applies a gain no greater than unity to 16-bit or 24-bit sample data.</p>
+<p><code>sf3::maybe_decode_sf3</code> detects Ogg-compressed sample regions and rebuilds an uncompressed SF2 image. Ordinary SF2 input passes through unchanged.</p>
+<p><code>sfz::sfz_to_sf2</code> converts the supported SFZ region model into an uncompressed SF2 image and reports ignored opcodes and skipped regions.</p>
+<h2 id="mixer-api">Mixer API</h2>
+<p>The mixer operates at 48 kHz with 128-frame blocks. It has 32 mono input strips, a stereo master, equal-power pan, trim, fader, mute, solo, and RMS, peak, peak-hold, and clip metering.</p>
+<p><code>mixer::Controls</code>, <code>ChannelControl</code>, and <code>MasterControl</code> hold the canonical control state.</p>
+<p><code>mixer::MixerEngine</code> accepts a fixed <code>SourceProfile</code> at construction. Its public control surface includes <code>set_controls</code>, <code>seek</code>, <code>process_block</code>, <code>process_block_audio</code>, clip-latch reset, and source-bank swaps.</p>
+<p>The source profiles are:</p>
+<ul>
+<li>deterministic benchmark multitone</li>
+<li>preloaded stem session</li>
+<li>per-track MIDI synthesis</li>
+</ul>
+<p><code>mixer::StemBank</code> stores immutable source audio plus non-destructive timeline regions. <code>MidiSynthBank</code> stores prebuilt per-track synthesiser voices and frame-keyed note schedules.</p>
+<p><code>mixer::run_simulator</code> drives the same block processor without an audio device or Bus broker and can write raw meter frames.</p>
+<p>The mixer meter wire types and leaf schema come from the <code>cosmix-mixer-schema</code> dependency.</p>
+<h2 id="playback-api">Playback API</h2>
+<p><code>play::play_blocking</code> plays one MIDI file through a SoundFont and blocks until completion.</p>
+<p><code>play::PlaybackEngine</code> owns the non-sendable audio stream on a dedicated operating-system thread. Callers send play and stop commands and read lock-free <code>PlaybackStatus</code>.</p>
+<p><code>live::run</code> connects a MIDI input to a fixed 16-voice sine synthesiser. MIDI events cross into the audio callback through a single-producer, single-consumer ring; the callback performs no locking, allocation, or I/O.</p>
+<h2 id="features">Features</h2>
+<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>playback</code></td><td style="text-align: right">Yes</td><td>Adds host audio output, live MIDI input, and the real-time event ring.</td></tr>
+<tr><td><code>sf3</code></td><td style="text-align: right">Yes</td><td>Adds pure-Rust Ogg Vorbis decoding for SF3 SoundFonts.</td></tr>
+<tr><td><code>sfz</code></td><td style="text-align: right">Yes</td><td>Adds FLAC decoding and the SFZ-to-SF2 converter.</td></tr>
+<tr><td><code>mixer-host</code></td><td style="text-align: right">No</td><td>Adds playback plus mixer property, session, song, hashing, serialisation, and tracing support.</td></tr>
+<tr><td><code>cosmix</code></td><td style="text-align: right">No</td><td>Adds the full Bus citizen, mixer host, daemon framework, configuration, logging, properties, async runtime, fetch, hashing, and provenance support.</td></tr>
+</tbody></table>
+<p>The <code>default</code> feature set is <code>playback</code>, <code>sf3</code>, and <code>sfz</code>.</p>
+<p>With no default features, the package retains the render, MIDI, SoundFont, stems, and headless mixer core. It omits local playback, live MIDI, SF3 decoding, SFZ conversion, and Bus service code.</p>
+<h2 id="runtime-behaviour">Runtime behaviour</h2>
+<p>The main daemon starts even when its configured SoundFont cannot be fetched or loaded. Render and play requests report the unavailable bank until loading succeeds.</p>
+<p>Playback requires a default output device. Rendering and the mixer simulator remain available on a headless system.</p>
+<p>The mixer daemon uses the audio clock when a compatible device is available and a monotonic software-paced fallback otherwise. Its property snapshot reports whether real audio is active.</p>
+<h2 id="errors">Errors</h2>
+<p>Library operations return <code>anyhow::Result</code>.</p>
+<p>Render calls fail on unreadable inputs, invalid MIDI or SoundFont data, unsupported options, synthesis errors, or output failures.</p>
+<p>SoundFont extraction validates RIFF and hydra record geometry and fails rather than emitting an inconsistent bank.</p>
+<p>Stem-session loading validates schema, sample rate, channel uniqueness, content hashes, mono WAV layout, and declared length before starting the real-time path.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +723,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +777,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +906,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

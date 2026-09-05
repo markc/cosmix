@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/stats</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,141 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/stats.md"><div class="prose"><h1 id="usage-statistics">Usage statistics</h1>
+<p><code>mix stats</code> records how Mix is used and reports either dynamic usage or static
+authorship coverage. Recording is best-effort: a missing, read-only, corrupt,
+or busy state store never changes program output or exit status.</p>
+<h2 id="collection-modes">Collection modes</h2>
+<table><thead><tr><th>Invocation</th><th>Mode</th><th>Script label</th></tr></thead><tbody>
+<tr><td>interactive REPL</td><td><code>interactive</code></td><td>none</td></tr>
+<tr><td><code>mix file.mix</code></td><td><code>script</code></td><td>basename only</td></tr>
+<tr><td><code>mix -c CODE</code></td><td><code>c</code></td><td>none</td></tr>
+<tr><td><code>mix -</code></td><td><code>stdin</code></td><td>none</td></tr>
+<tr><td><code>mix --serve file.mix</code></td><td><code>serve</code></td><td>basename only</td></tr>
+</tbody></table>
+<p>Calls in functions, callbacks, handlers, <code>source</code>, and <code>include</code> retain the
+top-level mode and script label. Paths are never stored. Basenames are truncated
+to 96 Unicode characters; each weekly document keeps at most 128 distinct
+labels and merges overflow into <code>(other)</code>.</p>
+<p>The standard prelude and <code>~/.mixrc</code> load before collection is attached, so
+bootstrap code does not pollute the invoking program's figures. Remote ssh
+execution needs no special mode: the far-end process records its normal
+<code>script</code>, <code>c</code>, or <code>stdin</code> invocation.</p>
+<p>Enabled collection is not free. Exact statement/function counts make recursive
+functions use the canonical evaluator path instead of the native sync-recursion
+fast path, and tracked calls perform builtin membership lookup. This can be
+measurable in tight recursive or call-heavy workloads; use <code>MIX_STATS=off</code> when
+that cost matters.</p>
+<h2 id="disable-collection">Disable collection</h2>
+<p>Set <code>MIX_STATS=off</code>; <code>0</code> and <code>false</code> are synonyms, ignoring ASCII case and
+surrounding whitespace. This is the documented setting for remote and mesh
+servers:</p>
+<pre><code class="language-text">MIX_STATS=off mix -c 'print("unrecorded")'
+</code></pre>
+<p>The setting is read once per process. When disabled, Mix allocates no collector
+and opens no state file, database, or lock. Every runtime tracking hook first
+checks the same cached boolean and returns before borrowing collector state,
+formatting errors, or scanning builtin names. <code>mix stats</code>, including <code>coverage</code>,
+prints a disabled message without reading its target.</p>
+<h2 id="storage-and-concurrency">Storage and concurrency</h2>
+<p>State lives under <code>$XDG_STATE_HOME/mix</code>, falling back to
+<code>$HOME/.local/state/mix</code>. One-shot runs accumulate counters in memory and flush
+once after evaluation, including after <code>exit(code)</code> and ordinary uncaught
+errors. Long-lived processes retain daily UTC buckets so a run crossing
+midnight or an ISO-week boundary is split truthfully.</p>
+<p><code>current.json</code> is the current ISO week; archived weeks are <code>YYYY-WNN.json</code>.
+Schema 2 adds daily context buckets while retaining the original aggregate
+fields. A schema-1 file is loaded as one approximate legacy bucket on its
+<code>last_date</code>; that is the limit of the old format's date precision. Unknown JSON
+fields are ignored. A malformed JSON document, or one containing an
+out-of-range persisted date or timestamp, is renamed with a <code>.corrupt</code> suffix
+and skipped; recording continues with a fresh document and reports use the
+remaining valid history. Set <code>MIX_DEBUG</code> to see the quarantine path.</p>
+<p>Rotation stores a fingerprint of each imported <code>current.json</code> in the archive,
+so retrying after a crash between archive commit and current-file removal does
+not double its counters. Persisted week labels are accepted as filenames only
+in canonical <code>YYYY-WNN</code> form; invalid labels are derived from bucket/session
+dates instead.</p>
+<p><code>mix.db</code> retains the original <code>usage</code> and <code>sessions</code> tables and adds
+<code>usage_context</code>, <code>runs</code>, and <code>stats_meta</code>. JSON is canonical. Mix takes one
+bounded advisory lock across JSON merge/rotation and the SQLite transaction;
+JSON writes use a unique same-directory temporary file and atomic rename. If
+an automatic writer flush cannot acquire the lock within 200 milliseconds, the
+batch is skipped so a one-shot never stalls its exit on stats contention.
+Reader/report and explicit mutation paths retain a two-second lock deadline.
+Details are printed only when <code>MIX_DEBUG</code> is set. Run IDs include 128 bits of
+random entropy; the <code>runs</code> primary key also gates insertion into the legacy
+<code>sessions</code> table, so retrying the same completed run cannot duplicate that row.</p>
+<p>The store is required to be on a responsive local filesystem. The 200 ms writer
+and two-second report bounds apply to lock acquisition, not reads, writes,
+rename, <code>sync_all</code>, or SQLite; a stalled NFS/FUSE mount can therefore stall a
+flush. Full asynchronous I/O deadlines are outside this local-state design.</p>
+<p>The advisory lock coordinates Mix 0.61 and newer writers. During upgrade, stop
+long-running pre-0.61 processes before starting 0.61; older processes do not
+participate in this lock protocol.</p>
+<p>In script, <code>-c</code>, stdin, and serve modes, SIGINT and SIGTERM take the normal
+flush path. The interactive REPL stays alive on Ctrl-C and later flushes on EOF,
+<code>exit</code>, or ordinary shutdown, but an OS SIGTERM uses the terminal process's
+default termination and may lose its in-memory batch. <code>SIGKILL</code>, a panic, or
+power loss can also lose the in-memory batch; stats are intentionally
+best-effort.</p>
+<p>If legacy history remains under <code>$COSMIX_SRC/_stats</code>, report commands print a
+migration or acknowledgement command. History is never moved automatically.</p>
+<h2 id="reports-and-windows">Reports and windows</h2>
+<p>Every usage report prints its window in the first line. The default window is
+the current ISO week, and <code>overview</code> and <code>never</code> use the exact same snapshot.</p>
+<pre><code class="language-text">mix stats                 current-week overview
+mix stats builtins       current-week builtin calls
+mix stats functions      current-week user-function calls
+mix stats aliases        current-week alias expansions
+mix stats commands       current-week external commands
+mix stats keywords       current-week canonical keyword executions
+mix stats meta           current-week meta commands
+mix stats errors         current-week errors
+mix stats sessions       current-week completed runs
+mix stats never          current-week builtins and keywords with zero use
+mix stats modes          current-week per-mode breakdown
+mix stats scripts [N]    top scripts; N defaults to 10 and is bounded to 1–100
+mix stats raw            current-week schema-2 JSON snapshot
+mix stats week YYYY-WNN  one ISO week
+mix stats since DATE     buckets on or after YYYY-MM-DD
+mix stats all            all weekly JSON documents
+mix stats trend NAME     last 30 recorded days
+mix stats query SQL      explicitly labelled all-time SQLite query
+</code></pre>
+<p>At the interactive REPL, a bare <code>mix stats …</code> line runs in-process and reports
+this session's live counters. Since 0.61.1 a piped or redirected line
+(<code>mix stats never | wc -l</code>, <code>mix stats never &gt;&gt; log</code>) runs as a real external
+pipeline instead — live stats are flushed to disk first, so the child reads
+current data including this session. Before 0.61.1 the plumbing was silently
+dropped. See <code>mix man shell-mode</code> § "<code>mix</code> meta-commands under plumbing".</p>
+<p><code>clear NAME</code> removes a name from persisted counter categories. <code>reset</code> removes
+the current week's JSON document. At a week boundary it archives the old
+<code>current.json</code> first, and a live REPL retains older pending buckets. Week and
+date arguments must use canonical <code>YYYY-WNN</code> and <code>YYYY-MM-DD</code> forms. These
+mutation commands use the same lock as recording.</p>
+<p>The canonical tracked keyword vocabulary is:</p>
+<pre><code class="language-text">if for while loop function return select print eprint parse die
+try catch finally export alias break continue send address emit on
+source include sh
+</code></pre>
+<p>Structural delimiters such as <code>then</code>, <code>end</code>, <code>done</code>, and <code>each</code> are not usage
+events.</p>
+<h2 id="static-authorship-coverage">Static authorship coverage</h2>
+<pre><code class="language-text">mix stats coverage DIR
+</code></pre>
+<p>Coverage follows the root path explicitly named by the user, then recursively
+scans sorted <code>.mix</code> files without following symlinks encountered below that
+root. It tokenises and parses with Mix's real lexer and parser, then walks the
+AST. Builtin call sites inside strings, heredocs, or comments cannot be mistaken
+for code. Nested calls, higher-order builtins, and builtin method syntax are
+counted. Calls through a function-valued expression are reported as “dynamic
+calls not classifiable” and are never guessed.</p>
+<p>The command reports used and never-authored builtins and canonical keywords.
+If any selected file is unreadable or fails to lex or parse, diagnostics are
+printed and the command exits non-zero without emitting a misleading coverage
+report. Coverage performs no persistence writes.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +753,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +807,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +936,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

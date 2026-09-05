@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,53 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/README.md"><div class="prose"><h1 id="cosmix-specifications">Cosmix specifications</h1>
+<p>This is the replacement specification candidate, audited against source commit
+<code>96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be</code>. It is not a claim that every
+requirement is implemented, tested, deployed or accepted. Publication does not
+resolve the discrepancies recorded in individual chapters.</p>
+<p>The <a href="/spec/compatibility-profile">security and delivery compatibility amendment</a>
+is accepted: its listed guarantees now match the implementation. The suite as a
+whole remains draft; other conflicts and publication gates remain open.</p>
+<p>The complete 47-file delta through commit
+<code>4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac</code> has also been reconciled.
+Chapters 03, 06, 07 and 08 describe the changed boundaries; unchanged modules
+retain original source pins. This does not imply fresh Rust tests or deployment.</p>
+<h2 id="reading-order">Reading order</h2>
+<table><thead><tr><th>Chapter</th><th>Contract</th></tr></thead><tbody>
+<tr><td><a href="/spec/00-authority">00 — Authority and change</a></td><td>Status, evidence, naming and amendment rules</td></tr>
+<tr><td><a href="/spec/01-foundations">01 — Foundations</a></td><td>Ownership, safety, autonomy and architectural principles</td></tr>
+<tr><td><a href="/spec/02-composition">02 — Composition</a></td><td>Workspace boundaries, dependencies and installation</td></tr>
+<tr><td><a href="/spec/03-shared-types">03 — Shared types</a></td><td>Validated values, records and environment gates</td></tr>
+<tr><td><a href="/spec/04-bus-wire">04 — Bus wire</a></td><td>Framing, envelopes and command contracts</td></tr>
+<tr><td><a href="/spec/05-broker-topics">05 — Broker and topics</a></td><td>Routing, pub/sub and distribution</td></tr>
+<tr><td><a href="/spec/06-properties">06 — Properties</a></td><td>Read surfaces, namespaces, mutations and authorisation</td></tr>
+<tr><td><a href="/spec/07-persistence-recovery">07 — Persistence and recovery</a></td><td>Transactions, history, audit and reconciliation</td></tr>
+<tr><td><a href="/spec/08-mesh-trust">08 — Mesh and trust</a></td><td>Peer identity, transport and authority</td></tr>
+<tr><td><a href="/spec/09-mix-integration">09 — Mix integration</a></td><td>Language discovery and runtime contracts</td></tr>
+<tr><td><a href="/spec/10-daemon-agent-operation">10 — Daemons and agents</a></td><td>Lifecycle, observation, repair and improvement</td></tr>
+<tr><td><a href="/spec/11-desktop">11 — Desktop</a></td><td>Compositor, Wayland and control-plane boundaries</td></tr>
+<tr><td><a href="/spec/12-toolkit-apps">12 — Toolkit and apps</a></td><td>Design system, UI state and application integration</td></tr>
+<tr><td><a href="/spec/13-conformance">13 — Conformance</a></td><td>Evidence gates, priorities and release readiness</td></tr>
+</tbody></table>
+<p>Retained-detail profiles follow their parent chapters: daemon identity (10a),
+repair/improvement (10b), package installation (10c), and design format (12a).
+They preserve detailed intended rules, not implementation certification.</p>
+<h2 id="scope-and-stability">Scope and stability</h2>
+<p>Bus names the protocol/library family. <strong>ABP means Agent Bus Protocol</strong>.
+AMP is historical terminology, not a new spelling to introduce into contracts.
+Existing historical identifiers and encoded data must not be mechanically renamed.</p>
+<p>The chapter prefixes are reading order only. They do <strong>not</strong> replace legacy
+<code>SPEC 07</code>, <code>SPEC 12</code>, <code>spec.get</code> numeric IDs, or <code>world.specs.NN</code> keys. Runtime
+distribution needs an explicit compatibility plan before switching directories.</p>
+<p>The intended public home is <code>docs/spec/</code> in <code>markc/cosmix</code>, served under <code>/spec/</code>.
+Private audit notes, original snapshots, deployment details and review transcripts
+stay private. While this candidate remains draft, do not treat its unresolved
+conflicts as permission to weaken an existing safety requirement.</p>
+<p>Before v1.0 GA, expect revisions and occasional reorganisation. Stable requirement
+IDs, source revisions, explicit dispositions and migration notes—not filenames—
+provide continuity. See <a href="/spec/00-authority">authority</a> and <a href="/spec/13-conformance">conformance</a>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +665,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +719,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +848,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/quoin</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,244 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/quoin.md"><div class="prose"><h1 id="cosmix-quoin">cosmix-quoin</h1>
+<p><code>cosmix-quoin</code> is the Cosmix desktop furniture shell. It owns four independent
+<code>zwlr_layer_surface_v1</code> panels — left, bottom, right and top — and renders the
+existing Quoin chrome into one explicit Bevy window target per surface. The
+installable application id and layer namespace are <code>dev.cosmix.quoin</code>.</p>
+<p>Arc 3 presents real layer-shell buffers through <code>cosmix-shell-host</code> 0.4.0,
+<code>cosmix-shell</code> 0.5.0 and SCTK 0.19.2. <code>cosmix-quoin</code> is 0.5.0;
+<code>cosmix-quoin-demo</code> remains a
+feature-gated, non-installable normal-window tuning arm; it is not a
+layer-shell client.</p>
+<h2 id="output-and-scale">Output and scale</h2>
+<p>Version 1 owns exactly one output runtime. <code>--output NAME</code> selects the exact
+complete SCTK <code>wl_output</code> advertising that name. A missing name is an error
+which lists every advertised output. Without the option, Quoin selects the
+first complete output in advertisement order. Every panel role is created
+with that explicit <code>wl_output</code>, never the compositor default. Removing an
+explicitly selected output unmaps and render-drains all four panels, drops
+their protocol resources, then exits cleanly; a later output reusing the same
+name is not the selected object. A default selection instead migrates to the
+next complete output, or exits cleanly when none remains.
+If a compositor advertises duplicate output names, explicit selection uses the
+first complete match in advertisement order.</p>
+<p>Layer protocol and viewport destination dimensions remain logical. Integer
+output scale 1 or 2 renders physical buffers at <code>logical × scale</code> and applies
+that integer with <code>wl_surface.set_buffer_scale</code>. With a fractional preferred
+scale such as 1.25 (150/120), Quoin keeps buffer scale 1, renders
+<code>ceil(logical × scale)</code> physical pixels and sets the <code>wp_viewport</code> destination
+back to the configured logical size. Bevy stores the corresponding physical
+resolution and scale override. Every configure and scale change is checked
+against the renderer's negotiated maximum 2D texture dimension before surface
+scaling requests or Bevy window mutation. SCTK acknowledges each configure
+first, as required by the protocol. Either zero configure dimension falls back
+to the planner-requested logical dimension; a compositor close or invalid
+scale terminates the affected lifecycle cleanly rather than panicking.</p>
+<h2 id="map-presentation-and-replay">Map, presentation and replay</h2>
+<p>Each first map replays layer, anchor, size, exclusive zone, edge margin and
+keyboard interactivity, then makes an initial bufferless commit. SCTK
+acknowledges the compositor configure before the host accepts its logical
+size. Only then does Quoin insert the retained Wayland raw handle, enable the
+panel's explicitly targeted <code>Camera2d</code>, emit the Bevy create/resize/scale
+messages, render, attach and present.</p>
+<p>Unmap runs in the opposite lifetime order: remove <code>RawHandleWrapper</code>, disable
+the camera, run one non-pipelined Bevy update to drain render-world removal,
+then destroy the <code>zwlr_layer_surface_v1</code> and its <code>wl_surface</code>. Destroying the
+objects prevents SCTK from acknowledging a configure queued for the old role
+after the compositor has reset its configure state. The Bevy <code>Window</code>, camera
+and chrome mount entities remain stable. Remap creates a fresh <code>wl_surface</code>
+and layer role on the explicit output, recreates the retained raw-handle
+owner, replays every property, and repeats the bufferless configure gate. A
+successful remap therefore emits <code>WindowCreated</code> again before another buffer
+can be presented. Teardown order is defined in one place and tested through a
+probe.</p>
+<p>Pinned panels use <code>Top</code>, reserve their complete logical thickness and keep
+protocol margin zero; chrome alone owns their transient slide. Revealed and
+mapped-concealing panels use <code>Overlay</code>, reserve zero and slide with their edge
+protocol margin. This also covers pin-from-hidden: the full zone exists at
+fraction zero while chrome supplies the only visual translation. Keyboard
+policy maps only to <code>None</code> or <code>OnDemand</code>; Quoin never requests <code>Exclusive</code>.
+Chrome selects its translation owner from the last successfully committed
+protocol mode, not the model's next desired mode. The host advances that latch
+only after a commit, or after completed role destruction for unmap, so pin and
+unpin cannot hand motion between protocol margin and chrome one frame early.</p>
+<h2 id="event-driven-wake-contract">Event-driven wake contract</h2>
+<p>There is no polling, refresh tick or fixed animation sleep. The calloop runner
+coalesces work into one <code>app.update()</code> demand. <code>Idle</code> removes the model timer
+and blocks on the Wayland file descriptor when no configure or frame request
+is outstanding. <code>WakeAt</code> owns one replaceable absolute calloop timer.
+<code>Animate</code> advances only from <code>wl_surface.frame</code> callbacks, with at most one
+outstanding callback per mapped animating panel. The visible bottom clock's
+one-second deadline is content work and disappears when that panel is
+unmapped. Callbacks are generation-tagged, so late or expired callbacks are
+ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
+requests, which no process lifetime reaches).</p>
+<p>Keyboard repeat shares this wake layer. The active key owns one replaceable
+absolute deadline; a due wake emits one coalesced repeat and arms the next
+deadline from the actual wake time. There is no per-key thread, catch-up burst,
+sleep loop or refresh timer. <code>Idle</code> therefore has no timer unless a real
+repeat, configure or other bounded deadline is outstanding.</p>
+<p>Two bounded one-shot liveness backstops share that single timer. The frame
+backstop participates only while the policy is <code>Animate</code> and a frame callback
+is outstanding. Its deadline is derived from the oldest request: one second
+after that request, rounded up to a 250 ms boundary. It releases only callbacks
+that are at least one second old and requests one coalesced update;
+quantisation lets consecutive animated frames retain the same timer source.
+A bufferless map independently arms a ten-second configure deadline; expiry
+exits with a distinct abnormal reason. These are not ticks: no backstop remains
+armed when its qualifying work is absent, and timely compositor replies
+replace or remove the deadline before it can fire.</p>
+<h2 id="exit-status-and-reasons">Exit status and reasons</h2>
+<p>The final marker is <code>QUOIN_LAYER_HOST_EXIT reason=...</code>. <code>--help</code> is the one
+successful path which prints usage and no marker. Error details replace <code>*</code> in
+the patterns below.</p>
+<table><thead><tr><th>Status</th><th>Reason value or pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>0</td><td>no marker (<code>--help</code>)</td><td>Usage requested.</td></tr>
+<tr><td>0</td><td><code>signal-int</code>, <code>signal-term</code></td><td>Clean SIGINT or SIGTERM drain.</td></tr>
+<tr><td>0</td><td><code>layer-surface-closed-{Left,Bottom,Right,Top}</code></td><td>The compositor closed a live layer surface.</td></tr>
+<tr><td>0</td><td><code>selected-output-removed-no-replacement</code></td><td>The selected output disappeared and no eligible replacement remained.</td></tr>
+<tr><td>0</td><td><code>bevy-app-exit</code>, <code>clean</code></td><td>Clean application exit, or the defensive clean fallback.</td></tr>
+<tr><td>non-zero</td><td><code>invalid-cli</code></td><td>Invalid command-line arguments.</td></tr>
+<tr><td>non-zero</td><td><code>wayland-connect-failed-*</code>, <code>wayland-registry-failed-*</code>, <code>wl-compositor-unavailable-*</code>, <code>layer-shell-unavailable-*</code></td><td>Wayland connection, registry or required-global setup failed.</td></tr>
+<tr><td>non-zero</td><td><code>output-discovery-failed-*</code>, <code>requested-output-unavailable-*</code>, <code>no-complete-output</code>, <code>v1-output-limit-exceeded</code></td><td>Output discovery or single-output selection failed.</td></tr>
+<tr><td>non-zero</td><td><code>raw-handle-failed-*</code>, <code>panel construction count was not four</code>, <code>forbidden-bevy-host-plugin-active</code>, <code>render-device-texture-limit-unavailable</code></td><td>Initial surface/renderer setup failed an invariant. The texture-limit reason specifically means that no usable <code>RenderDevice</code> was present after Bevy finish; renderer initialisation failures retain Bevy's existing panic path.</td></tr>
+<tr><td>non-zero</td><td><code>output-replacement-failed-*</code>, <code>surface-plan-failed-*</code></td><td>Output migration or surface reconciliation failed.</td></tr>
+<tr><td>non-zero</td><td><code>configure-out-of-range-*</code>, <code>configure-timeout-*</code></td><td>A configure was invalid or did not arrive in time.</td></tr>
+<tr><td>non-zero</td><td><code>wake-deadline-stuck</code>, <code>wake-timer-failed-*</code></td><td>Wake scheduling stopped making progress or its timer failed.</td></tr>
+<tr><td>non-zero</td><td><code>bevy-app-error</code></td><td>Bevy requested an error exit.</td></tr>
+<tr><td>non-zero</td><td><code>calloop-create-failed-*</code>, <code>wayland-source-failed-*</code>, <code>signal-source-failed-*</code>, <code>signal-source-insert-failed-*</code>, <code>calloop-dispatch-failed-*</code>, <code>wayland-flush-failed-*</code></td><td>Event-loop, signal integration, dispatch or Wayland flushing failed.</td></tr>
+</tbody></table>
+<h2 id="bus-identity-and-live-power">Bus identity and live power</h2>
+<p>Quoin registers the stable Bus service identity <code>shell</code>; its subscription
+plane is <code>shell-sub</code>. <code>shell.ping</code> and <code>shell.info</code> provide presence and
+discovery. Live panel state is read through the uniform
+<code>shell.props.{get,list,describe}</code> surface under
+<code>panels.&lt;edge&gt;.{visible,pinned,width_px,page,pages,output}</code>.</p>
+<p>The ephemeral semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin}</code>
+and <code>shell.panel.page.{next,prev,set}</code>. They require a broker-stamped local,
+registered caller and are translated to the same <code>ShellCommand</code> ingress used
+by Quoin's controls. There is no resize, arrangement, persistence, geometry or
+synthetic pointer/corner verb in this slice.</p>
+<p>The bottom carousel places <code>power</code> immediately after the clock-bearing
+launcher page. It subscribes to <code>power.props.changed</code> before reading
+<code>power.props.get</code>, snapshots again on reconnect, on a delivery gap, on a
+change arriving while it holds no snapshot (a powerd that was down at connect
+recovers on its first publication — no broker reconnect needed), and on a
+stale event sequence while live (a restarted powerd republishes from 1), and
+never polls. Before an authoritative snapshot it says <code>Power unavailable</code>; a
+host without a battery says <code>No system battery</code>; a partial battery reading
+names missing charge or state explicitly; a full reading renders only the
+supplied percentage, state, time, rate and health fields. Missing values are
+never rendered as zero.</p>
+<h2 id="interaction-boundary">Interaction boundary</h2>
+<p>Production reveal comes only from the compositor's semantic corner topics;
+Quoin creates no corner hotspot surfaces. <code>--comp-service NAME</code> selects the
+registered compositor instance (default <code>comp</code>), giving topic headers
+<code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code> and
+<code>&lt;service&gt;.output.changed</code>. Their inner commands remain the unprefixed
+<code>corner.entered</code>, <code>corner.left</code> and <code>output.changed</code>.</p>
+<p>Quoin subscribes to all three topics before addressing the selected service
+with the fixed <code>comp.props.get</code> request verb at <code>outputs</code>. It maps the topic's
+stable <code>o_&lt;slug&gt;</code> output key through the public
+row's raw <code>name</code> and accepts only the exact SCTK-selected output. Output-change
+notices and each reconnect generation refresh the complete map. A topic gap,
+disconnect, channel overflow, output replacement or shutdown clears every
+corner hold conservatively. Broker absence or restart disables only corner
+ingress: the layer surfaces, pointer controls and static smoke mode continue,
+and reconnect is automatic and starts disengaged. Topic delivery authenticates
+neither the original publisher nor its <code>from</code> header, so any local publisher
+authorised for those topics can inject corner events.</p>
+<p>Quoin opts into <code>cosmix-lib-client</code>'s bounded subscription receiver at 64
+commands. The socket reader never waits for capacity; a full lane drops the new
+frame and surfaces an overflow marker. Quoin treats that marker exactly like a
+disconnect: synthesize left for all engagements, invalidate the slug map, and
+refresh it before accepting mapped corner state again.</p>
+<p>A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
+BR→right, TR→top). Matching left starts the 800 ms grace only when the native
+pointer is also outside. Native SCTK pointer enter/leave supplies the second
+hold; Bevy pointer button events drive pin, both carousel chevrons and page
+dots. Pin survives both leaves, and unpin outside both holds starts normal
+grace. Wheel events are delivered to Bevy although current chrome does not
+consume them.</p>
+<p>SCTK installs the compositor xkb keymap and maps physical keys, logical keys,
+text, modifiers and repeat into Bevy's input model. Focus loss, panel teardown
+and keyboard capability loss synthesize releases for held keys, clear pressed
+state and stop repeat. Compositor repeat settings are clamped to 1–125 Hz and a
+50–2000 ms delay; each fired deadline advances strictly beyond both its prior
+deadline and current model time. Because SCTK does not expose the raw XKB masks
+needed to reinterpret repeated text safely, any compositor modifier callback
+stops repeat for that press; release and press the key again to resume. Touch
+down is attributed to the exact panel surface; motion and up retain that local
+Bevy window attribution. Touch cancel,
+teardown and capability loss emit cancellation and clear every held contact.
+Quoin chooses the first advertised seat independently for pointer, keyboard
+and touch, and fails each capability over after its selected seat is removed.</p>
+<p>The pure <code>CornerDetector</code> remains a development-host tuning tool and is not a
+production reveal source.</p>
+<p>Stable transition markers are:</p>
+<pre><code class="language-text">QUOIN_REVEAL edge=left trigger=corner
+QUOIN_CONCEAL edge=left reason=corner-left
+QUOIN_CONCEAL edge=left reason=grace
+QUOIN_PIN edge=left state=pinned
+QUOIN_PIN edge=left state=unpinned
+</code></pre>
+<p>The edge is one of <code>left</code>, <code>bottom</code>, <code>right</code> or <code>top</code>. A marker is printed once
+per real semantic transition. <code>--smoke-all-panels</code> starts all four panels
+pinned and prints one pinned marker per edge before the existing four-surface
+ready marker. Mutually exclusive <code>--smoke-hidden</code> starts them hidden and prints
+<code>QUOIN_HIDDEN_READY panels=4</code> after the first complete hidden frame.</p>
+<p>Chrome retains semantic AccessKit nodes, but disabling winit also removes its
+platform AccessKit adapter. Platform accessibility is therefore deferred and
+is not claimed by this host.</p>
+<p>Planner and raw-owner tests run without a compositor. A fake-Wayland-peer wire
+test was not added in this slice: it could check request ordering, but it
+cannot exercise Bevy/wgpu's foreign WSI attach/present boundary, and building a
+second miniature layer-shell compositor fixture solely for the partial claim
+was not reasonable for this gate. The live nested compositor gate remains the
+wire and presentation authority.</p>
+<p>This arc vendors nothing and edits no Smithay source. Quoin consumes
+<code>cosmix-comp</code>'s documented public layer-shell contract unchanged.</p>
+<h2 id="source-gates">Source gates</h2>
+<p><code>setup.mix --desktop</code> first retains the desktop workspace release build used
+for every other app, then rebuilds the installed <code>cosmix-quoin</code> binary from the
+isolated shipping selection in <code>src/desktop/Cargo.toml</code>, using
+<code>src/desktop/target/quoin-install</code> as its target directory. The demo target is
+still skipped because it has <code>required-features = ["demo"]</code>.</p>
+<p>The <code>cosmix-shell-host</code> test suite reads that same shipping selection and proves
+its full locked, offline graph remains Wayland-only. Cargo does not expose a
+dependency's active features through a consumer crate's <code>cfg</code>, so the test
+inspects Cargo's forward feature graph directly, rejects multiple resolved
+<code>winit</code> packages, clears inherited <code>CARGO_*</code> configuration, requires Wayland
+and rejects X11:</p>
+<pre><code class="language-sh">cargo test -p cosmix-shell-host shipped_quoin_graph_has_wayland_without_x11
+</code></pre>
+<h2 id="hardware-only-deferrals">Hardware-only deferrals</h2>
+<p>The source and nested gates cannot prove these real-session paths:</p>
+<ul>
+<li>the KMS four-panel path, including fuzzel retaining its <code>Exclusive</code> latch
+while Quoin's <code>None</code> and <code>OnDemand</code> panels redraw;</li>
+<li>texture-limit preflight against the real GPU's negotiated limit;</li>
+<li>scale 2 and a real 1.25 fractional scale end-to-end through
+<code>wp_fractional_scale</code> and viewporter;</li>
+<li>keyboard repeat pausing rather than bursting under KMS load; and</li>
+<li>VT switch and seat re-add on a real session.</li>
+</ul>
+<h2 id="known-limits">Known limits</h2>
+<p>This host deliberately supports one output runtime and one active device per
+input capability. It does not mirror panels across several outputs; pointer,
+keyboard and touch may come from different seats when the compositor splits
+those capabilities. Use <code>--output NAME</code> when advertisement-order selection is
+not appropriate.</p>
+<p>On compositors binding <code>wl_keyboard</code> below version 4 and therefore sending no
+<code>repeat_info</code>, SCTK 0.19.2 supplies no usable synthetic default, so keyboard
+repeat is unavailable.</p>
+<p>Destroy-and-recreate is required because the current compositor rejects an
+acknowledgement for a configure serial retained across unmap. If the
+compositor later tolerates stale post-unmap acknowledgements, a comp-side
+follow-up could make the cheaper attach-NULL path safe; this host does not
+assume that behaviour.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +856,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +910,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1039,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

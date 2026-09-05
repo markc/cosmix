@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,152 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild/README.md"><div class="prose"><h1 id="cosmix-maild">cosmix-maild</h1>
+<p><code>cosmix-maild</code> is the Cosmix mail, calendar, and contacts daemon. It serves JMAP, SMTP, IMAP, CalDAV, and CardDAV; owns account and mail-domain state; and exposes administration through a command-line interface and Bus. It belongs to the <code>cos</code> daemon layer in the <code>bus ← mix ← cos</code> dependency chain: it uses Bus client and wire libraries directly, and uses the Mix interpreter for strict-data configuration and inbound routing scripts.</p>
+<h2 id="package">Package</h2>
+<p>The Cargo package and binary are named <code>cosmix-maild</code>. The library import name is <code>cosmix_maild</code>.</p>
+<p>The crate has no crate-defined Cargo features.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<ul>
+<li>A JMAP server for core, mail, submission, calendar, contacts, and vacation-response operations.</li>
+<li>SMTP inbound delivery, implicit-TLS submission, outbound queuing and delivery, STARTTLS, DKIM signing, and mail-auth verification.</li>
+<li>An IMAPS server with password authentication, mailbox management, message fetch and mutation, search, copy, move, expunge, and IDLE.</li>
+<li>CalDAV and CardDAV discovery, property queries, reports, object reads, writes, and deletes.</li>
+<li>Basic and bearer-token HTTP authentication.</li>
+<li>SQLite metadata, content-addressed mailbox storage through <code>cosmix-mds</code>, blob storage, search indexing, retention, and Bayesian retraining.</li>
+<li>A SPEC 12 property substrate for accounts, aliases, domains, engine settings, retention, TLS identities, and per-account rules overrides.</li>
+<li>Bus verbs for administration, diagnostics, statistics, reloads, and token management.</li>
+<li>A reusable production runtime for integration tests and embedding.</li>
+</ul>
+<p>See <a href="/cos/cosmix-maild/cli">cli.md</a> for command syntax and <a href="/cos/cosmix-maild/bus">bus.md</a> for the Bus surface.</p>
+<h2 id="network-surfaces">Network surfaces</h2>
+<h3 id="jmap-and-http">JMAP and HTTP</h3>
+<p>The HTTP listener serves:</p>
+<table><thead><tr><th>Route</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>GET /.well-known/jmap</code></td><td>Authenticated JMAP Session resource</td></tr>
+<tr><td><code>POST /jmap</code></td><td>JMAP method endpoint</td></tr>
+<tr><td><code>GET /jmap/blob/{blobId}</code></td><td>Account-scoped blob download</td></tr>
+<tr><td><code>POST /jmap/upload/{accountId}</code></td><td>Account-scoped blob upload</td></tr>
+<tr><td><code>GET /jmap/eventsource</code></td><td>JMAP state-change event stream</td></tr>
+<tr><td><code>POST /auth/tokens/issue</code></td><td>Exchange Basic credentials for a bearer token</td></tr>
+<tr><td><code>POST /auth/tokens/verify</code></td><td>Verify a bearer token</td></tr>
+<tr><td><code>POST /auth/tokens/revoke</code></td><td>Revoke a bearer token</td></tr>
+</tbody></table>
+<p>Implemented JMAP method families are <code>Mailbox</code>, <code>Email</code>, <code>Thread</code>, <code>EmailSubmission</code>, <code>Identity</code>, <code>Calendar</code>, <code>CalendarEvent</code>, <code>AddressBook</code>, <code>Contact</code>, and <code>VacationResponse</code>. <code>Core/echo</code> is also available.</p>
+<h3 id="smtp">SMTP</h3>
+<p><code>smtp_inbound</code> enables inbound SMTP. <code>smtp_smtps</code> enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.</p>
+<p>Inbound delivery resolves local accounts and aliases, applies mail-auth checks, the rules engine, Bayesian classification, optional Mix routing, and retention-related metadata before committing mail to the mailbox store. Remote submissions enter the retry queue and outbound delivery path.</p>
+<h3 id="imap">IMAP</h3>
+<p><code>imap_imaps</code> enables implicit-TLS IMAP. The default advertised capabilities are:</p>
+<pre><code class="language-text">IMAP4rev2 IMAP4rev1 SASL-IR AUTH=PLAIN AUTH=LOGIN ID
+NAMESPACE CHILDREN SPECIAL-USE UNSELECT LITERAL+ UIDPLUS MOVE IDLE
+</code></pre>
+<p>The command handlers cover authentication, capability and session control, mailbox listing and mutation, selection and status, fetch, search, flags, store, append, copy, move, expunge, subscriptions, and IDLE.</p>
+<h3 id="caldav-and-carddav">CalDAV and CardDAV</h3>
+<p>The DAV router serves <code>/.well-known/caldav</code>, <code>/.well-known/carddav</code>, and <code>/dav/...</code>. It implements <code>OPTIONS</code>, <code>PROPFIND</code>, <code>REPORT</code>, <code>GET</code>, <code>PUT</code>, and <code>DELETE</code>. DAV data uses the same calendar and contact stores as JMAP.</p>
+<h2 id="library-surface">Library surface</h2>
+<p>The library exports the daemon module tree. Important entry points are:</p>
+<table><thead><tr><th>Module</th><th>Main surface</th></tr></thead><tbody>
+<tr><td><code>runtime</code></td><td><code>build_runtime</code>, <code>RuntimeOpts</code>, and <code>BuiltMaild</code></td></tr>
+<tr><td><code>config</code></td><td><code>Config</code>, <code>ListenSpec</code>, DKIM config types, config loading, and TLS resolution</td></tr>
+<tr><td><code>jmap</code></td><td>HTTP handlers, <code>AppState</code>, JMAP request dispatch, and state events</td></tr>
+<tr><td><code>smtp</code></td><td><code>SmtpConfig</code>, <code>SmtpState</code>, <code>SmtpHandle</code>, and <code>start</code></td></tr>
+<tr><td><code>imap</code></td><td>IMAP configuration, listener, session, codec, sequence, response, and operation modules</td></tr>
+<tr><td><code>dav</code></td><td>DAV router and resource routing</td></tr>
+<tr><td><code>mailstore</code></td><td><code>MailStore</code>, <code>SqliteMailStore</code>, query types, records, and retention operations</td></tr>
+<tr><td><code>db</code></td><td>SQLite connection, migrations, accounts, blobs, calendars, contacts, tokens, and vacation data</td></tr>
+<tr><td><code>props</code></td><td>Property schemas, hooks, mappings, and namespace registration</td></tr>
+<tr><td><code>bus</code></td><td>Broker registration, reconnecting dispatch, action handlers, and event publishers</td></tr>
+<tr><td><code>auth</code></td><td>Basic and bearer-token authentication</td></tr>
+<tr><td><code>tls</code></td><td>SNI certificate resolver, live TLS slot, and server-config cache</td></tr>
+<tr><td><code>keyword</code></td><td>Shared IMAP/JMAP user-keyword validation and normalisation</td></tr>
+<tr><td><code>vtoken</code></td><td>Opaque virtual-address token store and resolver</td></tr>
+</tbody></table>
+<p><code>build_runtime(&amp;Config, RuntimeOpts)</code> opens the stores, registers property namespaces, starts SMTP and IMAP listeners and background workers, and returns the HTTP router. The caller binds the HTTP listener and drives <code>axum::serve</code>.</p>
+<p><code>BuiltMaild</code> must remain alive while serving. SMTP and worker tasks are detached; process exit is the current shutdown path.</p>
+<h2 id="configuration">Configuration</h2>
+<p>Configuration is strict-data <code>.conf.mix</code>, deserialised into <code>config::Config</code>. An explicit path is selected with <code>--config</code>.</p>
+<p>Without <code>--config</code>, the binary checks:</p>
+<ol>
+<li><code>/etc/cosmix/maild/config.conf.mix</code></li>
+<li>The Cosmix user configuration path ending in <code>jmap.conf.mix</code></li>
+<li>Node configuration, converted into maild settings</li>
+<li>Built-in defaults</li>
+</ol>
+<p>Only a missing optional file falls through. Read, parse, permission, and validation failures stop startup.</p>
+<h3 id="core-keys">Core keys</h3>
+<table><thead><tr><th>Key</th><th>Default or state</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>listen</code></td><td><code>127.0.0.1:8088</code></td><td>JMAP and DAV HTTP listen address</td></tr>
+<tr><td><code>base_url</code></td><td><code>http://127.0.0.1:8088</code></td><td>Public JMAP URL prefix</td></tr>
+<tr><td><code>database_path</code></td><td>Cosmix variable-data path</td><td>SQLite metadata database</td></tr>
+<tr><td><code>blob_dir</code></td><td>Cosmix variable-data path</td><td>Blob storage directory</td></tr>
+<tr><td><code>mds_dir</code></td><td>Cosmix variable-data path</td><td>Mailbox Data Store root</td></tr>
+<tr><td><code>hostname</code></td><td><code>localhost</code></td><td>SMTP greeting, identity, and legacy TLS name</td></tr>
+<tr><td><code>max_message_size</code></td><td>25 MiB at runtime</td><td>SMTP message-size limit</td></tr>
+<tr><td><code>inbound_filter</code></td><td>unset</td><td>Mix script used to choose an inbound mailbox</td></tr>
+</tbody></table>
+<p>The inbound filter receives <code>FROM</code>, <code>TO</code>, <code>SUBJECT</code>, <code>HEADER_FROM</code>, <code>SPAM_VERDICT</code>, and <code>SPAM_SCORE</code> globals and returns a mailbox name.</p>
+<h3 id="listener-and-tls-keys">Listener and TLS keys</h3>
+<table><thead><tr><th>Key</th><th>Default or state</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>smtp_inbound</code></td><td><code>0.0.0.0:2525</code></td><td>One or more inbound SMTP binds; unset disables</td></tr>
+<tr><td><code>require_starttls_inbound</code></td><td>empty</td><td>Exact inbound binds that reject mail before STARTTLS</td></tr>
+<tr><td><code>smtp_smtps</code></td><td>unset</td><td>One or more implicit-TLS submission binds</td></tr>
+<tr><td><code>imap_imaps</code></td><td>unset</td><td>One or more implicit-TLS IMAP binds</td></tr>
+<tr><td><code>tls_cert</code>, <code>tls_key</code></td><td>unset</td><td>Legacy single-identity certificate and key</td></tr>
+<tr><td><code>tls</code></td><td>default TLS config</td><td>Multi-identity SNI configuration and strict-SNI policy</td></tr>
+<tr><td><code>tls_key_root</code></td><td>maild variable-data path</td><td>Root for substrate-managed TLS PEM files</td></tr>
+</tbody></table>
+<p>If <code>tls.identity</code> contains rows, those rows take precedence over <code>tls_cert</code> and <code>tls_key</code>. Otherwise a complete legacy pair becomes one default identity named by <code>hostname</code>. Incomplete TLS material does not produce an identity.</p>
+<h3 id="imap-keys">IMAP keys</h3>
+<table><thead><tr><th>Key</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>imap_max_literal_bytes</code></td><td>Maximum APPEND literal size</td></tr>
+<tr><td><code>imap_idle_status_interval_secs</code></td><td>IDLE keepalive interval</td></tr>
+<tr><td><code>imap_pre_auth_timeout_secs</code></td><td>Pre-authentication idle timeout</td></tr>
+<tr><td><code>imap_max_auth_failures</code></td><td>Authentication failure cap per connection</td></tr>
+<tr><td><code>imap_max_bad_commands_pre_auth</code></td><td>Bad-command cap before authentication</td></tr>
+<tr><td><code>imap_max_bad_commands_post_auth</code></td><td>Bad-command cap after authentication</td></tr>
+<tr><td><code>imap_max_concurrent_per_account</code></td><td>Concurrent connection cap per account</td></tr>
+<tr><td><code>imap_advertise_capabilities</code></td><td>Override the advertised capability list</td></tr>
+</tbody></table>
+<h3 id="spam-and-rules-keys">Spam and rules keys</h3>
+<table><thead><tr><th>Key</th><th>Default or state</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>spam_enabled</code></td><td><code>true</code></td><td>Enable Bayesian spam filtering</td></tr>
+<tr><td><code>spam_db_dir</code></td><td>Cosmix variable-data path</td><td>Per-account Bayesian databases</td></tr>
+<tr><td><code>spam_baseline_db</code></td><td>unset</td><td>Baseline database for new accounts</td></tr>
+<tr><td><code>spam_base_rate_prior</code></td><td>off</td><td>Enable the experimental observed-base-rate prior</td></tr>
+<tr><td><code>spam_base_rate_pseudocount</code></td><td>engine default</td><td>Shrink the observed prior towards 0.5</td></tr>
+<tr><td><code>spam_base_rate_min</code>, <code>spam_base_rate_max</code></td><td>engine defaults</td><td>Clamp the observed prior</td></tr>
+<tr><td><code>rules_pack_path</code></td><td>unset</td><td>Rule-pack file; unset uses the embedded pack</td></tr>
+<tr><td><code>rule_stats_flush_interval_secs</code></td><td><code>60</code></td><td>Persistent rule-counter flush cadence</td></tr>
+<tr><td><code>rule_stats_dir</code></td><td>maild variable-data path</td><td>Global rule-counter database root</td></tr>
+</tbody></table>
+<h3 id="operator-allowlists">Operator allowlists</h3>
+<table><thead><tr><th>Key</th><th>Empty-list behaviour</th></tr></thead><tbody>
+<tr><td><code>retention_operators</code></td><td>No Bus peer may run retention</td></tr>
+<tr><td><code>vtoken_operators</code></td><td>No Bus peer may use the global vtoken management path</td></tr>
+<tr><td><code>vtoken_delegated_peers</code></td><td>No peer may use delegated vtoken calls</td></tr>
+</tbody></table>
+<h3 id="dkim-keys">DKIM keys</h3>
+<p>Legacy signing uses <code>dkim_selector</code> and <code>dkim_private_key</code>.</p>
+<p>The <code>dkim</code> subsection contains <code>key_root</code> and a <code>domain</code> list. Each domain row has <code>domain</code>, <code>selector</code>, <code>algorithm</code>, <code>key_path</code>, optional <code>canonicalization</code>, optional <code>headers</code>, <code>active_for_signing</code>, and <code>allow_body_length_tag</code>.</p>
+<p>Supported algorithms are <code>rsa-sha256</code> and <code>ed25519-sha256</code>. Key files are read and validated at startup. At most one row per domain may be active for signing.</p>
+<h2 id="property-namespaces">Property namespaces</h2>
+<p>The runtime registers:</p>
+<table><thead><tr><th>Namespace</th><th>Shape</th></tr></thead><tbody>
+<tr><td><code>maild.accounts</code></td><td>Account collection; password is secret</td></tr>
+<tr><td><code>maild.account_overrides</code></td><td>Per-account rule overrides</td></tr>
+<tr><td><code>maild.aliases</code></td><td>Local single-hop aliases</td></tr>
+<tr><td><code>maild.domains</code></td><td>Per-domain delivery, identity, DKIM, and policy settings</td></tr>
+<tr><td><code>maild.engine_config</code></td><td>Required singleton rules-engine configuration</td></tr>
+<tr><td><code>maild.retention</code></td><td>Inert-by-default retention singleton</td></tr>
+<tr><td><code>maild.tls_identities</code></td><td>Read-only projection of active TLS identities</td></tr>
+<tr><td><code>maild.log</code></td><td>Live logging filter configuration</td></tr>
+</tbody></table>
+<p>The retention defaults delete nothing: both age windows are zero, <code>dry_run</code> is true, and no accounts are armed.</p>
+<h2 id="storage-and-background-work">Storage and background work</h2>
+<p>Mail metadata and operational state use SQLite. Mailbox content uses <code>cosmix-mds</code> through <code>SqliteMailStore</code>. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.</p>
+<p>Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +764,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +818,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +947,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

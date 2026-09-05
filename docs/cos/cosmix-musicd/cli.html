@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-musicd/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,115 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-musicd/cli.md"><div class="prose"><h1 id="cosmix-musicd-command-line-interface">cosmix-musicd command-line interface</h1>
+<h2 id="name">Name</h2>
+<p><code>cosmix-musicd</code> — render and play MIDI, inspect and reshape SoundFonts, simulate the mixer, or run the Bus service.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-musicd &lt;command&gt; [options]
+</code></pre>
+<p>Available commands depend on Cargo features.</p>
+<h2 id="core-commands">Core commands</h2>
+<p>The following commands build without the <code>cosmix</code> feature.</p>
+<h3 id="render">render</h3>
+<pre><code class="language-text">cosmix-musicd render &lt;midi&gt; &lt;out&gt; --soundfont &lt;file&gt; [options]
+</code></pre>
+<p>Renders a Standard MIDI File through a SoundFont.</p>
+<p>Options:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>-s, --soundfont &lt;file&gt;</code></td><td>Required fallback or complete SF2 bank.</td></tr>
+<tr><td><code>--sample-rate &lt;hz&gt;</code></td><td>Output sample rate; defaults to 44100.</td></tr>
+<tr><td><code>--gain &lt;factor&gt;</code></td><td>Output gain multiplier; defaults to 1.0.</td></tr>
+<tr><td><code>--channels &lt;layout&gt;</code></td><td><code>stereo</code>, <code>mono</code>, <code>left</code>, or <code>right</code>.</td></tr>
+<tr><td><code>--format &lt;format&gt;</code></td><td><code>wav16</code>, <code>wav24</code>, <code>wavf32</code>, or <code>flac24</code>.</td></tr>
+<tr><td><code>--per-track</code></td><td>Treat <code>&lt;out&gt;</code> as a directory and render one file per note-bearing SMF track.</td></tr>
+<tr><td><code>--library &lt;dir&gt;</code></td><td>Resolve presets from a split SoundFont library.</td></tr>
+</tbody></table>
+<p>Without <code>--per-track</code>, <code>--library</code> scans the whole song and assembles an in-memory orchestra bank. Missing presets come from <code>--soundfont</code>. If the required identity cannot be represented in SF2, rendering falls back to the full bank.</p>
+<p>With <code>--per-track</code>, each stem carries the tempo and time-signature conductor data. Track 0 becomes a stem only when it contains sounding notes.</p>
+<p>Examples:</p>
+<pre><code class="language-text">cosmix-musicd render song.mid song.wav --soundfont general.sf2
+cosmix-musicd render song.mid stems --soundfont general.sf2 --per-track
+cosmix-musicd render song.mid mix.flac --soundfont general.sf2 --format flac24
+</code></pre>
+<h3 id="presets">presets</h3>
+<pre><code class="language-text">cosmix-musicd presets --soundfont &lt;file&gt;
+</code></pre>
+<p>Prints each preset as bank, program, and name, followed by the total count. SF3 input requires the <code>sf3</code> feature.</p>
+<h3 id="merge">merge</h3>
+<pre><code class="language-text">cosmix-musicd merge --out &lt;file.sf2&gt; --take &lt;spec&gt; [--take &lt;spec&gt; ...]
+</code></pre>
+<p>Builds one multi-preset SF2 bank from selected presets.</p>
+<p>A take has this form:</p>
+<pre><code class="language-text">BANK:PROGRAM[=NEW_BANK:NEW_PROGRAM]@PATH
+</code></pre>
+<p>The optional new identity retags the extracted preset. Output identities must be unique.</p>
+<p>Example:</p>
+<pre><code class="language-text">cosmix-musicd merge --out orchestra.sf2 \
+  --take 0:0@piano.sf2 \
+  --take 0:32=0:36@bass.sf2
+</code></pre>
+<h3 id="split">split</h3>
+<pre><code class="language-text">cosmix-musicd split --soundfont &lt;file&gt; --out-dir &lt;dir&gt; [options]
+</code></pre>
+<p>Extracts each selected preset into a standalone SF2 file.</p>
+<p>Options:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>-s, --soundfont &lt;file&gt;</code></td><td>Input SF2, or SF3 when the <code>sf3</code> feature is enabled.</td></tr>
+<tr><td><code>-o, --out-dir &lt;dir&gt;</code></td><td>Output directory; created when absent.</td></tr>
+<tr><td><code>--bank &lt;number&gt;</code></td><td>Select one bank.</td></tr>
+<tr><td><code>--program &lt;number&gt;</code></td><td>Select one program in the range 0 through 127.</td></tr>
+<tr><td><code>--as &lt;bank:program&gt;</code></td><td>Retag the single selected preset.</td></tr>
+<tr><td><code>--normalize &lt;dbfs&gt;</code></td><td>Reduce loudness to the given rendered RMS target.</td></tr>
+<tr><td><code>--levels &lt;file&gt;</code></td><td>Write a TSV report of measured levels and output files.</td></tr>
+</tbody></table>
+<p><code>--as</code> requires the filters to select exactly one preset. <code>--normalize</code> never boosts sample data; presets already below the target remain unchanged.</p>
+<p>Generated names use:</p>
+<pre><code class="language-text">{bank:03}-{program:03}-{slug}.sf2
+</code></pre>
+<h3 id="mixer-sim">mixer-sim</h3>
+<pre><code class="language-text">cosmix-musicd mixer-sim [options]
+</code></pre>
+<p>Runs the fixed 32-channel block processor with deterministic multitone sources. It requires neither an audio device nor a Bus broker.</p>
+<p>Options:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--frames &lt;count&gt;</code></td><td>Number of 60 Hz meter frames; defaults to 120.</td></tr>
+<tr><td><code>--print-every &lt;count&gt;</code></td><td>Summary interval; defaults to 30. Zero suppresses intermediate summaries.</td></tr>
+<tr><td><code>--out &lt;file&gt;</code></td><td>Write concatenated 465-byte meter frames.</td></tr>
+</tbody></table>
+<p>Simulator frames carry the simulator flag and are not real mixer-daemon output.</p>
+<h2 id="playback-commands">Playback commands</h2>
+<p>These commands require <code>playback</code>, which is enabled by default.</p>
+<h3 id="play">play</h3>
+<pre><code class="language-text">cosmix-musicd play &lt;midi&gt; --soundfont &lt;file&gt; [--gain &lt;factor&gt;]
+</code></pre>
+<p>Streams the MIDI file through the SoundFont to the default output device and returns at end of playback.</p>
+<h3 id="live">live</h3>
+<pre><code class="language-text">cosmix-musicd live
+</code></pre>
+<p>Connects an available MIDI input to the built-in 16-voice sine synthesiser. Pressing Enter ends the session.</p>
+<h2 id="bus-commands">Bus commands</h2>
+<p>These commands require <code>cosmix</code>.</p>
+<h3 id="serve">serve</h3>
+<pre><code class="language-text">cosmix-musicd serve [-c &lt;config.conf.mix&gt;]
+</code></pre>
+<p>Runs the MIDI render and playback Bus citizen as service <code>musicd</code>.</p>
+<p>When <code>-c</code> or <code>--config</code> is absent, the daemon checks its system configuration and then its user service configuration.</p>
+<p>See <a href="/cos/cosmix-musicd/bus">Bus service and configuration</a>.</p>
+<h3 id="mixer-serve">mixer-serve</h3>
+<pre><code class="language-text">cosmix-musicd mixer-serve [--autoplay] [--stems &lt;session&gt;]
+</code></pre>
+<p>Runs the real 32-channel mixer Bus citizen as service <code>musicd</code>. Do not run it beside <code>serve</code> on the same broker because both register the same identity.</p>
+<p>Options:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--autoplay</code></td><td>Starts transport immediately for demonstrations or tests. This mode is not benchmark-eligible.</td></tr>
+<tr><td><code>--stems &lt;session&gt;</code></td><td>Loads and verifies a stem-session source before the audio thread starts.</td></tr>
+</tbody></table>
+<p>Without <code>--stems</code>, the mixer uses its deterministic multitone source profile.</p>
+<p>Stem sessions accept <code>stem-session.v1</code> JSON or <code>stem-session.v2</code> strict-data <code>.mix</code> files. Sources must be mono 48 kHz WAV files with matching SHA-256 values.</p>
+<h2 id="exit-status">Exit status</h2>
+<p>The process returns success after a command completes.</p>
+<p>Invalid arguments are rejected by the command-line parser. Runtime failures include unreadable files, invalid MIDI or SoundFont data, output errors, missing audio devices, rejected stem sessions, and Bus startup errors.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +727,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +781,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +910,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

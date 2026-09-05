@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/datetime</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,239 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/datetime.md"><div class="prose"><h1 id="dates--time">Dates &amp; time</h1>
+<p>Mix represents a moment in time as a <strong>Unix timestamp</strong> — a plain number of seconds since the epoch (1970-01-01 00:00:00 UTC). Everything else is conversion: format a timestamp into text, parse text back into a timestamp, or describe an interval. There is no opaque "date object" — a timestamp is just a <a href="/mix/numbers">number</a>, so you do date arithmetic with <code>+</code>, <code>-</code>, and the rest of the numeric operators.</p>
+<pre><code class="language-mix">$now = time()          -- seconds since the epoch, as a float
+$tomorrow = $now + 86400   -- one day later — just arithmetic
+print(date_format($tomorrow, "%Y-%m-%d"))
+</code></pre>
+<p>The six builtins:</p>
+<table><thead><tr><th>Builtin</th><th>Returns</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>time()</code></td><td>number (float seconds)</td><td>current Unix timestamp</td></tr>
+<tr><td><code>now_iso()</code></td><td>string</td><td>current local time as ISO 8601 / RFC 3339</td></tr>
+<tr><td><code>date_format(ts [, fmt])</code></td><td>string</td><td>render a timestamp via strftime (<strong>local</strong> time)</td></tr>
+<tr><td><code>date_parse(s)</code></td><td>number</td><td>parse a date string → Unix timestamp</td></tr>
+<tr><td><code>duration_format(secs)</code></td><td>string</td><td>render a span of seconds as <code>1d 2h 3m 4s</code></td></tr>
+<tr><td><code>relative_time(ts)</code></td><td>string</td><td>render a timestamp as <code>3h ago</code> / <code>in 5m</code></td></tr>
+</tbody></table>
+<p><code>time()</code> is always available. The five conversion builtins are <strong><code>datetime</code>-feature-gated</strong> in the library, but the shipping <code>mix</code> binary turns the feature on, so they are always present in the <code>mix</code> CLI and as a login shell. All six are <code>Pure</code>-class (no I/O beyond reading the wall clock) and register under the <code>system</code> builtin category — <code>mix builtins system</code> lists them. For <em>pausing</em> rather than measuring, <code>sleep(n)</code> lives on the <a href="/mix/system">system</a> page.</p>
+<h2 id="time--the-current-timestamp">time() — the current timestamp</h2>
+<p><code>time()</code> returns the current Unix time as a <strong>float</strong> with sub-second precision (it is <code>SystemTime::now()</code> as <code>as_secs_f64</code>).</p>
+<pre><code class="language-mix">print(time())
+</code></pre>
+<pre><code class="language-text">1783052394.0787532
+</code></pre>
+<p>The value obviously changes every call — examples below show the <em>shape</em>, not a fixed number. Because it is a number you can compare and subtract directly:</p>
+<pre><code class="language-mix">$t = time()
+print("" .. ($t &gt; 1700000000))
+</code></pre>
+<pre><code class="language-text">true
+</code></pre>
+<p>To time a block of work, capture <code>time()</code> before and after and feed the difference to <a href="/mix/datetime#duration_format--human-readable-spans"><code>duration_format</code></a>:</p>
+<pre><code class="language-mix">$start = time()
+-- ... do work ...
+$elapsed = time() - $start
+print("took " .. duration_format($elapsed))
+</code></pre>
+<blockquote>
+<p><code>time()</code> is a float. <code>date_format</code> / <code>relative_time</code> truncate it to whole seconds internally (<code>as i64</code>), so passing the raw <code>time()</code> value is fine — you never need to round it yourself.</p>
+</blockquote>
+<p>The numeric inputs accept numbers and numeric strings. A supplied value that
+<code>to_number</code> cannot parse raises <code>TYPE_MISMATCH</code>; it never silently becomes the
+epoch or a zero-duration result.</p>
+<h2 id="now_iso--current-local-time-as-a-string">now_iso() — current local time as a string</h2>
+<p><code>now_iso()</code> takes no arguments and returns the current <strong>local</strong> time as an RFC 3339 string (chrono's <code>Local::now().to_rfc3339()</code>), including the fractional seconds and the offset from UTC.</p>
+<pre><code class="language-mix">print(now_iso())
+</code></pre>
+<pre><code class="language-text">2026-07-03T14:19:54.080883176+10:00
+</code></pre>
+<p>The trailing <code>+10:00</code> is the machine's local UTC offset (here AEST). Use <code>now_iso()</code> for log lines and timestamps you want a human to read at a glance; use <code>time()</code> when you need a number to do arithmetic on.</p>
+<h2 id="date_formatts--fmt--timestamp--text">date_format(ts [, fmt]) — timestamp → text</h2>
+<p><code>date_format</code> turns a Unix timestamp into a string using a <strong>strftime</strong> pattern. The timestamp is interpreted as UTC seconds, then <strong>converted to the machine's local timezone</strong> before formatting.</p>
+<ul>
+<li>Argument 1: the timestamp (number; a float is truncated to whole seconds).</li>
+<li>Argument 2 (optional): the strftime format string. <strong>Default is <code>"%Y-%m-%d %H:%M:%S"</code>.</strong></li>
+</ul>
+<pre><code class="language-mix">print(date_format(1700000000))
+</code></pre>
+<pre><code class="language-text">2023-11-15 08:13:20
+</code></pre>
+<p>(That output is in local time, +10; the same instant is <code>2023-11-14 22:13:20</code> in UTC.)</p>
+<p>Custom patterns — these are <a href="https://docs.rs/chrono/latest/chrono/format/strftime/index.html">chrono</a> strftime specifiers:</p>
+<pre><code class="language-mix">print(date_format(1700000000, "%Y-%m-%d"))
+print(date_format(1700000000, "%A, %d %B %Y"))
+print(date_format(1700000000, "%H:%M"))
+print(date_format(1700000000, "%I:%M %p"))
+print(date_format(1700000000, "%a %j %s"))
+</code></pre>
+<pre><code class="language-text">2023-11-15
+Wednesday, 15 November 2023
+08:13
+08:13 AM
+Wed 319 1700000000
+</code></pre>
+<p>Common specifiers:</p>
+<table><thead><tr><th>Token</th><th>Meaning</th><th>Token</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>%Y</code></td><td>4-digit year</td><td><code>%H</code></td><td>hour, 24h (00–23)</td></tr>
+<tr><td><code>%m</code></td><td>month (01–12)</td><td><code>%I</code></td><td>hour, 12h (01–12)</td></tr>
+<tr><td><code>%d</code></td><td>day of month (01–31)</td><td><code>%M</code></td><td>minute (00–59)</td></tr>
+<tr><td><code>%B</code> / <code>%b</code></td><td>month name / abbrev</td><td><code>%S</code></td><td>second (00–60)</td></tr>
+<tr><td><code>%A</code> / <code>%a</code></td><td>weekday name / abbrev</td><td><code>%p</code></td><td>AM/PM</td></tr>
+<tr><td><code>%j</code></td><td>day of year (001–366)</td><td><code>%z</code></td><td>UTC offset (<code>+1000</code>)</td></tr>
+<tr><td><code>%s</code></td><td>Unix timestamp</td><td><code>%%</code></td><td>a literal <code>%</code></td></tr>
+</tbody></table>
+<p><code>date_format</code> needs at least one argument:</p>
+<pre><code class="language-mix">print(date_format())
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: date_format() expects at least 1 argument(s), got 0
+</code></pre>
+<h3 id="local-vs-utc--read-this">Local vs UTC — read this</h3>
+<p><code>date_format</code> always renders in the <strong>machine's local timezone</strong> — there is no UTC-output variant and no timezone argument. If you need UTC output, format the offset into the string and reason about it yourself, or include <code>%z</code>/<code>%Z</code> so the offset is explicit:</p>
+<pre><code class="language-mix">print(date_format(1700000000, "%Y-%m-%d %H:%M:%S %z"))
+</code></pre>
+<pre><code class="language-text">2023-11-15 08:13:20 +1000
+</code></pre>
+<h2 id="date_parses--text--timestamp">date_parse(s) — text → timestamp</h2>
+<p><code>date_parse</code> converts a date string back into a Unix timestamp (a number). It tries three formats in order and returns on the first that matches:</p>
+<ol>
+<li><strong>RFC 3339 / ISO 8601</strong> with an explicit offset or <code>Z</code> — e.g. <code>2023-11-15T08:13:20+10:00</code>, <code>...Z</code>. The offset is honoured.</li>
+<li><strong><code>%Y-%m-%d %H:%M:%S</code></strong> (space-separated) — interpreted as <strong>UTC</strong>.</li>
+<li><strong><code>%Y-%m-%d</code></strong> (date only) — interpreted as <strong>UTC midnight</strong>.</li>
+</ol>
+<pre><code class="language-mix">print("" .. date_parse("2023-11-15T08:13:20+10:00"))
+print("" .. date_parse("2023-11-15T08:13:20Z"))
+print("" .. date_parse("2023-11-15 08:13:20"))
+print("" .. date_parse("2023-11-15"))
+</code></pre>
+<pre><code class="language-text">1700000000
+1700036000
+1700036000
+1700006400
+</code></pre>
+<p>Note the difference: the offset form <code>+10:00</code> lands on <code>1700000000</code>, while the bare <code>2023-11-15 08:13:20</code> is read as UTC and lands on <code>1700036000</code> (10 hours later). <strong>The space and date-only forms have no timezone, so they are always UTC</strong> — supply an explicit offset when you mean local time.</p>
+<p>Two edge cases of the format list:</p>
+<ul>
+<li><strong>Fractional seconds parse in the RFC 3339 form only</strong>, and are truncated — <code>date_parse("2023-11-15T08:13:20.5+10:00")</code> returns <code>1700000000</code> (whole seconds; the result is always an integral number).</li>
+<li><strong>A <code>T</code>-separated string <em>without</em> an offset does not parse.</strong> <code>date_parse("2023-11-15T08:13:20")</code> raises — RFC 3339 requires the offset (or <code>Z</code>), and the offset-less fallback format is the <em>space</em>-separated <code>%Y-%m-%d %H:%M:%S</code> only. Swap the <code>T</code> for a space, or append an offset.</li>
+</ul>
+<p>Anything that matches none of the three formats raises a catchable runtime error:</p>
+<pre><code class="language-mix">print("" .. date_parse("15/11/2023"))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: date_parse: cannot parse '15/11/2023'
+</code></pre>
+<p>Wrap it in <a href="/mix/errors"><code>try</code>/<code>catch</code></a> when the input is untrusted:</p>
+<pre><code class="language-mix">try
+  $ts = date_parse($input)
+  print(date_format($ts, "%Y-%m-%d"))
+catch $e
+  print("bad date: " .. ("" .. $e))
+end
+</code></pre>
+<h3 id="the-round-trip-gotcha-parse-then-format">The round-trip gotcha (parse-then-format)</h3>
+<p><code>date_parse</code> treats the timezone-less forms as <strong>UTC</strong>, but <code>date_format</code> renders in <strong>local</strong> time — so a naive round-trip shifts by your UTC offset:</p>
+<pre><code class="language-mix">$ts = date_parse("2023-11-15 08:13:20")   -- read as 08:13:20 UTC
+print(date_format($ts, "%Y-%m-%d %H:%M:%S %z"))
+</code></pre>
+<pre><code class="language-text">2023-11-15 18:13:20 +1000
+</code></pre>
+<p>Parsed at <code>08:13:20</code> UTC, re-rendered at <code>18:13:20 +1000</code>. This is correct behaviour (same instant, two zones), but it surprises people. To round-trip text-identically, either include an explicit offset in the input that matches your locale, or format with the offset printed (<code>%z</code>/<code>%Z</code>) so the shift is visible.</p>
+<h2 id="duration_format--human-readable-spans">duration_format — human-readable spans</h2>
+<p><code>duration_format(secs)</code> turns a number of seconds (an <em>elapsed time</em>, not a timestamp) into a compact <code>Nd Nh Nm Ns</code> string. It drops any zero leading units, but always shows at least <code>0s</code> for a zero span. A float is truncated to whole seconds.</p>
+<pre><code class="language-mix">print(duration_format(0))
+print(duration_format(45))
+print(duration_format(90))
+print(duration_format(3600))
+print(duration_format(3661))
+print(duration_format(8100))
+print(duration_format(90061))
+print(duration_format(125.9))
+</code></pre>
+<pre><code class="language-text">0s
+45s
+1m 30s
+1h
+1h 1m 1s
+2h 15m
+1d 1h 1m 1s
+2m 5s
+</code></pre>
+<p>The breakdown is days / hours / minutes / seconds (1 day = 86400s); there is no weeks/months unit. Zero-valued <strong>leading and middle</strong> units are omitted (<code>2h 15m</code> has no <code>0s</code>, <code>1h</code> has no minutes), but the result is never empty. A <strong>negative</strong> input clamps to <code>0s</code> (the seconds are cast to an unsigned count before splitting) — an elapsed span is never negative, so take <code>abs()</code> first if your subtraction can go either way. Pair it with a <code>time()</code> difference for an uptime/elapsed readout:</p>
+<pre><code class="language-mix">$elapsed = 5025
+print("uptime " .. duration_format($elapsed))
+</code></pre>
+<pre><code class="language-text">uptime 1h 23m 45s
+</code></pre>
+<h2 id="relative_time--3h-ago--in-5m">relative_time — "3h ago" / "in 5m"</h2>
+<p><code>relative_time(ts)</code> compares a timestamp against <strong>now</strong> (<code>Utc::now()</code>) and renders the gap as a short relative phrase. Past times read <code>... ago</code>; future times read <code>in ...</code>.</p>
+<pre><code class="language-mix">print(relative_time(time() - 30))
+print(relative_time(time() - 7200))
+print(relative_time(time() - 172800))
+print(relative_time(time() + 300))
+print(relative_time(time() + 90000))
+</code></pre>
+<pre><code class="language-text">30s ago
+2h ago
+2d ago
+in 5m
+in 1d
+</code></pre>
+<p>The granularity is a single largest unit, truncating: under 60s → <code>Ns</code>, under an hour → <code>Nm</code>, under a day → <code>Nh</code>, otherwise <code>Nd</code>. It picks one unit only (no <code>2h 5m</code> — <code>7200</code>s reads <code>2h</code>, and <code>7800</code>s also reads <code>2h</code>). For a precise span use <code>duration_format</code> on the difference instead.</p>
+<h2 id="patterns">Patterns</h2>
+<h3 id="stamp-a-log-line">Stamp a log line</h3>
+<pre><code class="language-mix">print(now_iso() .. "  starting job")
+</code></pre>
+<pre><code class="language-text">2026-07-03T14:19:54.080883176+10:00  starting job
+</code></pre>
+<h3 id="last-seen-in-a-table-row">"Last seen" in a table row</h3>
+<pre><code class="language-mix">$rows = [
+  { name: "alpha", last: time() - 45 },
+  { name: "node1", last: time() - 9000 }
+]
+for each $r in $rows
+  print($r["name"] .. ": " .. relative_time($r["last"]))
+end
+</code></pre>
+<pre><code class="language-text">alpha: 45s ago
+node1: 2h ago
+</code></pre>
+<h3 id="day-bucket-a-timestamp-group-events-by-date">Day-bucket a timestamp (group events by date)</h3>
+<pre><code class="language-mix">$ts = 1700000000
+$day = date_format($ts, "%Y-%m-%d")
+print("bucket " .. $day)
+</code></pre>
+<pre><code class="language-text">bucket 2023-11-15
+</code></pre>
+<h3 id="compute-a-deadline-and-show-it-both-ways">Compute a deadline and show it both ways</h3>
+<pre><code class="language-mix">$deadline = time() + 3600
+print("due " .. date_format($deadline, "%H:%M") .. " (" .. relative_time($deadline) .. ")")
+</code></pre>
+<pre><code class="language-text">due 15:20 (in 1h)
+</code></pre>
+<h2 id="gotchas">Gotchas</h2>
+<ul>
+<li><strong>A timestamp is a number, an elapsed span is a number — don't confuse them.</strong> <code>date_format</code>/<code>relative_time</code> take an absolute timestamp (seconds since epoch); <code>duration_format</code> takes a duration (seconds of elapsed time). <code>duration_format(time())</code> prints a meaningless <code>20637d 4h …</code> (the age of the epoch).</li>
+<li><strong><code>date_format</code> is always LOCAL; <code>date_parse</code> treats offset-less input as UTC.</strong> There is no timezone parameter on either. Naive parse→format round-trips shift by your UTC offset (see above) — include <code>%z</code> or an explicit offset to make it visible.</li>
+<li><strong>Newline or <code>;</code> separates statements</strong> — <code>mix -c '$t = time(); print(date_format($t))'</code> is valid Mix. A shell-dispatch line still gives <code>;</code> its shell command-list meaning (see <a href="/mix/shell-mode">shell</a>).</li>
+<li><strong>Concatenate with <code>..</code>, never <code>+</code>.</strong> <code>print("at " .. date_format($t))</code> — <code>+</code> is numeric addition only.</li>
+<li><strong><code>$name</code> is literal inside <code>"double quotes"</code>.</strong> Build strings with <code>..</code> concat (<code>"day " .. $day</code>); only <code>${name}</code> interpolates. See <a href="/mix/strings">strings</a>.</li>
+<li><strong>Sub-second precision is dropped on format.</strong> <code>date_format</code>/<code>relative_time</code> truncate the float to whole seconds; <code>now_iso()</code> keeps nanoseconds because it formats <code>Local::now()</code> directly.</li>
+<li><strong>Bad numeric input raises.</strong> A numeric string (<code>"1700000000"</code>) works, but a non-numeric string — including <code>"inf"</code>/<code>"nan"</code>/<code>"1e999"</code>, rejected by strict coercion since 0.21 — raises <code>TYPE_MISMATCH</code> from <code>date_format</code>, <code>relative_time</code>, and <code>duration_format</code>. A timestamp outside chrono's representable range (for example <code>1e18</code>) raises <code>VALUE_OUT_OF_RANGE</code>; it never clamps to the epoch.</li>
+<li><strong><code>date_parse</code> raises on no match</strong> — only the three documented formats parse (and <code>T</code>-separated input <em>must</em> carry an offset). Wrap untrusted input in <code>try</code>/<code>catch</code>.</li>
+<li><strong>No date <em>math</em> helpers</strong> (add-month, day-of-week-of, business-day). Do arithmetic on the raw timestamp (<code>$t + 86400</code> for +1 day) and read fields back via <code>date_format</code> strftime tokens like <code>%A</code>/<code>%j</code>.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/math">math</a> — numeric operators and functions (timestamps are numbers; <code>abs</code>, <code>round</code>)</li>
+<li><a href="/mix/numbers">numbers</a> — numeric coercion rules, <code>to_number</code>/<code>is_number</code></li>
+<li><a href="/mix/strings">strings</a> — <code>..</code> concat, interpolation, formatting output</li>
+<li><a href="/mix/errors">errors</a> — <code>try</code>/<code>catch</code> for <code>date_parse</code> failures</li>
+<li><a href="/mix/system">system</a> — <code>sleep(n)</code>, <code>run</code>/<code>run_rc</code> timeouts, process helpers</li>
+<li><a href="/mix/builtins">builtins index</a> — the full builtin catalogue</li>
+<li><a href="/mix/shell-mode">shell</a> — <code>mix -c</code> one-liner rules (newlines, classifier)</li>
+<li>chrono strftime reference — <a href="https://docs.rs/chrono/latest/chrono/format/strftime/index.html">https://docs.rs/chrono/latest/chrono/format/strftime/index.html</a></li>
+<li>Run <code>mix help</code> for the category listing, or <code>mix what date_format</code> (also <code>time</code>, <code>date_parse</code>, <code>now_iso</code>, <code>duration_format</code>, <code>relative_time</code>) for a one-line description of any builtin.</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +851,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +905,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1034,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/datastar</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,330 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/datastar.md"><div class="prose"><h1 id="datastar--datastar-sse-event-framing">datastar — Datastar SSE event framing</h1>
+<p>Three builtins that <strong>frame</strong> <a href="https://data-star.dev">Datastar</a> v1 Server-Sent
+Events: <code>ds_patch_elements</code>, <code>ds_patch_signals</code>, and <code>ds_sse</code>. They are the pure
+half of the Datastar SDK — they build the exact wire bytes the Datastar JS
+client reads to patch the DOM or update the client-side signal store, and
+<code>ds_sse</code> glues those event strings into a <code>text/event-stream</code> response body.</p>
+<blockquote>
+<p><strong>The one rule:</strong> these builtins <strong>FRAME, they do not ESCAPE.</strong> A caller MUST
+<code>html_escape()</code> untrusted content <em>before</em> passing it to <code>ds_patch_elements</code>,
+exactly as for any rendered page (see <a href="/mix/strings">strings</a>). Framing wraps
+your bytes in SSE lines; it does nothing to neutralise <code>&lt;script&gt;</code> in them.</p>
+</blockquote>
+<p>These builtins are feature-gated on the <code>datastar</code> feature; the <code>mix</code> binary
+turns it on, so they are always present in the shipped binary. They are built on
+the upstream <a href="https://crates.io/crates/datastar"><code>datastar</code></a> crate's
+framework-agnostic wire serializer, so the format tracks upstream and never
+drifts. One-line help: <code>mix what ds_patch_elements</code>. Added in <strong>mix 0.18.1</strong>.</p>
+<h2 id="mental-model">Mental model</h2>
+<p>Datastar's transport is plain SSE. Each event is a few lines:</p>
+<pre><code class="language-text">event: &lt;datastar-event-type&gt;
+data: &lt;field&gt; &lt;value&gt;
+data: &lt;field&gt; &lt;value&gt;
+&lt;blank line&gt;
+</code></pre>
+<p>A blank line terminates the SSE frame. Mix gives you one builtin per Datastar
+event type plus an assembler:</p>
+<table><thead><tr><th>Builtin</th><th>Event type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ds_patch_elements(html[, opts])</code></td><td><code>datastar-patch-elements</code></td><td>morph HTML into the DOM</td></tr>
+<tr><td><code>ds_patch_signals(sig[, opts])</code></td><td><code>datastar-patch-signals</code></td><td>update the client signal store</td></tr>
+<tr><td><code>ds_sse(event | [events])</code></td><td>—</td><td>concatenate event strings into a response body</td></tr>
+</tbody></table>
+<p>Each <code>ds_patch_*</code> call returns a <strong>string</strong> — one fully-framed SSE event,
+trailing blank line included. <code>ds_sse</code> just splices those strings (no
+re-framing, no separators added — each event already carries its own blank-line
+terminator).</p>
+<h2 id="ds_patch_elements--patch-the-dom">ds_patch_elements — patch the DOM</h2>
+<pre><code>ds_patch_elements(html, [{selector, mode, view_transition}]) -&gt; event string
+</code></pre>
+<p>The first argument is an HTML fragment. The optional second argument is a map of
+options. Bare call, no options:</p>
+<pre><code class="language-mix">$ev = ds_patch_elements("&lt;div id=\"clock\"&gt;12:34&lt;/div&gt;")
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: elements &lt;div id="clock"&gt;12:34&lt;/div&gt;
+
+</code></pre>
+<p>(The output ends with a blank line — the SSE frame terminator.)</p>
+<h3 id="options">Options</h3>
+<table><thead><tr><th>Key</th><th>Values</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>selector</code></td><td>a CSS selector string</td><td>none (Datastar uses the element's <code>id</code>)</td></tr>
+<tr><td><code>mode</code></td><td><code>outer</code> <code>inner</code> <code>remove</code> <code>replace</code> <code>prepend</code> <code>append</code> <code>before</code> <code>after</code></td><td><code>outer</code></td></tr>
+<tr><td><code>view_transition</code></td><td>truthy → emit <code>useViewTransition true</code>; falsy → same as absent</td><td>off</td></tr>
+</tbody></table>
+<p>Two option-map behaviours to know: a <code>nil</code>-valued <code>selector</code>/<code>mode</code> is treated as
+absent, and <strong>unknown keys are silently ignored</strong> — there is no strict allowlist
+here (unlike <code>run</code>/<code>ssh_run</code> opts), so a typo'd <code>selectr:</code> produces a
+default-targeted frame, not an error. A non-string first argument is coerced to
+its string form (<code>ds_patch_elements(42)</code> frames the text <code>42</code>).</p>
+<pre><code class="language-mix">$ev = ds_patch_elements("&lt;li&gt;row&lt;/li&gt;", {selector: "#list", mode: "append"})
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: selector #list
+data: mode append
+data: elements &lt;li&gt;row&lt;/li&gt;
+
+</code></pre>
+<p><code>view_transition</code> wraps the patch in a browser View Transition:</p>
+<pre><code class="language-mix">$ev = ds_patch_elements("&lt;p&gt;hi&lt;/p&gt;", {view_transition: true})
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: useViewTransition true
+data: elements &lt;p&gt;hi&lt;/p&gt;
+
+</code></pre>
+<h3 id="mode--remove">mode = remove</h3>
+<p><code>remove</code> deletes matching elements and <strong>requires</strong> a <code>selector</code> (there is no
+HTML to send — pass <code>""</code> or anything; it is ignored):</p>
+<pre><code class="language-mix">$ev = ds_patch_elements("", {mode: "remove", selector: "#toast"})
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: selector #toast
+data: mode remove
+
+</code></pre>
+<p>Forgetting the selector is a clean runtime error, not a silent malformed frame:</p>
+<pre><code class="language-mix">ds_patch_elements("x", {mode: "remove"})
+-- Runtime error: ds_patch_elements: mode 'remove' requires a 'selector' in the options map
+</code></pre>
+<p>An unknown mode is rejected up front:</p>
+<pre><code class="language-mix">ds_patch_elements("x", {mode: "swap"})
+-- Runtime error: ds_patch_elements: unknown mode 'swap'
+--   (expected one of outer/inner/remove/replace/prepend/append/before/after)
+</code></pre>
+<h3 id="multi-line-html-is-re-prefixed-per-line">Multi-line HTML is re-prefixed per line</h3>
+<p>If the HTML contains newlines, every line gets its own <code>data: elements</code> prefix —
+that is how SSE carries a multi-line value, and it is what keeps an embedded <code>\n</code>
+from forging a new frame:</p>
+<pre><code class="language-mix">$html = "&lt;ul&gt;\n  &lt;li&gt;one&lt;/li&gt;\n  &lt;li&gt;two&lt;/li&gt;\n&lt;/ul&gt;"
+print(ds_patch_elements($html))
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: elements &lt;ul&gt;
+data: elements   &lt;li&gt;one&lt;/li&gt;
+data: elements   &lt;li&gt;two&lt;/li&gt;
+data: elements &lt;/ul&gt;
+
+</code></pre>
+<p>This composes cleanly with <code>markdown()</code> (documented below) — render author
+content to HTML, then frame it:</p>
+<pre><code class="language-mix">$ev = ds_patch_elements(markdown("# Hi\n\nrender me"), {selector: "#post", mode: "inner"})
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: selector #post
+data: mode inner
+data: elements &lt;h1&gt;Hi&lt;/h1&gt;
+data: elements &lt;p&gt;render me&lt;/p&gt;
+
+</code></pre>
+<h2 id="ds_patch_signals--update-the-client-signal-store">ds_patch_signals — update the client signal store</h2>
+<pre><code>ds_patch_signals(signals_map_or_json, [{only_if_missing}]) -&gt; event string
+</code></pre>
+<p>Datastar keeps a reactive <strong>signal store</strong> in the browser. This event merges a
+patch into it. Pass a <strong>map</strong> (or a <strong>list</strong> — it becomes a JSON array) and it
+is JSON-encoded for you:</p>
+<pre><code class="language-mix">$ev = ds_patch_signals({count: 5, name: "ada"})
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-signals
+data: signals {"count":5,"name":"ada"}
+
+</code></pre>
+<p>Pass a <strong>string</strong> and it is used <strong>verbatim</strong> — it must already be valid JSON
+(e.g. from <code>json_encode()</code>):</p>
+<pre><code class="language-mix">$ev = ds_patch_signals("{\"open\":true}")
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-signals
+data: signals {"open":true}
+
+</code></pre>
+<p><code>only_if_missing</code> makes the patch a default — it only sets signals the client
+does not already have (good for initial values that must not clobber user edits):</p>
+<pre><code class="language-mix">$ev = ds_patch_signals({theme: "dark"}, {only_if_missing: true})
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-signals
+data: onlyIfMissing true
+data: signals {"theme":"dark"}
+
+</code></pre>
+<p>Any other first-argument type (number, bool, nil) is rejected:</p>
+<pre><code class="language-mix">ds_patch_signals(42)
+-- Runtime error: ds_patch_signals: first argument must be a signals map or JSON string, got number
+</code></pre>
+<p>The map/list path uses the same encoder as <code>json_encode</code>, with the same rules
+(see <a href="/mix/data">JSON &amp; data</a>): a <strong>NaN or ±inf number anywhere in the value
+raises</strong> a catchable error rather than silently corrupting the store (since
+mix 0.21) —</p>
+<pre><code class="language-mix">ds_patch_signals({bad: sqrt(0 - 1)})
+-- Runtime error: ds_patch_signals: encode signals:
+--   non-finite number NaN has no JSON representation (JSON has no NaN/Infinity)
+</code></pre>
+<p>— and a lambda or bytes value inside the map encodes as <code>null</code>.</p>
+<h2 id="ds_sse--assemble-the-response-body">ds_sse — assemble the response body</h2>
+<pre><code>ds_sse(event | [events]) -&gt; text/event-stream body
+</code></pre>
+<p><code>ds_sse</code> takes one event string or a <strong>list</strong> of them and concatenates them into
+a single body string. It does <strong>not</strong> re-frame or insert separators — each event
+already carries its own blank-line terminator, so back-to-back events are
+correctly delimited.</p>
+<p>A single event (the round-trip is identity — <code>ds_sse</code> of one event is that event):</p>
+<pre><code class="language-mix">$body = ds_sse(ds_patch_signals({n: 1}))
+print($body)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-signals
+data: signals {"n":1}
+
+</code></pre>
+<p>A multi-event stream — patch the DOM, then flip a signal, in one response:</p>
+<pre><code class="language-mix">$e1 = ds_patch_elements("&lt;span&gt;a&lt;/span&gt;", {selector: "#x", mode: "inner"})
+$e2 = ds_patch_signals({ready: true})
+$body = ds_sse([$e1, $e2])
+print($body)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: selector #x
+data: mode inner
+data: elements &lt;span&gt;a&lt;/span&gt;
+
+event: datastar-patch-signals
+data: signals {"ready":true}
+
+</code></pre>
+<p>An empty list yields an empty body; a list element that is not a string is a
+clear error (<code>ds_sse: list element N must be an SSE event string, got &lt;type&gt;</code>).</p>
+<h2 id="security--frame-never-escape">Security — frame, never escape</h2>
+<p>Repeat, because it is the trap: <strong>these builtins do not sanitise.</strong> Whatever
+bytes you hand <code>ds_patch_elements</code> go on the wire and into the DOM. For any
+content that came from a user, a request, a database row, or any non-author
+source, run <code>html_escape()</code> first:</p>
+<pre><code class="language-mix">$user = "&lt;script&gt;alert(1)&lt;/script&gt;"
+$ev = ds_patch_elements("&lt;div&gt;" .. html_escape($user) .. "&lt;/div&gt;")
+print($ev)
+</code></pre>
+<pre><code class="language-text">event: datastar-patch-elements
+data: elements &lt;div&gt;&amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt;&lt;/div&gt;
+
+</code></pre>
+<p><code>html_escape(s)</code> escapes the five HTML-significant characters — <code>&amp;</code> <code>&lt;</code> <code>&gt;</code> <code>"</code>
+<code>'</code> (the apostrophe as <code>&amp;#x27;</code>, the HTML5-universal form, not the HTML4-invalid
+<code>&amp;apos;</code>) — making a value safe to interpolate into HTML <strong>element text</strong> or an
+<strong>ordinary quoted attribute value</strong>. That prevents <em>syntactic breakout</em> only: it
+is NOT sufficient where the value is interpreted as code or a URL — event
+handlers (<code>onclick=…</code>), <code>style=…</code>, <code>srcdoc</code>, or URL-valued attributes
+(<code>href</code>/<code>src</code>: an entity-escaped <code>javascript:…</code> still runs). Those contexts need
+scheme/context validation, not just entity escaping.</p>
+<p>For author content authored in Markdown, <code>markdown()</code> already escapes raw HTML
+and neutralises unsafe URL schemes (next section) — so
+<code>ds_patch_elements(markdown($author_md), …)</code> is safe without a separate
+<code>html_escape</code>.</p>
+<h3 id="frame-injection-guards-built-in">Frame-injection guards (built in)</h3>
+<p>The builtins fail closed against SSE frame injection even when you forget to
+escape, so a stray control character cannot forge an extra event:</p>
+<ul>
+<li><strong><code>selector</code></strong> goes into a single, un-split <code>data: selector …</code> line, so any CR or LF in it is <strong>rejected</strong> — a CSS selector never legitimately carries one:</li>
+</ul>
+<pre><code class="language-mix">ds_patch_elements("x", {selector: "#a\ndata: mode inner"})
+-- Runtime error: ds_patch_elements: selector must not contain a line terminator (CR/LF)
+--   — SSE frame-injection guard
+</code></pre>
+<ul>
+<li><strong><code>elements</code></strong> and a verbatim <strong><code>signals</code></strong> string are CR→LF normalised, then every <code>\n</code>-split line is re-prefixed with its field name — so an embedded newline (even a lone <code>\r</code> that <code>str::lines()</code> would miss) becomes another <code>data:</code> continuation line, never a frame break. A <code>\r\n</code> pair normalises to <strong>one</strong> <code>\n</code>, never a doubled newline (which would read as the blank-line frame separator).</li>
+<li>The <strong>map path</strong> for <code>signals</code> is JSON-encoded by serde, which escapes control characters, so its <code>data:</code> line is provably single-line.</li>
+</ul>
+<p>These are defence-in-depth, <strong>not</strong> a substitute for <code>html_escape</code> — a guard
+stops frame forgery; it does nothing about <code>&lt;script&gt;</code> inside an otherwise-valid
+single-line fragment.</p>
+<h2 id="markdown--render-author-content-to-html">markdown — render author content to HTML</h2>
+<pre><code>markdown(md) -&gt; HTML string
+</code></pre>
+<p>Renders <strong>CommonMark + GFM</strong> Markdown to HTML — the natural upstream of
+<code>ds_patch_elements</code> for content authored in Markdown. The GFM extensions are
+enabled: <strong>tables</strong>, <strong>strikethrough</strong> (<code>~~gone~~</code> → <code>&lt;del&gt;</code>), <strong>task lists</strong>
+(<code>- [x]</code> → a disabled checkbox), and <strong>footnotes</strong>. Feature-gated on the
+<code>markdown</code> feature (the <code>mix</code> binary turns it on); a Pure builtin, so always
+callable in sandboxed contexts (see <a href="/mix/capabilities">capabilities</a>).</p>
+<p>Its output is <strong>safe by default for author content</strong>:</p>
+<ul>
+<li><strong>Raw HTML in the source is escaped</strong> — emitted as literal text, never active markup:</li>
+</ul>
+<pre><code class="language-mix">print(markdown("hi &lt;b&gt;bold&lt;/b&gt; &lt;script&gt;alert(1)&lt;/script&gt;"))
+</code></pre>
+<pre><code class="language-text">&lt;p&gt;hi &amp;lt;b&amp;gt;bold&amp;lt;/b&amp;gt; &amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt;&lt;/p&gt;
+</code></pre>
+<ul>
+<li><strong>Unsafe URL schemes are neutralised</strong> — a link or image URL whose scheme is <code>javascript:</code>, <code>data:</code>, or <code>vbscript:</code> is rewritten to <code>#</code>. The scheme check strips ASCII whitespace/control characters first (browsers ignore those inside a scheme, so a whitespace-obfuscated <code>&lt;java script:…&gt;</code> destination still counts as <code>javascript:</code>); relative URLs and ordinary schemes (<code>https:</code>, <code>mailto:</code>) pass through untouched:</li>
+</ul>
+<pre><code class="language-mix">print(markdown("[x](javascript:alert(1)) [y](https://ok.example)"))
+</code></pre>
+<pre><code class="language-text">&lt;p&gt;&lt;a href="#"&gt;x&lt;/a&gt; &lt;a href="https://ok.example"&gt;y&lt;/a&gt;&lt;/p&gt;
+</code></pre>
+<p>The companion <code>markdown_escape(s)</code> goes the other direction: it
+backslash-escapes Markdown metacharacters (<code>\</code> <code>*</code> <code>_</code> <code>[</code> <code>]</code> <code>(</code> <code>)</code> <code>#</code>
+<code>`</code> <code>|</code> <code>&gt;</code> <code>-</code>) so a plain-text value can be embedded in Markdown source
+without becoming markup.</p>
+<h2 id="webd-integration">webd integration</h2>
+<p>In Cosmix these builtins exist so a Mix SSR handler running inside the <code>webd</code>
+web daemon can drive a live page over SSE without a client-side framework. The
+shape of a handler is: build event strings, assemble with <code>ds_sse</code>, and return
+the body with the right content type:</p>
+<pre><code class="language-mix">-- inside a webd Mix handler (illustrative)
+$rows = map($items, $render_row)          -- each -&gt; an HTML &lt;li&gt;
+$ev   = ds_patch_elements(join($rows, "\n"), {selector: "#list", mode: "inner"})
+$body = ds_sse($ev)
+
+return {
+  status:  200,
+  headers: { "Content-Type": "text/event-stream" },
+  body:    $body
+}
+</code></pre>
+<p>The Datastar JS client (loaded once in the page shell) opens the SSE connection,
+reads each framed event, and applies the DOM patch or signal update — no
+per-widget JavaScript, no compiled UI framework. This is the "Datastar as a
+transport, not a client library" posture: the server emits patches, the browser
+applies them.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<pre><code class="language-text">ds_patch_elements(html)                              -- morph by element id (mode=outer)
+ds_patch_elements(html, {selector, mode})            -- target + how to patch
+ds_patch_elements("", {mode:"remove", selector:"#x"})-- delete (selector required)
+ds_patch_elements(html, {view_transition:true})      -- wrap in a View Transition
+ds_patch_signals({k:v, ...})                         -- merge a signal patch (map/list -&gt; JSON)
+ds_patch_signals($json_string)                       -- verbatim JSON signals
+ds_patch_signals(sig, {only_if_missing:true})        -- set defaults only
+ds_sse($event)                                       -- body from one event
+ds_sse([$e1, $e2, ...])                              -- body from several events
+markdown($md)                                        -- CommonMark+GFM -&gt; safe HTML
+markdown_escape($text)                               -- escape text INTO markdown source
+html_escape($text)                                   -- escape text INTO html element text
+
+-- modes: outer(default) inner remove replace prepend append before after
+-- unknown option-map keys are silently ignored (no strict allowlist)
+-- a NaN/inf number in a signals map raises (JSON has no NaN/Infinity)
+-- ALWAYS html_escape() untrusted content before ds_patch_elements()
+</code></pre>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — string handling, interpolation and escaping rules</li>
+<li><a href="/mix/builtins">builtins index</a> — all builtin categories (the <code>ds_*</code> builtins are not bucketed by <code>mix builtins</code> — use <code>mix what &lt;name&gt;</code>)</li>
+<li><a href="/mix/hof">higher-order functions</a> — <code>map</code>/<code>filter</code> for building fragment lists</li>
+<li><a href="/mix/data">JSON &amp; data</a> — <code>json_encode</code> for a verbatim <code>ds_patch_signals</code> payload, and the shared encoder rules (non-finite numbers raise)</li>
+<li><a href="/mix/capabilities">capabilities</a> — the <code>ds_*</code> and <code>markdown</code> builtins are Pure</li>
+<li><a href="/mix/bus">Bus messaging</a> — the mesh transport behind a live-data handler</li>
+<li>Datastar — <a href="https://data-star.dev">https://data-star.dev</a> (hypermedia framework, SSE patch semantics)</li>
+<li>The Mix repo — <a href="https://github.com/markc/cosmix">https://github.com/markc/cosmix</a></li>
+<li>ARexx lineage (every app an addressable, scriptable port) — the ergonomic precedent for Mix as a control surface</li>
+<li><code>mix what ds_patch_elements</code> · <code>mix what ds_patch_signals</code> · <code>mix what ds_sse</code> · <code>mix what markdown</code></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +942,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +996,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1125,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

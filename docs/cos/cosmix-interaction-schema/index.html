@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-interaction-schema/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,140 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-interaction-schema/README.md"><div class="prose"><h1 id="cosmix-interaction-schema">cosmix-interaction-schema</h1>
+<p><code>cosmix-interaction-schema</code> defines the headless serde data-transfer objects for the <code>interact.*</code> wire contract used by the ctkd ephemeral-surfaces daemon. It is the shared interaction vocabulary for non-toolkit callers, toolkit code, and the daemon boundary. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it belongs to the <code>cos</code> layer, but it depends only on <code>serde</code> and does not pull in Bus, Mix, Bevy, CTK, or other CosMix crates.</p>
+<h2 id="scope">Scope</h2>
+<p>The crate currently defines <code>notify.v1</code>: passive, fire-and-forget desktop notifications.</p>
+<p>It covers the wire shapes for:</p>
+<ul>
+<li><code>interact.notify</code></li>
+<li><code>interact.update</code></li>
+<li><code>interact.dismiss</code></li>
+</ul>
+<p>It does not define modal dialogs or other interactive surfaces.</p>
+<p>The crate is a library. It has no binary, command-line interface, configuration file, Cargo features, or public submodules.</p>
+<p>Notification content has no password, <code>sensitive</code>, or other confidential-field vocabulary.</p>
+<h2 id="request-types">Request types</h2>
+<h3 id="notifyrequest"><code>NotifyRequest</code></h3>
+<p><code>NotifyRequest</code> is the notification content sent by a caller.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>summary</code></td><td><code>String</code></td><td>Required, non-empty single-line headline</td></tr>
+<tr><td><code>body</code></td><td><code>Option&lt;String&gt;</code></td><td>Optional plain longer text</td></tr>
+<tr><td><code>urgency</code></td><td><code>Urgency</code></td><td>Attention level; defaults to <code>Normal</code></td></tr>
+<tr><td><code>category</code></td><td><code>Option&lt;String&gt;</code></td><td>Freedesktop category hint</td></tr>
+<tr><td><code>icon</code></td><td><code>Option&lt;IconRef&gt;</code></td><td>Curated catalogue reference</td></tr>
+<tr><td><code>dedupe_key</code></td><td><code>Option&lt;String&gt;</code></td><td>Replacement and coalescing key</td></tr>
+<tr><td><code>timeout_ms</code></td><td><code>Option&lt;u32&gt;</code></td><td>Display-timeout hint in milliseconds</td></tr>
+<tr><td><code>actions</code></td><td><code>Vec&lt;NotifyAction&gt;</code></td><td>Optional action buttons</td></tr>
+</tbody></table>
+<p><code>NotifyRequest::new(summary)</code> constructs a minimal request with normal urgency and no optional fields.</p>
+<p>Call <code>NotifyRequest::validate()</code> before dispatch. Validation is structural; broker policy remains outside this crate.</p>
+<p>The request deliberately has no <code>origin</code> field. The broker derives provenance from the registered Bus caller identity.</p>
+<h3 id="notifycreaterequest"><code>NotifyCreateRequest</code></h3>
+<p><code>NotifyCreateRequest</code> is the envelope accepted by <code>interact.notify</code>.</p>
+<p>It flattens a <code>NotifyRequest</code> into the wire object and adds an optional <code>OwnerToken</code>.</p>
+<p><code>NotifyCreateRequest::new(request)</code> creates a fresh-notification envelope without an owner token. A caller replacing an existing <code>dedupe_key</code> supplies the token returned for that notification.</p>
+<h3 id="notifyupdaterequest"><code>NotifyUpdateRequest</code></h3>
+<p><code>NotifyUpdateRequest</code> is the token-bearing <code>interact.update</code> request.</p>
+<p>It contains:</p>
+<ul>
+<li>the opaque <code>NotifyHandle</code></li>
+<li>the matching <code>OwnerToken</code></li>
+<li>a flattened replacement <code>NotifyRequest</code></li>
+</ul>
+<h3 id="notifydismissrequest"><code>NotifyDismissRequest</code></h3>
+<p><code>NotifyDismissRequest</code> is the token-bearing <code>interact.dismiss</code> request. It contains the notification handle and its owner token.</p>
+<h2 id="responses-and-stored-records">Responses and stored records</h2>
+<h3 id="notifyresponse"><code>NotifyResponse</code></h3>
+<p>A successful <code>interact.notify</code> response returns a stable opaque <code>NotifyHandle</code> and an <code>OwnerToken</code> bearer capability for later mutation.</p>
+<p>The handle is distinct from the Bus transport correlation ID. The broker mints it independently of request contents.</p>
+<p><code>NotifyHandle::as_str()</code> and <code>OwnerToken::as_str()</code> expose the wrapped string by reference.</p>
+<p>The owner token is not notification content. It must not be logged, rendered, or projected through properties.</p>
+<h3 id="notifymutationresponse"><code>NotifyMutationResponse</code></h3>
+<p>An accepted update or dismissal returns a <code>NotifyMutationResponse</code> containing the handle and current <code>NotifyState</code>.</p>
+<p>Delivery is asynchronous. <code>Queued</code> acknowledges acceptance but does not mean that a desktop notification daemon has shown the notification.</p>
+<h3 id="notifyrecord"><code>NotifyRecord</code></h3>
+<p><code>NotifyRecord</code> is the broker-owned stored form of a live notification.</p>
+<p>It stores the opaque handle, broker-stamped <code>origin</code>, lifecycle state, creation time in Unix epoch milliseconds, summary, effective urgency, optional urgency override, and optional deduplication key. It does not store or expose the owner token.</p>
+<h2 id="notification-vocabulary">Notification vocabulary</h2>
+<h3 id="urgency"><code>Urgency</code></h3>
+<p><code>Urgency</code> has three lowercase wire values:</p>
+<table><thead><tr><th>Variant</th><th>Wire value</th></tr></thead><tbody>
+<tr><td><code>Low</code></td><td><code>low</code></td></tr>
+<tr><td><code>Normal</code></td><td><code>normal</code></td></tr>
+<tr><td><code>Critical</code></td><td><code>critical</code></td></tr>
+</tbody></table>
+<p><code>Normal</code> is the default. Broker-side policy may clamp a remote caller's requested urgency; the schema type does not perform that policy check.</p>
+<h3 id="iconref"><code>IconRef</code></h3>
+<p><code>IconRef</code> names a curated icon rather than carrying image bytes or a filesystem path.</p>
+<table><thead><tr><th>Variant</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Lucide(String)</code></td><td>Key in the shared Lucide icon catalogue</td></tr>
+<tr><td><code>Emoji(String)</code></td><td>Forward-compatible emoji catalogue key</td></tr>
+</tbody></table>
+<p>The wire variant names use <code>snake_case</code>. <code>notify.v1</code> resolves Lucide icons; emoji references remain unsupported until that asset class is available.</p>
+<h3 id="notifyaction"><code>NotifyAction</code></h3>
+<p>An action contains a stable <code>key</code>, a human-visible <code>label</code>, and an optional <code>Dispatch</code>.</p>
+<p>If <code>on_invoke</code> is absent, invoking the action dismisses and records it without sending a callback.</p>
+<p><code>MAX_ACTIONS</code> is <code>3</code>.</p>
+<h3 id="dispatch"><code>Dispatch</code></h3>
+<p><code>Dispatch</code> identifies the registered Bus service and command invoked for an action. The service is a registered service name, not a process ID. The delivery worker checks registration before showing the notification.</p>
+<h2 id="lifecycle">Lifecycle</h2>
+<p><code>NotifyState</code> serialises with <code>snake_case</code> names.</p>
+<table><thead><tr><th>State</th><th style="text-align: right">Terminal</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Queued</code></td><td style="text-align: right">no</td><td>Accepted but not yet handed to the notification daemon</td></tr>
+<tr><td><code>Shown</code></td><td style="text-align: right">no</td><td>Presented by the notification daemon</td></tr>
+<tr><td><code>Dismissed</code></td><td style="text-align: right">yes</td><td>Dismissed by the user or <code>interact.dismiss</code></td></tr>
+<tr><td><code>Expired</code></td><td style="text-align: right">yes</td><td>Timed out</td></tr>
+<tr><td><code>ActionInvoked</code></td><td style="text-align: right">yes</td><td>An action was invoked</td></tr>
+<tr><td><code>Failed</code></td><td style="text-align: right">yes</td><td>Delivery failed</td></tr>
+</tbody></table>
+<p><code>NotifyState::is_terminal()</code> reports whether further state transitions are prohibited.</p>
+<h2 id="validation">Validation</h2>
+<p><code>NotifyRequest::validate()</code> rejects:</p>
+<ul>
+<li>an empty or whitespace-only summary</li>
+<li>more than three actions</li>
+<li>an empty action key</li>
+<li>duplicate action keys</li>
+<li>an empty dispatch service or command</li>
+<li>dispatch identifiers outside the Bus wire grammars</li>
+</ul>
+<p><code>ValidationError</code> identifies the failed rule and implements <code>Display</code> and <code>std::error::Error</code>.</p>
+<p>The public helper <code>is_bus_service_name()</code> checks the service-name grammar: 2 to 31 ASCII bytes, starting with a lowercase letter, followed by lowercase letters, digits, or hyphens.</p>
+<p>Dispatch commands use the form <code>&lt;service&gt;.&lt;verb&gt;[-&lt;noun&gt;]</code>. They are lowercase ASCII, contain one dot, use hyphens between non-empty command segments, and do not accept underscores.</p>
+<p>Validation does not check:</p>
+<ul>
+<li>caller capability</li>
+<li>broker-stamped origin</li>
+<li>rate limits</li>
+<li>whether a dispatch service is currently registered</li>
+<li>urgency clamping</li>
+<li>timeout policy</li>
+</ul>
+<p>Those checks belong to the broker.</p>
+<h2 id="example">Example</h2>
+<pre><code class="language-rust">use cosmix_interaction_schema::{
+    Dispatch, IconRef, NotifyAction, NotifyCreateRequest, NotifyRequest, Urgency,
+};
+
+let mut notification = NotifyRequest::new("Export complete");
+notification.body = Some("The archive is ready.".into());
+notification.urgency = Urgency::Low;
+notification.icon = Some(IconRef::Lucide("circle-check".into()));
+notification.dedupe_key = Some("export-job".into());
+notification.actions.push(NotifyAction {
+    key: "open".into(),
+    label: "Open".into(),
+    on_invoke: Some(Dispatch {
+        service: "example-app".into(),
+        verb: "document.open".into(),
+    }),
+});
+
+notification.validate().expect("valid notification");
+let _wire_request = NotifyCreateRequest::new(notification);
+</code></pre></div></div>
     </div>
 
 </main>
@@ -620,6 +752,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +806,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +935,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

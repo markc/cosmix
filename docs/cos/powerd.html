@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/powerd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,119 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/powerd.md"><div class="prose"><h1 id="cosmix-powerd--battery-and-power-state">cosmix-powerd — battery and power state</h1>
+<p><strong><code>cosmix-powerd</code> is the event-driven UPower citizen for battery, charging and
+power-source state.</strong> It turns the local system D-Bus view into a read-only
+<code>power.*</code> Bus namespace and small lifecycle topics.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li>Reads UPower's virtual <code>DisplayDevice</code> and all devices returned by
+<code>EnumerateDevices</code>.</li>
+<li>Exposes presence, percentage, charging state, time-to-empty/full, energy rate
+and battery health when UPower provides them.</li>
+<li>Watches <code>PropertiesChanged</code>, <code>DeviceAdded</code>, <code>DeviceRemoved</code> and
+<code>org.freedesktop.DBus.NameOwnerChanged</code>; ordinary updates never depend on a
+polling loop.</li>
+<li>Keeps serving the Bus namespace when UPower is absent. The snapshot then has
+<code>present=false</code>. The daemon requests D-Bus activation once, waits for the
+owner edge without retry-spinning, and attaches when UPower claims its name.</li>
+</ul>
+<p>The signal matches are installed before the first owner query and snapshot so
+changes during startup remain queued. The tracker task drains the bounded raw
+signal stream alongside every D-Bus method reply, including activation and the
+final owner check, so a signal burst cannot back-pressure the shared D-Bus
+reader ahead of that reply. If a signal lands around a multi-call scan or final
+owner check, powerd discards that attempt and rescans. After three consecutively
+raced attempts it publishes nothing, retains the previous complete snapshot,
+logs the storm once, and uses the consumed signal wake to scan again. A
+sustained storm can delay freshness but can never publish a mixed state. A
+five-minute full rescan exists only as a missed-signal backstop.</p>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-powerd serve
+</code></pre>
+<p>The supplied <code>cosmix-powerd.service</code> is a systemd user unit because the Bus
+citizen belongs to the graphical session. The SPEC-10 <code>cosmix-powerd</code> UID/GID
+row reserves its daemon identity and namespace; it is not the runtime user of
+this session service.</p>
+<h2 id="bus-verbs">Bus verbs</h2>
+<p>The service name is <code>power</code>.</p>
+<table><thead><tr><th>Verb</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>power.info</code></td><td>Build identity, current power summary and cumulative publisher loss</td></tr>
+<tr><td><code>power.ping</code></td><td>Liveness reply (<code>{"pong":true}</code>)</td></tr>
+<tr><td><code>power.props.get</code></td><td>Full snapshot, or one path supplied as <code>args.path</code></td></tr>
+<tr><td><code>power.props.list</code></td><td>Current leaf paths</td></tr>
+<tr><td><code>power.props.describe</code></td><td>Schema for one path supplied as <code>args.path</code></td></tr>
+<tr><td><code>power.props.watch</code></td><td>Topic discovery and subscribe-before-read bootstrap instructions</td></tr>
+</tbody></table>
+<h2 id="property-namespace">Property namespace</h2>
+<p>All properties are read-only. Optional numeric leaves are absent when UPower
+reports that value as unknown.</p>
+<table><thead><tr><th>Path</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>present</code></td><td>A system battery or UPS is present</td></tr>
+<tr><td><code>on_battery</code></td><td>The system is currently running on battery</td></tr>
+<tr><td><code>battery.present</code></td><td>Presence of the aggregate display battery</td></tr>
+<tr><td><code>battery.kind</code></td><td><code>battery</code>, <code>ups</code>, <code>line-power</code>, <code>peripheral</code> or <code>unknown</code></td></tr>
+<tr><td><code>battery.power_supply</code></td><td>The aggregate device supplies the system</td></tr>
+<tr><td><code>battery.percentage</code></td><td>Remaining charge, 0–100</td></tr>
+<tr><td><code>battery.state</code></td><td><code>unknown</code>, <code>charging</code>, <code>discharging</code>, <code>empty</code>, <code>fully-charged</code>, <code>pending-charge</code> or <code>pending-discharge</code></td></tr>
+<tr><td><code>battery.time_to_empty_s</code></td><td>Estimated seconds until empty</td></tr>
+<tr><td><code>battery.time_to_full_s</code></td><td>Estimated seconds until full</td></tr>
+<tr><td><code>battery.energy_rate_w</code></td><td>Watts; positive is discharging, negative is charging</td></tr>
+<tr><td><code>battery.health_percent</code></td><td>Full-charge capacity as a percentage of design capacity</td></tr>
+<tr><td><code>devices.&lt;id&gt;.*</code></td><td>The same fields for each enumerated UPower device</td></tr>
+<tr><td><code>lifecycle.props_level</code></td><td><code>L2</code></td></tr>
+<tr><td><code>lifecycle.event_seq</code></td><td>Daemon-session monotonic event sequence</td></tr>
+<tr><td><code>lifecycle.publisher_loss</code></td><td>Cumulative publications lost during this daemon session</td></tr>
+</tbody></table>
+<p><code>&lt;id&gt;</code> is a stable lowercase <code>d_&lt;hex&gt;</code> encoding of the complete UPower object
+path. This fits the SPEC-07 segment grammar without collisions or leaking D-Bus
+path syntax. Peripheral batteries are retained in <code>devices.*</code>; the root
+<code>present</code> flag counts only a present <code>PowerSupply</code> battery or UPS.</p>
+<h2 id="topics">Topics</h2>
+<p>Domain-topic payloads contain <code>event</code>, <code>event_seq</code> and <code>data</code>;
+<code>power.props.changed</code> uses the standard <code>{path,old,new,ts,cause}</code> shape plus an
+<code>event_seq</code> header. Consumers subscribe on their Bus connection and then call
+<code>power.props.get</code>; <code>event_seq</code> reveals an edge between that bootstrap snapshot
+and later events.</p>
+<p>Publication never back-pressures the UPower tracker. State topics coalesce
+latest-wins by <code>(topic, path/device)</code>: property changes by property path,
+battery changes by device ID, and power-source changes as one state key. The
+keyed state map holds at most 1024 keys and drops the oldest key at the cap.
+<code>power.device.added</code> and <code>power.device.removed</code> are events, so they share a
+64-item FIFO and are never coalesced or reordered while loss-free.</p>
+<p>Any publication loss — latest-wins replacement, keyed-state cap, event FIFO
+overflow, stale owner epoch, broker send error or broker send timeout — advances
+the cumulative daemon-session loss counter. The publisher then discards its
+older backlog and publishes one <code>power.props.changed</code> control frame using the
+same convention as interactd: <code>gap=true</code>, <code>lost_count</code>, and
+<code>cause=publisher.loss</code>. On any frame with <code>gap=true</code>, a consumer must discard
+its projected power state and re-read the complete snapshot via
+<code>power.props.get</code> before applying later events. <code>lost_count</code> is the number of
+discarded or failed publications covered by that gap; <code>power.info</code> and
+<code>lifecycle.publisher_loss</code> expose the cumulative daemon-session total.</p>
+<p>Loss diagnostics are episode-limited so a broker outage or state storm cannot
+turn the synchronous reducer path into a logging bottleneck. The first loss
+logs its cause; later losses only advance the counters. A successful publish
+ends the episode and logs its total and duration. During a sustained outage, a
+continuing summary is emitted no more than once per 60 seconds.</p>
+<p>Every outgoing item is tagged with the unique UPower owner epoch. The publisher
+checks that epoch immediately before its single send await and skips stale
+items. It does not cancel an accepted send because cancellation cannot retract
+a frame already accepted by the socket sink; at most one already-sent
+old-epoch frame may still be in flight, and its <code>event_seq</code>/epoch turnover is
+covered by the same gap-and-reseed contract.</p>
+<table><thead><tr><th>Topic</th><th>Published for</th></tr></thead><tbody>
+<tr><td><code>power.props.changed</code></td><td>Standard SPEC-07 leaf-level old/new property deltas</td></tr>
+<tr><td><code>power.battery.changed</code></td><td>Aggregate or enumerated battery values changed</td></tr>
+<tr><td><code>power.device.added</code></td><td>An enumerated UPower device appeared</td></tr>
+<tr><td><code>power.device.removed</code></td><td>An enumerated UPower device disappeared</td></tr>
+<tr><td><code>power.on_battery.changed</code></td><td>The system switched between mains and battery</td></tr>
+</tbody></table>
+<h2 id="feature-boundary">Feature boundary</h2>
+<p>The default <code>cosmix</code> feature builds the UPower adapter and Bus citizen.
+<code>cargo test -p cosmix-powerd --no-default-features</code> builds and tests only the
+pure snapshot/diff core, without zbus, Tokio or Cosmix transport dependencies.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +731,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +785,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +914,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

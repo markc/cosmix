@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/03-shared-types</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,92 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/03-shared-types.md"><div class="prose"><h1 id="shared-types-and-validation-boundaries">Shared types and validation boundaries</h1>
+<h2 id="lexical-invariants-at-the-baseline">Lexical invariants at the baseline</h2>
+<table><thead><tr><th>Type</th><th>Accepted syntax</th><th>Construction and decoding</th></tr></thead><tbody>
+<tr><td><code>PropPath(String)</code></td><td><code>[a-z0-9_]+(\.[a-z0-9_]+)*</code>; no wildcard, empty segment, Unicode or hyphen</td><td>Private field; fallible <code>new</code>; <code>FromStr</code> and manual <code>Deserialize</code> call <code>new</code></td></tr>
+<tr><td><code>NamespaceName(String)</code></td><td><code>[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*</code></td><td>Private field; fallible <code>new</code>; <code>FromStr</code> and manual <code>Deserialize</code> call <code>new</code></td></tr>
+</tbody></table>
+<p>Sources:
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-core/src/path.rs">PropPath and tests</a>,
+<a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-props-store/src/namespace.rs">NamespaceName and tests</a>.
+These are structs, not enums; their error types are enums. Neither defines an
+explicit <code>TryFrom</code> conversion at this revision. Both retain transparent string
+serialisation. Neither constructor imposes a byte-length or segment-count limit.</p>
+<p><strong>TYPE-001 — One lexical invariant per type.</strong> All safe construction and decoding
+paths must preserve the type's accepted grammar. Do not derive transparent
+<code>Deserialize</code> around an unchecked inner string when a fallible constructor is
+the invariant gate. Keep serialisation compatible for valid values.</p>
+<p><strong>TYPE-002 — Nested decoding must use the field type.</strong> Ordinary derived Serde
+decoding of a <code>PropDescribe.path</code>, its <code>children</code>, or <code>RecordKey.namespace</code> invokes
+that field type's <code>Deserialize</code>. The baseline manual implementations therefore
+reject invalid strings inside those enclosing records without a new generic
+validation trait. This does not cover raw <code>String</code>/<code>Value</code> fields, custom decoders
+that bypass the type, or environment-dependent relationships between fields.</p>
+<p><strong>TYPE-003 — Distinguish selectors.</strong> A property path is not a record namespace,
+record key or structured field selector. <code>RecordKey</code> contains an unqualified
+<code>NamespaceName</code>, a <code>String</code> key and <code>Vec&lt;FieldPathSegment&gt;</code>; the latter uses
+<code>Field(String)</code> or <code>Index(u64)</code>. A constructible selector is not proof that a
+particular wire operation supports field projection.</p>
+<h2 id="required-environment-gates">Required environment gates</h2>
+<p>The following are responsibilities, not claims of a new implemented trait API.
+Keep lexical parsing pure. Route contextual checks through the owning registry,
+schema, authenticated request context and atomic mutation boundary.</p>
+<table><thead><tr><th>Gate</th><th>PropPath</th><th>NamespaceName / enclosing RecordKey</th></tr></thead><tbody>
+<tr><td>Input budget</td><td>Bound transport bytes, nesting and allocation before/while decoding</td><td>Same; constructors alone allocate before rejecting oversized input</td></tr>
+<tr><td>Lexical form</td><td><code>new</code> / <code>FromStr</code> / <code>Deserialize</code></td><td><code>new</code> / <code>FromStr</code> / <code>Deserialize</code></td></tr>
+<tr><td>Resolution</td><td>Resolve the path in the selected daemon's property tree</td><td>Resolve the unqualified namespace in the owning service's registered namespace set</td></tr>
+<tr><td>Operation support</td><td>Read/describe/write support; mutable/read-only property</td><td>Registered cardinality, key policy, supported verb and selector shape</td></tr>
+<tr><td>Identity and permission</td><td>Trusted transport provenance, permitted access, redaction</td><td>Service-qualified capabilities and authenticated actor; never trust caller-supplied authority strings</td></tr>
+<tr><td>Schema</td><td>Value type and property-specific domain constraints</td><td>Record schema, primary key and cross-field constraints; reserved/substrate fields</td></tr>
+<tr><td>State and race safety</td><td>Revision/own-operation rules where revisioned writes apply</td><td>Current version, lifecycle and hooks; authorise and commit without stale-state acceptance</td></tr>
+<tr><td>Durable outcome</td><td>Publish only the accepted transition</td><td>Atomic record/history effect, recovery and safe event/audit projection</td></tr>
+</tbody></table>
+<p><strong>TYPE-004 — No syntactic authorisation.</strong> A <code>NamespaceName</code> accepts dotted names
+without knowing the service. <code>qualified(service)</code> returns a composed <code>String</code>;
+it neither validates nor authenticates the service argument. A lexical namespace
+cannot prove that it is registered or that the caller may access it.</p>
+<p><strong>TYPE-005 — Contextual validity belongs at use.</strong> A proposed <code>ValidatedRequest</code>
+or equivalent contract is warranted only where several consumers need to share a
+contextual invariant and its lifetime/atomicity semantics. Adding a marker trait
+does not solve a TOCTOU race. Do not add one merely to duplicate existing string
+validation. <a href="/spec/06-properties">Properties</a> owns the actual routing behaviour.</p>
+<h2 id="reconciled-actor-and-capability-boundaries">Reconciled Actor and Capability boundaries</h2>
+<p>Commit <code>4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac</code> subsequently changed
+props-store to 0.3.0. Inspection of its
+<a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/crates/cosmix-lib-props-store/src/capability.rs">Capability changes</a>
+and <a href="https://github.com/markc/cosmix/blob/4d2f1ebb77af51d8bbd08cb18f4e7070cebb58ac/src/crates/cosmix-lib-props-store/src/record.rs">Actor changes</a>
+shows fallible construction and manual validating deserialisation. Capability
+enforces non-empty only; it deliberately remains an opaque vocabulary, not a
+fixed-alphabet or authorisation proof. Actor validates its supported token forms.
+The unchecked-construction finding at the original baseline is historical. All
+47 changed files were reconciled against the candidate; no Rust tests were rerun.</p>
+<table><thead><tr><th>Type</th><th>Current accepted form and entry points</th><th>Not established by acceptance</th></tr></thead><tbody>
+<tr><td><code>Actor(String)</code></td><td>Private field; fallible <code>new</code>, <code>from_token</code>, <code>service</code>, <code>operator</code>, <code>daemon_complete</code>, <code>FromStr</code> and manual Serde; <code>reconciliation()</code> returns a fixed checked token</td><td>Caller authentication or actor category merely from the helper name</td></tr>
+<tr><td><code>Capability(String)</code></td><td>Private field; non-empty string through <code>new</code>, <code>TryFrom&lt;&amp;str/String&gt;</code>, <code>FromStr</code> and manual Serde</td><td>Alphabet, authority or recognised grant vocabulary</td></tr>
+</tbody></table>
+<p>Actor service/runtime tokens are non-empty ASCII letters (either case), digits,
+underscore, hyphen or dot. Generic runtime forms are <code>token:uuid[:seq]</code>, with an
+8-4-4-4-12 hexadecimal UUID shape and an optional non-empty ASCII decimal sequence.
+The parser does not enforce UUID version/variant, sequence width or monotonicity.
+<code>operator:principal</code> accepts any non-empty remainder, including colons, whitespace,
+Unicode and controls. <code>daemon:token</code> is a special form; longer daemon forms can
+match the generic runtime grammar. Bare <code>operator</code> and <code>daemon</code> are service tokens.
+Helpers route through the general grammar, not separate category validators.</p>
+<p>Capability whitespace, Unicode and controls remain valid if non-empty. An empty
+<code>CapabilitySet</code> is valid; decoding one empty member rejects the entire set.
+Ordinary nested record/event decoding invokes these manual field decoders. Raw
+strings and custom bypasses still need their own gates. Shape does not establish
+the intended activity-emitter obligations in <a href="/spec/06-properties">properties</a>.</p>
+<p><code>Version</code>, <code>Nseq</code> and <code>AuditEpoch</code> still expose <code>u64</code> tuple fields; their <code>next()</code>
+uses ordinary addition, not explicit overflow errors. These and contextual
+authorisation/state checks remain separate from the completed lexical change.</p>
+<p><strong>TYPE-006 — Test the boundaries, not just constructors.</strong> Require direct invalid
+decoding, invalid nested fields/collections, valid round-trips and supported
+ingestion-path tests. Baseline PropPath/NamespaceName tests exist; this audit did
+not execute them. Add contextual rejection/race tests separately where behaviour
+depends on registration, capabilities, schema or current state.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +704,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +758,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +887,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-mds/cli</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,133 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-mds/cli.md"><div class="prose"><h1 id="cosmix-mds-command">cosmix-mds command</h1>
+<p><code>cosmix-mds</code> is the operator interface to a <code>SqliteCasMds</code> storage root. It lists and migrates sets, reports statistics, verifies and collects blobs, rebuilds the derived blob index, transfers sets, and prunes retained change streams.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-mds [OPTIONS] &lt;COMMAND&gt;
+</code></pre>
+<p>The storage root is mandatory. Pass <code>--root &lt;PATH&gt;</code> or set <code>COSMIX_MDS_ROOT</code>. The command-line option takes precedence over the environment variable. There is no implicit root.</p>
+<h2 id="global-options">Global options</h2>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--root &lt;PATH&gt;</code></td><td>MDS storage root</td></tr>
+<tr><td><code>--json</code></td><td>Emit the command report as JSON</td></tr>
+<tr><td><code>-q</code>, <code>--quiet</code></td><td>Accepted global flag; current handlers do not consult it</td></tr>
+<tr><td><code>-v</code>, <code>--verbose</code></td><td>Accepted global flag; current handlers do not consult it</td></tr>
+<tr><td><code>--help</code></td><td>Show help</td></tr>
+<tr><td><code>--version</code></td><td>Show the package version</td></tr>
+</tbody></table>
+<p>Reports go to standard output. Command failures print <code>cosmix-mds: &lt;error&gt;</code> to standard error.</p>
+<h2 id="exit-status">Exit status</h2>
+<table><thead><tr><th style="text-align: right">Status</th><th>Meaning</th></tr></thead><tbody>
+<tr><td style="text-align: right"><code>0</code></td><td>Command succeeded, including a report containing findings</td></tr>
+<tr><td style="text-align: right"><code>2</code></td><td>Argument, root, I/O, schema, UUID, duration, or storage failure</td></tr>
+</tbody></table>
+<p>Status <code>1</code> is reserved and is not emitted by the current implementation. Verification mismatches, garbage-collection deletions, and dry-run pending work do not change a successful status to a failure.</p>
+<h2 id="commands">Commands</h2>
+<table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>list-sets</code></td><td>Print every set UUID</td></tr>
+<tr><td><code>migrate-all</code></td><td>Open the root and apply all known schema migrations</td></tr>
+<tr><td><code>stats [--per-set]</code></td><td>Report global counters and optional per-set counters</td></tr>
+<tr><td><code>verify [SCOPE]</code></td><td>Recompute blob hashes and update the verification ledger</td></tr>
+<tr><td><code>gc [--dry-run]</code></td><td>Run two-pass garbage collection</td></tr>
+<tr><td><code>rebuild-index</code></td><td>Reconstruct <code>blobs.sqlite</code></td></tr>
+<tr><td><code>export &lt;SET_ID&gt; &lt;TARBALL&gt;</code></td><td>Export one set</td></tr>
+<tr><td><code>import &lt;TARBALL&gt;</code></td><td>Import one exported set</td></tr>
+<tr><td><code>prune-changelog &lt;SET_ID&gt; --stream &lt;STREAM&gt; --keep-n &lt;N&gt;</code></td><td>Retain the newest rows in a set change stream</td></tr>
+</tbody></table>
+<h2 id="list-sets">list-sets</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; list-sets
+</code></pre>
+<p>Human output contains one UUID per line. JSON output has this shape:</p>
+<pre><code class="language-json">{"sets":["018f0000-0000-7000-8000-000000000001"]}
+</code></pre>
+<p>Opening the root applies known migrations before listing sets.</p>
+<h2 id="migrate-all">migrate-all</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; migrate-all
+</code></pre>
+<p>The command opens the shared blob database and every discovered set database. Opening applies all known migrations. The current implementation stops at the first error; it does not continue with later sets.</p>
+<p>Successful JSON output contains <code>sets</code> and <code>errors</code>. <code>errors</code> is currently always zero because partial success is not implemented.</p>
+<pre><code class="language-json">{"sets":3,"errors":0}
+</code></pre>
+<h2 id="stats">stats</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; stats
+cosmix-mds --root &lt;PATH&gt; stats --per-set
+</code></pre>
+<p>Global statistics contain:</p>
+<ul>
+<li>Set count.</li>
+<li>Container count.</li>
+<li>Item count.</li>
+<li>Physical distinct blob count.</li>
+<li>Total physical blob bytes.</li>
+<li>Deduplication ratio.</li>
+</ul>
+<p><code>--per-set</code> appends a row for each set in human output. In JSON, the stable top-level <code>sets</code> field is <code>null</code> without <code>--per-set</code> and an array when the option is present.</p>
+<p>Per-set <code>blob_count</code> counts distinct hashes referenced by that set. Per-set <code>total_bytes</code> is logical item size, not deduplicated physical storage.</p>
+<h2 id="verify">verify</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; verify
+cosmix-mds --root &lt;PATH&gt; verify --full
+cosmix-mds --root &lt;PATH&gt; verify --since 24h
+cosmix-mds --root &lt;PATH&gt; verify --container &lt;CONTAINER_UUID&gt;
+</code></pre>
+<p>The scope options are mutually exclusive:</p>
+<table><thead><tr><th>Scope</th><th>Selection</th></tr></thead><tbody>
+<tr><td>No scope or <code>--full</code></td><td>Every blob row in <code>blobs.sqlite</code></td></tr>
+<tr><td><code>--since &lt;DURATION&gt;</code></td><td>Blobs never verified or last verified before the calculated time</td></tr>
+<tr><td><code>--container &lt;UUID&gt;</code></td><td>Blobs referenced by that container across all sets</td></tr>
+</tbody></table>
+<p>Durations use <code>humantime</code> syntax such as <code>30m</code>, <code>24h</code>, <code>7d</code>, or <code>1h30m</code>.</p>
+<p>The report separates hash mismatches from missing CAS files. JSON fields are <code>blobs_checked</code>, <code>mismatches</code>, <code>mismatches_hash</code>, <code>mismatches_missing</code>, <code>duration_ms</code>, and <code>scope</code>.</p>
+<h2 id="gc">gc</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; gc
+cosmix-mds --root &lt;PATH&gt; gc --dry-run
+</code></pre>
+<p>Garbage collection takes a first snapshot of zero-refcount candidates, waits for the configured quiescence interval, then rechecks each candidate before deleting it. A blob is skipped if it was referenced again or touched during the interval.</p>
+<p><code>--dry-run</code> performs both passes and rechecks but does not unlink CAS files or delete index rows. Its counters describe what would be removed.</p>
+<p>The report includes deleted blobs, bytes freed, first-pass candidates, re-referenced and re-touched skips, orphan rows swept, pending rows observed, and elapsed milliseconds. JSON also carries <code>dry_run</code>.</p>
+<p>The interval defaults to 60 seconds. <code>COSMIX_MDS_GC_QUIESCENCE_SECS</code> overrides it with an integer number of seconds; values below 5 are ignored.</p>
+<h2 id="rebuild-index">rebuild-index</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; rebuild-index
+</code></pre>
+<p><code>rebuild-index</code> recreates the shared blob and reference rows from all per-set <code>data.sqlite</code> files. It preserves the verification ledger.</p>
+<p>The report contains sets scanned, items indexed, blobs indexed, orphan CAS files found, and elapsed milliseconds. An orphan is a valid hash-named CAS file absent from the rebuilt index.</p>
+<h2 id="export">export</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; export &lt;SET_UUID&gt; &lt;TARBALL_PATH&gt;
+</code></pre>
+<p>The command locks the set for the export, creates a compact <code>data.sqlite</code> snapshot, gathers each distinct referenced blob, and writes:</p>
+<pre><code class="language-text">manifest.json
+data.sqlite
+blobs/&lt;hh&gt;/&lt;hh&gt;/&lt;blake3-hex&gt;
+</code></pre>
+<p>The archive does not contain <code>blobs.sqlite</code>. The destination is written through a sibling <code>.partial</code> file and renamed after completion. A missing referenced blob or write failure aborts the export and removes the partial output where possible.</p>
+<p>JSON fields are <code>set_id</code>, <code>tarball</code>, <code>item_count</code>, <code>blob_count</code>, <code>bytes_written</code>, and <code>duration_ms</code>.</p>
+<h2 id="import">import</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; import &lt;TARBALL_PATH&gt;
+</code></pre>
+<p>The set UUID comes from <code>manifest.json</code>; it is not a command argument. Import refuses a UUID already present in the root.</p>
+<p>Import accepts only the fixed export layout. It rejects absolute paths, traversal paths, duplicate required entries, unsupported format or schema versions, inconsistent counts, and blob paths whose BLAKE3 value does not match their bytes.</p>
+<p>The command stages data before making the set visible, migrates older supported set schemas, installs the set database, and writes the imported blob references. It does not populate the later verification ledger.</p>
+<p>JSON fields are <code>set_id</code>, <code>tarball</code>, <code>item_count</code>, <code>blob_count</code>, <code>bytes_read</code>, and <code>duration_ms</code>.</p>
+<h2 id="prune-changelog">prune-changelog</h2>
+<pre><code class="language-text">cosmix-mds --root &lt;PATH&gt; prune-changelog &lt;SET_UUID&gt; \
+  --stream container-change-set --keep-n 1000
+
+cosmix-mds --root &lt;PATH&gt; prune-changelog &lt;SET_UUID&gt; \
+  --stream set-change --keep-n 1000
+</code></pre>
+<p>The supported streams are:</p>
+<table><thead><tr><th>CLI value</th><th>Stored stream</th></tr></thead><tbody>
+<tr><td><code>container-change-set</code></td><td>Set-wide container lifecycle changes</td></tr>
+<tr><td><code>set-change</code></td><td>Set-wide item changes</td></tr>
+</tbody></table>
+<p>The command keeps the newest <code>N</code> rows and advances the durable retention floor to the highest deleted sequence. <code>--keep-n 0</code> removes every row in the selected stream. If fewer than <code>N</code> rows exist, the command is a no-op and leaves the floor unchanged.</p>
+<p>JSON fields are <code>set_id</code>, <code>stream</code>, <code>keep_n</code>, <code>rows_removed</code>, and <code>new_floor</code>.</p>
+<h2 id="json-conventions">JSON conventions</h2>
+<p>Each successful JSON report is one object followed by a newline. Durations use integer <code>duration_ms</code> fields. UUIDs and paths are strings. Human-readable byte values use decimal units, while JSON byte counters remain integers.</p>
+<p>Use <code>--json</code> for automation. Human output is intended for direct inspection and may contain aligned columns, thousands separators, and abbreviated durations.</p>
+<h2 id="see-also">See also</h2>
+<p><a href="/cos/cosmix-mds/">cosmix-mds library</a></p></div></div>
     </div>
 
 </main>
@@ -620,6 +745,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +799,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +928,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

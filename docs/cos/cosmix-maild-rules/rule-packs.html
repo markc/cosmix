@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild-rules/rule-packs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,134 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild-rules/rule-packs.md"><div class="prose"><h1 id="rule-packs">Rule packs</h1>
+<p><code>cosmix-maild-rules</code> loads deterministic rules from strict-data <code>.conf.mix</code>
+files. The bundled pack is available through <code>default_pack_str</code>; file-backed
+engines can atomically reload an operator-supplied pack.</p>
+<h2 id="top-level-shape">Top-level shape</h2>
+<p>A pack contains a version string and a list of rules.</p>
+<pre><code class="language-text">pack_version: "v1.0"
+
+rule: [
+  {
+    id: "example-subject",
+    description: "Subject contains an example marker",
+    weight: 2,
+    match: {
+      kind: "header_substring",
+      name: "Subject",
+      substring: "example"
+    }
+  },
+  {
+    id: "documentation-net",
+    description: "Peer belongs to a documentation network",
+    weight: 1,
+    match: {
+      kind: "peer_ip_in_cidr",
+      cidrs: ["192.0.2.0/24"]
+    }
+  }
+]
+</code></pre>
+<p>Every rule requires <code>id</code>, <code>description</code>, <code>weight</code>, and <code>match</code>. Rule
+identifiers are stable strings within a pack version. A matched rule contributes
+<code>max(weight, 0)</code> to the raw score.</p>
+<p>The <code>match</code> map rejects unknown fields. Required fields depend on <code>kind</code>.
+Regexes and CIDRs compile when the pack loads.</p>
+<p>Top-level parse failure rejects the pack. A matcher compile failure rejects
+only that rule; the loader returns the remaining compiled rules and a list of
+<code>(rule_id, error)</code> pairs.</p>
+<h2 id="matcher-kinds">Matcher kinds</h2>
+<table><thead><tr><th><code>kind</code></th><th>Fields</th><th>Match condition</th></tr></thead><tbody>
+<tr><td><code>header_present</code></td><td><code>name</code></td><td>The named top-level header occurs.</td></tr>
+<tr><td><code>header_absent</code></td><td><code>name</code></td><td>The named top-level header does not occur.</td></tr>
+<tr><td><code>header_regex</code></td><td><code>name</code>, <code>regex</code></td><td>Any value of the named header matches the Rust regex.</td></tr>
+<tr><td><code>header_substring</code></td><td><code>name</code>, <code>substring</code></td><td>Any value contains the substring, case-insensitively.</td></tr>
+<tr><td><code>body_regex</code></td><td><code>regex</code>, optional <code>view</code></td><td>The selected decoded body view matches the Rust regex.</td></tr>
+<tr><td><code>body_substring</code></td><td><code>substring</code>, optional <code>view</code></td><td>The selected body view contains the substring, case-insensitively.</td></tr>
+<tr><td><code>mail_auth</code></td><td>One or more of <code>spf</code>, <code>dkim</code>, <code>dmarc</code></td><td>Every configured authentication predicate matches.</td></tr>
+<tr><td><code>peer_ip_in_cidr</code></td><td><code>cidrs</code></td><td>The peer IPv4 or IPv6 address belongs to any CIDR.</td></tr>
+<tr><td><code>peer_ip_in_dnsbl</code></td><td>optional <code>zones</code></td><td>Any zone reports the peer address as listed.</td></tr>
+<tr><td><code>url_count</code></td><td><code>gt</code></td><td>Extracted URL count is greater than <code>gt</code>.</td></tr>
+<tr><td><code>attachment_count</code></td><td><code>gt</code>, optional <code>executable_only</code></td><td>Selected attachment count is greater than <code>gt</code>.</td></tr>
+<tr><td><code>recipient_count</code></td><td><code>gt</code></td><td>Envelope recipient count is greater than <code>gt</code>.</td></tr>
+<tr><td><code>structure</code></td><td>One structural boolean</td><td>The selected structural condition holds.</td></tr>
+<tr><td><code>alignment</code></td><td>optional <code>what</code></td><td>Reserved; accepted by the loader but always returns no match.</td></tr>
+</tbody></table>
+<h2 id="body-views">Body views</h2>
+<p><code>body_regex</code> and <code>body_substring</code> accept these <code>view</code> values:</p>
+<table><thead><tr><th>Value</th><th>Content</th></tr></thead><tbody>
+<tr><td><code>plain</code></td><td>Decoded <code>text/plain</code> parts.</td></tr>
+<tr><td><code>html</code></td><td>Decoded <code>text/html</code> parts.</td></tr>
+<tr><td><code>combined</code></td><td>Plain then HTML content, bounded as one combined view.</td></tr>
+</tbody></table>
+<p>The default is <code>combined</code>.</p>
+<p>Each individual plain and HTML view is bounded by <code>body_scan_bytes</code>. The
+combined view is independently bounded to the same size.</p>
+<h2 id="authentication-predicates">Authentication predicates</h2>
+<p><code>mail_auth</code> accepts one or more predicates. Multiple predicates form an AND
+condition.</p>
+<table><thead><tr><th>Field</th><th>Accepted values</th></tr></thead><tbody>
+<tr><td><code>spf</code></td><td><code>pass</code>, <code>fail</code>, <code>softfail</code>, <code>neutral</code>, <code>none</code>, <code>temperror</code>, <code>permerror</code></td></tr>
+<tr><td><code>dkim</code></td><td><code>pass</code>, <code>fail</code>, <code>none</code>, <code>temperror</code>, <code>permerror</code></td></tr>
+<tr><td><code>dmarc</code></td><td><code>pass</code>, <code>fail</code>, <code>none</code></td></tr>
+</tbody></table>
+<p>These rules add score. Engine-level authentication hard failures are configured
+separately through <code>EngineConfig::mail_auth_hard_fail_kinds</code>.</p>
+<h2 id="structural-rules">Structural rules</h2>
+<p>A <code>structure</code> matcher selects one of these boolean fields with value <code>true</code>:</p>
+<table><thead><tr><th>Field</th><th>Condition</th></tr></thead><tbody>
+<tr><td><code>html_only</code></td><td>HTML body exists without a plain-text alternative.</td></tr>
+<tr><td><code>deep_multipart_nesting</code></td><td>The parsed message crosses the structural nesting heuristic.</td></tr>
+<tr><td><code>missing_message_id</code></td><td>No top-level <code>Message-ID</code> header is visible within configured limits.</td></tr>
+<tr><td><code>has_executable_attachment</code></td><td>An attachment has a recognised executable extension or content type.</td></tr>
+</tbody></table>
+<p>Use one structural field per rule.</p>
+<p>For <code>attachment_count</code>, <code>executable_only</code> defaults to <code>false</code>. Recognised
+executable extensions are <code>exe</code>, <code>scr</code>, <code>bat</code>, <code>cmd</code>, <code>com</code>, <code>pif</code>, <code>vbs</code>,
+<code>js</code>, and <code>jar</code>. Recognised executable content types are
+<code>application/x-msdownload</code> and <code>application/x-executable</code>.</p>
+<h2 id="count-rules-and-limits">Count rules and limits</h2>
+<p><code>url_count</code>, <code>attachment_count</code>, and <code>recipient_count</code> use strict greater-than
+comparison. A rule with <code>gt: 20</code> starts matching at <code>21</code>.</p>
+<p>URL extraction uses the combined body view and stops at
+<code>EngineConfig::url_extraction_cap</code>. Links with <code>cid:</code> and <code>data:</code> schemes do
+not contribute.</p>
+<p>Header matchers inspect top-level headers only. Header count and rendered value
+length are bounded by <code>header_line_cap</code> and <code>header_line_byte_cap</code>.</p>
+<h2 id="dnsbl-rules">DNSBL rules</h2>
+<p><code>peer_ip_in_dnsbl</code> accepts a list of zone names.</p>
+<pre><code class="language-text">{
+  id: "listed-peer",
+  description: "Peer appears on an example DNS blocklist",
+  weight: 5,
+  match: {
+    kind: "peer_ip_in_dnsbl",
+    zones: ["blocklist.example.com"]
+  }
+}
+</code></pre>
+<p>The engine deduplicates zones across active rules and resolves them in parallel.
+An absent DNSBL implementation, an unknown zone result, timeout, or transient
+lookup failure counts as no match. A rule matches if at least one zone reports
+<code>Listed</code>.</p>
+<p>The <code>dnsbl</code> Cargo feature provides the Hickory-backed resolver. The base API
+also permits a caller-supplied <code>DnsblLookup</code>.</p>
+<h2 id="alignment">Alignment</h2>
+<p>The <code>alignment</code> kind accepts <code>what: "spf"</code>, <code>what: "dkim"</code>, or the default
+<code>"either"</code> representation. It is reserved in this version: the loader retains
+its data, but classification never matches it.</p>
+<h2 id="bundled-pack">Bundled pack</h2>
+<p>The embedded pack declares <code>pack_version: "v1.0"</code> and contains 17 rules. It
+covers missing and patterned headers, body patterns, URL and recipient counts,
+executable attachments, message structure, and soft SPF and DKIM failures.</p>
+<p>The default engine thresholds are calibrated separately in <code>EngineConfig</code>.
+Callers can load the embedded text without locating a file:</p>
+<pre><code class="language-rust">let pack = cosmix_maild_rules::default_pack_str();
+</code></pre>
+<p>Return to <a href="/cos/cosmix-maild-rules/">cosmix-maild-rules</a>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +746,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +800,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +929,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

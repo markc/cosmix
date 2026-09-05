@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/collections</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,566 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/collections.md"><div class="prose"><h1 id="collections--lists--maps">collections — lists &amp; maps</h1>
+<p>Mix has two compound data types: the <strong>list</strong> (an ordered, 0-indexed sequence)
+and the <strong>map</strong> (an ordered key→value table, insertion order preserved). Both are
+first-class values — store them in variables, nest them, pass them to functions,
+return them, iterate them, and serialise them with <a href="/mix/data">data</a>. Most list +
+map builtins live in the <code>list</code> and <code>map</code> categories — list them live with
+<code>mix builtins list</code> / <code>mix builtins map</code> — but a few multi-type ones
+(<code>contains</code>, <code>reverse</code>, <code>length</code>/<code>len</code>) sit in the <code>string</code> category since they
+also operate on strings, so <code>mix builtins list</code> won't show every name used here.
+Get one-line help for any name with <code>mix what NAME</code>.</p>
+<blockquote>
+<p>One-line model: <strong>lists are <code>[a, b, c]</code> 0-indexed (negatives count from the
+end, for reads AND writes); maps are <code>{key: value}</code> read with <code>.key</code> or
+<code>["key"]</code>. <code>push</code>/<code>pop</code>/<code>shift</code> and index-assignment mutate in place; everything
+else returns a fresh copy. Lists pass into functions by value, and
+<code>List == List</code> <strong>raises</strong> — use <code>deep_eq(a, b)</code>.</strong></p>
+</blockquote>
+<h2 id="literals--printing">Literals &amp; printing</h2>
+<pre><code class="language-mix">$nums = [10, 20, 30]
+$user = { name: "ada", age: 36 }
+print("" .. $nums)
+print("" .. $user)
+print("" .. [])
+print("" .. {})
+</code></pre>
+<pre><code class="language-text">[10, 20, 30]
+{name: ada, age: 36}
+[]
+{}
+</code></pre>
+<p>A list literal is <code>[</code>…<code>]</code> with <code>,</code>-separated elements; a map literal is <code>{</code>…<code>}</code>
+with <code>key: value</code> pairs. <strong>Map keys are bare identifiers, keyword lexemes, or
+string literals</strong> — <code>{ name: "ada" }</code> and <code>{ "name": "ada" }</code> are the same map.
+Since 0.21 a <a href="/mix/keywords">keyword</a> is accepted as a bare key wherever it is
+unambiguously a name: <code>{ label: 1, to: "x", on: true, parse: 2 }</code> all parse, and
+the same keywords work in dot-field reads and writes (<code>$m.to</code>, <code>$m.label = 2</code>).
+The <strong>one exception is <code>fn</code></strong> — it lexes to the same token as <code>function</code>, so it
+needs the quoted key <code>{ "fn": 1 }</code> and bracket access <code>$m["fn"]</code> (<code>.fn</code> is a
+parse error).</p>
+<p><strong>Map keys are always strings.</strong> A bare <em>number</em> is not a valid literal key —
+<code>{ 22: "ssh" }</code> is a parse error; quote it (<code>{ "22": "ssh" }</code>). Indexing with a
+number coerces to the key's string form, so <code>$m[22] = "ssh"</code> stores key <code>"22"</code>
+and <code>$m[22]</code> / <code>$m["22"]</code> both read it back.</p>
+<p>Elements and values are any Mix value, so nesting is free:</p>
+<pre><code class="language-mix">$cfg = { server: { host: "node1", ports: [80, 443] }, tls: true }
+print("" .. $cfg)
+</code></pre>
+<pre><code class="language-text">{server: {host: node1, ports: [80, 443]}, tls: true}
+</code></pre>
+<p>Note the print form is <strong>debug-ish, not round-trippable</strong>: strings inside a
+container print <em>without</em> quotes (<code>[a, b]</code>, not <code>["a", "b"]</code>). For a parseable
+representation use <a href="/mix/data"><code>data_encode</code></a> / <code>json_encode</code>.</p>
+<h2 id="indexing">Indexing</h2>
+<p>Lists are <strong>0-indexed</strong>. A <strong>negative</strong> index counts from the end (<code>-1</code> is the
+last element). An <strong>out-of-range</strong> index returns <code>nil</code> (never an error) — the
+same three rules hold for a string (yielding a one-character string) and, since
+<strong>v0.64.0</strong>, for <code>bytes</code>/<code>buffer</code> (yielding the byte as a <strong>number</strong> 0-255; see
+<a href="/mix/io#bytes-as-a-sequence-v0640">io</a>):</p>
+<pre><code class="language-mix">$l = [10, 20, 30]
+print($l[0])
+print($l[2])
+print($l[-1])
+print($l[5])
+</code></pre>
+<pre><code class="language-text">10
+30
+30
+nil
+</code></pre>
+<p>Maps are read with <strong>dot</strong> (<code>$m.key</code>) or <strong>bracket</strong> (<code>$m["key"]</code>) syntax; they
+are equivalent. Use the bracket form when the key is computed or held in a
+variable, or when it isn't a bare identifier. A <strong>missing key</strong> returns <code>nil</code>:</p>
+<pre><code class="language-mix">$m = { name: "ada", age: 36 }
+print($m.name)
+print($m["age"])
+print($m.missing)
+$k = "name"
+print($m[$k])
+</code></pre>
+<pre><code class="language-text">ada
+36
+nil
+ada
+</code></pre>
+<h3 id="the--wildcard-key">The <code>"*"</code> wildcard key</h3>
+<p>If a map has a key <code>"*"</code>, an indexing miss falls back to that value instead of
+<code>nil</code>. Handy for default/catch-all tables (e.g. a port→service map — note the
+quoted numeric keys, and that the numeric index <code>80</code> coerces to the string key
+<code>"80"</code>):</p>
+<pre><code class="language-mix">$svc = { "22": "ssh", "80": "http", "*": "unknown" }
+print($svc[80])
+print($svc[12345])
+</code></pre>
+<pre><code class="language-text">http
+unknown
+</code></pre>
+<h3 id="footgun-pos-is-1-based-indexing-is-0-based">Footgun: <code>pos</code> is 1-based, indexing is 0-based</h3>
+<p><code>index_of</code> (and list/<code>substr</code> indexing) are <strong>0-based</strong>; the string-search
+builtin <code>pos</code> is <strong>1-based</strong> and returns <code>0</code> for "not found". Don't mix them up:</p>
+<pre><code class="language-mix">$fruits = ["apple", "pear", "plum"]
+print("index_of (0-based): " .. ("" .. index_of($fruits, "pear")))
+print("index_of miss: " .. ("" .. index_of($fruits, "fig")))
+print("pos (1-based): " .. ("" .. pos("pear", join($fruits, " "))))
+</code></pre>
+<pre><code class="language-text">index_of (0-based): 1
+index_of miss: -1
+pos (1-based): 7
+</code></pre>
+<p><code>index_of(list, value)</code> → 0-based index, or <strong>-1</strong> when absent. <code>pos(needle, haystack)</code> is a <em>string</em> op (see <a href="/mix/strings">strings</a>) — 1-based, <strong>0</strong> when
+absent.</p>
+<h2 id="iterating">Iterating</h2>
+<p><code>for each</code> walks a list directly. Over a <strong>map</strong> with ONE variable it yields
+the <strong>keys</strong> (in insertion order) — <code>for each $k in $m</code> and
+<code>for each $k in keys($m)</code> are equivalent; look values up with <code>$m[$k]</code>. With
+<strong>two</strong> variables it yields <strong>(key, value)</strong> since 0.68.0, so no lookup is
+needed:</p>
+<pre><code class="language-mix">$ports = [22, 80, 443]
+for each $p in $ports
+  print("- port " .. ("" .. $p))
+end
+
+$m = { host: "node1", port: 8080, tls: true }
+for each $k in $m
+  print($k .. " = " .. ("" .. $m[$k]))
+end
+</code></pre>
+<pre><code class="language-text">- port 22
+- port 80
+- port 443
+host = node1
+port = 8080
+tls = true
+</code></pre>
+<p>Over a <strong>string</strong> <code>for each</code> yields one-character strings, and since <strong>v0.64.0</strong>
+over a <code>bytes</code>/<code>buffer</code> it yields the bytes as <strong>numbers</strong> 0-255 (see
+<a href="/mix/io#bytes-as-a-sequence-v0640">io</a>). Every source is materialised at loop
+entry, so mutating it in the body never extends the loop.</p>
+<p>A <strong>second variable</strong> binds the position for a list, string or bytes, and the
+<strong>value</strong> for a map — see
+<a href="/mix/control-flow#two-variables-over-a-map-bind-key-value--changed-in-0680">control-flow</a>
+for the 0.68.0 change and what stayed put.</p>
+<p>For value-producing transforms prefer a <a href="/mix/hof">hof</a> (<code>map</code>/<code>filter</code>/<code>reduce</code>/
+<code>sort_by</code>) over a hand-rolled <code>for each</code> + <code>push</code>.</p>
+<h2 id="length--emptiness">Length &amp; emptiness</h2>
+<p><code>length</code> (alias <code>len</code>) returns the <strong>element count</strong> for a list and the
+<strong>key count</strong> for a map (for a <em>string</em> it counts codepoints — see
+<a href="/mix/strings">strings</a>; for a <strong><code>bytes</code>/<code>buffer</code></strong> it counts bytes, v0.64.0 —
+see <a href="/mix/io#bytes-as-a-sequence-v0640">io</a>). <code>is_empty</code> tests for zero length:</p>
+<pre><code class="language-mix">print("" .. length([10, 20, 30]))
+print("" .. len({ a: 1, b: 2 }))
+print("" .. is_empty([]))
+print("" .. is_empty({ a: 1 }))
+</code></pre>
+<pre><code class="language-text">3
+2
+true
+false
+</code></pre>
+<h2 id="mutating-builtins-in-place">Mutating builtins (in place)</h2>
+<p>Three builtins <strong>mutate the list in place</strong>. <code>push</code> appends and <strong>returns
+<code>nil</code></strong>; <code>pop</code>/<code>shift</code> remove and <strong>return the removed element</strong> (or <code>nil</code> on an
+empty list).</p>
+<pre><code class="language-mix">$l = [1, 2, 3]
+push($l, 4)
+print("after push: " .. ("" .. $l))
+print("pop -&gt; " .. ("" .. pop($l)))
+print("shift -&gt; " .. ("" .. shift($l)))
+print("now: " .. ("" .. $l))
+</code></pre>
+<pre><code class="language-text">after push: [1, 2, 3, 4]
+pop -&gt; 4
+shift -&gt; 1
+now: [2, 3]
+</code></pre>
+<h3 id="footgun-what-push-mutates-depends-on-what-you-hand-it">Footgun: what <code>push</code> mutates depends on what you hand it</h3>
+<p><code>push</code>/<code>pop</code>/<code>shift</code> reach the list <strong>through the variable slot</strong>. That makes
+their behaviour shape-dependent, and it is the single most-tripped-over corner in
+Mix:</p>
+<ul>
+<li><strong>First argument is a bare variable</strong> (<code>push($l, 3)</code>) → mutates <code>$l</code> in place, and <code>push</code> <strong>returns <code>nil</code></strong>. So <code>$l = push($l, 3)</code> ✗ clobbers <code>$l</code> to <code>nil</code>. Call it as a statement: <code>push($l, 3)</code> ✓.</li>
+<li><strong>First argument is anything else</strong> — <code>push($m["a"], 3)</code>, <code>push($m.a, 3)</code> — there is no slot to mutate, so it appends to a <strong>copy</strong> and returns the new list. A bare <code>push($m["a"], 3)</code> therefore does <strong>nothing at all</strong>: the write is lost, silently. Assign the result back instead: <code>$m["a"] = push($m["a"], 3)</code> ✓.</li>
+</ul>
+<p>Since 0.33.0 <code>mix lint</code> catches the dead form as <strong>MIX-E1501</strong>, and the same
+release lets you skip the idiom entirely for maps of maps by writing the nested
+assignment directly (see <a href="/mix/collections#nested-assignment">Nested assignment</a>).</p>
+<pre><code class="language-mix">$l = [1, 2]
+print("push returns: " .. ("" .. push($l, 3)))
+$m = { a: [1] }
+$m["a"] = push($m["a"], 2)
+print("" .. $m)
+</code></pre>
+<pre><code class="language-text">push returns: nil
+{a: [1, 2]}
+</code></pre>
+<h3 id="index-assignment">Index-assignment</h3>
+<p>Assigning to an index mutates in place. <strong>Maps auto-create</strong> the key (so this is
+how you build a map incrementally) — via bracket (<code>$m["a"] = 1</code>) or single-level
+dot (<code>$m.b = 2</code>), which are equivalent. <strong>List writes resolve signed indices
+exactly like reads</strong>: a negative index writes from the end (<code>$l[-1] = v</code> sets the
+last element):</p>
+<pre><code class="language-mix">$m = {}
+$m["a"] = 1
+$m.b = 2
+print("" .. $m)
+
+$l = [10, 20, 30]
+$l[1] = 99
+$l[-1] = 77
+print("" .. $l)
+</code></pre>
+<pre><code class="language-text">{a: 1, b: 2}
+[10, 99, 77]
+</code></pre>
+<p><strong>Out-of-range and mistyped list writes are loud errors</strong> (since 0.20.5 — they
+were previously silent no-ops, and a negative write corrupted element 0):</p>
+<ul>
+<li>an out-of-range index (either direction) raises <code>list index 7 out of range (length 3)</code> — a lost write is data loss; use <code>push</code> to grow a list;</li>
+<li>only a <strong>number</strong> indexes a list on write — <code>$l["a"] = v</code> raises <code>cannot index list with string</code>; a NaN/infinite index is rejected too;</li>
+<li>index-assigning into a scalar (<code>$x = 5</code> then <code>$x[0] = 1</code>) raises <code>cannot index-assign into number</code> — and since 0.33.0 the <strong>dot form raises too</strong> (<code>$x.f = 1</code> previously discarded the write in silence).</li>
+</ul>
+<p>This is a <strong>deliberate read/write asymmetry</strong>: a missing <em>read</em> still returns
+<code>nil</code> (safe default), a missing <em>write</em> errors (silent data loss).</p>
+<h3 id="nested-assignment">Nested assignment</h3>
+<p>Since 0.33.0 an assignment target may carry <strong>any number of accessors</strong>, in any
+mix of <code>.field</code> and <code>["key"]</code>, over maps and lists alike:</p>
+<pre><code class="language-mix">$m = {}
+$m["u"]["k"] = 1
+$m.a.b.c = "deep"
+$l = [[1, 2]]
+$l[0][1] = 99
+print("" .. $m)
+print("" .. $l)
+</code></pre>
+<pre><code class="language-text">{u: {k: 1}, a: {b: {c: deep}}}
+[[1, 99]]
+</code></pre>
+<p>This is not sugar for the old read-mutate-write-back dance: it walks the path and
+mutates <strong>in place</strong>, so building a map of maps is linear where the workaround was
+quadratic (it deep-copied the inner container on every write).</p>
+<p><strong>A missing or <code>nil</code> intermediate is auto-created as a map</strong> — but only when the
+next accessor is a name or a string key, which is the only case where the intent
+is unambiguous:</p>
+<ul>
+<li><code>$m["g1"]["k"] = 1</code> on an empty <code>$m</code> creates <code>$m["g1"] = {}</code> first ✓</li>
+<li><code>$m["a"][0] = 1</code> <strong>raises</strong>: <code>[0]</code> could mean a list slot or the map key <code>"0"</code>, and guessing would freeze one interpretation into your data. Assign an explicit <code>[]</code> or <code>{}</code> first.</li>
+</ul>
+<p><strong>Nothing else is auto-created, and nothing is auto-overwritten:</strong></p>
+<ul>
+<li>an existing scalar intermediate raises (<code>$m = { a: 5 }</code> then <code>$m["a"]["b"] = 1</code> → <code>cannot index-assign into number at $m[a]</code>) — a map is never dropped on top of your data;</li>
+<li><strong>lists never extend</strong>, at any depth — <code>$m["a"][5] = 9</code> on a 1-element list raises, exactly as a single-level write does;</li>
+<li>the <code>"*"</code> wildcard is a <strong>read</strong> fallback only: <code>$m.missing.k = 1</code> creates <code>missing</code>, it does not mutate <code>$m["*"]</code>.</li>
+</ul>
+<p><strong>A failed nested write creates nothing.</strong> The path is validated before it is
+touched, so a write that dies halfway leaves no half-built maps behind — which
+matters because <code>catch</code> can resume after it.</p>
+<h2 id="pure-list-builtins-return-a-copy">Pure list builtins (return a copy)</h2>
+<p>Every builtin below leaves its argument <strong>unchanged</strong> and returns a <strong>new</strong> list.</p>
+<h3 id="sort--unique--reverse">sort / unique / reverse</h3>
+<pre><code class="language-mix">print("" .. sort([3, 1, 20, 2]))
+print("" .. unique([1, 2, 2, 3, 1]))
+print("" .. reverse([1, 2, 3]))
+</code></pre>
+<pre><code class="language-text">[1, 2, 3, 20]
+[1, 2, 3]
+[3, 2, 1]
+</code></pre>
+<blockquote>
+<p><strong><code>sort</code> orders a homogeneous number list numerically; everything else is
+lexicographic.</strong> A list whose every element is a number sorts by value
+(<code>sort([2, 10, 1, 20])</code> → <code>[1, 2, 10, 20]</code>). A list of strings — or a <em>mixed</em>
+list — compares by the <strong>string</strong> form of each element instead, so
+<code>sort([2, "a", 1])</code> → <code>[1, 2, a]</code>. For any other key (a map field, a computed
+value, descending order) use <a href="/mix/hof"><code>sort_by</code></a>:</p>
+</blockquote>
+<pre><code class="language-mix">print("numbers:  " .. ("" .. sort([2, 10, 1, 20])))
+print("strings:  " .. ("" .. sort(["banana", "apple", "cherry"])))
+print("by field: " .. ("" .. sort_by([{p: 80}, {p: 22}], fn($r) = $r["p"])))
+</code></pre>
+<pre><code class="language-text">numbers:  [1, 2, 10, 20]
+strings:  [apple, banana, cherry]
+by field: [{p: 22}, {p: 80}]
+</code></pre>
+<p><code>unique</code> removes duplicates <strong>keeping first-seen order</strong>. <code>reverse</code> works on a
+list, a string, or (since v0.70.0) a bytes/buffer value (byte-wise, returning
+a new value-semantic <code>bytes</code>).</p>
+<h3 id="contains--index_of">contains / index_of</h3>
+<pre><code class="language-mix">$l = ["x", "y", "z"]
+print("" .. contains($l, "y"))
+print("" .. contains($l, "q"))
+print("" .. index_of($l, "z"))
+print("" .. index_of($l, "q"))
+</code></pre>
+<pre><code class="language-text">true
+false
+2
+-1
+</code></pre>
+<p><code>contains(list, v)</code> → bool (it also accepts a <em>string</em> haystack, and since
+0.70.0 a <em>bytes/buffer</em> subject with a byte needle — but <strong>not</strong> a map; use
+<code>has_key</code> for maps). <code>index_of(list, v)</code> → 0-based position or <code>-1</code> (also
+string and, since 0.70.0, bytes/buffer — see <a href="/mix/io">io</a> for the byte-unit
+rules).</p>
+<h3 id="range">range</h3>
+<p><code>range(start, end)</code> is <strong>inclusive of both ends</strong>, with an optional step. Step
+direction must match the start→end direction or you get an empty list. A step of
+<code>0</code>, or a range over 10M elements, errors.</p>
+<p>Bounds and step must be <strong>whole numbers within the i64 range</strong> (fractional,
+non-finite, or beyond ±2^63 raises <code>VALUE_OUT_OF_RANGE</code> naming the argument).
+Before 0.59.0 an oversized bound silently saturated: <code>range(1e30, 1e30)</code>
+answered <code>[9223372036854775807]</code> — a value the caller never wrote.</p>
+<p>All supplied bounds and the optional step must coerce to numbers. Numeric
+strings remain valid (<code>range("1", "3")</code> → <code>[1, 2, 3]</code>); an unparseable value
+raises <code>TYPE_MISMATCH</code> with its argument position instead of silently becoming
+<code>0</code> (or <code>1</code> for step).</p>
+<pre><code class="language-mix">print("" .. range(1, 5))
+print("" .. range(0, 10, 2))
+print("" .. range(5, 1, -1))
+print("" .. range(5, 1))
+</code></pre>
+<pre><code class="language-text">[1, 2, 3, 4, 5]
+[0, 2, 4, 6, 8, 10]
+[5, 4, 3, 2, 1]
+[]
+</code></pre>
+<h3 id="flat">flat</h3>
+<p><code>flat</code> recursively flattens nested lists into one flat list:</p>
+<pre><code class="language-mix">print("" .. flat([1, [2, 3], [4, [5, 6]]]))
+</code></pre>
+<pre><code class="language-text">[1, 2, 3, 4, 5, 6]
+</code></pre>
+<h3 id="concat">concat</h3>
+<p><code>concat($a, $b, …)</code> joins <strong>2+ lists</strong> into one new list, <strong>one level deep</strong> —
+unlike <code>flat</code>, it does not recurse into nested elements, so a list <em>of lists</em>
+(or of maps) is concatenated without disturbing the inner structure:</p>
+<pre><code class="language-mix">print("" .. concat([1, 2], [3, 4], [5]))
+print("" .. concat([[1, 2]], [[3, 4]]))
+</code></pre>
+<pre><code class="language-text">[1, 2, 3, 4, 5]
+[[1, 2], [3, 4]]
+</code></pre>
+<p>It returns a fresh list and mutates nothing — the clean, O(total) way to
+<strong>accumulate a sequence across helpers</strong> under Mix's by-value list model: a
+helper returns its items, the caller <code>concat</code>s them in, sidestepping the
+<a href="/mix/collections#footgun-lists-pass-into-functions-by-value"><code>push($param, …)</code>-into-a-copy trap</a>
+entirely. Each argument must be a list (a non-list arg is a loud error); pass at
+least two.</p>
+<h3 id="slice--take--drop">slice / take / drop</h3>
+<p><code>slice(list, start[, end])</code> returns the half-open range <code>[start, end)</code>. <strong>End is
+exclusive</strong>; omit it (or pass <code>nil</code>) to slice to the end. Negative indices count
+from the end, and all bounds <strong>clamp</strong> (out-of-range never errors):</p>
+<pre><code class="language-mix">$l = [10, 20, 30, 40, 50]
+print("" .. slice($l, 1, 3))
+print("" .. slice($l, -2))
+print("" .. slice($l, -100, 100))
+</code></pre>
+<pre><code class="language-text">[20, 30]
+[40, 50]
+[10, 20, 30, 40, 50]
+</code></pre>
+<p><code>slice</code> also accepts a <strong>string</strong> (<code>slice("hello", 1, 3)</code> → <code>"el"</code>, counting
+codepoints — see <a href="/mix/strings">strings</a>) and, since <strong>v0.64.0</strong>, a
+<strong><code>bytes</code>/<code>buffer</code></strong> value (counting bytes, returning a new value-semantic
+<code>bytes</code> — see <a href="/mix/io#bytes-as-a-sequence-v0640">io</a>). A <strong>reversed</strong> range is
+empty in every case: <code>slice($l, 3, 1)</code> is <code>[]</code>, not a wrap-around.</p>
+<p><code>take(list, n)</code> keeps the <strong>first</strong> <code>n</code> (negative <code>n</code> → <strong>last</strong> <code>|n|</code>);
+<code>drop(list, n)</code> skips the <strong>first</strong> <code>n</code> (negative <code>n</code> → drops the <strong>last</strong>
+<code>|n|</code>). Both also accept a string (codepoints) and, since <strong>v0.70.0</strong>, a
+bytes/buffer value (bytes → a new value-semantic <code>bytes</code>):</p>
+<pre><code class="language-mix">$l = [10, 20, 30, 40, 50]
+print("take 2:   " .. ("" .. take($l, 2)))
+print("take -2:  " .. ("" .. take($l, -2)))
+print("drop 2:   " .. ("" .. drop($l, 2)))
+print("drop -2:  " .. ("" .. drop($l, -2)))
+</code></pre>
+<pre><code class="language-text">take 2:   [10, 20]
+take -2:  [40, 50]
+drop 2:   [30, 40, 50]
+drop -2:  [10, 20, 30]
+</code></pre>
+<h3 id="zip">zip</h3>
+<p><code>zip(a, b)</code> pairs corresponding elements into 2-element lists, stopping at the
+shorter input. Destructure each pair with <code>[0]</code> / <code>[1]</code>:</p>
+<pre><code class="language-mix">print("" .. zip([1, 2, 3], ["a", "b"]))
+for each $pair in zip(["host", "port"], ["node1", 8080])
+  print($pair[0] .. " = " .. ("" .. $pair[1]))
+end
+</code></pre>
+<pre><code class="language-text">[[1, a], [2, b]]
+host = node1
+port = 8080
+</code></pre>
+<h2 id="pure-map-builtins">Pure map builtins</h2>
+<h3 id="keys--values--has_key">keys / values / has_key</h3>
+<pre><code class="language-mix">$m = { host: "node1", port: 8080, tls: true }
+print("" .. keys($m))
+print("" .. values($m))
+print("" .. has_key($m, "port"))
+print("" .. has_key($m, "user"))
+</code></pre>
+<pre><code class="language-text">[host, port, tls]
+[node1, 8080, true]
+true
+false
+</code></pre>
+<p><code>keys</code>/<code>values</code> return lists in <strong>insertion order</strong>. <code>has_key(map, key)</code> is the
+map-membership test — remember <code>contains</code> does <strong>not</strong> accept a map and will
+raise <code>contains() expects a string, list, bytes or buffer</code>.</p>
+<h3 id="merge--delete">merge / delete</h3>
+<p>Both are <strong>non-mutating</strong> — they return a new map and leave the original alone.
+<code>merge(a, b)</code> overlays <code>b</code> onto <code>a</code> (b wins on conflicts); <code>delete(map, key)</code>
+returns a copy without that key.</p>
+<pre><code class="language-mix">$base = { host: "node1", port: 8080 }
+$out = merge($base, { port: 9090, tls: true })
+print("merged: " .. ("" .. $out))
+print("original: " .. ("" .. $base))
+print("deleted:  " .. ("" .. delete($base, "port")))
+print("still:    " .. ("" .. $base))
+</code></pre>
+<pre><code class="language-text">merged: {host: node1, port: 9090, tls: true}
+original: {host: node1, port: 8080}
+deleted:  {host: node1}
+still:    {host: node1, port: 8080}
+</code></pre>
+<h2 id="list--list-raises-0680--use-deep_eq"><code>List == List</code> raises (0.68.0) — use <code>deep_eq</code></h2>
+<p><code>==</code> and <code>!=</code> raise <code>TYPE_ERROR</code> when <strong>both</strong> operands are a map or list —
+including a self-compare (<code>$a == $a</code>) and a list-vs-map cross-compare.</p>
+<p>Until 0.68.0 they answered <code>false</code>/<code>true</code> instead — always, regardless of
+contents. That is not a comparison; it is a constant wearing a comparison's
+clothes, and it read as working code right up until someone depended on it.
+The raise names the fix:</p>
+<pre><code>TYPE_ERROR: `==` is not defined for list and list — it would always answer
+false, not compare them. Use deep_eq(a, b) for structural comparison
+</code></pre>
+<p><strong>Use <code>deep_eq(a, b)</code> (0.63.0)</strong> — structural equality: maps compare by key
+set with insertion order ignored, lists elementwise in order, scalars as
+<code>==</code>:</p>
+<pre><code class="language-mix">print(deep_eq([1, {x: 2}], [1, {x: 2}]))   -- true
+print(deep_eq({a: 1, b: 2}, {b: 2, a: 1})) -- true (map order ignored)
+print(deep_eq([1, 2], [2, 1]))             -- false (list order matters)
+</code></pre>
+<p>Scalars compare as <code>==</code>, with the corners that implies: a <strong>function</strong>
+value is never equal — even to itself, so a callback-bearing map is not
+<code>deep_eq</code> its own copy — and Buffer-vs-Bytes is false (<code>freeze()</code> first).
+Nesting deeper than 512 levels raises (catchable) rather than recursing
+unboundedly.</p>
+<p>Or compare a derived value (length, <code>join</code>, an element) — those are scalars,
+so <code>==</code> applies normally:</p>
+<pre><code class="language-mix">$a = [1, 2, 3]
+$b = [1, 2, 3]
+print("deep_eq:       " .. ("" .. deep_eq($a, $b)))
+print("same length:   " .. ("" .. (length($a) == length($b))))
+print("same joined:   " .. ("" .. (join($a, ",") == join($b, ","))))
+</code></pre>
+<pre><code class="language-text">deep_eq:       true
+same length:   true
+same joined:   true
+</code></pre>
+<h3 id="a-collection-compared-to-a-scalar-still-answers--mk--nil-works">A collection compared to a SCALAR still answers — <code>$m[$k] == nil</code> works</h3>
+<p>Only collection-vs-collection raises. A same-type <code>false</code> <strong>misleads</strong> — it
+invites the reading "these two lists differ", which is not what was computed.
+A collection and a scalar differ by <em>type</em>, so <code>false</code> there is truthful,
+exactly as <code>1 == "a"</code> is honestly false:</p>
+<pre><code class="language-mix">$reg = {}
+print($reg["k"] == nil)   -- true  (key absent)
+$reg.k = [1, 2]
+print($reg["k"] == nil)   -- false (key present, value is a list)
+print([1] == "text")      -- false
+print([1] != nil)         -- true
+</code></pre>
+<p>That first pattern is the whole reason for the narrower rule: <code>$map[$key] == nil</code> is <strong>the</strong> key-absence idiom, and the value on the left is a list or map
+precisely when the key IS populated. Raising there would fail
+data-dependently — the same line working until the map fills up.</p>
+<h3 id="the-raise-is-scoped-to-the-operators--searching-builtins-are-unchanged">The raise is scoped to the OPERATORS — searching builtins are unchanged</h3>
+<p><code>contains</code>, <code>index_of</code>, <code>last_index_of</code> and <code>unique</code> compare elements
+internally, without going through <code>==</code>. They do <strong>not</strong> raise — and they also
+still treat two equal-looking collections as different:</p>
+<pre><code class="language-mix">print(contains([{a: 1}], {a: 1}))      -- false, NOT a raise
+print(index_of([[1], [2]], [2]))       -- -1
+print(length(unique([[1], [1], [2]]))) -- 3 — no dedup of equal lists
+</code></pre>
+<p>That asymmetry is deliberate but worth knowing: since 0.68.0 <code>==</code> is loud
+about collections while these stay quiet. Scoping the change to the operators
+is what keeps <code>contains($list, $scalar)</code> — the overwhelmingly common use —
+working, and there is no <code>deep_contains</code> yet. When you need a structural
+search, drive it yourself:</p>
+<pre><code class="language-mix">$found = false
+for each $item in $haystack
+  if deep_eq($item, $needle) then $found = true end
+end
+</code></pre>
+<h2 id="footgun-lists-pass-into-functions-by-value">Footgun: lists pass into functions by value</h2>
+<p>A list (or map) handed to a function is <strong>copied in</strong>. Mutating the parameter —
+<code>push</code>, <code>pop</code>, index-assignment — changes only the function's local copy; the
+caller's value is untouched. The idiom is <strong>pass in → <code>return</code> the new value →
+reassign at the call site</strong> (the triad — see <a href="/mix/functions">functions</a>):</p>
+<pre><code class="language-mix">function with_tail($list)
+  push($list, 99)
+  return $list
+end
+
+$xs = [1, 2, 3]
+$ys = with_tail($xs)
+print("caller (unchanged): " .. ("" .. $xs))
+print("returned:           " .. ("" .. $ys))
+$xs = with_tail($xs)
+print("after reassign:     " .. ("" .. $xs))
+</code></pre>
+<pre><code class="language-text">caller (unchanged): [1, 2, 3]
+returned:           [1, 2, 3, 99]
+after reassign:     [1, 2, 3, 99]
+</code></pre>
+<h2 id="quick-reference">Quick reference</h2>
+<pre><code class="language-text">LISTS
+[a, b, c]            list literal (0-indexed)
+$l[i]   $l[-1]       index READ (negative from end; OOB -&gt; nil)
+$l[i] = v            index WRITE (negative from end; OOB/non-number = ERROR; grow with push)
+length($l) / len     element count
+is_empty($l)         true when zero length
+push($l, v)          append, MUTATES, returns nil
+pop($l) / shift($l)  remove last / first, MUTATES, returns element (nil if empty)
+sort($l)             all-number list→numeric; else lexicographic (sort_by for keys)
+unique($l)           dedupe, first-seen order
+reverse($l)          reversed copy
+contains($l, v)      bool membership
+index_of($l, v)      0-based pos, or -1
+range(a, b[, step])  inclusive both ends
+flat($l)             recursively flatten nested lists
+concat($a, $b, …)    join 2+ lists into one new list (one level)
+slice($l, s[, e])    half-open [s, e); negatives + clamp; reversed range = empty
+                     (also string -&gt; string, bytes/buffer -&gt; bytes, v0.64.0)
+take($l, n) drop($l, n)   first/last n  (negative n flips the end)
+zip($a, $b)          element-wise [a, b] pairs, min length
+
+MAPS
+{k: v, "x": w}       map literal (insertion-ordered; keys are STRINGS; keywords ok bare, "fn" not)
+$m.key  $m["key"]    read (missing -&gt; nil; "*" key = wildcard fallback)
+$m["key"] = v        assign / auto-create key (dot form $m.key = v equivalent, one level only)
+keys($m) values($m)  lists, insertion order (for each $k in $m iterates keys)
+has_key($m, k)       membership (NOT contains — that errors on a map)
+merge($a, $b)        new map, b wins on conflicts (non-mutating)
+delete($m, k)        new map without k       (non-mutating)
+length($m)           key count
+</code></pre>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/hof">hof</a> — <code>map</code> / <code>filter</code> / <code>reduce</code> / <code>sort_by</code> / <code>group_by</code> / <code>zip</code>-style transforms over collections (and the numeric <code>sort_by</code> that fixes lexical <code>sort</code>)</li>
+<li><a href="/mix/functions">functions</a> — the pass-by-value triad and closures</li>
+<li><a href="/mix/strings">strings</a> — <code>split</code> (string → list), <code>join</code> (list → string), <code>pos</code>, codepoint vs byte semantics</li>
+<li><a href="/mix/data">data</a> — <code>data_encode</code>, <code>json_parse</code> / <code>json_encode</code>, <code>jq</code> for round-trippable serialisation</li>
+<li><a href="/mix/keywords">keywords</a> — the keyword list, and which lexemes double as bare map keys / fields</li>
+<li><a href="/mix/builtins">builtins index</a> — every builtin by category</li>
+</ul>
+<pre><code class="language-text">mix builtins list     list every list builtin with its one-line description
+mix builtins map      list every map builtin
+mix what NAME         one-line description of a single builtin
+mix help              the full categorized builtin reference
+</code></pre>
+<p>Source of truth: the Mix repo at <a href="https://github.com/markc/cosmix">https://github.com/markc/cosmix</a> (verified
+against <strong>mix 0.21.2</strong> — the binary is the oracle).</p></div></div>
     </div>
 
 </main>
@@ -620,6 +1178,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1232,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1361,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

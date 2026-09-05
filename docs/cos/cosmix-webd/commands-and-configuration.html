@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-webd/commands-and-configuration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,139 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-webd/commands-and-configuration.md"><div class="prose"><h1 id="commands-and-configuration">Commands and configuration</h1>
+<p><code>cosmix-webd</code> is a subcommand-driven daemon binary. Server flags override matching values resolved from <code>node.conf.mix</code>.</p>
+<h2 id="commands">Commands</h2>
+<table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>cosmix-webd serve</code></td><td>Start production serving</td></tr>
+<tr><td><code>cosmix-webd init</code></td><td>Initialise the SQLite CMS schema</td></tr>
+<tr><td><code>cosmix-webd mkcert</code></td><td>Create a self-signed EC P-256 certificate</td></tr>
+<tr><td><code>cosmix-webd vhost</code></td><td>Add, list, show, or remove vhost property rows</td></tr>
+<tr><td><code>cosmix-webd acme</code></td><td>Force renewal or inspect one ACME vhost</td></tr>
+<tr><td><code>cosmix-webd routes list</code></td><td>Print the current route-map snapshot</td></tr>
+<tr><td><code>cosmix-webd stats</code></td><td>Print per-vhost response counters</td></tr>
+<tr><td><code>cosmix-webd tls status</code></td><td>Print TLS identity and ACME status</td></tr>
+<tr><td><code>cosmix-webd tls reload</code></td><td>Reload manual PEM files atomically</td></tr>
+<tr><td><code>cosmix-webd autoconfig served-domains</code></td><td>Print the autoconfiguration allowlist</td></tr>
+</tbody></table>
+<p><code>--version</code> includes the package version, source revision, and build time.</p>
+<h2 id="serve">Serve</h2>
+<pre><code class="language-text">cosmix-webd serve [OPTIONS]
+</code></pre>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--listen &lt;ADDR&gt;</code></td><td>Override the primary listen address</td></tr>
+<tr><td><code>--http-listen &lt;ADDR&gt;</code></td><td>Add a plain-HTTP redirect and ACME listener</td></tr>
+<tr><td><code>--www-dir &lt;PATH&gt;</code></td><td>Override the legacy static root</td></tr>
+<tr><td><code>--db-path &lt;PATH&gt;</code></td><td>Override the legacy SQLite path</td></tr>
+<tr><td><code>--jmap-upstream &lt;URL&gt;</code></td><td>Override the legacy JMAP upstream</td></tr>
+<tr><td><code>--noded-ws &lt;URL&gt;</code></td><td>Override the legacy broker WebSocket URL</td></tr>
+<tr><td><code>--docs-dir &lt;PATH&gt;</code></td><td>Serve Markdown files below <code>/docs</code></td></tr>
+<tr><td><code>--static-dir &lt;PATH&gt;</code></td><td>Enter loopback-only static preview mode</td></tr>
+<tr><td><code>--tls-cert &lt;PATH&gt;</code></td><td>Override the legacy certificate PEM path</td></tr>
+<tr><td><code>--tls-key &lt;PATH&gt;</code></td><td>Override the legacy private-key PEM path</td></tr>
+</tbody></table>
+<p>The normal resolution order is CLI, node configuration, then the source-defined default. The database defaults below the CosMix variable-data directory. The legacy static root defaults to its <code>www</code> subdirectory.</p>
+<p><code>--http-listen</code> is opt-in. Without a CLI value or configured value, no secondary plain-HTTP listener is created.</p>
+<h3 id="static-preview">Static preview</h3>
+<pre><code class="language-text">cosmix-webd serve --static-dir ./site
+</code></pre>
+<p>Static preview bypasses node configuration, SQLite, Bus, ACME, TLS, vhost registration, Mix handlers, the CMS API, JMAP, and WebSocket proxying. It serves static files plus the Markdown and asset routes.</p>
+<p>The default address is <code>127.0.0.1:8080</code>. An explicit <code>--listen</code> must resolve entirely to loopback addresses and must provide an IPv4 loopback result.</p>
+<h2 id="initialise-a-database">Initialise a database</h2>
+<pre><code class="language-text">cosmix-webd init [--db-path &lt;PATH&gt;]
+</code></pre>
+<p>The command creates parent directories and applies the <code>posts</code> and <code>session_epochs</code> schema with <code>CREATE TABLE IF NOT EXISTS</code>.</p>
+<h2 id="create-a-local-certificate">Create a local certificate</h2>
+<pre><code class="language-text">cosmix-webd mkcert &lt;FQDN&gt; &lt;CERT-PEM&gt; &lt;KEY-PEM&gt;
+</code></pre>
+<p>The command creates a self-signed EC P-256 certificate for an internal or <code>.localhost</code> vhost. The FQDN is used for the common name and DNS subject alternative name; the certificate also contains a loopback IP subject alternative name.</p>
+<h2 id="manage-vhosts">Manage vhosts</h2>
+<pre><code class="language-text">cosmix-webd vhost add &lt;FQDN&gt; &lt;WWW-DIR&gt; [OPTIONS]
+cosmix-webd vhost list
+cosmix-webd vhost show &lt;FQDN&gt;
+cosmix-webd vhost remove &lt;FQDN&gt;
+</code></pre>
+<p><code>vhost</code> commands connect to the running daemon through the default broker.</p>
+<p><code>vhost add</code> accepts:</p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--acme-provider &lt;NAME&gt;</code></td><td>Select an ACME provider</td></tr>
+<tr><td><code>--acme-challenge &lt;TYPE&gt;</code></td><td>Select the ACME challenge</td></tr>
+<tr><td><code>--acme-contact-email &lt;ADDRESS&gt;</code></td><td>Set the ACME account contact</td></tr>
+<tr><td><code>--tls-cert-path &lt;PATH&gt;</code></td><td>Set a manual certificate path</td></tr>
+<tr><td><code>--tls-key-path &lt;PATH&gt;</code></td><td>Set a manual private-key path</td></tr>
+<tr><td><code>--disabled</code></td><td>Create the row with <code>enabled = false</code></td></tr>
+</tbody></table>
+<p>The ACME provider, challenge, and contact fields form one mode. Manual certificate and key fields form the other mode. The modes are mutually exclusive, and certificate/key half-pairs are rejected.</p>
+<p><code>vhost remove</code> reads the current row version before deleting it. Missing rows are treated as an idempotent success; concurrent changes require a retry.</p>
+<h2 id="acme-routes-statistics-tls-and-autoconfiguration">ACME, routes, statistics, TLS, and autoconfiguration</h2>
+<pre><code class="language-text">cosmix-webd acme renew &lt;FQDN&gt;
+cosmix-webd acme status &lt;FQDN&gt;
+cosmix-webd routes list
+cosmix-webd stats
+cosmix-webd tls status
+cosmix-webd tls reload
+cosmix-webd autoconfig served-domains
+</code></pre>
+<p><code>acme renew</code> bypasses timing gates but does not bypass a disabled vhost or other policy gates. It returns after queuing the renewal; use <code>acme status</code> to observe the outcome.</p>
+<p><code>tls reload</code> is available only when manual PEM identities own the live listener resolvers. It validates all replacement material before swapping any resolver.</p>
+<h2 id="node-configuration-consumed-by-the-daemon">Node configuration consumed by the daemon</h2>
+<p>The crate loads <code>node.conf.mix</code> through <code>cosmix-lib-config</code>. Its source directly consumes the following web configuration fields.</p>
+<table><thead><tr><th>Field</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>www_dir</code></td><td>Legacy static root</td></tr>
+<tr><td><code>http_listen</code></td><td>Optional redirect and HTTP-01 listener</td></tr>
+<tr><td><code>tls_cert</code></td><td>Legacy manual certificate path</td></tr>
+<tr><td><code>tls_key</code></td><td>Legacy manual private-key path</td></tr>
+<tr><td><code>tls_server_name</code></td><td>Legacy host-routing and certificate names</td></tr>
+<tr><td><code>served_mail_domains</code></td><td>Mail autoconfiguration admission allowlist</td></tr>
+<tr><td><code>autoconfig_mail_host</code></td><td>Optional advertised mail host override</td></tr>
+<tr><td><code>vhost</code></td><td>Per-vhost configuration rows</td></tr>
+<tr><td><code>listener</code></td><td>Per-interface listener rows</td></tr>
+<tr><td><code>listeners.operators</code></td><td>Bus service names allowed to mutate listener state</td></tr>
+</tbody></table>
+<p>The daemon also resolves the node's web listen address, JMAP upstream, and broker URL through configuration helper methods.</p>
+<h2 id="per-vhost-configuration">Per-vhost configuration</h2>
+<p>Each <code>[[webd.vhost]]</code> row supplies:</p>
+<table><thead><tr><th>Field</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>host</code></td><td>Primary hostname</td></tr>
+<tr><td><code>aliases</code></td><td>Additional hostnames sharing the vhost state</td></tr>
+<tr><td><code>www_dir</code></td><td>Required static root</td></tr>
+<tr><td><code>tls_cert</code>, <code>tls_key</code></td><td>Manual TLS pair</td></tr>
+<tr><td><code>acme</code></td><td>ACME provider, challenge, and contact configuration</td></tr>
+<tr><td><code>cms_db_path</code></td><td>Optional per-vhost CMS SQLite file</td></tr>
+<tr><td><code>aux_dbs</code></td><td>Named auxiliary SQLite files attached to the CMS connection</td></tr>
+<tr><td><code>jmap_upstream</code></td><td>Optional JMAP proxy target</td></tr>
+<tr><td><code>noded_ws</code></td><td>Optional broker WebSocket proxy target</td></tr>
+<tr><td><code>docs_dir</code></td><td>Optional Markdown document root</td></tr>
+<tr><td><code>dev_session_email</code>, <code>dev_session_password</code></td><td>Paired internal-development auto-session credential</td></tr>
+<tr><td><code>public_read_email</code>, <code>public_read_password</code></td><td>Paired anonymous content-read credential</td></tr>
+<tr><td><code>system_sender_email</code>, <code>system_sender_password</code></td><td>Paired transactional-mail credential</td></tr>
+<tr><td><code>mfa_break_glass</code></td><td>Permit password-only login when second-factor state is indeterminate</td></tr>
+</tbody></table>
+<p>Hostnames are normalised and checked for duplicates before filesystem mutation. <code>www_dir</code> must exist. Operational failures for one vhost disable that vhost while healthy vhosts continue; an empty healthy set still prevents startup.</p>
+<p>Manual TLS and ACME are mutually exclusive. A public-facing manual certificate is validated against the primary name and aliases. A vhost with a development auto-session must be assigned only to explicit internal listeners with internal bind addresses.</p>
+<p>Auxiliary database paths must be absolute and unique within the vhost. They require <code>cms_db_path</code>. Schema names match <code>[a-z_][a-z0-9_]{0,31}</code> and cannot be <code>main</code> or <code>temp</code>.</p>
+<h2 id="listener-configuration">Listener configuration</h2>
+<p>Each explicit <code>[[webd.listener]]</code> row supplies:</p>
+<table><thead><tr><th>Field</th><th>Use</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>Stable listener identifier</td></tr>
+<tr><td><code>bind</code></td><td>Socket address</td></tr>
+<tr><td><code>external</code></td><td>Public/untrusted-facing classification</td></tr>
+<tr><td><code>enabled</code></td><td>Initial enabled state</td></tr>
+<tr><td><code>vhosts</code></td><td>Vhosts assigned to the listener</td></tr>
+</tbody></table>
+<p>Configuration validates unique IDs and binds, assigns every served host to one enabled listener, and rejects wildcard/specific clashes. Without explicit rows, the daemon creates one implicit internal listener at the resolved primary address and assigns every host to it.</p>
+<p>Configuration seeds <code>enabled</code> and guard state only when a <code>webd.listeners</code> property row is absent. Existing property state wins across restarts. The daemon always refreshes its own <code>external</code> field from configuration.</p>
+<h2 id="property-backed-configuration">Property-backed configuration</h2>
+<p>The daemon registers four property namespaces:</p>
+<ul>
+<li><code>webd.vhosts</code> for vhost identity, static root, TLS mode, and provisioner status.</li>
+<li><code>webd.handlers</code> for embedded Mix routes.</li>
+<li><code>webd.listeners</code> for listener guards, kill switches, and live status.</li>
+<li><code>webd.log</code> for live log-filter control.</li>
+</ul>
+<p>The three crate-defined namespaces use optimistic concurrency. Writes require the current row version.</p>
+<p>See <a href="/cos/cosmix-webd/bus-verbs">Bus verbs</a> for namespace keys, capabilities, ownership rules, lifecycle verbs, and listener lockout guards.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +751,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +805,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +934,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

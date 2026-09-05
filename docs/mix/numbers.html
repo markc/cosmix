@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/numbers</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,301 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/numbers.md"><div class="prose"><h1 id="numbers">Numbers</h1>
+<p>Mix has <strong>one numeric type: a 64-bit IEEE-754 double (<code>f64</code>)</strong>. There is no separate integer type — <code>5</code>, <code>5.0</code>, <code>1e6</code>, <code>0xFF</code>, and <code>0o755</code> are all the same <code>Number</code> value under the hood. What makes Mix <em>feel</em> like it has integers is the printer: a number that is exactly representable as an <code>i64</code> is written without a decimal point (<code>5</code>, not <code>5.0</code>). This page covers that f64 model, integer-clean formatting, the <code>0o</code>/<code>0x</code>/<code>0b</code> radix literals (and why a bare leading zero is a lexer error), scientific-notation literals, strict numeric-string coercion, <code>NaN</code>/<code>inf</code> behaviour, the ordering rules, and how whole numbers cross serialization boundaries as integers.</p>
+<p>For the numeric <em>functions</em> (<code>round</code>, <code>floor</code>, <code>sqrt</code>, <code>pow</code>, <code>abs</code>, …) see <a href="/mix/math">math</a>. For the comparison and arithmetic <em>operators</em> see <a href="/mix/operators">operators</a>.</p>
+<blockquote>
+<p>One-line model: <strong>every number is an f64; it prints as an integer when it round-trips through <code>i64</code>; <code>0o</code>/<code>0x</code>/<code>0b</code> and <code>1e6</code> are sugar for the same f64; a bare leading zero is rejected.</strong></p>
+</blockquote>
+<h2 id="one-type-f64">One type: f64</h2>
+<pre><code class="language-mix">print(2 + 2)        -- 4
+print(10 / 2)       -- 5      (whole result, prints clean)
+print(7 / 2)        -- 3.5    (fractional, prints with a point)
+print(10 / 4)       -- 2.5
+print(2.5)          -- 2.5
+print(1.0)          -- 1      (1.0 round-trips through i64 → printed as 1)
+print(-5)           -- -5
+print(17 % 5)       -- 2      (modulo)
+</code></pre>
+<pre><code class="language-text">4
+5
+3.5
+2.5
+2.5
+1
+-5
+2
+</code></pre>
+<p>Because the type is f64, integer division is <em>not</em> a separate operation — <code>/</code> is always float division and <code>10 / 2</code> happens to land on a whole number. There is no <code>//</code> floor-division operator; use <a href="/mix/math"><code>floor</code></a> if you want it.</p>
+<h3 id="f64-caveats-apply">f64 caveats apply</h3>
+<p>Mix inherits every IEEE-754 wrinkle. Fractions are binary, so the classic rounding error is visible:</p>
+<pre><code class="language-mix">print(0.1 + 0.2)    -- not exactly 0.3
+</code></pre>
+<pre><code class="language-text">0.30000000000000004
+</code></pre>
+<p>Integers stay exact only up to <strong>2^53</strong> (<code>9_007_199_254_740_992</code>). Past that, even whole numbers lose precision:</p>
+<pre><code class="language-mix">print(9007199254740992)   -- 2^53, exact
+print(9007199254740993)   -- 2^53 + 1, rounds back down
+</code></pre>
+<pre><code class="language-text">9007199254740992
+9007199254740992
+</code></pre>
+<p>That 2^53 boundary is why <a href="/mix/builtins"><code>stat</code></a> returns inode/device numbers as <strong>strings</strong>, not numbers — a u64 inode above 2^53 would lose its low bits as an f64.</p>
+<p>Division <strong>and modulo</strong> by zero are runtime errors (not <code>inf</code>/<code>NaN</code>), but a math function can still produce a non-finite value:</p>
+<pre><code class="language-mix">print(1 / 0)        -- runtime error
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: division by zero
+</code></pre>
+<pre><code class="language-mix">print(5 % 0)        -- runtime error too (0.21+; it used to return NaN silently)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: modulo by zero
+</code></pre>
+<pre><code class="language-mix">print(sqrt(-1))     -- NaN (from math, not an error)
+print(ln(0))        -- -inf
+print(exp(1000))    -- inf (overflow)
+</code></pre>
+<pre><code class="language-text">NaN
+-inf
+inf
+</code></pre>
+<p>Once a non-finite value exists it <strong>propagates</strong> through arithmetic per IEEE-754 (<code>exp(1000) + 1</code> is <code>inf</code>, <code>1 / exp(1000)</code> is <code>0</code>) and prints as <code>NaN</code> / <code>inf</code> / <code>-inf</code>. Comparisons involving a <code>NaN</code> <em>value</em> follow IEEE-754 too — they are <code>false</code>, not errors:</p>
+<pre><code class="language-mix">print(sqrt(-1) == sqrt(-1))   -- false (NaN is never equal to anything)
+print(sqrt(-1) &lt; 5)           -- false (any ordering against NaN is false)
+</code></pre>
+<pre><code class="language-text">false
+false
+</code></pre>
+<h2 id="integer-clean-printing">Integer-clean printing</h2>
+<p>When Mix renders a number — via <code>print</code>, <code>${...}</code> interpolation, <code>..</code> concatenation, or inside a list/map — it uses an <strong>i64 round-trip gate</strong>: if <code>(n as i64) as f64 == n</code>, it prints the i64 form (no decimal point); otherwise it prints the full f64 (<code>value.rs::write_mix</code>). The gate is the exact i64 cast, not merely "is it integral", so a value too big for i64 (like <code>1e20</code>) still prints in f64 form instead of silently saturating. (One pinhole: exactly 2^63 passes the gate through the saturating cast and prints as <code>9223372036854775807</code> — one below the true f64 value. Anything past 2^53 is approximate territory anyway.)</p>
+<p>Output is always plain decimal — the printer never uses exponent form, even for values you <em>wrote</em> in scientific notation: <code>print(1e20)</code> gives <code>100000000000000000000</code>, <code>print(1e-10)</code> gives <code>0.0000000001</code>.</p>
+<pre><code class="language-mix">print(4.0 / 2.0)          -- 2     (whole → integer form)
+print(3.0 * 3.0)          -- 9
+$n = 5
+print("count is ${n}")    -- interpolation: clean
+print("id-" .. $n)        -- concat: clean
+$f = 2.5
+print("val ${f}")         -- fractional stays fractional
+</code></pre>
+<pre><code class="language-text">2
+9
+count is 5
+id-5
+val 2.5
+</code></pre>
+<p>Every render path shares this gate, so a number looks the same whether you <code>print</code> it, splice it into a string, or nest it in a structure.</p>
+<h2 id="radix-literals--0o--0x--0b">Radix literals — <code>0o</code> / <code>0x</code> / <code>0b</code></h2>
+<p>For file modes and bitmasks, write the value in its natural base. All three prefixes are pure sugar that lex to the same f64 (<code>lexer.rs::lex_radix_number</code>):</p>
+<table><thead><tr><th>Prefix</th><th>Base</th><th>Example</th><th>Value</th></tr></thead><tbody>
+<tr><td><code>0o</code> / <code>0O</code></td><td>octal</td><td><code>0o755</code></td><td>493</td></tr>
+<tr><td><code>0x</code> / <code>0X</code></td><td>hex</td><td><code>0xFF</code></td><td>255</td></tr>
+<tr><td><code>0b</code> / <code>0B</code></td><td>binary</td><td><code>0b101</code></td><td>5</td></tr>
+</tbody></table>
+<pre><code class="language-mix">print(0o755)            -- 493
+print(0xFF)             -- 255
+print(0b101)            -- 5
+print(0o755 == 493)     -- true  (it IS the f64 493)
+</code></pre>
+<pre><code class="language-text">493
+255
+5
+true
+</code></pre>
+<p><code>_</code> digit separators are allowed anywhere in the body for readability — in decimals too:</p>
+<pre><code class="language-mix">print(1_000_000)        -- 1000000
+print(0xFF_FF)          -- 65535
+print(0b1010_1010)      -- 170
+</code></pre>
+<pre><code class="language-text">1000000
+65535
+170
+</code></pre>
+<p>Radix literals are checked at lex time. A digit out of range, an empty body, or a value past 2^53 is a clear lexer error rather than a silently-split or silently-rounded token:</p>
+<pre><code class="language-mix">print(0o78)             -- 8 is not an octal digit
+</code></pre>
+<pre><code class="language-text">Lexer error at line 1:7: '8' is not a valid octal digit in a 0o literal
+</code></pre>
+<pre><code class="language-mix">print(0xG)              -- no hex digit
+print(0x)               -- empty body
+print(0x20000000000001) -- past 2^53
+</code></pre>
+<pre><code class="language-text">Lexer error at line 1:7: 'G' is not a valid hex digit in a 0x literal
+Lexer error at line 1:7: 0x literal has no digits
+Lexer error at line 1:7: 0x20000000000001 exceeds the exact-integer range (2^53); Mix numbers are f64
+</code></pre>
+<p>The token boundary is precise: only an <em>alphanumeric</em> follower is a bad digit. An operator, <code>.</code>, space, or <code>)</code> is a legitimate end of the literal — <code>0xFF+1</code>, <code>0o7 .. "x"</code>, and <code>0b101)</code> all lex fine.</p>
+<p>Use these for <a href="/mix/builtins">native <code>chmod</code>/<code>write_new</code></a>, where the mode is the f64 <em>value</em>: <code>chmod($path, 0o755)</code>, <code>write_new($path, $body, 0o600)</code>.</p>
+<h3 id="no-bitwise-operators">No bitwise operators</h3>
+<p>Mix has <strong>no</strong> <code>&amp;</code> / <code>|</code> / <code>^</code> / <code>&lt;&lt;</code> / <code>&gt;&gt;</code> operators and no bitwise builtins. <code>^</code> is not a power operator either — the power operator is <a href="/mix/operators"><code>**</code></a> (or the <a href="/mix/math"><code>pow</code></a> builtin). A bare <code>&amp;</code> is a lexer error nudging you toward <code>&amp;&amp;</code>:</p>
+<pre><code class="language-mix">print(2 ^ 10)           -- '^' is not an operator
+</code></pre>
+<pre><code class="language-text">Lexer error at line 1:9: unexpected character '^'
+</code></pre>
+<pre><code class="language-mix">print(2 ** 10)          -- ** is the power operator (real powf)
+print(pow(2, 10))       -- same thing as a builtin
+</code></pre>
+<pre><code class="language-text">1024
+1024
+</code></pre>
+<h2 id="the-bare-leading-zero-trap">The bare-leading-zero trap</h2>
+<p>A decimal integer <strong>must not</strong> start with a redundant <code>0</code>. Rust's f64 parser would silently read <code>0755</code> as <code>755</code>, which is a footgun for a substrate whose daily work is octal file modes. Mix rejects it at lex time and tells you the fix (<code>lexer.rs::lex_number</code>):</p>
+<pre><code class="language-mix">print(0755)
+</code></pre>
+<pre><code class="language-text">Lexer error at line 1:7: ambiguous leading-zero number '0755' — use a 0o (octal) / 0x (hex) / 0b (binary) prefix, or drop the leading zero(s) for decimal
+</code></pre>
+<p>This is a <strong>Mix-expression</strong> hazard, not a shell one. When <code>0755</code> is a <em>string</em> (an argument in a shell-out), nothing is lexed as a number, so <code>run("install -m 0755 a b")</code> is fine. The error only fires when <code>0755</code> would be a Mix <em>number</em> literal.</p>
+<p>Plain <code>0</code> and genuine fractions are unaffected — the rule looks only at the integer part:</p>
+<pre><code class="language-mix">print(0)        -- 0
+print(0.5)      -- 0.5
+print(0.05)     -- 0.05
+</code></pre>
+<pre><code class="language-text">0
+0.5
+0.05
+</code></pre>
+<h2 id="scientific-notation-literals">Scientific-notation literals</h2>
+<p>The lexer accepts an <code>[eE][+-]?digits</code> exponent on a decimal literal (0.20.5+; earlier versions parse-errored on <code>1e3</code>). It is sugar for the same f64 — <code>_</code> separators work in the exponent too:</p>
+<pre><code class="language-mix">print(1e6)          -- 1000000
+print(1.5e3)        -- 1500
+print(2e-3)         -- 0.002
+print(1E3)          -- 1000
+print(1e+2)         -- 100
+print(1e1_0)        -- exponent 10
+</code></pre>
+<pre><code class="language-text">1000000
+1500
+0.002
+1000
+100
+10000000000
+</code></pre>
+<p>Two deliberate edges:</p>
+<ul>
+<li>The <code>e</code>/<code>E</code> is only consumed when a digit (after an optional sign) actually follows, so the <a href="/mix/math"><code>e()</code></a> Euler-constant builtin is never eaten — <code>2 * e()</code> is <code>5.43656…</code>, and a bare <code>2e</code> lexes as <code>2</code> followed by the token <code>e</code>.</li>
+<li>The exponent is checked <em>after</em> the leading-zero rule, which sees only the mantissa: <code>0e5</code> is a valid <code>0</code>, but <code>07e2</code> is still the ambiguous-leading-zero lexer error (see above).</li>
+</ul>
+<p>Radix literals take no exponent — <code>0x1e3</code> is just hex digits (<code>483</code>).</p>
+<h2 id="coercion-and-numeric-strings">Coercion and numeric strings</h2>
+<p><code>to_number(s)</code> converts a value to an f64, or returns <code>nil</code> on failure (<code>value.rs::to_number</code>):</p>
+<pre><code class="language-mix">print(to_number("42"))     -- 42
+print(to_number("3.14"))   -- 3.14
+print(to_number("1e3"))    -- 1000 (exponent strings parse)
+print(to_number("  7 "))   -- 7    (whitespace trimmed)
+print(to_number(true))     -- 1    (bools coerce: true→1, false→0)
+print(to_number("abc"))    -- nil  (not a number)
+print(to_number("0xFF"))   -- nil  (radix prefixes are SOURCE syntax, not parseable at runtime)
+</code></pre>
+<pre><code class="language-text">42
+3.14
+1000
+7
+1
+nil
+nil
+</code></pre>
+<p><code>to_number</code> parses a <em>decimal</em> string (sign, fraction, exponent). <code>"abc"</code> and <code>"0xFF"</code> both fail (the f64 parser doesn't accept a <code>0x</code> prefix), so guard for <code>nil</code> if the input is untrusted.</p>
+<p><strong>String coercion is strict about non-finites</strong> (0.21+). Rust's f64 parser happens to accept the words <code>"inf"</code> / <code>"infinity"</code> / <code>"nan"</code> (any case), but those are not Mix numeric strings — and an overflowing spelling like <code>"1e999"</code> is unrepresentable:</p>
+<pre><code class="language-mix">print(to_number("inf"))    -- nil
+print(to_number("nan"))    -- nil
+print(to_number("1e999"))  -- nil (overflows f64)
+print(is_number("inf"))    -- false (is_number agrees with to_number)
+print(is_number("1e3"))    -- true
+</code></pre>
+<pre><code class="language-text">nil
+nil
+nil
+false
+true
+</code></pre>
+<p>Only <em>string</em> coercion is strict. A non-finite number <strong>value</strong> passes through untouched — <code>to_number(sqrt(-1))</code> is <code>NaN</code>, and <code>is_number(sqrt(-1))</code> is <code>true</code> (it <em>is</em> a number; math keeps propagating IEEE-754 non-finites).</p>
+<p>Arithmetic operators auto-coerce a numeric <em>string</em> operand, so light shell-style input just works:</p>
+<pre><code class="language-mix">print("5" + 3)             -- 8   (string "5" coerces to 5)
+</code></pre>
+<pre><code class="language-text">8
+</code></pre>
+<p><code>to_number</code> itself returns <code>nil</code> on failure because it is the explicit probe.
+Builtins and numeric language forms that require a number do not turn that
+failure into <code>0</code>: they accept the same numeric strings and bools, but a supplied
+unparseable value raises <code>TYPE_MISMATCH</code>. Since 0.55.0 this is consistent across
+string positions/counts, <code>range</code>, numeric <code>for</code>, date/format helpers, <code>sleep</code>,
+<code>exit(code)</code>, and arithmetic <code>/</code>/<code>%</code> operands.</p>
+<p>Equality treats a number and its numeric-string form as equal, and <code>5 == 5.0</code> is true because they are the same f64:</p>
+<pre><code class="language-mix">print("5" == 5)            -- true
+print(5 == 5.0)            -- true
+</code></pre>
+<pre><code class="language-text">true
+true
+</code></pre>
+<h2 id="ordering-rules">Ordering rules</h2>
+<p>The comparison operators <code>&lt; &gt; &lt;= &gt;=</code> follow a two-step rule (see <a href="/mix/operators">operators</a> for the full table):</p>
+<ol>
+<li><strong>If <em>both</em> operands coerce to numbers</strong> (numbers, or numeric strings like <code>"5"</code>), compare <strong>numerically</strong>.</li>
+<li>Else, <strong>if both are strings</strong>, compare <strong>lexicographically by codepoint</strong>.</li>
+<li>Otherwise — a string-vs-number mix where the string isn't numeric — raise an error.</li>
+</ol>
+<pre><code class="language-mix">print("5" &lt; "10")     -- true  (both numeric → 5 &lt; 10, NOT string order)
+print(5 &lt; 10)         -- true
+print("apple" &lt; "banana")  -- true  (both non-numeric strings → lexicographic)
+print("5" &lt; "abc")    -- true  ("5" &lt; "abc" lexicographically; not both numeric)
+print(5 &gt;= 5)         -- true
+print(3 != 4)         -- true
+</code></pre>
+<pre><code class="language-text">true
+true
+true
+true
+true
+true
+</code></pre>
+<p>The footgun bash brings is the <em>opposite</em> of Mix here: <code>"5" &lt; "10"</code> is <strong>numeric</strong> (true), because both strings coerce. You only fall back to string ordering when at least one side won't coerce to a number. A genuine type clash errors rather than guessing:</p>
+<pre><code class="language-mix">print(5 &lt; "abc")
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: cannot compare 'abc' as number
+</code></pre>
+<h2 id="modulo-sign">Modulo sign</h2>
+<p><code>%</code> follows the f64 remainder (the result takes the sign of the <strong>dividend</strong>, like C/Rust <code>%</code>, <em>not</em> Python's floored modulo):</p>
+<pre><code class="language-mix">print(-7 % 3)     -- -1   (sign of -7)
+print(7 % -3)     -- 1    (sign of 7)
+print(5.5 % 2)    -- 1.5  (works on non-integers too)
+</code></pre>
+<pre><code class="language-text">-1
+1
+1.5
+</code></pre>
+<p>A zero divisor is a runtime error (<code>modulo by zero</code>), matching <code>/</code> — see the caveats section above.</p>
+<h2 id="serialization-whole-numbers-travel-as-integers">Serialization: whole numbers travel as integers</h2>
+<p>Because the one type is f64, every serialization boundary decides whether a whole value leaves as an <em>integer</em> or a <em>float</em>. Mix consistently picks <strong>integer for whole numbers</strong>, so a peer field typed <code>usize</code>/<code>i64</code> accepts it:</p>
+<ul>
+<li><strong><a href="/mix/data"><code>json_encode</code></a></strong> — a finite whole number in <code>[-2^63, 2^63)</code> encodes as a JSON integer; anything else (fractional, or ≥ 2^63) encodes as a JSON float (<code>json.rs::mix_to_json</code>). The upper bound is exclusive because <code>i64::MAX as f64</code> rounds up to exactly 2^63 — an f64 of 2^63 encodes as the real <code>9.223372036854776e+18</code> instead of silently saturating.</li>
+<li><strong><a href="/mix/builtins"><code>sqlexec</code></a> binds</strong> — the same rule, typed: a whole finite number binds as SQLite <code>INTEGER</code>, fractional/non-finite as <code>REAL</code> (nil→<code>NULL</code>, bool→<code>0</code>/<code>1</code>, string→<code>TEXT</code>, bytes→<code>BLOB</code>).</li>
+<li><strong><a href="/mix/bus">Bus <code>send</code> args</a></strong> — a whole number within ±2^53 serializes as a JSON integer (<code>limit=2</code> reaches the peer as <code>2</code>, not <code>2.0</code>); fractional values stay floats.</li>
+</ul>
+<pre><code class="language-mix">print(json_encode(2))            -- 2 (integer, not 2.0)
+print(json_encode(2.5))          -- 2.5
+print(json_encode([1, 2.5, 3]))  -- [1,2.5,3]
+</code></pre>
+<pre><code class="language-text">2
+2.5
+[1,2.5,3]
+</code></pre>
+<h3 id="non-finite-numbers-refuse-to-serialize">Non-finite numbers refuse to serialize</h3>
+<p><code>print</code> happily shows <code>NaN</code>/<code>inf</code>, but the serializers are <strong>loud</strong> about a non-finite number anywhere in the value — there is no JSON or strict-data representation for it:</p>
+<ul>
+<li><strong><code>json_encode</code></strong> raises a catchable error (0.21+; it used to encode <code>0</code> silently): <code>json_encode: non-finite number NaN has no JSON representation (JSON has no NaN/Infinity)</code>.</li>
+<li><strong><a href="/mix/data"><code>data_encode</code></a></strong> and the strict-data writers refuse likewise (<code>value.rs::write_mix_data</code>): <code>data_encode: Data serialize error: non-finite number NaN has no strict-data representation</code>.</li>
+</ul>
+<p>Keep generated config values finite, or <code>try</code>/<code>catch</code> the encode (<a href="/mix/errors">errors</a>).</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/math">math</a> — <code>round</code> / <code>floor</code> / <code>ceil</code> / <code>trunc</code> (each takes an optional decimal-places arg; negative rounds to tens/hundreds), <code>abs</code>, <code>sqrt</code>, <code>pow</code>, <code>min</code>/<code>max</code>/<code>clamp</code>, trig, <code>pi()</code>/<code>e()</code> — all propagate <code>NaN</code>/<code>inf</code> instead of erroring</li>
+<li><a href="/mix/operators">operators</a> — arithmetic incl. <code>**</code> power, the full comparison/ordering table, <code>and</code>/<code>or</code>/<code>not</code></li>
+<li><a href="/mix/strings">strings</a> — <code>..</code> concatenation, <code>${...}</code> interpolation, codepoint counting</li>
+<li><a href="/mix/builtins">builtins index</a> — <code>to_number</code>, <code>chmod</code> / <code>write_new</code> (mode is the f64 value), <code>stat</code> (ino/dev as strings), <code>sqlexec</code> typed binds</li>
+<li><a href="/mix/data">data</a> — <code>json_encode</code> / <code>data_encode</code> serialization (both reject non-finite numbers)</li>
+<li><a href="/mix/bus">bus</a> — <code>send</code> arg serialization (whole numbers as JSON integers)</li>
+<li>The repo: <a href="https://github.com/markc/cosmix">https://github.com/markc/cosmix</a></li>
+<li><code>mix help</code> for the topic list; <code>mix what to_number</code> (or <code>round</code>, <code>pow</code>, …) for a one-line builtin reference</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +913,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +967,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1096,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

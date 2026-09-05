@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-maild-rules/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,137 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-maild-rules/README.md"><div class="prose"><h1 id="cosmix-maild-rules">cosmix-maild-rules</h1>
+<p><code>cosmix-maild-rules</code> is the deterministic second stage of the inbound
+<code>cosmix-maild</code> DATA filtering pipeline. It consumes the authentication result,
+message, SMTP envelope, peer address, account identity, and account overrides,
+then returns a rule verdict for delivery or Bayesian classification. In the
+<code>bus &lt;- mix &lt;- cos</code> dependency chain it belongs to <code>cos</code>: it uses Mix to parse
+strict-data <code>.conf.mix</code> rule packs and can optionally use Bus client libraries
+when built for the wider Cosmix daemon family.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The pipeline order is:</p>
+<pre><code class="language-text">cosmix-maild-auth -&gt; cosmix-maild-rules -&gt; cosmix-maild-bayesian
+</code></pre>
+<p>Authentication establishes RFC-derived facts. This crate applies deterministic
+policy and content rules. Ambiguous messages continue to the Bayesian stage
+with their score and matched rule identifiers as contextual features.</p>
+<p>The library crate is named <code>cosmix_maild_rules</code>. The package also builds the
+<code>cosmix-maild-rules-smoke</code> diagnostic binary.</p>
+<h2 id="verdicts">Verdicts</h2>
+<p><code>RuleEngine::classify</code> returns one of three <code>RuleVerdict</code> shapes.</p>
+<table><thead><tr><th>Shape</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>HardAccept</code></td><td>Skip Bayesian classification and deliver to the inbox.</td></tr>
+<tr><td><code>HardJunk</code></td><td>Skip Bayesian classification and route to junk.</td></tr>
+<tr><td><code>Continue</code></td><td>Pass the score and matched rule identifiers to Bayesian classification.</td></tr>
+</tbody></table>
+<p><code>HardAccept</code> currently uses <code>AcceptReason::AllowlistSender</code>.</p>
+<p><code>HardJunk</code> can report <code>BlocklistSender</code>, <code>MailAuthHardFail</code>,
+<code>StructuralAnomaly</code>, or <code>ScoreBreach</code>.</p>
+<p>When <code>EngineConfig::shadow_mode</code> is true, every <code>HardJunk</code> result becomes
+<code>Continue { would_junk: true, .. }</code>. Shadow mode does not alter <code>HardAccept</code>.</p>
+<p>The engine applies decisive outcomes in this order:</p>
+<ol>
+<li>Account sender allowlist.</li>
+<li>Account sender blocklist.</li>
+<li>Configured mail-auth hard-fail combinations.</li>
+<li>Executable attachment combined with an SPF, DKIM, or DMARC failure.</li>
+<li>Score at or above <code>hard_junk_threshold</code>.</li>
+<li><code>Continue</code>.</li>
+</ol>
+<p>Malformed MIME adds the implicit <code>mime_parse_error</code> rule with weight <code>1</code>.
+Configured negative rule weights contribute <code>0</code>.</p>
+<h2 id="public-api">Public API</h2>
+<table><thead><tr><th>Module or export</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>config</code> and <code>EngineConfig</code></td><td>Classification limits, thresholds, shadow mode, and DNSBL settings.</td></tr>
+<tr><td><code>engine::RuleEngine</code></td><td>Object-safe async <code>classify</code>, <code>explain</code>, and <code>reload</code> interface.</td></tr>
+<tr><td><code>engine::DefaultRuleEngine</code></td><td>Rule-pack-backed implementation with atomic pack and configuration swaps.</td></tr>
+<tr><td><code>engine::RuleMatchHook</code></td><td>Callback fired once for each matched pack rule during <code>classify</code>.</td></tr>
+<tr><td><code>types</code></td><td>Context, overrides, verdicts, explanations, reload reports, identifiers, and match views.</td></tr>
+<tr><td><code>dnsbl</code></td><td>DNSBL traits, query encoding, cache and single-flight wrapper, and optional production resolver.</td></tr>
+<tr><td><code>preflight</code></td><td>Parallel DNSBL preflight and its per-zone result.</td></tr>
+<tr><td><code>glob_match::validate_sender_glob</code></td><td>Validates account allowlist and blocklist patterns.</td></tr>
+<tr><td><code>rules</code></td><td>Public matcher data types and CIDR helpers.</td></tr>
+<tr><td><code>default_pack_str</code></td><td>Returns the embedded v1.0 default <code>.conf.mix</code> rule pack.</td></tr>
+<tr><td><code>error</code></td><td>Crate-wide <code>Error</code> and <code>Result</code> types.</td></tr>
+</tbody></table>
+<p><code>RuleContext</code> borrows all classify-time data. It carries <code>peer_ip</code>,
+<code>envelope_from</code>, <code>envelope_to</code>, raw RFC 5322 message bytes, the
+<code>cosmix-maild-auth</code> <code>VerifyResult</code>, an <code>AccountId</code>, and <code>AccountOverrides</code>.</p>
+<p><code>AccountOverrides</code> supports disabled rule identifiers, a threshold override,
+and sender allowlist and blocklist globs. Literal addresses and <code>*</code> or <code>?</code>
+wildcards match case-insensitively against the envelope sender.</p>
+<p><code>Explanation</code> records every evaluated rule, match state, configured and
+effective weights, contribution, total score, threshold, pack version, and
+verdict shape. Calling <code>explain</code> does not fire the rule-match hook.</p>
+<h2 id="constructing-an-engine">Constructing an engine</h2>
+<p><code>DefaultRuleEngine::new</code> creates an engine with an empty pack. When no account
+override or engine-level hard-fail decides the result, classification returns
+<code>Continue</code> with score <code>0</code>.</p>
+<p><code>DefaultRuleEngine::with_pack_str</code> parses a <code>.conf.mix</code> string.
+<code>DefaultRuleEngine::with_pack_path</code> loads a file and remembers its path for
+later <code>reload</code> calls. Both constructors return the engine plus any per-rule
+compile failures.</p>
+<p><code>reload</code> compiles the next file before taking the write lock, then swaps the
+loaded rule set atomically. A top-level parse or I/O error leaves the current
+pack live. Individual invalid rules are omitted and reported in
+<code>ReloadReport::rules_failed</code>; valid rules from the same pack are loaded.</p>
+<p><code>pack_metadata</code>, <code>shadow_mode</code>, and <code>config_snapshot</code> return consistent
+snapshots. <code>set_config</code> atomically replaces the complete configuration. It does
+not merge fields or validate values.</p>
+<p><code>set_rule_match_hook</code> and <code>with_rule_match_hook</code> attach a callback before the
+engine is shared. The hook runs during <code>classify</code>, including for the implicit
+<code>mime_parse_error</code>, but not during <code>explain</code>.</p>
+<p>See <a href="/cos/cosmix-maild-rules/rule-packs">Rule packs</a> for the <code>.conf.mix</code> schema and matcher kinds.</p>
+<h2 id="configuration">Configuration</h2>
+<p><code>EngineConfig::default</code> supplies these values.</p>
+<table><thead><tr><th>Field</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>threshold</code></td><td style="text-align: right"><code>5.0</code></td><td>Soft threshold carried in explanations and replaceable per account.</td></tr>
+<tr><td><code>hard_junk_threshold</code></td><td style="text-align: right"><code>15.0</code></td><td>Score at or above this value produces <code>ScoreBreach</code>.</td></tr>
+<tr><td><code>shadow_mode</code></td><td style="text-align: right"><code>false</code></td><td>Downgrades hard-junk outcomes when enabled.</td></tr>
+<tr><td><code>body_scan_bytes</code></td><td style="text-align: right"><code>1048576</code></td><td>Bounds each prepared body view.</td></tr>
+<tr><td><code>url_extraction_cap</code></td><td style="text-align: right"><code>1024</code></td><td>Bounds extracted URL count.</td></tr>
+<tr><td><code>header_line_cap</code></td><td style="text-align: right"><code>256</code></td><td>Bounds top-level headers considered.</td></tr>
+<tr><td><code>header_line_byte_cap</code></td><td style="text-align: right"><code>8192</code></td><td>Bounds each rendered header value.</td></tr>
+<tr><td><code>budget_ms</code></td><td style="text-align: right"><code>50</code></td><td>Stored classification budget value; this crate does not apply a timer.</td></tr>
+<tr><td><code>mail_auth_hard_fail_kinds</code></td><td style="text-align: right">SPF/DMARC and DKIM/DMARC reject pairs</td><td>Selects engine-level authentication hard failures.</td></tr>
+<tr><td><code>dnsbl_query_timeout_ms</code></td><td style="text-align: right"><code>2000</code></td><td>Timeout supplied when constructing DNSBL lookup wiring.</td></tr>
+<tr><td><code>dnsbl_negative_ttl_secs</code></td><td style="text-align: right"><code>300</code></td><td>Cache lifetime supplied to DNSBL lookup wiring.</td></tr>
+<tr><td><code>dnsbl_resolver_addresses</code></td><td style="text-align: right">empty</td><td>Resolver socket overrides; empty selects system resolver wiring.</td></tr>
+</tbody></table>
+<p>The default hard-fail list contains <code>SpfFailDmarcReject</code> and
+<code>DkimFailDmarcReject</code>. <code>BothAuthFailNoArc</code> is available but not enabled by
+default.</p>
+<h2 id="dnsbl-support">DNSBL support</h2>
+<p><code>DnsblLookup</code> is the engine-facing async interface. <code>Dnsbl&lt;R&gt;</code> adds a bounded
+cache and leader/follower single-flight behaviour to any <code>AsyncDnsResolver</code>.</p>
+<p><code>DnsblResult</code> distinguishes <code>Listed</code>, <code>NotListed</code>, and <code>LookupFailed</code>.
+Successful and negative answers are cached. Transient failures are not cached
+across messages and count as no match.</p>
+<p>The engine resolves the deduplicated zones for active DNSBL rules in parallel
+before running synchronous matchers. Disabled rules do not cause DNS queries.
+A DNSBL rule matches when any configured zone returns <code>Listed</code>.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table><thead><tr><th>Feature</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>core</code></td><td>Yes</td><td>Base standalone rule-engine surface; adds no optional dependency.</td></tr>
+<tr><td><code>dnsbl</code></td><td>No</td><td>Adds the Hickory-backed production DNS resolver and <code>HickoryDnsbl</code> alias.</td></tr>
+<tr><td><code>cosmix</code></td><td>No</td><td>Adds Bus and native client dependencies and also enables <code>dnsbl</code>.</td></tr>
+</tbody></table>
+<p>The default feature set is <code>core</code>.</p>
+<h2 id="smoke-program">Smoke program</h2>
+<p><code>cosmix-maild-rules-smoke</code> reads one RFC 5322 message from standard input,
+loads the bundled default pack, uses a synthetic successful authentication
+result, and prints the debug verdict and explanation.</p>
+<pre><code class="language-text">cosmix-maild-rules-smoke &lt; message.eml
+</code></pre>
+<p>If the default pack cannot be found beside the crate source, the program uses
+an empty engine. Per-rule compile failures are written to standard error.</p>
+<h2 id="errors">Errors</h2>
+<p>The public <code>Error</code> type covers pack parse and file errors, regex compilation,
+unknown matcher kinds, missing fields, invalid rule configuration, MIME parse
+failure, and internal errors. Runtime MIME parse failure is normally represented
+by the implicit scored rule rather than returned from <code>classify</code>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +749,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +803,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +932,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

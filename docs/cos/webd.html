@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/webd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,76 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/webd.md"><div class="prose"><h1 id="cosmix-webd--multi-vhost-https-front-door">cosmix-webd — multi-vhost HTTPS front door</h1>
+<p><strong><code>cosmix-webd</code> is the mesh's web server: multi-vhost HTTPS with automatic
+ACME certificates, and a server-side-rendered UI that streams updates over
+Datastar SSE.</strong> One binary terminates TLS for many domains and serves the
+mail, files, and CMS surfaces of the substrate as ordinary web pages.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>A long-running Rust daemon that owns a node's <code>:443</code> (and optional <code>:80</code>)
+listeners. It is the human-facing edge of the mesh — where a browser meets the
+substrate. Vhosts, routes, TLS certificates, and page templates are all
+configured through Bus verbs and the SPEC-12 property store, not hand-edited
+config files, so an agent can add a site or rotate a certificate with a
+structured call.</p>
+<p>Pages are <strong>server-side rendered</strong>. Interactive behaviour comes from
+<a href="https://data-star.dev">Datastar</a> — the server pushes DOM patches over a
+Server-Sent-Events stream (<code>text/event-stream</code>) instead of shipping a
+client-side framework. Handler logic for a vhost is written in
+<a href="https://github.com/markc/cosmix">Mix</a> and evaluated per request, with seams into
+the mail daemon (<code>jmap()</code>), the files daemon, and the CMS database.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul>
+<li><strong>TLS termination + SNI</strong> for many vhosts on one listener, backed by a per-vhost certificate resolver.</li>
+<li><strong>Automatic ACME</strong> (Let's Encrypt style) — provisions and renews certificates over the HTTP-01 challenge on the <code>:80</code> listener, with cooldown and renewal-window gates.</li>
+<li><strong>SSR web UI</strong> — renders mail (JMAP-backed), a dual-pane file manager, and a CMS/PIM, patching the page live over Datastar SSE.</li>
+<li><strong>Per-vhost Mix handlers</strong> — request routing and page logic authored in Mix, with <code>$SIGNALS</code> (the parsed Datastar signal store), <code>$BODY</code>, and session identity injected into scope.</li>
+<li><strong>Sessions + auth</strong> — cookie sessions (<code>cosmix_session</code>), server-side authentication for every write; a loopback-gated dev auto-session for headless local preview.</li>
+</ul>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-webd
+</code></pre>
+<p>Runs under systemd as <code>cosmix-webd.service</code> (identity <code>User=cosmix-webd</code>, from
+the SPEC-10 sysusers fragment). Shared node settings load from
+<code>/etc/cosmix/node.toml</code>; the per-daemon block, listener addresses, and vhost
+tree come from <code>/etc/cosmix/webd/config.toml</code> plus the property store. A
+loopback-only dev listener (default <code>127.0.0.1:8080</code>) offers a zero-config
+local preview fenced to localhost.</p>
+<h2 id="interfaces">Interfaces</h2>
+<p>Listeners:</p>
+<ul>
+<li><code>:443</code> — TLS vhosts (public edge).</li>
+<li><code>:80</code> — plain HTTP: ACME HTTP-01 challenge + optional redirect / autoconfig.</li>
+<li><code>127.0.0.1:8080</code> — internal dev/preview listener (opt-in).</li>
+</ul>
+<p>Bus verbs (service <code>webd</code>):</p>
+<table><thead><tr><th>Verb</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>webd.vhost.add</code></td><td>register a new vhost</td></tr>
+<tr><td><code>webd.props.{list,get,set,delete}</code></td><td>property store surface</td></tr>
+<tr><td><code>webd.routes.list</code></td><td>list matched routes</td></tr>
+<tr><td><code>webd.acme.{status,renew}</code></td><td>certificate state; force a renewal</td></tr>
+<tr><td><code>webd.tls.{status,reload}</code></td><td>TLS resolver state; hot-reload certs</td></tr>
+<tr><td><code>webd.autoconfig.served_domains</code></td><td>mail-client autoconfig domains</td></tr>
+<tr><td><code>webd.session.revoke</code></td><td>revoke a session</td></tr>
+<tr><td><code>webd.stats</code></td><td>request/response counters</td></tr>
+</tbody></table>
+<h2 id="where-it-fits">Where it fits</h2>
+<p>Depends on <code>cosmix-lib-daemon</code> (the <code>tls</code> feature: rustls + ACME + SNI),
+<code>cosmix-lib-props-store</code> (SPEC-12 state), <code>cosmix-lib-config</code>, and the Bus
+client libraries from <a href="https://github.com/markc/cosmix">bus</a>. It reaches a local
+or remote <code>cosmix-maild</code> over JMAP for mail, the files daemon for the file
+manager, and evaluates per-vhost handlers through the embedded
+<a href="https://github.com/markc/cosmix">mix</a> engine. Every node needs a
+<a href="/cos/noded">cosmix-noded</a> broker for the Bus surface.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/noded">noded</a> — the Bus broker webd registers with</li>
+<li><a href="/cos/maild">maild</a> — the JMAP mail backend behind the web mail UI</li>
+<li><a href="/cos/dnsd">dnsd</a> — mesh DNS that resolves the vhost names webd serves</li>
+<li><a href="/cos/libraries">libraries</a> — <code>cosmix-lib-daemon</code>, <code>cosmix-lib-props-store</code></li>
+<li><a href="/cos/overview">overview</a> — the daemon family at a glance</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +688,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +742,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +871,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

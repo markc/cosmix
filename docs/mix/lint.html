@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/lint</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,254 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/lint.md"><div class="prose"><h1 id="mix-lint--semantic-analysis">mix lint — semantic analysis</h1>
+<p><code>mix --check</code> is a syntax check: it lexes and parses, nothing more. It happily
+passes a script that reads an undefined variable, calls a function that exists
+nowhere, or hands <code>substr</code> one argument. <code>mix lint</code> (0.29.0) is the semantic
+layer: it builds the scope universe, resolves every call against the builtin
+contract metadata and the file's own definitions, and reports machine-readable
+diagnostics with <strong>stable codes</strong> — designed for an agent to consume without
+parsing prose, and biased hard toward zero false positives on Mix's dynamic
+seams.</p>
+<pre><code class="language-text">mix lint [--json | --data] [--deny-warnings]
+         [--allow-global NAME]... [--allow-function NAME]...
+         FILE...
+</code></pre>
+<ul>
+<li>Exit codes: <code>0</code> no errors (warnings allowed unless <code>--deny-warnings</code>); <code>1</code> one or more errors, or any warning under <code>--deny-warnings</code>; <code>2</code> invalid usage, unreadable input, or internal failure. <strong>Notes never affect the exit code</strong> — a file whose only findings are notes exits <code>0</code> even under <code>--deny-warnings</code> (0.63.0; pinned by CLI tests, because <code>--deny-warnings</code> is a live fleet deploy gate).</li>
+<li>Diagnostics go to <strong>stdout</strong>; CLI errors go to <strong>stderr</strong>. <code>--deny-warnings</code> changes only the exit decision, never a severity.</li>
+<li><code>-</code> reads stdin (at most once); relative <code>require()</code> paths from stdin resolve against the current directory.</li>
+<li><code>--allow-global NAME</code> / <code>--allow-function NAME</code> declare names an embedder or environment provides (repeatable).</li>
+<li>If script parsing fails, lint tries the same strict-data parser as <code>load_data()</code>.
+A successful fallback exits cleanly and prints <code>validated as strict data (not as a script)</code>. If both parsers fail, an explicit top-level <code>key:</code> shape (or a
+conventional strict-data suffix as a tiebreak) gets the data error;
+otherwise the original script error is preserved.</li>
+</ul>
+<h2 id="the-rules-v1">The rules (v1)</h2>
+<p>Codes are permanent — never reused, never repurposed — from three
+namespaces: <code>MIX-E1xxx</code> errors, <code>MIX-W2xxx</code> warnings (born warnings), and
+<code>MIX-D3xxx</code> <strong>deprecations and release-transition advisories</strong> (0.63.0) —
+a severity-<em>independent</em> namespace: a deprecation starts at severity
+<code>note</code> and may later be promoted to <code>warning</code> with the <strong>code unchanged</strong>
+(only the wire <code>severity</code> field moves), so tooling that suppresses or
+greps by code keeps working across the promotion.</p>
+<h3 id="notes-severity-note-0630">Notes (severity <code>note</code>, 0.63.0)</h3>
+<p>Rendered with a <code>note:</code> prefix, sorted after errors and warnings, counted
+in their own summary field, and <strong>never</strong> gating. Current D-codes:</p>
+<table><thead><tr><th>code</th><th>what it flags</th></tr></thead><tbody>
+<tr><td><code>MIX-D3001</code>–<code>D3005</code></td><td>the five pattern-first legacy names <code>regex_match regex_find regex_replace regex_split grep</code> — use the subject-first <code>re_match re_find re_replace re_split grep_lines</code>. <strong>The legacy names were DELETED in release B (0.73.0)</strong> after the fleet-wide inventory read zero, so a surviving call also gets <code>MIX-E1102</code> (undefined function) and fails at runtime; these notes stay as the pointer to the replacement</td></tr>
+<tr><td><del><code>MIX-D3006</code></del></td><td><strong>RETIRED in 0.68.0.</strong> Watch note for the map-binding flip, which has landed: a two-variable loop over a MAP now binds (key, value). Code permanently spent, never reused</td></tr>
+<tr><td><del><code>MIX-D3007</code></del></td><td><strong>RETIRED in 0.68.0.</strong> Watch note for the equality flip, which has landed: <code>==</code>/<code>!=</code> with a map or list on <strong>both</strong> sides now raises <code>TYPE_ERROR</code> naming <code>deep_eq</code>. The shipped rule is narrower than this note's "either operand" wording — a collection compared to a <em>scalar</em> still answers, so <code>$m[$k] == nil</code> keeps working. Code permanently spent, never reused</td></tr>
+<tr><td><code>MIX-D3012</code></td><td>an <strong><code>ssh_mix</code> body that could not be analysed</strong> (0.69.0) — a non-literal second argument (a variable, a concatenation, an interpolated string, a <code>read_file</code>), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist</td></tr>
+<tr><td><code>MIX-D3013</code></td><td>a <strong>hand-rolled padding loop</strong> (0.74.0) — <code>while len($o) &lt; $n … $o = $o .. " "</code> — pointing at <code>lpad</code>/<code>rpad</code> (and the display-cell <code>lpad_w</code>/<code>rpad_w</code>). Four independent sessions wrote this loop while the builtins sat in the binary; the note is the discoverability fix that reaches the author at authoring time. Narrow by design: only a <code>&lt;</code>/<code>&lt;=</code> comparison of <code>len</code>/<code>length</code> of the same variable the body self-appends a string literal to</td></tr>
+<tr><td><code>MIX-D3008</code>–<code>D3011</code></td><td>the REXX-style <code>pos lastpos byte_pos byte_lastpos</code> family, declared legacy — with a sharper message when composed as <code>substr(.., pos(..))</code> in one expression (the 1-based/0-based off-by-one). These stay notes until their own fleet count reads zero; they are NOT deleted in release B</td></tr>
+</tbody></table>
+<p>Member-call spellings are covered too: a builtin-named <code>.name(</code> desugars
+to the same call at parse time.</p>
+<pre><code class="language-text">MIX-E1001  lexical error                    MIX-E1301  duplicate function parameter
+MIX-E1002  script parse error               MIX-E1302  duplicate function definition in one scope
+MIX-E1003  strict-data parse error          MIX-W2301  `+` stringifies a proven list
+MIX-E1101  undefined variable               MIX-E1401  require() target missing/unreadable
+MIX-E1102  undefined function               MIX-E1402  require() target invalid Mix
+MIX-E1201  builtin arity mismatch           MIX-E1501  dead mutation (write is lost)
+MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
+                                            MIX-W2101  unreachable statement
+                                            MIX-W2201  discarded must-use result
+                                            MIX-W2302  used implicit-nil function result
+                                            MIX-W2303  assignment operand in hand-built chain AST
+                                            MIX-W2304  unknown builtin-result key
+                                            MIX-W2305  -1-sentinel builtin as a truth value
+                                            MIX-W2306  escaped quotes in ssh command source
+                                            MIX-W2401  source/include defeats analysis
+                                            MIX-W2402  bare bound variable in heredoc
+</code></pre>
+<ul>
+<li>
+<p><strong>MIX-E1003</strong> means the source was recognisably intended as strict data but
+failed the literal-data grammar. It is distinct from a broken executable
+script (<code>MIX-E1002</code>). A valid data file under any filename is recognised by
+content; the suffix is only a tiebreak when neither grammar succeeds.</p>
+</li>
+<li>
+<p><strong>MIX-E1101</strong> flags a <code>$name</code> read only when the name is bound <strong>nowhere in its visible universe</strong> — function bodies see params + their own binders + everything bound anywhere at file level (Mix has no block scoping and no read-before-assign rule, so lexical order is deliberately ignored). <code>${name}</code> interpolation is never flagged (it falls back to the process environment), nor are <code>$1</code>-style positionals or the runtime-injected <code>rc</code> / <code>result</code> / <code>status</code> / <code>event</code> / <code>_</code>.</p>
+</li>
+<li>
+<p><strong>MIX-E1102</strong> resolves bareword calls against builtins, HOFs, evaluator special forms, every <code>function</code> definition in the file, the embedded prelude, <code>--allow-function</code> names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside <code>address ... end</code> blocks are sends and are never flagged; <code>MethodCall</code>/<code>ValueCall</code> are dynamic dispatch and are skipped.</p>
+</li>
+<li>
+<p><strong>MIX-E1201</strong> checks calls against the structured contract metadata (<code>mix builtins --json</code>), including non-contiguous exact-arity sets — <code>random(1)</code> is an error, <code>random()</code>/<code>random(min, max)</code> are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (<code>mix --strict-arity</code> makes the runtime agree).</p>
+</li>
+<li>
+<p><strong>MIX-E1501</strong> flags a discarded <code>push</code>/<code>pop</code>/<code>shift</code> whose first argument is <strong>not a bare variable</strong> — <code>push($m["a"], $v)</code>, <code>push($m.a, $v)</code>, <code>$m["a"].push($v)</code>. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is <strong>lost in silence</strong>. It is an ERROR, not a warning: the statement does nothing while reading as though it did. The fix <strong>differs by builtin</strong>: <code>push</code> returns the appended list, so assign it back (<code>$m["a"] = push($m["a"], $v)</code>); <code>pop</code>/<code>shift</code> return the <strong>removed element</strong>, not the list, so assigning that back replaces the list with the element (data corruption) — hoist first instead (<code>$l = $m[$k]; $x = pop($l); $m[$k] = $l</code>). For maps of maps, write the <a href="/mix/collections">nested assignment</a> directly. A by-value <strong>parameter</strong> is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.</p>
+</li>
+<li>
+<p><strong>MIX-E1502</strong> flags a discarded <code>delete</code> / <code>merge</code> — both are <strong>pure</strong> (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: <code>$m = delete($m, "k")</code>.</p>
+</li>
+<li>
+<p><strong>MIX-W2201</strong> fires when an operation whose failure signal lives in its RETURN VALUE (<code>effects.must_use</code>: <code>run_rc</code>, <code>run_argv</code>, <code>run_pipeline</code>, <code>run_parallel</code>, <code>ssh_run</code>, <code>ssh_exec</code>, <code>ssh_mix</code>, <code>http_*</code>, <code>kill</code>, <code>run_stream</code>) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (<code>run_argv</code>→<code>run_argv_must</code>, <code>run_pipeline</code>→<code>run_pipeline_must</code>, <code>ssh_run</code>→<code>ssh_must</code>). The last statement of a block is exempt (it may be the block's value).</p>
+</li>
+<li>
+<p><strong>MIX-W2301</strong> warns that <code>+</code> coerces lists to strings; it does not append or
+concatenate list values. It fires for a list literal operand, or a variable
+proven by straight-line analysis to hold a directly assigned list literal.
+Use <code>concat(list_a, list_b)</code> or <code>push(list, value)</code>.</p>
+</li>
+<li>
+<p><strong>MIX-W2302</strong> warns when the result of a uniquely defined named function is
+consumed, its block body's final statement is a bare expression, and the
+body contains no value-returning <code>return</code>. Block functions implicitly return
+<code>nil</code>; add <code>return</code>. A discarded call is quiet, as are mixed-return bodies,
+terminating final expressions, and calls whose name can be redirected
+through a variable.</p>
+</li>
+<li>
+<p><strong>MIX-W2303</strong> is defence-in-depth for Rust embedders that construct the public
+AST directly and pass it to <code>analyze()</code>: it warns if any operand of a
+hand-built <code>StmtKind::Chain</code> is an assignment. Ordinary Mix source cannot
+reach this warning because the parser rejects the same shape first as
+<code>MIX-E1002</code>. The code remains reserved for this public-API path and is not
+repurposed.</p>
+</li>
+<li>
+<p><strong>MIX-W2304</strong> checks a literal field/index key against the builtin's
+documented result-map fields from <code>mix builtins --json</code>. It works on a
+direct builtin call or a variable proven by straight-line assignment to
+hold that result. The hint names the closest documented key (for example,
+<code>exit_code</code> rather than <code>code</code>). Dynamic keys, generic maps and result
+shapes without declared fields are deliberately silent.</p>
+</li>
+<li>
+<p><strong>MIX-W2305</strong> flags <code>index_of()</code> / <code>byte_index_of()</code> / <code>bytes_find()</code> (added
+v0.64.0) used <strong>bare as a truth
+value</strong>. They return <code>-1</code> for "not found" and <code>0</code> for "found at the first
+position", and Mix treats <code>0</code> as falsy and every non-zero number — <code>-1</code>
+included — as truthy. So a bare call in a condition is wrong on <em>both</em>
+branches:</p>
+<pre><code class="language-mix">if index_of("abc", "z") then …   -- -1 is TRUTHY  → absent reads as present
+if index_of("abc", "a") then …   --  0 is FALSY   → found-at-0 reads as absent
+</code></pre>
+<p>Compare explicitly (<code>index_of(..) &gt;= 0</code>), or use <code>contains()</code> for the yes/no
+question — <strong>except for <code>byte_find</code>/<code>bytes_find</code></strong>, whose bytes subject
+<code>contains()</code> rejects, so those take the <code>&gt;= 0</code> comparison only. Their 1-based
+twins — <code>pos</code>, <code>lastpos</code>, <code>byte_pos</code>,
+<code>byte_lastpos</code> — are <strong>safe</strong> in the same position because their not-found
+sentinel is <code>0</code> and therefore falsy; that asymmetry is exactly what makes
+the trap easy to walk into, and why the rule exists. Fires in <code>if</code>/<code>elif</code>,
+<code>while</code>, <code>break if</code>/<code>continue if</code>, expression-position <code>if</code>, the ternary
+condition, and through <code>not</code>/<code>and</code>/<code>or</code>. Any explicit comparison is already
+correct code and stays silent.</p>
+</li>
+<li>
+<p><strong>MIX-W2306</strong> flags a literal command passed to <code>ssh_run</code> or <code>ssh_must</code> when
+its source spelling contains <code>\"</code>. That escape is the high-signal mark of
+nested Mix source which the remote shell will parse again. Ship the source
+verbatim with <a href="/mix/remote#headline-idiom-ssh_mix--heredoc"><code>ssh_mix</code> + a heredoc</a>.
+Simple command strings, computed commands, <code>ssh_exec</code>, <code>ssh_mix</code>, and
+single-quoted strings containing ordinary <code>"</code> stay quiet.</p>
+</li>
+<li>
+<p><strong>MIX-W2401</strong>: one <code>source</code>/<code>include</code> anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer <code>require()</code>: it is isolated, statically resolvable, and E1401/E1402 verify literal-path modules parse.</p>
+</li>
+<li>
+<p><strong>MIX-W2402</strong> warns when a heredoc literal contains bare <code>$NAME</code> and <code>NAME</code> is bound somewhere in the same visible universe. Heredocs interpolate <code>${NAME}</code>, not <code>$NAME</code>, so the bare form often means a generated config was silently corrupted. It does not fire for <code>${NAME}</code>, <code>$(</code> command substitution, explicitly escaped <code>\$NAME</code>, all-digit names such as <code>$1</code>, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare <code>$NAME</code> still evaluates to literal <code>$NAME</code>, and intentional literal output requires no change.</p>
+</li>
+<li>
+<p><strong>MIX-W2403</strong> (0.74.0) warns at the <em>definition</em> of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name (only an extracted function value or an exports-map index still reaches it). The worst shape this produces is a script that keeps running while its own function quietly stops being called — every release that adds a builtin name arms it again for older scripts. Deliberately a warning, never an error: a compat shim written for an older mix that lacks the builtin is legitimate authoring — but on the mix doing the linting it is dead, and the author should know.</p>
+</li>
+</ul>
+<h2 id="mix-explain-mix-xxxx--the-offline-diagnostics-explainer"><code>mix explain MIX-XXXX</code> — the offline diagnostics explainer</h2>
+<p>Every human-readable lint run that reports anything ends with one trailer line:</p>
+<pre><code class="language-text">explain any code with: mix explain MIX-XXXX
+</code></pre>
+<p><code>mix explain MIX-W2305</code> (the <code>MIX-</code> prefix is optional, case-insensitive — <code>mix explain w2305</code> works too) prints the code's full story — what it flags, why the
+rule exists, the shape it catches, and the fix — from a registry embedded in the
+binary, so an agent that hits a code it has never seen gets the whole rationale
+in one call without leaving the terminal or reaching the network. An unknown but
+code-shaped argument lists the known codes rather than failing blankly; a
+non-code argument (<code>mix explain round</code>) falls through to the AI builtin
+explainer. The registry is the same prose as this page; a build-time test
+asserts every code the analyzer can emit has a record, so a new diagnostic
+cannot ship without its explanation.</p>
+<h2 id="machine-output">Machine output</h2>
+<p><code>--json</code> (D3 schema, <code>schema_version: 2</code> since 0.63.0 — the severity
+domain gained <code>"note"</code> and <code>summary</code> gained <code>notes</code>; no in-tree consumer
+parsed v1, inventoried 2026-09-03):</p>
+<pre><code class="language-json">{
+  "schema_version": 2,
+  "tool": "mix lint",
+  "mix_version": "0.63.0",
+  "files": ["worker.mix"],
+  "strict_data_files": [],
+  "diagnostics": [{
+    "code": "MIX-E1101", "severity": "error", "file": "worker.mix",
+    "line": 412, "column": null,
+    "message": "undefined variable '$DOMAIN' (assigned nowhere in this file)",
+    "hint": "assign it, use env(\"DOMAIN\") for environment values, or pass --allow-global DOMAIN"
+  }],
+  "capabilities": ["fs-read", "network", "process"],
+  "summary": {"errors": 1, "warnings": 0, "notes": 0, "denied_warnings": false}
+}
+</code></pre>
+<p><code>--data</code> emits the same report as strict-data Mix source (parse with
+<code>data_parse</code>). <code>line</code>/<code>column</code> are 1-based or <code>null</code>. Most diagnostics are
+statement-level and carry a <code>null</code> column. Lexical and parse errors generally do
+carry one — the assignment-chain error, for instance, points at the offending
+<code>&amp;&amp;</code>/<code>||</code>.</p>
+<p><code>capabilities</code> is the inventory of capability classes the script's calls
+exercise — data, not warnings.
+<code>strict_data_files</code> lists inputs validated by the strict-data fallback rather
+than by the script analyzer.</p>
+<h2 id="remote-bodies--lint-sees-inside-ssh_mix-0690">Remote bodies — lint sees inside <code>ssh_mix</code> (0.69.0)</h2>
+<p><a href="/mix/remote"><code>ssh_mix(host, source[, opts])</code></a> ships its <strong>second argument</strong> to
+a remote <code>mix -</code>. That argument is Mix source, and since 0.69.0 lint treats it
+as such: when it is a <strong>string literal</strong> it is parsed and analysed, and its
+diagnostics are reported against the enclosing file with a
+<code>[inside ssh_mix body]</code> prefix and the line mapped into the outer file.</p>
+<pre><code>deploy_thing.mix:283: MIX-D3001 note: [inside ssh_mix body] `regex_match` is
+  pattern-first legacy: use `re_match(s, pattern)` (subject first)
+</code></pre>
+<p>Before this, a deploy script's entire remote half was one opaque string —
+invisible to lint and, more consequentially, to every <strong>inventory built from
+lint</strong>. That is not a hypothetical: the <code>MIX-D3006</code> inventory that gated
+0.68.0's map-binding flip reported <em>zero</em> sites for <code>deploy_vhost.mix</code>,
+locally and on 27/27 fleet nodes, while line 283 of that file is a
+two-variable loop over a map living inside such a body.</p>
+<p><strong>A body that cannot be analysed says so</strong> — <code>MIX-D3012</code>, for a non-literal
+argument (variable, concatenation, interpolation, <code>read_file</code>) or a literal
+that does not parse as Mix. This is the rule that matters more than the
+analysis: an unreadable body silently counted as clean is precisely how an
+inventory reads zero while live sites exist.</p>
+<p><strong>Name resolution is suppressed inside the body.</strong> Its free names come from
+<code>ssh_mix</code>'s <code>bindings</code> option and from the remote's own environment, neither
+visible locally, so <code>MIX-E1101</code>-class findings would be pure noise — and a
+linter that cries wolf about remote bodies gets switched off. The enclosing
+file keeps all of its own name checks. Everything else — legacy-name notes,
+arity, the truthiness trap — applies normally, and <strong>errors from inside a
+body gate exactly as they would anywhere else</strong>.</p>
+<p>Only <code>ssh_mix</code> carries Mix source this way. <code>run</code>/<code>run_argv</code>/<code>run_pipeline</code>
+execute <em>shell</em> commands, Mix has no heredoc syntax, there is no
+<code>source</code>/<code>include</code>/<code>eval</code> builtin taking a string, and <code>--serve</code> runs a script
+<em>file</em> (which lint reaches directly).</p>
+<h2 id="what-lint-deliberately-does-not-do-v1">What lint deliberately does NOT do (v1)</h2>
+<ul>
+<li>Straight-line facts do not cross branches, loops, function-call boundaries,
+<code>source</code>/<code>include</code>, or function frames. This deliberately misses lists and
+builtin-result maps produced indirectly, returned by helpers, assigned in a
+branch, or reached through a dynamic key. Suspicious <code>nil</code> coercion into
+paths/hostnames remains out of scope. <code>MIX-W2302</code> also stays silent for a
+mixed-return function even when one fallthrough path may still yield <code>nil</code>.
+Shell-vs-argv advice remains out of scope — use
+<a href="/mix/data"><code>validate</code></a> at boundaries for the nil class today.</li>
+<li>No reachability model for <code>E1102</code>/<code>E1101</code> beyond the universe rules above.</li>
+<li>Dynamic <code>require(expr)</code> paths, extension calls, and Bus dispatch are never hard errors.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/invocation">invocation</a> — <code>mix --check</code> (syntax only), <code>--strict-arity</code></li>
+<li><a href="/mix/errors">errors</a> — the structured errors the flagged code will raise at runtime</li>
+<li><a href="/mix/builtins">builtins</a> — the contract metadata lint checks against</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +866,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +920,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1049,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

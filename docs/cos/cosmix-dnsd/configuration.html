@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-dnsd/configuration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,115 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-dnsd/configuration.md"><div class="prose"><h1 id="cosmix-dnsd-configuration">cosmix-dnsd configuration</h1>
+<p><code>cosmix-dnsd</code> takes its service inputs from command-line options. The citizen
+build can additionally read <code>wg_ip</code> from the standard <code>node.conf.mix</code> search
+path.</p>
+<h2 id="command-line">Command line</h2>
+<pre><code class="language-text">cosmix-dnsd --zones &lt;zones.mix&gt; --state &lt;state-file&gt; \
+  --listen &lt;ip:port&gt; [--listen &lt;ip:port&gt; ...] \
+  [--allow-non-loopback-listen]
+</code></pre>
+<table><thead><tr><th>Option</th><th style="text-align: right">Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--zones &lt;path&gt;</code></td><td style="text-align: right">yes</td><td>Strict-data Mix file containing the static zones.</td></tr>
+<tr><td><code>--state &lt;path&gt;</code></td><td style="text-align: right">yes</td><td>Persistent daemon state used by the zone store.</td></tr>
+<tr><td><code>--listen &lt;ip:port&gt;</code></td><td style="text-align: right">yes</td><td>UDP and TCP listen address. Repeat for multiple addresses.</td></tr>
+<tr><td><code>--allow-non-loopback-listen</code></td><td style="text-align: right">no</td><td>Allows a non-loopback address in standalone mode or when trusted node configuration is unavailable.</td></tr>
+<tr><td><code>-h</code>, <code>--help</code></td><td style="text-align: right">no</td><td>Prints the usage string and exits with status <code>2</code>.</td></tr>
+<tr><td><code>-V</code>, <code>--version</code></td><td style="text-align: right">no</td><td>Prints the package name and version, then exits successfully.</td></tr>
+</tbody></table>
+<p>Hostnames are not accepted by <code>--listen</code>; the value parses as a socket address.
+Use brackets around IPv6 addresses, for example <code>[::1]:5353</code>.</p>
+<h2 id="zone-file">Zone file</h2>
+<p>The crate fixture uses Mix strict-data syntax. The top level contains a
+<code>zones</code> map. Each zone supplies an SOA description, an NS list, a configured
+serial floor, and a list of owner bundles.</p>
+<pre><code class="language-text">zones: {
+  "example.com": {
+    soa: {
+      primary: "beta.example.com",
+      mbox: "hostmaster.example.com",
+      ttl: 300,
+      minimum: 60
+    },
+    ns: [ "beta.example.com" ],
+    serial_floor: 1,
+    bundles: [
+      {
+        owner: "alpha",
+        serial: 1,
+        records: [
+          {
+            name: "alpha.example.com",
+            type: "A",
+            ttl: 300,
+            data: "192.0.2.5"
+          }
+        ]
+      }
+    ]
+  }
+}
+</code></pre>
+<p>Entries inside maps and lists are comma-separated. The crate fixture exercises
+<code>A</code>, <code>MX</code>, <code>SRV</code>, and <code>PTR</code> records plus generated zone-apex <code>SOA</code> and <code>NS</code>
+answers.</p>
+<p>The daemon treats <code>--zones</code> as read-only input. Send <code>SIGHUP</code> after replacing
+the file to request an adopt-or-keep-last-good reload.</p>
+<h2 id="state-file">State file</h2>
+<p><code>--state</code> names the file used by <code>FilePersistence</code>. The zone store uses it to
+retain its floor state.</p>
+<p>At startup:</p>
+<ul>
+<li>a readable state file is loaded;</li>
+<li>a corrupt or unreadable state file is logged and treated as absent; and</li>
+<li>an unusable initial zone candidate with no last-known-good state stops the
+daemon.</li>
+</ul>
+<p>The state file format is internal to the zone store. Do not use it as the zone
+configuration source.</p>
+<h2 id="listen-addresses">Listen addresses</h2>
+<p>Every explicit <code>--listen</code> value is mandatory: failure to bind either UDP or TCP
+stops startup. Each listener serves the same zone snapshot.</p>
+<table><thead><tr><th>Address</th><th>Standalone build</th><th>Citizen with usable <code>wg_ip</code></th><th>Citizen without usable <code>wg_ip</code></th></tr></thead><tbody>
+<tr><td>Loopback</td><td>accepted</td><td>accepted</td><td>accepted</td></tr>
+<tr><td>Configured <code>wg_ip</code></td><td>requires override flag</td><td>accepted</td><td>requires override flag</td></tr>
+<tr><td>Other non-loopback</td><td>requires override flag</td><td>rejected</td><td>requires override flag</td></tr>
+<tr><td>Wildcard or unspecified</td><td>rejected</td><td>rejected</td><td>rejected</td></tr>
+</tbody></table>
+<p><code>--allow-non-loopback-listen</code> never permits a wildcard address. In a citizen
+with a usable <code>wg_ip</code>, it also never permits an address other than that
+configured value.</p>
+<p>IPv4-mapped IPv6 addresses are canonicalised before classification and
+comparison. For example, <code>[::ffff:192.0.2.5]:53</code> matches a configured
+<code>192.0.2.5</code>.</p>
+<h2 id="citizen-node-configuration">Citizen node configuration</h2>
+<p>The default build asks <code>cosmix-lib-config</code> to load <code>node.conf.mix</code> using its
+standard environment, XDG, and system configuration search. Only the <code>wg_ip</code>
+field affects this crate's bind decision.</p>
+<p>The configured value must parse as an IP unicast address. Unspecified,
+loopback, multicast, and IPv4 broadcast values are not usable mesh identities.
+An absent, unreadable, malformed, or unusable value produces a warning and
+selects the degraded standalone bind rule.</p>
+<p>When the configured address is not yet present on an interface, the citizen
+retries the UDP and TCP bind pair for up to 30 seconds at one-second intervals.
+<code>AddrInUse</code>, permission errors, and other bind failures are returned
+immediately.</p>
+<h2 id="citizen-loopback-listener">Citizen loopback listener</h2>
+<p>After binding every explicit address, the citizen attempts
+<code>127.0.0.1:53</code> unless it was already requested. This implicit listener is
+best-effort: failure is logged but does not stop service on explicit
+listeners.</p>
+<p>Passing <code>--listen 127.0.0.1:53</code> makes that listener explicit and restores the
+normal fatal-on-bind-failure rule.</p>
+<p>The standalone build creates no implicit listener.</p>
+<h2 id="signals">Signals</h2>
+<table><thead><tr><th>Signal</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>SIGHUP</code></td><td>Reloads the zone candidate; keeps the current snapshot on rejection.</td></tr>
+<tr><td>Interrupt (<code>Ctrl-C</code>)</td><td>Aborts service tasks and exits successfully.</td></tr>
+</tbody></table>
+<p>Return to the <a href="/cos/cosmix-dnsd/">crate overview</a>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +727,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +781,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +910,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

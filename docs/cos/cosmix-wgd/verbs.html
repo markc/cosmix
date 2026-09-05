@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-wgd/verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,131 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-wgd/verbs.md"><div class="prose"><h1 id="bus-verbs">Bus verbs</h1>
+<p><code>cosmix-wgd</code> registers as the Bus service <code>wgd</code> and answers four read-only verbs. Request arguments and request bodies are ignored.</p>
+<p>Every valid verb returns <code>rc=0</code>. Before the first reconcile completes, the body is:</p>
+<pre><code class="language-json">{
+  "ready": false,
+  "reason": "no reconcile pass has completed yet"
+}
+</code></pre>
+<p>An unknown or non-read-only verb returns <code>rc=10</code> and names the supported verbs. There are no mutation verbs.</p>
+<h2 id="wgdifacestatus"><code>wgd.iface.status</code></h2>
+<p>Returns the latest interface and reconcile summary.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>ready</code></td><td>boolean</td><td><code>true</code> when a snapshot exists.</td></tr>
+<tr><td><code>iface</code></td><td>string</td><td>WireGuard interface read during the pass.</td></tr>
+<tr><td><code>mesh</code></td><td>string</td><td>Verified inventory mesh identity.</td></tr>
+<tr><td><code>epoch</code></td><td>integer</td><td>Accepted inventory epoch.</td></tr>
+<tr><td><code>self_name</code></td><td>string</td><td>Local inventory member name.</td></tr>
+<tr><td><code>self_mesh_ip</code></td><td>string</td><td>Local member mesh address.</td></tr>
+<tr><td><code>intended_peer_count</code></td><td>integer</td><td>Number of derived peers, excluding self.</td></tr>
+<tr><td><code>live_available</code></td><td>boolean</td><td>Whether <code>wg show IFACE dump</code> succeeded and parsed.</td></tr>
+<tr><td><code>live_error</code></td><td>string or null</td><td>Live-read error when unavailable.</td></tr>
+<tr><td><code>synced_count</code></td><td>integer</td><td>Correct live peers; zero when live state is unavailable.</td></tr>
+<tr><td><code>drift_count</code></td><td>integer</td><td>Detected drift entries; zero when live state is unavailable.</td></tr>
+<tr><td><code>in_sync</code></td><td>boolean</td><td>Whether live state is available and contains no drift.</td></tr>
+<tr><td><code>refreshed_at_unix</code></td><td>integer</td><td>Snapshot creation time in Unix seconds.</td></tr>
+</tbody></table>
+<p><code>in_sync</code> is false when live state is unavailable. A zero <code>drift_count</code> in that state does not mean that the interface is in sync.</p>
+<h2 id="wgdpeerstatus"><code>wgd.peer.status</code></h2>
+<p>Returns live liveness for peers that match the intended mesh address, an accepted key, and exactly the intended host route.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>ready</code></td><td>boolean</td><td><code>true</code> when a snapshot exists.</td></tr>
+<tr><td><code>iface</code></td><td>string</td><td>WireGuard interface read during the pass.</td></tr>
+<tr><td><code>live_available</code></td><td>boolean</td><td>Whether live state was read and parsed.</td></tr>
+<tr><td><code>live_error</code></td><td>string or null</td><td>Live-read error when unavailable.</td></tr>
+<tr><td><code>peers</code></td><td>array</td><td>Matching live peers; empty when live state is unavailable.</td></tr>
+</tbody></table>
+<p>Each <code>peers</code> entry contains:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td>string</td><td>Inventory member name.</td></tr>
+<tr><td><code>mesh_ip</code></td><td>string</td><td>Stable mesh address.</td></tr>
+<tr><td><code>pubkey</code></td><td>string</td><td>Base64 WireGuard public key installed in the kernel.</td></tr>
+<tr><td><code>state</code></td><td>string</td><td><code>pending</code>, <code>connected</code>, or <code>offline</code>.</td></tr>
+</tbody></table>
+<p>Peers with drift are not included in <code>peers</code>. Use <code>wgd.drift</code> or <code>wgd.topology.snapshot</code> to inspect them.</p>
+<h2 id="wgdtopologysnapshot"><code>wgd.topology.snapshot</code></h2>
+<p>Returns the complete intended peer set and any drift available from the same snapshot.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>ready</code></td><td>boolean</td><td><code>true</code> when a snapshot exists.</td></tr>
+<tr><td><code>mesh</code></td><td>string</td><td>Verified inventory mesh identity.</td></tr>
+<tr><td><code>subnet</code></td><td>string</td><td>Inventory subnet in CIDR form.</td></tr>
+<tr><td><code>epoch</code></td><td>integer</td><td>Accepted inventory epoch.</td></tr>
+<tr><td><code>self</code></td><td>object</td><td>Local member <code>name</code> and <code>mesh_ip</code>.</td></tr>
+<tr><td><code>intended_peers</code></td><td>array</td><td>Derived peers sorted by mesh address.</td></tr>
+<tr><td><code>live_available</code></td><td>boolean</td><td>Whether a live report is present.</td></tr>
+<tr><td><code>drift</code></td><td>array</td><td>Drift entries, or an empty array when live state is unavailable.</td></tr>
+</tbody></table>
+<p>Each <code>intended_peers</code> entry contains:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td>string</td><td>Inventory member name.</td></tr>
+<tr><td><code>mesh_ip</code></td><td>string</td><td>Member mesh address.</td></tr>
+<tr><td><code>allowed_ip</code></td><td>string</td><td>Intended <code>/32</code> or <code>/128</code> host route.</td></tr>
+<tr><td><code>acceptable_pubkeys</code></td><td>array</td><td>Base64 keys valid at the accepted epoch.</td></tr>
+</tbody></table>
+<p>The acceptable-key array normally has one entry. It may have two entries during a credential-overlap window.</p>
+<h2 id="wgddrift"><code>wgd.drift</code></h2>
+<p>Returns the dry-run reconcile result.</p>
+<p>When live state is available, the body contains:</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>ready</code></td><td>boolean</td><td><code>true</code>.</td></tr>
+<tr><td><code>live_available</code></td><td>boolean</td><td><code>true</code>.</td></tr>
+<tr><td><code>mesh</code></td><td>string</td><td>Mesh identity carried by the report.</td></tr>
+<tr><td><code>epoch</code></td><td>integer</td><td>Inventory epoch carried by the report.</td></tr>
+<tr><td><code>in_sync</code></td><td>boolean</td><td><code>true</code> when <code>drift</code> is empty.</td></tr>
+<tr><td><code>drift</code></td><td>array</td><td>Complete drift entries.</td></tr>
+</tbody></table>
+<p>When live state is unavailable, the body contains <code>ready: true</code>, <code>live_available: false</code>, <code>live_error</code>, and an empty <code>drift</code> array. It omits <code>mesh</code>, <code>epoch</code>, and <code>in_sync</code>.</p>
+<h2 id="drift-entries">Drift entries</h2>
+<h3 id="missing"><code>missing</code></h3>
+<pre><code class="language-json">{
+  "kind": "missing",
+  "name": "beta",
+  "mesh_ip": "192.0.2.20",
+  "action_p3": "add"
+}
+</code></pre>
+<h3 id="extra"><code>extra</code></h3>
+<pre><code class="language-json">{
+  "kind": "extra",
+  "pubkey": "BASE64_PUBLIC_KEY",
+  "allowed_ips": ["192.0.2.99/32"],
+  "action_p3": "remove"
+}
+</code></pre>
+<h3 id="key_mismatch"><code>key_mismatch</code></h3>
+<pre><code class="language-json">{
+  "kind": "key_mismatch",
+  "name": "beta",
+  "mesh_ip": "192.0.2.20",
+  "live_pubkey": "BASE64_PUBLIC_KEY",
+  "action_p3": "rotate"
+}
+</code></pre>
+<h3 id="allowed_ips_drift"><code>allowed_ips_drift</code></h3>
+<pre><code class="language-json">{
+  "kind": "allowed_ips_drift",
+  "name": "beta",
+  "mesh_ip": "192.0.2.20",
+  "live_allowed_ips": ["192.0.2.20/32", "192.0.2.64/32"],
+  "action_p3": "reset_allowed_ips"
+}
+</code></pre>
+<h3 id="duplicate_kernel_claimant"><code>duplicate_kernel_claimant</code></h3>
+<pre><code class="language-json">{
+  "kind": "duplicate_kernel_claimant",
+  "mesh_ip": "192.0.2.20",
+  "count": 2,
+  "action_p3": "operator_resolve"
+}
+</code></pre>
+<p>The <code>action_p3</code> field describes a possible later convergence action. This crate does not execute it.</p>
+<h2 id="availability">Availability</h2>
+<p>The Bus connection runs independently of the reconcile loop. Broker outages make the verb surface unavailable but do not stop inventory verification, live reads, or snapshot replacement.</p>
+<p>After a mid-session disconnect the Bus task reconnects with bounded exponential backoff. A session lasting at least 30 seconds resets the delay to one second.</p>
+<p><a href="/cos/cosmix-wgd/">Back to cosmix-wgd</a></p></div></div>
     </div>
 
 </main>
@@ -620,6 +743,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +797,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +926,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

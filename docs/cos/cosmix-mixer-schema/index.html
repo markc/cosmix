@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-mixer-schema/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,159 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-mixer-schema/README.md"><div class="prose"><h1 id="cosmix-mixer-schema">cosmix-mixer-schema</h1>
+<p><code>cosmix-mixer-schema</code> is the renderer-independent Rust contract for the
+<code>mixer.v1</code> domain. It defines the mixer property schema, frozen calibration,
+meter-frame codec, write messages, snapshots, and final-state hash used by
+mixer engines and domain-aware clients. The crate lives in the <code>cos</code> layer of
+the <code>bus &lt;- mix &lt;- cos</code> dependency chain, but deliberately has no dependency on
+Bus, Mix, or another Cosmix crate. Generic <code>cosmix-disp-*</code> renderers must not
+depend on it.</p>
+<h2 id="synopsis">Synopsis</h2>
+<p>The Cargo package is named <code>cosmix-mixer-schema</code>. Rust code imports it as
+<code>cosmix_mixer_schema</code>.</p>
+<p>The crate exposes all items from its library root. It has no public submodules.</p>
+<h2 id="domain-constants">Domain constants</h2>
+<p><code>SCHEMA_VERSION</code> is <code>mixer.v1</code>. The topology contains 32 mono input channels
+and one stereo master, so meter frames carry 33 <code>MeterRecord</code> values.</p>
+<table><thead><tr><th>Constant</th><th style="text-align: right">Value</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>NUM_CHANNELS</code></td><td style="text-align: right">32</td><td>Mono input strips</td></tr>
+<tr><td><code>NUM_METERS</code></td><td style="text-align: right">33</td><td>Input meters plus the master</td></tr>
+<tr><td><code>SILENCE_DB</code></td><td style="text-align: right">-120.0 dB</td><td>Exact silence and fader floor</td></tr>
+<tr><td><code>TRIM_MIN_DB</code> / <code>TRIM_MAX_DB</code></td><td style="text-align: right">-18.0 / 18.0 dB</td><td>Trim range</td></tr>
+<tr><td><code>FADER_MIN_DB</code> / <code>FADER_MAX_DB</code></td><td style="text-align: right">-120.0 / 6.0 dB</td><td>Channel and master fader range</td></tr>
+<tr><td><code>DB_QUANTUM</code></td><td style="text-align: right">0.1 dB</td><td>Trim and fader step</td></tr>
+<tr><td><code>PAN_MIN</code> / <code>PAN_MAX</code></td><td style="text-align: right">-1.0 / 1.0</td><td>Pan range</td></tr>
+<tr><td><code>PAN_QUANTUM</code></td><td style="text-align: right">1/512</td><td>Pan step</td></tr>
+<tr><td><code>METER_MIN_DB</code> / <code>METER_MAX_DB</code></td><td style="text-align: right">-120.0 / 24.0 dB</td><td>Meter range</td></tr>
+<tr><td><code>METER_QUANTUM</code></td><td style="text-align: right">0.01 dB</td><td>Snapshot meter step</td></tr>
+<tr><td><code>SRC_HEADROOM</code></td><td style="text-align: right">0.25</td><td>Seeded source headroom</td></tr>
+<tr><td><code>MASTER_PAD_DB</code></td><td style="text-align: right">-12.0 dB</td><td>Master output pad</td></tr>
+</tbody></table>
+<p>Control defaults are <code>0.0</code> for trim, fader, and pan, and <code>false</code> for boolean
+controls. The <code>-120.0 dB</code> silence value is the fader floor and meter default,
+not the default fader position.</p>
+<h2 id="property-schema">Property schema</h2>
+<p><code>leaf_spec(path)</code> returns a <code>LeafSpec</code> for an exact valid path. It rejects
+unknown leaves, non-canonical channel identifiers, and channel identifiers
+outside <code>0..31</code>.</p>
+<p><code>LeafSpec</code> reports the <code>LeafType</code>, numeric range, quantum, mutability, and
+transience of a leaf. <code>LeafType</code> distinguishes <code>Number</code>, <code>Bool</code>, <code>Enum</code>, and
+read-only <code>Text</code> values.</p>
+<p><code>LeafValue</code> is an untagged Serde scalar. Its <code>Number(f64)</code>, <code>Bool(bool)</code>, and
+<code>Enum(String)</code> variants serialise as bare JSON numbers, booleans, and strings.
+The string variant also carries text leaves.</p>
+<p>The channel surface is:</p>
+<table><thead><tr><th>Path suffix</th><th>Type</th><th>Mutable</th><th>Transient</th></tr></thead><tbody>
+<tr><td><code>trim</code></td><td>Number</td><td>yes</td><td>no</td></tr>
+<tr><td><code>fader</code></td><td>Number</td><td>yes</td><td>no</td></tr>
+<tr><td><code>pan</code></td><td>Number</td><td>yes</td><td>no</td></tr>
+<tr><td><code>mute</code></td><td>Bool</td><td>yes</td><td>no</td></tr>
+<tr><td><code>solo</code></td><td>Bool</td><td>yes</td><td>no</td></tr>
+<tr><td><code>name</code></td><td>Text</td><td>no</td><td>no</td></tr>
+<tr><td><code>meter.rms_l</code>, <code>meter.rms_r</code></td><td>Number</td><td>no</td><td>yes</td></tr>
+<tr><td><code>meter.peak_l</code>, <code>meter.peak_r</code></td><td>Number</td><td>no</td><td>yes</td></tr>
+<tr><td><code>meter.hold_l</code>, <code>meter.hold_r</code></td><td>Number</td><td>no</td><td>yes</td></tr>
+<tr><td><code>meter.clip</code></td><td>Bool</td><td>reset only</td><td>yes</td></tr>
+</tbody></table>
+<p>Channel paths take the form <code>mixer.channels.{id}.{suffix}</code>. Channel identifiers
+use canonical decimal notation: for example, <code>0</code> is valid and <code>00</code> is not.</p>
+<p>The master exposes <code>fader</code>, <code>mute</code>, the six meter levels, and <code>meter.clip</code>
+under <code>mixer.master</code>. It does not expose trim, pan, solo, or name leaves.</p>
+<p>Other valid leaves are:</p>
+<table><thead><tr><th>Path</th><th>Type</th><th>Mutable</th><th>Transient</th></tr></thead><tbody>
+<tr><td><code>transport.state</code></td><td>Enum</td><td>yes</td><td>no</td></tr>
+<tr><td><code>transport.position</code></td><td>Number</td><td>yes</td><td>yes</td></tr>
+<tr><td><code>transport.length</code></td><td>Number</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.song.title</code></td><td>Text</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.song.artist</code></td><td>Text</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.song.copyright</code></td><td>Text</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.schema_version</code></td><td>Text</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.engine</code></td><td>Enum</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.source_profile</code></td><td>Enum</td><td>no</td><td>no</td></tr>
+<tr><td><code>mixer.benchmark_eligible</code></td><td>Bool</td><td>no</td><td>no</td></tr>
+</tbody></table>
+<p><code>transport.state</code> accepts <code>stopped</code> and <code>playing</code>. <code>mixer.engine</code> accepts <code>dsp</code>
+and <code>simulator</code>. <code>mixer.source_profile</code> accepts
+<code>benchmark-multitone.v1</code>, <code>stem-session.v1</code>, and <code>midi-synth.v1</code>.</p>
+<p><code>leaf_enum_values(path)</code> returns an enum domain. <code>leaf_default(path)</code> returns
+the frozen default. <code>default_state()</code> constructs the complete default state for
+the 163 leaves covered by the final-state hash.</p>
+<h2 id="validation-and-canonicalisation">Validation and canonicalisation</h2>
+<p><code>validate_value(path, value)</code> checks topology, type, finite numeric values,
+range, quantum alignment, and enum membership. It validates read-back values
+without considering whether the leaf is writable.</p>
+<p><code>validate_write(path, value)</code> additionally requires a mutable leaf.
+<code>meter.clip</code> is writable only as <code>false</code>, which resets the latched clip state.</p>
+<p><code>canonicalize_write(path, value)</code> is the accepting path for control writes. It
+rejects unknown, read-only, wrongly typed, non-finite, and invalid enum values,
+and rejects <code>meter.clip = true</code>. It clamps numbers to the leaf range, snaps
+off-grid values to the leaf quantum, preserves aligned values, and normalises
+negative zero. The result passes <code>validate_value</code> and is the value to store and
+acknowledge.</p>
+<p><code>quantum(path)</code> reports a numeric leaf's quantum, or zero for a non-number or
+unknown path. <code>canonical_repr(path, value)</code> formats a validated value for
+hashing: numbers become integer quantum counts, booleans become <code>0</code> or <code>1</code>,
+and enums remain literal strings.</p>
+<h2 id="final-state-hash">Final-state hash</h2>
+<p><code>hash_leaves()</code> returns the fixed ordered set of 163 mutable, non-transient
+leaves: five controls for each of 32 channels, master fader and mute, then
+transport state.</p>
+<p><code>transport.position</code>, meters, metadata, schema identity, engine identity, and
+source-profile identity do not participate.</p>
+<p><code>final_state_hash(values)</code> validates every required value and computes SHA-256
+over each ordered entry as <code>path</code>, a NUL byte, its canonical representation,
+and a newline. It fails when a required leaf is missing or invalid and returns
+the digest as <code>[u8; 32]</code>.</p>
+<h2 id="meter-frame">Meter frame</h2>
+<p><code>MeterFrame</code> encodes the batched meter stream as a fixed 465-byte
+little-endian frame. <code>MeterRecord</code> holds six signed centi-dBFS levels and one
+clip byte. Records <code>0..31</code> belong to input channels; record <code>32</code> belongs to the
+master.</p>
+<table><thead><tr><th>Region</th><th style="text-align: right">Size</th><th>Fields</th></tr></thead><tbody>
+<tr><td>Header</td><td style="text-align: right">36 bytes</td><td>magic/version, sequence, capture frame, applied revision, frame-zero monotonic time, flags</td></tr>
+<tr><td>Record</td><td style="text-align: right">13 bytes</td><td>RMS L/R, peak L/R, hold L/R, clip</td></tr>
+<tr><td>Body</td><td style="text-align: right">429 bytes</td><td>33 records</td></tr>
+<tr><td>Total</td><td style="text-align: right">465 bytes</td><td>Header plus body</td></tr>
+</tbody></table>
+<p><code>MeterFrame::encode()</code> always writes <code>METER_MAGIC_VER</code>.
+<code>MeterFrame::decode()</code> returns <code>DecodeError</code> after verifying the magic/version,
+valid clip bits, and every level's range. <code>TryFrom&lt;&amp;[u8]&gt;</code> also checks the fixed
+frame length.</p>
+<p><code>FLAG_SIMULATOR</code> marks simulator output. <code>FLAG_NON_BENCH_SOURCE</code> marks a frame
+from a non-benchmark source profile. <code>FLAG_RESERVED_MASK</code> identifies all other
+flag bits. <code>MeterFrame::is_simulator()</code> tests the simulator bit.</p>
+<p><code>to_centi_dbfs(db)</code> rounds dB to signed centi-dBFS and clamps it to
+<code>-12000..=2400</code>; <code>NaN</code> maps to the floor. <code>from_centi_dbfs(value)</code> converts the
+integer representation back to dB.</p>
+<h2 id="write-and-snapshot-wire">Write and snapshot wire</h2>
+<p>The write wire uses stable Serde JSON structures.</p>
+<p><code>WriteRequest</code> carries a path, scalar value, operation identifier, and optional
+expected revision. An absent <code>if_revision</code> makes the request unconditional.</p>
+<p><code>WriteResponse</code> is internally tagged by <code>status</code> and has three variants:</p>
+<ul>
+<li><code>Accepted(WriteAck)</code> returns the new revision, canonical value, source
+identity, and operation identifier.</li>
+<li><code>Rejected(WriteReject)</code> returns the current revision and value with a durable
+refusal reason.</li>
+<li><code>Busy(WriteBusy)</code> reports transient backpressure; the write is not applied
+and can be retried.</li>
+</ul>
+<p><code>LeafSnapshot</code> carries one canonical leaf value and its last-written revision.
+<code>MixerSnapshotResponse</code> carries an atomic global revision, run and audio health
+flags, source-profile identity, benchmark eligibility, and the leaf snapshot.
+Its sticky <code>audio_fault</code> and <code>applied_fault</code> fields report loss of real audio
+and loss of trustworthy applied-revision timing. <code>DspApplied</code> reports when the
+real-time audio graph latched a control revision.</p>
+<h2 id="cargo-surface">Cargo surface</h2>
+<p>The crate defines no Cargo feature flags.</p>
+<p>Its runtime dependencies are:</p>
+<table><thead><tr><th>Dependency</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>serde</code></td><td>JSON-compatible scalar and wire type serialisation</td></tr>
+<tr><td><code>sha2</code></td><td>SHA-256 final-state hashing</td></tr>
+</tbody></table>
+<p><code>serde_json</code> is used only by the crate's wire-format tests.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +771,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +825,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +954,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

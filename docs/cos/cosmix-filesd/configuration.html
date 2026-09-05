@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-filesd/configuration</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,94 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-filesd/configuration.md"><div class="prose"><h1 id="configuration">Configuration</h1>
+<p><code>cosmix-filesd</code> reads a flat configuration format with one <code>key: value</code> pair per line. Blank lines and lines beginning with <code>#</code> are ignored. Keys and values are trimmed.</p>
+<p>The conventional suffix is <code>.conf.mix</code>, but the parser handles the flat syntax directly.</p>
+<p>CLI options override corresponding corpus configuration values. <code>--bus-service</code> also overrides the filesystem-mode service name.</p>
+<h2 id="corpus-mode">Corpus mode</h2>
+<p>Corpus mode is the default. It requires <code>root</code>, <code>corpus_id</code>, and <code>db</code>.</p>
+<pre><code class="language-text">root: /var/lib/cosmix/corpora/notes
+corpus_id: notes
+db: /var/lib/cosmix/filesd/notes.db
+interval_secs: 900
+bus_service: filesd-notes
+delegated_peers: webd
+</code></pre>
+<table><thead><tr><th>Key</th><th>Required</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>mode</code></td><td>No</td><td><code>corpus</code></td><td>Service mode; any value other than <code>fs</code> selects corpus mode</td></tr>
+<tr><td><code>root</code></td><td>Yes</td><td>None</td><td>Markdown corpus root</td></tr>
+<tr><td><code>corpus_id</code></td><td>Yes</td><td>None</td><td>Corpus identifier and semantic-index domain</td></tr>
+<tr><td><code>db</code></td><td>Yes</td><td>None</td><td>SQLite index path</td></tr>
+<tr><td><code>interval_secs</code></td><td>No</td><td><code>900</code></td><td>Periodic reconcile interval in seconds</td></tr>
+<tr><td><code>bus_service</code></td><td>No</td><td><code>filesd-&lt;corpus_id&gt;</code></td><td>Bus service registration name</td></tr>
+<tr><td><code>delegated_peers</code></td><td>No</td><td><code>webd</code></td><td>Comma-separated peers allowed to send delegated calls</td></tr>
+</tbody></table>
+<p>An explicitly empty <code>delegated_peers:</code> disables delegated calls. An absent key enables the default peer.</p>
+<p>The database parent directory is created when required. Each daemon instance serves one corpus and owns one store.</p>
+<h2 id="filesystem-mode">Filesystem mode</h2>
+<p>Filesystem mode requires <code>mode: fs</code>, <code>trash_root</code>, and at least one <code>place:</code> line.</p>
+<pre><code class="language-text">mode: fs
+bus_service: filesd-fs
+trash_root: /var/lib/cosmix/filesd/trash
+delegated_peers: webd
+
+place: documents | Documents | /home/example/Documents | group=places | icon=folder | writable=true
+place: public | Public | /var/lib/cosmix/public | writable=false | allow=*.md,manuals/*
+</code></pre>
+<table><thead><tr><th>Key</th><th>Required</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>mode</code></td><td>Yes</td><td>None</td><td>Must be <code>fs</code></td></tr>
+<tr><td><code>bus_service</code></td><td>No</td><td><code>filesd-fs</code></td><td>Bus service registration name</td></tr>
+<tr><td><code>trash_root</code></td><td>Yes</td><td>None</td><td>Root used by trash operations</td></tr>
+<tr><td><code>delegated_peers</code></td><td>No</td><td><code>webd</code></td><td>Comma-separated peers allowed to send delegated calls</td></tr>
+<tr><td><code>place</code></td><td>One or more</td><td>None</td><td>Place definition; repeated lines are allowed</td></tr>
+</tbody></table>
+<p>An explicitly empty <code>delegated_peers:</code> disables delegated calls in this mode as well.</p>
+<h2 id="place-definitions">Place definitions</h2>
+<p>The place form is:</p>
+<pre><code class="language-text">place: ID | LABEL | ROOT | group=GROUP | icon=ICON | writable=BOOL | allow=PATTERNS | deny=PATTERNS
+</code></pre>
+<p>The first three fields are positional:</p>
+<table><thead><tr><th>Field</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>ID</code></td><td>Non-empty and contains no <code>/</code></td></tr>
+<tr><td><code>LABEL</code></td><td>Display label; may be empty</td></tr>
+<tr><td><code>ROOT</code></td><td>Non-empty filesystem root</td></tr>
+</tbody></table>
+<p>Options may follow in any order:</p>
+<table><thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>group</code></td><td><code>places</code></td><td>Display grouping</td></tr>
+<tr><td><code>icon</code></td><td><code>folder</code></td><td>Display icon name</td></tr>
+<tr><td><code>writable</code></td><td><code>false</code></td><td>Enables write verbs when <code>true</code>, <code>1</code>, or <code>yes</code></td></tr>
+<tr><td><code>allow</code></td><td>Empty</td><td>Comma-separated relative path patterns to include</td></tr>
+<tr><td><code>deny</code></td><td>Empty</td><td>Comma-separated relative path patterns to exclude</td></tr>
+</tbody></table>
+<p>Unknown options and duplicate options are errors.</p>
+<h2 id="path-patterns">Path patterns</h2>
+<p><code>allow</code> and <code>deny</code> values contain comma-separated place-relative glob patterns.</p>
+<p>Accepted pattern characters are:</p>
+<pre><code class="language-text">A-Z a-z 0-9 . _ * - /
+</code></pre>
+<p>A pattern must not:</p>
+<ul>
+<li>begin with <code>/</code>;</li>
+<li>contain an empty, <code>.</code> or <code>..</code> path segment;</li>
+<li>contain whitespace or other punctuation.</li>
+</ul>
+<p>If <code>allow=</code> or <code>deny=</code> appears, it must contain at least one pattern. An empty explicit policy is rejected because it could otherwise remove a restriction.</p>
+<p>Omitting both options leaves the place without an allow or deny pattern policy.</p>
+<h2 id="delegation-settings">Delegation settings</h2>
+<p><code>delegated_peers</code> is a comma-separated list. Whitespace is trimmed and empty list items are discarded.</p>
+<p>Each listed peer must send a <code>$cosmix_delegation</code> envelope. A listed peer using the bare path is rejected. A peer not on the list cannot use the delegated path.</p>
+<p>The envelope format and command behaviour are described in <a href="/cos/cosmix-filesd/verbs#authorisation-boundary">verbs.md</a>.</p>
+<h2 id="cli-precedence">CLI precedence</h2>
+<p>For corpus mode, command-line values take precedence over the file:</p>
+<pre><code class="language-text">cosmix-filesd serve \
+  -c /etc/cosmix/filesd/notes.conf.mix \
+  --interval-secs 300 \
+  --bus-service filesd-notes-preview
+</code></pre>
+<p>Values not supplied on the command line remain sourced from the file or their defaults.</p>
+<p>Filesystem mode reads repeated <code>place:</code> lines from the raw file text. It accepts only <code>--bus-service</code> as a mode-specific override; corpus path and index flags do not configure its places.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +706,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +760,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +889,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

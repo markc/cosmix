@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — spec/12-toolkit-apps</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,45 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="spec/12-toolkit-apps.md"><div class="prose"><h1 id="toolkit-applications-and-design-contracts">Toolkit, applications and design contracts</h1>
+<p>Native applications render their own UI using CTK and Bevy. Bus exposes semantic operations and observable application state. The remote <code>ui.*</code> widget renderer, its fenced-widget grammar and conformance tiers are historical and must not be treated as the current application interface.</p>
+<p>Baseline: public revision <code>96d12fdf</code>. This chapter is a contract summary and implementation profile; it does not certify every widget against the complete design-system proposal. The <a href="/spec/12a-design-format">retained resolved-design format</a> preserves the exact source grammar, crosswalk, validation, derivation, ownership and gate requirements behind this summary.</p>
+<h2 id="application-ownership">Application ownership</h2>
+<p><strong>UI-001 — Semantic control.</strong> Application state and operations belong to the application. Prefer an explicit operation, such as opening a document, over synthesising input when that operation is exposed. The compositor owns window protocol state; the application owns its document and unsaved-work semantics. A Bus disconnect must not move rendering or document authority into the broker.</p>
+<p><strong>UI-002 — Behaviour and presentation.</strong> Rust owns widget structure, allowed axes, parts and behaviour. Design data selects values within that schema. Accessibility, keyboard focus, modal capture and drag/drop are behavioural contracts, not consequences of successful theme compilation.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/src/app_control.rs">CTK application control</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/src/bus.rs">Bus integration</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/src/modal_capture.rs">modal capture</a>, and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/src/dcs_app_shell.rs">app shell</a>. Existing modules provide mechanisms; application-level conformance still needs scenarios.</p>
+<h2 id="source-and-compilation">Source and compilation</h2>
+<p><strong>UI-003 — Versioned strict data.</strong> Design source is versioned Mix strict data. Preserve the authored v0 subset for the declared compatibility window. A v1 compiler checks the explicit v0 crosswalk rather than approximating old colours or dimensions. Unknown versions and invalid values must yield diagnostics; they must not silently produce a claimed v1 design.</p>
+<p><strong>UI-004 — Typed graph.</strong> References flow from family mapping to semantic tokens to primitives. Cycles and ambiguous equal-specificity writes are rejected. Text surfaces are surface/foreground pairs. Metrics carry explicit <code>px</code>, <code>step</code> or <code>ratio</code> kinds; ratios cannot occupy length positions. A scale step resolves to a length. Rust-defined enums and part schemas bound the reachable mapping space.</p>
+<p>The radius scale remains derived from the authored base as <code>max(base−4,0)</code>, <code>max(base−2,0)</code>, <code>base</code>, <code>base+4</code>; a second authored radius scale would create competing truth. The legacy <code>corner_radius</code> field is its own compatibility metric, not the nearest radius step. Numeric validity is assessed after the strict-data number has parsed to a double; step indices at or above 2^53 are rejected because integer identity is not recoverable.</p>
+<p><strong>UI-005 — Complete cells.</strong> Every resolver-owned property requires an authored base. More specific mappings override it; explicit null restores it. Equal-specificity overlap is an error. New enum values must be covered explicitly or identified as inheriting base, with the declared warning/fatal coverage policy. Spawn-time placeholder values are not a fallback styling authority.</p>
+<p>The headless <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-design/src/compiler.rs">design compiler</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-design/src/source.rs">source model</a> and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-design/src/mapping_model.rs">mapping model</a> exist. The public resolved table currently includes the button family; this does not establish migration of every CTK or application family.</p>
+<h2 id="colour-overrides-and-derivations">Colour, overrides and derivations</h2>
+<p><strong>UI-006 — Delivered contrast.</strong> V1 colours use explicit OKLCH authoring. Contrast is evaluated after gamut mapping to sRGB and the declared compositing context. Text pairs and non-text focus indicators have distinct postconditions. A successful compile must cover all permitted substitutions, not just the default theme.</p>
+<p><strong>UI-007 — Closed overrides.</strong> Runtime instance overrides are typed and family-specific: instance override, otherwise resolved table. No implicit ancestor/style cascade is introduced. A pair override moves its foreground with its surface. The artifact classifies each candidate substitution as admitted or excluded, retaining the exclusion reason. Runtime evaluation refuses an excluded candidate instead of silently substituting an unrelated value.</p>
+<p><strong>UI-008 — Deterministic derivations.</strong> Data may call registered typed derivations, not supply arbitrary expressions. A retained recipe has zero or one explicit override-substitutable input. Validate preconditions and output postconditions during compilation and any permitted runtime re-evaluation. Runtime recipes consume the compiled artifact, not raw source or a separately reconstructed admission rule.</p>
+<p>For the retained focus-ring algorithm, the seed and output are opaque; search lightness in 1/1000 increments plus each direction's endpoint, holding nominal hue/chroma before gamut mapping. Choose the first passing 3:1 candidate by integer step count, preferring lighter on a tie. Record both step index and actual lightness travel. More than 300 steps warns; it is not a compile failure. These are specific algorithm contracts, not a universal claim that all themes meet accessibility requirements.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-design/src/colour_model.rs">colour model</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-design/src/recipe_compiler.rs">recipes</a>, and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/crates/cosmix-design/src/design_model.rs">resolved artifact</a>. Exact palettes, crosswalk field sets and derivation registry entries require compatibility fixtures when changed; a prose simplification does not authorise deleting them.</p>
+<h2 id="state-invalidation-and-writer-ownership">State, invalidation and writer ownership</h2>
+<p><strong>UI-009 — Normalised state.</strong> Interaction precedence is disabled, pressed, hovered, resting; checked, selected and visible focus are orthogonal. State normalisation must observe removed markers and both the old and new focus holders. It does not paint.</p>
+<p><strong>UI-010 — Complete invalidation.</strong> Re-resolve on relevant state, variant/size, added/changed/removed override, late part insertion, reparenting and design revision changes. Typography uses family/part/variant/size rather than interaction state; interaction must not unexpectedly reflow text by changing font size.</p>
+<p><strong>UI-011 — Single writer.</strong> Each managed family/part/component has a declared presentation owner. Procedural geometry remains on separate widget-owned entities. Enforce this by writer-attribution tests and review; Bevy component access does not make the policy a Rust type-system guarantee. Settled widgets avoid spurious writes and text rerender. Change filtering may still scan entities; do not claim zero work solely because values remain equal.</p>
+<p>Evidence: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/src/button.rs">button implementation</a>, <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/src/design.rs">CTK design adapter</a> and <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/desktop/ctk/tests/design_button_gate.rs">button gate</a>. Ownership for all other families and application painters remains to be attested.</p>
+<h2 id="apply-wake-and-diagnostics">Apply, wake and diagnostics</h2>
+<p><strong>UI-012 — Atomic last-good apply.</strong> Compile a replacement completely before publishing its revision. Failed parse/compile retains the last good design and publishes an error distinct from the live revision. Avoid retrying an unchanged failure every frame; diagnostics must not dump source containing application-private content.</p>
+<p>The CTK adapter stores source identity/generation/fingerprint, attempted/applied keys, compile status and the last-good artifact. It compiles synchronously during <code>Update</code> when the key changes. It currently builds context with <code>Contrast::Normal</code> and <code>app: None</code>; compiler support for axes is not equivalent to end-user high-contrast or per-app overlay integration.</p>
+<p><strong>UI-013 — Reactive apps.</strong> Background changes need an event/wake path so an idle UI refreshes without continuous polling. Theme source updates and Bus notifications are inputs, not permission to put networking in the frame-critical path. Display diagnostics should distinguish source rejection, compile failure, unsupported context and failed delivery.</p>
+<p>Adapters may translate compiled values into backend representations, but must not become another styling authority. Font assets cross backend boundaries as assets/handles. The broader adapter set, public design introspection endpoints and migration of all families remain intended work until each is evidenced.</p>
+<h2 id="verification-and-evolution">Verification and evolution</h2>
+<table><thead><tr><th>Contract group</th><th>Required evidence</th></tr></thead><tbody>
+<tr><td>UI-001–002</td><td>Semantic operation scenarios; keyboard, accessibility, modal and drag/drop tests per application</td></tr>
+<tr><td>UI-003–005</td><td>Version/crosswalk compatibility fixtures; invalid references, units, coverage and ambiguous-rule rejection</td></tr>
+<tr><td>UI-006–008</td><td>Gamut/compositing tests; complete admitted override product; derivation pre/postcondition failures and ring threshold boundaries</td></tr>
+<tr><td>UI-009–011</td><td>Each invalidation trigger, old/new focus, override removal, late/reparented parts and writer attribution</td></tr>
+<tr><td>UI-012–013</td><td>Bad-replacement retains revision, valid replacement wakes idle app, unchanged input avoids recompile, settled widgets avoid writes</td></tr>
+</tbody></table>
+<p>Tests were not run for this audit. The old design-system chapter's full acceptance catalogue remains a traceability input; any requirement not yet mapped to an implementation/test is an open conformance item, not implicitly waived. Animation tokens, ambient surface axes, open app-owned schema extension and full alternative backend coverage remain deferred. Pre-GA changes must name the format/API affected and update the relevant fixtures in the same change.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +657,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +711,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +840,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-claud/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,95 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-claud/README.md"><div class="prose"><h1 id="cosmix-claud">cosmix-claud</h1>
+<p><code>cosmix-claud</code> is a local Bus port daemon that exposes LLM completion, code assistance, and embedded Mix evaluation through the <code>claud</code> port. It is part of the <code>cos</code> daemon family in the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it consumes Bus framing from <code>bus</code>, embeds the Mix evaluator from <code>mix</code>, and combines those lower layers with Cos configuration, logging, LLM, and knowledge services.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-text">cosmix-claud
+</code></pre>
+<p>The binary takes no command-line options. It starts the service, accepts Bus requests until interrupted, and removes its socket during an orderly shutdown.</p>
+<h2 id="service-endpoint">Service endpoint</h2>
+<p>The daemon listens on:</p>
+<pre><code class="language-text">/run/user/{uid}/cosmix/ports/claud.sock
+</code></pre>
+<p>The current user ID supplies <code>{uid}</code>. The daemon creates the parent directory when required, removes any existing socket at the path, and binds a Unix listener.</p>
+<p>Each accepted connection runs in its own Tokio task. A connection carries one Bus request and one Bus response.</p>
+<h2 id="request-and-response-format">Request and response format</h2>
+<p>Requests are Bus messages with a required <code>command</code> header. A non-empty message body must contain JSON. An empty body is treated as JSON <code>null</code>.</p>
+<p>Responses contain:</p>
+<ul>
+<li>an <code>rc</code> Bus header;</li>
+<li>a JSON response body.</li>
+</ul>
+<p><code>rc=0</code> reports success. <code>rc=10</code> reports command, validation, evaluation, initialisation, or backend errors. An unknown command also returns <code>rc=10</code>.</p>
+<p>See <a href="/cos/cosmix-claud/verbs">Bus verbs</a> for the complete request and response surface.</p>
+<h2 id="commands">Commands</h2>
+<table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ask</code></td><td>Complete a prompt with optional caller context and knowledge injection.</td></tr>
+<tr><td><code>ask_raw</code></td><td>Complete a prompt without knowledge search or skill extraction.</td></tr>
+<tr><td><code>analyze</code></td><td>Build and complete a concise code-error analysis prompt.</td></tr>
+<tr><td><code>generate</code></td><td>Build and complete a code-generation prompt.</td></tr>
+<tr><td><code>mix.execute</code></td><td>Execute a Mix script and return captured output.</td></tr>
+<tr><td><code>mix.expr</code></td><td>Evaluate a Mix expression and return its JSON representation.</td></tr>
+<tr><td><code>help</code></td><td>Return the command names.</td></tr>
+<tr><td><code>info</code></td><td>Return port, package, version, domain, and command metadata.</td></tr>
+</tbody></table>
+<h2 id="mix-client-examples">Mix client examples</h2>
+<p>Send a knowledge-augmented prompt:</p>
+<pre><code class="language-mix">send "claud" "ask" prompt="Explain recursion"
+</code></pre>
+<p>Supply caller context:</p>
+<pre><code class="language-mix">address "claud"
+    ask prompt="Explain recursion" context="Teaching a beginner"
+end
+</code></pre>
+<p>Execute a Mix script:</p>
+<pre><code class="language-mix">send "claud" "mix.execute" script="say json_encode(\[1,2,3\])"
+</code></pre>
+<h2 id="knowledge-flow">Knowledge flow</h2>
+<p><code>ask</code>, <code>analyze</code>, and <code>generate</code> use the knowledge-augmented path.</p>
+<ol>
+<li>The daemon detects a workspace domain from its current working directory.</li>
+<li>It searches the knowledge index for up to three domain-matched skills, three documents, and two journal entries.</li>
+<li>It formats successful hits and appends them to the system prompt after any caller-supplied context.</li>
+<li>It sends the system prompt and user prompt to the configured LLM backend.</li>
+<li>It schedules optional skill evaluation and extraction in a detached background task without awaiting them.</li>
+</ol>
+<p>Knowledge search failure does not fail the completion. The daemon logs the failure and continues without injected results.</p>
+<p>The background learning path skips interactions whose prompt or response is shorter than 100 bytes. For longer interactions it evaluates the task, extracts a reusable skill when warranted, assigns the detected domain, and attempts to store the result in the knowledge index.</p>
+<p><code>ask_raw</code> bypasses both knowledge search and post-response skill extraction. Caller-supplied <code>context</code> still contributes to its system prompt.</p>
+<h2 id="configuration">Configuration</h2>
+<p>At startup the daemon loads the <code>skills</code> service settings through <code>cosmix-lib-config</code>.</p>
+<p>The only setting read directly by this crate is <code>llm_backend</code>:</p>
+<ul>
+<li>a non-empty value selects that backend;</li>
+<li>an empty value leaves backend selection to <code>cosmix-lib-llm</code>.</li>
+</ul>
+<p>Knowledge augmentation is enabled in the daemon state at startup. The source exposes no command-line switch or crate-local setting to disable it globally; use <code>ask_raw</code> for an individual request without augmentation.</p>
+<h2 id="embedded-mix">Embedded Mix</h2>
+<p>The crate embeds <code>cosmix-lib-mix</code> rather than launching a separate Mix process. Its dependency enables the Mix <code>json</code>, <code>regex</code>, <code>toml</code>, <code>datetime</code>, <code>url</code>, and <code>crypto</code> features.</p>
+<p>Script and expression evaluation run on blocking worker tasks because the evaluator is not <code>Send</code>. Each request creates a fresh evaluator with captured standard output and standard error.</p>
+<p><code>mix.execute</code> may inject JSON values as Mix globals. Strings, numbers, and booleans retain their basic value kind; other JSON values are injected as their serialised string form.</p>
+<p><code>mix.expr</code> converts the final Mix value to JSON. Values without a JSON representation return <code>rc=10</code>.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<p>This package declares no Cargo features of its own.</p>
+<h2 id="runtime-characteristics">Runtime characteristics</h2>
+<p>The binary uses:</p>
+<ul>
+<li>Tokio for the Unix listener, signals, connection tasks, and blocking evaluation tasks;</li>
+<li><code>cosmix-lib-bus</code> for Bus stream framing and messages;</li>
+<li><code>cosmix-lib-llm</code> for completions;</li>
+<li><code>cosmix-lib-skills</code> for domain detection, index access, task evaluation, and skill extraction;</li>
+<li><code>cosmix-lib-config</code> for service settings and the current user ID;</li>
+<li><code>cosmix-lib-log</code> and <code>tracing</code> for daemon logging;</li>
+<li>mimalloc as the global allocator.</li>
+</ul>
+<p>The daemon handles <code>Ctrl-C</code> as its shutdown signal. A connection-level read, JSON decoding, or write failure is logged as a connection error.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/cos/cosmix-claud/verbs">Bus verbs</a></li>
+<li><a href="/cos/overview">Cos overview</a></li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +707,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +761,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +890,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

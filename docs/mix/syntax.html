@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/syntax</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,538 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/syntax.md"><div class="prose"><h1 id="syntax--lexical-structure--the-shellmix-classifier">syntax — lexical structure &amp; the shell/Mix classifier</h1>
+<p>How Mix reads source: what a token is, how statements end, and the one rule that
+trips up everyone coming from bash or Python — <strong>when a line is run as Mix code
+versus dispatched to the shell</strong>. Verified against <strong>mix 0.57.0</strong>.</p>
+<blockquote>
+<p>Mental model: Mix is a Bus-native shell where every variable carries a <code>$</code>
+sigil, concatenation is <code>..</code>, and statements are separated by a <strong>newline or
+<code>;</code></strong>. At a <code>mix -c</code> one-liner or the interactive REPL, a <em>shell-first
+classifier</em> decides per input whether to evaluate it as Mix or hand it to the
+shell. That single decision explains why <code>$x = 1</code> works but <code>x = 1</code> runs a
+command called <code>x</code>.</p>
+</blockquote>
+<h2 id="the-five-things-to-get-right-first">The five things to get right first</h2>
+<ol>
+<li><strong>Every variable has a <code>$</code> sigil</strong> — <code>$x = 1</code>, never <code>x = 1</code>. A bare <code>x = 1</code> is read as a shell command (run the program <code>x</code> with args <code>=</code> and <code>1</code>).</li>
+<li><strong>Concatenation is <code>..</code></strong> — <code>"a" .. $x</code>, never <code>.</code> (that's field access). <code>+</code> happens to also join strings today, but <code>..</code> is the canonical form.</li>
+<li><strong>Statements end at a newline or <code>;</code>.</strong> Newlines are the readable script style; <code>;</code> is the compact <code>mix -c</code> / generated-source form.</li>
+<li><strong><code>--</code> and <code>#</code> start a line comment.</strong> No block comments (<code>/* */</code>).</li>
+<li><strong>Blocks close with <code>end</code>.</strong> No <code>do</code> keyword.</li>
+</ol>
+<pre><code class="language-mix">$x = 1
+print($x)
+</code></pre>
+<pre><code class="language-text">1
+</code></pre>
+<pre><code class="language-mix">x = 1
+</code></pre>
+<pre><code class="language-text">mix: x: No such file or directory (os error 2)
+</code></pre>
+<p>The second snippet isn't a Mix error at all — the classifier saw a bareword head
+(<code>x</code>) and dispatched the line to the shell, which tried to exec a program named
+<code>x</code>. See <a href="/mix/syntax#the-shellmix-classifier">the classifier</a> below.</p>
+<h2 id="comments">Comments</h2>
+<p>Two line-comment forms, identical behaviour: <code>--</code> (ARexx/Lua/Haskell flavour) and
+<code>#</code> (shell flavour). Both run to the end of the line. There are <strong>no block
+comments</strong> — <code>/* ... */</code> is not recognised.</p>
+<p>Comments own the rest of their <strong>physical line</strong>. A semicolon inside a comment
+does not resume execution: <code>print(1); -- note; print(2)</code> prints only <code>1</code>.</p>
+<pre><code class="language-mix">-- a full-line comment
+$y = 2  -- a trailing comment
+# also a comment, shell-style
+print($y)
+</code></pre>
+<pre><code class="language-text">2
+</code></pre>
+<p>Non-ASCII inside a comment is fine for the lexer, but keep comments ASCII as a
+house convention.</p>
+<blockquote>
+<p><strong><code>mix -c</code> gotcha — a leading comment line swallows the whole input.</strong> The
+classifier trims the input and, if it <em>starts</em> with <code>#</code> or <code>--</code>, treats the
+entire <code>-c</code> argument as an empty (comment-only) line — it does <strong>not</strong> strip
+the first line and run the rest. So this prints nothing:</p>
+</blockquote>
+<pre><code class="language-text">$ mix -c '# header
+print(42)'
+(no output)
+</code></pre>
+<blockquote>
+<p>Put the comment <em>after</em> the first real statement, or run from a file / stdin
+(<code>mix script.mix</code>, <code>mix -</code>), where the input is parsed as source rather than
+classified as one <code>-c</code> command. A leading comment in a script is normal.</p>
+</blockquote>
+<h2 id="statement-separators--newline-and-">Statement separators — newline and <code>;</code></h2>
+<p>This section is the authoritative <code>;</code> contract for <strong>executable Mix</strong>. A
+semicolon is a real lexer token and the parser accepts it as a statement
+separator only where a complete statement may end. It is not text substitution
+for a newline and it is not an expression operator.</p>
+<p>Use a physical newline for normal script layout and <code>;</code> when several complete
+statements genuinely need to share a line — most often in <code>mix -c</code>, the REPL,
+generated source, or remote Mix source:</p>
+<pre><code class="language-mix">$a = 1; $b = 2; print($a + $b)
+</code></pre>
+<pre><code class="language-text">3
+</code></pre>
+<h3 id="where--is-legal">Where <code>;</code> is legal</h3>
+<table><thead><tr><th>Context</th><th style="text-align: right">Legal?</th><th>Example / rule</th></tr></thead><tbody>
+<tr><td>between top-level statements</td><td style="text-align: right">yes</td><td><code>$a = 1; print($a)</code></td></tr>
+<tr><td>after a block header or clause</td><td style="text-align: right">yes</td><td><code>if true then; print(1); else; print(0); end</code></td></tr>
+<tr><td>between statements in a function, loop, <code>try</code>, handler, or <code>address</code> body</td><td style="text-align: right">yes</td><td><code>function f(); print(1); return 2; end</code></td></tr>
+<tr><td>leading, trailing, or repeated at a statement boundary</td><td style="text-align: right">yes, no-op</td><td><code>; print(1);;</code></td></tr>
+<tr><td>inside strings, heredoc bodies, or comments</td><td style="text-align: right">literal text</td><td><code>print("a;b")</code>; a comment still owns its physical line</td></tr>
+<tr><td>inside an ordinary expression container</td><td style="text-align: right">no</td><td>calls, parentheses, lists, and maps use one expression or <code>,</code>, not <code>;</code></td></tr>
+<tr><td>in strict-data (<code>data_parse</code>, <code>load_data</code>, config files)</td><td style="text-align: right">no</td><td>use newline or <code>,</code>; see <a href="/mix/data">data</a></td></tr>
+</tbody></table>
+<p>Semicolons remain visible inside <code>()</code> / <code>[]</code> / <code>{}</code>, so a nested construct with
+a real statement body — an expression-position <code>if</code> or function literal — may
+use them:</p>
+<pre><code class="language-mix">print(if true then; $x = 1; $x + 1; else; 0; end)  -- valid: prints 2
+print((function($n); return $n + 1; end)(4))       -- valid: prints 5
+
+print(1; 2)             -- parse error: call arguments need `,`
+print((1; 2))           -- parse error: parentheses hold one expression
+print([1; 2])           -- parse error: list items need `,`
+print({a: 1; b: 2})     -- parse error: map entries need `,`
+</code></pre>
+<p>The diagnostic for the rejected forms says that <code>;</code> separates Mix statements
+only. In a script/stdin source, or with a Mix-keyword head such as <code>print</code> under
+<code>-c</code>/the REPL, parsing finishes before evaluation, so nothing before the error
+runs. A malformed <strong><code>$</code>-led</strong> <code>-c</code>/REPL input can instead trigger the historical
+whole-input shell fallback; use the keyword-led forms above when checking a
+diagnostic. The classifier section later on this page explains that fallback.</p>
+<h3 id="precedence-and-hard-boundary-rule">Precedence and hard-boundary rule</h3>
+<p>As a statement separator, <code>;</code> binds looser than Mix statement chains and ends
+the complete construct to its left:</p>
+<pre><code class="language-mix">print("a") &amp;&amp; print("b"); print("c")
+-- parsed as: (print("a") &amp;&amp; print("b")); print("c")
+
+print("x") | tr x y; print("z") -- `;` also ends the raw external pipeline tail
+</code></pre>
+<p>There is no general “pipeline before <code>&amp;&amp;</code>/<code>||</code>” rule in executable Mix. After a
+Mix <code>|</code>, everything through newline, <code>;</code>, or end-of-input is the raw external
+command tail; an <code>&amp;&amp;</code>/<code>||</code> there belongs to that external shell. In the other
+direction, a Mix statement-chain operand may itself start a pipeline:</p>
+<pre><code class="language-mix">print("a") &amp;&amp; print("b") | cat; print("c")
+-- Mix chain first; the right operand's external tail is `cat`; `;` then starts `c`
+</code></pre>
+<p>Unlike a physical newline, a semicolon is a <strong>hard</strong> chain boundary. Mix permits
+an existing <code>&amp;&amp;</code> / <code>||</code> chain to continue across a newline on either side of the
+operator, but never across <code>;</code>:</p>
+<pre><code class="language-mix">print("a")
+&amp;&amp; print("b")            -- valid newline continuation
+
+print("a"); &amp;&amp; print("b") -- parse error
+print("a") &amp;&amp;; print("b") -- parse error
+</code></pre>
+<p>The lexer also suppresses newlines — but deliberately retains semicolon tokens —
+inside ordinary grouping, as described below.</p>
+<h3 id="mix-versus-shell-meaning">Mix versus shell meaning</h3>
+<p>The separator does <strong>not</strong> mix the two languages. A line is classified once and
+the whole line must be valid Mix or valid shell. Use <code>sh</code>, <code>run_argv</code>, or
+<code>run_rc</code> for an external operation inside a Mix sequence; <code>print(1); echo hi</code>
+is a Mix parse error, not “run one Mix statement then one shell command”. On an
+external-command line, <code>;</code> keeps its shell command-list meaning:</p>
+<pre><code class="language-text">$ mix -c 'echo one; echo two'
+one
+two
+</code></pre>
+<p>The distinction matters for empty pieces: leading/trailing/repeated semicolons
+are harmless only after the input has been classified as Mix. Shell-dispatch
+accepts a single trailing <code>;</code>, but rejects a repeated/interior empty piece such
+as <code>echo a;; echo b</code>. A leading <code>; echo x</code> is tried as Mix first and surfaces a
+Mix parse error rather than a shell empty-piece error. See <a href="/mix/shell-mode">shell mode</a>
+for command-list classification, unknown-command preservation, and the
+whole-file-first <code>source</code> caveat.</p>
+<h3 id="newlines-are-suppressed-inside---">Newlines are suppressed inside <code>(</code> <code>[</code> <code>{</code></h3>
+<p>While the lexer is inside an open paren, bracket, or brace, newlines are
+swallowed — so list/map literals and call arguments wrap freely across lines
+without a continuation marker:</p>
+<pre><code class="language-mix">$nums = [
+  1,
+  2,
+  3
+]
+print(length($nums))
+</code></pre>
+<pre><code class="language-text">3
+</code></pre>
+<h3 id="explicit-line-continuation--at-end-of-line">Explicit line continuation: <code>\</code> at end of line</h3>
+<p>Outside a string or heredoc body, end a physical line with a backslash to
+continue onto the next physical line. This works for Mix expressions and for
+shell-dispatch commands in script files, <code>mix -c</code>, and the REPL:</p>
+<pre><code class="language-mix">$total = 1 + \
+2 + \
+3
+print($total)
+</code></pre>
+<pre><code class="language-text">6
+</code></pre>
+<pre><code class="language-text">$ mix -c 'echo one \
+two'
+one two
+</code></pre>
+<p>The splice happens <strong>before shell/Mix classification</strong>, so the classifier sees
+one complete logical line. This matters for operator-shaped command arguments:
+<code>ls -d \</code> followed by <code>/tmp</code> stays an <code>ls</code> command instead of becoming the Mix
+arithmetic expression <code>ls - d / tmp</code>.</p>
+<p>Trailing backslashes are counted. Odd means continuation: the final backslash
+and physical newline are removed, while preceding even pairs remain for the
+normal parser. Thus <code>\</code> continues, <code>\\</code> is a literal backslash, and <code>\\\</code> is
+one literal backslash plus continuation.</p>
+<p>A continuation marker at EOF is typed incomplete input. The REPL retains its
+accumulator; a file or <code>-c</code> invocation exits non-zero. Backslashes inside Mix
+single/double-quoted strings and heredoc bodies are not continuation markers,
+so Windows-style strings such as <code>"C:\\path"</code> and command text passed through
+<code>run</code> or <code>sh</code> keep their existing shell-owned escaping.</p>
+<h3 id="concat-continuation-trailing-">Concat continuation: trailing <code>..</code></h3>
+<p>The concat operator also continues its expression when <code>..</code> ends a physical
+line. Blank lines and comment-only lines may appear before the right operand:</p>
+<pre><code class="language-mix">$message = "a long prefix: " .. -- explain the next fragment
+
+  "middle" ..
+  " and suffix"
+print($message)
+</code></pre>
+<p>This is deliberately <strong>trailing-only</strong>. A <code>..</code> at the start of a line does not
+reattach to the previous statement, and <code>../path</code> keeps its existing relative
+path meaning in shell commands and in <code>source</code> / <code>include</code>. A semicolon remains
+a hard statement boundary. Use trailing <code>\</code> for general continuation after any
+other operator; no other binary operator gains this newline rule.</p>
+<h2 id="blocks-close-with-end--no-do">Blocks close with <code>end</code> — no <code>do</code></h2>
+<p>Every compound form (<code>if</code>, <code>for</code>, <code>while</code>, <code>function</code>/<code>fn</code>, <code>on</code>, <code>try</code>) is closed
+by <code>end</code>. There is <strong>no <code>do</code> keyword</strong>; writing one breaks an inline body. (A few
+legacy terminators — <code>next</code> for loops, <code>done</code> for <code>while</code>/<code>loop</code>/<code>on</code> — still
+parse with a deprecation warning; <code>if</code> and <code>function</code>/<code>fn</code> accept <strong>only</strong> <code>end</code>.
+Prefer <code>end</code> everywhere.) Full grammar of each block lives in
+<a href="/mix/control-flow">control flow</a> and <a href="/mix/functions">functions</a>.</p>
+<pre><code class="language-mix">$n = 3
+if $n &gt; 0 then
+  print("positive")
+end
+</code></pre>
+<pre><code class="language-text">positive
+</code></pre>
+<h2 id="tokens-the-lexer-produces">Tokens the lexer produces</h2>
+<h3 id="numbers--f64-with-radix-literals">Numbers — f64, with radix literals</h3>
+<p>Mix has a single numeric type (f64). Decimal, plus <code>0x</code> hex / <code>0o</code> octal / <code>0b</code>
+binary integer literals (sugar for the f64 value — handy for file modes and
+bitmasks). Underscores are allowed as digit separators. Scientific notation is
+accepted: <code>[eE][+-]?digits</code> — <code>1e6</code>, <code>1.5e3</code>, <code>2e-3</code>, <code>1E3</code>. The <code>e</code>/<code>E</code> is only
+consumed when a digit follows, so the Euler builtin in <code>2 * e()</code> is never eaten.</p>
+<pre><code class="language-mix">print(0o755)
+print(0xFF)
+print(0b101)
+print(1e6)
+print(2e-3)
+</code></pre>
+<pre><code class="language-text">493
+255
+5
+1000000
+0.002
+</code></pre>
+<p>A <strong>bare leading-zero integer is a lex error</strong> — <code>0755</code> is rejected so a file
+mode can't silently become decimal <code>755</code>. The error is surfaced, not masked:</p>
+<pre><code class="language-mix">0755
+</code></pre>
+<pre><code class="language-text">Lexer error at line 1:1: ambiguous leading-zero number '0755' — use a 0o (octal) / 0x (hex) / 0b (binary) prefix, or drop the leading zero(s) for decimal
+</code></pre>
+<p>Plain <code>0</code>, and genuine fractions like <code>0.5</code>, are unaffected, and <code>0e5</code> is a
+valid <code>0</code> — but <code>07e2</code> still errors (the leading-zero check runs before the
+exponent). This is a <em>Mix number-literal</em> hazard only: inside a shell-out the
+arg is a string, so <code>run("install -m 0755 a b")</code> is fine. Full numeric
+semantics live in <a href="/mix/numbers">numbers</a>.</p>
+<h3 id="strings--raw-vs-interpolated">Strings — <code>'raw'</code> vs <code>"interpolated"</code></h3>
+<p>Two forms, bash-style. Full coverage in <a href="/mix/strings">strings</a>; the lexical facts:</p>
+<ul>
+<li><code>'single'</code> is <strong>fully raw</strong> — no interpolation, no <code>~</code> expansion (only <code>\'</code> and <code>\\</code> escapes).</li>
+<li><code>"double"</code> interpolates <strong><code>${name}</code></strong> (scope → env), expands a <strong>leading <code>~</code></strong> to <code>$HOME</code>, and honours <code>\n \t \r \e \\ \" \$ \~</code> and <code>\u{XXXX}</code> escapes.</li>
+<li>In double quotes a <strong>bare <code>$name</code> is literal text</strong> (the opposite of bash), and <strong><code>$(...)</code> is literal</strong> — the build-time-substitution footgun was removed.</li>
+</ul>
+<pre><code class="language-mix">$name = "Ada"
+print("hi $name")
+print("hi ${name}")
+print('hi ${name}')
+print("~/code")               -- a LEADING ~ expands to $HOME
+print("home is ~/code")       -- a mid-string ~ stays literal
+</code></pre>
+<pre><code class="language-text">hi $name
+hi Ada
+hi ${name}
+/home/user/code
+home is ~/code
+</code></pre>
+<h3 id="variables--the--sigil">Variables — the <code>$</code> sigil</h3>
+<p>A variable token is <code>$</code> followed by <code>[A-Za-z0-9_]+</code>. Reading an <strong>unbound</strong> sigil
+raises a runtime error (positional <code>$1</code>/<code>$2</code> script args are exempt):</p>
+<pre><code class="language-mix">print($undefined)
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: undefined variable '$undefined'
+</code></pre>
+<h3 id="operators--delimiters">Operators &amp; delimiters</h3>
+<pre><code class="language-text">arithmetic   +  -  *  /  %  **            (** is power: 2 ** 10 -&gt; 1024)
+concat       ..                            ("a" .. $x)
+compare      ==  !=  &lt;  &lt;=  &gt;  &gt;=  eq  ne  (eq/ne are keyword string-equality ops)
+logical      and  or  not                  (keywords, not &amp;&amp; / ! in expressions)
+nil-coalesce ??                            ($x ?? "default")
+ternary      ?  :                          ($n &gt; 0 ? "pos" : "neg")
+field/index  .  []                         ($m.key  /  $m["key"])
+grouping     (  )   [  ]   {  }
+statement    ;                              (hard statement boundary; see above)
+misc         :  ,  =  ~                     (: in maps, = assignment, ~ path tilde)
+</code></pre>
+<p><code>??</code> returns its right side when the left is <code>nil</code>:</p>
+<pre><code class="language-mix">$x = nil
+print($x ?? "default")
+</code></pre>
+<pre><code class="language-text">default
+</code></pre>
+<p><code>**</code> is power; <code>..</code> is concat (not a range). A lone <code>?</code> is the ternary
+<code>cond ? a : b</code> token (see <a href="/mix/operators">operators</a> for precedence and the
+if-expression form). A lone <code>&amp;</code> is a lex error <em>with a hint</em>:</p>
+<pre><code class="language-mix">print(1 &amp; 2)
+</code></pre>
+<pre><code class="language-text">Lexer error at line 1:9: unexpected '&amp;', did you mean '&amp;&amp;'?
+</code></pre>
+<h3 id="heredocs--tag">Heredocs — <code>&lt;&lt;TAG</code></h3>
+<p><code>&lt;&lt;TAG</code> opens a heredoc; the body runs to a line containing only <code>TAG</code>. Unlike a
+double-quoted string, a heredoc body <strong>does</strong> interpolate <code>${var}</code> <em>and</em> run
+<code>$(command)</code> substitution. See <a href="/mix/strings">strings</a> for the full treatment.</p>
+<h3 id="keywords--reserved-as-identifiers-usable-as-names">Keywords — reserved as identifiers, usable as names</h3>
+<p>Identifiers matching a keyword become that keyword token. (<code>mix keywords</code> prints
+a curated subset; the complete lexer set — which also includes <code>then</code>/<code>each</code>/
+<code>to</code>/<code>step</code>/<code>next</code>/<code>done</code>/<code>with</code>/<code>on</code>/<code>include</code>/<code>label</code>/<code>eq</code>/<code>ne</code> — is below.)
+The full set: <code>if then else end for each in to step next while done loop break continue function fn return select when otherwise and or not true false nil parse with send address emit on try catch die export alias print eprint source include label sh eq ne</code>. See <a href="/mix/keywords">keywords</a> for what each one does.</p>
+<p>Keywords <strong>cannot</strong> be function names or bare user identifiers:</p>
+<pre><code class="language-mix">function step($x) return $x end
+</code></pre>
+<pre><code class="language-text">Parse error at line 1:10: expected identifier, got Step
+</code></pre>
+<p>But since 0.21 a keyword <strong>is accepted anywhere it is unambiguously a NAME</strong> —
+the old "quote every reserved-word key" footgun is retired:</p>
+<ul>
+<li><strong>Bare map keys</strong>: <code>{ label: 1, to: "x", on: true, parse: 2 }</code> parses.</li>
+<li><strong>Field access &amp; assignment</strong>: <code>$m.to</code>, <code>$r.label</code>, <code>$cfg.to = 1</code>. An assignment target may chain accessors freely since 0.33.0 — <code>$cfg.server.host = "x"</code>, <code>$m[$u]["k"] = 1</code>, <code>$l[0][1] = 9</code> (see <code>mix man collections</code>).</li>
+<li><strong>Strict-data <code>.conf.mix</code> keys</strong>: a key named <code>to</code>/<code>in</code>/<code>on</code>/<code>label</code> needs no quoting.</li>
+<li><strong><code>send</code>/<code>emit</code>/<code>address</code> kwargs</strong>: <code>send maild mailbox.move to=$dest</code> parses (keyword + <code>=</code> is a named arg).</li>
+<li><strong><code>parse … with</code> delimiter words</strong>: <code>parse $s with $a to $b</code> uses the literal word <code>to</code> as the delimiter — EXCEPT the block/branch terminator set (<code>end</code> <code>else</code> <code>catch</code> <code>when</code> <code>otherwise</code> <code>done</code> <code>next</code>), which still ends an inline <code>parse</code> statement first.</li>
+<li><strong>Sigil variables were never restricted</strong>: <code>$to</code>, <code>$label</code>, even <code>$fn</code> are ordinary variables — the lexer reads the name after <code>$</code> as a variable token, never a keyword.</li>
+</ul>
+<pre><code class="language-mix">$m = { label: 1, to: "x" }
+print($m.to)
+$m.label = 9
+print($m.label)
+</code></pre>
+<pre><code class="language-text">x
+9
+</code></pre>
+<p><strong>The one exception is <code>fn</code></strong> — it lexes to the <em>same token</em> as <code>function</code>, so
+the original spelling is unrecoverable and a bare <code>fn</code> key/field still errors.
+Quote the key and use index access:</p>
+<pre><code class="language-mix">$m = { fn: 1 }
+</code></pre>
+<pre><code class="language-text">Parse error at line 1:8: expected identifier, got Function
+</code></pre>
+<pre><code class="language-mix">$m = { "fn": 1 }
+print($m["fn"])
+</code></pre>
+<pre><code class="language-text">1
+</code></pre>
+<h3 id="parser-nesting-cap--depth-200">Parser nesting cap — depth 200</h3>
+<p>The parser caps recursive nesting (parens, deep <code>if</code> chains, nested maps/lists)
+at <strong>depth 200</strong>, matching the evaluator's recursion cap — a pathological
+<code>((((…</code> input gets a clean parse error, never a stack-overflow abort:</p>
+<pre><code class="language-text">$ mix -c 'print((((( … 205 deep … )))))'
+Parse error at line 1:202: nesting too deep (limit 200)
+</code></pre>
+<h2 id="the-shellmix-classifier">The shell/Mix classifier</h2>
+<p>At a <code>mix -c '&lt;line&gt;'</code> one-liner, the interactive REPL, and a mix login shell, Mix
+follows the universal shell <code>-c</code> contract: it is <strong>shell-first</strong>. Each input is
+classified once into one of: <strong>Mix code</strong>, <strong>external command</strong>, <strong>empty</strong>,
+<strong>incomplete</strong>, or <strong>parse-error</strong>. The decision rests almost entirely on the
+<strong>first word</strong> (after alias expansion and after skipping any leading <code>KEY=VALUE</code>
+env prefixes).</p>
+<p>The order of checks (from <code>shell.rs</code>):</p>
+<ol>
+<li><strong>Empty / comment</strong> — blank, or trimmed input starting with <code>#</code> or <code>--</code> → <em>empty</em>, runs nothing.</li>
+<li><strong><code>$</code>-led line</strong> → <strong>Mix</strong> (with a shell-chain fallback). A line beginning with <code>$</code> is your variable work.</li>
+<li><strong>First word is a Mix keyword</strong> (<code>if for while loop function fn return select print eprint die try parse export alias break continue send address emit source sh label</code>) → <strong>Mix</strong>. Note <code>true</code>/<code>false</code>/<code>nil</code> are deliberately <strong>not</strong> in this list: as a line <em>head</em> they are shell commands, so a bare <code>false</code> at the prompt runs <code>/usr/bin/false</code> and exits <strong>1</strong> like every shell. The lexer still owns the literals inside Mix source (<code>$x = true</code>, <code>if $a == nil</code>); <code>nil</code> has no external binary, so it falls through to the Mix parse anyway.</li>
+<li><strong>First word is a REPL shell builtin</strong> (<code>cd pushd popd history exit which type unalias jobs fg bg mix</code>) → <strong>external command</strong>. (A plain foreground <code>cd</code> also works inside <code>&amp;&amp;</code>/<code>||</code>/<code>;</code> chains — <code>cd /tmp &amp;&amp; pwd</code> is intercepted in-process; see <a href="/mix/shell-mode">shell-mode</a>.)</li>
+<li><strong>First word is a tight-hyphenated command shape</strong> (<code>cosmix-comp</code>, <code>systemd-nspawn</code>, <code>weston-simple-dmabuf-egl</code>) → <strong>external command</strong>, whether or not it is on <code>$PATH</code>. This applies only to the statement head: it must start with an ASCII letter or <code>_</code>, contain a <code>-</code> with no surrounding whitespace, end with an ASCII letter/digit/<code>_</code>, and otherwise contain only ASCII letters/digits/<code>_</code>/<code>-</code>.</li>
+<li><strong>First word is found on <code>$PATH</code> or is a path</strong> (<code>/</code>, <code>./</code>, <code>~/…</code>) → <strong>external command</strong> (the shell-first principle). If the head is a real program but the command line is malformed (e.g. a bad redirect), the shell tokenizer's error is surfaced.</li>
+<li><strong>Otherwise</strong> → try to parse as <strong>Mix</strong>. If that parse succeeds it's Mix code; if it fails, a tie-break decides whether to surface the real Mix lex/parse error or report "command not found".</li>
+</ol>
+<p>So the <code>$</code> sigil isn't decoration — it is what routes assignment to the Mix
+evaluator instead of the shell:</p>
+<pre><code class="language-mix">$greeting = "hi there"
+print($greeting)
+</code></pre>
+<pre><code class="language-text">hi there
+</code></pre>
+<p>A parenthesized call is unambiguously Mix:</p>
+<pre><code class="language-mix">print(1 + 1)
+</code></pre>
+<pre><code class="language-text">2
+</code></pre>
+<p>A bareword head that lives on <code>$PATH</code> is a shell command:</p>
+<pre><code class="language-text">$ mix -c 'echo hello from shell'
+hello from shell
+</code></pre>
+<p>A tight hyphen keeps a command name whole before the Mix parser can read it as
+subtraction. PATH membership is not required, so a typo still names the complete
+command and exits 127:</p>
+<pre><code class="language-text">$ mix -c 'cosmix-comp --nested'       # runs one command named cosmix-comp
+$ mix -c 'alpha-no-such-command'
+mix: alpha-no-such-command: No such file or directory (os error 2)
+</code></pre>
+<p>The rule is deliberately statement-head-only. Whitespace or an expression
+marker makes subtraction explicit, so all of these stay Mix:</p>
+<pre><code class="language-mix">a - b
+$a - $b
+1 - 2
+$x-1
+$a-$b
+print(alpha-beta)       -- hyphen is inside a call, not the line head
+</code></pre>
+<p>Scope never changes this decision. Bare <code>alpha</code> is the string <code>"alpha"</code>, not a
+reference to <code>$alpha</code>, so <code>alpha-beta</code> is a command even when <code>$alpha</code> is live.
+Working variable subtraction is sigil-led (<code>$alpha-$beta</code>) and stays Mix.
+Earlier exact head rules still win, so <code>mix not-a-command</code> remains the <code>mix</code>
+meta-command with one hyphenated argument, not a command named
+<code>not-a-command</code>.</p>
+<p>A <code>KEY=VALUE</code> prefix is skipped to find the real head — this is an <em>external
+command</em> with an env var set for it:</p>
+<pre><code class="language-text">$ mix -c 'FOO=bar printenv FOO'
+bar
+</code></pre>
+<h3 id="the-tie-break-real-mix-error-vs-command-not-found">The tie-break: real Mix error vs "command not found"</h3>
+<p>After the tight-hyphen check, when the head is <strong>not</strong> on <code>$PATH</code> and the Mix
+parse <strong>fails</strong>, Mix inspects the head's shape (only the first word — a later
+character can't flip the verdict):</p>
+<ul>
+<li>A <strong>bareword / path-like</strong> head (<code>gti status</code>, <code>./build</code>, <code>foo:bar</code>) is a command target → reports the familiar command-not-found:</li>
+</ul>
+<pre><code class="language-text">$ mix -c 'gti status'
+mix: gti: No such file or directory (os error 2)
+</code></pre>
+<ul>
+<li>A <strong>Mix-expression</strong> head (a number, an operator, a <code>$</code>, or a call/index opener like <code>print(</code>) was meant as Mix → surfaces the real lex/parse error instead of masking it as a missing binary:</li>
+</ul>
+<pre><code class="language-text">$ mix -c 'print(0755)'
+Lexer error at line 1:7: ambiguous leading-zero number '0755' — use a 0o (octal) / 0x (hex) / 0b (binary) prefix, or drop the leading zero(s) for decimal
+</code></pre>
+<p>This is why <code>print(0755)</code> tells you about the bad number rather than "No such
+file <code>print(0755)</code>".</p>
+<h3 id="shell-chaining-vs-mix-chaining">Shell chaining vs Mix chaining</h3>
+<p><code>&amp;&amp;</code> / <code>||</code> / <code>;</code> on an <strong>external-command</strong> line are shell operators (command
+lists) — <code>true</code>/<code>false</code> heads are external commands, so <code>true &amp;&amp; echo yes</code> and
+<code>false || echo fallback</code> are plain shell chains. On a <strong>Mix-keyword or <code>$</code>-led</strong>
+line, Mix's own grammar owns <code>&amp;&amp;</code> / <code>||</code> and <code>;</code>, so a valid Mix
+chain stays Mix. A keyword/<code>$</code> head that <em>fails</em> Mix parse <strong>and</strong> is a genuine
+multi-command shell list normally falls back to the shell (e.g.
+<code>send oops ; echo hi</code> runs as a two-command shell list); definitive language
+errors such as an assignment-led chain do not. Mix-keyword heads never
+reach the command-not-found tie-break — they route through the Mix-then-shell
+path, so a keyword-led line that fails both surfaces its Mix error
+(<code>print(1); echo hi</code> reports a Mix parse error, not "command not found").</p>
+<p>In a <strong>Mix-classified</strong> chain, an assignment cannot be any operand of <code>&amp;&amp;</code> or
+<code>||</code>, whether first, middle or last. Since these are statement-chain operators,
+accepting <code>$ok = $a.ok &amp;&amp; $b.ok</code> would assign only <code>$a.ok</code>, while
+<code>print("gate") &amp;&amp; $ok = false || print("fallback")</code> can conceal the falsy
+assignment behind a successful statement chain. Mix rejects every such shape as
+<code>MIX-E1002</code>, and the line's own operands never run. Use <code>and</code> / <code>or</code> inside the
+assigned expression for logical values, or split the assignment and command
+chain into two statements if shell-style conditional execution was intended.
+This applies to variable, field, index and nested-path assignments, to the
+value-binding <code>export x = v</code>, <code>alias n = c</code> and terse <code>function f() = expr</code>
+forms, and to all of them inside nested statement bodies. The forms that bind
+no <code>=</code> expression stay legal operands: <code>alias</code> in its query and list forms, and
+the block-bodied <code>function f() … end</code>.</p>
+<p>Once a line is rejected it stays rejected: the error never falls back to shell
+execution under <code>mix -c</code>, <code>source</code>, or <code>~/.mixrc</code> loading.</p>
+<p>The qualifier "Mix-classified" is load-bearing. Two conditions must <strong>both</strong>
+hold before a line carrying an assignment keeps shell semantics:</p>
+<ol>
+<li>the classifier routes the line to the shell — either straight off the head
+(a path, a name on <code>PATH</code>, a shell builtin), or through one of the
+fallbacks that reconsider a line whose Mix parse failed and which is
+structurally a shell command list (a shell redirect; an env prefix in
+front of a keyword head like <code>export</code>); and</li>
+<li>the Mix parse never reaches the assignment, so the typed
+assignment-chain error is never constructed.</li>
+</ol>
+<p>Where both hold, the line behaves as <code>bash</code> does with it: <code>$x = false</code> is
+three shell words whose <code>$x</code> expands, the failed <code>=</code> command is reported on
+stderr, and <code>||</code> fires. That covers a path-shaped head (<code>/usr/bin/true &amp;&amp; $x = false || cmd</code> fails the Mix parse at <code>unexpected token Slash</code>), a shell
+redirect (<code>zqxfoo &gt; /dev/null; $x = false || cmd</code>), and an env prefix
+(<code>FOO=bar export x = false || cmd</code>). Adding a redirect or an env prefix to an
+otherwise-rejected line therefore turns it from a Mix error into a shell
+command list — a consequence of where the parse gives out, not a guarantee
+that assignments are honoured there.</p>
+<p>Neither condition is sufficient alone. <strong>Failing to parse as Mix does not by
+itself send a line to the shell</strong>: <code>print(1); echo hi</code> and <code>$x = (((</code> are both
+parse errors that stay Mix errors, because a call head and a <code>$</code> head are
+never routed to the shell. And a head being a shell command is not enough
+either — <code>true &amp;&amp; $x = false || cmd</code> has a head that is both a <code>PATH</code> binary
+and a valid Mix literal, so the parse reaches the assignment and condition 2
+fails. Once the parser has typed this error no head rule may reclassify the
+line; the same holds for a tight-hyphenated head (<code>zqx-foo &amp;&amp; …</code>) and for
+<code>cd</code>. Those head rules still decide every line that does <em>not</em> carry a
+rejected assignment, so <code>cosmix-comp --nested</code> and <code>true &amp;&amp; cmd</code> remain shell
+as before. In a mixed sourced file, earlier shell lines execute normally
+before a later line's rejection aborts the <code>source</code>.</p>
+<p>One asymmetry predates this rule and is unchanged by it: the tight-hyphen head
+discriminator exists only in the <code>mix -c</code>/REPL classifier. A <code>source</code>d file
+reads <code>cosmix-comp --nested</code> as the subtraction <code>"cosmix" - "comp"</code> (the
+option becomes a comment) and fails with <code>cannot use 'cosmix' as number</code> —
+whether the file parses whole or falls back to per-line handling. Give such a
+head its full path (<code>/usr/bin/cosmix-comp --nested</code>). Quoting it does <strong>not</strong>
+work: <code>"cosmix-comp" --nested</code> is a discarded string followed by a comment, so
+the command silently never runs.</p>
+<pre><code class="language-mix">$ok = $a.ok and $b.ok       -- logical value: valid
+$value = primary() ?? fallback() -- nil fallback: valid
+$ok = $a.ok &amp;&amp; $b.ok        -- parse error: assignment cannot be chained
+print("gate") &amp;&amp; $ok = false -- same parse error; nothing prints
+</code></pre>
+<pre><code class="language-text">$ mix -c 'true &amp;&amp; echo yes'
+yes
+$ mix -c 'false || echo fallback'
+fallback
+</code></pre>
+<p>The full set of shell-dispatch syntax — pipes, redirects, <code>$(...)</code> command
+substitution, brace expansion — is documented in <a href="/mix/shell-mode">shell-mode</a>.
+Those apply only on a line the classifier routed to the shell; inside Mix <em>source</em>
+they are inert (<code>$(...)</code> is literal text, <code>{a,b}</code> is a map/string) — except
+inside a heredoc body, which does interpolate <code>$(...)</code>.</p>
+<h3 id="running-scripts-vs-one-liners">Running scripts vs one-liners</h3>
+<ul>
+<li><code>mix script.mix</code> / <code>mix -</code> (stdin) — normally a whole-file Mix <strong>script</strong> (<code>echo hi</code> remains a Mix parse error). An explicitly continued command line is the narrow exception: its physical lines are assembled, then the complete logical line enters the strict classifier fallback.</li>
+<li><code>mix -c '&lt;line&gt;'</code> — a one-liner: the <strong>whole argument</strong> is classified as one unit (hence the leading-comment gotcha above). Use <code>;</code> or real newlines for multiple Mix statements.</li>
+<li><code>mix -i -c '&lt;line&gt;'</code> — interactive flavour: loads <code>~/.mixrc</code> (aliases + PATH) before classifying, so an aliased head resolves.</li>
+</ul>
+<p>See <a href="/mix/invocation">invocation</a> for the full launch matrix.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — <code>'raw'</code> vs <code>"interp"</code>, <code>${...}</code>, <code>~</code>, <code>\u{}</code>, heredocs</li>
+<li><a href="/mix/shell-mode">shell-mode</a> — shell-dispatch syntax: pipes, redirects, <code>$(...)</code>, brace expansion, <code>&amp;&amp;</code>/<code>||</code>/<code>;</code></li>
+<li><a href="/mix/keywords">keywords</a> — what each reserved word does</li>
+<li><a href="/mix/numbers">numbers</a> — f64 semantics, radix and scientific literals</li>
+<li><a href="/mix/variables">variables</a> — sigils, scope, the unbound-read rule</li>
+<li><a href="/mix/control-flow">control flow</a> · <a href="/mix/functions">functions</a> — the <code>end</code>-closed block forms</li>
+<li><a href="/mix/operators">operators</a> — precedence, ternary <code>? :</code>, comparison/ordering, <code>??</code>, <code>..</code></li>
+<li><a href="/mix/invocation">invocation</a> — <code>mix file</code> / <code>-c</code> / <code>-</code> / <code>-i</code></li>
+<li><a href="/mix/bus">Bus messaging</a> — the <code>send</code> / <code>emit</code> / <code>address</code> / <code>on</code> keywords</li>
+<li><a href="/mix/builtins">builtins index</a></li>
+</ul>
+<pre><code class="language-text">mix keywords          list the reserved words
+mix help              the full categorized builtin reference
+mix what NAME         one-line description of a builtin or keyword
+</code></pre>
+<p>The source of truth is the lexer and parser in the public
+<a href="https://github.com/markc/cosmix/tree/main/src/crates/cosmix-lib-mix/src">mix repo</a>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +1150,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1204,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1333,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-mcp/</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,88 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-mcp/README.md"><div class="prose"><h1 id="cosmix-mcp">cosmix-mcp</h1>
+<p><code>cosmix-mcp</code> is a stdio Model Context Protocol server that bridges an MCP client to the CosMix appmesh, local CosMix logs, the knowledge and skill store, and the Mix evaluator. It belongs to the <code>cos</code> layer of the <code>bus &lt;- mix &lt;- cos</code> dependency chain: it uses Bus client, logging, and build-information crates from <code>bus</code>, uses the Mix runtime from <code>mix</code>, and combines them with <code>cos</code> configuration and skill libraries.</p>
+<h2 id="synopsis">Synopsis</h2>
+<pre><code class="language-sh">cosmix-mcp
+cosmix-mcp --version
+cosmix-mcp -V
+</code></pre>
+<p>Example MCP registration:</p>
+<pre><code class="language-sh">claude mcp add cosmix-mcp -- ~/.local/bin/cosmix-mcp
+</code></pre>
+<h2 id="description">Description</h2>
+<p>The normal invocation starts an MCP server over standard input and standard output. The client owns the process lifetime; end-of-file or client disconnection ends the service.</p>
+<p>Broker access is anonymous and lazy. Startup does not contact <code>cosmix-noded</code>. The first broker-dependent tool initialises and retains the Bus client connection.</p>
+<p>Knowledge and skill tools connect to <code>cosmix-indexd</code> when called. The server can therefore start before either backend is available. A failed connection is returned as an <code>ERROR:</code> string in the tool result.</p>
+<p><code>cosmix-mcp</code> does not register as a Bus service and does not host Bus verbs. It calls existing services through the broker and exposes those operations as MCP tools.</p>
+<h2 id="command-line-interface">Command-line interface</h2>
+<table><thead><tr><th>Option</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>--version</code></td><td>Print embedded build provenance and exit before starting MCP transport.</td></tr>
+<tr><td><code>-V</code></td><td>Alias for <code>--version</code>.</td></tr>
+</tbody></table>
+<p>The version line is the binary's version-discovery surface. Build time and source revision are captured by <code>build.rs</code>.</p>
+<p>There are no subcommands and no crate-specific Cargo features.</p>
+<h2 id="mcp-tool-groups">MCP tool groups</h2>
+<p>The server publishes 23 tools.</p>
+<table><thead><tr><th>Group</th><th>Tools</th></tr></thead><tbody>
+<tr><td>Bus</td><td><code>bus_call</code>, <code>bus_list_services</code>, <code>bus_node_info</code>, <code>bus_list_peers</code>, <code>noded_ping</code></td></tr>
+<tr><td>Logs</td><td><code>log_tail</code>, <code>log_search</code></td></tr>
+<tr><td>Knowledge</td><td><code>context_search</code>, <code>index_workspace</code>, <code>knowledge_digest</code>, <code>knowledge_brief</code></td></tr>
+<tr><td>Feedback</td><td><code>docs_feedback</code>, <code>journal_feedback</code>, <code>memory_feedback</code>, <code>journal_supersede</code></td></tr>
+<tr><td>Skills</td><td><code>skills_retrieve</code>, <code>skills_store</code>, <code>skills_refine</code>, <code>skills_graduate</code>, <code>skills_list</code>, <code>skills_delete</code></td></tr>
+<tr><td>Script execution</td><td><code>mix_execute</code></td></tr>
+<tr><td>Status</td><td><code>mcp_status</code></td></tr>
+</tbody></table>
+<p>See <a href="/cos/cosmix-mcp/tools">MCP tools</a> for parameters, defaults, and return behaviour.</p>
+<h2 id="bus-access">Bus access</h2>
+<p><code>bus_call</code> accepts a target service, a Bus command, and an optional JSON argument string. The other Bus tools provide broker connectivity, peer discovery, node information, and service inventory.</p>
+<p>The inventory path includes service build provenance where supplied by the broker. <code>bus_node_info</code> calls <code>noded.info</code>; peer and connectivity tools call <code>noded.peers</code> and <code>noded.ping</code>.</p>
+<p>The Mix evaluator also receives a Bus handler. Mix <code>send</code>, <code>emit</code>, and <code>port_exists</code> operations route through the same broker connection. Incoming long-lived <code>on</code> delivery is not supported.</p>
+<h2 id="knowledge-and-skills">Knowledge and skills</h2>
+<p><code>context_search</code> searches indexed skills and project material. It can infer a project domain from the server working directory, restrict results to a named domain, or search all domains.</p>
+<p><code>index_workspace</code> discovers recognised project content trees, splits Markdown at level-two headings, and replaces indexed entries for each processed file. Re-indexing the same files is intended to be idempotent.</p>
+<p>The skill tools implement a retrieve, store, refine, graduate, list, and delete lifecycle. Refinement uses the configured language-model backend. Graduation writes a trusted skill into project instructions through the shared skill library.</p>
+<p>Feedback tools update retrieval scoring for document, journal, and memory chunks. <code>journal_supersede</code> retains the older chunk for audit while hiding it from subsequent search results.</p>
+<h2 id="mix-execution">Mix execution</h2>
+<p><code>mix_execute</code> parses and evaluates inline Mix source on a dedicated thread. The crate enables Mix support for JSON, regular expressions, TOML, date and time values, URLs, and cryptography.</p>
+<p>The tool captures standard output and standard error and returns both as text. Parse, evaluation, working-directory, and task failures are returned with an <code>ERROR:</code> prefix.</p>
+<p>An optional working directory may be supplied. A leading <code>~/</code> is expanded from <code>HOME</code>.</p>
+<h2 id="configuration">Configuration</h2>
+<p>The crate defines no standalone configuration file or command-line configuration flags.</p>
+<table><thead><tr><th>Surface</th><th>Use</th></tr></thead><tbody>
+<tr><td>Shared client configuration</td><td>Resolves the anonymous default broker connection.</td></tr>
+<tr><td>Shared index configuration</td><td>Resolves the <code>cosmix-indexd</code> client.</td></tr>
+<tr><td><code>knowledge</code> settings</td><td>Supply search trust weights and journal ageing policy.</td></tr>
+<tr><td><code>skills</code> settings</td><td>Supply retrieval limits, refinement backend, and skill lifecycle policy.</td></tr>
+<tr><td><code>HOME</code></td><td>Locates persistent logs and expands <code>~/</code> for Mix execution.</td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Overrides the default logging filter.</td></tr>
+</tbody></table>
+<h2 id="logs">Logs</h2>
+<p>Logging starts before the MCP transport. The default filter is <code>info,cosmix_mcp=debug</code>.</p>
+<p>Records are written to standard error, the system journal, and the persistent <code>cosmix-mcp.log</code> under the CosMix user log directory. Rotation is disabled by this binary.</p>
+<p>The <code>log_tail</code> and <code>log_search</code> tools read files from the same user log directory. The special name <code>bus</code> selects <code>bus.log</code>.</p>
+<p>Every MCP tool call records the tool name, a redacted argument summary, elapsed milliseconds, success or failure, and a shape-only result summary. The in-memory status store retains the newest 50 call records.</p>
+<p>String argument values are not present in normal log summaries. Container values are reduced to shape and size, control characters in keys are scrubbed, and result bodies are reduced to content type and size.</p>
+<p>Setting <code>RUST_LOG=cosmix_mcp=trace</code> enables full request arguments. This can expose sensitive caller data and is an explicit diagnostic mode.</p>
+<h2 id="status">Status</h2>
+<p><code>mcp_status</code> returns:</p>
+<ul>
+<li>process start time and uptime;</li>
+<li>whether the lazy broker connection has been initialised;</li>
+<li>total and failed tool-call counts;</li>
+<li>counts by tool name;</li>
+<li>the newest retained call records, including timestamp, duration, and outcome.</li>
+</ul>
+<p>The status data is process-local and resets when the MCP server restarts.</p>
+<h2 id="return-conventions">Return conventions</h2>
+<p>Tools return text. Structured broker and index responses are serialised as JSON text where applicable.</p>
+<p>Most runtime failures are returned in-band with an <code>ERROR:</code> prefix. MCP parameter-deserialisation and routing failures remain protocol-level tool errors.</p>
+<p><code>bus_call</code> treats an absent or invalid JSON argument string as JSON <code>null</code>.</p>
+<h2 id="build-dependencies">Build dependencies</h2>
+<p>The binary is built with <code>rmcp</code> server, stdio transport, and macro support. It also depends on Tokio, Serde, JSON Schema generation, Chrono, glob matching, and the CosMix Bus, Mix, configuration, logging, build-information, and skill libraries.</p>
+<p>Because the Bus and Mix crates are path dependencies, their sibling source trees must be available when building this crate from the <code>cos</code> workspace.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +700,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +754,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +883,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

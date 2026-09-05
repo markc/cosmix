@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — mix/regex</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,360 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="mix/regex.md"><div class="prose"><h1 id="regular-expressions">Regular expressions</h1>
+<p>Mix ships five regex builtins — <code>re_match</code>, <code>re_find</code>, <code>re_replace</code>,
+<code>re_split</code>, <code>grep_lines</code> — built on the Rust
+<a href="https://docs.rs/regex"><code>regex</code></a> crate, all taking their <strong>subject first</strong>
+like every literal-string builtin. The <code>mix</code> binary compiles with the
+<code>regex</code> feature <strong>on</strong>, so they're always available; a library build
+without that feature won't have the four <code>re_*</code> (and <code>grep_lines</code> falls
+back to a literal substring test per line). The plain string ops <code>replace</code>
+/ <code>split</code> / <code>contains</code> are <strong>always present</strong> (not feature-gated) and treat
+their needle <strong>literally</strong> — <code>split("a1b22c", "[0-9]+")</code> does not split —
+so reach for them first when the needle is a fixed substring.</p>
+<blockquote>
+<p><strong>History.</strong> From 0.2.0 to 0.72.0 the family was pattern-first
+(<code>regex_match(pattern, s)</code>, plus <code>grep</code>), which silently inverted at
+swapped call sites — both arguments are strings, so a swapped call is a
+plausible "no", never an error; it overwrote two journals with regex
+text on one occasion. The subject-first <code>re_*</code> names landed in 0.63.0,
+every caller in the fleet was migrated, and the five legacy names were
+<strong>deleted in release B (0.73.0)</strong> once the fleet-wide inventory read
+zero. A surviving legacy call now fails loudly: <code>MIX-E1102</code> at lint
+time, <code>undefined function</code> at runtime.</p>
+</blockquote>
+<p>The flavor is <strong>RE2-style</strong>: linear-time matching, full Unicode support, but
+<strong>no backreferences and no look-around</strong> (a deliberate trade for guaranteed
+linear time — see <a href="/mix/regex#limitations">Limitations</a>). Patterns and replacements are
+ordinary <a href="/mix/strings">strings</a>, so the quoting rules there apply directly and
+bite hard — read <a href="/mix/regex#quoting-traps">Quoting traps</a> before you write a <code>$</code>-bearing
+pattern.</p>
+<blockquote>
+<p>One-line mental model: <strong>a regex is just a string argument</strong>; matches come
+back as structured maps (<code>{match, start, end, groups}</code>), not as magic <code>$~</code>
+globals.</p>
+</blockquote>
+<pre><code class="language-mix">print(re_match("abc123", "[0-9]+"))
+print(re_find("a1 b22 c333", "[0-9]+"))
+print(re_replace("hello world", "[aeiou]", "_"))
+print(re_split("a, b ,c,  d", "\\s*,\\s*"))
+</code></pre>
+<pre><code class="language-text">true
+[{match: 1, start: 1, end: 2}, {match: 22, start: 4, end: 6}, {match: 333, start: 8, end: 11}]
+h_ll_ w_rld
+[a, b, c, d]
+</code></pre>
+<h2 id="the-family">The family</h2>
+<table><thead><tr><th>Call</th><th>Returns</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>re_match(s, pattern)</code></td><td><strong>bool</strong></td><td>true if <code>pattern</code> matches <em>anywhere</em> in <code>s</code> (not anchored)</td></tr>
+<tr><td><code>re_find(s, pattern)</code></td><td><strong>list of maps</strong></td><td>every non-overlapping match, <code>{match, start, end[, groups]}</code> — <strong>codepoint</strong> offsets, so <code>start</code>/<code>end</code> compose with <code>substr</code>/<code>slice</code>/<code>index_of</code>; <code>[]</code> when none</td></tr>
+<tr><td><code>re_replace(s, pattern, repl)</code></td><td><strong>string</strong></td><td>replaces <strong>all</strong> matches; <code>$1</code>/<code>${name}</code> backrefs in <code>repl</code></td></tr>
+<tr><td><code>re_split(s, pattern)</code></td><td><strong>list of strings</strong></td><td>splits on each match; keeps empty leading/trailing parts</td></tr>
+<tr><td><code>grep_lines(text, pattern)</code></td><td><strong>list of strings</strong></td><td>the lines of <code>text</code> matching <code>pattern</code>; <code>[]</code> when none</td></tr>
+</tbody></table>
+<p>All five <strong>compile the pattern fresh on every call</strong> and <strong>raise a catchable
+runtime error</strong> on an invalid pattern (see <a href="/mix/regex#errors-and-validation">Errors</a>).
+There is no precompile/cache step — for a hot loop, hoist the work, not the
+pattern (the crate has no Mix-visible compiled handle yet).</p>
+<p>Arity is checked as a <strong>minimum</strong>: a missing argument raises, but surplus
+arguments are <strong>silently ignored</strong> (<code>re_match("abc", "b", "extra")</code> →
+<code>true</code>). Non-string arguments are coerced with the standard string coercion —
+<code>re_match("x420", 42)</code> matches the pattern <code>42</code> → <code>true</code>.</p>
+<h3 id="re_match--does-it-match">re_match — does it match?</h3>
+<p><code>re_match</code> is a predicate. The pattern is <strong>unanchored</strong> — it matches if it
+occurs anywhere — so add <code>^</code> / <code>$</code> yourself to anchor.</p>
+<pre><code class="language-mix">print(re_match("abc123", "[0-9]+"))   -- substring match -&gt; true
+print(re_match("abc123", "^[0-9]+$")) -- fully anchored  -&gt; false
+print(re_match("abcd", "^abc$"))      -- anchored        -&gt; false
+print(re_match("HELLO", "(?i)hello")) -- inline flag     -&gt; true
+</code></pre>
+<pre><code class="language-text">true
+false
+false
+true
+</code></pre>
+<p>Use it straight in an <code>if</code> (<a href="/mix/control-flow">control flow</a>):</p>
+<pre><code class="language-mix">$email = "joe@example.com"
+if re_match($email, "^[^@]+@[^@]+\\.[^@]+$") then
+  print("looks like an address")
+else
+  print("rejected")
+end
+</code></pre>
+<pre><code class="language-text">looks like an address
+</code></pre>
+<h3 id="re_find--every-match-with-offsets-and-captures">re_find — every match, with offsets and captures</h3>
+<p><code>re_find</code> returns a <strong>list of maps</strong>, one per non-overlapping match, left to
+right. Each map always has <code>match</code>, <code>start</code>, <code>end</code>; if the pattern has capture
+groups it also gets a <code>groups</code> list (group 1.. — group 0 is <code>match</code>).</p>
+<pre><code class="language-mix">print(re_find("a1 b22 c333", "[0-9]+"))
+</code></pre>
+<pre><code class="language-text">[{match: 1, start: 1, end: 2}, {match: 22, start: 4, end: 6}, {match: 333, start: 8, end: 11}]
+</code></pre>
+<p>With capture groups, <code>groups</code> carries each <code>(...)</code> in order:</p>
+<pre><code class="language-mix">print(re_find("joe@acme jane@corp", "(\\w+)@(\\w+)"))
+</code></pre>
+<pre><code class="language-text">[{match: joe@acme, start: 0, end: 8, groups: [joe, acme]}, {match: jane@corp, start: 9, end: 18, groups: [jane, corp]}]
+</code></pre>
+<p>An optional group that didn't participate comes back as <code>nil</code> in <code>groups</code>
+(verified — the second match has no <code>px</code>):</p>
+<pre><code class="language-mix">$r = re_find("10px 20", "(\\d+)(px)?")
+print($r)
+</code></pre>
+<pre><code class="language-text">[{match: 10px, start: 0, end: 4, groups: [10, px]}, {match: 20, start: 5, end: 7, groups: [20, nil]}]
+</code></pre>
+<p>Field access is the usual map syntax — <code>["match"]</code> or <code>.start</code>
+(<a href="/mix/collections">collections</a>):</p>
+<pre><code class="language-mix">$m = re_find("id=42", "[0-9]+")
+print($m[0]["match"])
+print($m[0].start)
+</code></pre>
+<pre><code class="language-text">42
+3
+</code></pre>
+<blockquote>
+<p><strong><code>start</code>/<code>end</code> are CODEPOINT indices</strong> — the same unit <code>substr</code>, <code>slice</code>
+and <code>index_of</code> count in, so <code>substr($s, $m[0].start, 1)</code> is always the
+first matched character, non-ASCII included. (The deleted legacy
+<code>regex_find</code> answered in raw UTF-8 <em>byte</em> offsets, which silently broke
+that composition on any input with an <code>é</code> in it.)</p>
+</blockquote>
+<pre><code class="language-mix">print(re_find("café über", "über"))
+-- "café " is 5 CODEPOINTS (é is one), so "über" starts at 5
+</code></pre>
+<pre><code class="language-text">[{match: über, start: 5, end: 9}]
+</code></pre>
+<p>No match → an <strong>empty list</strong>, never <code>nil</code>. Test with <code>is_empty</code> or <code>length</code>:</p>
+<pre><code class="language-mix">$r = re_find("abc", "z+")
+print($r)
+if is_empty($r) then
+  print("no match")
+end
+</code></pre>
+<pre><code class="language-text">[]
+no match
+</code></pre>
+<h3 id="re_replace--substitute-all-matches">re_replace — substitute all matches</h3>
+<p><code>re_replace(s, pattern, replacement)</code> replaces <strong>every</strong> match (it's
+<code>replace_all</code> under the hood) and returns the new string. The replacement
+supports the crate's backreference syntax: <strong><code>$1</code> … <code>$N</code></strong> for numbered groups
+and <strong><code>${name}</code></strong> for named groups.</p>
+<pre><code class="language-mix">print(re_replace("hello world", "[aeiou]", "_"))
+print(re_replace("joe@acme", "(\\w+)@(\\w+)", "$2.$1"))
+print(re_replace("The theory", "(?i)the", "X"))
+</code></pre>
+<pre><code class="language-text">h_ll_ w_rld
+acme.joe
+X Xory
+</code></pre>
+<p>Note the last one: <code>(?i)the</code> matched both the standalone <code>The</code> <strong>and</strong> the
+<code>the</code> inside <code>theory</code> — <code>re_replace</code> is unanchored and global, so use <code>\b</code>
+word boundaries when you mean whole words.</p>
+<p><strong>Named groups</strong> use <code>(?P&lt;name&gt;...)</code> — or the shorter <code>(?&lt;name&gt;...)</code> — in the
+pattern and <code>${name}</code> in the replacement. But <code>${name}</code> is exactly what a Mix
+double-quoted string interpolates, so <strong>single-quote the replacement</strong> (or it's
+eaten before the regex sees it — see <a href="/mix/regex#quoting-traps">Quoting traps</a>):</p>
+<pre><code class="language-mix">print(re_replace('joe@acme', '(?P&lt;user&gt;\w+)@(?P&lt;host&gt;\w+)', '${host}/${user}'))
+</code></pre>
+<pre><code class="language-text">acme/joe
+</code></pre>
+<p>To insert a <strong>literal <code>$</code></strong>, double it: <code>$$</code>.</p>
+<p>Two more replacement-parser rules (both verified):</p>
+<ul>
+<li><strong>Group names parse greedily.</strong> <code>$1x</code> reads as one reference to the (nonexistent) group <em>named</em> <code>1x</code> — <code>re_replace('10', '(\d+)', '$1x')</code> returns <code>""</code>, not <code>10x</code>. Brace the number whenever a word character follows: <code>'${1}x'</code> → <code>10x</code>. (<code>'$2.$1'</code> works only because <code>.</code> isn't a word char.)</li>
+<li><strong>An unknown group substitutes the empty string</strong>, never an error — a typoed backref silently deletes the match.</li>
+</ul>
+<h3 id="re_split--split-on-a-pattern">re_split — split on a pattern</h3>
+<p><code>re_split(s, pattern)</code> splits <code>s</code> at each match and returns the pieces
+as a list. Empty leading/trailing/adjacent pieces are <strong>kept</strong> (unlike a naive
+trim), and a pattern that never matches yields the whole string as one element.</p>
+<pre><code class="language-mix">print(re_split("a, b ,c,  d", "\\s*,\\s*"))  -- comma + flexible spaces
+print(re_split("ax12by34cz", "[0-9]+"))      -- split on digit runs
+print(re_split(",a,,b,", ","))               -- empties preserved
+print(re_split("no-commas", ","))            -- no match -&gt; whole string
+print(re_split("abc", ""))                   -- empty match at every boundary
+</code></pre>
+<pre><code class="language-text">[a, b, c, d]
+[ax, by, cz]
+[, a, , b, ]
+[no-commas]
+[, a, b, c, ]
+</code></pre>
+<h3 id="grep_lines--regex-line-filter-always-present">grep_lines — regex line filter (always present)</h3>
+<p><code>grep_lines(text, pattern)</code> returns the <strong>lines</strong> of <code>text</code> that match
+<code>pattern</code>, as a list of strings (<code>[]</code> when none). Unlike the <code>re_*</code> four it
+is <strong>not</strong> feature-gated — but when the <code>regex</code> feature is on (always, in
+the <code>mix</code> binary) the pattern is a full regex with the same syntax and the
+same invalid-pattern error; a library build without the feature falls back
+to a literal substring test per line.</p>
+<pre><code class="language-mix">$t = "alpha\nbeta\ngamma\nbravo"
+print(grep_lines($t, "^b"))
+</code></pre>
+<pre><code class="language-text">[beta, bravo]
+</code></pre>
+<h2 id="syntax-flavor">Syntax flavor</h2>
+<p>The patterns are Rust-<code>regex</code> syntax — see the
+<a href="https://docs.rs/regex/latest/regex/#syntax">full grammar</a>. The common pieces:</p>
+<table><thead><tr><th>Construct</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>.</code> <code>*</code> <code>+</code> <code>?</code> <code>{n}</code> <code>{n,m}</code></td><td>any-char, repetition (greedy; add <code>?</code> for lazy: <code>+?</code>)</td></tr>
+<tr><td><code>[...]</code> <code>[^...]</code></td><td>character class / negated class</td></tr>
+<tr><td><code>\d \w \s</code> (+ <code>\D \W \S</code>)</td><td>digit / word / whitespace classes (<strong>Unicode-aware</strong>)</td></tr>
+<tr><td><code>\b \B</code></td><td>word / non-word boundary</td></tr>
+<tr><td><code>^</code> <code>$</code></td><td>start / end (of text; of line with the <code>m</code> flag)</td></tr>
+<tr><td><code>(...)</code></td><td>capturing group</td></tr>
+<tr><td><code>(?:...)</code></td><td>non-capturing group</td></tr>
+<tr><td><code>(?P&lt;name&gt;...)</code> / <code>(?&lt;name&gt;...)</code></td><td>named capturing group (both spellings work)</td></tr>
+<tr><td><code>(?i)</code> <code>(?m)</code> <code>(?s)</code> <code>(?x)</code></td><td>inline flags: ignore-case, multiline, dot-all, verbose</td></tr>
+<tr><td><code>a|b</code></td><td>alternation</td></tr>
+</tbody></table>
+<p>Inline flag groups also scope: <code>(?i:abc)</code> is case-insensitive only inside.</p>
+<p><code>\d</code>/<code>\w</code> are <strong>Unicode by default</strong>, so accented letters count as word chars
+(offsets in codepoints — <code>é</code> is one):</p>
+<pre><code class="language-mix">print(re_find("café über", "\\w+"))
+</code></pre>
+<pre><code class="language-text">[{match: café, start: 0, end: 4}, {match: über, start: 5, end: 9}]
+</code></pre>
+<p>Matching is codepoint-exact with <strong>no Unicode normalization</strong>: precomposed <code>é</code>
+(U+00E9) does not match decomposed <code>e</code> + combining acute —
+<code>re_match("e\u{0301}", "é")</code> → <code>false</code> — so normalize first when inputs mix
+forms (same rule as the plain byte-exact string ops, <a href="/mix/strings">strings</a>).
+Case-insensitive <code>(?i)</code> <em>does</em> full Unicode case-folding: <code>(?i)é</code> matches <code>É</code>.</p>
+<p>Multiline <code>^</code>/<code>$</code> (the <code>(?m)</code> flag) anchor per line:</p>
+<pre><code class="language-mix">print(re_find("alpha\nbeta\ngamma", '(?m)^\w+'))
+</code></pre>
+<pre><code class="language-text">[{match: alpha, start: 0, end: 5}, {match: beta, start: 6, end: 10}, {match: gamma, start: 11, end: 16}]
+</code></pre>
+<h2 id="quoting-traps">Quoting traps</h2>
+<p>This is where most regex bugs in Mix come from. A pattern is a string, and Mix
+string rules (<a href="/mix/strings">strings</a>) run <strong>before</strong> the regex crate sees a
+single byte.</p>
+<p><strong>1. Backslashes.</strong> In a <code>"double-quoted"</code> Mix string you escape each backslash:
+<code>"\\d"</code> is the two characters <code>\d</code> that the regex wants. In a <code>'single-quoted'</code>
+string a backslash is <strong>literal</strong>, so <code>'\d'</code> is already <code>\d</code> — single quotes are
+usually the cleaner choice for a regex.</p>
+<pre><code class="language-mix">print(re_match("x42", "\\d+"))   -- double quotes: \\ -&gt; \
+print(re_match("x42", '\d+'))    -- single quotes: \ literal, same result
+</code></pre>
+<pre><code class="language-text">true
+true
+</code></pre>
+<p><strong>2. <code>${...}</code> in double quotes interpolates.</strong> A double-quoted <code>"${host}"</code> is a
+scope/env lookup that resolves to <code>nil</code> if unset — <em>before</em> the regex engine
+runs. This silently corrupts a named-group replacement:</p>
+<pre><code class="language-mix">-- WRONG: "${host}" interpolates to nil at string-build time
+print(re_replace('joe@acme', '(?P&lt;u&gt;\w+)@(?P&lt;h&gt;\w+)', "${h}/${u}"))
+-- RIGHT: single quotes keep ${h}/${u} literal for the regex crate
+print(re_replace('joe@acme', '(?P&lt;u&gt;\w+)@(?P&lt;h&gt;\w+)', '${h}/${u}'))
+</code></pre>
+<pre><code class="language-text">nil/nil
+acme/joe
+</code></pre>
+<p>A <strong>bare</strong> <code>$1</code> (no braces) is <em>literal</em> in a double-quoted Mix string, so
+numbered backrefs happen to survive double quotes — but <code>${name}</code> does not.
+<strong>Rule of thumb: single-quote regex patterns and replacements</strong> and you sidestep
+both traps. (<code>$(...)</code> is also literal in a Mix string — it does not run a
+command here.)</p>
+<h2 id="errors-and-validation">Errors and validation</h2>
+<p>An invalid pattern, or an unsupported construct, raises a <strong>catchable</strong> runtime
+error and exits non-zero from <code>-c</code>:</p>
+<pre><code class="language-mix">print(re_match("x", "[unterminated"))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: invalid regex '[unterminated': regex parse error:
+    [unterminated
+    ^
+error: unclosed character class
+</code></pre>
+<p><strong>Long or multi-line patterns get a truncated diagnostic</strong> (0.63.0). A
+pattern over 80 characters — almost always a <strong>swapped call</strong> that passed
+the <em>subject</em> as the pattern — is echoed truncated with only the regex
+engine's final <code>error:</code> line, plus a hint naming the usual cause, instead
+of printing the whole document back:</p>
+<pre><code class="language-text">Runtime error at line 2: invalid regex 'line of roster text line of …' (8020 chars, truncated): error: repetition quantifier expects a valid decimal
+  (in the re_* family the SUBJECT comes first and the PATTERN second — a
+  swapped argument order is the usual cause of a huge pattern: see mix man regex)
+</code></pre>
+<p>A swapped call where both compile is <em>silent</em> (<code>re_match($pattern, $text)</code>
+is just a "no") — but subject-first matches every other string builtin, so
+the muscle memory that writes <code>replace($s, …)</code> writes <code>re_replace($s, …)</code>
+correctly too. That consistency is what retired the legacy family's trap.</p>
+<p>Wrap user-supplied patterns in <code>try</code>/<code>catch</code> so a bad pattern doesn't abort the
+script (<a href="/mix/errors">errors</a>):</p>
+<pre><code class="language-mix">try
+  print(re_match($text, $user_pattern))
+catch $e
+  print("bad pattern: " .. ("" .. $e))
+end
+</code></pre>
+<p>Wrong arity is a runtime error too:</p>
+<pre><code class="language-mix">print(re_match("a"))
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: re_match() expects at least 2 argument(s), got 1
+</code></pre>
+<h2 id="limitations">Limitations</h2>
+<p>The Rust <code>regex</code> crate guarantees linear-time matching by <strong>not</strong> supporting
+features that require backtracking. Both raise a compile error, not a silent
+mismatch:</p>
+<pre><code class="language-mix">print(re_match("aa", "(a)\\1"))         -- backreference
+print(re_match("foobar", "foo(?=bar)")) -- lookahead
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: invalid regex '(a)\1': regex parse error:
+    (a)\1
+       ^^
+error: backreferences are not supported
+</code></pre>
+<pre><code class="language-text">Runtime error at line 1: invalid regex 'foo(?=bar)': regex parse error:
+    foo(?=bar)
+       ^^^
+error: look-around, including look-ahead and look-behind, is not supported
+</code></pre>
+<p>If you reach for a backreference, usually a non-regex approach works:
+<code>contains</code>/<code>split</code>/<code>replace</code>/<code>starts_with</code> for fixed substrings (byte-exact, no
+pattern compile), or extract groups with <code>re_find</code> then compare in Mix code.</p>
+<p>There is also no compiled-pattern value type — every call recompiles. For most
+scripting that's fine; for a tight inner loop, prefer one <code>re_find</code> over the
+whole input to a per-element <code>re_match</code>.</p>
+<h2 id="recipes">Recipes</h2>
+<p><strong>Extract numbers and sum them</strong> — <code>re_find</code> + the <a href="/mix/hof">HOF</a> builtins
+<code>map</code>/<code>reduce</code>:</p>
+<pre><code class="language-mix">$ms = re_find('a1 b22 c333', '\d+')
+$nums = map($ms, fn($m) = to_number($m["match"]))
+print($nums)
+print(reduce($nums, 0, fn($a, $b) = $a + $b))
+</code></pre>
+<pre><code class="language-text">[1, 22, 333]
+356
+</code></pre>
+<p><strong>Parse <code>key=value</code> lines</strong> with named groups:</p>
+<pre><code class="language-mix">$ms = re_find('host=node1 port=8443 tls=on', '(?P&lt;k&gt;\w+)=(?P&lt;v&gt;\S+)')
+$out = map($ms, fn($m) = $m["groups"][0] .. " -&gt; " .. $m["groups"][1])
+print(join($out, "\n"))
+</code></pre>
+<pre><code class="language-text">host -&gt; node1
+port -&gt; 8443
+tls -&gt; on
+</code></pre>
+<p><strong>Normalize whitespace</strong> — collapse any run of spaces/tabs/newlines to one space:</p>
+<pre><code class="language-mix">print(re_replace("  too    much\twhitespace ", '\s+', " "))
+</code></pre>
+<pre><code class="language-text"> too much whitespace 
+</code></pre>
+<p><strong>Redact something that looks like a secret</strong> before logging:</p>
+<pre><code class="language-mix">print(re_replace("user=joe token=abc123 ok", '(?i)(token|password)=\S+', "$1=***"))
+</code></pre>
+<pre><code class="language-text">user=joe token=*** ok
+</code></pre>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="/mix/strings">strings</a> — quoting (<code>'raw'</code> vs <code>"${...}"</code>), codepoint vs byte ops; read this <em>first</em> for regex patterns</li>
+<li><a href="/mix/collections">collections</a> — the <code>{match, start, end, groups}</code> maps and <code>groups</code> lists <code>re_find</code> returns</li>
+<li><a href="/mix/functions">functions</a> / <a href="/mix/hof">hof</a> — lambdas and <code>map</code>/<code>filter</code>/<code>reduce</code> for processing match lists</li>
+<li><a href="/mix/control-flow">control-flow</a>, <a href="/mix/errors">errors</a> — <code>if</code>/<code>try</code>/<code>catch</code> around match predicates and bad patterns</li>
+<li><a href="/mix/builtins">builtins</a> — full builtin index; <a href="/mix/">the manual index</a></li>
+<li>Rust <a href="https://docs.rs/regex/latest/regex/#syntax"><code>regex</code> crate syntax reference</a> — the authoritative pattern grammar (RE2-style)</li>
+<li><a href="https://github.com/google/re2/wiki/WhyRE2">RE2 design notes</a> — why linear-time matching means no backreferences/look-around</li>
+<li><code>mix help</code> for the builtin overview; <code>mix what re_match</code> (etc.) for the one-line signatures</li>
+</ul></div></div>
     </div>
 
 </main>
@@ -620,6 +972,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +1026,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +1155,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but

@@ -83,7 +83,7 @@ fn esc($s)
 end
 
 -- Every tracked markdown doc: the section trees plus the root whitelist.
-$tracked = split(trim(run_argv_must(["git", "ls-files", "--", "bus/", "cos/", "mix/", "bugs/"], {cwd: $docs})), "\n")
+$tracked = split(trim(run_argv_must(["git", "ls-files", "--", "bus/", "cos/", "mix/", "bugs/", "spec/"], {cwd: $docs})), "\n")
 $docs_list = []
 for each $d in $tracked
   if ends_with($d, ".md") then push($docs_list, $d) end
@@ -120,6 +120,13 @@ mkdir($outdir, {parents: true})
 $made = 0
 for each $doc in $docs_list
   $src = read_file($docs .. "/" .. $doc)
+  -- Strip leading YAML frontmatter (the spec suite carries it; rendered
+  -- it becomes an <hr> + setext-<h2> blob). Same rule as md.js.
+  $fm = re_find($src, "^---\\r?\\n[\\s\\S]*?\\r?\\n---\\r?\\n?")
+  if len($fm) == 1 then
+    $fmlen = len($fm[0]["match"])
+    $src = substr($src, $fmlen, len($src) - $fmlen)
+  end
   $title = ""
   -- First ATX H1 as the page title, else the path.
   -- Title = the first ATX H1's text, with markdown backticks stripped so

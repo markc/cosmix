@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — an agent-operable computing system</title>
+    <title>CosMix — cos/cosmix-dnsd/bus-verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -440,8 +440,92 @@
 
     <div id="brochure" data-stub style="display:none"></div>
 
-    <div id="doc-view" class="content-section" style="display:none">
-        <div id="content-doc"></div>
+    <div id="doc-view" class="content-section">
+        <div id="content-doc" data-prerendered="cos/cosmix-dnsd/bus-verbs.md"><div class="prose"><h1 id="cosmix-dnsd-bus-verbs">cosmix-dnsd Bus verbs</h1>
+<p>The default <code>cosmix</code> build registers the Bus service <code>dnsd</code>. The standalone
+<code>--no-default-features</code> build has no Bus surface.</p>
+<p>The service is read-only. It accepts exactly <code>dnsd.zone.snapshot</code> and
+<code>dnsd.stats</code>.</p>
+<h2 id="return-codes">Return codes</h2>
+<table><thead><tr><th style="text-align: right">Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td style="text-align: right"><code>0</code></td><td>Action completed.</td></tr>
+<tr><td style="text-align: right"><code>10</code></td><td>Unknown action or action outside the read-only surface.</td></tr>
+</tbody></table>
+<p>An unsupported action returns a JSON body with the rejected action and the
+accepted action names:</p>
+<pre><code class="language-json">{
+  "error": "unknown or non-read-only action",
+  "action": "dnsd.zone.set",
+  "read_only_actions": [
+    "dnsd.zone.snapshot",
+    "dnsd.stats"
+  ]
+}
+</code></pre>
+<p>There are no zone mutation, adoption, or reload Bus actions.</p>
+<h2 id="dnsdzonesnapshot">dnsd.zone.snapshot</h2>
+<p>Returns identity information for the currently served zone snapshot.</p>
+<pre><code class="language-json">{
+  "config_hash": "18446744073709551615",
+  "zone_count": 2,
+  "zones": [
+    "alpha.example.com.",
+    "beta.example.com."
+  ]
+}
+</code></pre>
+<table><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>config_hash</code></td><td>string</td><td>Lossless decimal representation of the snapshot's 64-bit configuration hash.</td></tr>
+<tr><td><code>zone_count</code></td><td>number</td><td>Number of served zones.</td></tr>
+<tr><td><code>zones</code></td><td>array of strings</td><td>Served zone names in deterministic sorted order.</td></tr>
+</tbody></table>
+<p><code>config_hash</code> is a string because the full unsigned 64-bit range is larger
+than the exact integer range of common JSON number consumers.</p>
+<p>The hash excludes the daemon-owned emitted serial. It includes the configured
+serial floor. The action therefore supports exact configuration-parity
+comparison without treating a locally emitted serial as configuration drift.</p>
+<p>The action does not export individual resource records.</p>
+<h2 id="dnsdstats">dnsd.stats</h2>
+<p>Returns process-lifetime response counts grouped by resolver-selected DNS
+response code.</p>
+<pre><code class="language-json">{
+  "noerror": 120,
+  "nxdomain": 4,
+  "refused": 2,
+  "formerr": 0,
+  "notimp": 0,
+  "other": 0,
+  "total": 126
+}
+</code></pre>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>noerror</code></td><td><code>NOERROR</code> responses.</td></tr>
+<tr><td><code>nxdomain</code></td><td><code>NXDOMAIN</code> responses.</td></tr>
+<tr><td><code>refused</code></td><td><code>REFUSED</code> responses.</td></tr>
+<tr><td><code>formerr</code></td><td><code>FORMERR</code> responses.</td></tr>
+<tr><td><code>notimp</code></td><td><code>NOTIMP</code> responses.</td></tr>
+<tr><td><code>other</code></td><td>Any response code outside the named buckets.</td></tr>
+<tr><td><code>total</code></td><td>Sum of all bucket values in this snapshot.</td></tr>
+</tbody></table>
+<p>The counters are monotone atomic values shared by every citizen UDP and TCP
+serve task. The returned fields can reflect slightly different instants, but
+<code>total</code> is computed from the same loaded bucket values and equals their sum.</p>
+<p>The observer records the resolver's completed response before wire encoding.
+An encoder fallback response can therefore differ from the counted response in
+the encoding-failure edge case.</p>
+<p><code>refused</code> acts as an authority-health canary. The resolver uses <code>REFUSED</code> for
+out-of-zone or wrong-class queries, not for an in-zone name.</p>
+<h2 id="availability">Availability</h2>
+<p>Bus runs in a sibling task and does not gate DNS service. Failure to reach the
+broker leaves DNS serving active.</p>
+<p>Connection and registration retry with exponential delays from one second up
+to 60 seconds. A session lasting at least 30 seconds resets the delay. A short
+accept-then-drop session continues increasing the delay, preventing a tight
+reconnect loop.</p>
+<p>When an incoming Bus stream ends, the client closes the old session and
+registers again. The zone store and statistics counters remain shared with the
+DNS tasks across reconnects.</p>
+<p>Return to the <a href="/cos/cosmix-dnsd/">crate overview</a>.</p></div></div>
     </div>
 
 </main>
@@ -620,6 +704,37 @@
         tocNav.innerHTML = html;
     }
 
+    /* Everything after the doc's HTML is in #content-doc: heading ids,
+       canonical link rewrites, TOC, icons, scroll. Shared by the fetch
+       path (showDoc) and the pre-rendered hydration path (initial load of
+       a build/gen-doc-pages.mix page, whose headings already carry
+       build-time ids — the !h.id guard leaves those alone). */
+    function finishDoc(path, frag) {
+        var used = {};
+        docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
+            if (!h.id) h.id = slugify(h.textContent, used);
+        });
+        /* Rewrite the doc's own links to canonical routed hrefs so
+           ctrl/middle-click and copy-link produce working deep links
+           (a raw 'strings.md' href would resolve against the site
+           root, not this doc's folder). */
+        docRender.querySelectorAll('a[href]').forEach(function (a2) {
+            var h2 = a2.getAttribute('href') || '';
+            if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
+            if (h2.charAt(0) === '#') {
+                a2.setAttribute('href', urlFor(path, h2.slice(1)));
+                return;
+            }
+            var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
+            if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
+        });
+        buildToc(path);
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        var el = fragEl(frag);
+        if (el) el.scrollIntoView({ block: 'start' });
+        else window.scrollTo(0, 0);
+    }
+
     function showDoc(path, push, frag) {
         var my = ++fetchSeq; /* claim the slot first: even an invalid route must
                                 invalidate any slower in-flight fetch */
@@ -643,29 +758,7 @@
             .then(function (text) {
                 if (my !== fetchSeq) return;
                 docRender.innerHTML = '<div class="prose">' + md(text) + '</div>';
-                var used = {};
-                docRender.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function (h) {
-                    if (!h.id) h.id = slugify(h.textContent, used);
-                });
-                /* Rewrite the doc's own links to canonical routed hrefs so
-                   ctrl/middle-click and copy-link produce working deep links
-                   (a raw 'strings.md' href would resolve against the site
-                   root, not this doc's folder). */
-                docRender.querySelectorAll('a[href]').forEach(function (a2) {
-                    var h2 = a2.getAttribute('href') || '';
-                    if (/^[a-z][a-z0-9+.-]*:/i.test(h2) || h2.charAt(0) === '/') return;
-                    if (h2.charAt(0) === '#') {
-                        a2.setAttribute('href', urlFor(path, h2.slice(1)));
-                        return;
-                    }
-                    var m2 = h2.match(/^([^#?]+\.md)(?:#(.*))?$/i);
-                    if (m2) a2.setAttribute('href', urlFor(resolveRel(path, m2[1]), m2[2] || ''));
-                });
-                buildToc(path);
-                if (typeof lucide !== 'undefined') lucide.createIcons();
-                var el = fragEl(frag);
-                if (el) el.scrollIntoView({ block: 'start' });
-                else window.scrollTo(0, 0);
+                finishDoc(path, frag);
             })
             .catch(function (e) {
                 if (my === fetchSeq) renderError('Error: ' + e.message);
@@ -794,9 +887,35 @@
         }
     }
     if (p0) {
-        (function (pp, ff) {
-            setTimeout(function () { showDoc(pp, false, ff); }, 0);
-        })(p0, f0);
+        /* Hydration: gen-doc-pages.mix pages arrive with this exact doc
+           already rendered into #content-doc (data-prerendered names it).
+           Skip the fetch + client render and just finish — ids, link
+           canonicalisation, TOC, icons, scroll. Any mismatch (pushed
+           state, legacy-hash upgrade, stale page) falls back to the
+           normal fetch path. */
+        if (docRender.getAttribute('data-prerendered') === p0) {
+            /* Claim the fetchSeq slot like every showDoc call does: a doc
+               link clicked in the paint-to-timeout window hands the DOM to
+               showDoc, and the stale finish must then stand down. setActive
+               runs inside the timeout so Base.init()'s panel restore has
+               already happened (same ordering the fetch path always had). */
+            var my0 = ++fetchSeq;
+            currentDoc = p0;
+            document.title = 'CosMix — ' + urlFor(p0).slice(1);
+            brochure.style.display = 'none';
+            docView.style.display = 'block';
+            (function (pp, ff) {
+                setTimeout(function () {
+                    if (my0 !== fetchSeq) return;
+                    setActive(pp);
+                    finishDoc(pp, ff);
+                }, 0);
+            })(p0, f0);
+        } else {
+            (function (pp, ff) {
+                setTimeout(function () { showDoc(pp, false, ff); }, 0);
+            })(p0, f0);
+        }
     }
 
     /* First visit: the FOUC head script paints scheme-mono by default, but
