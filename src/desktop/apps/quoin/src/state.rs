@@ -215,15 +215,35 @@ pub(crate) fn persist_transitions(
     effects: Res<ShellEffects>,
     frame: Res<ShellFrameState>,
     mut store: ResMut<StateStore>,
+    mut schemes: MessageReader<cosmix_shell::chrome::QuoinSchemeSelected>,
+    mut themes: MessageWriter<ctk::theme::ApplyTheme>,
+    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
 ) {
+    let selection = schemes.read().last().map(|selection| selection.0);
+    if let Some(scheme) = selection {
+        let mut spec = ctk::theme::ThemeSpec::from_scheme(scheme, ctk::theme::Mode::Dark);
+        if let Some(font) = crate::desktop_font::detect() {
+            spec.typography = ctk::theme::TypographySpec {
+                family: font.family,
+                body_px: font.body_px,
+            };
+        }
+        themes.write(ctk::theme::ApplyTheme(spec));
+        // CTK may already have consumed requests in this Update pass.
+        redraw.write(bevy::window::RequestRedraw);
+    }
     if store.path.is_none()
-        || (!effects
-            .0
-            .iter()
-            .any(|effect| matches!(effect.effect, PanelEffect::Pin { .. }))
+        || (selection.is_none()
+            && !effects
+                .0
+                .iter()
+                .any(|effect| matches!(effect.effect, PanelEffect::Pin { .. }))
             && effects.1.is_empty())
     {
         return;
+    }
+    if let Some(scheme) = selection {
+        store.saved.scheme = scheme.name().to_owned();
     }
     for edge in Edge::ALL {
         let panel = frame.0.panel(edge);
@@ -278,6 +298,72 @@ mod tests {
             };
         }
         state
+    }
+
+    #[test]
+    fn scheme_dot_applies_dark_theme_and_persists_for_restart() {
+        use cosmix_shell::chrome::{QuoinChromePlugin, scheme_dot};
+        use ctk::theme::{ApplyTheme, Mode, Scheme};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut model = model();
+        model
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_message::<ApplyTheme>()
+        .add_message::<bevy::window::RequestRedraw>()
+        .insert_resource(StateStore::load(Some(path.clone())))
+        .add_systems(Update, persist_transitions.in_set(ShellRuntimeSet::Host));
+        for scheme in Scheme::ALL {
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            let dot = scheme_dot(
+                &mut Commands::new(&mut queue, app.world()),
+                Edge::Right,
+                "monitor",
+                scheme,
+            )
+            .unwrap();
+            queue.apply(app.world_mut());
+            assert_eq!(
+                app.world().get::<BackgroundColor>(dot).unwrap().0,
+                ctk::theme::ThemeSpec::from_scheme(scheme, Mode::Dark)
+                    .colors
+                    .control_active
+            );
+            assert!(
+                app.world()
+                    .get::<bevy::feathers::theme::ThemeBackgroundColor>(dot)
+                    .is_none()
+            );
+            // Newly spawned controls remain disabled until presentation admits them.
+            app.world_mut()
+                .trigger(bevy::ui_widgets::Activate { entity: dot });
+            app.update();
+            assert!(app.world().resource::<Messages<ApplyTheme>>().is_empty());
+            app.world_mut()
+                .trigger(bevy::ui_widgets::Activate { entity: dot });
+            app.update();
+            let applied = app
+                .world_mut()
+                .resource_mut::<Messages<ApplyTheme>>()
+                .drain()
+                .last()
+                .unwrap();
+            assert_eq!(applied.0.scheme, scheme);
+            assert_eq!(applied.0.mode, Mode::Dark);
+            assert_eq!(
+                StateStore::load(Some(path.clone())).scheme(),
+                Some(scheme.name())
+            );
+            app.world_mut().entity_mut(dot).despawn();
+        }
     }
 
     #[test]
@@ -341,6 +427,9 @@ mod tests {
     fn smoke_skips_restore_and_all_writes() {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model())))
+            .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
+            .add_message::<ctk::theme::ApplyTheme>()
+            .add_message::<bevy::window::RequestRedraw>()
             .insert_resource(StateStore::startup(true))
             .add_systems(Update, persist_transitions.in_set(ShellRuntimeSet::Host));
         app.world_mut().write_message(ShellCommand {
@@ -351,6 +440,10 @@ mod tests {
                 input: PanelInput::Pin,
             },
         });
+        app.world_mut()
+            .write_message(cosmix_shell::chrome::QuoinSchemeSelected(
+                ctk::theme::Scheme::Forest,
+            ));
         app.update();
         let store = app.world().resource::<StateStore>();
         assert!(store.path.is_none());
@@ -363,6 +456,9 @@ mod tests {
         let path = directory.path().join("quoin.state.mix");
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model())))
+            .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
+            .add_message::<ctk::theme::ApplyTheme>()
+            .add_message::<bevy::window::RequestRedraw>()
             .insert_resource(StateStore::load(Some(path.clone())))
             .add_systems(Update, persist_transitions.in_set(ShellRuntimeSet::Host));
         let command = |kind| ShellCommand {

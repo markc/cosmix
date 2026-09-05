@@ -2755,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "accesskit",
  "bevy",

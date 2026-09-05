@@ -129,9 +129,10 @@ fn main() -> AppExit {
             ShellBusPlugin,
         ))
         .add_systems(Startup, setup)
+        .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host))
         .add_systems(
             Update,
-            (log_transitions, state::persist_transitions).in_set(ShellRuntimeSet::Host),
+            state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
     app.run()
 }
@@ -288,24 +289,9 @@ fn setup(
     bindings.set(
         Edge::Left,
         vec![
-            QuoinPageContent::new(
-                "nav",
-                placeholder(
-                    &mut commands,
-                    "Navigation",
-                    "Home\nApps\nFiles\nSettings",
-                    false,
-                ),
-            ),
-            QuoinPageContent::new(
-                "places",
-                placeholder(
-                    &mut commands,
-                    "Places",
-                    "Desktop\nProjects\nDownloads",
-                    false,
-                ),
-            ),
+            QuoinPageContent::new("nav", left_page(&mut commands, "nav")),
+            QuoinPageContent::new("places", left_page(&mut commands, "places")),
+            QuoinPageContent::new("info", left_page(&mut commands, "info")),
         ],
     );
     bindings.set(
@@ -350,27 +336,103 @@ fn page_registry() -> QuoinPageRegistry {
             .collect()
     };
     QuoinPageRegistry::new(
-        pages(&[("nav", "Navigation"), ("places", "Places")]),
+        pages(&[("nav", "Apps"), ("places", "Places"), ("info", "Info")]),
         pages(&[
             ("launcher", "Launcher"),
             ("power", "Power"),
             ("tasks", "Tasks"),
         ]),
-        pages(&[("monitor", "Monitoring"), ("agents", "Agents")]),
+        pages(&[("monitor", "System"), ("agents", "Agents")]),
         pages(&[("status", "Status"), ("spaces", "Spaces")]),
     )
     .expect("static page registry is valid")
 }
 
 fn system_page(commands: &mut Commands) -> Entity {
-    let root = placeholder(
-        commands,
-        "Monitoring",
-        "CPU  12%\nMemory  8.4 GiB\nMesh  healthy",
-        false,
-    );
+    let root = placeholder(commands, "System", "Colour scheme", false);
     let quit = cosmix_shell::chrome::quoin_quit_button(commands, Edge::Right, "monitor");
-    commands.entity(root).add_child(quit);
+    let dots = commands
+        .spawn(Node {
+            flex_wrap: FlexWrap::Wrap,
+            column_gap: px(8),
+            row_gap: px(8),
+            ..default()
+        })
+        .id();
+    for scheme in Scheme::ALL {
+        let dot = cosmix_shell::chrome::scheme_dot(commands, Edge::Right, "monitor", scheme)
+            .expect("static system page ID is valid");
+        commands.entity(dots).add_child(dot);
+    }
+    commands.entity(root).add_children(&[dots, quit]);
+    root
+}
+
+fn left_page(commands: &mut Commands, page: &str) -> Entity {
+    use cosmix_shell::chrome::{NavLinkTarget, navlink};
+    let root = commands
+        .spawn(Node {
+            width: percent(100),
+            min_width: px(0),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(px(6)),
+            row_gap: px(4),
+            ..default()
+        })
+        .id();
+    for (icon, label, target) in [
+        ("⊞", "Apps", "nav"),
+        ("⌂", "Places", "places"),
+        ("ℹ", "Info", "info"),
+    ] {
+        let link = navlink(
+            commands,
+            Edge::Left,
+            page,
+            icon,
+            label,
+            NavLinkTarget::Page(target.into()),
+        )
+        .expect("static navigation IDs are valid");
+        commands.entity(root).add_child(link);
+    }
+    if page == "places" {
+        for (icon, label) in [
+            ("⌂", "Home"),
+            ("🗀", "Projects"),
+            ("↓", "Downloads"),
+            ("⚙", "Quoin cfg"),
+        ] {
+            let link = navlink(
+                commands,
+                Edge::Left,
+                page,
+                icon,
+                label,
+                NavLinkTarget::Intent,
+            )
+            .expect("static places ID is valid");
+            commands.entity(root).add_child(link);
+        }
+    } else {
+        let body = if page == "info" {
+            concat!(
+                "Quoin ",
+                env!("CARGO_PKG_VERSION"),
+                "\nFour-edge desktop shell"
+            )
+        } else {
+            "Konsole\nFirefox\nDolphin\nKate"
+        };
+        let copy = commands
+            .spawn((
+                Text::new(body),
+                TextFont::from_font_size(12.0),
+                bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
+            ))
+            .id();
+        commands.entity(root).add_child(copy);
+    }
     root
 }
 
@@ -414,7 +476,7 @@ fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: boo
 fn bottom_launcher(commands: &mut Commands) -> Entity {
     let apps = commands
         .spawn((
-            Text::new("⌘  Launcher    Studio    Mail    Files    Terminal"),
+            Text::new("Konsole  ·  Firefox  ·  Dolphin  ·  Kate"),
             TextFont::from_font_size(13.0),
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
         ))
