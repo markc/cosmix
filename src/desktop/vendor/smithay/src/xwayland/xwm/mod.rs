@@ -112,7 +112,7 @@ use std::{
     },
     sync::{atomic::Ordering, Arc},
 };
-use tracing::{debug, debug_span, error, info, trace, warn};
+use tracing::{debug, debug_span, info, trace, warn};
 use wayland_server::Resource;
 
 pub use x11rb::protocol::xproto::Window as X11Window;
@@ -274,6 +274,10 @@ pub trait XwmHandler {
     /// In general new windows will either stay in this state, if they serve secondary purposes
     /// or request to be mapped shortly afterwards.
     fn new_window(&mut self, xwm: XwmId, window: X11Surface);
+    /// An EWMH `_NET_ACTIVE_WINDOW` request. The compositor owns admission
+    /// policy; source (0 legacy, 1 application, 2 pager) is not authentication.
+    /// The timestamp may be zero. The default deliberately does nothing.
+    fn activate_request(&mut self, _xwm: XwmId, _window: X11Surface, _source: u32, _timestamp: u32) {}
     /// A new X11 window with the override redirect flag.
     ///
     /// New override_redirect windows are not mapped yet, but can become any time.
@@ -400,6 +404,7 @@ pub trait XwmHandler {
 #[derive(Debug)]
 pub struct X11Wm {
     id: XwmId,
+    client: wayland_server::Client,
     conn: Arc<RustConnection>,
     client_scale: Arc<AtomicF64>,
     screen: Screen,
@@ -866,9 +871,13 @@ impl X11Wm {
         conn.flush()?;
 
         let conn = Arc::new(conn);
-        let source = X11Source::new(Arc::clone(&conn), win, atoms._SMITHAY_CLOSE_CONNECTION);
-
         let client_data = client.get_data::<XWaylandClientData>().unwrap();
+        let source = X11Source::new_with_shutdown(
+            Arc::clone(&conn),
+            win,
+            atoms._SMITHAY_CLOSE_CONNECTION,
+            Arc::clone(&client_data.shutdown_requested),
+        );
         let client_scale = client_data.compositor_state.clone_client_scale();
 
         // We need this for the commit hook.
@@ -889,6 +898,7 @@ impl X11Wm {
         drop(_guard);
         let wm = Self {
             id,
+            client,
             conn,
             client_scale,
             screen,
@@ -919,6 +929,15 @@ impl X11Wm {
             }
         })?;
         Ok(wm)
+    }
+
+    /// Mark the associated XWayland generation for orderly shutdown before
+    /// dropping its event source. Never use this to dispose of a failure.
+    pub fn begin_shutdown(&self) {
+        self.client
+            .get_data::<XWaylandClientData>()
+            .unwrap()
+            .begin_shutdown();
     }
 
     /// Id of this X11 WM
@@ -2261,6 +2280,18 @@ where
                 );
             }
             match msg.type_ {
+                x if x == xwm.atoms._NET_ACTIVE_WINDOW && msg.format == 32 => {
+                    if let Some(surface) = xwm
+                        .windows
+                        .iter()
+                        .find(|surface| surface.window_id() == msg.window)
+                        .cloned()
+                    {
+                        let data = msg.data.as_data32();
+                        drop(_guard);
+                        state.activate_request(xwm_id, surface, data[0], data[1]);
+                    }
+                }
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];
                     info!(

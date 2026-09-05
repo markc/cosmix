@@ -8,8 +8,12 @@ use std::{
         process::CommandExt,
     },
     process::{Child, Command},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::{Duration, Instant},
 };
 
 use tracing::{error, info, trace};
@@ -212,6 +216,7 @@ impl XWayland {
                 compositor_state: CompositorClientState::default(),
                 data_map,
                 child: Mutex::new(Some(child)),
+                shutdown_requested: Arc::new(AtomicBool::new(false)),
             }),
         )?;
 
@@ -367,11 +372,12 @@ pub struct XWaylandClientData {
     pub compositor_state: CompositorClientState,
     data_map: UserDataMap,
     child: Mutex<Option<Child>>,
+    pub(crate) shutdown_requested: Arc<AtomicBool>,
 }
 
 impl ClientData for XWaylandClientData {
     fn disconnected(&self, _client_id: ClientId, reason: DisconnectReason) {
-        if let DisconnectReason::ProtocolError(err) = reason {
+        if let DisconnectReason::ProtocolError(ref err) = reason {
             error!("Xwayland disconnected: {}", err);
         }
 
@@ -388,20 +394,133 @@ impl ClientData for XWaylandClientData {
             error!("Xwayland client disconnected twice; second kill ignored (child already reaped)");
             return;
         };
-        thread::spawn(move || {
-            if let Ok(status) = child.wait() {
-                if !status.success() {
-                    error!("Xwayland terminated: {}", status);
-                }
-            }
-        });
+        // Snapshot intent at disconnect, not after the child exits: a later
+        // compositor shutdown must not relabel an already observed failure.
+        let orderly = self.shutdown_requested.load(Ordering::Acquire)
+            && matches!(reason, DisconnectReason::ConnectionClosed);
+        thread::spawn(move || reap_child(&mut child, orderly));
     }
 }
 
 impl XWaylandClientData {
+    /// Mark this generation for orderly compositor shutdown before closing
+    /// its connections. Do not call this on a failed generation or restart.
+    pub fn begin_shutdown(&self) {
+        let mut child = self.child.lock().unwrap();
+        let Some(child) = child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            // Do not bless an exit that already happened. There is still an
+            // unavoidable process-exit race after this check; signal deaths
+            // and non-1 errors remain failures even inside that interval.
+            Ok(None) => self.shutdown_requested.store(true, Ordering::Release),
+            Ok(Some(_)) => {}
+            Err(err) => error!(%err, "could not establish live Xwayland shutdown intent"),
+        }
+    }
+
     /// Access user_data map for a xwayland client
     pub fn user_data(&self) -> &UserDataMap {
         &self.data_map
+    }
+}
+
+fn expected_shutdown_status(status: std::process::ExitStatus, orderly: bool) -> bool {
+    // Xwayland returns 1 when its Wayland connection is deliberately closed.
+    // Signals (including crashes) and other nonzero codes remain failures.
+    status.success() || (orderly && status.code() == Some(1))
+}
+
+fn reap_child(child: &mut Child, orderly: bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if expected_shutdown_status(status, orderly) {
+                    info!(%status, orderly, "Xwayland reaped");
+                } else {
+                    error!("Xwayland terminated: {}", status);
+                }
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                error!("Xwayland did not exit after disconnect; killing child");
+                if let Err(err) = child.kill() {
+                    error!(%err, "failed to kill Xwayland child");
+                }
+                if let Err(err) = child.wait() {
+                    error!(%err, "failed to reap Xwayland child");
+                }
+                return;
+            }
+            Err(err) => {
+                error!(%err, "failed to poll Xwayland child");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::{expected_shutdown_status, reap_child, XWaylandClientData};
+    use crate::{utils::user_data::UserDataMap, wayland::compositor::CompositorClientState};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, ExitStatus};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    #[test]
+    fn only_requested_connection_close_exit_is_expected() {
+        assert!(expected_shutdown_status(ExitStatus::from_raw(0), false));
+        assert!(!expected_shutdown_status(ExitStatus::from_raw(1 << 8), false));
+        assert!(expected_shutdown_status(ExitStatus::from_raw(1 << 8), true));
+        assert!(!expected_shutdown_status(ExitStatus::from_raw(2 << 8), true));
+        assert!(!expected_shutdown_status(ExitStatus::from_raw(11), true));
+        assert!(!expected_shutdown_status(ExitStatus::from_raw(15), true));
+    }
+
+    #[test]
+    fn shutdown_does_not_relabel_an_already_exited_child() {
+        let mut child = Command::new("false").spawn().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let data = XWaylandClientData {
+            compositor_state: CompositorClientState::default(),
+            data_map: UserDataMap::new(),
+            child: Mutex::new(Some(child)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+        };
+        data.begin_shutdown();
+        assert!(!data.shutdown_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_intent_precedes_live_child_disconnect() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let data = XWaylandClientData {
+            compositor_state: CompositorClientState::default(),
+            data_map: UserDataMap::new(),
+            child: Mutex::new(Some(child)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!data.shutdown_requested.load(Ordering::Acquire));
+        data.begin_shutdown();
+        let marked = data.shutdown_requested.load(Ordering::Acquire);
+        let mut child = data.child.lock().unwrap().take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(marked);
+    }
+
+    #[test]
+    fn unresponsive_child_is_killed_and_reaped_after_grace() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        reap_child(&mut child, true);
+        assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(9));
     }
 }
 

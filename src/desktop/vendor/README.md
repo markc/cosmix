@@ -561,6 +561,23 @@ Genuine upstream bug, worth reporting.
 
 ### Downstream API additions
 
+The desktop dogfood additions (2026-09-05) include
+`XwmHandler::activate_request`, dispatched for 32-bit `_NET_ACTIVE_WINDOW`
+messages. The default is a no-op; the compositor owns generation checks,
+managed-window eligibility and seat policy. The source indication is not
+authentication. Offline compositor tests cover the callback policy and a source
+guard covers dispatch presence; actual XWM wire delivery needs a live run.
+
+`X11Wm::begin_shutdown` and `XWaylandClientData::begin_shutdown` mark a live
+generation before deliberate disconnection. Only marked EOF/reset and child
+exit code 1 are classified as expected teardown; already-exited children,
+protocol errors, signal deaths and other failures are not reclassified. A
+two-second grace precedes kill/reap of a lingering child. Reaping is still on a
+detached worker, not an acknowledgement that blocks compositor exit. The
+`shutdown_tests` filters in `utils/x11rb.rs` and `xwayland/xserver.rs` exercise
+classification and child lifecycle. Generic `X11Source::new` retains strict
+unexpected-disconnect reporting.
+
 Separate from the eight defect fixes above, `PointerHandle::current_pressed`
 mirrors `current_location`: it locks the outer handle, clones the physically
 pressed button list, and makes removal reconciliation available without entering

@@ -1277,6 +1277,9 @@ const TEST_SUBSURFACE_ID: u32 = 13;
 const TEST_LINUX_DMABUF_ID: u32 = 14;
 const TEST_LAYER_SHELL_ID: u32 = 15;
 
+#[path = "window_switching_tests.rs"]
+mod window_switching;
+
 struct KeybindingHarness {
     server: ProtocolServer,
     client: UnixStream,
@@ -35970,6 +35973,15 @@ fn vendored_xwayland_disconnected_stays_idempotent() {
         .join("../../vendor/smithay/src/xwayland/xserver.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("vendored xserver.rs unreadable at {path:?}: {error}"));
+    // Scope the pin to production ClientData, not unrelated test fixtures
+    // which legitimately take their own child to clean it up.
+    let source = source
+        .split("impl ClientData for XWaylandClientData {")
+        .nth(1)
+        .expect("XWayland ClientData implementation")
+        .split("impl XWaylandClientData {")
+        .next()
+        .unwrap();
     assert!(
         !source.contains(".take().unwrap()"),
         "vendored XWaylandClientData::disconnected must stay idempotent: a \
@@ -36328,6 +36340,9 @@ fn x11_override_redirect_role_string_matches_the_gate_needle() {
 
 #[cfg(feature = "xwayland")]
 mod x11 {
+    mod window_switching {
+        include!("window_switching_x11_tests.rs");
+    }
     use super::*;
     use crate::protocol::xwayland::{
         PendingX11Window, X11WindowPhase, XwaylandRetryDecision, XwaylandRetryPolicy,
@@ -38884,5 +38899,10 @@ mod x11 {
         let pending = PendingX11Window::default();
         assert!(!pending.phase.eligible());
         assert!(pending.granted_geometry.is_none());
+    }
+
+    mod placement {
+        use super::*;
+        include!("x11_placement_tests.rs");
     }
 }

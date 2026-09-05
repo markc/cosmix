@@ -208,6 +208,8 @@ pub enum BindingAction {
     RequestCloseFocused,
     /// Restore the most recently minimised live toplevel.
     RestoreMostRecentlyMinimized,
+    /// Cycle mapped managed windows in stable creation order.
+    CycleWindow { reverse: bool },
     /// Ask the Bevy app to exit. Nested-session lifecycle only — bare-metal
     /// Phase 2 will not carry this binding.
     ExitNestedCompositor,
@@ -222,6 +224,8 @@ impl BindingAction {
         match self {
             Self::RequestCloseFocused => "RequestCloseFocused",
             Self::RestoreMostRecentlyMinimized => "RestoreMostRecentlyMinimized",
+            Self::CycleWindow { reverse: false } => "CycleWindowForward",
+            Self::CycleWindow { reverse: true } => "CycleWindowBackward",
             Self::ExitNestedCompositor => "ExitNestedCompositor",
             Self::ToggleInterception => "ToggleInterception",
             Self::SwitchVt(_) => "SwitchVt",
@@ -312,6 +316,8 @@ impl BindingTable {
                     reserved: false,
                 },
                 restore_minimized_binding(),
+                cycle_window_binding(false),
+                cycle_window_binding(true),
                 Binding {
                     id: "exit-nested-compositor",
                     keysym: keysyms::KEY_Escape,
@@ -359,6 +365,7 @@ impl BindingTable {
                 reserved: true,
             })
             .chain(std::iter::once(restore_minimized_binding()))
+            .chain([cycle_window_binding(false), cycle_window_binding(true)])
             .collect();
         Self { bindings }
     }
@@ -384,6 +391,27 @@ const fn restore_minimized_binding() -> Binding {
         keysym_name: "m",
         modifiers: ModifierPattern::exact(ModifierSet::logo().with_shift()),
         action: BindingAction::RestoreMostRecentlyMinimized,
+        reserved: false,
+    }
+}
+
+const fn cycle_window_binding(reverse: bool) -> Binding {
+    Binding {
+        id: if reverse {
+            "cycle-window-backward"
+        } else {
+            "cycle-window-forward"
+        },
+        // The raw symbol is Tab even with Shift held; XKB's transformed
+        // ISO_Left_Tab symbol is deliberately not used by this matcher.
+        keysym: keysyms::KEY_Tab,
+        keysym_name: "Tab",
+        modifiers: ModifierPattern::exact(if reverse {
+            ModifierSet::NONE.with_alt().with_shift()
+        } else {
+            ModifierSet::NONE.with_alt()
+        }),
+        action: BindingAction::CycleWindow { reverse },
         reserved: false,
     }
 }
@@ -995,7 +1023,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(table.bindings.len(), 4);
+        assert_eq!(table.bindings.len(), 6);
     }
 
     #[test]
@@ -1018,6 +1046,39 @@ mod tests {
             );
             assert_eq!(
                 state.dispatch(code(50), false, sym(keysyms::KEY_m), &modifiers),
+                KeyDisposition::SwallowRelease
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_binding_respects_disabled_and_locked_profiles() {
+        let modifiers = ModifiersState {
+            alt: true,
+            ..Default::default()
+        };
+        for profile in [BindingProfile::Nested, BindingProfile::KmsLive] {
+            let mut state = BindingState::for_profile(profile, false);
+            assert_eq!(
+                state.dispatch(code(23), true, sym(keysyms::KEY_Tab), &modifiers),
+                KeyDisposition::Forward
+            );
+            state.toggle_interception();
+            assert_eq!(
+                state.dispatch_session_locked(code(23), true, sym(keysyms::KEY_Tab), &modifiers),
+                KeyDisposition::Forward
+            );
+            assert_eq!(
+                state.dispatch(code(23), true, sym(keysyms::KEY_Tab), &modifiers),
+                KeyDisposition::Act(BindingAction::CycleWindow { reverse: false })
+            );
+            assert_eq!(
+                state.dispatch_session_locked(
+                    code(23),
+                    false,
+                    sym(keysyms::KEY_Tab),
+                    &ModifiersState::default()
+                ),
                 KeyDisposition::SwallowRelease
             );
         }

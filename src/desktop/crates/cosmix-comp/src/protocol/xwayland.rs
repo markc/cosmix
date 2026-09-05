@@ -614,6 +614,22 @@ pub(super) fn clamp_x11_content_size(
 }
 
 impl WaylandState {
+    pub(super) fn x11_activate_request(&mut self, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else {
+            return;
+        };
+        // Reject stale associations and override-redirect windows before the
+        // common managed-window gate; an XID alone is not a live identity.
+        if self.surfaces.get(&surface.id()).is_some_and(|record| {
+            record
+                .role
+                .x11()
+                .is_some_and(|role| !role.override_redirect && role.surface == window)
+        }) {
+            self.activate_managed_window(&surface);
+        }
+    }
+
     /// Spawn a new XWayland generation. Called at protocol startup and by the
     /// one-shot retry backstop; never from a periodic tick.
     pub(super) fn start_xwayland(&mut self) {
@@ -970,6 +986,17 @@ impl WaylandState {
     /// descriptor, tear down all X records and the XWM/XWayland source.
     pub(super) fn shutdown_xwayland(&mut self) {
         self.xwayland.shutting_down = true;
+        // Intent belongs only to this orderly path, never the shared failure
+        // teardown. Publish it before closing either generation connection.
+        match &self.xwayland.lifecycle {
+            XwaylandLifecycle::Starting { client, .. } => {
+                if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+                    data.begin_shutdown();
+                }
+            }
+            XwaylandLifecycle::Ready { wm, .. } => wm.begin_shutdown(),
+            _ => {}
+        }
         self.teardown_xwayland_generation();
         self.xwayland.lifecycle = XwaylandLifecycle::Failed;
     }
@@ -1150,6 +1177,14 @@ impl WaylandState {
     /// it stated one inside the usable rect, else the cascade; size from the
     /// client's request clamped by hints and the usable output.
     fn choose_initial_x11_geometry(&mut self, window: &X11Surface) -> Rectangle<i32, Logical> {
+        self.choose_initial_x11_geometry_with_origin(window, None)
+    }
+
+    fn choose_initial_x11_geometry_with_origin(
+        &mut self,
+        window: &X11Surface,
+        requested_origin: Option<(i32, i32)>,
+    ) -> Rectangle<i32, Logical> {
         let usable = self.usable_output_rect();
         let extents = DecoExtents::of(&self.decoration.theme);
         let server_side =
@@ -1160,8 +1195,10 @@ impl WaylandState {
         // creates the window there. Smithay does not expose the
         // WM_NORMAL_HINTS US/PPosition flags, so (0,0) — every X client's
         // default — is indistinguishable from "no preference" and cascades.
-        let requested = window.geometry().loc;
-        let requested_inside = (requested.x != 0 || requested.y != 0)
+        let requested = requested_origin
+            .map(Into::into)
+            .unwrap_or(window.geometry().loc);
+        let requested_inside = (requested_origin.is_some() || requested.x != 0 || requested.y != 0)
             && (requested.x as f32) >= usable.x
             && (requested.y as f32) >= usable.y
             && (requested.x as f32) < usable.x + usable.width
@@ -1194,8 +1231,16 @@ impl WaylandState {
             y,
         );
         let usable_size = (
-            (usable.x + usable.width - x - OUTPUT_MARGIN).max(1.0) as i32,
-            (usable.y + usable.height - y - OUTPUT_MARGIN).max(1.0) as i32,
+            (usable.x + usable.width
+                - x
+                - OUTPUT_MARGIN
+                - if server_side { extents.right } else { 0.0 })
+            .max(1.0) as i32,
+            (usable.y + usable.height
+                - y
+                - OUTPUT_MARGIN
+                - if server_side { extents.bottom } else { 0.0 })
+            .max(1.0) as i32,
         );
         let size = clamp_x11_content_size(
             (requested.w, requested.h),
@@ -1204,7 +1249,89 @@ impl WaylandState {
             fallback,
             usable_size,
         );
-        Rectangle::new((x as i32, y as i32).into(), size.into())
+        self.clamp_x11_normal_geometry(
+            window,
+            Rectangle::new((x as i32, y as i32).into(), size.into()),
+        )
+    }
+
+    fn clamp_x11_normal_geometry(
+        &self,
+        window: &X11Surface,
+        geometry: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        let usable = self.usable_output_rect();
+        let server_side =
+            self.x11_decoration_mode(window, false) == SceneDecorationMode::ServerSide;
+        let restore = clamp_normal_restore(
+            NormalRestore {
+                window_origin: (geometry.loc.x as f32, geometry.loc.y as f32),
+                client_size: (geometry.size.w, geometry.size.h),
+                output: usable,
+                server_side,
+            },
+            usable,
+            server_side,
+            &self.decoration.theme,
+        );
+        Rectangle::new(
+            (
+                restore.window_origin.0 as i32,
+                restore.window_origin.1 as i32,
+            )
+                .into(),
+            restore.client_size.into(),
+        )
+    }
+
+    /// Reserved-area/output changes are compositor policy, not a client
+    /// reposition request. Keep managed X11 windows in the usable area,
+    /// preserving restore memory and leaving override-redirect menus alone.
+    pub(super) fn reconfigure_x11_for_output(&mut self) {
+        let usable = self.usable_output_rect();
+        let output = self.logical_output_rect();
+        let extents = DecoExtents::of(&self.decoration.theme);
+        let targets = self
+            .surfaces
+            .values()
+            .filter_map(|record| {
+                let role = record.role.x11()?;
+                if role.override_redirect || !role.phase.ever_granted {
+                    return None;
+                }
+                let server_side = record.committed_decoration == SceneDecorationMode::ServerSide;
+                let target = if role.fullscreen {
+                    Rectangle::new(
+                        (output.x as i32, output.y as i32).into(),
+                        (output.width.max(1.0) as i32, output.height.max(1.0) as i32).into(),
+                    )
+                } else if record.committed_maximized {
+                    let content = if server_side {
+                        extents.content_size_for_window(vec2(usable.width, usable.height))
+                    } else {
+                        vec2(usable.width, usable.height)
+                    };
+                    Rectangle::new(
+                        (
+                            (usable.x + if server_side { extents.left } else { 0.0 }) as i32,
+                            (usable.y + if server_side { extents.top } else { 0.0 }) as i32,
+                        )
+                            .into(),
+                        (content.x.max(1.0) as i32, content.y.max(1.0) as i32).into(),
+                    )
+                } else {
+                    self.clamp_x11_normal_geometry(&role.surface, role.granted_geometry)
+                };
+                (target != role.granted_geometry).then_some((role.surface.clone(), target))
+            })
+            .collect::<Vec<_>>();
+        for (window, target) in targets {
+            if let Err(error) = window.configure(Some(target)) {
+                tracing::warn!(xid = window.window_id(), %error, "failed to reflow X11 window for output");
+                continue;
+            }
+            self.apply_x11_geometry(window.window_id(), target);
+        }
     }
 
     /// Make an associated, map-granted record eligible and republish retained
@@ -1865,7 +1992,7 @@ impl WaylandState {
                     let SurfaceRole::X11(role) = &record.role else {
                         return None;
                     };
-                    Some(role.granted_geometry)
+                    role.phase.ever_granted.then_some(role.granted_geometry)
                 })
             });
         let pending_granted = self
@@ -1874,7 +2001,7 @@ impl WaylandState {
             .get(&xid)
             .and_then(|entry| entry.granted_geometry);
         let geometry = existing
-            .or(pending_granted)
+            .or_else(|| pending_granted.map(|rect| self.clamp_x11_normal_geometry(&window, rect)))
             .unwrap_or_else(|| self.choose_initial_x11_geometry(&window));
         // Failure policy for `configure`/`set_maximized`/`set_fullscreen`
         // (here and in the maximize/fullscreen state functions): comp-side
@@ -2253,7 +2380,7 @@ impl WaylandState {
                     let SurfaceRole::X11(role) = &record.role else {
                         return None;
                     };
-                    Some(role.granted_geometry)
+                    role.phase.ever_granted.then_some(role.granted_geometry)
                 })
             })
             .or_else(|| {
@@ -2262,31 +2389,73 @@ impl WaylandState {
                     .get(&xid)
                     .and_then(|entry| entry.granted_geometry)
             });
-        let base = current.unwrap_or_else(|| window.geometry());
+        // A pre-map size-only ConfigureRequest must run the same placement
+        // policy as MapRequest, not make the client's default (0,0) an
+        // authoritative grant that bypasses reserved panel space forever.
+        let base = current.unwrap_or_else(|| {
+            let raw = window.geometry().loc;
+            let requested_origin =
+                (x.is_some() || y.is_some()).then_some((x.unwrap_or(raw.x), y.unwrap_or(raw.y)));
+            self.choose_initial_x11_geometry_with_origin(&window, requested_origin)
+        });
         let usable = self.usable_output_rect();
-        let origin = if current.is_none() && (x.is_some() || y.is_some()) {
-            let requested = (x.unwrap_or(base.loc.x), y.unwrap_or(base.loc.y));
-            let inside = (requested.0 as f32) >= usable.x
-                && (requested.1 as f32) >= usable.y
-                && (requested.0 as f32) < usable.x + usable.width
-                && (requested.1 as f32) < usable.y + usable.height;
-            if inside { requested.into() } else { base.loc }
+        let origin = base.loc;
+        let already_mapped = self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .is_some_and(|record| record.mapped);
+        let extents = DecoExtents::of(&self.decoration.theme);
+        let server_side =
+            self.x11_decoration_mode(&window, false) == SceneDecorationMode::ServerSide;
+        let usable_size = if already_mapped {
+            // Preserve the established resize contract for placed windows;
+            // a user may deliberately position part of a window off-screen.
+            (usable.width.max(1.0) as i32, usable.height.max(1.0) as i32)
         } else {
-            base.loc
+            (
+                (usable.x + usable.width
+                    - origin.x as f32
+                    - if server_side { extents.right } else { 0.0 })
+                .max(1.0) as i32,
+                (usable.y + usable.height
+                    - origin.y as f32
+                    - if server_side { extents.bottom } else { 0.0 })
+                .max(1.0) as i32,
+            )
         };
-        let usable_size = (usable.width.max(1.0) as i32, usable.height.max(1.0) as i32);
         let requested = (
             w.map_or(base.size.w, |w| w.min(i32::MAX as u32) as i32),
             h.map_or(base.size.h, |h| h.min(i32::MAX as u32) as i32),
         );
-        let size = clamp_x11_content_size(
-            requested,
-            window.min_size().map(Into::into),
-            window.max_size().map(Into::into),
-            (base.size.w.max(1), base.size.h.max(1)),
-            usable_size,
-        );
+        let state_controls_size = self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .is_some_and(|record| {
+                record.committed_maximized || record.role.x11().is_some_and(|role| role.fullscreen)
+            });
+        let size = if current.is_some() && (state_controls_size || (w.is_none() && h.is_none())) {
+            // Restacking is not a resize. Maximized/fullscreen geometry is
+            // controlled by compositor state, not ConfigureRequest hints.
+            (base.size.w, base.size.h)
+        } else {
+            clamp_x11_content_size(
+                requested,
+                window.min_size().map(Into::into),
+                window.max_size().map(Into::into),
+                (base.size.w.max(1), base.size.h.max(1)),
+                usable_size,
+            )
+        };
         let granted = Rectangle::new(origin, size.into());
+        let granted = if !already_mapped && !state_controls_size {
+            self.clamp_x11_normal_geometry(&window, granted)
+        } else {
+            granted
+        };
         let changed = Some(granted) != current;
         let result = if changed {
             window.configure(Some(granted))
@@ -2702,6 +2871,13 @@ impl WaylandState {
 /// green. Each arm was verified by read in review (2026-09-02); the live
 /// nested gate is the only executable check. Keep the arms boring and 1:1.
 impl XwmHandler for WaylandState {
+    fn activate_request(&mut self, xwm: XwmId, window: X11Surface, _source: u32, _timestamp: u32) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
+        self.x11_activate_request(window);
+    }
+
     fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
         if self.xwm_event_is_live(xwm) {
             match &mut self.xwayland.lifecycle {
@@ -3042,11 +3218,20 @@ impl WaylandState {
                 (size.0.max(1), size.1.max(1)).into(),
             )
         };
-        let geometry_unchanged = record.window_origin == (target.loc.x as f32, target.loc.y as f32)
-            && record.configured_size == (target.size.w.max(1), target.size.h.max(1));
+        let previous_geometry = (record.window_origin, record.configured_size);
         record.requested_maximized = maximized;
         record.committed_maximized = maximized;
         sync_toplevel_scene_state(record);
+        let target = if maximized {
+            target
+        } else {
+            self.clamp_x11_normal_geometry(window, target)
+        };
+        let geometry_unchanged = previous_geometry
+            == (
+                (target.loc.x as f32, target.loc.y as f32),
+                (target.size.w.max(1), target.size.h.max(1)),
+            );
         if let Err(error) = window.configure(Some(target)) {
             tracing::warn!(xid, %error, "failed to configure X11 maximize geometry");
         }
@@ -3070,6 +3255,10 @@ impl WaylandState {
             return;
         }
         let output = self.logical_output_rect();
+        let usable = self.usable_output_rect();
+        let extents = DecoExtents::of(&self.decoration.theme);
+        let restore_ssd =
+            self.x11_decoration_mode(window, false) == SceneDecorationMode::ServerSide;
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
         };
@@ -3094,6 +3283,23 @@ impl WaylandState {
                 (output.x as i32, output.y as i32).into(),
                 (output.width.max(1.0) as i32, output.height.max(1.0) as i32).into(),
             )
+        } else if record.committed_maximized {
+            // Fullscreen temporarily supersedes maximize; leaving it must
+            // restore the current maximized work area, not consume the normal
+            // rectangle that a later unmaximize still needs.
+            let content = if restore_ssd {
+                extents.content_size_for_window(vec2(usable.width, usable.height))
+            } else {
+                vec2(usable.width, usable.height)
+            };
+            Rectangle::new(
+                (
+                    (usable.x + if restore_ssd { extents.left } else { 0.0 }) as i32,
+                    (usable.y + if restore_ssd { extents.top } else { 0.0 }) as i32,
+                )
+                    .into(),
+                (content.x.max(1.0) as i32, content.y.max(1.0) as i32).into(),
+            )
         } else {
             let restore = record.normal_restore.take();
             let (origin, size) = restore
@@ -3107,8 +3313,17 @@ impl WaylandState {
                 (size.0.max(1), size.1.max(1)).into(),
             )
         };
-        let geometry_unchanged = record.window_origin == (target.loc.x as f32, target.loc.y as f32)
-            && record.configured_size == (target.size.w.max(1), target.size.h.max(1));
+        let previous_geometry = (record.window_origin, record.configured_size);
+        let target = if fullscreen {
+            target
+        } else {
+            self.clamp_x11_normal_geometry(window, target)
+        };
+        let geometry_unchanged = previous_geometry
+            == (
+                (target.loc.x as f32, target.loc.y as f32),
+                (target.size.w.max(1), target.size.h.max(1)),
+            );
         if let Err(error) = window.configure(Some(target)) {
             tracing::warn!(xid, %error, "failed to configure X11 fullscreen geometry");
         }

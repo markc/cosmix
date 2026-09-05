@@ -4,7 +4,10 @@
 //! backend in a compositor.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread::{spawn, JoinHandle},
 };
 
@@ -50,10 +53,26 @@ impl X11Source {
     /// created by us. Thus, the event reading thread will wake up and check an internal exit flag,
     /// then exit.
     pub fn new(connection: Arc<RustConnection>, close_window: Window, close_type: Atom) -> Self {
+        Self::new_with_shutdown(
+            connection,
+            close_window,
+            close_type,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    // Only the XWayland lifecycle supplies this generation-scoped intent.
+    // Generic X11 backends keep treating unexpected disconnects as errors.
+    pub(crate) fn new_with_shutdown(
+        connection: Arc<RustConnection>,
+        close_window: Window,
+        close_type: Atom,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Self {
         let (sender, channel) = sync_channel(5);
         let conn = Arc::clone(&connection);
         let event_thread = Some(spawn(move || {
-            run_event_thread(conn, sender);
+            run_event_thread(conn, sender, shutdown_requested);
         }));
 
         Self {
@@ -154,13 +173,21 @@ impl EventSource for X11Source {
 /// This thread will call wait_for_event(). RustConnection then ensures internally to wake us up
 /// when an event arrives. So far, this seems to be the only safe way to integrate x11rb with
 /// calloop.
-fn run_event_thread(connection: Arc<RustConnection>, sender: SyncSender<Event>) {
+fn run_event_thread(
+    connection: Arc<RustConnection>,
+    sender: SyncSender<Event>,
+    shutdown_requested: Arc<AtomicBool>,
+) {
     loop {
         let event = match connection.wait_for_event() {
             Ok(event) => event,
             Err(err) => {
                 // Connection errors are most likely permanent. Thus, exit the thread.
-                error!("Event thread exiting due to connection error {}", err);
+                if expected_shutdown_error(&err, shutdown_requested.load(Ordering::Acquire)) {
+                    tracing::debug!("X11 event thread closed during requested shutdown");
+                } else {
+                    error!("Event thread exiting due to connection error {}", err);
+                }
                 break;
             }
         };
@@ -172,5 +199,30 @@ fn run_event_thread(connection: Arc<RustConnection>, sender: SyncSender<Event>) 
                 break;
             }
         }
+    }
+}
+
+fn expected_shutdown_error(error: &x11rb::errors::ConnectionError, orderly: bool) -> bool {
+    orderly
+        && matches!(error, x11rb::errors::ConnectionError::IoError(err)
+        if matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset))
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::expected_shutdown_error;
+    use std::io::{Error, ErrorKind};
+    use x11rb::errors::ConnectionError;
+
+    #[test]
+    fn disconnect_errors_require_explicit_shutdown_intent() {
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset] {
+            let err = ConnectionError::IoError(Error::from(kind));
+            assert!(expected_shutdown_error(&err, true));
+            assert!(!expected_shutdown_error(&err, false));
+        }
+        let err = ConnectionError::IoError(Error::from(ErrorKind::PermissionDenied));
+        assert!(!expected_shutdown_error(&err, true));
+        assert!(!expected_shutdown_error(&ConnectionError::UnknownError, true));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.48.0"
+version = "0.49.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -116,5 +116,4 @@ wgpu = { version = "=29.0.4", features = ["noop"] }
 smithay = { version = "=0.7.0", default-features = false, features = [
     "cosmix_offline_test",
 ] }
-
 

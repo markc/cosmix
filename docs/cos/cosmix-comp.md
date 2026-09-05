@@ -4,6 +4,32 @@
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.
 
+## Window switching and X11 placement
+
+Alt+Tab cycles forward and Alt+Shift+Tab cycles backward through mapped,
+non-minimised managed windows in stable creation order. This is not an MRU
+switcher or a visual switcher overlay. Both nested and KMS profiles support
+these bindings when interception is enabled. Session locking and exclusive
+keyboard layers retain priority.
+
+X11 `_NET_ACTIVE_WINDOW` requests use the same managed-window admission and
+focus path. Local automation is accepted without timestamp-based focus-stealing
+prevention; source identifiers are not authentication. Unmapped, minimised and
+override-redirect windows cannot be activated through this path.
+
+Initial X11 placement, including size-only configure requests before mapping,
+respects reserved panel space. Reserved-area changes reflow managed X11 windows;
+maximised windows use the usable area and fullscreen windows use the full
+output. Restore geometry is kept until restoration, then clamped to the current
+usable area. Override-redirect menus retain client-owned coordinates and do not
+gain priority over top-layer panels or lock surfaces.
+
+Intentional XWayland shutdown is marked before connection teardown. Expected
+connection closure and exit code 1 are distinguished from runtime crashes;
+protocol errors, signal deaths and timeout escalation remain errors. The child
+reaper allows a two-second exit grace before kill/reap. It remains asynchronous:
+compositor exit does not wait for a positive child-reaped acknowledgement.
+
 ## Bus control plane
 
 The default `bus` feature gives the compositor an L2 Bus control plane.

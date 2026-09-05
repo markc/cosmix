@@ -11719,6 +11719,7 @@ impl WaylandState {
                 debug_assert!(!action.needs_ecs());
                 self.restore_most_recently_minimized();
             }
+            BindingAction::CycleWindow { reverse } => self.cycle_window(reverse),
             BindingAction::ExitNestedCompositor => {
                 debug_assert!(action.needs_ecs());
                 match self
@@ -13078,6 +13079,8 @@ impl WaylandState {
     }
 
     fn reconfigure_window_states_for_output(&mut self) {
+        #[cfg(feature = "xwayland")]
+        self.reconfigure_x11_for_output();
         let window_states = self
             .surfaces
             .values()
@@ -14844,6 +14847,7 @@ mod focus;
 mod handlers;
 mod input;
 mod release_use;
+mod window_switching;
 #[cfg(feature = "xwayland")]
 mod xwayland;
 
