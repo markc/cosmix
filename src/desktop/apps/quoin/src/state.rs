@@ -184,6 +184,16 @@ impl StateStore {
     pub(crate) fn snapshot(&self) -> SavedState {
         self.saved.clone()
     }
+
+    /// The restored appearance scheme name, or `None` when the state uses the
+    /// sentinel default (`"builtin"`) — meaning no scheme was ever persisted
+    /// and the caller should keep CTK's built-in selection.
+    pub(crate) fn scheme(&self) -> Option<&str> {
+        match self.saved.scheme.as_str() {
+            "builtin" => None,
+            scheme => Some(scheme),
+        }
+    }
 }
 
 /// A failed save leaves the previous complete file available for the next launch.

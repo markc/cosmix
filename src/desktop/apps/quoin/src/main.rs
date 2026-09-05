@@ -1,6 +1,7 @@
 //! Cosmix Quoin's real SCTK layer-shell host.
 
 mod bus_service;
+mod desktop_font;
 mod power;
 mod state;
 
@@ -20,7 +21,10 @@ use cosmix_shell_host::{LayerHostConfig, LayerHostWake, LayerPanelMounts, config
 use ctk::bus::{
     BusBridgeConfig, BusBridgePlugin, BusWorkerWake, provenance_from_build, resolve_noded_url,
 };
-use ctk::theme::{CtkThemePlugin, ThemeSpec, ThemeState, apply_theme, tokens};
+use ctk::theme::{
+    CtkMonospace, CtkThemePlugin, Mode, Scheme, ThemeSpec, ThemeState, TypographySpec, apply_theme,
+    tokens,
+};
 
 const USAGE: &str =
     "usage: cosmix-quoin [--output NAME] [--comp-service NAME] [--smoke-all-panels|--smoke-hidden]";
@@ -242,9 +246,27 @@ fn setup(
     mut theme_state: ResMut<ThemeState>,
     registry: Res<QuoinPageRegistry>,
     frame: Res<ShellFrameState>,
+    state_store: Res<state::StateStore>,
 ) {
+    // Furniture reads as furniture in dark mode against a desktop; the shipped
+    // default is Ocean/Dark, overridden by a persisted scheme when present.
+    let scheme = state_store
+        .scheme()
+        .and_then(Scheme::from_name)
+        .unwrap_or(Scheme::Ocean);
+    let mut spec = ThemeSpec::from_scheme(scheme, Mode::Dark);
+    // Match the host desktop's UI font where it can be read; otherwise CTK's
+    // built-in typography stands (a machine with no KDE config still looks
+    // right). Point sizes are converted to logical px; output scale is applied
+    // downstream, so this stays scale-free.
+    if let Some(font) = desktop_font::detect() {
+        spec.typography = TypographySpec {
+            family: font.family,
+            body_px: font.body_px,
+        };
+    }
     *theme = UiTheme(create_dark_theme());
-    apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
+    apply_theme(&mut theme, &mut theme_state, &spec);
 
     let mut bindings = QuoinContentBindings::default();
     bindings.set(
@@ -402,6 +424,10 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
             Text::new("--:--:-- UTC"),
             TextFont::from_font_size(13.0),
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
+            // A proportional face makes clock digits jitter each second; the
+            // monospace role keeps them on a fixed advance while staying
+            // size-managed by CTK.
+            CtkMonospace,
             QuoinClock,
         ))
         .id();
