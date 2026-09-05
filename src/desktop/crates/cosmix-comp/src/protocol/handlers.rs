@@ -1920,6 +1920,8 @@ impl SeatHandler for WaylandState {
         let focused_root = focused_surface
             .as_ref()
             .map(|surface| canonical_root_surface(&self.popup_manager, surface));
+        #[cfg(feature = "xwayland")]
+        self.publish_x11_active_window(focused_root.as_ref());
         // Data-device focus is still withheld from X11 targets, but the reason
         // CHANGED with X-2b and the old one ("comp refuses to bridge") is no
         // longer true. Xwayland is itself a Wayland client, so granting it

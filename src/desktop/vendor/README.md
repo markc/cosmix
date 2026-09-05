@@ -568,6 +568,14 @@ managed-window eligibility and seat policy. The source indication is not
 authentication. Offline compositor tests cover the callback policy and a source
 guard covers dispatch presence; actual XWM wire delivery needs a live run.
 
+`X11Wm::set_active_window` publishes the compositor seat's managed XID (or zero)
+to the root `_NET_ACTIVE_WINDOW` property. A different-XWM or override-redirect
+window is never published. Raw `FocusIn`/`FocusOut` events no longer write this
+property: root/ancestor events and delayed transitions are not compositor focus
+authority. The compositor calls the setter for every seat focus change;
+offline tests cover target selection and pin the event/source routing, while
+property delivery and `xdotool --sync` remain live-test obligations.
+
 `X11Wm::begin_shutdown` and `XWaylandClientData::begin_shutdown` mark a live
 generation before deliberate disconnection. Only marked EOF/reset and child
 exit code 1 are classified as expected teardown; already-exited children,

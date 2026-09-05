@@ -945,6 +945,25 @@ impl X11Wm {
         self.id
     }
 
+    /// Publish the compositor seat's active managed X11 window, or clear it
+    /// when a native surface (or no surface) owns focus. Raw X focus events
+    /// include ancestors and temporary grab transitions and are not authority
+    /// for this EWMH property. A window from another XWM is never published.
+    pub fn set_active_window(&self, window: Option<&X11Surface>) -> Result<(), ConnectionError> {
+        let xid = window
+            .filter(|window| window.xwm_id() == Some(self.id) && !window.is_override_redirect())
+            .map(X11Surface::window_id)
+            .unwrap_or(x11rb::NONE);
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.screen.root,
+            self.atoms._NET_ACTIVE_WINDOW,
+            AtomEnum::WINDOW,
+            &[xid],
+        )?;
+        self.conn.flush()
+    }
+
     /// Raises a window in the internal X11 state
     ///
     /// Needs to be called to match raising of windows inside the compositor to keep the stacking order
@@ -2253,24 +2272,9 @@ where
                 }
             }
         }
-        Event::FocusIn(n) => {
-            conn.change_property32(
-                PropMode::REPLACE,
-                xwm.screen.root,
-                xwm.atoms._NET_ACTIVE_WINDOW,
-                AtomEnum::WINDOW,
-                &[n.event],
-            )?;
-        }
-        Event::FocusOut(n) => {
-            conn.change_property32(
-                PropMode::REPLACE,
-                xwm.screen.root,
-                xwm.atoms._NET_ACTIVE_WINDOW,
-                AtomEnum::WINDOW,
-                &[n.event],
-            )?;
-        }
+        // Seat policy publishes _NET_ACTIVE_WINDOW via set_active_window.
+        // In particular a delayed root FocusOut must not overwrite its XID.
+        Event::FocusIn(_) | Event::FocusOut(_) => {}
         Event::ClientMessage(msg) => {
             if let Some(reply) = conn.get_atom_name(msg.type_)?.reply_unchecked()? {
                 debug!(

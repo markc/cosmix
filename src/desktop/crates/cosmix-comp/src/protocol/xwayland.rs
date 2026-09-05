@@ -614,6 +614,36 @@ pub(super) fn clamp_x11_content_size(
 }
 
 impl WaylandState {
+    /// Resolve the seat's canonical root to this generation's managed XID.
+    /// Kept separate from the live connection write for offline policy tests.
+    pub(super) fn x11_active_window_for_root(
+        &self,
+        root: Option<&WlSurface>,
+    ) -> Option<X11Surface> {
+        if self.session_lock_active() || self.xwayland.shutting_down {
+            return None;
+        }
+        let record = self.surfaces.get(&root?.id())?;
+        let role = record.role.x11()?;
+        (record.mapped
+            && record.layout.visible
+            && !record.minimized
+            && !role.override_redirect
+            && role.generation == self.xwayland.generation
+            && record.role.wl_surface().is_alive()
+            && self.surface_is_input_presentable(record))
+        .then(|| role.surface.clone())
+    }
+
+    pub(super) fn publish_x11_active_window(&self, root: Option<&WlSurface>) {
+        let window = self.x11_active_window_for_root(root);
+        if let XwaylandLifecycle::Ready { wm, .. } = &self.xwayland.lifecycle
+            && let Err(error) = wm.set_active_window(window.as_ref())
+        {
+            tracing::warn!(%error, "failed to publish X11 active window");
+        }
+    }
+
     pub(super) fn x11_activate_request(&mut self, window: X11Surface) {
         let Some(surface) = window.wl_surface() else {
             return;

@@ -16,6 +16,11 @@ X11 `_NET_ACTIVE_WINDOW` requests use the same managed-window admission and
 focus path. Local automation is accepted without timestamp-based focus-stealing
 prevention; source identifiers are not authentication. Unmapped, minimised and
 override-redirect windows cannot be activated through this path.
+The root `_NET_ACTIVE_WINDOW` property follows the compositor seat's managed
+X11 focus, including mouse and keyboard switching. Native, lock or absent
+focus clears it to zero; delayed X focus events cannot replace it with a root
+or ancestor window ID. This keeps `xdotool windowactivate --sync` and
+`getactivewindow` consistent with compositor focus.
 
 Initial X11 placement, including size-only configure requests before mapping,
 respects reserved panel space. Reserved-area changes reflow managed X11 windows;

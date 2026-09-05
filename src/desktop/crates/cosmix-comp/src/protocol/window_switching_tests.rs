@@ -1,5 +1,19 @@
 use super::*;
 
+/// Offline source guard: delayed root/grab X events cannot replace the
+/// compositor seat's publication. Actual X property delivery is a live gate.
+#[test]
+fn active_window_publication_is_seat_owned_not_raw_focus_event_owned() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        std::fs::read_to_string(root.join("../../vendor/smithay/src/xwayland/xwm/mod.rs")).unwrap();
+    assert!(source.contains("Event::FocusIn(_) | Event::FocusOut(_) => {}"));
+    assert!(!source.contains("&[n.event]"));
+    assert!(source.contains("window.xwm_id() == Some(self.id)"));
+    let handler = std::fs::read_to_string(root.join("src/protocol/handlers.rs")).unwrap();
+    assert!(handler.contains("self.publish_x11_active_window(focused_root.as_ref());"));
+}
+
 /// The privileged XWM handshake is unavailable in the offline harness.
 /// Pin the vendor dispatch as a source-presence guard, not a live wire test.
 #[test]

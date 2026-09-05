@@ -454,7 +454,12 @@ keyboard layers retain priority.</p>
 <p>X11 <code>_NET_ACTIVE_WINDOW</code> requests use the same managed-window admission and
 focus path. Local automation is accepted without timestamp-based focus-stealing
 prevention; source identifiers are not authentication. Unmapped, minimised and
-override-redirect windows cannot be activated through this path.</p>
+override-redirect windows cannot be activated through this path.
+The root <code>_NET_ACTIVE_WINDOW</code> property follows the compositor seat's managed
+X11 focus, including mouse and keyboard switching. Native, lock or absent
+focus clears it to zero; delayed X focus events cannot replace it with a root
+or ancestor window ID. This keeps <code>xdotool windowactivate --sync</code> and
+<code>getactivewindow</code> consistent with compositor focus.</p>
 <p>Initial X11 placement, including size-only configure requests before mapping,
 respects reserved panel space. Reserved-area changes reflow managed X11 windows;
 maximised windows use the usable area and fullscreen windows use the full
