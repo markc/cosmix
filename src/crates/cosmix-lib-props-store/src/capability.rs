@@ -23,13 +23,48 @@ use std::fmt;
 /// substrate enforces no syntactic constraint here beyond non-empty —
 /// validation that an issued token matches a meaningful action/scope
 /// is the deployment's `AuthPolicy` responsibility.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
+// INVARIANT: every value originates from `new` (FromStr and Deserialize
+// both route through it); Serialize stays derived-transparent on that
+// basis. No other constructor may set this field.
 pub struct Capability(String);
 
+// Manual impl so wire input is validated by `new` — the derived
+// transparent form would admit any string.
+impl<'de> Deserialize<'de> for Capability {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(de)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CapabilityError {
+    Empty,
+}
+
+impl fmt::Display for CapabilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "capability is empty"),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityError {}
+
 impl Capability {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+    pub fn new(s: impl Into<String>) -> Result<Self, CapabilityError> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(CapabilityError::Empty);
+        }
+        Ok(Self(s))
     }
 
     pub fn as_str(&self) -> &str {
@@ -43,15 +78,24 @@ impl fmt::Display for Capability {
     }
 }
 
-impl From<&str> for Capability {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
+impl std::str::FromStr for Capability {
+    type Err = CapabilityError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
     }
 }
 
-impl From<String> for Capability {
-    fn from(s: String) -> Self {
-        Self(s)
+impl TryFrom<&str> for Capability {
+    type Error = CapabilityError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<String> for Capability {
+    type Error = CapabilityError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s)
     }
 }
 
@@ -102,8 +146,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_empty_at_every_entry_point() {
+        assert_eq!(Capability::new("").unwrap_err(), CapabilityError::Empty);
+        assert_eq!(
+            "".parse::<Capability>().unwrap_err(),
+            CapabilityError::Empty
+        );
+        assert_eq!(
+            Capability::try_from("").unwrap_err(),
+            CapabilityError::Empty
+        );
+        assert_eq!(
+            Capability::try_from(String::new()).unwrap_err(),
+            CapabilityError::Empty
+        );
+        assert!(
+            serde_json::from_value::<Capability>(serde_json::json!(""))
+                .unwrap_err()
+                .to_string()
+                .contains("capability is empty")
+        );
+        for wire in [
+            serde_json::json!([""]),
+            serde_json::json!(["props.read:maild.accounts", ""]),
+        ] {
+            assert!(serde_json::from_value::<CapabilitySet>(wire).is_err());
+        }
+        assert!(
+            serde_json::from_value::<CapabilitySet>(serde_json::json!([]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn opaque_non_empty_capabilities_round_trip() {
+        for s in [
+            "props.audit:*",
+            "webd.acme.renew:webd.vhosts",
+            "custom vocabulary:部署",
+            " ",
+            "\n",
+        ] {
+            let cap = Capability::new(s).unwrap();
+            assert_eq!(s.parse::<Capability>().unwrap(), cap);
+            assert_eq!(Capability::try_from(s).unwrap(), cap);
+            assert_eq!(Capability::try_from(s.to_owned()).unwrap(), cap);
+            let wire = serde_json::json!(s);
+            assert_eq!(serde_json::to_value(&cap).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<Capability>(wire).unwrap(), cap);
+        }
+    }
+
+    #[test]
     fn capability_round_trip() {
-        let c = Capability::new("props.write:maild.accounts");
+        let c = Capability::new("props.write:maild.accounts").expect("non-empty capability");
         assert_eq!(c.as_str(), "props.write:maild.accounts");
         let j = serde_json::to_string(&c).unwrap();
         assert_eq!(j, "\"props.write:maild.accounts\"");
@@ -114,18 +211,32 @@ mod tests {
     #[test]
     fn capability_set_membership() {
         let mut set = CapabilitySet::empty();
-        assert!(!set.contains(&Capability::from("props.write:maild.accounts")));
-        assert!(set.insert(Capability::from("props.write:maild.accounts")));
-        assert!(!set.insert(Capability::from("props.write:maild.accounts")));
-        assert!(set.contains(&Capability::from("props.write:maild.accounts")));
-        assert!(!set.contains(&Capability::from("props.read:maild.accounts")));
+        assert!(!set.contains(
+            &Capability::new("props.write:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(
+            set.insert(
+                Capability::new("props.write:maild.accounts").expect("non-empty capability")
+            )
+        );
+        assert!(
+            !set.insert(
+                Capability::new("props.write:maild.accounts").expect("non-empty capability")
+            )
+        );
+        assert!(set.contains(
+            &Capability::new("props.write:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(!set.contains(
+            &Capability::new("props.read:maild.accounts").expect("non-empty capability")
+        ));
     }
 
     #[test]
     fn capability_set_serde() {
         let set: CapabilitySet = [
-            Capability::from("props.write:maild.accounts"),
-            Capability::from("props.read:maild.accounts"),
+            Capability::new("props.write:maild.accounts").expect("non-empty capability"),
+            Capability::new("props.read:maild.accounts").expect("non-empty capability"),
         ]
         .into_iter()
         .collect();
@@ -134,6 +245,7 @@ mod tests {
         // BTreeSet → lexicographic sort: read < write.
         assert_eq!(arr[0], "props.read:maild.accounts");
         assert_eq!(arr[1], "props.write:maild.accounts");
+        assert_eq!(serde_json::from_value::<CapabilitySet>(j).unwrap(), set);
     }
 
     #[test]

@@ -226,7 +226,7 @@ pub fn auth_policy() -> AuthPolicy {
             "props.audit:maild.tls_identities",
         ]
         .into_iter()
-        .map(Capability::from)
+        .map(|s| Capability::new(s).expect("non-empty capability"))
         .collect()
     }
     AuthPolicy::new(resolve)
@@ -539,7 +539,7 @@ async fn project_identities(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let actor = Actor::service(BOOTSTRAP_SERVICE);
+    let actor = Actor::service(BOOTSTRAP_SERVICE).expect("valid bootstrap service actor");
 
     // Pre-pass: parse every PEM, read every prior row version, AND
     // list the existing namespace to compute the stale-row delete set
@@ -756,11 +756,16 @@ mod tests {
             "props.describe:maild.tls_identities:full",
             "props.audit:maild.tls_identities",
         ] {
-            assert!(caps.contains(&Capability::from(c)), "grant {c}");
+            assert!(
+                caps.contains(&Capability::new(c).expect("non-empty capability")),
+                "grant {c}"
+            );
         }
         // No write / delete caps.
         assert!(
-            !caps.contains(&Capability::from("props.write:maild.tls_identities")),
+            !caps.contains(
+                &Capability::new("props.write:maild.tls_identities").expect("non-empty capability")
+            ),
             "tls_identities is read-only"
         );
     }
@@ -773,7 +778,7 @@ mod tests {
             old: None,
             new: Some(PropValue::Object(BTreeMap::new())),
             version: Version::zero(),
-            actor: Actor::operator("alice"),
+            actor: Actor::operator("alice").expect("valid actor"),
             merge: Some(MergeMode::Replace),
             origin: cosmix_props::WriteOrigin::caller(),
         };
@@ -793,7 +798,7 @@ mod tests {
             old: None,
             new: Some(PropValue::Object(BTreeMap::new())),
             version: Version::zero(),
-            actor: Actor::service(BOOTSTRAP_SERVICE),
+            actor: Actor::service(BOOTSTRAP_SERVICE).expect("valid bootstrap service actor"),
             merge: Some(MergeMode::Replace),
             origin: cosmix_props::WriteOrigin::caller(),
         };
@@ -811,7 +816,7 @@ mod tests {
             old: Some(PropValue::Object(BTreeMap::new())),
             new: None,
             version: Version::zero(),
-            actor: Actor::operator("alice"),
+            actor: Actor::operator("alice").expect("valid actor"),
             merge: None,
             origin: cosmix_props::WriteOrigin::caller(),
         };

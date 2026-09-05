@@ -522,7 +522,7 @@ mod tests {
             expected_version: expected,
             merge: MergeMode::Patch,
             lifecycle,
-            actor: Actor::service("maild"),
+            actor: Actor::service("maild").expect("valid actor"),
             cause: None,
             ts_ms: 1_700_000_000_000,
         }
@@ -672,7 +672,7 @@ mod tests {
             .commit_delete(DeleteCommit {
                 key: key.clone(),
                 expected_version: Some(Version(1)),
-                actor: Actor::service("maild"),
+                actor: Actor::service("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -707,7 +707,7 @@ mod tests {
                 key: key.clone(),
                 lifecycle: Lifecycle::Active,
                 expected_version: Version(1),
-                actor: Actor::daemon_complete("maild"),
+                actor: Actor::daemon_complete("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -741,7 +741,7 @@ mod tests {
                     reason: "mds seed failed".into(),
                 },
                 expected_version: Version(1),
-                actor: Actor::daemon_complete("maild"),
+                actor: Actor::daemon_complete("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -776,7 +776,7 @@ mod tests {
                 key,
                 lifecycle: Lifecycle::Active,
                 expected_version: Version(1),
-                actor: Actor::daemon_complete("maild"),
+                actor: Actor::daemon_complete("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })

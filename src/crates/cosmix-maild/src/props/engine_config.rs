@@ -373,7 +373,7 @@ pub fn auth_policy() -> AuthPolicy {
             "props.audit:maild.engine_config",
         ]
         .into_iter()
-        .map(Capability::from)
+        .map(|s| Capability::new(s).expect("non-empty capability"))
         .collect()
     }
     AuthPolicy::new(resolve)
@@ -1163,7 +1163,7 @@ mod tests {
             old,
             new: Some(new),
             version: Version::zero(),
-            actor: Actor::service("test"),
+            actor: Actor::service("test").expect("valid actor"),
             merge: Some(merge),
             origin: cosmix_props::WriteOrigin::caller(),
         }
@@ -1175,7 +1175,7 @@ mod tests {
             old: Some(defaults_value()),
             new: None,
             version: Version::zero(),
-            actor: Actor::service("test"),
+            actor: Actor::service("test").expect("valid actor"),
             merge: None,
             origin: cosmix_props::WriteOrigin::caller(),
         }
@@ -1604,7 +1604,10 @@ mod tests {
             "props.describe:maild.engine_config:full",
             "props.audit:maild.engine_config",
         ] {
-            assert!(caps.contains(&Capability::from(c)), "cap {c} granted");
+            assert!(
+                caps.contains(&Capability::new(c).expect("non-empty capability")),
+                "cap {c} granted"
+            );
         }
     }
 
@@ -1825,7 +1828,7 @@ mod tests {
         SetOpts {
             expected_version: version,
             merge: MergeMode::Replace,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         }
@@ -1913,7 +1916,7 @@ mod tests {
                     SetOpts {
                         expected_version: Some(version),
                         merge: MergeMode::Patch,
-                        actor: Actor::operator("test"),
+                        actor: Actor::operator("test").expect("valid actor"),
                         cause: None,
                         ts_ms: 0,
                     },

@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::lifecycle::Lifecycle;
 use crate::namespace::NamespaceName;
@@ -185,46 +186,168 @@ impl EventKind {
 /// SPEC 12's two special tokens; encoded as a flat string on the wire.
 ///
 /// Concrete forms:
-/// - `<svc>` — e.g. `maild`, when a service peer originated the call.
+/// - `<svc>[:<uuid>]` — e.g. `maild`, when a service peer originated the call.
 /// - `<runtime>:<uuid>[:<seq>]` — SPEC 07 runtime peer identity.
 /// - `operator:<principal>` — human operator via SPEC 07.
 /// - `daemon:<svc>` — owning daemon performing the library-internal
 ///   saga `complete` transition.
 /// - `daemon:reconciliation` — substrate reconciliation pass on
 ///   startup hand-edit detection (§11).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Service/runtime tokens use ASCII letters, digits, `_`, `-`, or `.`.
+/// UUIDs have the hyphenated 8-4-4-4-12 hex shape; an optional sequence
+/// is non-empty ASCII decimal digits. Operator principals are non-empty
+/// but otherwise opaque (including colons, spaces, and Unicode).
+/// This gate cannot distinguish service instances from runtime sessions;
+/// UUID version, provenance, and sequence monotonicity belong to emitters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
+// INVARIANT: every value originates from `new` (FromStr and Deserialize
+// both route through it); Serialize stays derived-transparent on that
+// basis. No other constructor may set this field.
 pub struct Actor(String);
 
+// Manual impl so wire input is validated by `new` — the derived
+// transparent form would admit any string.
+impl<'de> Deserialize<'de> for Actor {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(de)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActorError {
+    Empty,
+    EmptySegment,
+    InvalidTokenChar { ch: char },
+    InvalidUuid { segment: String },
+    InvalidSequence,
+    TooManySegments,
+}
+
+impl fmt::Display for ActorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "actor is empty"),
+            Self::EmptySegment => write!(f, "actor has empty segment"),
+            Self::InvalidTokenChar { ch } => write!(f, "actor token contains invalid char {ch:?}"),
+            Self::InvalidUuid { segment } => write!(
+                f,
+                "actor segment {segment:?} where an 8-4-4-4-12 hex UUID is required \
+                 (multi-segment forms are `<token>:<uuid>[:<seq>]`; `daemon:<svc>` \
+                 takes exactly one suffix)"
+            ),
+            Self::InvalidSequence => write!(f, "actor call sequence must be ASCII decimal digits"),
+            Self::TooManySegments => write!(f, "actor has too many segments"),
+        }
+    }
+}
+
+impl std::error::Error for ActorError {}
+
 impl Actor {
-    /// Construct from a SPEC 07 §3.5.1 actor-variant string verbatim.
-    pub fn from_token(s: impl Into<String>) -> Self {
-        Self(s.into())
+    /// Validate a SPEC 07 / SPEC 12 actor shape without normalising it.
+    pub fn new(s: impl Into<String>) -> Result<Self, ActorError> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(ActorError::Empty);
+        }
+        let token = |s: &str| -> Result<(), ActorError> {
+            if s.is_empty() {
+                return Err(ActorError::EmptySegment);
+            }
+            for ch in s.chars() {
+                if !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')) {
+                    return Err(ActorError::InvalidTokenChar { ch });
+                }
+            }
+            Ok(())
+        };
+        let (first, rest) = s
+            .split_once(':')
+            .map_or((s.as_str(), None), |(a, b)| (a, Some(b)));
+        token(first)?;
+        if let Some(rest) = rest {
+            if rest.is_empty() {
+                return Err(ActorError::EmptySegment);
+            }
+            match first {
+                // The entire suffix is the deployment's principal, not segments.
+                "operator" => {}
+                // A single suffix is the SPEC 12 service token. With a
+                // sequence, the generic runtime shape can still apply;
+                // the syntax alone does not reserve runtime names.
+                "daemon" if !rest.contains(':') => token(rest)?,
+                _ => {
+                    let mut parts = rest.split(':');
+                    let uuid = parts.next().expect("non-empty suffix");
+                    if uuid.len() != 36
+                        || !uuid.bytes().enumerate().all(|(i, b)| {
+                            if matches!(i, 8 | 13 | 18 | 23) {
+                                b == b'-'
+                            } else {
+                                b.is_ascii_hexdigit()
+                            }
+                        })
+                    {
+                        return Err(ActorError::InvalidUuid {
+                            segment: uuid.to_string(),
+                        });
+                    }
+                    if let Some(seq) = parts.next()
+                        && (seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()))
+                    {
+                        return Err(ActorError::InvalidSequence);
+                    }
+                    if parts.next().is_some() {
+                        return Err(ActorError::TooManySegments);
+                    }
+                }
+            }
+        }
+        Ok(Self(s))
     }
 
-    /// Service-peer form (bare service name, e.g. `maild`).
-    pub fn service(svc: impl AsRef<str>) -> Self {
-        Self(svc.as_ref().to_string())
+    /// Validate an actor token, preserving its bytes.
+    pub fn from_token(s: impl Into<String>) -> Result<Self, ActorError> {
+        Self::new(s)
+    }
+
+    /// Service-peer token (e.g. `maild` or `maild:<uuid>`).
+    pub fn service(svc: impl AsRef<str>) -> Result<Self, ActorError> {
+        Self::new(svc.as_ref())
     }
 
     /// Human operator form `operator:<principal>`.
-    pub fn operator(principal: impl AsRef<str>) -> Self {
-        Self(format!("operator:{}", principal.as_ref()))
+    pub fn operator(principal: impl AsRef<str>) -> Result<Self, ActorError> {
+        Self::new(format!("operator:{}", principal.as_ref()))
     }
 
     /// Saga `complete` transition emitted by the owning daemon:
     /// `daemon:<svc>`.
-    pub fn daemon_complete(svc: impl AsRef<str>) -> Self {
-        Self(format!("daemon:{}", svc.as_ref()))
+    pub fn daemon_complete(svc: impl AsRef<str>) -> Result<Self, ActorError> {
+        Self::new(format!("daemon:{}", svc.as_ref()))
     }
 
     /// Synthetic reconcile event attribution: `daemon:reconciliation`.
     pub fn reconciliation() -> Self {
-        Self("daemon:reconciliation".to_string())
+        Self::new("daemon:reconciliation").expect("fixed reconciliation actor is valid")
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::str::FromStr for Actor {
+    type Err = ActorError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
     }
 }
 
@@ -513,12 +636,19 @@ mod tests {
     #[test]
     fn actor_serializes_as_flat_string() {
         let cases = [
-            (Actor::service("maild"), "maild"),
-            (Actor::operator("markc"), "operator:markc"),
-            (Actor::daemon_complete("maild"), "daemon:maild"),
+            (Actor::service("maild").expect("valid actor"), "maild"),
+            (
+                Actor::operator("markc").expect("valid actor"),
+                "operator:markc",
+            ),
+            (
+                Actor::daemon_complete("maild").expect("valid actor"),
+                "daemon:maild",
+            ),
             (Actor::reconciliation(), "daemon:reconciliation"),
             (
-                Actor::from_token("runtime:11111111-2222-3333-4444-555555555555:7"),
+                Actor::from_token("runtime:11111111-2222-3333-4444-555555555555:7")
+                    .expect("valid actor"),
                 "runtime:11111111-2222-3333-4444-555555555555:7",
             ),
         ];
@@ -527,6 +657,135 @@ mod tests {
             assert_eq!(j, want, "actor {a:?}");
             let back: Actor = serde_json::from_value(j).unwrap();
             assert_eq!(back, a);
+        }
+    }
+
+    const VALID_ACTORS: &[&str] = &[
+        "maild",
+        "maild.dkim",
+        "phase3-identity-tests",
+        "Runtime_2",
+        "maild:01900000-0000-7000-8000-000000000001",
+        "runtime:01900000-0000-7000-8000-000000000001",
+        "runtime:01900000-0000-7000-8000-000000000001:0",
+        "runtime:01900000-0000-7000-8000-000000000001:123",
+        // Existing fixture: validate UUID shape, not version or variant bits.
+        "runtime:11111111-2222-3333-4444-555555555555:7",
+        "runtime:ABCDEF01-2345-6789-ABCD-EF0123456789:0007",
+        "runtime:01900000-0000-7000-8000-000000000001:18446744073709551616",
+        "operator:alice",
+        "operator:uid-1000",
+        "operator:mesh:node.example",
+        "operator:部署 team/key:id::alice@example.org",
+        "operator: ",
+        "daemon:maild",
+        "daemon:maild.worker-1",
+        "daemon:reconciliation",
+        "daemon:01900000-0000-7000-8000-000000000001:7",
+        // Bare service tokens are ambiguous, even when named like a prefix.
+        "operator",
+        "daemon",
+    ];
+
+    const INVALID_ACTORS: &[&str] = &[
+        "",
+        " ",
+        "bad service",
+        "maild\n",
+        "maild/worker",
+        "máil",
+        ":maild",
+        "operator:",
+        "daemon:",
+        "daemon:bad service",
+        "daemon:maild:extra",
+        "runtime:",
+        "runtime:not-a-uuid",
+        "runtime::7",
+        "runtime:01900000000070008000000000000001",
+        "runtime:{01900000-0000-7000-8000-000000000001}",
+        "runtime:01900000_0000-7000-8000-000000000001",
+        "runtime:01900000-0000-7000-8000-00000000000g",
+        "runtime:01900000-0000-7000-8000-000000000001:",
+        "runtime:01900000-0000-7000-8000-000000000001:-1",
+        "runtime:01900000-0000-7000-8000-000000000001:+1",
+        "runtime:01900000-0000-7000-8000-000000000001:1.0",
+        "runtime:01900000-0000-7000-8000-000000000001:١",
+        "runtime:01900000-0000-7000-8000-000000000001:1:extra",
+    ];
+
+    #[test]
+    fn actor_valid_forms_round_trip() {
+        for &s in VALID_ACTORS {
+            let actor = Actor::new(s).unwrap();
+            assert_eq!(actor.as_str(), s);
+            assert_eq!(s.parse::<Actor>().unwrap(), actor);
+            assert_eq!(Actor::from_token(s).unwrap(), actor);
+            let wire = serde_json::json!(s);
+            assert_eq!(serde_json::to_value(&actor).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<Actor>(wire).unwrap(), actor);
+        }
+        assert!(Actor::service("").is_err());
+        assert!(Actor::operator("").is_err());
+        assert!(Actor::daemon_complete("").is_err());
+        assert_eq!(
+            Actor::operator("mesh:node.example").unwrap().as_str(),
+            "operator:mesh:node.example"
+        );
+    }
+
+    #[test]
+    fn actor_rejects_invalid_construction_and_serde() {
+        for &s in INVALID_ACTORS {
+            let error = Actor::new(s).unwrap_err();
+            assert_eq!(s.parse::<Actor>().unwrap_err(), error);
+            assert_eq!(Actor::from_token(s).unwrap_err(), error);
+            let error_text = error.to_string();
+            assert!(
+                serde_json::from_value::<Actor>(serde_json::json!(s))
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&error_text),
+                "input {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn actor_validation_nested_in_event_and_audit() {
+        let mut wire = serde_json::json!({
+            "namespace": "accounts", "key": "alice@example.org",
+            "kind": "created", "verb": "maild.props.set",
+            "version": 1, "nseq": 1, "audit_epoch": 0,
+            "actor": "maild", "at": "2026-05-11T12:00:00Z"
+        });
+        // Positive controls prove all the other required fields are valid.
+        for &s in VALID_ACTORS {
+            wire["actor"] = serde_json::json!(s);
+            let event: RecordEvent = serde_json::from_value(wire.clone()).unwrap();
+            let audit: AuditRow = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(event.actor.as_str(), s);
+            assert_eq!(audit.actor.as_str(), s);
+            assert_eq!(
+                serde_json::from_value::<RecordEvent>(serde_json::to_value(&event).unwrap())
+                    .unwrap(),
+                event
+            );
+            assert_eq!(
+                serde_json::from_value::<AuditRow>(serde_json::to_value(&audit).unwrap()).unwrap(),
+                audit
+            );
+        }
+        for &s in INVALID_ACTORS {
+            wire["actor"] = serde_json::json!(s);
+            assert!(
+                serde_json::from_value::<RecordEvent>(wire.clone()).is_err(),
+                "event actor {s:?}"
+            );
+            assert!(
+                serde_json::from_value::<AuditRow>(wire.clone()).is_err(),
+                "audit actor {s:?}"
+            );
         }
     }
 
@@ -540,7 +799,7 @@ mod tests {
             verb: EventKind::Created.verb_for("maild"),
             key: RecordKey::collection(ns(), "test@example.com"),
             lifecycle: Some(Lifecycle::Provisioning),
-            actor: Actor::operator("markc"),
+            actor: Actor::operator("markc").expect("valid actor"),
             fields_changed: vec!["email".into(), "spam_enabled".into()],
             secret_fields_changed_count: 1,
             at: ts(),
@@ -589,7 +848,7 @@ mod tests {
             verb: EventKind::Deleted.verb_for("maild"),
             key: RecordKey::collection(ns(), "u@h"),
             lifecycle: None,
-            actor: Actor::service("maild"),
+            actor: Actor::service("maild").expect("valid actor"),
             fields_changed: Vec::new(),
             secret_fields_changed_count: 0,
             at: ts(),
@@ -615,7 +874,7 @@ mod tests {
             version: Version(1),
             nseq: Nseq(1),
             audit_epoch: AuditEpoch::zero(),
-            actor: Actor::service("maild"),
+            actor: Actor::service("maild").expect("valid actor"),
             at: ts(),
             fields_changed: vec!["email".into()],
             audit_digest: "deadbeef".into(),

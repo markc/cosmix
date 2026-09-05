@@ -31,7 +31,7 @@ fn set_opts(merge: MergeMode) -> SetOpts {
     SetOpts {
         expected_version: Some(Version::zero()),
         merge,
-        actor: Actor::operator("test"),
+        actor: Actor::operator("test").expect("valid actor"),
         cause: None,
         ts_ms: 0,
     }
@@ -181,7 +181,7 @@ async fn delete_is_refused() {
             singleton_key(),
             DeleteOpts {
                 expected_version: None,
-                actor: Actor::operator("test"),
+                actor: Actor::operator("test").expect("valid actor"),
                 cause: None,
                 ts_ms: 1,
             },

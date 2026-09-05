@@ -482,9 +482,9 @@ fn register_runtime(
             return CapabilitySet::empty();
         }
         [
-            Capability::new(format!("props.read:{fqn}")),
-            Capability::new(format!("props.describe:{fqn}:public")),
-            Capability::new(format!("props.audit:{fqn}")),
+            Capability::new(format!("props.read:{fqn}")).expect("non-empty capability"),
+            Capability::new(format!("props.describe:{fqn}:public")).expect("non-empty capability"),
+            Capability::new(format!("props.audit:{fqn}")).expect("non-empty capability"),
         ]
         .into_iter()
         .collect()
@@ -634,7 +634,7 @@ async fn set_typed<T: Serialize>(
             SetOpts {
                 expected_version: Some(Version(expected)),
                 merge: MergeMode::Replace,
-                actor: Actor::daemon_complete("nspawnd"),
+                actor: Actor::daemon_complete("nspawnd").expect("valid actor"),
                 cause: Some(cause.into()),
                 ts_ms: Utc::now().timestamp_millis(),
             },
@@ -2046,10 +2046,21 @@ mod tests {
             ..Default::default()
         };
         let caps = store.instances.spec().auth.resolve(&peer);
-        assert!(caps.contains(&Capability::new("props.read:nspawnd.instances")));
-        assert!(caps.contains(&Capability::new("props.describe:nspawnd.instances:public")));
-        assert!(!caps.contains(&Capability::new("props.describe:nspawnd.instances")));
-        assert!(!caps.contains(&Capability::new("props.write:nspawnd.instances")));
+        assert!(caps.contains(
+            &Capability::new("props.read:nspawnd.instances").expect("non-empty capability")
+        ));
+        assert!(
+            caps.contains(
+                &Capability::new("props.describe:nspawnd.instances:public")
+                    .expect("non-empty capability")
+            )
+        );
+        assert!(!caps.contains(
+            &Capability::new("props.describe:nspawnd.instances").expect("non-empty capability")
+        ));
+        assert!(!caps.contains(
+            &Capability::new("props.write:nspawnd.instances").expect("non-empty capability")
+        ));
     }
 
     #[tokio::test]

@@ -372,7 +372,7 @@ mod tests {
         SetOpts {
             expected_version: Some(Version::zero()),
             merge: MergeMode::Patch,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms,
         }

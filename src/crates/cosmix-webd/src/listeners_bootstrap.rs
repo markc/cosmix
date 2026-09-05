@@ -112,7 +112,7 @@ pub async fn bootstrap_upsert_from_config(
                 SetOpts {
                     expected_version: Some(expected_version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("listeners_bootstrap".into()),
                     ts_ms,
                 },

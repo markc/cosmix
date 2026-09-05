@@ -406,7 +406,7 @@ async fn create_account(
     let opts = SetOpts {
         expected_version: Some(Version::zero()),
         merge: MergeMode::Replace,
-        actor: Actor::operator("e2e-test"),
+        actor: Actor::operator("e2e-test").expect("valid actor"),
         cause: Some("create test account".into()),
         ts_ms: 0,
     };

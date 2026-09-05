@@ -240,7 +240,7 @@ async fn vhost_add(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, String)
             SetOpts {
                 expected_version: Some(expected_version),
                 merge: MergeMode::Patch,
-                actor: Actor::service("webd"),
+                actor: Actor::service("webd").expect("valid actor"),
                 cause: Some("vhost.add".into()),
                 ts_ms,
             },
@@ -303,7 +303,7 @@ async fn vhost_remove(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, Stri
             key,
             DeleteOpts {
                 expected_version: Some(expected_version),
-                actor: Actor::service("webd"),
+                actor: Actor::service("webd").expect("valid actor"),
                 cause: Some("vhost.remove".into()),
                 ts_ms,
             },
@@ -575,7 +575,7 @@ fn peer_from_cmd(cmd: &IncomingCommand) -> PeerIdentity {
 fn has_cap(cmd: &IncomingCommand, cap: &str) -> bool {
     let peer = peer_from_cmd(cmd);
     let caps = resolve_caps_for_dispatch(&peer);
-    caps.contains(&Capability::from(cap.to_string()))
+    Capability::new(cap).is_ok_and(|cap| caps.contains(&cap))
 }
 
 /// Resolve the dispatch-time capability set for `peer`.
@@ -887,7 +887,7 @@ mod tests {
     /// Build a CapabilitySet from a slice of cap strings.
     fn caps_from(list: &[&str]) -> CapabilitySet {
         list.iter()
-            .map(|s| Capability::from((*s).to_string()))
+            .map(|s| Capability::new((*s).to_string()).expect("non-empty capability"))
             .collect()
     }
 
@@ -929,7 +929,7 @@ mod tests {
             "webd.acme.renew:webd.vhosts",
         ] {
             assert!(
-                caps.contains(&Capability::from(w.to_string())),
+                caps.contains(&Capability::new(w.to_string()).expect("non-empty capability")),
                 "default policy must declare {w}",
             );
         }

@@ -309,7 +309,7 @@ async fn create_account(built: &BuiltMaild, email: &str, password: &str) -> Resu
     let opts = SetOpts {
         expected_version: Some(Version::zero()),
         merge: MergeMode::Replace,
-        actor: Actor::operator("t20-test"),
+        actor: Actor::operator("t20-test").expect("valid actor"),
         cause: Some("create test account".into()),
         ts_ms: 0,
     };

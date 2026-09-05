@@ -266,7 +266,7 @@ async fn writeback_status(
                 SetOpts {
                     expected_version: Some(anchor),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("listener_reaction".into()),
                     ts_ms,
                 },

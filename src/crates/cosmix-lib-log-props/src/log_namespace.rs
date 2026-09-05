@@ -234,11 +234,15 @@ pub fn schema() -> PropertySchema {
 /// `<svc>.log` write/audit MUST be covered and `<svc>.log` write MUST
 /// NOT be cross-mesh-exposable by default.
 pub fn auth_policy(service: &str) -> AuthPolicy {
-    let read = Capability::from(format!("props.read:{service}.log"));
-    let describe_public = Capability::from(format!("props.describe:{service}.log:public"));
-    let describe_full = Capability::from(format!("props.describe:{service}.log:full"));
-    let write = Capability::from(format!("props.write:{service}.log"));
-    let audit = Capability::from(format!("props.audit:{service}.log"));
+    let read = Capability::new(format!("props.read:{service}.log")).expect("non-empty capability");
+    let describe_public = Capability::new(format!("props.describe:{service}.log:public"))
+        .expect("non-empty capability");
+    let describe_full = Capability::new(format!("props.describe:{service}.log:full"))
+        .expect("non-empty capability");
+    let write =
+        Capability::new(format!("props.write:{service}.log")).expect("non-empty capability");
+    let audit =
+        Capability::new(format!("props.audit:{service}.log")).expect("non-empty capability");
     let caps: CapabilitySet = [read, describe_public, describe_full, write, audit]
         .into_iter()
         .collect();
@@ -428,7 +432,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::operator("test"),
+                    actor: Actor::operator("test").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },

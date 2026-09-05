@@ -197,11 +197,13 @@ pub fn schema() -> PropertySchema {
 /// operator is explicitly named in maild config. Daemon backend-origin
 /// writes don't flow through `AuthPolicy` and are unaffected.
 pub fn auth_policy(operators: Vec<String>) -> AuthPolicy {
-    let read = Capability::from("props.read:maild.retention");
-    let describe_public = Capability::from("props.describe:maild.retention:public");
-    let describe_full = Capability::from("props.describe:maild.retention:full");
-    let audit = Capability::from("props.audit:maild.retention");
-    let write = Capability::from("props.write:maild.retention");
+    let read = Capability::new("props.read:maild.retention").expect("non-empty capability");
+    let describe_public =
+        Capability::new("props.describe:maild.retention:public").expect("non-empty capability");
+    let describe_full =
+        Capability::new("props.describe:maild.retention:full").expect("non-empty capability");
+    let audit = Capability::new("props.audit:maild.retention").expect("non-empty capability");
+    let write = Capability::new("props.write:maild.retention").expect("non-empty capability");
     AuthPolicy::new(move |peer: &PeerIdentity| {
         let mut caps = vec![
             read.clone(),
@@ -606,8 +608,8 @@ mod tests {
 
     #[test]
     fn auth_policy_gates_write_on_operator_allowlist() {
-        let write = Capability::from("props.write:maild.retention");
-        let read = Capability::from("props.read:maild.retention");
+        let write = Capability::new("props.write:maild.retention").expect("non-empty capability");
+        let read = Capability::new("props.read:maild.retention").expect("non-empty capability");
 
         // An operator-named peer gets write (can arm).
         let policy = auth_policy(vec!["ops-node".to_string()]);

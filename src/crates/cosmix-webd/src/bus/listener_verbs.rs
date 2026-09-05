@@ -100,7 +100,7 @@ async fn set_enabled(node: &Arc<NodeState>, cmd: &IncomingCommand, enabled: bool
                 SetOpts {
                     expected_version: Some(expected_version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some(cause.into()),
                     ts_ms: now_ms(),
                 },
@@ -186,7 +186,7 @@ async fn status(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, String) {
 fn has_cap(node: &Arc<NodeState>, cmd: &IncomingCommand, cap: &str) -> bool {
     let peer = peer_from_cmd(cmd);
     let caps: CapabilitySet = auth_policy("webd", node.listeners_operators.clone()).resolve(&peer);
-    caps.contains(&Capability::from(cap.to_string()))
+    Capability::new(cap).is_ok_and(|cap| caps.contains(&cap))
 }
 
 pub(crate) fn require_cap(

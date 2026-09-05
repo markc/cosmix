@@ -480,7 +480,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: cosmix_props::store::MergeMode::Replace,
-                    actor: Actor::operator("test"),
+                    actor: Actor::operator("test").expect("valid actor"),
                     cause: Some("test seed".into()),
                     ts_ms: 0,
                 },
@@ -657,7 +657,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: cosmix_props::store::MergeMode::Replace,
-                    actor: Actor::operator("test"),
+                    actor: Actor::operator("test").expect("valid actor"),
                     cause: Some("path-traversal probe".into()),
                     ts_ms: 0,
                 },

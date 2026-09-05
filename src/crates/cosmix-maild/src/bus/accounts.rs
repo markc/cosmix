@@ -182,7 +182,7 @@ async fn handle_set_lock(
             SetOpts {
                 expected_version: None,
                 merge: MergeMode::Patch,
-                actor: Actor::service("maild.accounts"),
+                actor: Actor::service("maild.accounts").expect("valid actor"),
                 cause: Some(cause.to_string()),
                 ts_ms: chrono::Utc::now().timestamp_millis(),
             },

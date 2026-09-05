@@ -238,6 +238,16 @@ impl Runtime {
         origin: WriteOrigin,
     ) -> Result<SetOutcome, RuntimeError> {
         self.validate_key(&key)?;
+        // Validate completion attribution before hooks or the first saga write.
+        // A bad owning service must not leave a committed provisioning row.
+        let complete_actor = if matches!(self.spec.lifecycle, NamespaceLifecycle::Saga) {
+            Some(
+                Actor::daemon_complete(&self.service)
+                    .map_err(|e| HookError::validation(format!("completion actor: {e}")))?,
+            )
+        } else {
+            None
+        };
         // SPEC 12 §4.4 — `require_version: true` makes `if_version`
         // mandatory. Refuse before any IO or hook side effects.
         if self.spec.require_version && opts.expected_version.is_none() {
@@ -355,7 +365,8 @@ impl Runtime {
                         key,
                         lifecycle: complete_lifecycle,
                         expected_version: record.version,
-                        actor: Actor::daemon_complete(&self.service),
+                        actor: complete_actor
+                            .expect("saga completion actor validated before write"),
                         cause: opts.cause,
                         ts_ms: opts.ts_ms,
                     })
@@ -621,7 +632,7 @@ mod tests {
         SetOpts {
             expected_version: Some(Version::zero()),
             merge: MergeMode::Patch,
-            actor: Actor::operator("markc"),
+            actor: Actor::operator("markc").expect("valid actor"),
             cause: None,
             ts_ms: 1_700_000_000_000,
         }
@@ -667,6 +678,30 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_completion_actor_refused_before_saga_write() {
+        let store: Arc<dyn PropertyStore> = Arc::new(MemoryStore::new("maild"));
+        let rt = Runtime::new("bad service", spec_saga(), Arc::clone(&store));
+        let key = RecordKey::collection(ns(), "alice@example.org");
+        let error = rt
+            .set(
+                key.clone(),
+                obj(&[("email", PropValue::from("alice@example.org"))]),
+                set_opts(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("completion actor"));
+        assert!(matches!(store.get(&key).await, Err(StoreError::NotFound)));
+        assert!(
+            store
+                .events_since(&ns(), crate::record::Nseq::zero())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -792,7 +827,7 @@ mod tests {
                 key.clone(),
                 DeleteOpts {
                     expected_version: Some(Version(1)),
-                    actor: Actor::operator("markc"),
+                    actor: Actor::operator("markc").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },
@@ -1038,7 +1073,7 @@ mod tests {
                 key,
                 DeleteOpts {
                     expected_version: None,
-                    actor: Actor::operator("markc"),
+                    actor: Actor::operator("markc").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },
@@ -1338,7 +1373,7 @@ mod tests {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Patch,
                 lifecycle: None,
-                actor: Actor::service("maild"),
+                actor: Actor::service("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1497,7 +1532,7 @@ mod tests {
             key,
             DeleteOpts {
                 expected_version: None,
-                actor: Actor::operator("markc"),
+                actor: Actor::operator("markc").expect("valid actor"),
                 cause: None,
                 ts_ms: 1_700_000_000_000,
             },

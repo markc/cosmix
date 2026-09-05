@@ -222,7 +222,7 @@ async fn write_row(
             SetOpts {
                 expected_version: Some(version),
                 merge: MergeMode::Replace,
-                actor: Actor::service("maild.dkim"),
+                actor: Actor::service("maild.dkim").expect("valid actor"),
                 cause: Some(cause.to_string()),
                 ts_ms: chrono::Utc::now().timestamp_millis(),
             },

@@ -1329,7 +1329,8 @@ impl PropertyStore for SqliteStore {
                         field_path,
                     },
                     lifecycle: lifecycle_from_cols(row.lifecycle_kind, row.lifecycle_reason)?,
-                    actor: Actor::from_token(row.actor),
+                    actor: Actor::from_token(row.actor)
+                        .map_err(|e| StoreError::storage(format!("actor decode: {e}")))?,
                     fields_changed,
                     secret_fields_changed_count: row.secret_fields_changed_count as u32,
                     at: ts_to_dt(row.at_ms),
@@ -1467,7 +1468,7 @@ mod tests {
             expected_version: expected,
             merge: MergeMode::Patch,
             lifecycle,
-            actor: Actor::service("maild"),
+            actor: Actor::service("maild").expect("valid actor"),
             cause: None,
             ts_ms: 1_700_000_000_000,
         }
@@ -1599,7 +1600,7 @@ mod tests {
             .commit_delete(DeleteCommit {
                 key: key.clone(),
                 expected_version: Some(Version(1)),
-                actor: Actor::service("maild"),
+                actor: Actor::service("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1642,7 +1643,7 @@ mod tests {
             .commit_delete(DeleteCommit {
                 key: key.clone(),
                 expected_version: Some(Version(1)),
-                actor: Actor::service("maild"),
+                actor: Actor::service("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1731,7 +1732,7 @@ mod tests {
             .commit_delete(DeleteCommit {
                 key: tomb_key.clone(),
                 expected_version: Some(Version(1)),
-                actor: Actor::service("maild"),
+                actor: Actor::service("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1781,7 +1782,7 @@ mod tests {
                 key: key.clone(),
                 lifecycle: Lifecycle::Active,
                 expected_version: Version(1),
-                actor: Actor::daemon_complete("maild"),
+                actor: Actor::daemon_complete("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1816,7 +1817,7 @@ mod tests {
                     reason: "mds seed failed".into(),
                 },
                 expected_version: Version(1),
-                actor: Actor::daemon_complete("maild"),
+                actor: Actor::daemon_complete("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1849,7 +1850,7 @@ mod tests {
                 key: key.clone(),
                 lifecycle: Lifecycle::Active,
                 expected_version: Version(99),
-                actor: Actor::daemon_complete("maild"),
+                actor: Actor::daemon_complete("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })
@@ -1903,6 +1904,38 @@ mod tests {
         assert_eq!(ev2.audit_epoch, AuditEpoch(1));
         assert_eq!(rec.version, Version(3));
         assert_eq!(store.audit_epoch(&ns()).await.unwrap(), AuditEpoch(1));
+    }
+
+    #[tokio::test]
+    async fn events_reject_malformed_persisted_actor() {
+        let store = open_store(DeleteMode::SoftDelete);
+        let key = RecordKey::collection(ns(), "alice@example.org");
+        store
+            .commit_set(set_commit(
+                key,
+                obj(&[("v", PropValue::from(1i64))]),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.events_since(&ns(), Nseq::zero()).await.unwrap().len(),
+            1
+        );
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE __props_events SET actor = ?1",
+                params!["runtime:broken"],
+            )
+            .unwrap();
+        let error = store.events_since(&ns(), Nseq::zero()).await.unwrap_err();
+        assert!(matches!(error, StoreError::Storage { .. }));
+        assert!(error.to_string().contains("actor decode"));
     }
 
     #[tokio::test]
@@ -1986,7 +2019,7 @@ mod tests {
             .commit_delete(DeleteCommit {
                 key: k1,
                 expected_version: Some(Version(1)),
-                actor: Actor::service("maild"),
+                actor: Actor::service("maild").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             })

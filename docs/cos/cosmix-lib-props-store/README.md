@@ -79,6 +79,46 @@ reconciliation promotes externally changed state.
 reconciled transitions. `Actor` records the initiating caller, service,
 operator, daemon completion, or reconciliation identity as a token.
 
+Since 0.2.2, `Capability::new` returns `Result<Capability, CapabilityError>`
+and rejects only the empty string. Capability vocabulary remains the
+deployment's responsibility: custom actions, scopes, whitespace and Unicode
+are preserved. Replace `Capability::from` / string `.into()` with fallible
+`Capability::try_from`, `Capability::new`, or `.parse()`. `CapabilitySet`
+may be empty; deserialising any empty member fails the whole set.
+
+`Actor::new`, `from_token`, `service`, `operator`, and `daemon_complete`
+return `Result<Actor, ActorError>`. `reconciliation()` remains infallible
+because its token is fixed. Constructors, `FromStr`, and JSON deserialisation
+share one validation gate per type; serialisation remains a flat string.
+Invalid actors also fail deserialisation inside `RecordEvent` and `AuditRow`.
+
+Actor accepts these shapes without changing their bytes:
+
+- `<svc>` or `<svc>:<uuid>` for daemon processes.
+- `<runtime>:<uuid>[:<call_seq>]` for agent sessions.
+- `operator:<principal>` with a non-empty, otherwise opaque principal
+  (including colons, spaces and Unicode).
+- `daemon:<svc>`, including `daemon:reconciliation`.
+
+Service/runtime tokens use ASCII letters, digits, dots, underscores and
+hyphens, preserving names such as `maild.dkim` and `webd-test`. UUIDs require
+the hyphenated `8-4-4-4-12` hexadecimal shape; a call sequence requires one
+or more ASCII decimal digits, without an integer-width limit. Empty parts,
+bad UUID shapes, non-decimal sequences and extra non-principal segments fail.
+Service instances and runtime sessions overlap syntactically, so this gate
+does not classify them, require UUIDv7, authenticate identities, or check
+sequence monotonicity. Those remain emitter/deployment responsibilities.
+Bare `operator` and `daemon` remain valid service tokens, and
+`daemon:<uuid>:<call_seq>` can satisfy the runtime shape.
+
+Malformed peer attribution returns `validation_error` before mutation.
+Saga completion attribution is validated before the initial write, and
+malformed actors read from SQLite history return a storage error. That
+storage error stalls the namespace's event dispatch and replay verbs at
+the offending row (writes continue); there is no skip or quarantine
+path — repairing a hand-edited history row means manual SQL against the
+event table, which breaks audit-digest continuity anyway (§11).
+
 ## Storage contract
 
 `PropertyStore` is the object-safe asynchronous storage trait. Its boxed

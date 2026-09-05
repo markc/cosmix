@@ -63,7 +63,9 @@ pub fn with_cross_mesh_grants(
         let core_caps = resolve_cross_mesh_caps(&cache, ident, namespace_id.as_str(), Utc::now());
         core_caps
             .iter()
-            .map(|c| Capability::new(c.as_str()))
+            // Core grants are opaque strings; malformed empty grants confer
+            // no capability and must not panic or fall back to the base policy.
+            .filter_map(|c| Capability::new(c.as_str()).ok())
             .collect::<CapabilitySet>()
     })
 }
@@ -141,9 +143,10 @@ mod tests {
     #[test]
     fn non_cross_mesh_peer_falls_through_to_base() {
         // signed_ident=None → base policy handles it.
-        let base_caps: CapabilitySet = [Capability::new("props.read:maild.accounts")]
-            .into_iter()
-            .collect();
+        let base_caps: CapabilitySet =
+            [Capability::new("props.read:maild.accounts").expect("non-empty capability")]
+                .into_iter()
+                .collect();
         let (base, count) = counting_base(base_caps.clone());
 
         let cache = TrustGrantsCache::for_testing(Snapshot::default());
@@ -157,9 +160,10 @@ mod tests {
     #[test]
     fn non_mesh_signed_ident_falls_through_to_base() {
         // signed_ident = "wg:..." or similar → base handles it.
-        let base_caps: CapabilitySet = [Capability::new("props.read:maild.accounts")]
-            .into_iter()
-            .collect();
+        let base_caps: CapabilitySet =
+            [Capability::new("props.read:maild.accounts").expect("non-empty capability")]
+                .into_iter()
+                .collect();
         let (base, count) = counting_base(base_caps.clone());
 
         let cache = TrustGrantsCache::for_testing(Snapshot::default());
@@ -176,9 +180,10 @@ mod tests {
         // contract is empty CapabilitySet, NOT fall-through — a
         // cross-mesh assertion is answered by the cross-mesh layer
         // alone, never by base.
-        let base_caps: CapabilitySet = [Capability::new("props.read:maild.accounts")]
-            .into_iter()
-            .collect();
+        let base_caps: CapabilitySet =
+            [Capability::new("props.read:maild.accounts").expect("non-empty capability")]
+                .into_iter()
+                .collect();
         let (base, count) = counting_base(base_caps);
 
         let cache = TrustGrantsCache::for_testing(Snapshot::default());
@@ -187,6 +192,26 @@ mod tests {
         let resolved = wrapped.resolve(&peer_with(Some("mesh:unknown.example")));
         assert!(resolved.is_empty());
         assert_eq!(count.load(Ordering::SeqCst), 0, "base must NOT be called");
+    }
+
+    #[test]
+    fn empty_cross_mesh_grant_confers_no_capability() {
+        let (base, count) = counting_base(CapabilitySet::empty());
+        let cache = TrustGrantsCache::for_testing(Snapshot::from_parts(
+            [trusted("node.example")],
+            [grant("node.example", &["", "props.read:maild.accounts"])],
+            [(
+                "maild.accounts".into(),
+                core_caps(&["", "props.read:maild.accounts"]),
+            )],
+        ));
+        let wrapped = with_cross_mesh_grants(base, "maild.accounts", cache.handle());
+        let resolved = wrapped.resolve(&peer_with(Some("mesh:node.example")));
+        assert_eq!(
+            resolved.iter().map(Capability::as_str).collect::<Vec<_>>(),
+            ["props.read:maild.accounts"]
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -211,8 +236,12 @@ mod tests {
 
         let resolved = wrapped.resolve(&peer_with(Some("mesh:channie.net")));
         assert_eq!(resolved.iter().count(), 1);
-        assert!(resolved.contains(&Capability::new("props.read:maild.accounts")));
-        assert!(!resolved.contains(&Capability::new("props.write:maild.accounts")));
+        assert!(resolved.contains(
+            &Capability::new("props.read:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(!resolved.contains(
+            &Capability::new("props.write:maild.accounts").expect("non-empty capability")
+        ));
     }
 
     #[test]
@@ -257,9 +286,10 @@ mod tests {
         // "mesh:" alone (empty fqdn) is a cross-mesh assertion for
         // an empty FQDN; the cache won't have a record, so empty
         // CapabilitySet is returned and base is NOT called.
-        let base_caps: CapabilitySet = [Capability::new("props.read:maild.accounts")]
-            .into_iter()
-            .collect();
+        let base_caps: CapabilitySet =
+            [Capability::new("props.read:maild.accounts").expect("non-empty capability")]
+                .into_iter()
+                .collect();
         let (base, count) = counting_base(base_caps);
         let cache = TrustGrantsCache::for_testing(Snapshot::default());
         let wrapped = with_cross_mesh_grants(base, "maild.accounts", cache.handle());
@@ -305,9 +335,17 @@ mod tests {
         let r_accounts = p_accounts.resolve(&peer);
         let r_engine = p_engine.resolve(&peer);
 
-        assert!(r_accounts.contains(&Capability::new("props.read:maild.accounts")));
-        assert!(!r_accounts.contains(&Capability::new("props.read:maild.engine_config")));
-        assert!(r_engine.contains(&Capability::new("props.read:maild.engine_config")));
-        assert!(!r_engine.contains(&Capability::new("props.read:maild.accounts")));
+        assert!(r_accounts.contains(
+            &Capability::new("props.read:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(!r_accounts.contains(
+            &Capability::new("props.read:maild.engine_config").expect("non-empty capability")
+        ));
+        assert!(r_engine.contains(
+            &Capability::new("props.read:maild.engine_config").expect("non-empty capability")
+        ));
+        assert!(!r_engine.contains(
+            &Capability::new("props.read:maild.accounts").expect("non-empty capability")
+        ));
     }
 }

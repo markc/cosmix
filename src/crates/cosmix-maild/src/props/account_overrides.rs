@@ -148,7 +148,7 @@ pub fn auth_policy() -> AuthPolicy {
             "props.audit:maild.account_overrides",
         ]
         .into_iter()
-        .map(Capability::from)
+        .map(|s| Capability::new(s).expect("non-empty capability"))
         .collect()
     }
     AuthPolicy::new(resolve)
@@ -635,7 +635,10 @@ mod tests {
             "props.describe:maild.account_overrides:full",
             "props.audit:maild.account_overrides",
         ] {
-            assert!(caps.contains(&Capability::from(c)), "cap {c} granted");
+            assert!(
+                caps.contains(&Capability::new(c).expect("non-empty capability")),
+                "cap {c} granted"
+            );
         }
     }
 
@@ -645,7 +648,7 @@ mod tests {
             old: None,
             new: Some(value),
             version: Version::zero(),
-            actor: Actor::service("test"),
+            actor: Actor::service("test").expect("valid actor"),
             merge: Some(cosmix_props::store::MergeMode::Replace),
             origin: cosmix_props::WriteOrigin::caller(),
         }
@@ -938,7 +941,7 @@ mod tests {
         let opts = SetOpts {
             expected_version: None,
             merge: MergeMode::Replace,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         };
@@ -1193,7 +1196,7 @@ mod tests {
         SetOpts {
             expected_version: None,
             merge: MergeMode::Replace,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         }
@@ -1259,7 +1262,7 @@ mod tests {
 
         let del_opts = DeleteOpts {
             expected_version: None,
-            actor: RecordActor::operator("test"),
+            actor: RecordActor::operator("test").expect("valid actor"),
             cause: Some("test:cascade".into()),
             ts_ms: 0,
         };
@@ -1323,7 +1326,7 @@ mod tests {
 
         let del_opts = DeleteOpts {
             expected_version: None,
-            actor: RecordActor::operator("test"),
+            actor: RecordActor::operator("test").expect("valid actor"),
             cause: Some("test:cascade-failure".into()),
             ts_ms: 0,
         };
@@ -1456,7 +1459,7 @@ mod tests {
         let acct_key = RecordKey::collection(crate::props::accounts::namespace_name(), email);
         let del_opts = DeleteOpts {
             expected_version: None,
-            actor: RecordActor::operator("test"),
+            actor: RecordActor::operator("test").expect("valid actor"),
             cause: Some("test:toctou".into()),
             ts_ms: 0,
         };
@@ -1532,7 +1535,7 @@ mod tests {
                         key_for(email),
                         DeleteOpts {
                             expected_version: None,
-                            actor: RecordActor::operator("test"),
+                            actor: RecordActor::operator("test").expect("valid actor"),
                             cause: Some("test:toctou-cleanup".into()),
                             ts_ms: 0,
                         },

@@ -626,7 +626,7 @@ mod identity_get_tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("phase3-identity-tests"),
+                    actor: Actor::service("phase3-identity-tests").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },

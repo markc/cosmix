@@ -167,7 +167,7 @@ pub async fn migrate_amp_runtime_rows(runtime: &Arc<Runtime>, ts_ms: i64) -> Res
                 SetOpts {
                     expected_version: Some(record.version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("amp→bus rename migration".into()),
                     ts_ms,
                 },
@@ -280,7 +280,7 @@ pub async fn bootstrap_upsert_from_config(
                 key,
                 DeleteOpts {
                     expected_version: Some(*version),
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("config_bootstrap orphan".into()),
                     ts_ms,
                 },
@@ -353,7 +353,7 @@ pub async fn bootstrap_upsert_from_config(
                 SetOpts {
                     expected_version: Some(expected_version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("config_bootstrap".into()),
                     ts_ms,
                 },
@@ -757,7 +757,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("test seed".into()),
                     ts_ms: 1_000,
                 },
@@ -835,7 +835,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(current_version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("simulated cert issuance".into()),
                     ts_ms: 2_000,
                 },
@@ -1042,7 +1042,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("test seed".into()),
                     ts_ms: 1_000,
                 },
@@ -1095,7 +1095,7 @@ mod tests {
                 key.clone(),
                 DeleteOpts {
                     expected_version: Some(live_v),
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("test remove".into()),
                     ts_ms: 2_000,
                 },
@@ -1251,7 +1251,7 @@ mod tests {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Replace,
                 lifecycle: None,
-                actor: Actor::service("webd"),
+                actor: Actor::service("webd").expect("valid actor"),
                 cause: Some("test seed (pre-rename daemon)".into()),
                 ts_ms: 1_000,
             })

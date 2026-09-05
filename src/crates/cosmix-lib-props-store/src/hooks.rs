@@ -225,7 +225,7 @@ mod tests {
             old: None,
             new: Some(PropValue::from("x")),
             version: Version::zero(),
-            actor: Actor::operator("delta"),
+            actor: Actor::operator("delta").expect("valid actor"),
             merge: Some(MergeMode::Replace),
             origin: WriteOrigin::caller(),
         }

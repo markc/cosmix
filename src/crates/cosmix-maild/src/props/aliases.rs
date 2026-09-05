@@ -112,7 +112,7 @@ pub fn auth_policy() -> AuthPolicy {
             "props.audit:maild.aliases",
         ]
         .into_iter()
-        .map(Capability::from)
+        .map(|s| Capability::new(s).expect("non-empty capability"))
         .collect()
     }
     AuthPolicy::new(resolve)
@@ -509,7 +509,7 @@ mod tests {
             old: None,
             new,
             version: Version::zero(),
-            actor: Actor::service("test"),
+            actor: Actor::service("test").expect("valid actor"),
             merge: Some(MergeMode::Replace),
             origin: cosmix_props::WriteOrigin::caller(),
         }
@@ -580,7 +580,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("test"),
+                    actor: Actor::service("test").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },
@@ -699,7 +699,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("test"),
+                    actor: Actor::service("test").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },
@@ -752,7 +752,7 @@ mod tests {
             SetOpts {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Replace,
-                actor: Actor::service("test"),
+                actor: Actor::service("test").expect("valid actor"),
                 cause: None,
                 ts_ms: 0,
             },

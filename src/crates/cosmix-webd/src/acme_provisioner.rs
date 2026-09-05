@@ -2193,7 +2193,7 @@ impl AcmeProvisioner {
                     // Version-pinned per the method-level docs.
                     expected_version: Some(current_version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("acme_runtime_writeback".into()),
                     ts_ms,
                 },
@@ -5140,7 +5140,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("webd-test"),
+                    actor: Actor::service("webd-test").expect("valid actor"),
                     cause: Some("v_o1_test".into()),
                     ts_ms: 0,
                 },

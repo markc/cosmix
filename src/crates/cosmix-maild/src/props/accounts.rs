@@ -601,7 +601,7 @@ impl HookHandler for AccountsHooks {
                 // attribute via `service("maild")` plus the cascade
                 // origin in `cause` so the audit stream shows the
                 // hop. See SPEC 12 §5.5 / §10.
-                actor: RecordActor::service("maild"),
+                actor: RecordActor::service("maild").expect("valid actor"),
                 cause: Some("maild.accounts.after_delete:cascade".into()),
                 ts_ms: 0,
             };
@@ -856,7 +856,7 @@ pub fn auth_policy() -> AuthPolicy {
             "props.audit:maild.accounts",
         ]
         .into_iter()
-        .map(Capability::from)
+        .map(|s| Capability::new(s).expect("non-empty capability"))
         .collect()
     }
     AuthPolicy::new(resolve)
@@ -936,12 +936,24 @@ mod tests {
     fn auth_policy_grants_phase1_caps() {
         let caps = auth_policy().resolve(&PeerIdentity::default());
         // Five-cap surface; phase 2+ narrows.
-        assert!(caps.contains(&Capability::from("props.read:maild.accounts")));
-        assert!(caps.contains(&Capability::from("props.write:maild.accounts")));
-        assert!(caps.contains(&Capability::from("props.describe:maild.accounts:public")));
-        assert!(caps.contains(&Capability::from("props.describe:maild.accounts:full")));
-        assert!(caps.contains(&Capability::from("props.audit:maild.accounts")));
-        assert!(!caps.contains(&Capability::from("props.write:maild.elsewhere")));
+        assert!(caps.contains(
+            &Capability::new("props.read:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(caps.contains(
+            &Capability::new("props.write:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(caps.contains(
+            &Capability::new("props.describe:maild.accounts:public").expect("non-empty capability")
+        ));
+        assert!(caps.contains(
+            &Capability::new("props.describe:maild.accounts:full").expect("non-empty capability")
+        ));
+        assert!(caps.contains(
+            &Capability::new("props.audit:maild.accounts").expect("non-empty capability")
+        ));
+        assert!(!caps.contains(
+            &Capability::new("props.write:maild.elsewhere").expect("non-empty capability")
+        ));
     }
 
     #[test]
@@ -1140,7 +1152,7 @@ mod tests {
         let opts = SetOpts {
             expected_version: None,
             merge: MergeMode::Replace,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         };
@@ -1220,7 +1232,7 @@ mod tests {
         let opts2 = SetOpts {
             expected_version: None,
             merge: MergeMode::Replace,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         };
@@ -1303,7 +1315,7 @@ mod tests {
         let opts = SetOpts {
             expected_version: None,
             merge: MergeMode::Replace,
-            actor: Actor::operator("test"),
+            actor: Actor::operator("test").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         };
@@ -1388,7 +1400,7 @@ mod tests {
             old: None,
             new: Some(PropValue::Object(Default::default())),
             version: Version::zero(),
-            actor: Actor::service("test"),
+            actor: Actor::service("test").expect("valid actor"),
             merge: Some(cosmix_props::store::MergeMode::Replace),
             origin: cosmix_props::WriteOrigin::caller(),
         };

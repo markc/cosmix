@@ -85,7 +85,7 @@ pub use value::PropValue;
 
 // SPEC 12 mutation surface — new in v0.2.
 pub use audit::{AuditKey, canonical_serialise, compute_digest, tombstone_value};
-pub use capability::{AuthDecision, Capability, CapabilitySet};
+pub use capability::{AuthDecision, Capability, CapabilityError, CapabilitySet};
 pub use hooks::{
     HookCtx, HookError, HookFuture, HookHandler, HookResult, Hooks, NoopHooks, WriteOrigin,
 };
@@ -98,8 +98,8 @@ pub use namespace::{
     SubscribePayload, Validator, ValidatorFn,
 };
 pub use record::{
-    Actor, AuditEpoch, AuditRow, EventKind, FieldPathSegment, Nseq, Record, RecordEvent, RecordKey,
-    Version,
+    Actor, ActorError, AuditEpoch, AuditRow, EventKind, FieldPathSegment, Nseq, Record,
+    RecordEvent, RecordKey, Version,
 };
 pub use runtime::{DeleteOpts, Runtime, RuntimeError, SetOpts, SetOutcome};
 pub use store::{

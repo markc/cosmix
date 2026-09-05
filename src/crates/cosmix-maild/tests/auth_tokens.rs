@@ -317,7 +317,7 @@ async fn create_account(built: &BuiltMaild, email: &str, password: &str) -> Resu
     let opts = SetOpts {
         expected_version: Some(Version::zero()),
         merge: MergeMode::Replace,
-        actor: Actor::operator("token-test"),
+        actor: Actor::operator("token-test").expect("valid actor"),
         cause: Some("create test account".into()),
         ts_ms: 0,
     };
@@ -345,7 +345,7 @@ async fn set_account_password(built: &BuiltMaild, email: &str, password: &str) -
     let opts = SetOpts {
         expected_version: None,
         merge: MergeMode::Replace,
-        actor: Actor::operator("token-test"),
+        actor: Actor::operator("token-test").expect("valid actor"),
         cause: Some("rotate test password".into()),
         ts_ms: 0,
     };

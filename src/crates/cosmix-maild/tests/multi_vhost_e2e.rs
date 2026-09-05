@@ -405,7 +405,7 @@ async fn seed_domain_row(
             SetOpts {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Replace,
-                actor: Actor::operator("multi-vhost-e2e"),
+                actor: Actor::operator("multi-vhost-e2e").expect("valid actor"),
                 cause: Some(format!("seed domain {domain}")),
                 ts_ms: 0,
             },
@@ -433,7 +433,7 @@ async fn create_account(built: &BuiltMaild, email: &str, password: &str) -> Resu
             SetOpts {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Replace,
-                actor: Actor::operator("multi-vhost-e2e"),
+                actor: Actor::operator("multi-vhost-e2e").expect("valid actor"),
                 cause: Some(format!("create {email}")),
                 ts_ms: 0,
             },

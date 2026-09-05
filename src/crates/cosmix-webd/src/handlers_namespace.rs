@@ -290,11 +290,16 @@ pub fn schema() -> PropertySchema {
 /// trust domain) gets the full read/write/describe/audit set, matching
 /// `webd.vhosts`. Cross-mesh authz narrows later without renaming caps.
 pub fn auth_policy(service: &str) -> AuthPolicy {
-    let read = Capability::from(format!("props.read:{service}.handlers"));
-    let write = Capability::from(format!("props.write:{service}.handlers"));
-    let describe_public = Capability::from(format!("props.describe:{service}.handlers:public"));
-    let describe_full = Capability::from(format!("props.describe:{service}.handlers:full"));
-    let audit = Capability::from(format!("props.audit:{service}.handlers"));
+    let read =
+        Capability::new(format!("props.read:{service}.handlers")).expect("non-empty capability");
+    let write =
+        Capability::new(format!("props.write:{service}.handlers")).expect("non-empty capability");
+    let describe_public = Capability::new(format!("props.describe:{service}.handlers:public"))
+        .expect("non-empty capability");
+    let describe_full = Capability::new(format!("props.describe:{service}.handlers:full"))
+        .expect("non-empty capability");
+    let audit =
+        Capability::new(format!("props.audit:{service}.handlers")).expect("non-empty capability");
     let caps: CapabilitySet = [read, write, describe_public, describe_full, audit]
         .into_iter()
         .collect();
@@ -677,7 +682,7 @@ pub async fn migrate_amp_capability_rows(runtime: &Runtime, ts_ms: i64) -> Resul
                 SetOpts {
                     expected_version: Some(record.version),
                     merge: MergeMode::Patch,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("amp→bus rename migration".into()),
                     ts_ms,
                 },
@@ -765,7 +770,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },
@@ -1050,7 +1055,7 @@ mod tests {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Replace,
                 lifecycle: None,
-                actor: Actor::service("webd"),
+                actor: Actor::service("webd").expect("valid actor"),
                 cause: Some("test seed (pre-rename daemon)".into()),
                 ts_ms: 1_000,
             })
@@ -1118,7 +1123,7 @@ mod tests {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
                     lifecycle: None,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("test seed (pre-rename daemon)".into()),
                     ts_ms: 1_000,
                 })

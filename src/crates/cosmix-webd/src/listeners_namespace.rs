@@ -308,12 +308,18 @@ pub fn schema() -> PropertySchema {
 /// `AuthPolicy`). Caps are named stably; the gate tightens when the
 /// cross-mesh principal model lands.
 pub fn auth_policy(service: &str, operators: Vec<String>) -> AuthPolicy {
-    let read_public = Capability::from(format!("props.read:{service}.listeners"));
-    let read_secrets = Capability::from(format!("props.read:{service}.listeners:secrets"));
-    let describe_public = Capability::from(format!("props.describe:{service}.listeners:public"));
-    let describe_full = Capability::from(format!("props.describe:{service}.listeners:full"));
-    let audit = Capability::from(format!("props.audit:{service}.listeners"));
-    let write = Capability::from(format!("props.write:{service}.listeners"));
+    let read_public =
+        Capability::new(format!("props.read:{service}.listeners")).expect("non-empty capability");
+    let read_secrets = Capability::new(format!("props.read:{service}.listeners:secrets"))
+        .expect("non-empty capability");
+    let describe_public = Capability::new(format!("props.describe:{service}.listeners:public"))
+        .expect("non-empty capability");
+    let describe_full = Capability::new(format!("props.describe:{service}.listeners:full"))
+        .expect("non-empty capability");
+    let audit =
+        Capability::new(format!("props.audit:{service}.listeners")).expect("non-empty capability");
+    let write =
+        Capability::new(format!("props.write:{service}.listeners")).expect("non-empty capability");
     AuthPolicy::new(move |peer: &PeerIdentity| {
         let mut caps = vec![
             read_public.clone(),
@@ -693,7 +699,7 @@ mod tests {
             old: None,
             new: Some(PropValue::Object(body)),
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: Some(MergeMode::Replace),
             origin: WriteOrigin::caller(),
         }
@@ -709,7 +715,7 @@ mod tests {
             old: Some(PropValue::Object(old)),
             new: Some(PropValue::Object(new)),
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: Some(MergeMode::Patch),
             origin: WriteOrigin::caller(),
         }
@@ -727,8 +733,10 @@ mod tests {
     #[test]
     fn auth_policy_gates_write_on_operator_allowlist() {
         let policy = auth_policy("webd", vec!["op-node".to_string()]);
-        let write = Capability::from("props.write:webd.listeners".to_string());
-        let read = Capability::from("props.read:webd.listeners".to_string());
+        let write = Capability::new("props.write:webd.listeners".to_string())
+            .expect("non-empty capability");
+        let read =
+            Capability::new("props.read:webd.listeners".to_string()).expect("non-empty capability");
 
         // Operator sender → write + read.
         let op = PeerIdentity {

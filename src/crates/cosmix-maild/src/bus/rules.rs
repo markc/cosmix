@@ -825,7 +825,7 @@ mod tests {
         let opts = SetOpts {
             expected_version: None,
             merge: MergeMode::Replace,
-            actor: Actor::service("maild-tests"),
+            actor: Actor::service("maild-tests").expect("valid actor"),
             cause: None,
             ts_ms: 0,
         };

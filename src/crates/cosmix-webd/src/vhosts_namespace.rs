@@ -486,12 +486,18 @@ pub fn schema() -> PropertySchema {
 /// backend-origin writes bypass that arm — the cross-field rules
 /// (rules 2-5) run on every write regardless of origin.
 pub fn auth_policy(service: &str) -> AuthPolicy {
-    let read_public = Capability::from(format!("props.read:{service}.vhosts"));
-    let read_secrets = Capability::from(format!("props.read:{service}.vhosts:secrets"));
-    let describe_public = Capability::from(format!("props.describe:{service}.vhosts:public"));
-    let describe_full = Capability::from(format!("props.describe:{service}.vhosts:full"));
-    let audit = Capability::from(format!("props.audit:{service}.vhosts"));
-    let write = Capability::from(format!("props.write:{service}.vhosts"));
+    let read_public =
+        Capability::new(format!("props.read:{service}.vhosts")).expect("non-empty capability");
+    let read_secrets = Capability::new(format!("props.read:{service}.vhosts:secrets"))
+        .expect("non-empty capability");
+    let describe_public = Capability::new(format!("props.describe:{service}.vhosts:public"))
+        .expect("non-empty capability");
+    let describe_full = Capability::new(format!("props.describe:{service}.vhosts:full"))
+        .expect("non-empty capability");
+    let audit =
+        Capability::new(format!("props.audit:{service}.vhosts")).expect("non-empty capability");
+    let write =
+        Capability::new(format!("props.write:{service}.vhosts")).expect("non-empty capability");
     // C5 — narrow cap gating the `webd.acme.renew` ergonomic verb
     // ([`crate::bus::vhost_verbs`]). NOT a `props.*` cap because the
     // verb is daemon-internal kick semantics, not a substrate row
@@ -500,13 +506,15 @@ pub fn auth_policy(service: &str) -> AuthPolicy {
     // Naming follows the spec's "cross-mesh authz narrows later
     // without renaming caps" rule: the wire shape stays stable when
     // the policy graduates from "every WG peer" to a tighter scope.
-    let acme_renew = Capability::from(format!("webd.acme.renew:{service}.vhosts"));
+    let acme_renew =
+        Capability::new(format!("webd.acme.renew:{service}.vhosts")).expect("non-empty capability");
     // Narrow cap gating the `webd.session.revoke` ergonomic verb
     // ([`crate::bus::session_verbs`]) — cookie-path session revocation
     // (2026-07 audit). Same non-`props.*` rationale as `acme_renew`:
     // it mutates runtime security state (the per-vhost `session_epochs`
     // table), not a substrate row.
-    let session_revoke = Capability::from(format!("webd.session.revoke:{service}.vhosts"));
+    let session_revoke = Capability::new(format!("webd.session.revoke:{service}.vhosts"))
+        .expect("non-empty capability");
     let caps: CapabilitySet = [
         read_public,
         read_secrets,
@@ -1306,7 +1314,7 @@ mod tests {
         ];
         for w in want {
             assert!(
-                caps.contains(&Capability::from(w.to_string())),
+                caps.contains(&Capability::new(w.to_string()).expect("non-empty capability")),
                 "missing cap {w}; got {caps:?}",
             );
         }
@@ -1323,7 +1331,8 @@ mod tests {
     fn auth_policy_grants_write_cap_with_validating_hook() {
         let policy = auth_policy("webd");
         let caps = policy.resolve(&PeerIdentity::default());
-        let write_cap = Capability::from("props.write:webd.vhosts".to_string());
+        let write_cap =
+            Capability::new("props.write:webd.vhosts".to_string()).expect("non-empty capability");
         assert!(
             caps.contains(&write_cap),
             "C1c grants the write cap — validating hook defends it. Got: {caps:?}",
@@ -1506,7 +1515,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("webd"),
+                    actor: Actor::service("webd").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },
@@ -1555,7 +1564,7 @@ mod tests {
             old: None,
             new: Some(PropValue::Object(body)),
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: Some(MergeMode::Replace),
             origin: WriteOrigin::caller(),
         }
@@ -1975,7 +1984,7 @@ mod tests {
             old: Some(PropValue::Object(prior)),
             new: Some(PropValue::Object(patch)),
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: Some(MergeMode::Patch),
             origin: WriteOrigin::caller(),
         };
@@ -2005,7 +2014,7 @@ mod tests {
             old: Some(PropValue::Object(prior_obj)),
             new: Some(PropValue::Object(patch)),
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: Some(MergeMode::Patch),
             origin: WriteOrigin::caller(),
         };
@@ -2040,7 +2049,7 @@ mod tests {
                     // refuse before any hook or storage IO.
                     expected_version: None,
                     merge: MergeMode::Replace,
-                    actor: Actor::operator("test-operator"),
+                    actor: Actor::operator("test-operator").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },
@@ -2088,7 +2097,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::operator("test-operator"),
+                    actor: Actor::operator("test-operator").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },
@@ -2204,7 +2213,7 @@ mod tests {
             old: Some(PropValue::Object(minimal_acme_body("a.example.com"))),
             new: None,
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: None,
             origin: WriteOrigin::caller(),
         };
@@ -2231,7 +2240,7 @@ mod tests {
             old: Some(PropValue::Object(minimal_acme_body("a.example.com"))),
             new: None,
             version: Version::zero(),
-            actor: Actor::operator("test-operator"),
+            actor: Actor::operator("test-operator").expect("valid actor"),
             merge: None,
             origin: WriteOrigin::caller(),
         };
@@ -2273,7 +2282,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::operator("test-operator"),
+                    actor: Actor::operator("test-operator").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },
@@ -2318,7 +2327,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::operator("test-operator"),
+                    actor: Actor::operator("test-operator").expect("valid actor"),
                     cause: Some("seed".into()),
                     ts_ms: 0,
                 },
@@ -2343,7 +2352,7 @@ mod tests {
                 key,
                 DeleteOpts {
                     expected_version: Some(cur_version),
-                    actor: Actor::operator("test-operator"),
+                    actor: Actor::operator("test-operator").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },

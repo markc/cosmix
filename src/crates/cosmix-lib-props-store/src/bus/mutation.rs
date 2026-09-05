@@ -333,7 +333,10 @@ impl PropsRouter {
         let opts = SetOpts {
             expected_version,
             merge,
-            actor: peer_actor(peer, &self.service),
+            actor: match peer_actor(peer, &self.service) {
+                Ok(actor) => actor,
+                Err(e) => return err(ErrorCode::ValidationError, e.to_string()),
+            },
             cause: req.get("cause").map(|s| s.to_string()),
             ts_ms: now_ms(),
         };
@@ -390,7 +393,10 @@ impl PropsRouter {
 
         let opts = DeleteOpts {
             expected_version,
-            actor: peer_actor(peer, &self.service),
+            actor: match peer_actor(peer, &self.service) {
+                Ok(actor) => actor,
+                Err(e) => return err(ErrorCode::ValidationError, e.to_string()),
+            },
             cause: req.get("cause").map(|s| s.to_string()),
             ts_ms: now_ms(),
         };
@@ -858,7 +864,7 @@ fn cap(spec: &NamespaceSpec, service: &str, action: &str, scope: Option<&str>) -
         Some(scope) => format!("props.{action}:{fqn}:{scope}"),
         None => format!("props.{action}:{fqn}"),
     };
-    Capability::new(s)
+    Capability::new(s).expect("non-empty capability")
 }
 
 fn require_cap(
@@ -962,11 +968,14 @@ fn parse_set_body(body: &str) -> Result<PropValue, PropsResponse> {
 /// Service peers register a `service_name`; the broker is the source of
 /// truth for that field per §7.3. Human operators carry `unix_uid` and
 /// are surfaced as `operator:uid-<n>` until a SPEC 10 signed principal
-/// arrives. Anonymous peers (neither service nor unix) fall back to a
-/// bare `operator:anonymous` token — this is benign because the
+/// arrives. Anonymous peers (neither service nor unix) fall back to the
+/// owning service token — this is benign because the
 /// capability check has already happened by the time we reach here, so
 /// only authorised callers ever materialise an event row.
-fn peer_actor(peer: &PeerIdentity, fallback_service: &str) -> Actor {
+fn peer_actor(
+    peer: &PeerIdentity,
+    fallback_service: &str,
+) -> Result<Actor, crate::record::ActorError> {
     if let Some(svc) = peer.service_name.as_deref() {
         return Actor::service(svc);
     }
@@ -1429,13 +1438,15 @@ mod tests {
         ];
         strings
             .iter()
-            .map(|s| Capability::from(*s))
+            .map(|s| Capability::new(*s).expect("non-empty capability"))
             .collect::<CapabilitySet>()
     }
 
     /// Capability-issuing fixture parameterised on a fixed set.
     fn caps_from(list: &[&str]) -> CapabilitySet {
-        list.iter().map(|s| Capability::from(*s)).collect()
+        list.iter()
+            .map(|s| Capability::new(*s).expect("non-empty capability"))
+            .collect()
     }
 
     fn spec_simple() -> NamespaceSpec {
@@ -1490,6 +1501,73 @@ mod tests {
         PeerIdentity {
             unix_uid: Some(1000),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_peer_actor_refused_before_mutation() {
+        let (router, store) = router_with(spec_simple());
+        for peer in [
+            PeerIdentity {
+                service_name: Some("bad service".into()),
+                ..Default::default()
+            },
+            PeerIdentity {
+                signed_ident: Some(String::new()),
+                ..Default::default()
+            },
+        ] {
+            for verb in ["set", "delete"] {
+                let response = router
+                    .dispatch(
+                        verb,
+                        &req(
+                            &[("namespace", "accounts"), ("key", "alice@example.org")],
+                            r#"{"email":"alice@example.org"}"#,
+                        ),
+                        &peer,
+                    )
+                    .await;
+                assert_eq!(body_json(&response)["error_code"], "validation_error");
+                assert!(
+                    body_json(&response)["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("actor")
+                );
+            }
+        }
+        assert!(
+            store
+                .events_since(&ns_name(), Nseq::zero())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn peer_actor_preserves_existing_identity_forms() {
+        let cases = [
+            (
+                PeerIdentity {
+                    service_name: Some("maild.dkim".into()),
+                    ..Default::default()
+                },
+                "maild.dkim",
+            ),
+            (
+                PeerIdentity {
+                    signed_ident: Some("mesh:node.example".into()),
+                    ..Default::default()
+                },
+                "operator:mesh:node.example",
+            ),
+            (peer(), "operator:uid-1000"),
+            (PeerIdentity::default(), "maild"),
+        ];
+        for (peer, expected) in cases {
+            assert_eq!(peer_actor(&peer, "maild").unwrap().as_str(), expected);
         }
     }
 
@@ -2555,7 +2633,7 @@ mod tests {
         fn read_only(_p: &PeerIdentity) -> CapabilitySet {
             ["props.read:maild.accounts"]
                 .iter()
-                .map(|s| Capability::from(*s))
+                .map(|s| Capability::new(*s).expect("non-empty capability"))
                 .collect()
         }
         spec.auth = AuthPolicy::new(read_only);

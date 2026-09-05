@@ -227,7 +227,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("test"),
+                    actor: Actor::service("test").expect("valid actor"),
                     cause: Some("test".into()),
                     ts_ms: 0,
                 },

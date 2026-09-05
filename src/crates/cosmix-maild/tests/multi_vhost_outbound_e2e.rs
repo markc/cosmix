@@ -497,7 +497,7 @@ async fn seed_domain_row(built: &BuiltMaild, domain: &str, helo_identity: &str) 
             SetOpts {
                 expected_version: Some(Version::zero()),
                 merge: MergeMode::Replace,
-                actor: Actor::operator("multi-vhost-outbound-e2e"),
+                actor: Actor::operator("multi-vhost-outbound-e2e").expect("valid actor"),
                 cause: Some(format!("seed sender domain {domain}")),
                 ts_ms: 0,
             },

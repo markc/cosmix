@@ -460,7 +460,7 @@ pub fn auth_policy() -> AuthPolicy {
             "props.audit:maild.domains",
         ]
         .into_iter()
-        .map(Capability::from)
+        .map(|s| Capability::new(s).expect("non-empty capability"))
         .collect()
     }
     AuthPolicy::new(resolve)
@@ -1310,7 +1310,7 @@ mod tests {
             old,
             new: Some(new),
             version: Version::zero(),
-            actor: Actor::service("test"),
+            actor: Actor::service("test").expect("valid actor"),
             merge: Some(merge),
             origin: cosmix_props::WriteOrigin::caller(),
         }
@@ -2112,7 +2112,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("test"),
+                    actor: Actor::service("test").expect("valid actor"),
                     cause: None,
                     ts_ms: 0,
                 },
@@ -2140,7 +2140,7 @@ mod tests {
                 SetOpts {
                     expected_version: Some(create.set_event.version),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("test"),
+                    actor: Actor::service("test").expect("valid actor"),
                     cause: None,
                     ts_ms: 1,
                 },
@@ -2176,12 +2176,17 @@ mod tests {
             "props.describe:maild.domains:full",
             "props.audit:maild.domains",
         ] {
-            assert!(caps.contains(&Capability::from(want)), "missing cap {want}");
+            assert!(
+                caps.contains(&Capability::new(want).expect("non-empty capability")),
+                "missing cap {want}"
+            );
         }
         // `props.read:maild.domains:secrets` intentionally absent in
         // Phase 2 — no secret-bucketed fields yet (`dkim_keys` is
         // Phase 4).
-        assert!(!caps.contains(&Capability::from("props.read:maild.domains:secrets")));
+        assert!(!caps.contains(
+            &Capability::new("props.read:maild.domains:secrets").expect("non-empty capability")
+        ));
     }
 
     #[test]

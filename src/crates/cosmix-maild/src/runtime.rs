@@ -496,7 +496,7 @@ pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild
                 SetOpts {
                     expected_version: Some(Version::zero()),
                     merge: MergeMode::Replace,
-                    actor: Actor::service("maild"),
+                    actor: Actor::service("maild").expect("valid actor"),
                     cause: Some("engine_config bootstrap".into()),
                     ts_ms: now_ms,
                 },
