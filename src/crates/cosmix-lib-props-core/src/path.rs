@@ -5,9 +5,24 @@ use std::fmt;
 
 /// A validated dotted property path. Segments are lowercase
 /// alphanumeric + `_`; the wildcard `*` is reserved.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
+// INVARIANT: every value originates from `new` (FromStr and Deserialize
+// both route through it); Serialize stays derived-transparent on that
+// basis. No other constructor may set this field.
 pub struct PropPath(String);
+
+// Manual impl so wire input is validated by `new` — the derived
+// transparent form would admit any string.
+impl<'de> Deserialize<'de> for PropPath {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(de)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropPathError {
@@ -125,6 +140,61 @@ mod tests {
         for (s, want) in cases {
             assert_eq!(PropPath::new(s).unwrap_err(), want, "input {s}");
         }
+    }
+
+    #[test]
+    fn serde_rejects_invalid() {
+        for j in ["", "a..b", ".a", "Foo", "a-b", "foo.*", "a.b*c"] {
+            assert!(
+                serde_json::from_value::<PropPath>(serde_json::json!(j)).is_err(),
+                "should reject {j:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn serde_round_trips_valid() {
+        let p: PropPath = serde_json::from_value(serde_json::json!("config.bind")).unwrap();
+        assert_eq!(p.as_str(), "config.bind");
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::json!("config.bind")
+        );
+    }
+
+    #[test]
+    fn serde_rejects_invalid_nested_in_describe() {
+        use crate::describe::PropDescribe;
+        // Invalid `path` field.
+        let j = serde_json::json!({
+            "path": "Bad Path",
+            "type": "string",
+            "mutable": false,
+            "sensitive": false,
+            "description": ""
+        });
+        assert!(serde_json::from_value::<PropDescribe>(j).is_err());
+        // Invalid entry inside `children`.
+        let j = serde_json::json!({
+            "path": "config",
+            "type": "object",
+            "mutable": false,
+            "sensitive": false,
+            "description": "",
+            "children": ["config.ok", "config.*"]
+        });
+        assert!(serde_json::from_value::<PropDescribe>(j).is_err());
+        // Valid nested form still deserialises.
+        let j = serde_json::json!({
+            "path": "config",
+            "type": "object",
+            "mutable": false,
+            "sensitive": false,
+            "description": "",
+            "children": ["config.bind"]
+        });
+        let d: PropDescribe = serde_json::from_value(j).unwrap();
+        assert_eq!(d.path.as_str(), "config");
     }
 
     #[test]

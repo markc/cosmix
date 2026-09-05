@@ -37,9 +37,24 @@ use cosmix_props_core::value::PropValue;
 /// The fully-qualified form `<service>.<name>` is constructed via
 /// [`NamespaceName::qualified`] and is NOT a separate type; it is only
 /// used as a string in capability vocabularies and event verbs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
+// INVARIANT: every value originates from `new` (FromStr and Deserialize
+// both route through it); Serialize stays derived-transparent on that
+// basis. No other constructor may set this field.
 pub struct NamespaceName(String);
+
+// Manual impl so wire input is validated by `new` — the derived
+// transparent form would admit any string.
+impl<'de> Deserialize<'de> for NamespaceName {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(de)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceNameError {
@@ -845,6 +860,36 @@ mod tests {
                 ch: '-'
             }
         );
+    }
+
+    #[test]
+    fn name_serde_rejects_invalid() {
+        for j in ["", "a..b", "Accounts", "9accounts", "acc-ounts"] {
+            assert!(
+                serde_json::from_value::<NamespaceName>(serde_json::json!(j)).is_err(),
+                "should reject {j:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_serde_round_trips_valid() {
+        let n: NamespaceName = serde_json::from_value(serde_json::json!("audit.entries")).unwrap();
+        assert_eq!(n.as_str(), "audit.entries");
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            serde_json::json!("audit.entries")
+        );
+    }
+
+    #[test]
+    fn name_serde_rejects_invalid_nested_in_record_key() {
+        use crate::record::RecordKey;
+        let j = serde_json::json!({"namespace": "Bad Namespace", "key": "k"});
+        assert!(serde_json::from_value::<RecordKey>(j).is_err());
+        let j = serde_json::json!({"namespace": "accounts", "key": "k"});
+        let rk: RecordKey = serde_json::from_value(j).unwrap();
+        assert_eq!(rk.namespace.as_str(), "accounts");
     }
 
     #[test]
