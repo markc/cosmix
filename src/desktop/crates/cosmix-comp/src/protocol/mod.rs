@@ -338,6 +338,17 @@ impl StackBand {
             WlrLayer::Overlay => Self::Overlay,
         }
     }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Bottom => "bottom",
+            Self::Normal => "normal",
+            Self::Top => "top",
+            Self::Overlay => "overlay",
+            Self::Lock => "lock",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -12571,6 +12582,58 @@ impl WaylandState {
             return;
         };
         self.restack_role_tree(surface, band, "wayland.focus");
+    }
+
+    /// Move a mapped toplevel between the two operator-reachable stack bands
+    /// (a bottom-band window sits behind every normal window — the
+    /// "maximised game behind the desktop" mode). Returns the (old, new)
+    /// band names, or `None` when no live mapped toplevel has this id.
+    /// A same-band set is a successful no-op; raise-on-click keeps working
+    /// unchanged because `raise_surface` restacks within the record's own
+    /// band, so a demoted window can never climb above normal windows by
+    /// being focused.
+    pub(crate) fn set_window_band(
+        &mut self,
+        id: SurfaceId,
+        band: StackBand,
+        cause: &'static str,
+    ) -> Option<(&'static str, &'static str)> {
+        let object = self.surface_objects.get(&id)?.clone();
+        let record = self.surfaces.get(&object)?;
+        if !matches!(record.role, SurfaceRole::Toplevel(_)) || !record.mapped {
+            return None;
+        }
+        let old = record.layout.z.band;
+        if old == band {
+            return Some((old.name(), band.name()));
+        }
+        let surface = record.role.wl_surface().clone();
+        self.restack_role_tree(&surface, band, cause);
+        Some((old.name(), band.name()))
+    }
+
+    /// Corner supremacy: a Quoin corner must always be reachable, so the
+    /// moment a corner activates, any active pointer constraint — locked or
+    /// confined — is broken. The activation policy in
+    /// `PointerConstraintsHandler::new_constraint` is deliberately open
+    /// (agentic-first law); this is its one unconditional counterpart, and
+    /// it protects the corner rather than asking a human to.
+    pub(crate) fn break_pointer_constraint_for_corner(&mut self) {
+        let Some(surface) = self
+            .pointer
+            .current_focus()
+            .and_then(|focus| focus.owned_surface())
+        else {
+            return;
+        };
+        let pointer = self.pointer.clone();
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && constraint.is_active()
+            {
+                constraint.deactivate();
+            }
+        });
     }
 
     fn layer_root_object_for_surface(&self, surface: &WlSurface) -> Option<ObjectId> {

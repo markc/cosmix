@@ -182,6 +182,7 @@ pub(crate) struct WindowSnapshot {
     pub(crate) maximized: bool,
     pub(crate) minimized: bool,
     pub(crate) output: Option<String>,
+    pub(crate) band: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -436,6 +437,7 @@ flat_snapshot!(
     maximized,
     minimized,
     output,
+    band,
 );
 flat_snapshot!(
     FocusSnapshot,
@@ -725,6 +727,7 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         maximized: surface.maximized,
         minimized: surface.minimized,
         output: surface.output.clone(),
+        band: surface.band,
     }
 }
 
@@ -1359,6 +1362,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         String,
         "Output key or null"
     ),
+    descriptor!(&[L("windows"), S, L("band")], String, "Compositor stack band; writable as bottom|normal to demote a window behind all normal windows or restore it", enum = &["background", "bottom", "normal", "top", "overlay", "lock"]),
     descriptor!(
         &[L("stack")],
         List,
@@ -1947,6 +1951,7 @@ mod tests {
                 maximized: toplevel.maximized,
                 minimized: toplevel.minimized,
                 output: toplevel.output.clone(),
+                band: toplevel.band,
             },
         );
         CompSnapshot {

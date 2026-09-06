@@ -976,7 +976,7 @@ fn handle_incoming(
                 return;
             }
         };
-        if let Err(error) = port_observation::validate_corner_value(&path, &value) {
+        if let Err(error) = port_observation::validate_set_request(&path, &value) {
             queue_reply(
                 reply_sender,
                 reply_timeouts,

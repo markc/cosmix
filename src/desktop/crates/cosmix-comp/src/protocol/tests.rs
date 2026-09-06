@@ -28039,6 +28039,175 @@ fn xwayland_enabled_persist_round_trips_through_a_tempdir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Bottom-band demotion end to end (`windows.s<id>.band`): the set demotes
+/// a mapped toplevel behind every normal window and `normal` restores it;
+/// the reply, the record's stack key, the changed-event lane and
+/// raise-on-focus all agree. This is the "maximised game behind the
+/// desktop" mode: a demoted window can be focused and raised but never
+/// climbs above the Bottom band.
+#[cfg(feature = "bus")]
+#[test]
+fn window_band_prop_demotes_and_restores_toplevels() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let first_id = test_toplevel_record(&harness).id;
+    let (_, _, _, second_object) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let second_id = harness
+        .server
+        .state
+        .surfaces
+        .get(&second_object)
+        .expect("second toplevel tracked")
+        .id;
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    // The window-row diff lane runs against the watched baseline, so hold a
+    // props watch like any real consumer (Quoin, the wallpaper) would.
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    runtime.block_on(watch.receive()).expect("watch reply");
+    drain_observations(&observations);
+    let stack_key = |harness: &KeybindingHarness, id: SurfaceId| {
+        harness
+            .server
+            .state
+            .surfaces
+            .values()
+            .find(|record| record.id == id)
+            .expect("record remains tracked")
+            .layout
+            .z
+    };
+    let band_path = format!("windows.s{}.band", first_id.0);
+    assert_eq!(stack_key(&harness, first_id).band, StackBand::Normal);
+    assert!(
+        stack_key(&harness, first_id) < stack_key(&harness, second_id),
+        "later-mapped Beta starts above Alpha"
+    );
+
+    // Demote Alpha: structured reply, drops below Beta, changed events flow
+    // through the same window-row diff lane as every other window mutation.
+    let set = ingress
+        .request_set(band_path.clone(), json!("bottom"))
+        .expect("set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("set service cycle");
+    let (rc, body) = runtime
+        .block_on(set.receive())
+        .expect("set reply")
+        .into_wire();
+    assert_eq!(rc, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"path": band_path, "old": "normal", "new": "bottom"})
+    );
+    assert_eq!(stack_key(&harness, first_id).band, StackBand::Bottom);
+    assert!(stack_key(&harness, first_id) < stack_key(&harness, second_id));
+    // The restack marks surfaces/stack dirty; the observation flush turns
+    // that into props.changed events on the next service pass.
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged {
+                path,
+                cause: "props.set",
+                ..
+            } if *path == band_path
+        )),
+        "band change reaches props.changed: {changed:?}"
+    );
+
+    // Raise-on-focus restacks within the record's own band only.
+    let alpha_surface = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| record.id == first_id)
+        .and_then(|record| record.role.toplevel().map(|role| role.wl_surface().clone()))
+        .expect("alpha wl surface");
+    harness.server.state.raise_surface(&alpha_surface);
+    assert_eq!(stack_key(&harness, first_id).band, StackBand::Bottom);
+    assert!(stack_key(&harness, first_id) < stack_key(&harness, second_id));
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    // A same-band set succeeds without publishing anything.
+    let no_op = ingress
+        .request_set(band_path.clone(), json!("bottom"))
+        .expect("no-op set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("no-op service cycle");
+    let (rc, body) = runtime
+        .block_on(no_op.receive())
+        .expect("no-op reply")
+        .into_wire();
+    assert_eq!(rc, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"path": band_path, "old": "bottom", "new": "bottom"})
+    );
+    assert!(drain_observations(&observations).is_empty());
+
+    // Restore: Alpha re-enters Normal with a fresh key, so it lands on top.
+    let restore = ingress
+        .request_set(band_path.clone(), json!("normal"))
+        .expect("restore admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("restore service cycle");
+    let (rc, _) = runtime
+        .block_on(restore.receive())
+        .expect("restore reply")
+        .into_wire();
+    assert_eq!(rc, 0);
+    assert_eq!(stack_key(&harness, first_id).band, StackBand::Normal);
+    assert!(stack_key(&harness, first_id) > stack_key(&harness, second_id));
+    drain_observations(&observations);
+
+    // Garbage band values and unknown window ids are structured refusals.
+    let bad_value = ingress
+        .request_set(band_path, json!("overlay"))
+        .expect("bad value reaches the service");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("bad value cycle");
+    let (rc, body) = runtime
+        .block_on(bad_value.receive())
+        .expect("bad value reply")
+        .into_wire();
+    assert_eq!(rc, 10);
+    assert!(body.contains("invalid_value"), "{body}");
+    let missing = ingress
+        .request_set("windows.s999999.band".into(), json!("bottom"))
+        .expect("missing window reaches the service");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("missing window cycle");
+    let (rc, body) = runtime
+        .block_on(missing.receive())
+        .expect("missing window reply")
+        .into_wire();
+    assert_eq!(rc, 10);
+    assert!(body.contains("a live toplevel window"), "{body}");
+}
+
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
 /// event, no-op dedup, validation, and the startup gate it feeds. The
 /// PERSISTED half (the etc-tree file) is deliberately not driven here —

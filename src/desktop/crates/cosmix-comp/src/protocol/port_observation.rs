@@ -25,7 +25,7 @@ use tokio::sync::Notify;
 use crate::port::{ControlReply, PortControl, PortSetRequest};
 
 use super::{
-    SurfaceId, WaylandState,
+    StackBand, SurfaceId, WaylandState,
     corner::{Corner, CornerConfig, CornerDetector, CornerEvent},
     port_snapshot::{
         BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
@@ -923,6 +923,7 @@ impl WaylandState {
             };
             match event {
                 CornerEvent::Entered { corner, dwell_ms } => {
+                    self.break_pointer_constraint_for_corner();
                     self.emit_corner_entered(output, corner, dwell_ms);
                 }
                 CornerEvent::Left { corner, dwell_ms } => {
@@ -1753,6 +1754,11 @@ fn diff_window_row(
             prop_opt_string(old.output.as_deref()),
             prop_opt_string(new.output.as_deref()),
         ),
+        (
+            "band",
+            PropValue::String(old.band.into()),
+            PropValue::String(new.band.into()),
+        ),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -1942,6 +1948,10 @@ fn service_set(
         service_set_xwayland_enabled(state, request, changes);
         return;
     }
+    if let Some(window) = parse_window_band_path(&path) {
+        service_set_window_band(state, request, window);
+        return;
+    }
     let old_config = state.observations.corner_config;
     let mut new_config = old_config;
     let validated = match validate_corner_value(&path, &request.value) {
@@ -2040,6 +2050,42 @@ fn service_set_xwayland_enabled(
     }
 }
 
+/// The `windows.s<id>.band` set: restack the window's whole role tree into
+/// the requested band. No explicit prop-change queueing — the restack marks
+/// the surface and stack dirty, and the observation flush diffs the window
+/// row against the watched baseline, so `windows.s<id>.band` and `stack`
+/// changed events flow through the same lane as every other window mutation.
+/// Runtime state only: a band assignment is never persisted.
+fn service_set_window_band(state: &mut WaylandState, request: &mut PortSetRequest, window: u64) {
+    let path = request.path.clone();
+    let band = match validate_window_band_value(&path, &request.value) {
+        Ok(band) => band,
+        Err(error) => {
+            if let Some(reply) = request.reply.take() {
+                let _ = reply.send(ControlReply::Validation(error));
+            }
+            return;
+        }
+    };
+    let outcome = state.set_window_band(SurfaceId(window), band, "props.set");
+    let reply_value = match outcome {
+        Some((old, new)) => ControlReply::Set {
+            path,
+            old: PropValue::String(old.into()),
+            new: PropValue::String(new.into()),
+            persisted: None,
+        },
+        None => ControlReply::Validation(invalid_value(
+            &path,
+            "existing window id",
+            "a live toplevel window",
+        )),
+    };
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(reply_value);
+    }
+}
+
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     flush_prop_changes(state, changes);
     if let Some(baseline) = state.observations.watched_baseline.as_mut() {
@@ -2049,6 +2095,53 @@ fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
             baseline.xwayland.enabled = state.xwayland.enabled;
         }
     }
+}
+
+/// Parse a `windows.s<id>.band` write path into the window's surface id.
+/// Only this exact shape is writable; every other `windows.*` path stays
+/// read-only through `known_read_only_path`.
+pub(crate) fn parse_window_band_path(path: &str) -> Option<u64> {
+    let id = path.strip_prefix("windows.s")?.strip_suffix(".band")?;
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
+}
+
+/// A window band write accepts exactly the two operator-reachable bands:
+/// `bottom` (behind every normal window; Quoin corners stay live because
+/// they are compositor-side hotspots) and `normal`. The other bands belong
+/// to layer-shell and session-lock surfaces, never to toplevels.
+pub(crate) fn validate_window_band_value(
+    path: &str,
+    value: &Value,
+) -> Result<StackBand, SetValidationError> {
+    match value.as_str() {
+        Some("bottom") => Ok(StackBand::Bottom),
+        Some("normal") => Ok(StackBand::Normal),
+        _ => Err(invalid_value(path, "string", "bottom|normal")),
+    }
+}
+
+/// The one ingress-side gate for `comp.props.set`: admits every writable
+/// leaf family (corner config, the window band leaf, and — with the
+/// feature — `xwayland.enabled`, whose service arm previously existed but
+/// was unreachable because this gate only knew corner paths). Value
+/// validation is repeated by the service arms; state-dependent checks
+/// (does the window exist) belong to the service, not this gate.
+pub(crate) fn validate_set_request(path: &str, value: &Value) -> Result<(), SetValidationError> {
+    #[cfg(feature = "xwayland")]
+    if path == "xwayland.enabled" {
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(invalid_value(path, "bool", "true|false"))
+        };
+    }
+    if parse_window_band_path(path).is_some() {
+        return validate_window_band_value(path, value).map(|_| ());
+    }
+    validate_corner_value(path, value).map(|_| ())
 }
 
 pub(crate) fn validate_corner_value(
@@ -2167,6 +2260,69 @@ mod tests {
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,
     };
+
+    mod set_request_validation {
+        use super::super::*;
+        use serde_json::json;
+
+        #[test]
+        fn window_band_path_parses_only_the_exact_writable_shape() {
+            assert_eq!(parse_window_band_path("windows.s12.band"), Some(12));
+            assert_eq!(parse_window_band_path("windows.s0.band"), Some(0));
+            assert_eq!(parse_window_band_path("windows.s.band"), None);
+            assert_eq!(parse_window_band_path("windows.s12.title"), None);
+            assert_eq!(parse_window_band_path("windows.s1x2.band"), None);
+            assert_eq!(parse_window_band_path("windows.12.band"), None);
+            assert_eq!(parse_window_band_path("surfaces.s12.band"), None);
+            assert_eq!(parse_window_band_path("windows.s12.band.extra"), None);
+        }
+
+        #[test]
+        fn window_band_value_accepts_exactly_the_operator_bands() {
+            assert_eq!(
+                validate_window_band_value("windows.s1.band", &json!("bottom")),
+                Ok(StackBand::Bottom)
+            );
+            assert_eq!(
+                validate_window_band_value("windows.s1.band", &json!("normal")),
+                Ok(StackBand::Normal)
+            );
+            for refused in [json!("top"), json!("overlay"), json!("lock"), json!(1)] {
+                assert!(matches!(
+                    validate_window_band_value("windows.s1.band", &refused),
+                    Err(SetValidationError::InvalidValue { .. })
+                ));
+            }
+        }
+
+        #[test]
+        fn ingress_gate_admits_every_writable_leaf_family() {
+            assert!(validate_set_request("input.corners.enabled", &json!(true)).is_ok());
+            assert!(validate_set_request("windows.s7.band", &json!("bottom")).is_ok());
+            // Other window leaves stay read-only, unknown stays unknown.
+            assert!(matches!(
+                validate_set_request("windows.s7.title", &json!("x")),
+                Err(SetValidationError::ReadOnly)
+            ));
+            assert!(matches!(
+                validate_set_request("nonsense.path", &json!(true)),
+                Err(SetValidationError::UnknownPath)
+            ));
+        }
+
+        /// The regression this gate refactor fixed: `xwayland.enabled` had a
+        /// complete service arm that the wire-level gate could never reach,
+        /// because the old ingress validation only knew corner paths.
+        #[cfg(feature = "xwayland")]
+        #[test]
+        fn ingress_gate_admits_the_xwayland_leaf_it_previously_rejected() {
+            assert!(validate_set_request("xwayland.enabled", &json!(false)).is_ok());
+            assert!(matches!(
+                validate_set_request("xwayland.enabled", &json!("nope")),
+                Err(SetValidationError::InvalidValue { .. })
+            ));
+        }
+    }
 
     use super::*;
 
