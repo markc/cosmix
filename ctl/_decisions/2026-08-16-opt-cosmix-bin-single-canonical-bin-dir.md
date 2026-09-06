@@ -129,13 +129,13 @@ stop and think about.
   `PrivateUsers=off` (D3's deliberate call — DRM/VT ioctls do init-userns
   `capable()` checks) the CT's root holds CAP_SYS_ADMIN in the init userns,
   and `mount -o remount,rw,bind /opt/cosmix/bin` succeeds — **live-proven on
-  desk1 2026-08-16** (remounted rw, verified, restored ro; no writes made).
+  the desk CT, 2026-08-16** (remounted rw, verified, restored ro; no writes made).
   A compromised desk-CT root can therefore tamper with every canonical host
   binary, `mix` (root's login shell) included. Under the dist scheme the
   same remount only exposed the disposable trio staging dir — this decision
   raises the stakes, it did not create the hole. No clean containment
   exists inside D3: dropping CAP_SYS_ADMIN breaks `Boot=yes` (systemd must
   mount API filesystems) and userns mount-locking is what D3 traded away.
-  **Accepted for desk1 as a local, Mark-only experimental instance; a desk
+  **Accepted for the desk CT as a local, operator-only experimental instance; a desk
   CT must never run untrusted workloads while this bind + PrivateUsers=off
   combination stands. Revisit at V-3.**
