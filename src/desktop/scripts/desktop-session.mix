@@ -1,0 +1,30 @@
+-- Run with mix --serve desktop-session.mix --name desktop-SESSION.
+-- Bind its systemd unit and clipboard-owner children to the desktop lifetime.
+$desktop = require("lib/desktop.mix")
+$config_path = env("DESKTOP_SESSION_CONFIG")
+if $config_path == "" then raise("DESKTOP_CONFIG", "DESKTOP_SESSION_CONFIG is required") end
+$session_context = $desktop.session_config(load_data($config_path))
+
+fn respond()
+  $plan = $desktop.prepare($session_context, $event.command, $event.headers, $event.args, byte_length($event.body))
+  if $plan.action == nil then
+    reply($plan.rc, json_encode($plan.body))
+  else
+    $result = run_argv($plan.argv, $plan.options)
+    $response = $desktop.finish($session_context, $plan, $result)
+    reply($response.rc, json_encode($response.body))
+  end
+end
+
+on desktop.capabilities
+  respond()
+end
+on desktop.clipboard.read
+  respond()
+end
+on desktop.clipboard.write
+  respond()
+end
+on desktop.open
+  respond()
+end

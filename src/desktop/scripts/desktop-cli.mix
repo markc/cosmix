@@ -1,0 +1,27 @@
+-- Explicit Bus operations. Clipboard content is never printed or stored here.
+-- usage: mix desktop-cli.mix capabilities TARGET | copy SOURCE TARGET | open TARGET URL
+$a = args()
+$request = {}
+if len($a) == 2 and $a[0] == "capabilities" then
+  $request = {operation:"capabilities", target:$a[1]}
+elif len($a) == 3 and $a[0] == "copy" then
+  $request = {operation:"copy", source:$a[1], target:$a[2]}
+elif len($a) == 3 and $a[0] == "open" then
+  $request = {operation:"open", target:$a[1], url:$a[2]}
+else
+  raise("DESKTOP_ARGS", "capabilities TARGET | copy SOURCE TARGET | open TARGET URL")
+end
+-- A one-shot registered citizen avoids anonymous calls and deregisters on quit.
+$worker = env("DESKTOP_REQUEST_WORKER")
+if $worker == "" and env("COSMIX") != "" then
+  $worker = env("COSMIX") .. "/src/desktop/scripts/desktop-request.mix"
+end
+if not starts_with($worker, "/") or not is_file($worker) then
+  raise("DESKTOP_CONFIG", "set COSMIX to the checkout root or DESKTOP_REQUEST_WORKER to the installed worker")
+end
+$desktop = require("lib/desktop.mix")
+-- Linux desktop: use this exact executable, including checkout installations.
+$interpreter = "/proc/" .. to_string(pid()) .. "/exe"
+$result = run_argv([$interpreter,"--serve",$worker,"--name",$desktop.client_name()],
+  {timeout:40, env:{DESKTOP_REQUEST:json_encode($request), MIX_STATS:"off"}, stdout:"inherit", stderr:"null"})
+if not $result.ok then raise("DESKTOP_REQUEST_FAILED", "Bus operation failed; no automatic retry") end

@@ -1,0 +1,51 @@
+-- Deterministic production validation/response tests; no clipboard or browser.
+$d = require("../lib/desktop.mix")
+$ctx = {session:"test",instance:"instance-one",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true"}
+$headers = {broker_origin:"local",from:"desktopctl-test"}
+fn check($condition, $message)
+  if not $condition then raise("DESKTOP_TEST", $message) end
+end
+$configured = $d.session_config({session:"test",opener:"/usr/bin/true"})
+check(type($configured) == "map" and $configured.session == "test" and type($configured.instance) == "string","session configuration failed")
+for each $i in range(1,100)
+  $name = $d.client_name()
+  check(byte_length($name) <= 31 and re_match($name,"^[a-z][a-z0-9-]{1,30}$"),"client name rejected by current noded")
+end
+for each $verb in ["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.open"]
+  for each $bad in [{},{from:"desktopctl-test"},{broker_origin:"mesh",from:"desktopctl-test"},{broker_origin:"local"},{broker_origin:"local",from:"fake.remote.bus"}]
+    check($d.prepare($ctx,$verb,$bad,{},2).rc == 13,"untrusted caller accepted")
+  end
+end
+check($d.prepare($ctx,"desktop.capabilities",$headers,{},2).body.instance == $ctx.instance,"missing instance")
+for each $bad in [nil,[],"text",{unknown:true}]
+  check($d.prepare($ctx,"desktop.capabilities",$headers,$bad,2).rc == 10,"invalid capability request")
+end
+check($d.prepare($ctx,"desktop.capabilities",$headers,{},400001).rc == 10,"oversize envelope")
+check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:"old"},2).rc == 12,"stale instance accepted")
+check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:$ctx.instance,path:"/etc/passwd"},2).rc == 10,"injected field accepted")
+for each $text in ["", "  café\n\n", repeat("é",32768)]
+  $plan = $d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100)
+  check($plan.action == "write" and $plan.options.stdin == $text,"text modified")
+  check(len($plan.argv) == 3 and $plan.options.stdout == "null" and $plan.options.stderr == "null","text leaked to argv/output")
+end
+for each $text in [repeat("é",32769),json_parse("\"\\u0000\""),{},42]
+  check($d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100).rc == 10,"invalid text accepted")
+end
+for each $url in ["https://example.org/a?x=1&y=2", "http://localhost:1234/callback", "https://example.org/$(literal)"]
+  $plan = $d.prepare($ctx,"desktop.open",$headers,{instance:$ctx.instance,url:$url},100)
+  check($plan.action == "open" and deep_eq($plan.argv,[$ctx.opener,$url]),"URL argv not preserved")
+end
+for each $url in ["file:///tmp/a","javascript:alert(1)","--help","https://","https:///oops","https://x/\n",repeat("x",8193),nil]
+  check($d.prepare($ctx,"desktop.open",$headers,{instance:$ctx.instance,url:$url},100).rc == 10,"unsafe URL accepted")
+end
+$plan = {action:"read"}
+$result = {ok:true,stdout:"  café\n\n",stdout_truncated:false,utf8_lossy:false}
+check($d.finish($ctx,$plan,$result).body.text == $result.stdout,"read whitespace lost")
+$result.stdout_truncated = true
+check($d.finish($ctx,$plan,$result).rc == 10,"truncated clipboard accepted")
+$result.stdout_truncated = false
+$result.utf8_lossy = true
+check($d.finish($ctx,$plan,$result).rc == 10,"lossy clipboard accepted")
+check($d.finish($ctx,{action:"open"},{ok:false,timed_out:true}).body.error == "ACTION_OUTCOME_UNKNOWN","ambiguous timeout called success")
+check($d.finish($ctx,{action:"write"},{ok:false,timed_out:false}).rc == 11,"failed write called success")
+print("PASS desktop caller gates, schema, session identity, text limits, argv, redaction and outcome checks")

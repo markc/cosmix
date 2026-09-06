@@ -1,0 +1,40 @@
+-- Internal one-shot worker for desktop-cli.mix; no positional arguments in serve mode.
+$request = json_parse(env("DESKTOP_REQUEST"))
+fn rpc($target, $verb, $body)
+  send $target $verb body=json_encode($body) timeout=8
+  if $rc != 0 then
+    -- Raw replies can contain clipboard contents or URLs. Never print them.
+    raise("DESKTOP_RPC", "Bus operation failed rc=" .. to_string($rc))
+  end
+  if type($result) == "string" then return json_parse($result) end
+  return $result
+end
+fn target_ok($target)
+  return type($target) == "string" and re_match($target, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+end
+if type($request) != "map" or not target_ok($request.target) then
+  raise("DESKTOP_ARGS", "local target service required")
+end
+$destination = rpc($request.target, "desktop.capabilities", {})
+if $destination.api_version != 1 or type($destination.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported capability response") end
+if $request.operation == "capabilities" then
+  print(json_encode($destination))
+elif $request.operation == "copy" then
+  if not target_ok($request.source) or $request.source == $request.target then raise("DESKTOP_ARGS", "distinct local source and target required") end
+  $source = rpc($request.source, "desktop.capabilities", {})
+  if $source.api_version != 1 or type($source.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported source response") end
+  $clipboard = rpc($request.source, "desktop.clipboard.read", {instance:$source.instance})
+  if $clipboard.instance != $source.instance or $clipboard.mime != "text/plain;charset=utf-8" or type($clipboard.text) != "string" or byte_length($clipboard.text) > 65536 then
+    raise("DESKTOP_PROTOCOL", "invalid clipboard response")
+  end
+  $reply = rpc($request.target, "desktop.clipboard.write", {instance:$destination.instance,text:$clipboard.text})
+  if $reply.instance != $destination.instance or $reply.accepted != true then raise("DESKTOP_PROTOCOL", "write not accepted") end
+  print(json_encode({operation:"copy", accepted:true, bytes:byte_length($clipboard.text)}))
+elif $request.operation == "open" then
+  $reply = rpc($request.target, "desktop.open", {instance:$destination.instance,url:$request.url})
+  if $reply.instance != $destination.instance or $reply.accepted != true then raise("DESKTOP_PROTOCOL", "open not accepted") end
+  print(json_encode({operation:"open",accepted:true}))
+else
+  raise("DESKTOP_ARGS", "unknown operation")
+end
+quit()

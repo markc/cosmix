@@ -1,0 +1,96 @@
+-- Desktop Bus capability provider v0.1.0. Trusted session configuration only.
+-- Requests never select executable paths, environment, display or session bus.
+$_nul = json_parse("\"\\u0000\"")
+fn error($code, $status)
+  return {rc:$status, body:{error:$code}}
+end
+
+fn client_name()
+  -- 80 random bits, within noded's 31-character service-name limit.
+  return "desktopctl-" .. slice(replace(uuid(),"-",""),0,20)
+end
+
+fn session_config($config)
+  if type($config) != "map" or type($config.session) != "string" or not re_match($config.session, "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$") then
+    raise("DESKTOP_CONFIG", "session must be a short Bus-safe name")
+  end
+  $opener = $config.opener
+  if type($opener) != "string" or not starts_with($opener, "/") then
+    raise("DESKTOP_CONFIG", "opener must be an absolute executable path")
+  end
+  return {session:$config.session, instance:uuid(), max_bytes:65536,
+    wayland:env("WAYLAND_DISPLAY"), runtime:env("XDG_RUNTIME_DIR"),
+    copy:which("wl-copy"), paste:which("wl-paste"), opener:$opener}
+end
+
+fn keys_are($body, $expected)
+  if type($body) != "map" or len(keys($body)) != len($expected) then return false end
+  for each $key in keys($body)
+    if not contains($expected, $key) then return false end
+  end
+  return true
+end
+
+fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
+  -- noded overwrites these headers. Mesh ingress currently removes `from`;
+  -- there is deliberately no remote-name allowlist or forged identity fallback.
+  if $headers.broker_origin != "local" or type($headers.from) != "string" or not re_match($headers.from, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$") then
+    return error("LOCAL_REGISTERED_CALLER_REQUIRED", 13)
+  end
+  if $raw_bytes > 400000 then return error("REQUEST_TOO_LARGE", 10) end
+  if $verb == "desktop.capabilities" then
+    if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
+    $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
+    return {rc:0, body:{api_version:1, implementation_version:"0.1.0", session:$ctx.session,
+      instance:$ctx.instance, access:"registered-local", max_text_bytes:$ctx.max_bytes,
+      clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8"},
+      open:{configured:is_executable($ctx.opener), schemes:["http","https"]},
+      verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.open"]}}
+  end
+  $expected = ["instance"]
+  if $verb == "desktop.clipboard.write" then $expected = ["instance","text"]
+  elif $verb == "desktop.open" then $expected = ["instance","url"]
+  elif $verb != "desktop.clipboard.read" then return error("UNKNOWN_COMMAND", 10) end
+  if not keys_are($body, $expected) then return error("INVALID_REQUEST", 10) end
+  if $body.instance != $ctx.instance then return error("STALE_SESSION", 12) end
+  if $verb == "desktop.open" then
+    if type($body.url) != "string" or byte_length($body.url) > 8192 or not re_match($body.url, "^https?://[^/?#[:space:][:cntrl:]]+([/?#][^[:space:][:cntrl:]]*)?$") then
+      return error("INVALID_HTTP_URL", 10)
+    end
+    if not is_executable($ctx.opener) then return error("OPENER_UNAVAILABLE", 11) end
+    return {action:"open", argv:[$ctx.opener,$body.url], options:{timeout:5, stdin:{null:true}, stdout:"null", stderr:"null"}}
+  end
+  if $ctx.copy == nil or $ctx.paste == nil or $ctx.wayland == "" or $ctx.runtime == "" then
+    return error("CLIPBOARD_UNAVAILABLE", 11)
+  end
+  if $verb == "desktop.clipboard.read" then
+    return {action:"read", argv:[$ctx.paste,"--no-newline","--type","text"],
+      options:{timeout:5, stdin:{null:true}, max_output:$ctx.max_bytes + 1, stderr:"null"}}
+  end
+  if type($body.text) != "string" or byte_length($body.text) > $ctx.max_bytes or contains($body.text, $_nul) then
+    return error("INVALID_CLIPBOARD_TEXT", 10)
+  end
+  return {action:"write", bytes:byte_length($body.text), argv:[$ctx.copy,"--type","text/plain;charset=utf-8"],
+    options:{timeout:5, stdin:$body.text, stdout:"null", stderr:"null"}}
+end
+
+fn is_executable($path)
+  return run_argv(["test","-x",$path], {timeout:2, stdout:"null", stderr:"null"}).ok
+end
+
+fn finish($ctx, $plan, $result)
+  if not $result.ok then
+    if $result.timed_out then return error("ACTION_OUTCOME_UNKNOWN", 20) end
+    return error("HELPER_FAILED", 11)
+  end
+  if $plan.action == "read" then
+    if $result.stdout_truncated or $result.utf8_lossy or byte_length($result.stdout) > $ctx.max_bytes or contains($result.stdout, $_nul) then
+      return error("INVALID_CLIPBOARD_TEXT", 10)
+    end
+    return {rc:0, body:{instance:$ctx.instance, mime:"text/plain;charset=utf-8", text:$result.stdout, bytes:byte_length($result.stdout)}}
+  end
+  if $plan.action == "write" then
+    return {rc:0, body:{instance:$ctx.instance, accepted:true, bytes:$plan.bytes}}
+  end
+  return {rc:0, body:{instance:$ctx.instance, accepted:true}}
+end

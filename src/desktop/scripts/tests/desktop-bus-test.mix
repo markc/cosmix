@@ -1,0 +1,95 @@
+-- Real isolated noded + two session citizens + production CLI. Synthetic helpers
+-- only: never connects to a user's Wayland clipboard or opens a real browser.
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$scripts = $root .. "/src/desktop/scripts"
+$tmp = trim(run_argv_must(["mktemp","-d","/tmp/cosmix-desktop-test.XXXXXXXX"]))
+$tag = uuid()
+$broker = "desktop-bus-test-" .. $tag
+$units = [$broker, $broker .. "-one", $broker .. "-two"]
+$port = random(46000,46999)
+$node = $tmp .. "/node.conf.mix"
+$env = {COSMIX:$root,COSMIX_NODE_CONFIG:$node,MIX_STATS:"off"}
+write_file($node,json_encode({node:"desktop-test",wg_ip:"",mesh:"desktop-test.invalid",noded:{port:$port,admission:"off"}}))
+$_mkdir = run_argv_must(["mkdir",$tmp .. "/bin",$tmp .. "/one",$tmp .. "/two"])
+write_file($tmp .. "/bin/wl-copy", "#!/opt/cosmix/bin/mix\nwrite_file(env(\"DESKTOP_TEST_DIR\") .. \"/clipboard\",read_stdin())\n")
+write_file($tmp .. "/bin/wl-paste", "#!/opt/cosmix/bin/mix\n$r=run_argv([\"cat\",env(\"DESKTOP_TEST_DIR\") .. \"/clipboard\"],{stdout:\"inherit\",stderr:\"null\"})\nexit($r.ok ? 0 : 1)\n")
+write_file($tmp .. "/bin/open", "#!/opt/cosmix/bin/mix\nwrite_file(env(\"DESKTOP_TEST_DIR\") .. \"/opened\",args()[0])\n")
+$_chmod = run_argv_must(["chmod","0755",$tmp .. "/bin/wl-copy",$tmp .. "/bin/wl-paste",$tmp .. "/bin/open"])
+fn start_broker()
+  return run_argv_must(["systemd-run","--user","--quiet","--collect","--unit=" .. $broker,
+    "-p","RuntimeMaxSec=180","-p","StandardOutput=null","-p","StandardError=null",
+    "-p","Environment=COSMIX_NODE_CONFIG=" .. $node,
+    "--","/opt/cosmix/bin/cosmix-noded","serve","--listen","127.0.0.1:" .. to_string($port),"--node","desktop-test","--no-monitor","--no-log"])
+end
+fn cli($arguments)
+  return run_argv(concat(["/opt/cosmix/bin/mix",$scripts .. "/desktop-cli.mix"],$arguments),{env:$env,timeout:40})
+end
+fn ready($target)
+  for each $i in range(1,40)
+    $result = cli(["capabilities",$target])
+    if $result.ok then return json_parse($result.stdout) end
+    sleep(0.1)
+  end
+  $diagnostic_env = $env
+  $diagnostic_env.DESKTOP_REQUEST = json_encode({operation:"capabilities",target:$target})
+  print(run_argv(["/opt/cosmix/bin/mix","--serve",$scripts .. "/desktop-request.mix","--name","desktopctl-diagnostic"],{env:$diagnostic_env,timeout:10}))
+  raise("TEST_READY", "desktop citizen did not register")
+end
+fn check($condition,$message)
+  if not $condition then raise("DESKTOP_BUS_TEST",$message) end
+end
+try
+  $_start = start_broker()
+  $up = false
+  for each $i in range(1,40)
+    $ping = run_argv(["/opt/cosmix/bin/mix","-c","send noded noded.ping timeout=1; print($rc)"],{env:$env,timeout:3})
+    if $ping.ok and trim($ping.stdout) == "0" then $up = true; break end
+    sleep(0.1)
+  end
+  check($up,"broker unavailable")
+  for each $name in ["one","two"]
+    $config = $tmp .. "/" .. $name .. "/session.conf.mix"
+    write_file($config,json_encode({session:$name,opener:$tmp .. "/bin/open"}))
+    $_start = run_argv_must(["systemd-run","--user","--quiet","--collect","--unit=" .. $broker .. "-" .. $name,
+      "-p","RuntimeMaxSec=180","-p","KillMode=control-group","-p","StandardOutput=null","-p","StandardError=null",
+      "-p","Environment=MIX_STATS=off","-p","Environment=COSMIX_NODE_CONFIG=" .. $node,
+      "-p","Environment=DESKTOP_SESSION_CONFIG=" .. $config,"-p","Environment=DESKTOP_TEST_DIR=" .. $tmp .. "/" .. $name,
+      "-p","Environment=PATH=" .. $tmp .. "/bin:/opt/cosmix/bin:/usr/bin:/bin",
+      "-p","Environment=WAYLAND_DISPLAY=synthetic","-p","Environment=XDG_RUNTIME_DIR=" .. $tmp,
+      "--","/opt/cosmix/bin/mix","--serve",$scripts .. "/desktop-session.mix","--name","desktop-" .. $name])
+  end
+  $one = ready("desktop-one")
+  $two = ready("desktop-two")
+  print("PASS discovery")
+  check($one.instance != $two.instance,"session instances collided")
+  $denied = run_argv(["/opt/cosmix/bin/mix","-c","send \"desktop-one\" desktop.capabilities body=\"{}\" broker_origin=local from=forged timeout=2; print($rc)"],{env:$env,timeout:5})
+  check($denied.ok and trim($denied.stdout) == "13","anonymous forged caller denial failed")
+  $sample = "  synthetic café\nsecond line\n\n"
+  write_file($tmp .. "/one/clipboard",$sample)
+  $copy = cli(["copy","desktop-one","desktop-two"])
+  check($copy.ok,"Bus copy failed")
+  check(read_file($tmp .. "/two/clipboard") == $sample,"clipboard bytes changed")
+  check(not contains($copy.stdout .. $copy.stderr,"synthetic café"),"clipboard leaked in CLI output")
+  $url = "https://example.org/callback?x=1&y=2"
+  check(cli(["open","desktop-two",$url]).ok,"open RPC failed")
+  check(read_file($tmp .. "/two/opened") == $url,"URL argv changed")
+  check(not cli(["open","desktop-two","file:///tmp/forbidden"]).ok,"file URI admitted")
+  write_file($tmp .. "/one/clipboard",repeat("x",65537))
+  check(not cli(["copy","desktop-one","desktop-two"]).ok,"oversize transfer admitted")
+  check(read_file($tmp .. "/two/clipboard") == $sample,"failed transfer replaced destination")
+  $_stop = run_argv_must(["systemctl","--user","stop",$broker .. ".service"])
+  $_restart = start_broker()
+  $restored = ready("desktop-one")
+  check($restored.instance == $one.instance,"broker bounce restarted session identity")
+  $_two = ready("desktop-two")
+  print("PASS real Bus discovery, forged caller denial, exact text transfer, URL routing, limit failure and broker reconnect")
+finally
+  for each $unit in $units
+    $_stop = run_argv(["systemctl","--user","stop",$unit .. ".service"],{timeout:15})
+  end
+  -- Only the unique mktemp tree created by this test is removed.
+  if starts_with($tmp,"/tmp/cosmix-desktop-test.") then
+    $_remove = run_argv_must(["rm","-rf","--",$tmp])
+  end
+end

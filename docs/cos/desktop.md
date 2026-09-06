@@ -8,6 +8,11 @@ patched Smithay/wgpu) and is built with `setup.mix --desktop`.
 This page is the orientation. The compositor's protocol coverage has its own
 page: [cosmix-comp](cosmix-comp.md).
 
+The initial [desktop Bus capability provider](desktop-bus.md) adds session
+discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
+It currently serves registered local callers; cross-broker and mesh access
+remain planned extensions.
+
 ## What it is
 
 | Part | Crate | What it is |
