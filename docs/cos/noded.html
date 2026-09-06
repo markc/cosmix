@@ -488,6 +488,28 @@ to <code>ws://127.0.0.1:4200/ws</code> (loopback).</p>
 <li>Every other daemon — <code>cosmix-maild</code>, <code>cosmix-webd</code>, <code>cosmix-dnsd</code>, <code>cosmix-indexd</code> — and every Mix <code>--serve</code> citizen is a client of it.</li>
 <li>Cross-mesh routing rides the WireGuard peering that <code>cosmix-lib-mesh</code> describes.</li>
 </ul>
+<h2 id="authenticated-direct-mesh-callers-0150">Authenticated direct mesh callers (0.15.0)</h2>
+<p>For a direct ABP request, the source noded supplies <code>mesh_from</code> only for a
+registered local citizen whose registry entry still belongs to that connection.
+Client-supplied values are stripped. A mesh-to-mesh relay does not acquire this
+assertion, so it cannot borrow an intermediary node's application grants.</p>
+<p>At local service delivery, the receiving noded consumes that assertion and may
+stamp <code>broker_peer</code> (the proven node) and <code>broker_service</code> (its source service).
+This requires enforce admission, the correct successfully registered
+<code>bridge-&lt;node&gt;</code> connection, verified current membership, active <code>bus:true</code>
+status and current D2 credentials. <code>from</code> remains the registered bridge name;
+<code>broker_origin</code> remains <code>mesh</code>. Applications must explicitly authorise the
+stamped peer; admission alone does not grant clipboard or other capabilities.</p>
+<p>Final validation and enqueue share a fence with inventory publication. Work
+already enqueued is not recalled. The existing admission policy grandfathers
+sessions while their member still has current D2 credentials; the new stamps
+do not introduce proving-key-specific revocation. Local clients, off/observe
+admission, unproven bridges, and unsolicited outbound-connection frames do not
+receive mesh identity stamps. Replies and topic payloads strip these reserved
+headers case-insensitively.</p>
+<p>Replies are accepted only from the exact connection to which the pending
+request was delivered. A guessed correlation ID, reused service name or another
+connection cannot consume the legitimate request's reply slot.</p>
 <h2 id="see-also">See also</h2>
 <ul>
 <li><a href="/cos/maild">maild</a> — a broker client: the JMAP-native mail daemon</li>

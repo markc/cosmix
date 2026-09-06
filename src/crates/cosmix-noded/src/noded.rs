@@ -130,6 +130,8 @@ type TapSubscribers = Arc<RwLock<Vec<mpsc::Sender<String>>>>;
 /// uncovered this against concurrent `mix -c` fan-outs.
 struct PendingResponse {
     caller_tx: mpsc::Sender<String>,
+    /// Exact recipient connection; a reused service name is not reply authority.
+    responder_tx: mpsc::Sender<String>,
     caller_id: String,
     /// Original caller correlation captured before the broker rewrites `id`.
     /// Kept as an explicit observation field so a future correlation surface
@@ -178,6 +180,7 @@ impl PendingResponseTable {
         msg: &mut BusMessage,
         caller_tx: &mpsc::Sender<String>,
         caller_service: Option<&str>,
+        responder_tx: &mpsc::Sender<String>,
     ) -> Option<String> {
         let caller_id = msg.get("id")?.to_string();
         // §14 class from the Bus `type` (request/unset → rpc; the table only
@@ -200,6 +203,7 @@ impl PendingResponseTable {
             broker_id.clone(),
             PendingResponse {
                 caller_tx: caller_tx.clone(),
+                responder_tx: responder_tx.clone(),
                 observer_correlation_id: caller_id.clone(),
                 caller_id,
                 caller_service: caller_service.map(ToString::to_string),
@@ -217,6 +221,23 @@ impl PendingResponseTable {
     /// take attempts behave as last-writer-wins exactly once.
     async fn take(&self, broker_id: &str) -> Option<PendingResponse> {
         self.map.write().await.remove(broker_id)
+    }
+
+    /// An incorrect responder must neither complete nor consume the request.
+    async fn take_response(
+        &self,
+        broker_id: &str,
+        responder_tx: &mpsc::Sender<String>,
+    ) -> Option<PendingResponse> {
+        let mut pending = self.map.write().await;
+        if pending
+            .get(broker_id)
+            .is_some_and(|entry| entry.responder_tx.same_channel(responder_tx))
+        {
+            pending.remove(broker_id)
+        } else {
+            None
+        }
     }
 
     /// Remove and return every pending entry whose caller is `caller_tx`
@@ -268,6 +289,9 @@ struct AppState {
     /// `noded.peers` cannot observe different epochs. `#[derive(Clone)]` shares
     /// the one cell via the outer `Arc`.
     authority: Arc<ArcSwap<crate::routing::RoutingAuthority>>,
+    /// Serialises authorised delivery with authority publication. Never held
+    /// across an await; already enqueued work is outside revocation's boundary.
+    delivery_fence: Arc<std::sync::RwLock<()>>,
     /// Start-immutable `/etc` roster used only when no Verified posture has
     /// ever been accepted since boot.
     etc_roster: Arc<Vec<PeerConfig>>,
@@ -697,6 +721,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         spec_release,
         change_bus: change_bus.clone(),
         authority: authority.clone(),
+        delivery_fence: Arc::new(std::sync::RwLock::new(())),
         etc_roster,
         wg_ip,
         listener_port,
@@ -1533,7 +1558,13 @@ async fn apply_inventory_reload(state: &AppState, new: crate::authority::Posture
         .mesh
         .reconcile_endpoints(next.routes.desired_endpoints(), next.revision())
         .await;
-    state.authority.store(next.clone());
+    {
+        let _fence = state
+            .delivery_fence
+            .write()
+            .expect("delivery fence poisoned");
+        state.authority.store(next.clone());
+    }
     if state.admission_mode == AdmissionMode::Enforce
         && let crate::authority::Posture::Verified(accepted) = &next.posture
     {
@@ -1838,7 +1869,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, source_ip: std::net::
         }
 
         // Check if this is a response to a pending request. Responses MUST be
-        // routed by id only — never fall through to the command dispatcher,
+        // correlated by id AND recipient connection — never fall through to the command dispatcher,
         // because a `type=response` whose `command` matches a broker verb (e.g.
         // `topic.publish`) would otherwise be re-dispatched as a fresh request,
         // closing a feedback loop with the original publisher (observed
@@ -1851,7 +1882,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, source_ip: std::net::
         // correlates against the id it issued — not the broker's internal one.
         if bus_msg.message_type() == Some("response") {
             if let Some(id) = bus_msg.get("id").map(|s| s.to_string()) {
-                if let Some(pending) = state.pending_responses.take(&id).await {
+                if let Some(pending) = state.pending_responses.take_response(&id, &tx).await {
                     let wire = canonicalize_correlated_response(
                         &mut bus_msg,
                         &pending.caller_id,
@@ -2159,6 +2190,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, source_ip: std::net::
                 }
             }
             Route::LocalService(local_service) => {
+                let mesh_from = bus_msg
+                    .get(crate::subscription::MESH_FROM_HEADER)
+                    .map(str::to_owned);
                 let observing = state.observe.is_active();
                 let correlation_id = if observing {
                     bus_msg.get("id").map(ToString::to_string)
@@ -2175,13 +2209,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, source_ip: std::net::
                 // saw — not the caller's pre-rewrite id, which would
                 // disagree with the response wire the broker emits.
                 let route_result = route_local(
-                    &state.registry,
-                    &state.pending_responses,
+                    &state,
                     local_service,
                     &mut bus_msg,
                     &tx,
                     service_name.as_deref(),
-                    &state.observe,
+                    source_ip,
+                    &session_adm,
+                    mesh_from.as_deref(),
                 )
                 .await;
                 let observed_wire = route_result
@@ -2206,6 +2241,20 @@ async fn handle_socket(socket: WebSocket, state: AppState, source_ip: std::net::
             }
             Route::RemoteMesh { target } => {
                 canonicalize_routed_from_in_place(&mut bus_msg, service_name.as_deref());
+                // Only a local registered source acquires a direct-hop service
+                // assertion. A relay cannot borrow this node's clipboard grant.
+                if is_same_node_origin(source_ip, &state.bind)
+                    && let Some(service) = service_name.as_deref()
+                    && valid_service_name(service)
+                    && state
+                        .registry
+                        .read()
+                        .await
+                        .get(service)
+                        .is_some_and(|entry| entry.same_channel(&tx))
+                {
+                    bus_msg.set(crate::subscription::MESH_FROM_HEADER, service);
+                }
                 // The request clone and canonical wire have no delivery
                 // consumer: retain them only while observation is active.
                 // With no subscribers this relaxed load is the complete
@@ -2601,6 +2650,34 @@ fn broker_origin_for_delivery(source_ip: std::net::IpAddr, bind: &str) -> Broker
     }
 }
 
+/// Caller holds delivery_fence through enqueue and the registry read lock
+/// proving that the registered bridge still belongs to this connection.
+fn admitted_delivery_peer(
+    state: &AppState,
+    source_ip: std::net::IpAddr,
+    registered: Option<&str>,
+    admission: &SessionAdmission,
+) -> Option<String> {
+    let authority = state.authority.load();
+    let crate::authority::Posture::Verified(accepted) = &authority.posture else {
+        return None;
+    };
+    let RegisterGate::Admit(peer) = register_gate_decision(
+        source_ip,
+        &state.bind,
+        state.admission_mode,
+        state.wg_bound,
+        true,
+        registered?,
+        admission,
+    ) else {
+        return None;
+    };
+    reload_revoke_detail(accepted.members_full.get(&peer), accepted.epoch)
+        .is_none()
+        .then_some(peer)
+}
+
 fn observe_rejected_local_route(
     state: &AppState,
     message: &mut BusMessage,
@@ -2700,15 +2777,20 @@ struct LocalRouteResult {
     outcome: ObserveOutcome,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route_local(
-    registry: &Registry,
-    pending_responses: &PendingResponses,
+    state: &AppState,
     service: &str,
     msg: &mut BusMessage,
     caller_tx: &mpsc::Sender<String>,
     caller_service: Option<&str>,
-    observe: &ObserveManager,
+    source_ip: std::net::IpAddr,
+    admission: &SessionAdmission,
+    mesh_from: Option<&str>,
 ) -> LocalRouteResult {
+    let registry = &state.registry;
+    let pending_responses = &state.pending_responses;
+    let observe = &state.observe;
     let reg = registry.read().await;
     if let Some(target_tx) = reg.get(service).map(|e| e.tx.clone()) {
         // Register pending BEFORE rewriting the wire bytes so the
@@ -2717,10 +2799,29 @@ async fn route_local(
         // id-less messages — fire-and-forget skips the correlation table
         // entirely.
         let broker_id = pending_responses
-            .register(msg, caller_tx, caller_service)
+            .register(msg, caller_tx, caller_service, &target_tx)
             .await;
-        let wire = msg.to_wire();
-        match target_tx.try_send(wire.clone()) {
+        let (wire, delivery) = {
+            let _fence = state
+                .delivery_fence
+                .read()
+                .expect("delivery fence poisoned");
+            let owns_registration = caller_service
+                .and_then(|name| reg.get(name))
+                .is_some_and(|entry| entry.same_channel(caller_tx));
+            if owns_registration
+                && let Some(origin_service) = mesh_from.filter(|name| valid_service_name(name))
+                && let Some(peer) =
+                    admitted_delivery_peer(state, source_ip, caller_service, admission)
+            {
+                msg.set(crate::subscription::BROKER_PEER_HEADER, &peer);
+                msg.set(crate::subscription::BROKER_SERVICE_HEADER, origin_service);
+            }
+            let wire = msg.to_wire();
+            let delivery = target_tx.try_send(wire.clone());
+            (wire, delivery)
+        };
+        match delivery {
             Ok(()) => LocalRouteResult {
                 target_tx: Some(target_tx),
                 forwarded_wire: Some(wire),
@@ -4131,7 +4232,7 @@ mod tests {
             m.set("id", id);
             assert!(
                 table
-                    .register(&mut m, &tx_a, Some("caller-a"))
+                    .register(&mut m, &tx_a, Some("caller-a"), &tx_a)
                     .await
                     .is_some()
             );
@@ -4143,7 +4244,7 @@ mod tests {
         mb.set("id", "b1");
         assert!(
             table
-                .register(&mut mb, &tx_b, Some("caller-b"))
+                .register(&mut mb, &tx_b, Some("caller-b"), &tx_b)
                 .await
                 .is_some()
         );
@@ -4600,6 +4701,7 @@ mod tests {
             spec_release: None,
             change_bus: crate::props::ChangeBus::new(broker),
             authority: Arc::new(ArcSwap::from_pointee(authority_value)),
+            delivery_fence: Arc::new(std::sync::RwLock::new(())),
             etc_roster: Arc::new(etc_roster),
             wg_ip: "127.0.0.1".into(),
             listener_port,
@@ -5835,6 +5937,284 @@ mod tests {
         let canonical = super::canonicalize_routed_from(&mut msg, None, &original);
         assert_eq!(canonical, original, "short-circuit returns original text");
         assert_eq!(msg.get("from"), None);
+    }
+
+    async fn mesh_delivery_test_state() -> AppState {
+        use base64::Engine as _;
+        let mut posture = reload_posture(1, vec![]);
+        let crate::authority::Posture::Verified(accepted) = &mut posture else {
+            unreachable!()
+        };
+        accepted.members_full.insert("beta".into(), serde_json::json!({
+            "name":"beta", "status":"active", "bus":true,
+            "credentials":[{"kind":"d2", "pubkey":base64::engine::general_purpose::STANDARD.encode([3u8;32]),
+                "from_epoch":1, "until_epoch":null}]
+        }));
+        let mut state = reload_test_state(posture, vec![]).await;
+        state.admission_mode = AdmissionMode::Enforce;
+        state
+    }
+
+    #[tokio::test]
+    async fn mesh_delivery_identity_requires_proof_owner_and_direct_source() {
+        for case in [
+            "valid",
+            "off",
+            "observe",
+            "local",
+            "no-proof",
+            "wrong-proof",
+            "wrong-owner",
+            "relay",
+            "bad-source",
+            "non-wg",
+            "revoked",
+        ] {
+            let mut state = mesh_delivery_test_state().await;
+            let (caller, _caller_rx) = mpsc::channel(4);
+            let (other, _other_rx) = mpsc::channel(4);
+            let (target, mut target_rx) = mpsc::channel(4);
+            let mut admission = super::SessionAdmission {
+                admitted_node: Some("beta".into()),
+                response_seen: true,
+                last_detail: None,
+            };
+            match case {
+                "off" => state.admission_mode = AdmissionMode::Off,
+                "observe" => state.admission_mode = AdmissionMode::Observe,
+                "no-proof" => admission.admitted_node = None,
+                "wrong-proof" => admission.admitted_node = Some("gamma".into()),
+                "non-wg" => state.wg_bound = false,
+                "revoked" => apply_inventory_reload(&state, reload_posture(2, vec![])).await,
+                _ => {}
+            }
+            {
+                let mut registry = state.registry.write().await;
+                registry.insert(
+                    "bridge-beta".into(),
+                    super::ServiceEntry {
+                        tx: if case == "wrong-owner" {
+                            other
+                        } else {
+                            caller.clone()
+                        },
+                        info: Default::default(),
+                    },
+                );
+                registry.insert(
+                    "desktop".into(),
+                    super::ServiceEntry {
+                        tx: target,
+                        info: Default::default(),
+                    },
+                );
+            }
+            let mut request = BusMessage::new()
+                .with_header("id", "original")
+                .with_header("from", "bridge-beta")
+                .with_header("broker_origin", "mesh");
+            let source = if case == "local" {
+                "127.0.0.1"
+            } else {
+                "192.0.2.2"
+            }
+            .parse()
+            .unwrap();
+            let origin_service = match case {
+                "relay" => None,
+                "bad-source" => Some("nested.beta.bus"),
+                _ => Some("desktopctl"),
+            };
+            super::route_local(
+                &state,
+                "desktop",
+                &mut request,
+                &caller,
+                Some("bridge-beta"),
+                source,
+                &admission,
+                origin_service,
+            )
+            .await;
+            let delivered = bus_mod::parse(&target_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(
+                delivered.get("broker_peer"),
+                if case == "valid" { Some("beta") } else { None },
+                "{case}"
+            );
+            assert_eq!(
+                delivered.get("broker_service"),
+                if case == "valid" {
+                    Some("desktopctl")
+                } else {
+                    None
+                },
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_while_delivery_waits_cannot_stamp_old_authority() {
+        let state = mesh_delivery_test_state().await;
+        let (caller, _caller_rx) = mpsc::channel(4);
+        let (target, mut target_rx) = mpsc::channel(4);
+        {
+            let mut registry = state.registry.write().await;
+            registry.insert(
+                "bridge-beta".into(),
+                super::ServiceEntry {
+                    tx: caller.clone(),
+                    info: Default::default(),
+                },
+            );
+            registry.insert(
+                "desktop".into(),
+                super::ServiceEntry {
+                    tx: target,
+                    info: Default::default(),
+                },
+            );
+        }
+        let pending_guard = state.pending_responses.map.write().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            let mut request = BusMessage::new()
+                .with_header("id", "original")
+                .with_header("broker_origin", "mesh");
+            let admission = super::SessionAdmission {
+                admitted_node: Some("beta".into()),
+                response_seen: true,
+                last_detail: None,
+            };
+            super::route_local(
+                &task_state,
+                "desktop",
+                &mut request,
+                &caller,
+                Some("bridge-beta"),
+                "192.0.2.2".parse().unwrap(),
+                &admission,
+                Some("desktopctl"),
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.registry.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        apply_inventory_reload(&state, reload_posture(2, vec![])).await;
+        drop(pending_guard);
+        task.await.unwrap();
+        let delivered = bus_mod::parse(&target_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(delivered.get("broker_peer"), None);
+        assert_eq!(delivered.get("broker_service"), None);
+    }
+
+    #[test]
+    fn reserved_mesh_identity_is_stripped_case_insensitively() {
+        let mut msg = BusMessage::new();
+        for name in [
+            "broker_peer",
+            "BROKER_PEER",
+            "broker_service",
+            "Broker_Service",
+            "mesh_from",
+            "Mesh_From",
+        ] {
+            msg.headers.insert(name.into(), "forged".into());
+        }
+        super::stamp_broker_origin(&mut msg, super::BrokerOrigin::Local);
+        assert_eq!(msg.headers.len(), 1);
+        assert_eq!(msg.get("broker_origin"), Some("local"));
+    }
+
+    #[tokio::test]
+    async fn pending_reply_requires_exact_recipient_connection() {
+        let table = PendingResponseTable::new();
+        let (caller, _caller_rx) = mpsc::channel(4);
+        let (recipient, _recipient_rx) = mpsc::channel(4);
+        let (replacement, _replacement_rx) = mpsc::channel(4);
+        let mut message = BusMessage::new().with_header("id", "original");
+        let id = table
+            .register(&mut message, &caller, Some("caller"), &recipient)
+            .await
+            .unwrap();
+        assert!(table.take_response(&id, &caller).await.is_none());
+        assert!(table.take_response(&id, &replacement).await.is_none());
+        let accepted = table.take_response(&id, &recipient.clone()).await.unwrap();
+        assert_eq!(accepted.caller_id, "original");
+        assert!(table.take_response(&id, &recipient).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forged_wire_response_cannot_consume_another_services_request() {
+        let url = spawn_broker().await.expect("live broker required");
+        let (mut caller, mut caller_rx) = raw_connect(&url).await;
+        let (mut owner, mut owner_rx) = raw_connect(&url).await;
+        let (mut intruder, mut intruder_rx) = raw_connect(&url).await;
+        raw_register(&mut owner, &mut owner_rx, "clipboard").await;
+        raw_register(&mut intruder, &mut intruder_rx, "intruder").await;
+        let request = BusMessage::new()
+            .with_header("to", "clipboard")
+            .with_header("command", "desktop.capabilities")
+            .with_header("id", "caller-id");
+        caller
+            .send(WsMessage::Text(request.to_wire().into()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(3), owner_rx.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WsMessage::Text(text) = frame else {
+            panic!("expected routed request")
+        };
+        let routed = bus_mod::parse(&text).unwrap();
+        let response = BusMessage::new()
+            .with_header("type", "response")
+            .with_header("id", routed.get("id").unwrap())
+            .with_header("rc", "0");
+        intruder
+            .send(WsMessage::Text(response.to_wire().into()))
+            .await
+            .unwrap();
+        // An ordered ping proves the forged response was processed first.
+        let barrier = raw_call(
+            &mut intruder,
+            &mut intruder_rx,
+            BusMessage::new()
+                .with_header("to", "noded")
+                .with_header("command", "noded.ping")
+                .with_header("id", "barrier"),
+            "barrier",
+        )
+        .await;
+        assert_eq!(barrier.get("rc"), Some("0"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), caller_rx.next())
+                .await
+                .is_err()
+        );
+        owner
+            .send(WsMessage::Text(response.to_wire().into()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(3), caller_rx.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WsMessage::Text(text) = frame else {
+            panic!("expected legitimate reply")
+        };
+        let reply = bus_mod::parse(&text).unwrap();
+        assert_eq!(reply.get("id"), Some("caller-id"));
+        assert_eq!(reply.get("from"), Some("clipboard"));
     }
 
     /// SPEC 12 §15.5 wire-trust regression — a peer "alice" sending

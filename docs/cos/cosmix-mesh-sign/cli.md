@@ -26,6 +26,25 @@ Select the mesh identifier. The value forms the database `domain` component of k
 
 Examples use `mesh.example.com`.
 
+## Node-local WireGuard keys (0.8.0)
+
+```text
+cosmix-mesh-sign wg-gen --private-file /etc/wireguard/mesh.key
+cosmix-mesh-sign wg-pubkey --private-file /etc/wireguard/mesh.key
+```
+
+These commands use `cosmix-lib-wg` and do not access the operator secrets DB.
+Run generation on the node that will own the key. The absolute parent directory
+must already exist. `wg-gen` creates a new private file with mode 0600 (subject
+to a more restrictive umask), syncs it and its directory, and prints only the
+public key. It never replaces an existing file and has no force option. An I/O
+failure may leave an incomplete file requiring explicit operator inspection.
+
+`wg-pubkey` refuses symlinks, non-regular files, group/other permissions and
+invalid or oversized encodings. It prints only the derived public key, allowing
+an interrupted enrolment to resume without replacing the private key. Key
+generation alone does not enrol a node or configure a WireGuard interface.
+
 ## `genesis`
 
 Generate a mesh-wide Ed25519 genesis keypair and store the private seed.

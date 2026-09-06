@@ -53,6 +53,33 @@ to `ws://127.0.0.1:4200/ws` (loopback).
 - Every other daemon — `cosmix-maild`, `cosmix-webd`, `cosmix-dnsd`, `cosmix-indexd` — and every Mix `--serve` citizen is a client of it.
 - Cross-mesh routing rides the WireGuard peering that `cosmix-lib-mesh` describes.
 
+## Authenticated direct mesh callers (0.15.0)
+
+For a direct ABP request, the source noded supplies `mesh_from` only for a
+registered local citizen whose registry entry still belongs to that connection.
+Client-supplied values are stripped. A mesh-to-mesh relay does not acquire this
+assertion, so it cannot borrow an intermediary node's application grants.
+
+At local service delivery, the receiving noded consumes that assertion and may
+stamp `broker_peer` (the proven node) and `broker_service` (its source service).
+This requires enforce admission, the correct successfully registered
+`bridge-<node>` connection, verified current membership, active `bus:true`
+status and current D2 credentials. `from` remains the registered bridge name;
+`broker_origin` remains `mesh`. Applications must explicitly authorise the
+stamped peer; admission alone does not grant clipboard or other capabilities.
+
+Final validation and enqueue share a fence with inventory publication. Work
+already enqueued is not recalled. The existing admission policy grandfathers
+sessions while their member still has current D2 credentials; the new stamps
+do not introduce proving-key-specific revocation. Local clients, off/observe
+admission, unproven bridges, and unsolicited outbound-connection frames do not
+receive mesh identity stamps. Replies and topic payloads strip these reserved
+headers case-insensitively.
+
+Replies are accepted only from the exact connection to which the pending
+request was delivered. A guessed correlation ID, reused service name or another
+connection cannot consume the legitimate request's reply slot.
+
 ## See also
 
 - [maild](maild.md) — a broker client: the JMAP-native mail daemon

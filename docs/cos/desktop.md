@@ -10,8 +10,8 @@ page: [cosmix-comp](cosmix-comp.md).
 
 The initial [desktop Bus capability provider](desktop-bus.md) adds session
 discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
-It currently serves registered local callers; cross-broker and mesh access
-remain planned extensions.
+It serves registered local callers and explicitly granted mesh clipboard
+callers through admitted noded connections.
 
 ## What it is
 

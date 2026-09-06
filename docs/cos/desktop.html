@@ -450,8 +450,8 @@ patched Smithay/wgpu) and is built with <code>setup.mix --desktop</code>.</p>
 page: <a href="/cos/cosmix-comp">cosmix-comp</a>.</p>
 <p>The initial <a href="/cos/desktop-bus">desktop Bus capability provider</a> adds session
 discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
-It currently serves registered local callers; cross-broker and mesh access
-remain planned extensions.</p>
+It serves registered local callers and explicitly granted mesh clipboard
+callers through admitted noded connections.</p>
 <h2 id="what-it-is">What it is</h2>
 <table><thead><tr><th>Part</th><th>Crate</th><th>What it is</th></tr></thead><tbody>
 <tr><td>Compositor</td><td><code>cosmix-comp</code></td><td>Smithay protocol frontend with Bevy 0.19 / wgpu rendering. Runs nested inside an existing Wayland session (<code>--nested</code>) or on a KMS seat.</td></tr>

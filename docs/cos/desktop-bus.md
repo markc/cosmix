@@ -1,8 +1,8 @@
 # Desktop Bus capabilities
 
-Status: initial local-session provider, API 1, implementation 0.1.0. This is the
-first layer for desktop automation through noded. Mesh grants, cross-broker
-pairing and automatic clipboard synchronisation are not implemented yet.
+Status: API 1, implementation 0.2.0. Explicit clipboard grants use native ABP
+between noded instances, requiring noded 0.15.0 or newer at both ends.
+Automatic clipboard synchronisation is not implemented.
 
 The reusable scripts live in `src/desktop/scripts/`. One supervised Mix citizen
 belongs to one desktop session. It uses the Wayland display, runtime directory
@@ -44,9 +44,21 @@ mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-a desktop-b
 mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix open desktop-b https://example.org/
 ```
 
-Both targets currently reside on the same broker. Remote `.bus` targets are
-deliberately rejected by this initial CLI. The commands themselves are normal
-Bus RPCs; the provider contains no replacement mesh transport.
+Targets may be local services or `service.node.bus` addresses. Cross-node
+messages use the existing noded ABP transport, without an alternative relay.
+To grant clipboard access to registered local citizens of node `alpha`, add
+`mesh_clipboard_nodes:["alpha"]` to the trusted provider configuration and
+restart it. The default grant list is empty. This grants capabilities/read/write;
+HTTP(S) opening remains local-only. Cross-mesh `@` addresses are refused.
+
+Both nodes need protected WireGuard endpoints, verified signed membership and
+D2 identities. The receiving noded must enforce admission. A provider grant
+never substitutes for broker admission. Example:
+
+```text
+mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-a desktop-b.beta.bus
+mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-b.beta.bus desktop-a
+```
 
 | Verb | JSON request | Successful response |
 |---|---|---|
@@ -72,11 +84,17 @@ rejected; 20 timeout with ambiguous outcome. Transport errors remain separate.
 
 ## Trust and privacy boundary
 
-All desktop verbs require broker-stamped `broker_origin=local` and a canonical
-registered `from`. noded removes anonymous claims and rewrites client-supplied
-origin headers. Mesh ingress does not yet supply verified remote-service
-identity, so the provider rejects it. Registration is not Unix UID identity:
-this is a trusted local broker boundary, not isolation from hostile local apps.
+Local calls require broker-stamped `broker_origin=local` and a canonical
+registered `from`. An opted-in mesh clipboard call requires `broker_origin=mesh`,
+an allowed `broker_peer`, a canonical `broker_service`, and `from=bridge-<peer>`.
+noded supplies these only for a direct registered source received on a proven,
+currently authorised bridge connection. Anonymous sources and multi-hop relays
+receive no such authority. Callers cannot supply their own identity stamps.
+
+A node grant trusts that node's registered local citizens; it is not per-app
+consent or Unix UID isolation. Revocation is checked at broker enqueue; work
+already queued or executing cannot be recalled. Session admission retains the
+existing inventory policy for overlapping D2 credentials. See [noded](noded.md).
 
 Broker taps can expose message bodies. Do not mistake suppressed helper logs
 for end-to-end clipboard confidentiality. Use an isolated/trusted broker for
@@ -92,4 +110,7 @@ handling without desktop effects. `tests/desktop-bus-test.mix` uses a real,
 isolated noded and two production citizens with synthetic helper programs;
 it requires a user systemd manager and the installed Mix/noded binaries.
 It does not read or replace the user's clipboard or open a real browser.
-Live cross-desktop Wayland and paired mesh tests belong to the next stage.
+The noded suite covers reply connection ownership, spoofed identity stripping,
+proof/registration/membership gates and reload while delivery is waiting.
+Deployment acceptance still requires bidirectional transfer over the actual
+admitted nodes and their Wayland sessions; unit gates do not prove that result.

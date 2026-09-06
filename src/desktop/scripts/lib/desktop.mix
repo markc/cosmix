@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.1.0. Trusted session configuration only.
+-- Desktop Bus capability provider v0.2.0. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 fn error($code, $status)
@@ -18,9 +18,29 @@ fn session_config($config)
   if type($opener) != "string" or not starts_with($opener, "/") then
     raise("DESKTOP_CONFIG", "opener must be an absolute executable path")
   end
+  $mesh_nodes = $config.mesh_clipboard_nodes
+  if $mesh_nodes == nil then $mesh_nodes = [] end
+  if type($mesh_nodes) != "list" or len($mesh_nodes) > 32 then raise("DESKTOP_CONFIG","invalid mesh clipboard grants") end
+  for each $node in $mesh_nodes
+    if type($node) != "string" or not re_match($node,"^[a-z][a-z0-9-]{0,23}$") then raise("DESKTOP_CONFIG","invalid mesh node") end
+  end
   return {session:$config.session, instance:uuid(), max_bytes:65536,
+    mesh_nodes:$mesh_nodes,
     wayland:env("WAYLAND_DISPLAY"), runtime:env("XDG_RUNTIME_DIR"),
     copy:which("wl-copy"), paste:which("wl-paste"), opener:$opener}
+end
+
+fn target_ok($target)
+  return type($target) == "string" and re_match($target,"^[a-z][a-z0-9-]{1,30}(\\.[a-z][a-z0-9-]{0,23}\\.bus)?$")
+end
+
+fn caller_allowed($ctx,$verb,$headers)
+  if $headers.broker_origin == "local" then
+    return type($headers.from) == "string" and re_match($headers.from,"^[a-z][a-z0-9-]{1,30}$")
+  end
+  if $headers.broker_origin != "mesh" or not contains(["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"],$verb) then return false end
+  if type($ctx.mesh_nodes) != "list" or type($headers.broker_peer) != "string" or not contains($ctx.mesh_nodes,$headers.broker_peer) then return false end
+  return $headers.from == "bridge-" .. $headers.broker_peer and type($headers.broker_service) == "string" and re_match($headers.broker_service,"^[a-z][a-z0-9-]{1,30}$")
 end
 
 fn keys_are($body, $expected)
@@ -32,17 +52,16 @@ fn keys_are($body, $expected)
 end
 
 fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
-  -- noded overwrites these headers. Mesh ingress currently removes `from`;
-  -- there is deliberately no remote-name allowlist or forged identity fallback.
-  if $headers.broker_origin != "local" or type($headers.from) != "string" or not re_match($headers.from, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$") then
-    return error("LOCAL_REGISTERED_CALLER_REQUIRED", 13)
+  -- noded owns the origin/peer/service stamps. No raw claimed sender is a grant.
+  if not caller_allowed($ctx,$verb,$headers) then
+    return error("CALLER_NOT_AUTHORISED", 13)
   end
   if $raw_bytes > 400000 then return error("REQUEST_TOO_LARGE", 10) end
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.1.0", session:$ctx.session,
-      instance:$ctx.instance, access:"registered-local", max_text_bytes:$ctx.max_bytes,
+    return {rc:0, body:{api_version:1, implementation_version:"0.2.0", session:$ctx.session,
+      instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
       clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8"},
       open:{configured:is_executable($ctx.opener), schemes:["http","https"]},
       verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.open"]}}

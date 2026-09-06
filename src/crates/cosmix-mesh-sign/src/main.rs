@@ -41,6 +41,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
+mod wg_key;
+
 /// The genesis key_id — the non-removable trust anchor (§7.2 rule 1).
 const GENESIS_KEY_ID: &str = "genesis";
 /// The `service` column under which the genesis key is filed in secrets.db.
@@ -171,6 +173,17 @@ enum Cmd {
     /// Print a node's d2 PUBLIC key (base64) from the secrets DB — the value to
     /// author into that node's `credentials[]` in `inventory.mix`.
     D2Pubkey { node: String },
+    /// Generate a node-local WireGuard key using cosmix-lib-wg. Write the
+    /// private key to a new mode-0600 file; print only the public key.
+    WgGen {
+        #[arg(long)]
+        private_file: PathBuf,
+    },
+    /// Print the public key derived from an existing protected node-local key.
+    WgPubkey {
+        #[arg(long)]
+        private_file: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -223,6 +236,14 @@ fn main() -> Result<()> {
         }
         Cmd::D2Gen { node, force } => cmd_d2gen(&db, &cli.mesh, &node, force),
         Cmd::D2Pubkey { node } => cmd_d2pubkey(&db, &cli.mesh, &node),
+        Cmd::WgGen { private_file } => {
+            println!("{}", wg_key::generate(&private_file)?);
+            Ok(())
+        }
+        Cmd::WgPubkey { private_file } => {
+            println!("{}", wg_key::public_key(&private_file)?);
+            Ok(())
+        }
     }
 }
 

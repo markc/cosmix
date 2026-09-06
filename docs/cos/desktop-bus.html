@@ -442,9 +442,9 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/desktop-bus.md"><div class="prose"><h1 id="desktop-bus-capabilities">Desktop Bus capabilities</h1>
-<p>Status: initial local-session provider, API 1, implementation 0.1.0. This is the
-first layer for desktop automation through noded. Mesh grants, cross-broker
-pairing and automatic clipboard synchronisation are not implemented yet.</p>
+<p>Status: API 1, implementation 0.2.0. Explicit clipboard grants use native ABP
+between noded instances, requiring noded 0.15.0 or newer at both ends.
+Automatic clipboard synchronisation is not implemented.</p>
 <p>The reusable scripts live in <code>src/desktop/scripts/</code>. One supervised Mix citizen
 belongs to one desktop session. It uses the Wayland display, runtime directory
 and session D-Bus inherited at launch; requests cannot select another session
@@ -472,9 +472,18 @@ the opened URL.</p>
 mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-a desktop-b
 mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix open desktop-b https://example.org/
 </code></pre>
-<p>Both targets currently reside on the same broker. Remote <code>.bus</code> targets are
-deliberately rejected by this initial CLI. The commands themselves are normal
-Bus RPCs; the provider contains no replacement mesh transport.</p>
+<p>Targets may be local services or <code>service.node.bus</code> addresses. Cross-node
+messages use the existing noded ABP transport, without an alternative relay.
+To grant clipboard access to registered local citizens of node <code>alpha</code>, add
+<code>mesh_clipboard_nodes:["alpha"]</code> to the trusted provider configuration and
+restart it. The default grant list is empty. This grants capabilities/read/write;
+HTTP(S) opening remains local-only. Cross-mesh <code>@</code> addresses are refused.</p>
+<p>Both nodes need protected WireGuard endpoints, verified signed membership and
+D2 identities. The receiving noded must enforce admission. A provider grant
+never substitutes for broker admission. Example:</p>
+<pre><code class="language-text">mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-a desktop-b.beta.bus
+mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-b.beta.bus desktop-a
+</code></pre>
 <table><thead><tr><th>Verb</th><th>JSON request</th><th>Successful response</th></tr></thead><tbody>
 <tr><td><code>desktop.capabilities</code></td><td><code>{}</code></td><td>API/implementation version, session/instance, configured operations and limits</td></tr>
 <tr><td><code>desktop.clipboard.read</code></td><td><code>{instance}</code></td><td><code>{instance,mime,text,bytes}</code></td></tr>
@@ -494,11 +503,16 @@ There is no idempotency/replay guarantee in API 1.</p>
 request/data; 11 unavailable/helper failure; 12 stale session; 13 caller
 rejected; 20 timeout with ambiguous outcome. Transport errors remain separate.</p>
 <h2 id="trust-and-privacy-boundary">Trust and privacy boundary</h2>
-<p>All desktop verbs require broker-stamped <code>broker_origin=local</code> and a canonical
-registered <code>from</code>. noded removes anonymous claims and rewrites client-supplied
-origin headers. Mesh ingress does not yet supply verified remote-service
-identity, so the provider rejects it. Registration is not Unix UID identity:
-this is a trusted local broker boundary, not isolation from hostile local apps.</p>
+<p>Local calls require broker-stamped <code>broker_origin=local</code> and a canonical
+registered <code>from</code>. An opted-in mesh clipboard call requires <code>broker_origin=mesh</code>,
+an allowed <code>broker_peer</code>, a canonical <code>broker_service</code>, and <code>from=bridge-&lt;peer&gt;</code>.
+noded supplies these only for a direct registered source received on a proven,
+currently authorised bridge connection. Anonymous sources and multi-hop relays
+receive no such authority. Callers cannot supply their own identity stamps.</p>
+<p>A node grant trusts that node's registered local citizens; it is not per-app
+consent or Unix UID isolation. Revocation is checked at broker enqueue; work
+already queued or executing cannot be recalled. Session admission retains the
+existing inventory policy for overlapping D2 credentials. See <a href="/cos/noded">noded</a>.</p>
 <p>Broker taps can expose message bodies. Do not mistake suppressed helper logs
 for end-to-end clipboard confidentiality. Use an isolated/trusted broker for
 real clipboard data. No payload is deliberately written to disk, retained on
@@ -511,7 +525,10 @@ handling without desktop effects. <code>tests/desktop-bus-test.mix</code> uses a
 isolated noded and two production citizens with synthetic helper programs;
 it requires a user systemd manager and the installed Mix/noded binaries.
 It does not read or replace the user's clipboard or open a real browser.
-Live cross-desktop Wayland and paired mesh tests belong to the next stage.</p></div></div>
+The noded suite covers reply connection ownership, spoofed identity stripping,
+proof/registration/membership gates and reload while delivery is waiting.
+Deployment acceptance still requires bidirectional transfer over the actual
+admitted nodes and their Wayland sessions; unit gates do not prove that result.</p></div></div>
     </div>
 
 </main>

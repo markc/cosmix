@@ -1,5 +1,6 @@
 -- Internal one-shot worker for desktop-cli.mix; no positional arguments in serve mode.
 $request = json_parse(env("DESKTOP_REQUEST"))
+$desktop = require("lib/desktop.mix")
 fn rpc($target, $verb, $body)
   send $target $verb body=json_encode($body) timeout=8
   if $rc != 0 then
@@ -10,17 +11,17 @@ fn rpc($target, $verb, $body)
   return $result
 end
 fn target_ok($target)
-  return type($target) == "string" and re_match($target, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+  return $desktop.target_ok($target)
 end
 if type($request) != "map" or not target_ok($request.target) then
-  raise("DESKTOP_ARGS", "local target service required")
+  raise("DESKTOP_ARGS", "target must be a local service or service.node.bus")
 end
 $destination = rpc($request.target, "desktop.capabilities", {})
 if $destination.api_version != 1 or type($destination.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported capability response") end
 if $request.operation == "capabilities" then
   print(json_encode($destination))
 elif $request.operation == "copy" then
-  if not target_ok($request.source) or $request.source == $request.target then raise("DESKTOP_ARGS", "distinct local source and target required") end
+  if not target_ok($request.source) or $request.source == $request.target then raise("DESKTOP_ARGS", "distinct source and target required") end
   $source = rpc($request.source, "desktop.capabilities", {})
   if $source.api_version != 1 or type($source.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported source response") end
   $clipboard = rpc($request.source, "desktop.clipboard.read", {instance:$source.instance})

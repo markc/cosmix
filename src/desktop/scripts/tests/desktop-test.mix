@@ -7,6 +7,26 @@ fn check($condition, $message)
 end
 $configured = $d.session_config({session:"test",opener:"/usr/bin/true"})
 check(type($configured) == "map" and $configured.session == "test" and type($configured.instance) == "string","session configuration failed")
+$granted = $d.session_config({session:"test",opener:"/usr/bin/true",mesh_clipboard_nodes:["alpha"]})
+$mesh = {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha",broker_service:"desktopctl"}
+for each $verb in ["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"]
+  check($d.caller_allowed($granted,$verb,$mesh),"granted direct mesh caller denied")
+  check(not $d.caller_allowed($configured,$verb,$mesh),"default mesh grant")
+  for each $bad in [{broker_origin:"mesh",from:"bridge-alpha"},
+    {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha"},
+    {broker_origin:"mesh",from:"bridge-beta",broker_peer:"beta",broker_service:"desktopctl"},
+    {broker_origin:"mesh",from:"bridge-beta",broker_peer:"alpha",broker_service:"desktopctl"},
+    {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha",broker_service:"nested.alpha.bus"}]
+    check(not $d.caller_allowed($granted,$verb,$bad),"unverified mesh caller granted")
+  end
+end
+check(not $d.caller_allowed($granted,"desktop.open",$mesh),"clipboard grant allowed remote open")
+for each $target in ["desktop-host","desktop-host.alpha.bus","desktop-desk.beta.bus"]
+  check($d.target_ok($target),"native target rejected")
+end
+for each $target in ["desktop@alpha","desktop.alpha.other.bus","desktop.alpha.bus@elsewhere","a","desktop.alpha.bus/path"]
+  check(not $d.target_ok($target),"non-native target accepted")
+end
 for each $i in range(1,100)
   $name = $d.client_name()
   check(byte_length($name) <= 31 and re_match($name,"^[a-z][a-z0-9-]{1,30}$"),"client name rejected by current noded")

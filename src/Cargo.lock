@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mesh-sign"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1721,6 +1721,7 @@ dependencies = [
  "clap",
  "cosmix-lib-config",
  "cosmix-lib-mesh-trust",
+ "cosmix-lib-wg",
  "ed25519-dalek",
  "libc",
  "rand 0.8.7",
@@ -1829,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-noded"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "arc-swap",

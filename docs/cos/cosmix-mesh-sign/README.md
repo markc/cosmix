@@ -22,6 +22,8 @@ See [CLI reference](cli.md) for complete command and option details.
 | `pubkey` | Print the genesis public verify key as base64. |
 | `d2-gen` | Generate and store a node-specific d2 admission key. |
 | `d2-pubkey` | Print a node's d2 public key as base64. |
+| `wg-gen` | Generate a node-local WireGuard private-key file and print its public key. |
+| `wg-pubkey` | Derive the public key from a protected node-local private-key file. |
 
 The CLI exposes no Bus verbs and runs as a finite operator command, not as a daemon.
 

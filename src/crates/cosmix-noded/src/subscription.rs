@@ -32,6 +32,10 @@ pub const STALE_SNAPSHOT_TTL: Duration = Duration::from_secs(60);
 pub const JANITOR_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(crate) const BROKER_ORIGIN_HEADER: &str = "broker_origin";
+pub(crate) const BROKER_PEER_HEADER: &str = "broker_peer";
+pub(crate) const BROKER_SERVICE_HEADER: &str = "broker_service";
+/// Source broker assertion, consumed only over a proven direct bridge.
+pub(crate) const MESH_FROM_HEADER: &str = "mesh_from";
 
 /// Reserved header names the broker injects into deliveries. Any producer-
 /// supplied headers with these names are unconditionally overwritten
@@ -42,6 +46,9 @@ pub const RESERVED_HEADERS: &[&str] = &[
     "topic_stale",
     "topic_op",
     BROKER_ORIGIN_HEADER,
+    BROKER_PEER_HEADER,
+    BROKER_SERVICE_HEADER,
+    MESH_FROM_HEADER,
 ];
 
 // ── Public types ──
@@ -63,9 +70,16 @@ impl BrokerOrigin {
 
 pub(crate) fn strip_broker_origin(message: &mut BusMessage) -> bool {
     let before = message.headers.len();
-    message
-        .headers
-        .retain(|name, _| !name.eq_ignore_ascii_case(BROKER_ORIGIN_HEADER));
+    message.headers.retain(|name, _| {
+        ![
+            BROKER_ORIGIN_HEADER,
+            BROKER_PEER_HEADER,
+            BROKER_SERVICE_HEADER,
+            MESH_FROM_HEADER,
+        ]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    });
     before != message.headers.len()
 }
 
