@@ -534,12 +534,80 @@ pub(crate) fn configure_ingress(app: &mut App) {
     app.add_message::<KeyboardFocusLost>()
         .add_message::<WindowFocused>()
         .add_message::<WindowEvent>()
+        // The boundary traces below read these; minimal test fixtures call
+        // configure_ingress without the plugins that would register them.
+        .add_message::<MouseButtonInput>()
+        .init_resource::<bevy::picking::hover::HoverMap>()
         .init_resource::<StagedShellCommands>()
         .add_systems(
             Update,
             flush_staged_shell_commands.in_set(ShellRuntimeSet::Input),
         )
+        .add_systems(Update, trace_press_hover)
         .add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
+    app.add_observer(
+        |t: bevy::ecs::observer::On<
+            bevy::picking::events::Pointer<bevy::picking::events::Press>,
+        >| {
+            tracing::debug!(event = "quoin_trigger_press", entity = ?t.entity);
+        },
+    );
+    app.add_observer(
+        |t: bevy::ecs::observer::On<
+            bevy::picking::events::Pointer<bevy::picking::events::Release>,
+        >| {
+            tracing::debug!(event = "quoin_trigger_release", entity = ?t.entity);
+        },
+    );
+    app.add_observer(
+        |t: bevy::ecs::observer::On<
+            bevy::picking::events::Pointer<bevy::picking::events::Click>,
+        >,
+         q: bevy::prelude::Query<(
+            bevy::prelude::Has<bevy::ui_widgets::Button>,
+            bevy::prelude::Has<bevy::ui::Pressed>,
+            bevy::prelude::Has<bevy::ui::InteractionDisabled>,
+        )>| {
+            tracing::debug!(
+                event = "quoin_trigger_click",
+                entity = ?t.entity,
+                button_pressed_disabled = ?q.get(t.entity).ok()
+            );
+        },
+    );
+    app.add_observer(|t: bevy::ecs::observer::On<bevy::ui_widgets::Activate>| {
+        tracing::debug!(event = "quoin_trigger_activate", entity = ?t.entity);
+    });
+}
+
+/// Diagnostic boundary trace: what Bevy picking resolved at each press.
+/// An empty hover map on an item press means hit-testing found no node at
+/// the fed position (mapping/scale defect); a populated one moves the fault
+/// past picking into observer wiring. Debug level — quiet in production.
+fn trace_press_hover(
+    mut buttons: MessageReader<MouseButtonInput>,
+    hover: Res<bevy::picking::hover::HoverMap>,
+    pointers: bevy::prelude::Query<(
+        &bevy::picking::pointer::PointerId,
+        &bevy::picking::pointer::PointerLocation,
+    )>,
+) {
+    for event in buttons.read() {
+        if event.state != ButtonState::Pressed {
+            continue;
+        }
+        let location = pointers
+            .iter()
+            .find(|(id, _)| **id == bevy::picking::pointer::PointerId::Mouse)
+            .map(|(_, location)| location.location.clone());
+        tracing::debug!(
+            event = "quoin_press_hover",
+            window = ?event.window,
+            button = ?event.button,
+            pointer_location = ?location,
+            hover = ?hover.iter().collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Emit a global keyboard loss only when an update batch contains no focus
@@ -798,6 +866,13 @@ impl PointerBridge {
                     self.record_output_position(target, position);
                     match event.kind {
                         PointerEventKind::Press { button, .. } => {
+                            tracing::debug!(
+                                event = "quoin_item_press_feed",
+                                window = ?target.window,
+                                edge = ?target.edge,
+                                raw = ?raw,
+                                position = ?position
+                            );
                             if let Some(button) = translate_button(button) {
                                 if !self.pressed.contains(&button) {
                                     self.pressed.push(button);

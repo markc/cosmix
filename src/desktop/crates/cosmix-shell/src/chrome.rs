@@ -22,7 +22,7 @@ use bevy::picking::Pickable;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::ui::{InteractionDisabled, UiRect, Val2, percent, px};
-use bevy::ui_widgets::Activate;
+use bevy::ui_widgets::{Activate, Button as WidgetButton, ButtonPlugin as WidgetButtonPlugin};
 use bevy::window::RequestRedraw;
 use ctk::theme::{Mode, Scheme, ThemeSpec, ThemeState, tokens};
 
@@ -397,6 +397,18 @@ pub struct QuoinChromePlugin;
 
 impl Plugin for QuoinChromePlugin {
     fn build(&self, app: &mut App) {
+        // The widget observer set (Pointer<Click> -> Activate on ui_widgets
+        // Button entities): production hosts already get it — DefaultPlugins
+        // includes UiWidgetsPlugins under the bevy_ui_widgets feature this
+        // crate enables — so there the guard skips. Self-registering covers
+        // plugin-less compositions (bare-App tests, slimmed hosts). Feathers'
+        // same-named ButtonPlugin is styles-only; don't mistake it for this.
+        // ORDERING: Bevy panics on duplicate plugins, and this guard only
+        // sees EARLIER registrations — add DefaultPlugins/UiWidgetsPlugins/
+        // WidgetButtonPlugin BEFORE QuoinChromePlugin, never after it.
+        if !app.is_plugin_added::<WidgetButtonPlugin>() {
+            app.add_plugins(WidgetButtonPlugin);
+        }
         app.init_resource::<InputFocus>()
             .add_message::<QuoinSchemeSelected>()
             .add_observer(on_activate)
@@ -688,7 +700,15 @@ fn button(
                 ..default()
             },
             bevy::feathers::theme::ThemeBackgroundColor(tokens::CONTROL),
-            Button,
+            // ui_widgets::Button, NOT the bevy::prelude Button (legacy
+            // bevy_ui marker): the Activate-producing click observers filter
+            // on the ui_widgets type. The prelude one compiled and rendered
+            // fine while making every control click-dead (found live
+            // 2026-09-06; the test fixtures inserted the right type by hand,
+            // which is why unit tests never caught it). Same trap already
+            // documented at ctk/src/file_requester.rs — "left every requester
+            // button silently inert".
+            WidgetButton,
             Pickable::default(),
             Hovered::default(),
             // Panels start unmapped; ShellFrame reconciliation opts controls
@@ -1698,5 +1718,81 @@ mod tests {
         assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(-1)));
         assert!(world.entity(control).contains::<InteractionDisabled>());
         assert_eq!(world.resource::<InputFocus>().get(), None);
+    }
+
+    /// Type-identity regression for the 2026-09-06 click-dead bug: the
+    /// production spawn path must attach `bevy::ui_widgets::Button` (the type
+    /// the Activate observers filter on) — the prelude `Button` renders and
+    /// hovers identically while never activating. The plugin half asserts the
+    /// plugin-less-host fallback: production gets the observers from
+    /// DefaultPlugins' UiWidgetsPlugins, bare compositions from
+    /// QuoinChromePlugin's own guarded registration.
+    #[test]
+    fn controls_carry_the_widget_button_type_and_observer_plugin() {
+        let mut app = App::new();
+        app.add_plugins(QuoinChromePlugin);
+        assert!(
+            app.is_plugin_added::<WidgetButtonPlugin>(),
+            "QuoinChromePlugin must register the ui_widgets ButtonPlugin"
+        );
+        let label = app.world_mut().spawn_empty().id();
+        let mut commands = app.world_mut().commands();
+        let control = button(&mut commands, Edge::Right, QuoinAction::Quit, label, "quit");
+        app.world_mut().flush();
+        assert!(
+            app.world().entity(control).contains::<WidgetButton>(),
+            "chrome controls must carry bevy::ui_widgets::Button, not the prelude Button"
+        );
+        assert!(
+            !app.world()
+                .entity(control)
+                .contains::<bevy::ui::widget::Button>(),
+            "the legacy prelude Button must not creep back into the bundle"
+        );
+    }
+
+    /// Full-spawn sweep: every control the production `spawn_quoin_chrome`
+    /// path produces — pins, chevrons, dots, page controls on all four
+    /// edges — must carry the ui_widgets Button. Guards the assumption that
+    /// `button()` stays the single spawn choke point; a control spawned some
+    /// other way would pass the choke-point test above and still be
+    /// click-dead in production.
+    #[test]
+    fn every_spawned_control_carries_the_widget_button_type() {
+        let mut app = App::new();
+        app.add_plugins(QuoinChromePlugin);
+        let world = app.world_mut();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let panels = std::array::from_fn(|index| {
+            vec![QuoinPage {
+                id: format!("page-{index}"),
+                title: format!("Page {index}"),
+                content: world.spawn_empty().id(),
+            }]
+        });
+        let props = QuoinChromeProps { panels };
+        let mut commands = app.world_mut().commands();
+        spawn_quoin_chrome(&mut commands, mounts, props);
+        app.world_mut().flush();
+        let mut parts_query = app.world_mut().query::<&QuoinPanelParts>();
+        let controls: Vec<Entity> = parts_query
+            .iter(app.world())
+            .flat_map(|parts| parts.controls.iter().copied())
+            .collect();
+        assert!(
+            !controls.is_empty(),
+            "spawn_quoin_chrome produced no controls — the sweep would be vacuous"
+        );
+        for control in controls {
+            assert!(
+                app.world().entity(control).contains::<WidgetButton>(),
+                "control {control} lacks bevy::ui_widgets::Button — it renders but can never Activate"
+            );
+        }
     }
 }
