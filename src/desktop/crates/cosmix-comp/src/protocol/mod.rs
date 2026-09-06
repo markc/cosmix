@@ -339,6 +339,7 @@ impl StackBand {
         }
     }
 
+    #[cfg(feature = "bus")]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Background => "background",
@@ -11089,6 +11090,8 @@ impl WaylandState {
         );
         pointer.frame(self);
         self.record_pointer_focus_local_position(focus.as_ref(), (x, y));
+        #[cfg(feature = "bus")]
+        self.service_deferred_constraint_activation();
     }
 
     /// Apply accelerated relative motion to the compositor's own cursor.
@@ -12599,6 +12602,7 @@ impl WaylandState {
     /// unchanged because `raise_surface` restacks within the record's own
     /// band, so a demoted window can never climb above normal windows by
     /// being focused.
+    #[cfg(feature = "bus")]
     pub(crate) fn set_window_band(
         &mut self,
         id: SurfaceId,
@@ -12631,6 +12635,7 @@ impl WaylandState {
     /// keyboard bindings (window cycling, VT switch) and focus change —
     /// smithay deactivates a constraint when its surface loses pointer
     /// focus. A reserved break-constraint binding is a pending design call.
+    #[cfg(feature = "bus")]
     pub(crate) fn break_pointer_constraint_for_corner(&mut self) {
         let Some(surface) = self
             .pointer
@@ -12647,14 +12652,31 @@ impl WaylandState {
                 constraint.deactivate();
             }
         });
+        self.defer_constraint_activation();
     }
 
-    /// Counterpart to the corner break: when the pointer leaves a corner, a
-    /// pending (created-but-never-activated) constraint of the
-    /// pointer-focused surface is activated — the constraint a client
-    /// created while a corner was engaged, which `new_constraint`
-    /// deliberately left inactive.
-    pub(crate) fn activate_pointer_constraint_after_corner(&mut self) {
+    /// The deferred half of corner supremacy, run at the END of
+    /// `pointer_moved` so activation follows the motion delivery it belongs
+    /// after. Only physical motion services the deferral, and only once the
+    /// cursor is outside every corner — a detector reset (output geometry
+    /// change) can therefore never re-activate a constraint while the
+    /// cursor still sits in a corner.
+    #[cfg(feature = "bus")]
+    pub(crate) fn service_deferred_constraint_activation(&mut self) {
+        if !self.constraint_activation_deferred() || self.corner_engaged() {
+            return;
+        }
+        self.clear_deferred_constraint_activation();
+        self.activate_pointer_constraint_after_corner();
+    }
+
+    /// Counterpart to the corner break: activates the pointer-focused
+    /// surface's pending (created-but-never-activated) constraint — the
+    /// one a client created while a corner was engaged, which
+    /// `new_constraint` deliberately left inactive. Called only through
+    /// `service_deferred_constraint_activation`.
+    #[cfg(feature = "bus")]
+    fn activate_pointer_constraint_after_corner(&mut self) {
         let Some(surface) = self
             .pointer
             .current_focus()

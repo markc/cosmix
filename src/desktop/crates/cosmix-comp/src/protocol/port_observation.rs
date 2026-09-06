@@ -540,6 +540,10 @@ pub(crate) struct ObservationState {
     focus_cause: &'static str,
     stack_dirty: Option<&'static str>,
     full_dirty: Option<&'static str>,
+    /// A pointer constraint was broken or declined while a corner was
+    /// engaged; the next physical motion outside every corner activates
+    /// the pending constraint (see `defer_constraint_activation`).
+    constraint_activation_deferred: bool,
     watched_baseline: Option<CompSnapshot>,
     pub(crate) corner_config: CornerConfig,
     pub(crate) corner_regions: Vec<CornerRegion>,
@@ -575,6 +579,7 @@ impl ObservationState {
             focus_cause: "wayland.focus",
             stack_dirty: None,
             full_dirty: None,
+            constraint_activation_deferred: false,
             watched_baseline: None,
             corner_config,
             corner_regions: Vec::new(),
@@ -927,7 +932,6 @@ impl WaylandState {
                     self.emit_corner_entered(output, corner, dwell_ms);
                 }
                 CornerEvent::Left { corner, dwell_ms } => {
-                    self.activate_pointer_constraint_after_corner();
                     self.emit_corner_left(output, corner, dwell_ms);
                 }
             }
@@ -978,6 +982,25 @@ impl WaylandState {
     /// activating a fresh pointer constraint.
     pub(crate) fn corner_engaged(&self) -> bool {
         self.observations.corner_detector.engaged_corner().is_some()
+    }
+
+    /// Arm the deferred constraint re-activation: a constraint was broken
+    /// or declined because a corner was engaged; the next physical pointer
+    /// motion that lands outside every corner re-activates the pending
+    /// constraint. Deliberately NOT driven by `CornerEvent::Left` — the
+    /// detector also emits Left on output-geometry resets with the cursor
+    /// still physically inside the corner, and activation must follow the
+    /// motion delivery it belongs after, not precede it.
+    pub(crate) fn defer_constraint_activation(&mut self) {
+        self.observations.constraint_activation_deferred = true;
+    }
+
+    pub(crate) fn constraint_activation_deferred(&self) -> bool {
+        self.observations.constraint_activation_deferred
+    }
+
+    pub(crate) fn clear_deferred_constraint_activation(&mut self) {
+        self.observations.constraint_activation_deferred = false;
     }
 
     #[cfg(test)]

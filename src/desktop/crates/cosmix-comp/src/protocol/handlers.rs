@@ -2104,10 +2104,12 @@ impl PointerConstraintsHandler for WaylandState {
         // engaged corner, a freshly created constraint must not activate —
         // otherwise a client defeats the corner break by destroying and
         // recreating its constraint (no new Entered event fires while the
-        // same corner stays engaged). The constraint stays pending; leaving
-        // the corner re-activates it (`CornerEvent::Left` hook).
+        // same corner stays engaged). The constraint stays pending; the
+        // first physical motion outside every corner activates it
+        // (`service_deferred_constraint_activation`, end of pointer_moved).
         #[cfg(feature = "bus")]
         if self.corner_engaged() {
+            self.defer_constraint_activation();
             return;
         }
         with_pointer_constraint(surface, pointer, |constraint| {
