@@ -477,7 +477,8 @@ fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: boo
 }
 
 fn bottom_launcher(commands: &mut Commands) -> Entity {
-    let thunderbird = launcher::thunderbird_button(commands);
+    let thunderbird = launcher::button(commands, launcher::LauncherApp::Thunderbird);
+    let foot = launcher::button(commands, launcher::LauncherApp::Foot);
     let apps = commands
         .spawn((
             Text::new("Konsole  ·  Firefox  ·  Dolphin  ·  Kate"),
@@ -508,7 +509,7 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
             padding: UiRect::axes(px(14), px(8)),
             ..default()
         })
-        .add_children(&[apps, thunderbird, clock])
+        .add_children(&[apps, foot, thunderbird, clock])
         .id()
 }
 

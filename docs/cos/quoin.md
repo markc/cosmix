@@ -142,14 +142,16 @@ synthetic pointer/corner verb in this slice.
 
 ### Launch state and lifecycle
 
-The bottom `launcher` page includes a Thunderbird button. It starts
-`thunderbird` through argv, reports process startup and failures, and disables
-duplicate requests while the launched process is running. Hidden panels and
-other carousel pages cannot activate it. The other application names remain
+The bottom `launcher` page includes working Foot and Thunderbird buttons. They
+start `foot` and `thunderbird` through argv, report process startup and failures,
+and disable duplicate requests for each app while its launched process is running.
+An open Thunderbird does not block Foot. Hidden panels and
+other carousel pages cannot activate either button. The other application names remain
 static labels.
 
 Operators can set `COSMIX_QUOIN_LAUNCHER` to an absolute Mix script path.
-Quoin invokes `/opt/cosmix/bin/mix <script> thunderbird` without shell parsing.
+Quoin invokes `/opt/cosmix/bin/mix <script> foot` or
+`/opt/cosmix/bin/mix <script> thunderbird` without shell parsing.
 The helper is responsible for its application's account, display and service
 lifetime; a successful helper exit does not prove a window was mapped.
 Process feedback wakes the UI without periodic polling. The default child
