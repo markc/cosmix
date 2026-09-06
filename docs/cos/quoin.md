@@ -142,6 +142,19 @@ synthetic pointer/corner verb in this slice.
 
 ### Launch state and lifecycle
 
+The bottom `launcher` page includes a Thunderbird button. It starts
+`thunderbird` through argv, reports process startup and failures, and disables
+duplicate requests while the launched process is running. Hidden panels and
+other carousel pages cannot activate it. The other application names remain
+static labels.
+
+Operators can set `COSMIX_QUOIN_LAUNCHER` to an absolute Mix script path.
+Quoin invokes `/opt/cosmix/bin/mix <script> thunderbird` without shell parsing.
+The helper is responsible for its application's account, display and service
+lifetime; a successful helper exit does not prove a window was mapped.
+Process feedback wakes the UI without periodic polling. The default child
+inherits Quoin's environment and service lifetime.
+
 Quoin loads strict-data `$COSMIX_VAR/quoin.state.mix` before constructing its
 initial model, using the shared path resolver (including its XDG fallback).
 The root map contains `scheme` and `left`, `bottom`, `right`, `top` maps with

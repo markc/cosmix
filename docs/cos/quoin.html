@@ -555,11 +555,45 @@ plane is <code>shell-sub</code>. <code>shell.ping</code> and <code>shell.info</c
 discovery. Live panel state is read through the uniform
 <code>shell.props.{get,list,describe}</code> surface under
 <code>panels.&lt;edge&gt;.{visible,pinned,width_px,page,pages,output}</code>.</p>
-<p>The ephemeral semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin}</code>
-and <code>shell.panel.page.{next,prev,set}</code>. They require a broker-stamped local,
+<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin}</code>,
+<code>shell.panel.page.{next,prev,set}</code> and <code>shell.quit</code>. They require a broker-stamped local,
 registered caller and are translated to the same <code>ShellCommand</code> ingress used
-by Quoin's controls. There is no resize, arrangement, persistence, geometry or
+by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
+persistence. <code>shell.quit</code> and the right Monitoring page's Quit Quoin button
+request a successful Bevy exit through the normal render and surface drain
+(<code>QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit</code>). There is no resize, arrangement, geometry or
 synthetic pointer/corner verb in this slice.</p>
+<h3 id="launch-state-and-lifecycle">Launch state and lifecycle</h3>
+<p>The bottom <code>launcher</code> page includes a Thunderbird button. It starts
+<code>thunderbird</code> through argv, reports process startup and failures, and disables
+duplicate requests while the launched process is running. Hidden panels and
+other carousel pages cannot activate it. The other application names remain
+static labels.</p>
+<p>Operators can set <code>COSMIX_QUOIN_LAUNCHER</code> to an absolute Mix script path.
+Quoin invokes <code>/opt/cosmix/bin/mix &lt;script&gt; thunderbird</code> without shell parsing.
+The helper is responsible for its application's account, display and service
+lifetime; a successful helper exit does not prove a window was mapped.
+Process feedback wakes the UI without periodic polling. The default child
+inherits Quoin's environment and service lifetime.</p>
+<p>Quoin loads strict-data <code>$COSMIX_VAR/quoin.state.mix</code> before constructing its
+initial model, using the shared path resolver (including its XDG fallback).
+The root map contains <code>scheme</code> and <code>left</code>, <code>bottom</code>, <code>right</code>, <code>top</code> maps with
+<code>thickness_px</code>, <code>pinned</code> and stable <code>page</code> IDs. Thickness must be finite and
+positive; missing or invalid files use defaults with one diagnostic line.
+Unknown page IDs use the edge's default page. Scheme is retained unchanged
+until theme controls are implemented.</p>
+<p>Accepted pin and page changes save the current state after the Model stage,
+using a temporary file and atomic rename. Output migration carries live
+pin, page and thickness state; it never reloads disk state. Both smoke modes
+skip restore, saving and the intro pulse.</p>
+<p>A normal cold start reveals unpinned panels for two seconds, then releases
+a temporary startup hold into normal 800 ms grace. This discovery pulse is
+an explicit exception to compositor-only corner reveal. Real corner and
+pointer membership remain independent and can keep panels revealed after
+the pulse expires. Restored pins remain pinned.</p>
+<p><code>setup.mix --desktop</code> installs <code>dev.cosmix.quoin.desktop</code> into the user's XDG
+applications directory, pointing at the installed checkout binary. Quit
+completes the existing render/surface drain; the launcher adds no settle sleep.</p>
 <p>The bottom carousel places <code>power</code> immediately after the clock-bearing
 launcher page. It subscribes to <code>power.props.changed</code> before reading
 <code>power.props.get</code>, snapshots again on reconnect, on a delivery gap, on a
@@ -575,10 +609,16 @@ never rendered as zero.</p>
 <p>Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. <code>--comp-service NAME</code> selects the
 registered compositor instance (default <code>comp</code>), giving topic headers
-<code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code> and
+<code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code>, <code>&lt;service&gt;.corner.clicked</code> and
 <code>&lt;service&gt;.output.changed</code>. Their inner commands remain the unprefixed
-<code>corner.entered</code>, <code>corner.left</code> and <code>output.changed</code>.</p>
-<p>Quoin subscribes to all three topics before addressing the selected service
+<code>corner.entered</code>, <code>corner.left</code>, <code>corner.clicked</code> and <code>output.changed</code>.
+The compositor emits <code>corner.clicked</code> on a left-button press on an engaged
+corner; the client toggles the clockwise edge's panel pin (TL→left, BL→bottom,
+BR→right, TR→top). Each click is an impulse, independent of corner membership;
+the model resolves the toggle from its current pin state and persists the
+change. Unpinning leaves the panel revealed and arms grace when no hold remains.
+The visible header pin control remains available as a fallback.</p>
+<p>Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed <code>comp.props.get</code> request verb at <code>outputs</code>. It maps the topic's
 stable <code>o_&lt;slug&gt;</code> output key through the public
 row's raw <code>name</code> and accepts only the exact SCTK-selected output. Output-change
@@ -593,7 +633,9 @@ authorised for those topics can inject corner events.</p>
 commands. The socket reader never waits for capacity; a full lane drops the new
 frame and surfaces an overflow marker. Quoin treats that marker exactly like a
 disconnect: synthesize left for all engagements, invalidate the slug map, and
-refresh it before accepting mapped corner state again.</p>
+refresh it before accepting mapped corner state again.
+A lost click is a missed toggle and is never replayed or synthetically recovered.
+If only a click is dropped at the host-to-runner queue, existing holds are retained.</p>
 <p>A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native
 pointer is also outside. Native SCTK pointer enter/leave supplies the second

@@ -2,6 +2,7 @@
 
 mod bus_service;
 mod desktop_font;
+mod launcher;
 mod power;
 mod state;
 
@@ -127,6 +128,7 @@ fn main() -> AppExit {
             CtkThemePlugin::default(),
             QuoinChromePlugin,
             ShellBusPlugin,
+            launcher::LauncherPlugin,
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host))
@@ -475,6 +477,7 @@ fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: boo
 }
 
 fn bottom_launcher(commands: &mut Commands) -> Entity {
+    let thunderbird = launcher::thunderbird_button(commands);
     let apps = commands
         .spawn((
             Text::new("Konsole  ·  Firefox  ·  Dolphin  ·  Kate"),
@@ -505,7 +508,7 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
             padding: UiRect::axes(px(14), px(8)),
             ..default()
         })
-        .add_children(&[apps, clock])
+        .add_children(&[apps, thunderbird, clock])
         .id()
 }
 

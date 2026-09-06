@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-quoin"
-version = "0.8.3"
+version = "0.8.4"
 description = "Cosmix Quoin four-edge layer-shell furniture"
 edition = "2024"
 rust-version = "1.95"

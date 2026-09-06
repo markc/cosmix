@@ -547,7 +547,11 @@ below, so handlers do not depend on the instance name.</p>
 <tr><td><code>&lt;service&gt;.output.changed</code></td><td><code>output.changed</code></td><td><code>{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.entered</code></td><td><code>corner.entered</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.left</code></td><td><code>corner.left</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.corner.clicked</code></td><td><code>corner.clicked</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 </tbody></table>
+<p><code>corner.clicked</code> observes a left-button press while a corner is engaged, carrying
+the same engagement dwell as entered/left. It does not consume the button event;
+clients can map it to a panel pin toggle.</p>
 <p>For a reliable property bootstrap: subscribe to the instance topic (for
 example <code>comp.props.changed</code> on the seat or <code>comp-nested.props.changed</code> when
 nested), call <code>comp.props.watch</code>, verify its returned topic, then read the
