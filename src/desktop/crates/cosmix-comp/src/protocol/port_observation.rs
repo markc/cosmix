@@ -927,6 +927,7 @@ impl WaylandState {
                     self.emit_corner_entered(output, corner, dwell_ms);
                 }
                 CornerEvent::Left { corner, dwell_ms } => {
+                    self.activate_pointer_constraint_after_corner();
                     self.emit_corner_left(output, corner, dwell_ms);
                 }
             }
@@ -970,6 +971,13 @@ impl WaylandState {
                     self.observations.corner_timer_arms.saturating_add(1);
             }
         }
+    }
+
+    /// Whether the pointer currently sits inside an engaged Quoin corner —
+    /// the corner-supremacy gate `new_constraint` consults before
+    /// activating a fresh pointer constraint.
+    pub(crate) fn corner_engaged(&self) -> bool {
+        self.observations.corner_detector.engaged_corner().is_some()
     }
 
     #[cfg(test)]
@@ -2102,7 +2110,13 @@ fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
 /// read-only through `known_read_only_path`.
 pub(crate) fn parse_window_band_path(path: &str) -> Option<u64> {
     let id = path.strip_prefix("windows.s")?.strip_suffix(".band")?;
-    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+    // Canonical ids only: a leading zero ("windows.s0007.band") would write
+    // through an alias that reads, describes and event-diffs as "s7" — the
+    // reply would name a path that can never be read back.
+    if id.is_empty()
+        || (id.len() > 1 && id.starts_with('0'))
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     id.parse().ok()
@@ -2270,6 +2284,12 @@ mod tests {
             assert_eq!(parse_window_band_path("windows.s12.band"), Some(12));
             assert_eq!(parse_window_band_path("windows.s0.band"), Some(0));
             assert_eq!(parse_window_band_path("windows.s.band"), None);
+            assert_eq!(
+                parse_window_band_path("windows.s0007.band"),
+                None,
+                "leading zeros would alias the canonical s7 key"
+            );
+            assert_eq!(parse_window_band_path("windows.s01.band"), None);
             assert_eq!(parse_window_band_path("windows.s12.title"), None);
             assert_eq!(parse_window_band_path("windows.s1x2.band"), None);
             assert_eq!(parse_window_band_path("windows.12.band"), None);

@@ -2100,6 +2100,16 @@ impl PointerConstraintsHandler for WaylandState {
         if !focused {
             return;
         }
+        // Corner supremacy's second half: while the cursor sits inside an
+        // engaged corner, a freshly created constraint must not activate —
+        // otherwise a client defeats the corner break by destroying and
+        // recreating its constraint (no new Entered event fires while the
+        // same corner stays engaged). The constraint stays pending; leaving
+        // the corner re-activates it (`CornerEvent::Left` hook).
+        #[cfg(feature = "bus")]
+        if self.corner_engaged() {
+            return;
+        }
         with_pointer_constraint(surface, pointer, |constraint| {
             if let Some(constraint) = constraint {
                 constraint.activate();

@@ -31701,6 +31701,22 @@ fn layer_rearrange_shifts_subsurface_and_popup_layout_and_hit_testing() {
         )
     );
 
+    // A restack while the reposition is pending must not be undone by the
+    // ack: the pending layout is geometry authority only. A stale stack key
+    // restored here would resurrect the popup's old band — the window band
+    // demotion regression, where a demoted window's popup ack promoted the
+    // whole role tree back to Normal.
+    let root_wl = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.raise_surface(&root_wl);
+    let popup_z_after_restack = test_layer_record(&harness, popup_surface).layout.z;
+    assert_ne!(
+        popup_z_after_restack, pending_layout_before.z,
+        "the restack reassigned the popup's stack key while the reposition is pending"
+    );
+
     send_request(
         &mut harness.client,
         popup_xdg_surface,
@@ -31717,6 +31733,10 @@ fn layer_rearrange_shifts_subsurface_and_popup_layout_and_hit_testing() {
             pending_layout_before.y + delta.1,
         ),
         "the ack applies the reposition in the moved root coordinate space"
+    );
+    assert_eq!(
+        popup_repositioned.z, popup_z_after_restack,
+        "the ack restores geometry only — the live stack key survives"
     );
 
     let child_hit = harness

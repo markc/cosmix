@@ -9711,7 +9711,14 @@ impl WaylandState {
         let Some(record) = self.surfaces.get_mut(&surface.id()) else {
             return;
         };
+        // The reposition restore is GEOMETRY authority only. The stack key
+        // may have been reassigned while the reposition was pending (a
+        // raise, a window band demotion); restoring the saved key would
+        // resurrect a stale band for this popup and let a later
+        // raise-through-the-role-tree promote a demoted window.
+        let current_z = record.layout.z;
         record.layout = pending.layout;
+        record.layout.z = current_z;
         record.window_origin = pending.window_origin;
         record.configured_size = pending.configured_size;
         let id = record.id;
@@ -12618,6 +12625,12 @@ impl WaylandState {
     /// `PointerConstraintsHandler::new_constraint` is deliberately open
     /// (agentic-first law); this is its one unconditional counterpart, and
     /// it protects the corner rather than asking a human to.
+    ///
+    /// Known limit: a LOCKED pointer never moves, so it can never enter a
+    /// corner and this break never fires for it. The locked escape remains
+    /// keyboard bindings (window cycling, VT switch) and focus change —
+    /// smithay deactivates a constraint when its surface loses pointer
+    /// focus. A reserved break-constraint binding is a pending design call.
     pub(crate) fn break_pointer_constraint_for_corner(&mut self) {
         let Some(surface) = self
             .pointer
@@ -12632,6 +12645,29 @@ impl WaylandState {
                 && constraint.is_active()
             {
                 constraint.deactivate();
+            }
+        });
+    }
+
+    /// Counterpart to the corner break: when the pointer leaves a corner, a
+    /// pending (created-but-never-activated) constraint of the
+    /// pointer-focused surface is activated — the constraint a client
+    /// created while a corner was engaged, which `new_constraint`
+    /// deliberately left inactive.
+    pub(crate) fn activate_pointer_constraint_after_corner(&mut self) {
+        let Some(surface) = self
+            .pointer
+            .current_focus()
+            .and_then(|focus| focus.owned_surface())
+        else {
+            return;
+        };
+        let pointer = self.pointer.clone();
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && !constraint.is_active()
+            {
+                constraint.activate();
             }
         });
     }
