@@ -2209,7 +2209,7 @@ fn retain_copyable_consumers(
     #[cfg(feature = "frame-capture")]
     group.png.retain(|request| {
         if request.deadline <= Instant::now() {
-            request.complete();
+            request.fail("render-deadline-expired");
             false
         } else {
             true
@@ -2324,6 +2324,14 @@ fn capture_output_frames(
     let mut deferred_png = Vec::new();
     #[cfg(feature = "frame-capture")]
     for admission in png_admissions {
+        if admission.deadline <= Instant::now() {
+            admission.fail(
+                admission
+                    .readiness_reason
+                    .unwrap_or("queued-deadline-expired"),
+            );
+            continue;
+        }
         let source = match &admission.request.target {
             PngCaptureTarget::Nested => views.iter().find_map(|(_, _, source)| {
                 source.and_then(|source| {
@@ -2338,7 +2346,7 @@ fn capture_output_frames(
                 groups.entry(source).or_default().png.push(admission);
             }
             Some(_) => deferred_png.push(admission),
-            None => admission.complete(),
+            None => admission.fail("nested-source-unavailable"),
         }
     }
     #[cfg(feature = "frame-capture")]
@@ -2385,6 +2393,14 @@ fn capture_output_frames(
                     }
             })
         }) else {
+            #[cfg(feature = "frame-capture")]
+            if matches!(&source_id, CaptureSourceId::Kms { .. }) {
+                png_service.defer_unready(
+                    std::mem::take(&mut group.png),
+                    Instant::now(),
+                    "kms-camera-unavailable",
+                );
+            }
             fail_readback_group(&group, reporter.as_ref());
             continue;
         };
@@ -2407,6 +2423,16 @@ fn capture_output_frames(
                 .and_then(|targets| targets.capture_frame_token(&source_id)),
         };
         let Some(frame_token) = frame_token else {
+            // A KMS camera is published before its first acquired frame. The
+            // registrar deliberately requires a complete ready render update
+            // before acquisition. Keep PNG admissions through that gap, with
+            // their original deadline; wire-client failure semantics stay put.
+            #[cfg(feature = "frame-capture")]
+            png_service.defer_unready(
+                std::mem::take(&mut group.png),
+                Instant::now(),
+                "kms-frame-token-unavailable",
+            );
             fail_readback_group(&group, reporter.as_ref());
             continue;
         };
@@ -2426,6 +2452,14 @@ fn capture_output_frames(
         // nested and KMS. Cursor cameras render to independent transparent
         // targets and therefore cannot clear or swap this texture.
         let Some(scene_texture) = target.out_texture() else {
+            #[cfg(feature = "frame-capture")]
+            if matches!(&source_id, CaptureSourceId::Kms { .. }) {
+                png_service.defer_unready(
+                    std::mem::take(&mut group.png),
+                    Instant::now(),
+                    "kms-scene-texture-unavailable",
+                );
+            }
             fail_readback_group(&group, reporter.as_ref());
             continue;
         };
@@ -2943,7 +2977,7 @@ fn capture_output_frames(
         let Some(sender) = worker.sender.as_ref() else {
             fail_requests(&job.requests, job.reporter.as_ref());
             #[cfg(feature = "frame-capture")]
-            fail_png(&job.png_requests);
+            fail_png(&job.png_requests, "readback-worker-unavailable");
             continue;
         };
         let _ = try_submit_readback(sender, job);
@@ -3025,28 +3059,32 @@ fn try_submit_readback(sender: &SyncSender<CaptureReadbackJob>, job: CaptureRead
             job.buffer.unmap();
             fail_requests(&job.requests, job.reporter.as_ref());
             #[cfg(feature = "frame-capture")]
-            fail_png(&job.png_requests);
+            fail_png(&job.png_requests, "readback-queue-unavailable");
             false
         }
     }
 }
 
+#[track_caller]
 fn fail_readback_group(group: &CaptureReadbackGroup, reporter: Option<&CaptureCompletionReporter>) {
     fail_requests(&group.requests, reporter);
     #[cfg(feature = "frame-capture")]
-    fail_png(&group.png);
+    fail_png(&group.png, "render-readback-rejected");
 }
 
 #[cfg(feature = "frame-capture")]
-fn fail_png(requests: &[PngCaptureAdmission]) {
+#[track_caller]
+fn fail_png(requests: &[PngCaptureAdmission], reason: &'static str) {
     for request in requests {
-        request.complete();
+        request.fail(reason);
     }
 }
 
 fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
     let mapped = loop {
         if stop.load(Ordering::Acquire) {
+            #[cfg(feature = "frame-capture")]
+            fail_png(&job.png_requests, "readback-worker-stopped");
             job.buffer.unmap();
             return;
         }
@@ -3066,7 +3104,7 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
         #[cfg(feature = "frame-capture")]
         job.png_requests.retain(|request| {
             if request.deadline <= now {
-                request.complete();
+                request.fail("readback-deadline-expired");
                 false
             } else {
                 true
@@ -3110,7 +3148,7 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
     if !mapped {
         fail_requests(&job.requests, job.reporter.as_ref());
         #[cfg(feature = "frame-capture")]
-        fail_png(&job.png_requests);
+        fail_png(&job.png_requests, "gpu-map-failed");
         job.buffer.unmap();
         return;
     }
@@ -3126,7 +3164,7 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
         job.buffer.unmap();
         fail_requests(&job.requests, job.reporter.as_ref());
         #[cfg(feature = "frame-capture")]
-        fail_png(&job.png_requests);
+        fail_png(&job.png_requests, "pixel-normalisation-failed");
         return;
     };
     drop(mapped);
@@ -3367,6 +3405,28 @@ impl PngCaptureService {
         self.batch_in_flight.load(Ordering::Acquire)
     }
 
+    /// Reconsider transient KMS readiness only on normal render frames. Never
+    /// renew admission or its deadline, and never submit another batch.
+    fn defer_unready(
+        &self,
+        requests: Vec<PngCaptureAdmission>,
+        now: Instant,
+        reason: &'static str,
+    ) {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for mut request in requests {
+            request.readiness_reason = Some(reason);
+            if request.deadline <= now {
+                request.fail(reason);
+            } else {
+                queue.push(request);
+            }
+        }
+    }
+
     pub(crate) fn submit_batch(&self, requests: Vec<PngCaptureRequest>) -> bool {
         if requests.is_empty()
             || self
@@ -3386,6 +3446,7 @@ impl PngCaptureService {
             .extend(requests.into_iter().map(|request| PngCaptureAdmission {
                 request,
                 deadline,
+                readiness_reason: None,
                 finished: Arc::new(AtomicBool::new(false)),
                 batch_remaining: Arc::clone(&remaining),
                 service: self.clone(),
@@ -3399,6 +3460,7 @@ impl PngCaptureService {
 struct PngCaptureAdmission {
     request: PngCaptureRequest,
     deadline: Instant,
+    readiness_reason: Option<&'static str>,
     finished: Arc<AtomicBool>,
     batch_remaining: Arc<AtomicUsize>,
     service: PngCaptureService,
@@ -3407,18 +3469,42 @@ struct PngCaptureAdmission {
 #[cfg(feature = "frame-capture")]
 impl PngCaptureAdmission {
     fn complete(&self) {
-        if !self.finished.swap(true, Ordering::AcqRel)
-            && self.batch_remaining.fetch_sub(1, Ordering::AcqRel) == 1
-        {
+        self.finish_once();
+    }
+
+    fn finish_once(&self) -> bool {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if self.batch_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.service.batch_in_flight.store(false, Ordering::Release);
         }
+        true
+    }
+
+    #[track_caller]
+    fn fail(&self, reason: &'static str) {
+        if !self.finish_once() {
+            return;
+        }
+        let (source, output) = match &self.request.target {
+            PngCaptureTarget::Nested => (None, "nested"),
+            PngCaptureTarget::Kms {
+                source_id,
+                output_name,
+            } => (Some(source_id), output_name.as_str()),
+        };
+        let location = std::panic::Location::caller();
+        tracing::warn!(reason, ?source, output, path = %self.request.final_path.display(),
+            deadline_expired = self.deadline <= Instant::now(),
+            file = location.file(), line = location.line(), "composed-frame capture failed");
     }
 }
 
 #[cfg(feature = "frame-capture")]
 fn publish_png(rgba: &[u8], size: (u32, u32), request: PngCaptureAdmission) {
     if request.deadline <= Instant::now() {
-        request.complete();
+        request.fail("png-publication-deadline-expired");
         return;
     }
     let mut bgra = Vec::with_capacity(rgba.len());
@@ -3920,6 +4006,83 @@ mod tests {
             feed.capture_outcomes_for_test(),
             vec![crate::protocol::CaptureTestOutcome::Failed(CaptureId(1))]
         );
+    }
+
+    #[cfg(feature = "frame-capture")]
+    #[test]
+    fn png_kms_readiness_retry_preserves_admission_and_deadline() {
+        let service = PngCaptureService::default();
+        assert!(service.submit_batch(vec![PngCaptureRequest {
+            target: PngCaptureTarget::Kms {
+                source_id: CaptureSourceId::Kms {
+                    key: crate::backend::kms::OutputKey {
+                        device: 1,
+                        connector_name: "HDMI-A-1".into(),
+                    },
+                    generation: 7,
+                },
+                output_name: "HDMI-A-1".into(),
+            },
+            cursor: None,
+            final_path: "capture.png".into(),
+            temporary_path: "capture.tmp".into(),
+        }]));
+        let admitted = service.queue.lock().unwrap().pop().unwrap();
+        let original_deadline = admitted.deadline;
+        let completion = admitted.finished.clone();
+        // First render has the camera but no acquired frame. Second render
+        // still has no texture. Neither attempt relinquishes the batch slot.
+        service.defer_unready(
+            vec![admitted],
+            Instant::now(),
+            "kms-frame-token-unavailable",
+        );
+        let retry = service.queue.lock().unwrap().pop().unwrap();
+        assert_eq!(retry.deadline, original_deadline);
+        assert!(Arc::ptr_eq(&completion, &retry.finished));
+        service.defer_unready(vec![retry], Instant::now(), "kms-scene-texture-unavailable");
+        assert!(service.busy());
+        // Once an eligible frame exists the same admission reaches the normal
+        // copyability gate and completes, with no fresh timeout or batch.
+        let mut group = CaptureReadbackGroup {
+            png: std::mem::take(&mut *service.queue.lock().unwrap()),
+            ..Default::default()
+        };
+        assert!(retain_copyable_consumers(
+            &mut group,
+            None,
+            Some((3840, 2160))
+        ));
+        assert_eq!(group.png.len(), 1);
+        assert_eq!(
+            group.png[0].readiness_reason,
+            Some("kms-scene-texture-unavailable")
+        );
+        group.png[0].complete();
+        assert!(!service.busy());
+        assert!(completion.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "frame-capture")]
+    #[test]
+    fn png_readiness_expiry_completes_batch_exactly_once() {
+        let service = PngCaptureService::default();
+        assert!(service.submit_batch(vec![PngCaptureRequest {
+            target: PngCaptureTarget::Nested,
+            cursor: None,
+            final_path: "expired.png".into(),
+            temporary_path: "expired.tmp".into(),
+        }]));
+        let admitted = service.queue.lock().unwrap().pop().unwrap();
+        let duplicate = admitted.clone();
+        let deadline = admitted.deadline;
+        service.defer_unready(vec![admitted], deadline, "kms-camera-unavailable");
+        assert!(service.queue.lock().unwrap().is_empty());
+        assert!(!service.busy());
+        assert_eq!(duplicate.batch_remaining.load(Ordering::Acquire), 0);
+        duplicate.fail("duplicate-test-completion");
+        duplicate.complete();
+        assert_eq!(duplicate.batch_remaining.load(Ordering::Acquire), 0);
     }
 
     #[cfg(feature = "frame-capture")]

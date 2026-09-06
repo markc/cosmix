@@ -846,6 +846,11 @@ outputs. PNG capture retains its filename, atomic-rename and cadence contract;
 an unavailable output or an encode/write task which starts after the deadline
 releases the one-batch-in-flight latch. A genuinely blocked filesystem write
 cannot be cancelled safely and remains outside this deadline guarantee.</p>
+<p>PNG requests which reach KMS before their camera or frame token is ready are
+retained for a later render frame within the original deadline. This does not
+extend the deadline or add a timer. Terminal PNG failures emit a structured
+reason, target and output path so a missing evidence image can be diagnosed;
+the batch latch is released exactly once on completion or failure.</p>
 <p>The per-destination fd duplication and Vulkan image creation/bind syscalls run
 on the render thread. This is intentionally retained for S-2: admission is
 bounded to eight destinations per render batch, and moving import into the

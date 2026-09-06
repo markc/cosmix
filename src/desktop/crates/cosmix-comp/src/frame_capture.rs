@@ -283,6 +283,13 @@ fn request_frame_capture(
         .signal
         .as_ref()
         .is_some_and(CaptureSignal::take_request);
+    if signal_requested {
+        info!(
+            target_available,
+            capture_in_flight = service.busy(),
+            "composed-frame capture signal received"
+        );
+    }
     if !runtime.cadence.should_capture(
         Instant::now(),
         signal_requested,
