@@ -3153,13 +3153,24 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
         return;
     }
     let mapped = job.buffer.slice(..).get_mapped_range();
-    let Some(rgba) = normalise_mapped_output(
+    #[cfg(feature = "frame-capture")]
+    let normalise_started = Instant::now();
+    let normalised = normalise_mapped_output(
         &mapped,
         job.row_pitch,
         job.source_extent,
         job.source_format,
         job.transform,
-    ) else {
+    );
+    #[cfg(feature = "frame-capture")]
+    for request in &job.png_requests {
+        tracing::info!(path = %request.request.final_path.display(),
+            elapsed_ms = normalise_started.elapsed().as_secs_f64() * 1000.0,
+            deadline_remaining_at_start_ms = request.deadline.saturating_duration_since(normalise_started).as_secs_f64() * 1000.0,
+            width = job.source_extent.0, height = job.source_extent.1,
+            format = ?job.source_format, "composed-frame capture pixel normalisation");
+    }
+    let Some(rgba) = normalised else {
         drop(mapped);
         job.buffer.unmap();
         fail_requests(&job.requests, job.reporter.as_ref());
@@ -3296,6 +3307,31 @@ fn normalise_mapped_output(
         .checked_mul(displayed.1 as usize)?
         .checked_mul(4)?;
     let mut rgba = vec![0_u8; byte_count];
+    if matches!(transform, smithay::utils::Transform::Normal) && byte_count != 0 {
+        let bgra = match source_format {
+            TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => false,
+            TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => true,
+            _ => return None,
+        };
+        // Mapped Vulkan staging memory can be uncached: scalar channel reads
+        // took over six seconds for a 4K frame on the live integrated GPU.
+        // Transfer rows in bulk first, then swizzle only CPU-owned memory.
+        let row_bytes = (width as usize).checked_mul(4)?;
+        if row_pitch == row_bytes {
+            rgba.copy_from_slice(mapped.get(..byte_count)?);
+        } else {
+            for (y, row) in rgba.chunks_exact_mut(row_bytes).enumerate() {
+                let start = y.checked_mul(row_pitch)?;
+                row.copy_from_slice(mapped.get(start..start.checked_add(row_bytes)?)?);
+            }
+        }
+        if bgra {
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        return Some(rgba);
+    }
     for y in 0..height {
         for x in 0..width {
             let source = (y as usize)
@@ -3610,6 +3646,12 @@ mod tests {
     }
 
     fn test_render_device() -> (wgpu::Device, RenderDevice) {
+        let (device, _) = test_gpu_device();
+        let render_device = RenderDevice::from(device.clone());
+        (device, render_device)
+    }
+
+    fn test_gpu_device() -> (wgpu::Device, wgpu::Queue) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -3621,11 +3663,9 @@ mod tests {
                 force_fallback_adapter: false,
             }))
             .expect("capture worker tests require a real Vulkan adapter");
-        let (device, _) =
-            bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("capture worker test device");
-        let render_device = RenderDevice::from(device.clone());
-        (device, render_device)
+        eprintln!("capture worker Vulkan adapter: {:?}", adapter.get_info());
+        bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("capture worker test device")
     }
 
     fn request(transform: smithay::utils::Transform) -> CaptureRequest {
@@ -3660,6 +3700,140 @@ mod tests {
             reservation: CaptureReservationLease::detached(CaptureId(1)),
             deadline: Instant::now() + crate::protocol::CAPTURE_REQUEST_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn normalisation_bulk_rows_preserve_channels_padding_and_bounds() {
+        let tight = [17, 73, 149, 255, 41, 83, 151, 127];
+        let padded = [17, 73, 149, 255, 99, 98, 97, 96, 41, 83, 151, 127];
+        for (format, expected) in [
+            (TextureFormat::Rgba8Unorm, tight),
+            (TextureFormat::Rgba8UnormSrgb, tight),
+            (
+                TextureFormat::Bgra8Unorm,
+                [149, 73, 17, 255, 151, 83, 41, 127],
+            ),
+            (
+                TextureFormat::Bgra8UnormSrgb,
+                [149, 73, 17, 255, 151, 83, 41, 127],
+            ),
+        ] {
+            for (bytes, pitch) in [(tight.as_slice(), 4), (padded.as_slice(), 8)] {
+                assert_eq!(
+                    normalise_mapped_output(
+                        bytes,
+                        pitch,
+                        (1, 2),
+                        format,
+                        smithay::utils::Transform::Normal
+                    ),
+                    Some(expected.to_vec())
+                );
+                assert!(
+                    normalise_mapped_output(
+                        &bytes[..bytes.len() - 1],
+                        pitch,
+                        (1, 2),
+                        format,
+                        smithay::utils::Transform::Normal
+                    )
+                    .is_none()
+                );
+            }
+        }
+        assert_eq!(
+            normalise_mapped_output(
+                &[],
+                0,
+                (0, 2),
+                TextureFormat::Rgba8Unorm,
+                smithay::utils::Transform::Normal
+            ),
+            Some(Vec::new())
+        );
+        assert!(
+            normalise_mapped_output(
+                &tight,
+                4,
+                (1, 2),
+                TextureFormat::R8Unorm,
+                smithay::utils::Transform::Normal
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual headless real-Vulkan mapped-memory performance probe"]
+    fn mapped_4k_normalisation_bulk_copy_probe() {
+        let (device, queue) = test_gpu_device();
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture mapped-memory probe"),
+            size: 3840 * 2160 * 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        let input = [17, 73, 149, 255].repeat(3840 * 2160);
+        buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(&input);
+        buffer.unmap();
+        queue.submit([]);
+        let map_started = Instant::now();
+        let (tx, rx) = mpsc::sync_channel(1);
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+        poll_test_gpu(&device, "map 4K staging probe");
+        rx.recv().unwrap().unwrap();
+        let map_elapsed = map_started.elapsed();
+        let mapped = buffer.slice(..).get_mapped_range();
+        let started = Instant::now();
+        let baseline = normalise_mapped_output(
+            &mapped,
+            15360,
+            (3840, 2160),
+            TextureFormat::Bgra8Unorm,
+            smithay::utils::Transform::Normal,
+        )
+        .unwrap();
+        let baseline_elapsed = started.elapsed();
+        let started = Instant::now();
+        let mut bulk = mapped.to_vec();
+        for pixel in bulk.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let bulk_elapsed = started.elapsed();
+        assert!(baseline == bulk, "mapped scalar and bulk paths differ");
+        assert!(
+            baseline
+                .chunks_exact(4)
+                .all(|pixel| pixel == [149, 73, 17, 255]),
+            "all channels and alpha survive mapped readback"
+        );
+        let started = Instant::now();
+        let ram = normalise_mapped_output(
+            &bulk,
+            15360,
+            (3840, 2160),
+            TextureFormat::Rgba8Unorm,
+            smithay::utils::Transform::Normal,
+        )
+        .unwrap();
+        let ram_elapsed = started.elapsed();
+        assert!(
+            ram == baseline,
+            "CPU copy must preserve the normalised bytes"
+        );
+        eprintln!(
+            "mapped4K BGRA map={map_elapsed:?} production={baseline_elapsed:?} bulk={bulk_elapsed:?} RAM={ram_elapsed:?} debug_assertions={}",
+            cfg!(debug_assertions)
+        );
+        drop(mapped);
+        buffer.unmap();
     }
 
     #[test]

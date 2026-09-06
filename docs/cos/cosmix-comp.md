@@ -450,6 +450,9 @@ retained for a later render frame within the original deadline. This does not
 extend the deadline or add a timer. Terminal PNG failures emit a structured
 reason, target and output path so a missing evidence image can be diagnosed;
 the batch latch is released exactly once on completion or failure.
+For unrotated output, pixel normalisation bulk-copies each mapped row into
+CPU memory before any BGRA channel swizzle. This avoids slow scalar reads
+from mapped GPU memory at high resolutions without extending capture deadlines.
 
 The per-destination fd duplication and Vulkan image creation/bind syscalls run
 on the render thread. This is intentionally retained for S-2: admission is
