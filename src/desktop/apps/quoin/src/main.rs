@@ -479,9 +479,10 @@ fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: boo
 fn bottom_launcher(commands: &mut Commands) -> Entity {
     let thunderbird = launcher::button(commands, launcher::LauncherApp::Thunderbird);
     let foot = launcher::button(commands, launcher::LauncherApp::Foot);
+    let firefox = launcher::button(commands, launcher::LauncherApp::Firefox);
     let apps = commands
         .spawn((
-            Text::new("Konsole  ·  Firefox  ·  Dolphin  ·  Kate"),
+            Text::new("Konsole  ·  Dolphin  ·  Kate"),
             TextFont::from_font_size(13.0),
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
         ))
@@ -509,7 +510,7 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
             padding: UiRect::axes(px(14), px(8)),
             ..default()
         })
-        .add_children(&[apps, foot, thunderbird, clock])
+        .add_children(&[apps, foot, firefox, thunderbird, clock])
         .id()
 }
 

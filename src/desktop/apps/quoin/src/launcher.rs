@@ -35,15 +35,17 @@ impl Plugin for LauncherPlugin {
 pub(crate) enum LauncherApp {
     Thunderbird,
     Foot,
+    Firefox,
 }
 
 impl LauncherApp {
-    const ALL: [Self; 2] = [Self::Thunderbird, Self::Foot];
+    const ALL: [Self; 3] = [Self::Thunderbird, Self::Foot, Self::Firefox];
 
     fn command(self) -> &'static str {
         match self {
             Self::Thunderbird => "thunderbird",
             Self::Foot => "foot",
+            Self::Firefox => "firefox",
         }
     }
 
@@ -51,6 +53,7 @@ impl LauncherApp {
         match self {
             Self::Thunderbird => "Thunderbird",
             Self::Foot => "Foot",
+            Self::Firefox => "Firefox",
         }
     }
 }
@@ -66,7 +69,7 @@ enum LaunchFeedback {
 
 #[derive(Resource, Default)]
 struct LauncherState {
-    apps: [AppLaunchState; 2],
+    apps: [AppLaunchState; LauncherApp::ALL.len()],
 }
 
 #[derive(Default)]
@@ -285,14 +288,18 @@ mod tests {
 
     #[test]
     fn launcher_argv_preserves_hook_as_one_argument_and_rejects_relative_paths() {
-        for app in LauncherApp::ALL {
+        for (app, executable) in [
+            (LauncherApp::Thunderbird, "thunderbird"),
+            (LauncherApp::Foot, "foot"),
+            (LauncherApp::Firefox, "firefox"),
+        ] {
             assert_eq!(
                 launch_argv(app, None).unwrap(),
-                vec![OsString::from(app.command())]
+                vec![OsString::from(executable)]
             );
             assert_eq!(
                 launch_argv(app, Some(OsStr::new("/tmp/mail hook.mix"))).unwrap(),
-                ["/opt/cosmix/bin/mix", "/tmp/mail hook.mix", app.command()].map(OsString::from)
+                ["/opt/cosmix/bin/mix", "/tmp/mail hook.mix", executable].map(OsString::from)
             );
             assert!(launch_argv(app, Some(OsStr::new("relative.mix"))).is_err());
             assert!(launch_argv(app, Some(OsStr::new(""))).is_err());
@@ -320,86 +327,92 @@ mod tests {
     #[test]
     fn button_uses_widget_type_and_tracks_visible_page_and_focus() {
         for app_kind in LauncherApp::ALL {
-            use bevy::ecs::system::RunSystemOnce;
-            use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
-            use cosmix_shell::runtime::ShellFrame;
-            use std::time::Duration;
-            let model = ShellModel::new(
-                OutputKey::new("test").unwrap(),
-                LogicalSize::new(1536.0, 864.0).unwrap(),
-                Duration::ZERO,
-                Duration::from_millis(800),
-                Duration::from_millis(200),
-            )
-            .unwrap();
-            let mut app = App::new();
-            app.insert_resource(ShellFrameState(ShellFrame::from_model(&model)))
-                .init_resource::<LauncherState>()
-                .init_resource::<InputFocus>()
-                .add_observer(activate);
-            let mut queue = bevy::ecs::world::CommandQueue::default();
-            let entity = button(&mut Commands::new(&mut queue, app.world()), app_kind);
-            let other_kind = LauncherApp::ALL[1 - app_kind as usize];
-            let other = button(&mut Commands::new(&mut queue, app.world()), other_kind);
-            queue.apply(app.world_mut());
-            assert!(app.world().entity(entity).contains::<WidgetButton>());
-            app.world_mut().run_system_once(present).unwrap();
-            assert!(app.world().entity(entity).contains::<InteractionDisabled>());
-            app.world_mut().trigger(Activate { entity });
-            assert!(!app.world().resource::<LauncherState>().apps[app_kind as usize].requested);
+            for other_kind in LauncherApp::ALL
+                .into_iter()
+                .filter(|other| *other != app_kind)
             {
-                let mut frame = app.world_mut().resource_mut::<ShellFrameState>();
-                let panel = &mut frame.0.panels[Edge::Bottom.index()];
-                panel.mapped = true;
-                panel.active_page_id = Some("launcher".into());
-            }
-            app.world_mut().run_system_once(present).unwrap();
-            assert!(!app.world().entity(entity).contains::<InteractionDisabled>());
-            app.world_mut()
-                .resource_mut::<InputFocus>()
-                .set(entity, bevy::input_focus::FocusCause::Navigated);
-            app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Bottom.index()]
-                .active_page_id = Some("power".into());
-            app.world_mut().run_system_once(present).unwrap();
-            assert!(app.world().entity(entity).contains::<InteractionDisabled>());
-            assert_eq!(app.world().resource::<InputFocus>().get(), None);
-            // Even a stale enabled component cannot activate another page.
-            app.world_mut()
-                .entity_mut(entity)
-                .remove::<InteractionDisabled>();
-            app.world_mut().trigger(Activate { entity });
-            assert!(!app.world().resource::<LauncherState>().apps[app_kind as usize].requested);
-            app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Bottom.index()]
-                .active_page_id = Some("launcher".into());
-            app.world_mut().trigger(Activate { entity });
-            assert!(app.world().resource::<LauncherState>().apps[app_kind as usize].requested);
-            assert!(app.world().resource::<LauncherState>().apps[app_kind as usize].busy);
-            app.world_mut().resource_mut::<LauncherState>().apps[app_kind as usize].requested =
-                false;
-            app.world_mut().trigger(Activate { entity });
-            assert!(
-                !app.world().resource::<LauncherState>().apps[app_kind as usize].requested,
-                "busy launcher rejects duplicates"
-            );
-            app.world_mut().run_system_once(present).unwrap();
-            assert!(!app.world().entity(other).contains::<InteractionDisabled>());
-            app.world_mut().trigger(Activate { entity: other });
-            assert!(app.world().resource::<LauncherState>().apps[other_kind as usize].requested);
-            // Completion belongs to one app; it cannot clear another app's busy state.
-            app.world().resource::<LauncherState>().apps[app_kind as usize]
-                .feedback
-                .lock()
-                .unwrap()
-                .push(LaunchFeedback::Finished(Err("test failure".into())));
-            app.world_mut().run_system_once(present).unwrap();
-            assert!(!app.world().resource::<LauncherState>().apps[app_kind as usize].busy);
-            assert!(app.world().resource::<LauncherState>().apps[other_kind as usize].busy);
-            let mut labels = app.world_mut().query::<(&LauncherLabel, &Text)>();
-            for (owner, text) in labels.iter(app.world()) {
-                if owner.0 == app_kind {
-                    assert_eq!(text.0, "test failure");
-                } else {
-                    assert_eq!(text.0, format!("Starting {}…", other_kind.label()));
+                use bevy::ecs::system::RunSystemOnce;
+                use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+                use cosmix_shell::runtime::ShellFrame;
+                use std::time::Duration;
+                let model = ShellModel::new(
+                    OutputKey::new("test").unwrap(),
+                    LogicalSize::new(1536.0, 864.0).unwrap(),
+                    Duration::ZERO,
+                    Duration::from_millis(800),
+                    Duration::from_millis(200),
+                )
+                .unwrap();
+                let mut app = App::new();
+                app.insert_resource(ShellFrameState(ShellFrame::from_model(&model)))
+                    .init_resource::<LauncherState>()
+                    .init_resource::<InputFocus>()
+                    .add_observer(activate);
+                let mut queue = bevy::ecs::world::CommandQueue::default();
+                let entity = button(&mut Commands::new(&mut queue, app.world()), app_kind);
+                let other = button(&mut Commands::new(&mut queue, app.world()), other_kind);
+                queue.apply(app.world_mut());
+                assert!(app.world().entity(entity).contains::<WidgetButton>());
+                app.world_mut().run_system_once(present).unwrap();
+                assert!(app.world().entity(entity).contains::<InteractionDisabled>());
+                app.world_mut().trigger(Activate { entity });
+                assert!(!app.world().resource::<LauncherState>().apps[app_kind as usize].requested);
+                {
+                    let mut frame = app.world_mut().resource_mut::<ShellFrameState>();
+                    let panel = &mut frame.0.panels[Edge::Bottom.index()];
+                    panel.mapped = true;
+                    panel.active_page_id = Some("launcher".into());
+                }
+                app.world_mut().run_system_once(present).unwrap();
+                assert!(!app.world().entity(entity).contains::<InteractionDisabled>());
+                app.world_mut()
+                    .resource_mut::<InputFocus>()
+                    .set(entity, bevy::input_focus::FocusCause::Navigated);
+                app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Bottom.index()]
+                    .active_page_id = Some("power".into());
+                app.world_mut().run_system_once(present).unwrap();
+                assert!(app.world().entity(entity).contains::<InteractionDisabled>());
+                assert_eq!(app.world().resource::<InputFocus>().get(), None);
+                // Even a stale enabled component cannot activate another page.
+                app.world_mut()
+                    .entity_mut(entity)
+                    .remove::<InteractionDisabled>();
+                app.world_mut().trigger(Activate { entity });
+                assert!(!app.world().resource::<LauncherState>().apps[app_kind as usize].requested);
+                app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Bottom.index()]
+                    .active_page_id = Some("launcher".into());
+                app.world_mut().trigger(Activate { entity });
+                assert!(app.world().resource::<LauncherState>().apps[app_kind as usize].requested);
+                assert!(app.world().resource::<LauncherState>().apps[app_kind as usize].busy);
+                app.world_mut().resource_mut::<LauncherState>().apps[app_kind as usize].requested =
+                    false;
+                app.world_mut().trigger(Activate { entity });
+                assert!(
+                    !app.world().resource::<LauncherState>().apps[app_kind as usize].requested,
+                    "busy launcher rejects duplicates"
+                );
+                app.world_mut().run_system_once(present).unwrap();
+                assert!(!app.world().entity(other).contains::<InteractionDisabled>());
+                app.world_mut().trigger(Activate { entity: other });
+                assert!(
+                    app.world().resource::<LauncherState>().apps[other_kind as usize].requested
+                );
+                // Completion belongs to one app; it cannot clear another app's busy state.
+                app.world().resource::<LauncherState>().apps[app_kind as usize]
+                    .feedback
+                    .lock()
+                    .unwrap()
+                    .push(LaunchFeedback::Finished(Err("test failure".into())));
+                app.world_mut().run_system_once(present).unwrap();
+                assert!(!app.world().resource::<LauncherState>().apps[app_kind as usize].busy);
+                assert!(app.world().resource::<LauncherState>().apps[other_kind as usize].busy);
+                let mut labels = app.world_mut().query::<(&LauncherLabel, &Text)>();
+                for (owner, text) in labels.iter(app.world()) {
+                    if owner.0 == app_kind {
+                        assert_eq!(text.0, "test failure");
+                    } else {
+                        assert_eq!(text.0, format!("Starting {}…", other_kind.label()));
+                    }
                 }
             }
         }
