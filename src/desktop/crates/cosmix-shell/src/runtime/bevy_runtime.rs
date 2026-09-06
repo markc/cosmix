@@ -9,7 +9,7 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy::prelude::{Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use crate::chrome::QuoinCommittedMotionModes;
 use crate::core::{Edge, PanelInput, ShellModel};
@@ -201,7 +201,7 @@ fn update_model(
             .clock_deadline
             .is_none_or(|deadline| now >= deadline)
         {
-            runtime.clock_text = utc_clock_text();
+            runtime.clock_text = local_clock_text_at(SystemTime::now());
             runtime.clock_deadline = Some(now + Duration::from_secs(1));
         }
         next_frame.content.bottom_clock_text = Some(runtime.clock_text.clone());
@@ -219,13 +219,11 @@ fn update_model(
     frame.0 = next_frame;
 }
 
-fn utc_clock_text() -> String {
-    let wall = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let day = wall % 86_400;
-    format!("{:02}:{:02}:{:02} UTC", day / 3600, day / 60 % 60, day % 60)
+fn local_clock_text_at(wall: SystemTime) -> String {
+    // Honour the machine timezone (or its process TZ override). Numeric
+    // offsets remain unambiguous across daylight saving and half-hour zones.
+    let local = chrono::DateTime::<chrono::Local>::from(wall);
+    local.format("%H:%M:%S %:z").to_string()
 }
 
 fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
@@ -239,6 +237,44 @@ fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_clock_timezone_probe() {
+        let Ok(expected) = std::env::var("QUOIN_CLOCK_TEST_EXPECTED") else {
+            return;
+        };
+        let wall = std::time::UNIX_EPOCH + Duration::from_secs(86_399);
+        assert_eq!(local_clock_text_at(wall), expected);
+    }
+
+    #[test]
+    fn local_clock_uses_process_timezone() {
+        // Separate processes avoid mutating TZ in a multithreaded test runner
+        // and exercise the same local-time conversion as the visible clock.
+        for (zone, expected) in [
+            ("UTC", "23:59:59 +00:00"),
+            ("Australia/Brisbane", "09:59:59 +10:00"),
+            ("Asia/Kolkata", "05:29:59 +05:30"),
+            ("America/New_York", "18:59:59 -05:00"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::bevy_runtime::tests::local_clock_timezone_probe",
+                    "--nocapture",
+                ])
+                .env("TZ", zone)
+                .env("QUOIN_CLOCK_TEST_EXPECTED", expected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "zone={zone}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
     use crate::core::{
         Corner, CornerEvent, CornerTrigger, LogicalSize, OutputKey, PanelEffect, PanelMode,
         RevealTrigger,

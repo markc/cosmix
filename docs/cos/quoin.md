@@ -83,6 +83,11 @@ unmapped. Callbacks are generation-tagged, so late or expired callbacks are
 ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
 requests, which no process lifetime reaches).
 
+The clock follows the system timezone, or the process `TZ` override, and shows
+local time with an explicit numeric UTC offset. Persist timezone preferences
+through the operating system's timezone configuration; Quoin reuses that
+configuration on subsequent launches.
+
 Keyboard repeat shares this wake layer. The active key owns one replaceable
 absolute deadline; a due wake emits one coalesced repeat and arms the next
 deadline from the actual wake time. There is no per-key thread, catch-up burst,
