@@ -1,0 +1,27 @@
+[package]
+name = "cosmix-bg-showcase"
+version = "0.2.2"
+description = "Native Wayland Bevy 3D background exploration"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+cosmix-bg-boing = { path = "../../crates/cosmix-bg-boing" }
+cosmix-flock = { path = "../../crates/cosmix-flock" }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }
+tempfile = "3"
+ctk = { path = "../../ctk", default-features = false, features = ["bus"] }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+bevy = { version = "=0.19.0", default-features = false, features = ["std", "bevy_pbr", "bevy_gltf", "bevy_post_process", "tonemapping_luts", "ktx2", "zstd_rust", "multi_threaded", "wayland", "png"] }
+cosmix-shell-host = { path = "../../crates/cosmix-shell-host", features = ["scene-3d"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dev-dependencies]
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }

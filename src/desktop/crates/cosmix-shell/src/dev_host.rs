@@ -48,21 +48,9 @@ pub struct DevShellHostConfig {
     pub corner: CornerDetectorConfig,
 }
 
-/// Pure host-computed rectangle, exposed for deterministic layout tests.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct DevRect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-/// Result of simulated exclusive-zone and corner-ownership layout.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct DevHostLayout {
-    pub panels: [DevRect; 4],
-    pub canvas: DevRect,
-}
+pub use crate::host::{
+    PanelLayout as DevHostLayout, PanelRect as DevRect, panel_layout as layout_for,
+};
 
 /// Stateful implementation of the renderer-neutral host contract.
 #[derive(Resource)]
@@ -543,53 +531,6 @@ fn arm_if_changed(armed: &mut Option<ArmedWake>, desired: ArmedWake) -> bool {
     }
     *armed = Some(desired);
     true
-}
-
-/// Compute deterministic corner ownership and pinned-adjacent reductions.
-pub fn layout_for(frame: &ShellFrame) -> DevHostLayout {
-    let width = frame.geometry.logical_size.width();
-    let height = frame.geometry.logical_size.height();
-    let pinned = |edge: Edge| frame.panel(edge).exclusive_zone_px;
-    let left_inset = pinned(Edge::Left).min(width);
-    let right_inset = pinned(Edge::Right).min((width - left_inset).max(0.0));
-    let top_inset = pinned(Edge::Top).min(height);
-    let bottom_inset = pinned(Edge::Bottom).min((height - top_inset).max(0.0));
-    let thickness = |edge: Edge| frame.panel(edge).thickness_px;
-
-    let mut panels = [DevRect::default(); 4];
-    panels[Edge::Top.index()] = DevRect {
-        x: 0.0,
-        y: 0.0,
-        width,
-        height: thickness(Edge::Top),
-    };
-    panels[Edge::Right.index()] = DevRect {
-        x: (width - thickness(Edge::Right)).max(0.0),
-        y: top_inset,
-        width: thickness(Edge::Right),
-        height: (height - top_inset).max(0.0),
-    };
-    panels[Edge::Bottom.index()] = DevRect {
-        x: 0.0,
-        y: (height - thickness(Edge::Bottom)).max(0.0),
-        width: (width - right_inset).max(0.0),
-        height: thickness(Edge::Bottom),
-    };
-    panels[Edge::Left.index()] = DevRect {
-        x: 0.0,
-        y: top_inset,
-        width: thickness(Edge::Left),
-        height: (height - top_inset - bottom_inset).max(0.0),
-    };
-    DevHostLayout {
-        panels,
-        canvas: DevRect {
-            x: left_inset,
-            y: top_inset,
-            width: (width - left_inset - right_inset).max(0.0),
-            height: (height - top_inset - bottom_inset).max(0.0),
-        },
-    }
 }
 
 #[cfg(test)]

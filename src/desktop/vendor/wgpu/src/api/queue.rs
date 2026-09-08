@@ -258,6 +258,9 @@ impl Queue {
         &self,
         command_buffers: I,
     ) -> SubmissionIndex {
+        #[cfg(std)]
+        let _diagnostic =
+            crate::diagnostics::begin(crate::diagnostics::Operation::QueueSubmit, || 0);
         // As submit drains the iterator (even on error), collect deferred actions
         // from each CommandBuffer along the way.
         let mut actions = DeferredCommandBufferActions::default();
@@ -266,10 +269,24 @@ impl Queue {
             actions.append(&mut comb.actions.lock());
             comb.buffer
         });
-        let index = self.inner.submit(&mut command_buffers);
+        let index = {
+            #[cfg(std)]
+            let _diagnostic = crate::diagnostics::begin(
+                crate::diagnostics::Operation::QueueSubmitInner,
+                || 0,
+            );
+            self.inner.submit(&mut command_buffers)
+        };
 
         // Execute all deferred actions after submit.
-        actions.execute(&self.inner);
+        {
+            #[cfg(std)]
+            let _diagnostic = crate::diagnostics::begin(
+                crate::diagnostics::Operation::QueueDeferredActions,
+                || 0,
+            );
+            actions.execute(&self.inner);
+        }
 
         SubmissionIndex { index }
     }

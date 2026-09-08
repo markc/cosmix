@@ -89,6 +89,548 @@ const MAX_PAST_DEADLINE_OBSERVATIONS: u8 = 64;
 #[derive(Resource, Default)]
 struct LayerHostUpdateWake(bool);
 
+/// Optional one-shot application wake in the `Time<Real>::elapsed()` domain.
+/// The host clears an expired deadline before the consuming update. Clients
+/// can schedule their next reconciliation even while all panels are hidden.
+#[derive(Resource, Default)]
+pub struct LayerHostDeadline(pub Option<Duration>);
+
+/// Opt-in bounded diagnostics shared by native layer and scene hosts.
+pub mod frame_trace {
+    use bevy::{
+        app::{App, SubApp},
+        ecs::schedule::ScheduleLabel,
+        prelude::*,
+        render::{
+            Render, RenderApp, RenderSystems,
+            renderer::{RenderGraph, RenderGraphSystems, render_system},
+            view::window::{ExtractedWindows, prepare_windows},
+        },
+    };
+    use rustix::time::{ClockId, clock_gettime};
+    use std::{
+        io::Write,
+        marker::PhantomData,
+        rc::Rc,
+        sync::{
+            Arc, OnceLock,
+            atomic::{AtomicU64, Ordering},
+            mpsc::{SyncSender, sync_channel},
+        },
+    };
+    const LIMIT: u64 = 65_536;
+    struct Counters {
+        attempted: AtomicU64,
+        dropped: AtomicU64,
+    }
+    struct State {
+        sender: SyncSender<Record>,
+        counters: Arc<Counters>,
+    }
+    struct Record {
+        tid: u32,
+        stage: &'static str,
+        subject: u64,
+        detail: u64,
+        sequence: u64,
+        start_us: u64,
+        end_us: u64,
+        cpu_us: u64,
+    }
+    static STATE: OnceLock<Option<State>> = OnceLock::new();
+
+    fn state() -> Option<&'static State> {
+        STATE.get_or_init(|| {
+            if std::env::var_os("COSMIX_FRAME_TRACE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+                return None;
+            }
+            let (sender, receiver) = sync_channel::<Record>(256);
+            let counters = Arc::new(Counters {
+                attempted: AtomicU64::new(0), dropped: AtomicU64::new(0),
+            });
+            let report = counters.clone();
+            std::thread::Builder::new().name("cosmix-frame-trace".into()).spawn(move || {
+                let stderr = std::io::stderr();
+                for r in receiver {
+                    // Only this diagnostic thread can block on journal IO.
+                    let _ = writeln!(stderr.lock(),
+                        "FRAME_TRACE mono_us={} start_us={} end_us={} duration_us={} cpu_us={} cpu_scope=caller pid={} tid={} sequence={} stage={} subject={} detail={} dropped_total={} capped={}",
+                        r.start_us, r.start_us, r.end_us, r.end_us.saturating_sub(r.start_us),
+                        r.cpu_us, std::process::id(), r.tid, r.sequence, r.stage, r.subject, r.detail,
+                        report.dropped.load(Ordering::Relaxed),
+                        report.attempted.load(Ordering::Relaxed) >= LIMIT);
+                }
+            }).ok()?;
+            Some(State { sender, counters })
+        }).as_ref()
+    }
+
+    fn reserve(counter: &AtomicU64) -> Option<u64> {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                (value < LIMIT).then_some(value + 1)
+            })
+            .ok()
+    }
+    fn clock_us(clock: ClockId) -> u64 {
+        let value = clock_gettime(clock);
+        (value.tv_sec as u64).saturating_mul(1_000_000) + value.tv_nsec as u64 / 1_000
+    }
+
+    /// Span remains on its creating thread so thread CPU deltas are meaningful.
+    pub struct Span {
+        record: Option<(Record, u64)>,
+        _same_thread: PhantomData<Rc<()>>,
+    }
+    pub fn span(stage: &'static str, subject: u64) -> Span {
+        let record = (|| {
+            let state = state()?;
+            let sequence = reserve(&state.counters.attempted)?;
+            let start_us = clock_us(ClockId::Monotonic);
+            let cpu = clock_us(ClockId::ThreadCPUTime);
+            Some((
+                Record {
+                    tid: rustix::thread::gettid().as_raw_nonzero().get() as u32,
+                    stage,
+                    subject,
+                    detail: 0,
+                    sequence,
+                    start_us,
+                    end_us: 0,
+                    cpu_us: 0,
+                },
+                cpu,
+            ))
+        })();
+        Span {
+            record,
+            _same_thread: PhantomData,
+        }
+    }
+    /// Instant observation with one numeric correlation value, using the same
+    /// bounded, nonblocking recorder as spans.
+    pub fn point(stage: &'static str, subject: u64, detail: u64) {
+        let mut event = span(stage, subject);
+        if let Some((record, _)) = &mut event.record {
+            record.detail = detail;
+        }
+    }
+    impl Drop for Span {
+        fn drop(&mut self) {
+            let Some((mut record, cpu)) = self.record.take() else {
+                return;
+            };
+            let end = clock_us(ClockId::Monotonic);
+            let cpu_end = clock_us(ClockId::ThreadCPUTime);
+            record.end_us = end;
+            record.cpu_us = cpu_end.saturating_sub(cpu);
+            if let Some(state) = STATE.get().and_then(Option::as_ref)
+                && state.sender.try_send(record).is_err()
+            {
+                state.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Diagnostic-only bridge: preserve nesting without an unbounded allocation.
+    // wgpu's guards are thread-bound and our callback never calls back into wgpu.
+    #[derive(Default)]
+    struct ApiSpans {
+        active: Vec<Span>,
+        suppressed: usize,
+    }
+    impl ApiSpans {
+        fn begin(&mut self, create: impl FnOnce() -> Span) {
+            if self.suppressed != 0 || self.active.len() >= 16 {
+                self.suppressed = self.suppressed.saturating_add(1);
+            } else {
+                self.active.push(create());
+            }
+        }
+        fn end(&mut self) {
+            if self.suppressed != 0 {
+                self.suppressed -= 1;
+            } else {
+                self.active.pop();
+            }
+        }
+    }
+    thread_local! {
+        static API_SPANS: std::cell::RefCell<ApiSpans> = std::cell::RefCell::new(ApiSpans::default());
+    }
+    fn api_event(event: wgpu::diagnostics::Event) {
+        use wgpu::diagnostics::{Operation, Phase};
+        let _ = API_SPANS.try_with(|spans| {
+            let Ok(mut spans) = spans.try_borrow_mut() else {
+                return;
+            };
+            match event.phase {
+                Phase::Begin => spans.begin(|| {
+                    span(
+                        match event.operation {
+                            Operation::QueueSubmit => "wgpu_queue_submit",
+                            Operation::QueueSubmitInner => "wgpu_queue_submit_inner",
+                            Operation::QueueDeferredActions => "wgpu_queue_deferred_actions",
+                            Operation::DevicePoll => "wgpu_device_poll",
+                            Operation::SurfaceConfigure => "wgpu_surface_configure",
+                            Operation::SurfaceAcquire => "wgpu_surface_acquire",
+                            Operation::SurfacePresent => "wgpu_surface_present",
+                        },
+                        event.subject,
+                    )
+                }),
+                Phase::End => spans.end(),
+            }
+        });
+    }
+
+    #[derive(Resource, Default)]
+    struct AcquiredProbe(Vec<Entity>);
+    fn acquired_probe(windows: Res<ExtractedWindows>, mut acquired: ResMut<AcquiredProbe>) {
+        acquired.0.clear();
+        for window in windows.values() {
+            if let Some(texture) = &window.swap_chain_texture {
+                acquired.0.push(window.entity);
+                let mut mapping = span("host_window_surface", window.entity.to_bits());
+                if let Some((record, _)) = &mut mapping.record {
+                    record.detail = texture.diagnostic_surface_id();
+                }
+            }
+        }
+    }
+    fn presented_probe(windows: Res<ExtractedWindows>, acquired: Res<AcquiredProbe>) {
+        for entity in &acquired.0 {
+            if windows
+                .get(entity)
+                .is_some_and(|w| w.swap_chain_texture.is_none())
+            {
+                // Bevy consumed the acquired texture for presentation. This is
+                // a client submission observation, never proof of scanout.
+                drop(span("host_window_submitted", entity.to_bits()));
+            }
+        }
+    }
+
+    #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+    struct TracedUpdate;
+    fn wrap_update(sub: &mut SubApp, stage: &'static str) -> bool {
+        let Some(original) = sub.update_schedule else {
+            return false;
+        };
+        if original == TracedUpdate.intern() {
+            return false;
+        }
+        sub.init_schedule(TracedUpdate)
+            .add_systems(TracedUpdate, move |world: &mut World| {
+                let _trace = span(stage, 0);
+                world.run_schedule(original);
+            });
+        sub.update_schedule = Some(TracedUpdate.intern());
+        true
+    }
+    struct AcquireTrace {
+        stage: &'static str,
+        active: Option<Span>,
+    }
+    fn acquire_begin(mut trace: NonSendMut<AcquireTrace>) {
+        trace.active = Some(span(trace.stage, 0));
+    }
+    fn acquire_end(mut trace: NonSendMut<AcquireTrace>) {
+        // CPU is marker/caller-thread time, not a parallel worker's CPU time.
+        trace.active.take();
+    }
+
+    struct GraphTrace {
+        stages: [&'static str; 7],
+        active: [Option<Span>; 7],
+    }
+    impl GraphTrace {
+        fn start(&mut self, index: usize) {
+            self.active[index] = Some(span(self.stages[index], 0));
+        }
+        fn finish(&mut self, index: usize) {
+            self.active[index].take();
+        }
+    }
+    fn render_system_begin(mut trace: NonSendMut<GraphTrace>) {
+        trace.start(0);
+    }
+    fn render_system_end(mut trace: NonSendMut<GraphTrace>) {
+        trace.finish(6);
+        trace.finish(0);
+    }
+    fn graph_begin(mut trace: NonSendMut<GraphTrace>) {
+        trace.start(1);
+        trace.start(2);
+    }
+    fn graph_boundary<const PREVIOUS: usize, const NEXT: usize>(mut trace: NonSendMut<GraphTrace>) {
+        trace.finish(PREVIOUS);
+        trace.start(NEXT);
+    }
+    fn graph_end(mut trace: NonSendMut<GraphTrace>) {
+        trace.finish(5);
+        trace.finish(1);
+        // render_system still submits screenshot/readback commands, presents
+        // swapchains and collects screenshots after the graph returns.
+        trace.start(6);
+    }
+    fn install_graph_trace(render: &mut SubApp, stages: [&'static str; 7]) {
+        render.world_mut().insert_non_send(GraphTrace {
+            stages,
+            active: std::array::from_fn(|_| None),
+        });
+        render.add_systems(
+            Render,
+            (
+                render_system_begin
+                    .before(render_system)
+                    .in_set(RenderSystems::Render),
+                render_system_end
+                    .after(render_system)
+                    .in_set(RenderSystems::Render),
+            ),
+        );
+        // Existing graph phase sets already form this chain. Mark only their
+        // boundaries; preserve all original systems, executors and commands.
+        render.add_systems(
+            RenderGraph,
+            (
+                graph_begin.before(RenderGraphSystems::Begin),
+                graph_boundary::<2, 3>
+                    .after(RenderGraphSystems::Begin)
+                    .before(RenderGraphSystems::Render),
+                graph_boundary::<3, 4>
+                    .after(RenderGraphSystems::Render)
+                    .before(RenderGraphSystems::Submit),
+                graph_boundary::<4, 5>
+                    .after(RenderGraphSystems::Submit)
+                    .before(RenderGraphSystems::Finish),
+                graph_end.after(RenderGraphSystems::Finish),
+            ),
+        );
+    }
+    /// Install only after plugin finish; originals keep their executor and
+    /// extraction closure, while SubApp retains ownership of tracker clearing.
+    pub fn install(app: &mut App, stages: [&'static str; 4]) {
+        if state().is_none() || !wrap_update(app.main_mut(), stages[0]) {
+            return;
+        }
+        if wgpu::diagnostics::install(api_event).is_err() {
+            drop(span("wgpu_observer_already_installed", 0));
+        }
+        if let Some(render) = app.get_sub_app_mut(RenderApp) {
+            render.init_resource::<AcquiredProbe>().add_systems(
+                Render,
+                (
+                    acquired_probe
+                        .before(render_system)
+                        .in_set(RenderSystems::Render),
+                    presented_probe
+                        .after(render_system)
+                        .in_set(RenderSystems::Render),
+                ),
+            );
+            install_graph_trace(
+                render,
+                if stages[0] == "quoin_main" {
+                    [
+                        "quoin_render_system",
+                        "quoin_graph",
+                        "quoin_graph_begin",
+                        "quoin_graph_render",
+                        "quoin_graph_submit",
+                        "quoin_graph_finish",
+                        "quoin_render_tail",
+                    ]
+                } else {
+                    [
+                        "scene_render_system",
+                        "scene_graph",
+                        "scene_graph_begin",
+                        "scene_graph_render",
+                        "scene_graph_submit",
+                        "scene_graph_finish",
+                        "scene_render_tail",
+                    ]
+                },
+            );
+            wrap_update(render, stages[2]);
+            if let Some(mut extract) = render.take_extract() {
+                render.set_extract(move |main, render| {
+                    let _trace = span(stages[1], 0);
+                    extract(main, render);
+                });
+            }
+            render.world_mut().insert_non_send(AcquireTrace {
+                stage: stages[3],
+                active: None,
+            });
+            render.add_systems(
+                Render,
+                (
+                    acquire_begin
+                        .before(prepare_windows)
+                        .in_set(RenderSystems::PrepareViews),
+                    acquire_end
+                        .after(prepare_windows)
+                        .in_set(RenderSystems::PrepareViews),
+                ),
+            );
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn api_trace_overflow_does_not_pop_outer_spans() {
+            let mut spans = ApiSpans::default();
+            for _ in 0..16 {
+                spans.begin(|| Span {
+                    record: None,
+                    _same_thread: PhantomData,
+                });
+            }
+            for _ in 0..3 {
+                spans.begin(|| panic!("suppressed span must not be created"));
+            }
+            for _ in 0..3 {
+                spans.end();
+            }
+            assert_eq!(spans.active.len(), 16);
+            assert_eq!(spans.suppressed, 0);
+            for _ in 0..16 {
+                spans.end();
+            }
+            assert!(spans.active.is_empty());
+            spans.end();
+            assert!(spans.active.is_empty());
+        }
+        #[test]
+        fn graph_markers_preserve_phase_order_and_close_each_span() {
+            use bevy::ecs::system::RunSystemOnce;
+            #[derive(Resource, Default)]
+            struct Visits(Vec<usize>);
+            fn phase<const INDEX: usize>(mut visits: ResMut<Visits>, trace: NonSend<GraphTrace>) {
+                assert!(trace.active[0].is_some());
+                assert!(trace.active[1].is_some());
+                for index in 2..=5 {
+                    assert_eq!(trace.active[index].is_some(), index == INDEX);
+                }
+                visits.0.push(INDEX);
+            }
+            let mut render = SubApp::new();
+            render
+                .add_schedule(RenderGraph::base_schedule())
+                .init_schedule(Render)
+                .init_resource::<Visits>();
+            install_graph_trace(
+                &mut render,
+                [
+                    "system", "graph", "begin", "render", "submit", "finish", "tail",
+                ],
+            );
+            render.add_systems(
+                RenderGraph,
+                (
+                    phase::<2>.in_set(RenderGraphSystems::Begin),
+                    phase::<3>.in_set(RenderGraphSystems::Render),
+                    phase::<4>.in_set(RenderGraphSystems::Submit),
+                    phase::<5>.in_set(RenderGraphSystems::Finish),
+                ),
+            );
+            for _ in 0..2 {
+                render
+                    .world_mut()
+                    .run_system_once(render_system_begin)
+                    .unwrap();
+                render.world_mut().run_schedule(RenderGraph);
+                let trace = render.world().non_send::<GraphTrace>();
+                assert!(trace.active[0].is_some());
+                assert!(trace.active[1..=5].iter().all(Option::is_none));
+                assert!(trace.active[6].is_some());
+                render
+                    .world_mut()
+                    .run_system_once(render_system_end)
+                    .unwrap();
+                assert!(
+                    render
+                        .world()
+                        .non_send::<GraphTrace>()
+                        .active
+                        .iter()
+                        .all(Option::is_none)
+                );
+            }
+            assert_eq!(
+                render.world().resource::<Visits>().0,
+                [2, 3, 4, 5, 2, 3, 4, 5]
+            );
+        }
+        #[test]
+        fn wrapper_runs_original_once_and_preserves_extract_order() {
+            #[derive(Resource, Default)]
+            struct Count(u32);
+            #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+            struct TestRender;
+            let mut app = App::new();
+            app.init_resource::<Count>()
+                .add_systems(Update, |mut count: ResMut<Count>| count.0 += 1);
+            let mut render = SubApp::new();
+            render.init_resource::<Count>().init_schedule(TestRender);
+            render.update_schedule = Some(TestRender.intern());
+            render.set_extract(|main, render| {
+                render.resource_mut::<Count>().0 = main.resource::<Count>().0 * 10;
+            });
+            render.add_systems(TestRender, |mut count: ResMut<Count>| count.0 += 1);
+            assert!(wrap_update(app.main_mut(), "test_main"));
+            assert!(!wrap_update(app.main_mut(), "test_main"));
+            assert!(wrap_update(&mut render, "test_render"));
+            app.insert_sub_app(RenderApp, render);
+            for expected in [1, 2] {
+                app.update();
+                assert_eq!(app.world().resource::<Count>().0, expected);
+                assert_eq!(
+                    app.sub_app(RenderApp).world().resource::<Count>().0,
+                    expected * 10 + 1
+                );
+            }
+        }
+        #[test]
+        fn diagnostic_budget_saturates_without_wrapping() {
+            let counter = AtomicU64::new(LIMIT - 1);
+            assert_eq!(reserve(&counter), Some(LIMIT - 1));
+            assert_eq!(reserve(&counter), None);
+            assert_eq!(counter.load(Ordering::Relaxed), LIMIT);
+        }
+        #[test]
+        fn monotonic_and_thread_cpu_clocks_are_available() {
+            let start = clock_us(ClockId::Monotonic);
+            let cpu = clock_us(ClockId::ThreadCPUTime);
+            assert!(clock_us(ClockId::ThreadCPUTime) >= cpu);
+            assert!(clock_us(ClockId::Monotonic) >= start);
+        }
+    }
+}
+
+fn application_wake_deadline(app: &App, other: Option<Duration>) -> Option<Duration> {
+    other
+        .into_iter()
+        .chain(
+            app.world()
+                .get_resource::<LayerHostDeadline>()
+                .and_then(|d| d.0),
+        )
+        .min()
+}
+
+fn consume_application_deadline(app: &mut App, elapsed: Duration) {
+    if let Some(mut deadline) = app.world_mut().get_resource_mut::<LayerHostDeadline>()
+        && deadline.0.is_some_and(|at| at <= elapsed)
+    {
+        deadline.0 = None;
+    }
+}
+
 /// Thread-safe, coalescing wake handle for producers outside Bevy.
 ///
 /// A successful send makes the host's blocked calloop dispatcher runnable.
@@ -121,7 +663,10 @@ fn take_layer_host_update_wake(app: &mut App) -> bool {
 }
 
 fn run_layer_host_app_update(app: &mut App) -> bool {
-    app.update();
+    {
+        let _trace = frame_trace::span("quoin_app_update", 0);
+        app.update();
+    }
     let redraw = take_layer_host_update_wake(app);
     let staged = staged_shell_commands_pending(app);
     let elapsed = app
@@ -737,6 +1282,7 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
     );
     app.insert_resource(LayerHostWake(external_wake))
         .init_resource::<LayerHostUpdateWake>()
+        .init_resource::<LayerHostDeadline>()
         .add_systems(Last, capture_layer_host_redraw);
     app.set_runner(move |app| {
         run_layer_host(
@@ -859,7 +1405,10 @@ impl RunnerState {
         if !unmaps.is_empty() {
             // This non-pipelined update drains render extraction after raw handle
             // removal and before destroying the protocol objects.
-            app.update();
+            {
+                let _trace = frame_trace::span("quoin_unmap_render_drain", unmaps.len() as u64);
+                app.update();
+            }
             for (edge, next) in unmaps {
                 panels[edge.index()].finish_unmap();
                 panels[edge.index()].last_committed = Some(next.clone());
@@ -970,6 +1519,7 @@ impl<'loop_handle>
             &LoopHandle<'loop_handle, RunnerState>,
         ),
     ) -> Result<(), LayerHostError> {
+        let _trace = frame_trace::span("quoin_wayland_flush", 0);
         self.connection
             .flush()
             .map_err(|error| LayerHostError::new(error.to_string()))
@@ -1104,6 +1654,16 @@ fn run_layer_host(
     state.app.finish();
     state.app.cleanup();
 
+    frame_trace::install(
+        &mut state.app,
+        [
+            "quoin_main",
+            "quoin_extract",
+            "quoin_render",
+            "quoin_acquire_windows",
+        ],
+    );
+
     let Some(max_texture_dimension_2d) = render_device_texture_limit(&state.app) else {
         return state_setup_error(state, "render-device-texture-limit-unavailable".to_owned());
     };
@@ -1229,7 +1789,12 @@ fn run_layer_host(
         if state.needs_update || state.exit_reason.is_some() || state.replacement_needed {
             continue;
         }
-        if let Err(error) = event_loop.dispatch(None, &mut state) {
+        let dispatch = {
+            // Includes intentional idle waiting; cpu_us separates work from wait.
+            let _trace = frame_trace::span("quoin_dispatch_wait", 0);
+            event_loop.dispatch(None, &mut state)
+        };
+        if let Err(error) = dispatch {
             state.abnormal_exit = true;
             state.exit_reason = Some(format!("calloop-dispatch-failed-{error}"));
         }
@@ -1313,7 +1878,10 @@ fn finish_closed_panels<'a>(panels: impl IntoIterator<Item = &'a mut PanelSurfac
 fn render_drain_and_retire(app: &mut App, panels: [PanelSurface; 4]) {
     // `close` has removed each Bevy raw-handle component. This update is the
     // non-pipelined render extraction barrier; Wayland resources drop after it.
-    app.update();
+    {
+        let _trace = frame_trace::span("quoin_retire_render_drain", panels.len() as u64);
+        app.update();
+    }
     for panel in panels {
         panel.retire(app);
     }
@@ -1531,6 +2099,7 @@ impl RunnerState {
             let operations = plan_surface(effective_previous, next, geometry)
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
             if !panel.has_wayland_objects() && operations.contains(&ProtocolOp::CreateSurface) {
+                let _trace = frame_trace::span("quoin_panel_create", edge.index() as u64);
                 let (wl_surface, layer_surface, fractional) =
                     factory.create(qh, &output.wl_output, edge);
                 panel
@@ -1597,12 +2166,15 @@ impl RunnerState {
             })
             .collect::<Vec<_>>();
         let repeat_deadline = self.keyboard_bridge.repeat_deadline();
-        let next_deadline = next_timer_deadline(
-            self.last_wake,
-            self.last_wake_deadline,
-            animate_backstop,
-            repeat_deadline,
-            &configure_deadlines,
+        let next_deadline = application_wake_deadline(
+            &self.app,
+            next_timer_deadline(
+                self.last_wake,
+                self.last_wake_deadline,
+                animate_backstop,
+                repeat_deadline,
+                &configure_deadlines,
+            ),
         );
         let model_progressed = self
             .app
@@ -1663,6 +2235,7 @@ impl RunnerState {
     }
 
     fn handle_due_wake_timer(&mut self, elapsed: Duration) {
+        consume_application_deadline(&mut self.app, elapsed);
         let configure_timeout = self
             .outputs
             .values()
@@ -2614,6 +3187,11 @@ impl Dispatch<wl_callback::WlCallback, FrameCallbackData> for RunnerState {
         let wl_callback::Event::Done { .. } = event else {
             unreachable!("wl_callback has only the done event")
         };
+        frame_trace::point(
+            "quoin_frame_received",
+            u64::from(data.surface.id().protocol_id()),
+            u64::from(_proxy.id().protocol_id()),
+        );
         let Some(panel) = state.panel_for_surface_mut(&data.surface) else {
             tracing::trace!(
                 callback_generation = data.generation,
@@ -3792,6 +4370,33 @@ mod tests {
             ),
             Some(seconds(5)),
             "keyboard repeat shares the one earliest-deadline timer"
+        );
+    }
+
+    #[test]
+    fn application_deadline_wakes_idle_host_once_without_overriding_earlier_work() {
+        let mut app = App::new();
+        app.insert_resource(LayerHostDeadline(Some(Duration::from_secs(2))));
+        let idle = next_timer_deadline(WakePolicy::Idle, None, None, None, &[]);
+        assert_eq!(
+            application_wake_deadline(&app, idle),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            application_wake_deadline(&app, Some(Duration::from_secs(1))),
+            Some(Duration::from_secs(1))
+        );
+        consume_application_deadline(&mut app, Duration::from_secs(1));
+        assert_eq!(
+            application_wake_deadline(&app, idle),
+            Some(Duration::from_secs(2))
+        );
+        consume_application_deadline(&mut app, Duration::from_secs(2));
+        assert_eq!(application_wake_deadline(&app, idle), None);
+        app.world_mut().resource_mut::<LayerHostDeadline>().0 = Some(Duration::from_secs(4));
+        assert_eq!(
+            application_wake_deadline(&app, idle),
+            Some(Duration::from_secs(4))
         );
     }
 

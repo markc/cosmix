@@ -3,6 +3,8 @@
 #[cfg(feature = "bus")]
 mod corner;
 #[cfg(feature = "bus")]
+mod pointer_observation;
+#[cfg(feature = "bus")]
 pub(crate) mod port_observation;
 #[cfg(feature = "bus")]
 pub(crate) mod port_snapshot;
@@ -293,8 +295,11 @@ pub(crate) const MAX_IN_FLIGHT_CAPTURES: usize = 8;
 pub(crate) const MAX_CLIENT_CAPTURE_MANAGERS: usize = 8;
 pub(crate) const MAX_GLOBAL_CAPTURE_MANAGERS: usize = 64;
 pub(crate) const SCREENCOPY_MANAGER_ERROR_IMPLEMENTATION_LIMIT: u32 = 0;
-pub(crate) const MAX_CLIENT_CAPTURE_BYTES: usize = 128 * 1024 * 1024;
-pub(crate) const MAX_GLOBAL_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
+// Reservations include all four resident full-frame copies. Three active 4K
+// requests plus one retiring request need about 507 MiB. Request count caps
+// remain four per client and eight globally.
+pub(crate) const MAX_CLIENT_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_GLOBAL_CAPTURE_BYTES: usize = 1024 * 1024 * 1024;
 const CAPTURE_SHM_BYTES_PER_TURN: usize = 256 * 1024;
 /// Absolute lifetime of one admitted screencopy request. This is a request
 /// deadline, not a periodic maintenance timer: a stuck Bevy/GPU completion
@@ -953,6 +958,12 @@ impl HostInput {
 }
 
 enum ProtocolCommand {
+    #[cfg(feature = "native-quoin")]
+    NativeShell(crate::native_shell::NativeShellBridge),
+    #[cfg(feature = "native-quoin")]
+    NativeWorkArea(Option<cosmix_shell::host::PanelRect>),
+    #[cfg(feature = "native-quoin")]
+    NativeShellQuit,
     Frame {
         inputs: Vec<HostInput>,
     },
@@ -1248,6 +1259,26 @@ pub(crate) struct ClientSceneFeed {
 static_assertions::assert_not_impl_any!(ClientSceneFeed: Clone, Copy);
 
 impl ClientSceneFeed {
+    #[cfg(feature = "native-quoin")]
+    pub(crate) fn install_native_shell(&self, bridge: crate::native_shell::NativeShellBridge) {
+        self.commands
+            .send(ProtocolCommand::NativeShell(bridge))
+            .expect("live protocol thread for native shell");
+    }
+    #[cfg(feature = "native-quoin")]
+    pub(crate) fn native_work_area(&self, area: Option<cosmix_shell::host::PanelRect>) {
+        let _ = self.commands.send(ProtocolCommand::NativeWorkArea(area));
+    }
+    #[cfg(feature = "native-quoin")]
+    pub(crate) fn native_quit_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let commands = self.commands.clone();
+        let requested = std::sync::atomic::AtomicBool::new(false);
+        Arc::new(move || {
+            if !requested.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _ = commands.send(ProtocolCommand::NativeShellQuit);
+            }
+        })
+    }
     fn new(
         events: Receiver<Vec<ProtocolEvent>>,
         commands: CommandSender<ProtocolCommand>,
@@ -1956,6 +1987,7 @@ impl WaylandRuntime {
         } = input;
         let WaylandRuntimePolicy {
             keybindings_enabled,
+            f9_bus,
             explicit_sync_exposure_mode,
             decoration,
         } = policy;
@@ -1984,6 +2016,7 @@ impl WaylandRuntime {
                     ecs_action_sender,
                     kms_render_command_sender,
                     keybindings_enabled,
+                    f9_bus,
                     binding_profile,
                     vt_switch_requested,
                     explicit_sync_exposure_mode,
@@ -2302,6 +2335,7 @@ fn drain_kms_render_commands(
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WaylandRuntimePolicy {
     pub(crate) keybindings_enabled: bool,
+    pub(crate) f9_bus: Option<crate::bus_key::BusKeyConfig>,
     pub(crate) explicit_sync_exposure_mode: ExplicitSyncExposureMode,
     pub(crate) decoration: DecorationStartup,
 }
@@ -2397,6 +2431,7 @@ struct ProtocolServerBootstrap {
     ecs_action_sender: SyncSender<EcsAction>,
     kms_render_command_sender: Sender<KmsRenderCommand>,
     keybindings_enabled: bool,
+    f9_bus: Option<crate::bus_key::BusKeyConfig>,
     binding_profile: BindingProfile,
     vt_switch_requested: Option<Box<dyn Fn(u8) + Send>>,
     explicit_sync_exposure_mode: ExplicitSyncExposureMode,
@@ -2682,6 +2717,7 @@ impl ProtocolServer {
             ecs_action_sender,
             kms_render_command_sender,
             keybindings_enabled,
+            f9_bus,
             binding_profile,
             vt_switch_requested,
             explicit_sync_exposure_mode,
@@ -3002,7 +3038,13 @@ impl ProtocolServer {
             keyboard,
             input_ingress: input::InputIngressState::default(),
             touch_devices: 0,
-            bindings: BindingState::for_profile(binding_profile, keybindings_enabled),
+            bindings: BindingState::for_profile(binding_profile, keybindings_enabled)
+                .with_bus_key(f9_bus.is_some()),
+            #[cfg(feature = "bus")]
+            bus_key: f9_bus
+                .map(crate::bus_key::BusKeyWorker::start)
+                .transpose()
+                .map_err(|error| format!("F9 Bus worker startup failed: {error}"))?,
             decoration,
             ecs_action_sender,
             kms_render_command_sender,
@@ -3012,6 +3054,10 @@ impl ProtocolServer {
             backend,
             cursor_position: (0.0, 0.0),
             cursor_position_snapshot: cursor_position,
+            #[cfg(feature = "native-quoin")]
+            native_shell: None,
+            #[cfg(feature = "native-quoin")]
+            native_work_area: None,
             cursor_selection: CursorSelection::Default,
             chrome_cursor_override: None,
             cursor_surfaces: HashMap::new(),
@@ -3196,6 +3242,13 @@ impl ProtocolServer {
                                 .push(PortControl::Watch(request));
                         }
                     }
+                    ChannelEvent::Msg(PortCommand::PointerWatch(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state
+                                .pending_port_controls
+                                .push(PortControl::PointerWatch(request));
+                        }
+                    }
                     ChannelEvent::Msg(PortCommand::Set(request)) => {
                         if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_controls.push(PortControl::Set(request));
@@ -3226,6 +3279,30 @@ impl ProtocolServer {
         event_loop
             .handle()
             .insert_source(command_source, |event, (), state| match event {
+                #[cfg(feature = "native-quoin")]
+                ChannelEvent::Msg(ProtocolCommand::NativeShell(bridge)) => {
+                    state.native_shell = Some(bridge);
+                }
+                #[cfg(feature = "native-quoin")]
+                ChannelEvent::Msg(ProtocolCommand::NativeWorkArea(area)) => {
+                    state.set_native_work_area(area);
+                }
+                #[cfg(feature = "native-quoin")]
+                ChannelEvent::Msg(ProtocolCommand::NativeShellQuit) => {
+                    // KMS teardown belongs to the live coordinator; nested
+                    // ECS exit actions are not consumed by that coordinator.
+                    // The callback sends this request at most once.
+                    #[cfg(all(feature = "kms-live", not(test)))]
+                    if crate::backend::kms_live::latched_signal_exit_code().is_none()
+                        && let Err(error) = signal_hook::low_level::raise(libc::SIGTERM)
+                    {
+                        tracing::error!(%error, "native shell could not request KMS shutdown");
+                    }
+                    #[cfg(any(not(feature = "kms-live"), test))]
+                    let _ = state
+                        .ecs_action_sender
+                        .try_send(EcsAction::ExitNestedCompositor);
+                }
                 ChannelEvent::Msg(ProtocolCommand::Frame { inputs }) => {
                     state.handle_frame(inputs);
                 }
@@ -3517,6 +3594,20 @@ impl ProtocolServer {
     }
 
     fn dispatch_cycle(&mut self, timeout: Option<Duration>) -> Result<(), String> {
+        // Chunks queued as idles are runnable work. Calloop polls before
+        // dispatching idles, so blocking here makes every 256 KiB chunk wait
+        // for unrelated client traffic. Poll without sleeping while a copy
+        // is pending; each turn still services clients between bounded chunks.
+        let timeout = if self
+            .state
+            .capture_frames
+            .values()
+            .any(|record| record.write_scheduled && !record.terminal)
+        {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
         self.event_loop
             .dispatch(timeout, &mut self.state)
             .map_err(|error| format!("calloop dispatch failed: {error}"))?;
@@ -5705,6 +5796,8 @@ struct WaylandState {
     /// with what clients were actually told.
     touch_devices: usize,
     bindings: BindingState,
+    #[cfg(feature = "bus")]
+    bus_key: Option<crate::bus_key::BusKeyWorker>,
     decoration: DecorationStartup,
     ecs_action_sender: SyncSender<EcsAction>,
     kms_render_command_sender: Sender<KmsRenderCommand>,
@@ -5714,6 +5807,10 @@ struct WaylandState {
     backend: BackendData,
     cursor_position: (f64, f64),
     cursor_position_snapshot: Arc<Mutex<CursorPositionSnapshot>>,
+    #[cfg(feature = "native-quoin")]
+    native_shell: Option<crate::native_shell::NativeShellBridge>,
+    #[cfg(feature = "native-quoin")]
+    native_work_area: Option<cosmix_shell::host::PanelRect>,
     cursor_selection: CursorSelection,
     chrome_cursor_override: Option<ChromeCursorIcon>,
     cursor_surfaces: HashMap<ObjectId, CursorSurfaceRecord>,
@@ -7559,6 +7656,10 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
+        #[cfg(feature = "native-quoin")]
+        if let Some(bridge) = &self.native_shell {
+            bridge.reset();
+        }
         #[cfg(feature = "bus")]
         self.reset_corner_detector();
         let popup_parents = self
@@ -8216,13 +8317,15 @@ impl WaylandState {
                     && record.role.parent_surface().is_none()
                     && !self.surface_belongs_to_minimized_toplevel(record.role.wl_surface())
             })
-            .map(|record| send_frames_surface_tree(record.role.wl_surface(), frame_time))
+            .map(|record| {
+                send_frames_surface_tree(record.role.wl_surface(), frame_time, &self.surfaces)
+            })
             .sum::<usize>();
         if let CursorSelection::Surface(id) = &self.cursor_selection
             && let Some(record) = self.cursor_surfaces.get(id)
             && record.presentation.is_some()
         {
-            delivered += send_frames_surface_tree(&record.surface, frame_time);
+            delivered += send_frames_surface_tree(&record.surface, frame_time, &self.surfaces);
         }
         if delivered > 0 {
             tracing::trace!(delivered, "completed Wayland frame callbacks");
@@ -11166,6 +11269,19 @@ impl WaylandState {
     }
 
     fn pointer_button(&mut self, button: u32, state: HostButtonState, time: u32) {
+        #[cfg(feature = "native-quoin")]
+        if let Some(bridge) = &self.native_shell
+            && bridge.button(
+                self.cursor_position.0,
+                self.cursor_position.1,
+                button,
+                state == HostButtonState::Pressed,
+                self.pointer.is_grabbed() || self.chrome_pointer_grab.is_some(),
+            )
+        {
+            self.titlebar_click_candidate = None;
+            return;
+        }
         #[cfg(feature = "bus")]
         if state == HostButtonState::Pressed && button == PRIMARY_POINTER_BUTTON {
             self.observe_corner_click();
@@ -11513,6 +11629,18 @@ impl WaylandState {
             return;
         }
         // Finger and continuous sources have a defined end of sequence, so a
+        #[cfg(feature = "native-quoin")]
+        if !self.pointer.is_grabbed()
+            && let Some(bridge) = &self.native_shell
+            && bridge.covers(self.cursor_position.0, self.cursor_position.1)
+        {
+            bridge.scroll(bevy::prelude::Vec2::new(
+                horizontal.map_or(0.0, |axis| -axis.amount as f32),
+                vertical.map_or(0.0, |axis| -axis.amount as f32),
+            ));
+            return;
+        }
+        // Finger and continuous sources have a defined end of sequence, so a
         // reported zero from one is a stop. A wheel never promises a
         // terminating event, so a zero from one is just an idle axis.
         let stop_is_meaningful = matches!(source, AxisSource::Finger | AxisSource::Continuous);
@@ -11766,6 +11894,13 @@ impl WaylandState {
                 let enabled = self.bindings.toggle_interception();
                 tracing::info!(enabled, "compositor key interception toggled");
             }
+            BindingAction::SendBusKey =>
+            {
+                #[cfg(feature = "bus")]
+                if let Some(worker) = &self.bus_key {
+                    worker.trigger();
+                }
+            }
             BindingAction::SwitchVt(vt) => {
                 debug_assert!(!action.needs_ecs());
                 if let Some(request) = self.vt_switch_requested.as_ref() {
@@ -12002,6 +12137,15 @@ impl WaylandState {
     }
 
     fn pointer_target_at(&self, x: f64, y: f64) -> Option<PointerTarget> {
+        #[cfg(feature = "native-quoin")]
+        if !self.session_lock_active()
+            && self
+                .native_shell
+                .as_ref()
+                .is_some_and(|bridge| bridge.covers(x, y))
+        {
+            return None;
+        }
         let client = self.surface_at(x, y);
         if self.session_lock_active() {
             // Compositor chrome belongs to hidden ordinary toplevels. Under
@@ -13037,6 +13181,42 @@ impl WaylandState {
     }
 
     fn usable_output_rect(&self) -> LogicalOutputRect {
+        self.native_usable_rect(self.layer_usable_output_rect())
+    }
+
+    #[cfg(feature = "native-quoin")]
+    fn set_native_work_area(&mut self, area: Option<cosmix_shell::host::PanelRect>) {
+        if self.native_work_area == area {
+            return;
+        }
+        let previous = self.usable_output_rect();
+        #[cfg(feature = "bus")]
+        if let Some(output) = self.backend.default_output() {
+            self.mark_output_before_change(&output, "shell.work-area");
+        }
+        self.native_work_area = area;
+        if self.usable_output_rect() != previous {
+            self.reconfigure_window_states_for_output();
+            self.invalidate_pointer_hit_test_geometry();
+        }
+    }
+
+    fn native_usable_rect(&self, rect: LogicalOutputRect) -> LogicalOutputRect {
+        #[cfg(feature = "native-quoin")]
+        if let Some(area) = self.native_work_area {
+            let x = rect.x.max(area.x);
+            let y = rect.y.max(area.y);
+            return LogicalOutputRect {
+                x,
+                y,
+                width: ((rect.x + rect.width).min(area.x + area.width) - x).max(0.0),
+                height: ((rect.y + rect.height).min(area.y + area.height) - y).max(0.0),
+            };
+        }
+        rect
+    }
+
+    fn layer_usable_output_rect(&self) -> LogicalOutputRect {
         let Some(output) = self.backend.default_output() else {
             return self.logical_output_rect();
         };
@@ -13056,6 +13236,11 @@ impl WaylandState {
 
     #[cfg(feature = "bus")]
     fn port_usable_output_rect_for(&self, output: &Output) -> Option<LogicalOutputRect> {
+        #[cfg(feature = "native-quoin")]
+        if self.native_work_area.is_some() && self.backend.default_output().as_ref() == Some(output)
+        {
+            return Some(self.usable_output_rect());
+        }
         let own_rect = match output.current_mode() {
             Some(mode) => {
                 let size = mode
@@ -14022,6 +14207,16 @@ impl WaylandState {
                 break candidate;
             }
         };
+        crate::frame_trace::event("comp_buffer_retain", || {
+            (
+                token,
+                trace_object_identity(&buffer.id()),
+                self.retained_buffers
+                    .buffers
+                    .get(&buffer.id())
+                    .map_or(1, |retained| retained.count.saturating_add(1) as u64),
+            )
+        });
         self.retained_buffers.retain(token, buffer.id(), buffer);
         token
     }
@@ -14302,6 +14497,17 @@ impl WaylandState {
     }
 
     fn release_buffer_token(&mut self, token: u64) {
+        crate::frame_trace::event("comp_buffer_drop_owner", || {
+            let retained = self.retained_buffers.tokens.get(&token).and_then(|key| {
+                self.retained_buffers
+                    .buffers
+                    .get(key)
+                    .map(|buffer| (key, buffer))
+            });
+            retained.map_or((token, 0, 0), |(key, buffer)| {
+                (token, trace_object_identity(key), buffer.count as u64)
+            })
+        });
         if matches!(
             self.release_uses.release_owner(token),
             release_use::ReleaseOwnerDecision::Faulted(_)
@@ -14326,6 +14532,9 @@ impl WaylandState {
         }
         if let Some(buffer) = self.retained_buffers.release(token) {
             buffer.release();
+            crate::frame_trace::event("comp_buffer_release_queued", || {
+                (token, trace_object_identity(&buffer.id()), 0)
+            });
             tracing::debug!(token, "released final retained wl_buffer reference");
         }
     }
@@ -14431,6 +14640,22 @@ impl WaylandState {
             record.commit_count = record.commit_count.saturating_add(1);
             (record.id, record.commit_count)
         };
+        if commit_count == 1 {
+            crate::frame_trace::event("comp_surface_client", || {
+                let pid = surface
+                    .client()
+                    .and_then(|client| client.get_credentials(&self.display_handle).ok())
+                    .map_or(0, |credentials| credentials.pid as u64);
+                (surface_id.0, u64::from(surface.id().protocol_id()), pid)
+            });
+        }
+        crate::frame_trace::event("comp_surface_buffer", || {
+            (
+                surface_id.0,
+                trace_object_identity(&buffer.id()),
+                u64::from(surface.id().protocol_id()),
+            )
+        });
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(surface_id, "wayland.map");
         if let Ok(dmabuf) = get_dmabuf(&buffer) {
@@ -16038,13 +16263,26 @@ fn convert_shm_row(format: wl_shm::Format, packed_bgra: &[u8], rgba: &mut [u8]) 
     }
 }
 
-fn send_frames_surface_tree(surface: &WlSurface, time: u32) -> usize {
+// ObjectId includes client and object generation; this process-local hash is a
+// diagnostic correlation key only, never a protocol identity or ownership key.
+fn trace_object_identity(id: &ObjectId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hash);
+    hash.finish()
+}
+
+fn send_frames_surface_tree(
+    surface: &WlSurface,
+    time: u32,
+    surfaces: &HashMap<ObjectId, SurfaceRecord>,
+) -> usize {
     let mut delivered = 0;
     with_surface_tree_downward(
         surface,
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
-        |_surface, states, &()| {
+        |surface, states, &()| {
             for callback in states
                 .cached_state
                 .get::<SurfaceAttributes>()
@@ -16053,6 +16291,13 @@ fn send_frames_surface_tree(surface: &WlSurface, time: u32) -> usize {
                 .drain(..)
             {
                 callback.done(time);
+                crate::frame_trace::event("comp_callback_done_queued", || {
+                    (
+                        surfaces.get(&surface.id()).map_or(0, |record| record.id.0),
+                        u64::from(callback.id().protocol_id()),
+                        u64::from(surface.id().protocol_id()),
+                    )
+                });
                 delivered += 1;
             }
         },

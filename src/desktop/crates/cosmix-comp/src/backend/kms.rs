@@ -572,7 +572,7 @@ impl KmsTopology {
         self.generation
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bus"))]
     pub(crate) fn is_active(&self) -> bool {
         self.active
     }

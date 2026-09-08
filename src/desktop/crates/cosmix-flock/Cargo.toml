@@ -1,0 +1,8 @@
+[package]
+name = "cosmix-flock"
+version = "0.1.0"
+description = "Bounded deterministic flock simulation for the Cosmix living wallpaper"
+edition = "2024"
+license = "MIT"
+
+[dependencies]

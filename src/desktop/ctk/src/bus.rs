@@ -431,6 +431,23 @@ enum ObservationRequest {
     },
 }
 
+/// One bounded application/worker channel, observed without consuming it.
+#[derive(Clone, Copy, Debug)]
+pub struct BusQueueDepth {
+    pub name: &'static str,
+    pub depth: usize,
+    pub capacity: Option<usize>,
+}
+
+/// Read-only observations of bridge channels and the latest-topic mailbox.
+/// Concurrent producers/consumers can change depths between field reads.
+/// Worker-local pending/in-flight calls and socket buffers are not included.
+#[derive(Clone, Copy, Debug)]
+pub struct BusQueueSnapshot {
+    pub queues: [BusQueueDepth; 6],
+    pub latest_topics: usize,
+}
+
 #[derive(Resource)]
 pub struct BusBridge {
     requests: Sender<WorkerRequest>,
@@ -472,6 +489,47 @@ pub struct BusBridge {
 }
 
 impl BusBridge {
+    /// Inspect queues without draining them, claiming an owner or waking the
+    /// runner. A maximum sampled from this API is an observed peak, not an
+    /// exact enqueue-time high-water mark; short bursts may fall between reads.
+    pub fn queue_snapshot(&self) -> BusQueueSnapshot {
+        BusQueueSnapshot {
+            queues: [
+                BusQueueDepth {
+                    name: "outbound",
+                    depth: self.requests.len(),
+                    capacity: self.requests.capacity(),
+                },
+                BusQueueDepth {
+                    name: "events",
+                    depth: self.events.len(),
+                    capacity: self.events.capacity(),
+                },
+                BusQueueDepth {
+                    name: "messages",
+                    depth: self.messages.len(),
+                    capacity: self.messages.capacity(),
+                },
+                BusQueueDepth {
+                    name: "inbound",
+                    depth: self.inbound.len(),
+                    capacity: self.inbound.capacity(),
+                },
+                BusQueueDepth {
+                    name: "observation_outbound",
+                    depth: self.observation_requests.len(),
+                    capacity: self.observation_requests.capacity(),
+                },
+                BusQueueDepth {
+                    name: "observation_messages",
+                    depth: self.observation_messages.len(),
+                    capacity: self.observation_messages.capacity(),
+                },
+            ],
+            latest_topics: self.latest_messages.lock().unwrap().len(),
+        }
+    }
+
     /// Guard for the telemetry drain methods once a mixer transport owns the
     /// streams (see [`Self::mixer_transport`]).
     fn assert_telemetry_owned(&self) {
@@ -752,6 +810,7 @@ pub struct TestBusPeer {
     requests: Receiver<WorkerRequest>,
     events: Sender<BusBridgeEvent>,
     messages: Sender<BusMessage>,
+    latest_messages: Arc<Mutex<HashMap<String, BusMessage>>>,
     #[cfg(feature = "theme")]
     semantic_inboxes: Arc<SemanticInboxes>,
 }
@@ -773,7 +832,7 @@ pub struct TestBusCall {
     pub body: String,
 }
 
-#[cfg(all(any(test, feature = "test-support"), feature = "theme"))]
+#[cfg(any(test, feature = "test-support"))]
 pub struct TestBusPublish {
     pub to: String,
     pub command: String,
@@ -795,6 +854,15 @@ impl TestBusPeer {
     /// Deliver one ordinary telemetry message, as the worker would.
     pub fn deliver_message(&self, message: BusMessage) {
         self.messages.send(message).expect("test messages are open");
+    }
+
+    /// Replace the latest sample for a topic, matching the worker mailbox.
+    pub fn deliver_latest_message(&self, message: BusMessage) {
+        let topic = message
+            .topic()
+            .expect("latest sample has a topic")
+            .to_owned();
+        self.latest_messages.lock().unwrap().insert(topic, message);
     }
 
     /// The outbound calls queued since the last drain.
@@ -839,7 +907,6 @@ impl TestBusPeer {
             .collect()
     }
 
-    #[cfg(feature = "theme")]
     pub fn drain_publishes(&self) -> Vec<TestBusPublish> {
         self.requests
             .try_iter()
@@ -887,6 +954,7 @@ pub fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
     let (shutdown_done_tx, shutdown_done_rx) = flume::bounded(1);
     let _ = shutdown_done_tx.send(());
     let semantic_inboxes = Arc::new(SemanticInboxes::default());
+    let latest_messages = Arc::new(Mutex::new(HashMap::new()));
     (
         BusBridge {
             requests: request_tx,
@@ -896,7 +964,7 @@ pub fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
             observation_messages: observation_message_rx,
             inbound: inbound_rx,
             committed_generation: Arc::new(AtomicU64::new(1)),
-            latest_messages: Arc::new(Mutex::new(HashMap::new())),
+            latest_messages: latest_messages.clone(),
             semantic_inboxes: semantic_inboxes.clone(),
             wake: no_op_wake(),
             max_messages_per_frame: 16,
@@ -911,6 +979,7 @@ pub fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
             requests: request_rx,
             events: event_tx,
             messages: message_tx,
+            latest_messages,
             #[cfg(feature = "theme")]
             semantic_inboxes,
         },
@@ -2470,6 +2539,41 @@ pub use mixer_transport::BusTransport;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_snapshots_preserve_messages_calls_and_latest_samples() {
+        let (bridge, peer) = super::test_bridge("test-service");
+        peer.deliver_event(BusBridgeEvent::DroppedMessages(3));
+        let message = BusMessage {
+            connection_generation: 1,
+            from: "test-source".into(),
+            command: "test.pointer".into(),
+            body: "latest".into(),
+            headers: BTreeMap::from([("topic".into(), "test.pointer".into())]),
+        };
+        peer.deliver_message(message.clone());
+        peer.deliver_latest_message(message.clone());
+        peer.deliver_latest_message(message);
+        bridge
+            .try_call(7, "test-source", "test.get", BTreeMap::new(), "{}")
+            .unwrap();
+        for _ in 0..3 {
+            let snapshot = bridge.queue_snapshot();
+            for name in ["outbound", "events", "messages"] {
+                let queue = snapshot.queues.iter().find(|q| q.name == name).unwrap();
+                assert_eq!(queue.depth, 1);
+                assert_eq!(queue.capacity, Some(16));
+            }
+            assert_eq!(snapshot.latest_topics, 1);
+        }
+        assert_eq!(peer.drain_calls()[0].request_id, 7);
+        assert_eq!(bridge.drain_events().count(), 1);
+        assert_eq!(bridge.drain_messages().count(), 1);
+        assert_eq!(bridge.drain_latest_messages()[0].body, "latest");
+        let drained = bridge.queue_snapshot();
+        assert!(drained.queues.iter().all(|q| q.depth == 0));
+        assert_eq!(drained.latest_topics, 0);
+    }
+
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;

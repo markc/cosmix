@@ -25,8 +25,9 @@ use tokio::sync::Notify;
 use crate::port::{ControlReply, PortControl, PortSetRequest};
 
 use super::{
-    StackBand, SurfaceId, WaylandState,
+    CursorPositionSnapshot, StackBand, SurfaceId, WaylandState,
     corner::{Corner, CornerConfig, CornerDetector, CornerEvent},
+    pointer_observation::{LEASE, PointerLease, PointerPosition, PointerSample},
     port_snapshot::{
         BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
         SurfaceSnapshot, WindowSnapshot, project_focus, project_output, project_outputs,
@@ -42,6 +43,7 @@ pub(crate) const OUTPUT_TOPIC_SUFFIX: &str = "output.changed";
 pub(crate) const CORNER_ENTERED_TOPIC_SUFFIX: &str = "corner.entered";
 pub(crate) const CORNER_LEFT_TOPIC_SUFFIX: &str = "corner.left";
 pub(crate) const CORNER_CLICKED_TOPIC_SUFFIX: &str = "corner.clicked";
+pub(crate) const POINTER_TOPIC_SUFFIX: &str = "pointer.changed";
 
 pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
     format!("{service}.{suffix}")
@@ -100,6 +102,10 @@ impl PropValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ObservationRecord {
+    PointerChanged {
+        sample: PointerSample,
+        event_seq: u64,
+    },
     PropsChanged {
         path: String,
         old: PropValue,
@@ -154,6 +160,7 @@ pub(crate) enum ObservationRecord {
 impl ObservationRecord {
     pub(crate) fn event_seq(&self) -> u64 {
         match self {
+            Self::PointerChanged { event_seq, .. } => *event_seq,
             Self::PropsChanged { event_seq, .. }
             | Self::SurfaceMapped { event_seq, .. }
             | Self::SurfaceUnmapped { event_seq, .. }
@@ -167,6 +174,7 @@ impl ObservationRecord {
 
     pub(crate) fn topic_suffix(&self) -> &'static str {
         match self {
+            Self::PointerChanged { .. } => POINTER_TOPIC_SUFFIX,
             Self::PropsChanged { .. } => PROPS_TOPIC_SUFFIX,
             Self::SurfaceMapped { .. } => SURFACE_MAPPED_TOPIC_SUFFIX,
             Self::SurfaceUnmapped { .. } => SURFACE_UNMAPPED_TOPIC_SUFFIX,
@@ -183,6 +191,11 @@ impl ObservationRecord {
         message.set("command", self.topic_suffix());
         message.set("event_seq", &self.event_seq().to_string());
         message.body = match self {
+            Self::PointerChanged { sample, event_seq } => {
+                let mut value = serde_json::to_value(sample).expect("finite pointer sample");
+                value["event_seq"] = json!(event_seq);
+                value.to_string()
+            }
             Self::PropsChanged {
                 path,
                 old,
@@ -284,7 +297,7 @@ impl ObservationRecord {
     }
 }
 
-const TOPIC_SUFFIXES: [&str; 8] = [
+const TOPIC_SUFFIXES: [&str; 9] = [
     PROPS_TOPIC_SUFFIX,
     SURFACE_MAPPED_TOPIC_SUFFIX,
     SURFACE_UNMAPPED_TOPIC_SUFFIX,
@@ -293,17 +306,18 @@ const TOPIC_SUFFIXES: [&str; 8] = [
     CORNER_ENTERED_TOPIC_SUFFIX,
     CORNER_LEFT_TOPIC_SUFFIX,
     CORNER_CLICKED_TOPIC_SUFFIX,
+    POINTER_TOPIC_SUFFIX,
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AffectedTopics(u8);
+pub(crate) struct AffectedTopics(u16);
 
 impl AffectedTopics {
     fn index(suffix: &str) -> usize {
         TOPIC_SUFFIXES
             .iter()
             .position(|candidate| *candidate == suffix)
-            .expect("every observation has one of the eight fixed topic suffixes")
+            .expect("every observation has a fixed topic suffix")
     }
 
     pub(crate) fn insert(&mut self, suffix: &str) {
@@ -531,6 +545,10 @@ pub(crate) struct CornerRegion {
 }
 
 pub(crate) struct ObservationState {
+    pointer_lease: PointerLease,
+    pointer_seen: Option<(CursorPositionSnapshot, bool)>,
+    pointer_timer: Option<RegistrationToken>,
+    pointer_deadline: Option<Instant>,
     pending_surface_edges: BTreeMap<u64, SurfaceEdgeStart>,
     dirty_surfaces: BTreeMap<u64, &'static str>,
     dirty_outputs: BTreeMap<String, OutputEdgeStart>,
@@ -570,6 +588,10 @@ impl ObservationState {
     ) -> Self {
         let corner_config = CornerConfig::default();
         Self {
+            pointer_lease: PointerLease::default(),
+            pointer_seen: None,
+            pointer_timer: None,
+            pointer_deadline: None,
             pending_surface_edges: BTreeMap::new(),
             dirty_surfaces: BTreeMap::new(),
             dirty_outputs: BTreeMap::new(),
@@ -757,6 +779,7 @@ impl WaylandState {
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     pub(crate) fn mark_output_topology_before_change(&mut self) {
+        self.observations.pointer_lease.changed();
         self.mark_all_outputs_before_change("output.geometry");
         self.observations.output_topology_dirty = true;
         self.observations
@@ -1033,6 +1056,97 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     service_output_edges(state);
     service_property_diffs(state);
     service_controls(state);
+    service_pointer(state);
+}
+
+/// Runs at a stable post-dispatch boundary. Input handlers never serialize or
+/// wait for the Bus; only the latest authoritative cursor snapshot is read.
+fn service_pointer(state: &mut WaylandState) {
+    let now = Instant::now();
+    if state.observations.pointer_lease.active(now) {
+        let cursor = *state
+            .cursor_position_snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let suppressed = state.session_lock_active() || !state.backend.pointer_session_active();
+        if state.observations.pointer_seen != Some((cursor, suppressed)) {
+            state.observations.pointer_seen = Some((cursor, suppressed));
+            state.observations.pointer_lease.changed();
+        }
+        if state.observations.pointer_lease.take(now)
+            && let Some(context) = state.port_context.as_ref()
+        {
+            let instance = context.instance.clone();
+            let position = if !suppressed
+                && cursor.on_output
+                && cursor.x.is_finite()
+                && cursor.y.is_finite()
+            {
+                project_outputs(state).and_then(|projection| {
+                    projection.rows.values().find_map(|row| {
+                        let x = cursor.x - f64::from(row.x);
+                        let y = cursor.y - f64::from(row.y);
+                        (x >= 0.0
+                            && y >= 0.0
+                            && x < f64::from(row.width)
+                            && y < f64::from(row.height))
+                        .then(|| (row.name.clone(), PointerPosition { x, y }))
+                    })
+                })
+            } else {
+                None
+            };
+            let valid = position.is_some();
+            let (output, position) = position.map_or((None, None), |(output, position)| {
+                (Some(output), Some(position))
+            });
+            let sample = PointerSample {
+                version: 1,
+                instance,
+                output,
+                position,
+                valid,
+                timestamp_ms: state
+                    .observations
+                    .corner_clock
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            };
+            state
+                .observations
+                .offer(|event_seq| ObservationRecord::PointerChanged { sample, event_seq });
+        }
+    } else {
+        state.observations.pointer_seen = None;
+    }
+    let deadline = state.observations.pointer_lease.deadline(now);
+    if deadline == state.observations.pointer_deadline {
+        return;
+    }
+    if let Some(token) = state.observations.pointer_timer.take() {
+        state.observations.loop_handle.remove(token);
+    }
+    state.observations.pointer_deadline = None;
+    if let Some(deadline) = deadline {
+        let delay = deadline.saturating_duration_since(Instant::now());
+        let timer = state.observations.loop_handle.insert_source(
+            Timer::from_duration(delay),
+            |_, _, state| {
+                state.observations.pointer_timer = None;
+                state.observations.pointer_deadline = None;
+                // The normal dispatch-cycle epilogue services the due sample.
+                TimeoutAction::Drop
+            },
+        );
+        match timer {
+            Ok(token) => {
+                state.observations.pointer_timer = Some(token);
+                state.observations.pointer_deadline = Some(deadline);
+            }
+            Err(error) => tracing::warn!(%error, "pointer observation timer unavailable"),
+        }
+    }
 }
 
 fn service_surface_edges(state: &mut WaylandState) {
@@ -1930,6 +2044,17 @@ fn service_controls(state: &mut WaylandState) {
     let mut watches = Vec::new();
     for control in controls {
         match control {
+            PortControl::PointerWatch(request) => {
+                state.observations.pointer_lease.renew(Instant::now());
+                let reply = state
+                    .port_context
+                    .as_ref()
+                    .map_or(ControlReply::Busy, |context| ControlReply::PointerWatch {
+                        topic: topic_name(&context.service, POINTER_TOPIC_SUFFIX),
+                        lease_ms: LEASE.as_millis() as u64,
+                    });
+                let _ = request.reply.send(reply);
+            }
             PortControl::Watch(request) => {
                 desired_active = true;
                 watches.push(request);
@@ -2761,19 +2886,21 @@ mod tests {
     }
 
     #[test]
-    fn affected_topics_supports_all_eight_bits() {
+    fn affected_topics_supports_every_topic_including_pointer() {
         let mut topics = AffectedTopics::default();
         for suffix in TOPIC_SUFFIXES {
             topics.insert(suffix);
         }
-        assert_eq!(topics.0, u8::MAX);
+        assert_eq!(topics.0, (1u16 << TOPIC_SUFFIXES.len()) - 1);
         assert_eq!(topics.iter().collect::<Vec<_>>(), TOPIC_SUFFIXES);
         topics.remove(CORNER_CLICKED_TOPIC_SUFFIX);
         assert!(!topics.contains(CORNER_CLICKED_TOPIC_SUFFIX));
         let mut clicked = AffectedTopics::default();
         clicked.insert(CORNER_CLICKED_TOPIC_SUFFIX);
         topics.merge(clicked);
-        assert_eq!(topics.0, u8::MAX);
+        assert_eq!(topics.0, (1u16 << TOPIC_SUFFIXES.len()) - 1);
+        topics.remove(POINTER_TOPIC_SUFFIX);
+        assert!(!topics.contains(POINTER_TOPIC_SUFFIX));
     }
 
     #[test]

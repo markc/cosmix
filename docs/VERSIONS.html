@@ -453,7 +453,8 @@ and <em>history</em> ("strict since v0.52.0"), because those describe what happe
 and never go out of date.</p>
 <p><strong>What is deployed is not stated here.</strong> Which host runs which build is
 answered by the host, not by a document:</p>
-<pre><code class="language-sh">ssh &lt;node&gt; 'print(run("/opt/cosmix/bin/mix --version"))'
+<p>For example, query a node's broker through the native Bus:</p>
+<pre><code class="language-mix">send noded.alpha.bus noded.info
 </code></pre>
 <h2 id="bus">bus</h2>
 <p>CosMix Agent Bus — protocol family</p>
@@ -462,7 +463,7 @@ answered by the host, not by a document:</p>
 <tr><td><code>cosmix-lib-bus</code></td><td>0.3.2</td></tr>
 <tr><td><code>cosmix-lib-client</code></td><td>0.4.2</td></tr>
 <tr><td><code>cosmix-lib-log</code></td><td>0.3.0</td></tr>
-<tr><td><code>cosmix-lib-props-core</code></td><td>0.3.0</td></tr>
+<tr><td><code>cosmix-lib-props-core</code></td><td>0.3.1</td></tr>
 </tbody></table>
 <h2 id="mix">mix</h2>
 <p>Mix — the language and shell</p>
@@ -495,7 +496,7 @@ answered by the host, not by a document:</p>
 <tr><td><code>cosmix-lib-mesh</code></td><td>0.6.0</td></tr>
 <tr><td><code>cosmix-lib-mesh-trust</code></td><td>0.10.0</td></tr>
 <tr><td><code>cosmix-lib-node-id</code></td><td>0.2.0</td></tr>
-<tr><td><code>cosmix-lib-props-store</code></td><td>0.2.0</td></tr>
+<tr><td><code>cosmix-lib-props-store</code></td><td>0.3.0</td></tr>
 <tr><td><code>cosmix-lib-skills</code></td><td>0.1.0</td></tr>
 <tr><td><code>cosmix-lib-wg</code></td><td>0.2.0</td></tr>
 <tr><td><code>cosmix-maild</code></td><td>0.8.1</td></tr>
@@ -504,20 +505,47 @@ answered by the host, not by a document:</p>
 <tr><td><code>cosmix-maild-rules</code></td><td>0.2.2</td></tr>
 <tr><td><code>cosmix-mcp</code></td><td>0.4.0</td></tr>
 <tr><td><code>cosmix-mds</code></td><td>0.2.2</td></tr>
-<tr><td><code>cosmix-mesh-sign</code></td><td>0.7.3</td></tr>
+<tr><td><code>cosmix-mesh-sign</code></td><td>0.8.0</td></tr>
 <tr><td><code>cosmix-midicomp</code></td><td>0.3.0</td></tr>
 <tr><td><code>cosmix-mixer-schema</code></td><td>0.5.0</td></tr>
 <tr><td><code>cosmix-mprisd</code></td><td>0.1.1</td></tr>
 <tr><td><code>cosmix-musicd</code></td><td>0.25.0</td></tr>
-<tr><td><code>cosmix-noded</code></td><td>0.13.1</td></tr>
+<tr><td><code>cosmix-noded</code></td><td>0.16.0</td></tr>
 <tr><td><code>cosmix-nspawnd</code></td><td>0.2.0</td></tr>
 <tr><td><code>cosmix-powerd</code></td><td>0.1.0</td></tr>
 <tr><td><code>cosmix-song</code></td><td>0.2.0</td></tr>
 <tr><td><code>cosmix-webd</code></td><td>0.10.1</td></tr>
 <tr><td><code>cosmix-wgd</code></td><td>0.4.1</td></tr>
 </tbody></table>
+<h2 id="desktop">desktop</h2>
+<p>Desktop compositor, shell, widgets and applications (separate workspace).</p>
+<table><thead><tr><th>crate</th><th>version</th></tr></thead><tbody>
+<tr><td><code>cosmix-bg-boing</code></td><td>0.1.0</td></tr>
+<tr><td><code>cosmix-bg-showcase</code></td><td>0.2.2</td></tr>
+<tr><td><code>cosmix-capture</code></td><td>0.1.2</td></tr>
+<tr><td><code>cosmix-comp</code></td><td>0.51.0</td></tr>
+<tr><td><code>cosmix-deco</code></td><td>0.4.0</td></tr>
+<tr><td><code>cosmix-design</code></td><td>0.14.0</td></tr>
+<tr><td><code>cosmix-filemgr</code></td><td>0.9.5</td></tr>
+<tr><td><code>cosmix-flock</code></td><td>0.1.0</td></tr>
+<tr><td><code>cosmix-imeprobe</code></td><td>0.1.0</td></tr>
+<tr><td><code>cosmix-interactgui</code></td><td>0.1.1</td></tr>
+<tr><td><code>cosmix-mail</code></td><td>0.1.0</td></tr>
+<tr><td><code>cosmix-quoin</code></td><td>0.11.0</td></tr>
+<tr><td><code>cosmix-shell</code></td><td>0.8.6</td></tr>
+<tr><td><code>cosmix-shell-host</code></td><td>0.6.5</td></tr>
+<tr><td><code>cosmix-studio</code></td><td>0.4.5</td></tr>
+<tr><td><code>cosmix-tower</code></td><td>0.5.2</td></tr>
+<tr><td><code>cosmix-tray</code></td><td>0.3.1</td></tr>
+<tr><td><code>cosmix-trayd</code></td><td>0.6.2</td></tr>
+<tr><td><code>cosmix-wallpaper</code></td><td>0.2.0</td></tr>
+<tr><td><code>cosmix-wgpu-dmabuf</code></td><td>0.14.0</td></tr>
+<tr><td><code>cosmix-wl-dnd</code></td><td>0.4.2</td></tr>
+<tr><td><code>ctk</code></td><td>0.53.0</td></tr>
+<tr><td><code>spike-wl-dnd</code></td><td>0.1.0</td></tr>
+</tbody></table>
 <hr />
-<p>49 crates in one workspace, <code>$COSMIX/src</code> (groups are the former repositories).</p></div></div>
+<p>49 crates in <code>$COSMIX/src</code> and 23 in the separate <code>$COSMIX/src/desktop</code> workspace.</p></div></div>
     </div>
 
 </main>

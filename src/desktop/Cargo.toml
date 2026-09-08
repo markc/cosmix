@@ -10,11 +10,16 @@ members = [
     "apps/interactgui",
     "apps/imeprobe",
     "apps/quoin",
+    "apps/wallpaper",
+    "apps/bg-showcase",
+    "apps/capture",
     "crates/cosmix-design",
     "crates/cosmix-comp",
     "crates/cosmix-deco",
     "crates/cosmix-shell",
     "crates/cosmix-shell-host",
+    "crates/cosmix-flock",
+    "crates/cosmix-bg-boing",
     "crates/cosmix-wgpu-dmabuf",
     "crates/cosmix-wl-dnd",
     "spike/wl-dnd",
@@ -37,6 +42,7 @@ bin = "cosmix-quoin"
 # Vendored upstream sources with narrow local patches: see vendor/README.md for
 # provenance, exact patch shape and source-routing assertions.
 [patch.crates-io]
+calloop = { path = "vendor/calloop" }
 smithay = { path = "vendor/smithay" }
 wgpu = { path = "vendor/wgpu" }
 wgpu-core = { path = "vendor/wgpu-core" }

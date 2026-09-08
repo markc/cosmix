@@ -7,13 +7,9 @@ use std::{fmt::Debug, time::Duration};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use bevy::camera::RenderTarget;
 use bevy::prelude::*;
 use bevy::ui::{UiTargetCamera, percent};
-use bevy::window::{
-    CompositeAlphaMode, RawHandleWrapper, WindowCreated, WindowRef, WindowResized,
-    WindowScaleFactorChanged,
-};
+use bevy::window::{RawHandleWrapper, WindowCreated, WindowResized, WindowScaleFactorChanged};
 use cosmix_shell::chrome::QuoinPanelMounts;
 use cosmix_shell::core::PanelMode;
 use cosmix_shell::core::{Edge, LogicalSize};
@@ -33,6 +29,7 @@ use wayland_protocols::wp::{
 
 use crate::planner::{ProtocolAnchor, ProtocolKeyboardInteractivity, ProtocolLayer, ProtocolOp};
 use crate::raw_handle::{RawHandleError, RetainedWindow, retained_raw_handle};
+use crate::render_target::HostedRenderTarget;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceTag {
@@ -344,14 +341,14 @@ fn validate_surface_size(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct SurfaceScalePlan {
-    scale_factor: f64,
-    physical_size: (u32, u32),
-    buffer_scale: i32,
-    viewport_destination: Option<(i32, i32)>,
+pub(crate) struct SurfaceScalePlan {
+    pub scale_factor: f64,
+    pub physical_size: (u32, u32),
+    pub buffer_scale: i32,
+    pub viewport_destination: Option<(i32, i32)>,
 }
 
-fn surface_scale_plan(
+pub(crate) fn surface_scale_plan(
     logical: (u32, u32),
     integer_scale: i32,
     preferred_fractional_scale: Option<f64>,
@@ -429,31 +426,17 @@ impl PanelSurface {
         retained_mount: Option<Entity>,
     ) -> Result<Self, RawHandleError> {
         debug_assert!(output_scale > 0, "selected output scale was validated");
-        let window = app
-            .world_mut()
-            .spawn(Window {
-                title: format!("Cosmix Quoin — {edge:?}"),
-                // The compositor configure is validated before the real WSI
-                // dimensions are installed.
-                resolution: bevy::window::WindowResolution::new(1, 1)
-                    .with_scale_factor_override(1.0),
-                transparent: true,
-                focused: false,
-                composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
-                ..default()
-            })
-            .id();
-        let camera = app
-            .world_mut()
-            .spawn((
-                Camera2d,
-                Camera {
-                    is_active: false,
-                    ..default()
-                },
-                RenderTarget::Window(WindowRef::Entity(window)),
-            ))
-            .id();
+        let HostedRenderTarget { window, camera } =
+            HostedRenderTarget::spawn(app, format!("Cosmix Quoin — {edge:?}"));
+        drop(crate::runner::frame_trace::span(
+            match edge {
+                Edge::Left => "quoin_panel_window_left",
+                Edge::Right => "quoin_panel_window_right",
+                Edge::Top => "quoin_panel_window_top",
+                Edge::Bottom => "quoin_panel_window_bottom",
+            },
+            window.to_bits(),
+        ));
         let mount = if let Some(mount) = retained_mount {
             app.world_mut()
                 .entity_mut(mount)
@@ -471,6 +454,11 @@ impl PanelSurface {
                 ))
                 .id()
         };
+        crate::runner::frame_trace::point(
+            "host_window_wayland",
+            window.to_bits(),
+            u64::from(wl_surface.id().protocol_id()),
+        );
         let (_raw_owner, raw_handle) = retained_raw_handle(connection.clone(), wl_surface)?;
         Ok(Self {
             edge,
@@ -509,6 +497,11 @@ impl PanelSurface {
         fractional: Option<FractionalObjects>,
     ) -> Result<(), RawHandleError> {
         debug_assert!(self.wayland.is_none());
+        crate::runner::frame_trace::point(
+            "host_window_wayland",
+            self.window.to_bits(),
+            u64::from(wl_surface.id().protocol_id()),
+        );
         let (_raw_owner, raw_handle) = retained_raw_handle(connection.clone(), wl_surface)?;
         self.wayland = Some(PanelWaylandObjects::Live(WaylandObjects::new(
             LiveObjects {
@@ -592,12 +585,20 @@ impl PanelSurface {
                     layer_surface.set_anchor(sctk_anchor(anchor));
                 }
                 ProtocolOp::SetSize { width, height } => {
+                    let _trace = crate::runner::frame_trace::span(
+                        "quoin_panel_set_size",
+                        self.window.to_bits(),
+                    );
                     layer_surface.set_size(width, height);
                 }
                 ProtocolOp::SetExclusiveZone(zone) => {
                     layer_surface.set_exclusive_zone(zone);
                 }
                 ProtocolOp::SetMargin(margin) => {
+                    let _trace = crate::runner::frame_trace::span(
+                        "quoin_panel_set_margin",
+                        self.window.to_bits(),
+                    );
                     layer_surface.set_margin(margin.top, margin.right, margin.bottom, margin.left)
                 }
                 ProtocolOp::SetKeyboardInteractivity(interactivity) => layer_surface
@@ -643,6 +644,10 @@ impl PanelSurface {
 
     pub fn finish_unmap(&mut self) {
         if self.phase == SurfacePhase::PreparingUnmap {
+            let _trace = crate::runner::frame_trace::span(
+                "quoin_panel_finish_unmap",
+                self.edge.index() as u64,
+            );
             self.destroy_wayland_objects();
             self.phase = SurfacePhase::Unmapped;
             self.configured_logical_size = None;
@@ -676,6 +681,8 @@ impl PanelSurface {
         if effect == ConfigureEffect::Ignore {
             return Ok(None);
         }
+        let _trace =
+            crate::runner::frame_trace::span("quoin_panel_configure", self.edge.index() as u64);
         let scale = surface_scale_plan(
             logical,
             self.output_scale,
@@ -850,6 +857,10 @@ impl PanelSurface {
         State: Dispatch<WlCallback, FrameCallbackData> + 'static,
     {
         if let Some(generation) = self.begin_frame_request(elapsed) {
+            let _trace = crate::runner::frame_trace::span(
+                "quoin_panel_frame_request",
+                self.window.to_bits(),
+            );
             let surface = self
                 .wayland
                 .as_ref()
@@ -858,12 +869,17 @@ impl PanelSurface {
                 .layer_surface()
                 .wl_surface()
                 .clone();
-            surface.frame(
+            let callback = surface.frame(
                 qh,
                 FrameCallbackData {
                     surface: surface.clone(),
                     generation,
                 },
+            );
+            crate::runner::frame_trace::point(
+                "quoin_frame_requested",
+                u64::from(surface.id().protocol_id()),
+                u64::from(callback.id().protocol_id()),
             );
         }
     }
@@ -889,6 +905,8 @@ impl PanelSurface {
             return false;
         }
         self.frame_pending = false;
+        let _trace =
+            crate::runner::frame_trace::span("quoin_panel_frame_done", self.window.to_bits());
         self.frame_requested_at = None;
         if self.phase == SurfacePhase::Configured {
             self.presented = true;
@@ -913,12 +931,11 @@ impl PanelSurface {
     }
 
     pub fn close(&mut self, app: &mut App) {
-        app.world_mut()
-            .entity_mut(self.window)
-            .remove::<RawHandleWrapper>();
-        if let Some(mut camera) = app.world_mut().get_mut::<Camera>(self.camera) {
-            camera.is_active = false;
+        HostedRenderTarget {
+            window: self.window,
+            camera: self.camera,
         }
+        .detach(app);
         self.phase = SurfacePhase::Closed;
         self.invalidate_frame_request();
         self.waiting_configure_since = None;

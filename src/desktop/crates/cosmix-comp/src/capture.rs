@@ -994,6 +994,55 @@ impl CaptureQueue {
 #[derive(Resource, Clone, Default)]
 struct CaptureReadbackBatch(Arc<Mutex<Vec<CaptureRequest>>>);
 
+/// Non-consuming render admission after Main has retired invalid requests.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+pub(crate) fn kms_render_demand(world: &World, source: &CaptureSourceId, now: Instant) -> bool {
+    if world
+        .get_resource::<CaptureReadbackBatch>()
+        .is_none_or(|batch| batch.has_render_demand(source, now))
+    {
+        return true;
+    }
+    #[cfg(feature = "frame-capture")]
+    if world
+        .get_resource::<PngCaptureService>()
+        .is_none_or(|service| service.has_render_demand(source, now))
+    {
+        return true;
+    }
+    false
+}
+
+impl CaptureReadbackBatch {
+    fn has_render_demand(&self, source: &CaptureSourceId, now: Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|request| {
+                &request.source_id == source
+                    && request.deadline > now
+                    && !request.cancellation.is_cancelled()
+            })
+    }
+
+    fn retire_invalid(&self, now: Instant, reporter: Option<&CaptureCompletionReporter>) {
+        let retired = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extract_if(.., |request| {
+                request.deadline <= now || request.cancellation.is_cancelled()
+            })
+            .collect::<Vec<_>>();
+        // Release the queue lock before reporting or dropping reservations.
+        // Render execution retains its own checks for cancellation after this pass.
+        for request in retired {
+            report_capture_request_failed(&request, reporter);
+        }
+    }
+}
+
 #[derive(Default)]
 struct CaptureReadbackGroup {
     requests: Vec<CaptureRequest>,
@@ -1782,7 +1831,11 @@ impl Plugin for CaptureServicePlugin {
             .add_plugins(ExtractComponentPlugin::<CaptureCursorOverlaySource>::default())
             .add_systems(
                 First,
-                (evaluate_damage_eligibility, schedule_capture_requests)
+                (
+                    evaluate_damage_eligibility,
+                    schedule_capture_requests,
+                    retire_capture_admissions,
+                )
                     .chain()
                     .after(CompositorSceneSet),
             );
@@ -1868,31 +1921,22 @@ fn prepare_nested_capture_redirect(
     mut redirect: ResMut<NestedCaptureRedirect>,
 ) {
     redirect.0 = None;
-    let wire_requested = batches
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .any(|request| matches!(request.source_id, CaptureSourceId::Nested { .. }));
-    #[cfg(feature = "frame-capture")]
-    let png_requested = png_service
-        .queue
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .any(|request| matches!(request.request.target, PngCaptureTarget::Nested));
-    #[cfg(not(feature = "frame-capture"))]
-    let png_requested = false;
-    if !wire_requested && !png_requested {
-        return;
-    }
-
     let Some((camera, source)) = cameras
         .iter()
         .find(|(_, source)| matches!(source.source_id, CaptureSourceId::Nested { .. }))
     else {
         return;
     };
+    let now = Instant::now();
+    let wire_requested = batches.has_render_demand(&source.source_id, now);
+    #[cfg(feature = "frame-capture")]
+    let png_requested = png_service.has_render_demand(&source.source_id, now);
+    #[cfg(not(feature = "frame-capture"))]
+    let png_requested = false;
+    if !wire_requested && !png_requested {
+        return;
+    }
+
     let Some(target) = camera.target.clone() else {
         return;
     };
@@ -2080,6 +2124,21 @@ fn schedule_capture_requests(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .extend(admitted);
+}
+
+/// Retire admitted work even on Main-only turns. Rendering used to be the only
+/// place that released expired/cancelled admissions after they left the queue.
+/// Waiting damage watches are already serviced by schedule_capture_requests;
+/// submitted jobs belong to their completion workers and are not touched here.
+fn retire_capture_admissions(
+    batches: Res<CaptureReadbackBatch>,
+    bridge: Res<CaptureReporterBridge>,
+    #[cfg(feature = "frame-capture")] png: Res<PngCaptureService>,
+) {
+    let now = Instant::now();
+    batches.retire_invalid(now, bridge.reporter().as_ref());
+    #[cfg(feature = "frame-capture")]
+    png.retire_invalid(now);
 }
 
 fn encode_cursor_overlay(
@@ -2283,6 +2342,7 @@ fn capture_output_frames(
     overlay_views: Query<(&ViewTarget, &CaptureCursorOverlaySource)>,
 ) {
     let phase = *phase;
+    let _trace = crate::frame_trace::span("capture_encode_copy", 0);
     let reporter = reporter.reporter();
     let requests = std::mem::take(
         &mut *batches
@@ -3081,6 +3141,8 @@ fn fail_png(requests: &[PngCaptureAdmission], reason: &'static str) {
 }
 
 fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
+    let _trace = crate::frame_trace::span("capture_readback", 0);
+    let wait_trace = crate::frame_trace::span("capture_map_wait", 0);
     let mapped = loop {
         if stop.load(Ordering::Acquire) {
             #[cfg(feature = "frame-capture")]
@@ -3145,6 +3207,7 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
             ),
         }
     };
+    drop(wait_trace);
     if !mapped {
         fail_requests(&job.requests, job.reporter.as_ref());
         #[cfg(feature = "frame-capture")]
@@ -3153,6 +3216,38 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
         return;
     }
     let mapped = job.buffer.slice(..).get_mapped_range();
+    let _copy_trace = crate::frame_trace::span("capture_pack_publish", 0);
+    // Screencopy's wire format is BGRA. Most output frames already have that
+    // layout, including the GPU-composed cursor: avoid an RGBA intermediate,
+    // full-frame cursor clone and second channel conversion for this case.
+    #[cfg(feature = "frame-capture")]
+    let no_png = job.png_requests.is_empty();
+    #[cfg(not(feature = "frame-capture"))]
+    let no_png = true;
+    if no_png
+        && job.transform == smithay::utils::Transform::Normal
+        && job
+            .requests
+            .iter()
+            .all(|request| !request.overlay_cursor || request.cursor.is_none())
+    {
+        for request in &job.requests {
+            if request.cancellation.is_cancelled() {
+                continue;
+            }
+            let packed = (request.deadline > Instant::now())
+                .then(|| pack_mapped_capture(&mapped, job.row_pitch, job.source_format, request))
+                .flatten();
+            if let Some(packed) = packed {
+                report_capture_pixels(&job, request, packed);
+            } else {
+                report_capture_request_failed(request, job.reporter.as_ref());
+            }
+        }
+        drop(mapped);
+        job.buffer.unmap();
+        return;
+    }
     #[cfg(feature = "frame-capture")]
     let normalise_started = Instant::now();
     let normalised = normalise_mapped_output(
@@ -3191,38 +3286,21 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
             continue;
         }
         let mut composed;
-        let pixels = if request.overlay_cursor {
-            composed = rgba.clone();
-            if let Some(cursor) = &request.cursor {
+        let pixels =
+            if let Some(cursor) = request.cursor.as_ref().filter(|_| request.overlay_cursor) {
+                composed = rgba.clone();
                 overlay_cursor(&mut composed, request.displayed_physical_extent, cursor);
-            }
-            &composed
-        } else {
-            &rgba
-        };
+                &composed
+            } else {
+                &rgba
+            };
         let Some(packed_bgra) = convert_capture(pixels, request) else {
             if let Some(reporter) = &job.reporter {
                 reporter.failed(request.id, request.generation, request.security_epoch);
             }
             continue;
         };
-        if let Some(reporter) = &job.reporter {
-            reporter.pixels(CapturePixels {
-                id: request.id,
-                source_id: request.source_id.clone(),
-                frame_token: job.frame_token,
-                generation: request.generation,
-                security_epoch: request.security_epoch,
-                width: request.region.width,
-                height: request.region.height,
-                format: request.format,
-                y_invert: false,
-                damage_revision: request.damage_revision,
-                damage: request.damage.clone(),
-                packed_bgra: Arc::new(packed_bgra),
-                _reservation: request.reservation.clone(),
-            });
-        }
+        report_capture_pixels(&job, request, packed_bgra);
     }
     #[cfg(feature = "frame-capture")]
     for request in job.png_requests {
@@ -3236,6 +3314,84 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
         };
         publish_png(pixels, job.displayed_extent, request);
     }
+}
+
+fn report_capture_pixels(job: &CaptureReadbackJob, request: &CaptureRequest, packed_bgra: Vec<u8>) {
+    if let Some(reporter) = &job.reporter {
+        reporter.pixels(CapturePixels {
+            id: request.id,
+            source_id: request.source_id.clone(),
+            frame_token: job.frame_token,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            width: request.region.width,
+            height: request.region.height,
+            format: request.format,
+            y_invert: false,
+            damage_revision: request.damage_revision,
+            damage: request.damage.clone(),
+            packed_bgra: Arc::new(packed_bgra),
+            _reservation: request.reservation.clone(),
+        });
+    }
+}
+
+/// Normal-orientation SHM path: transfer only the requested region from the
+/// mapping, then adjust channels in CPU-owned memory. Never read WC bytes in
+/// the scalar pixel loop. The general RGBA path still owns PNG and CPU cursors.
+fn pack_mapped_capture(
+    mapped: &[u8],
+    row_pitch: usize,
+    source_format: TextureFormat,
+    request: &CaptureRequest,
+) -> Option<Vec<u8>> {
+    let swap = match source_format {
+        TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => false,
+        TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => true,
+        _ => return None,
+    };
+    let region = request.region;
+    let extent = request.displayed_physical_extent;
+    if request.transform != smithay::utils::Transform::Normal
+        || region.x.checked_add(region.width)? > extent.0
+        || region.y.checked_add(region.height)? > extent.1
+        || row_pitch < (extent.0 as usize).checked_mul(4)?
+    {
+        return None;
+    }
+    let row_bytes = (region.width as usize).checked_mul(4)?;
+    let mut packed = vec![0; row_bytes.checked_mul(region.height as usize)?];
+    if row_bytes == 0 || region.height == 0 {
+        return Some(packed);
+    }
+    if region.x == 0 && row_pitch == row_bytes {
+        let start = (region.y as usize).checked_mul(row_pitch)?;
+        let end = start.checked_add(packed.len())?;
+        copy_mapped_bytes(&mut packed, mapped.get(start..end)?);
+    } else {
+        for (row, destination) in packed.chunks_exact_mut(row_bytes).enumerate() {
+            let start = (region.y as usize)
+                .checked_add(row)?
+                .checked_mul(row_pitch)?
+                .checked_add((region.x as usize).checked_mul(4)?)?;
+            copy_mapped_bytes(
+                destination,
+                mapped.get(start..start.checked_add(row_bytes)?)?,
+            );
+        }
+    }
+    let opaque = request.format == CaptureFormat::Xrgb8888;
+    if swap || opaque {
+        for pixel in packed.chunks_exact_mut(4) {
+            if swap {
+                pixel.swap(0, 2);
+            }
+            if opaque {
+                pixel[3] = 255;
+            }
+        }
+    }
+    Some(packed)
 }
 
 fn overlay_cursor(target: &mut [u8], extent: (u32, u32), cursor: &CaptureCursorSnapshot) {
@@ -3283,6 +3439,65 @@ fn fail_requests(requests: &[CaptureRequest], reporter: Option<&CaptureCompletio
     }
 }
 
+/// Read a GPU staging mapping into ordinary CPU memory. On x86-64, libc's
+/// large-copy REP MOVSB path can be very slow for write-combining mappings.
+/// MOVNTDQA reads complete streaming lines instead; stores remain cached for
+/// the immediately following channel conversion. Other CPUs retain memcpy.
+/// See Intel SDM, MOVNTDQA, and Rust's _mm_stream_load_si128 documentation.
+fn copy_mapped_bytes(destination: &mut [u8], source: &[u8]) {
+    assert_eq!(destination.len(), source.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: runtime feature check; equal-length disjoint Rust slices
+        // provide valid memory for all loads/stores. The helper aligns loads.
+        unsafe {
+            copy_mapped_bytes_sse41(destination.as_mut_ptr(), source.as_ptr(), source.len());
+        }
+        return;
+    }
+    destination.copy_from_slice(source);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn copy_mapped_bytes_sse41(destination: *mut u8, source: *const u8, len: usize) {
+    use std::arch::x86_64::{__m128i, _mm_mfence, _mm_storeu_si128, _mm_stream_load_si128};
+    // SAFETY: caller guarantees nonoverlapping live slices of len bytes and
+    // SSE4.1. Streaming loads require 16-byte source alignment; prefix/tail
+    // accesses remain strictly inside the supplied range. Stores may be
+    // unaligned. Fences order WC streaming loads with accesses outside this
+    // function; the completed wgpu map owns GPU/CPU synchronisation.
+    unsafe {
+        _mm_mfence();
+        let mut offset = 0;
+        while offset < len && (source.add(offset) as usize) & 15 != 0 {
+            destination.add(offset).write(source.add(offset).read());
+            offset += 1;
+        }
+        while len - offset >= 64 {
+            let a = _mm_stream_load_si128(source.add(offset).cast::<__m128i>());
+            let b = _mm_stream_load_si128(source.add(offset + 16).cast::<__m128i>());
+            let c = _mm_stream_load_si128(source.add(offset + 32).cast::<__m128i>());
+            let d = _mm_stream_load_si128(source.add(offset + 48).cast::<__m128i>());
+            _mm_storeu_si128(destination.add(offset).cast::<__m128i>(), a);
+            _mm_storeu_si128(destination.add(offset + 16).cast::<__m128i>(), b);
+            _mm_storeu_si128(destination.add(offset + 32).cast::<__m128i>(), c);
+            _mm_storeu_si128(destination.add(offset + 48).cast::<__m128i>(), d);
+            offset += 64;
+        }
+        while len - offset >= 16 {
+            let value = _mm_stream_load_si128(source.add(offset).cast::<__m128i>());
+            _mm_storeu_si128(destination.add(offset).cast::<__m128i>(), value);
+            offset += 16;
+        }
+        while offset < len {
+            destination.add(offset).write(source.add(offset).read());
+            offset += 1;
+        }
+        _mm_mfence();
+    }
+}
+
 fn normalise_mapped_output(
     mapped: &[u8],
     row_pitch: usize,
@@ -3318,11 +3533,11 @@ fn normalise_mapped_output(
         // Transfer rows in bulk first, then swizzle only CPU-owned memory.
         let row_bytes = (width as usize).checked_mul(4)?;
         if row_pitch == row_bytes {
-            rgba.copy_from_slice(mapped.get(..byte_count)?);
+            copy_mapped_bytes(&mut rgba, mapped.get(..byte_count)?);
         } else {
             for (y, row) in rgba.chunks_exact_mut(row_bytes).enumerate() {
                 let start = y.checked_mul(row_pitch)?;
-                row.copy_from_slice(mapped.get(start..start.checked_add(row_bytes)?)?);
+                copy_mapped_bytes(row, mapped.get(start..start.checked_add(row_bytes)?)?);
             }
         }
         if bgra {
@@ -3437,6 +3652,39 @@ pub(crate) struct PngCaptureService {
 
 #[cfg(feature = "frame-capture")]
 impl PngCaptureService {
+    fn has_render_demand(&self, source: &CaptureSourceId, now: Instant) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|admission| {
+                let matches = match (&admission.request.target, source) {
+                    (PngCaptureTarget::Nested, CaptureSourceId::Nested { .. }) => true,
+                    (PngCaptureTarget::Kms { source_id, .. }, _) => source_id == source,
+                    _ => false,
+                };
+                matches && admission.deadline > now && !admission.finished.load(Ordering::Acquire)
+            })
+    }
+
+    fn retire_invalid(&self, now: Instant) {
+        let retired = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extract_if(.., |admission| {
+                admission.deadline <= now || admission.finished.load(Ordering::Acquire)
+            })
+            .collect::<Vec<_>>();
+        for admission in retired {
+            admission.fail(
+                admission
+                    .readiness_reason
+                    .unwrap_or("queued-deadline-expired"),
+            );
+        }
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.batch_in_flight.load(Ordering::Acquire)
     }
@@ -3570,6 +3818,36 @@ fn publish_png(rgba: &[u8], size: (u32, u32), request: PngCaptureAdmission) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_copy_preserves_alignment_tails_and_destination_guards() {
+        let source: Vec<u8> = (0..512).map(|i| ((i * 37 + 19) % 251) as u8).collect();
+        for source_offset in 0..32 {
+            for destination_offset in 0..32 {
+                for len in [0, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 255] {
+                    let mut destination = vec![0xa5; 320];
+                    super::copy_mapped_bytes(
+                        &mut destination[destination_offset..destination_offset + len],
+                        &source[source_offset..source_offset + len],
+                    );
+                    assert_eq!(
+                        &destination[destination_offset..destination_offset + len],
+                        &source[source_offset..source_offset + len],
+                        "source offset={source_offset}, destination offset={destination_offset}, len={len}"
+                    );
+                    assert!(
+                        destination[..destination_offset]
+                            .iter()
+                            .all(|byte| *byte == 0xa5)
+                    );
+                    assert!(
+                        destination[destination_offset + len..]
+                            .iter()
+                            .all(|byte| *byte == 0xa5)
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     use bevy::{
@@ -3700,6 +3978,72 @@ mod tests {
             reservation: CaptureReservationLease::detached(CaptureId(1)),
             deadline: Instant::now() + crate::protocol::CAPTURE_REQUEST_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn direct_shm_pack_matches_general_path_for_formats_crops_and_padding() {
+        for format in [
+            TextureFormat::Bgra8Unorm,
+            TextureFormat::Bgra8UnormSrgb,
+            TextureFormat::Rgba8Unorm,
+            TextureFormat::Rgba8UnormSrgb,
+        ] {
+            for pitch in [12, 20] {
+                let mut mapped = vec![0xee; pitch * 2];
+                mapped[..12].copy_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]);
+                mapped[pitch..pitch + 12]
+                    .copy_from_slice(&[11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111, 121]);
+                let rgba = normalise_mapped_output(
+                    &mapped,
+                    pitch,
+                    (3, 2),
+                    format,
+                    smithay::utils::Transform::Normal,
+                )
+                .unwrap();
+                for wire in [CaptureFormat::Argb8888, CaptureFormat::Xrgb8888] {
+                    for region in [
+                        CaptureRegion {
+                            x: 0,
+                            y: 0,
+                            width: 3,
+                            height: 2,
+                        },
+                        CaptureRegion {
+                            x: 1,
+                            y: 0,
+                            width: 2,
+                            height: 2,
+                        },
+                        CaptureRegion {
+                            x: 0,
+                            y: 1,
+                            width: 3,
+                            height: 1,
+                        },
+                    ] {
+                        let mut request = request(smithay::utils::Transform::Normal);
+                        request.displayed_physical_extent = (3, 2);
+                        request.source_storage_extent = (3, 2);
+                        request.region = region;
+                        request.format = wire;
+                        assert_eq!(
+                            pack_mapped_capture(&mapped, pitch, format, &request),
+                            convert_capture(&rgba, &request)
+                        );
+                        assert!(
+                            pack_mapped_capture(&mapped[..pitch + 11], pitch, format, &request)
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        }
+        let mut request = request(smithay::utils::Transform::_90);
+        assert!(pack_mapped_capture(&[0; 8], 8, TextureFormat::Bgra8Unorm, &request).is_none());
+        request.transform = smithay::utils::Transform::Normal;
+        request.region.x = 1;
+        assert!(pack_mapped_capture(&[0; 8], 8, TextureFormat::Bgra8Unorm, &request).is_none());
     }
 
     #[test]
@@ -3896,6 +4240,192 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn capture_demand_is_source_bound_live_and_non_consuming() {
+        let batch = CaptureReadbackBatch::default();
+        let mut capture = request(smithay::utils::Transform::Normal);
+        let source = CaptureSourceId::Kms {
+            key: crate::backend::kms::OutputKey {
+                device: 1,
+                connector_name: "HDMI-A-1".into(),
+            },
+            generation: 7,
+        };
+        capture.source_id = source.clone();
+        capture.generation = 7;
+        let deadline = capture.deadline;
+        let cancellation = capture.cancellation.clone();
+        let releases = Arc::new(AtomicUsize::new(0));
+        capture.reservation = CaptureReservationLease::counted(capture.id, releases.clone());
+        batch.0.lock().unwrap().push(capture);
+        for _ in 0..3 {
+            assert!(batch.has_render_demand(&source, deadline - Duration::from_nanos(1)));
+            assert!(!batch.has_render_demand(&source, deadline));
+            assert_eq!(batch.0.lock().unwrap()[0].deadline, deadline);
+            assert_eq!(releases.load(Ordering::Acquire), 0);
+        }
+        let mut stale = source.clone();
+        if let CaptureSourceId::Kms { generation, .. } = &mut stale {
+            *generation = 8;
+        }
+        assert!(!batch.has_render_demand(&stale, Instant::now()));
+        assert!(!batch.has_render_demand(
+            &CaptureSourceId::Nested {
+                output_name: "nested".into()
+            },
+            Instant::now(),
+        ));
+        cancellation.cancel();
+        assert!(!batch.has_render_demand(&source, Instant::now()));
+        assert_eq!(batch.0.lock().unwrap().len(), 1);
+        batch.retire_invalid(Instant::now(), None);
+        batch.retire_invalid(Instant::now(), None);
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn main_only_capture_retirement_reports_once_and_preserves_live_admissions() {
+        let (_events, feed) = ClientSceneFeed::test_channel();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<RequestRedraw>()
+            .insert_resource(feed.capture_completion_reporter())
+            .add_plugins(CaptureServicePlugin);
+        assert!(app.get_sub_app(RenderApp).is_none());
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut expired = request(smithay::utils::Transform::Normal);
+        expired.deadline = Instant::now();
+        expired.reservation = CaptureReservationLease::counted(expired.id, releases.clone());
+        let mut cancelled = request(smithay::utils::Transform::Normal);
+        cancelled.id = CaptureId(2);
+        cancelled.cancellation.cancel();
+        cancelled.reservation = CaptureReservationLease::counted(cancelled.id, releases.clone());
+        let mut live = request(smithay::utils::Transform::Normal);
+        live.id = CaptureId(3);
+        let deadline = live.deadline;
+        let batch = app.world().resource::<CaptureReadbackBatch>().clone();
+        batch.0.lock().unwrap().extend([expired, cancelled, live]);
+        for _ in 0..3 {
+            app.main_mut().run_default_schedule();
+            app.world_mut().clear_trackers();
+            let pending = batch.0.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, CaptureId(3));
+            assert_eq!(pending[0].deadline, deadline);
+        }
+        assert_eq!(releases.load(Ordering::Acquire), 2);
+        assert_eq!(
+            feed.capture_outcomes_for_test(),
+            vec![crate::protocol::CaptureTestOutcome::Failed(CaptureId(1)),]
+        );
+    }
+
+    #[test]
+    fn capture_damage_watch_waits_without_render_demand_then_admits_damage() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<RequestRedraw>()
+            .add_plugins(CaptureServicePlugin);
+        app.world_mut().resource_mut::<CaptureRendererAvailable>().0 = true;
+        let damage = app.world().resource::<OutputDamageJournal>().clone();
+        let mut capture = request(smithay::utils::Transform::Normal);
+        damage.register(
+            capture.source_id.clone(),
+            capture.logical_rect,
+            capture.source_storage_extent,
+            capture.displayed_physical_extent,
+            capture.scale120,
+            capture.transform,
+        );
+        capture.with_damage = true;
+        capture.damage_baseline = Some(
+            damage
+                .snapshot(
+                    &capture.source_id,
+                    None,
+                    capture.overlay_cursor,
+                    capture.region,
+                )
+                .0,
+        );
+        let source = capture.source_id.clone();
+        app.world_mut().resource_mut::<CaptureQueue>().push(capture);
+        for _ in 0..3 {
+            app.update();
+            assert_eq!(app.world().resource::<CaptureDamageWatches>().0.len(), 1);
+            assert!(
+                !app.world()
+                    .resource::<CaptureReadbackBatch>()
+                    .has_render_demand(&source, Instant::now())
+            );
+        }
+        damage.mark_all_base_full();
+        app.update();
+        assert!(app.world().resource::<CaptureDamageWatches>().0.is_empty());
+        assert!(
+            app.world()
+                .resource::<CaptureReadbackBatch>()
+                .has_render_demand(&source, Instant::now())
+        );
+    }
+
+    #[cfg(feature = "frame-capture")]
+    #[test]
+    fn png_capture_demand_excludes_completion_and_main_retires_deferred_admission() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<RequestRedraw>()
+            .add_plugins(CaptureServicePlugin);
+        let service = app.world().resource::<PngCaptureService>().clone();
+        let source = CaptureSourceId::Kms {
+            key: crate::backend::kms::OutputKey {
+                device: 1,
+                connector_name: "HDMI-A-1".into(),
+            },
+            generation: 7,
+        };
+        let request = PngCaptureRequest {
+            target: PngCaptureTarget::Kms {
+                source_id: source.clone(),
+                output_name: "HDMI-A-1".into(),
+            },
+            cursor: None,
+            final_path: "capture.png".into(),
+            temporary_path: "capture.tmp".into(),
+        };
+        assert!(service.submit_batch(vec![request]));
+        assert!(service.has_render_demand(&source, Instant::now()));
+        let mut stale = source.clone();
+        if let CaptureSourceId::Kms { generation, .. } = &mut stale {
+            *generation = 8;
+        }
+        assert!(!service.has_render_demand(&stale, Instant::now()));
+        let mut admission = service.queue.lock().unwrap().pop().unwrap();
+        assert!(!service.has_render_demand(&source, Instant::now()));
+        assert!(service.busy(), "submitted work still owns the batch slot");
+        app.update();
+        assert!(
+            service.busy(),
+            "Main must not complete a worker-owned admission"
+        );
+        let now = Instant::now();
+        admission.deadline = now + Duration::from_secs(1);
+        let deadline = admission.deadline;
+        let finished = admission.finished.clone();
+        let remaining = admission.batch_remaining.clone();
+        service.defer_unready(vec![admission], now, "kms-frame-token-unavailable");
+        assert!(service.has_render_demand(&source, deadline - Duration::from_nanos(1)));
+        assert!(!service.has_render_demand(&source, deadline));
+        service.queue.lock().unwrap()[0].deadline = Instant::now();
+        for _ in 0..3 {
+            app.main_mut().run_default_schedule();
+        }
+        assert!(!service.busy());
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
+        assert!(service.queue.lock().unwrap().is_empty());
     }
 
     #[test]

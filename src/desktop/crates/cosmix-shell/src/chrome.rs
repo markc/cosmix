@@ -1055,14 +1055,20 @@ fn present_panels(
 ) {
     for (chrome, parts, mut node, mut transform) in &mut queries.panels {
         let panel = frame.0.panel(chrome.edge);
-        node.display = if panel.mapped {
+        let display = if panel.mapped {
             Display::Flex
         } else {
             Display::None
         };
+        if node.display != display {
+            node.display = display;
+        }
         for control in &parts.controls {
             if let Ok(mut tab_index) = queries.tab_indices.get_mut(*control) {
-                tab_index.0 = if panel.mapped { 0 } else { -1 };
+                let index = if panel.mapped { 0 } else { -1 };
+                if tab_index.0 != index {
+                    tab_index.0 = index;
+                }
             }
             let disabled = queries.disabled_controls.get(*control).unwrap_or(false);
             if panel.mapped && disabled {
@@ -1089,18 +1095,24 @@ fn present_panels(
         } else {
             0.0
         };
-        transform.translation = match chrome.edge {
+        let translation = match chrome.edge {
             Edge::Left => Val2::new(px(-hidden), px(0)),
             Edge::Bottom => Val2::new(px(0), px(hidden)),
             Edge::Right => Val2::new(px(hidden), px(0)),
             Edge::Top => Val2::new(px(0), px(-hidden)),
         };
+        if transform.translation != translation {
+            transform.translation = translation;
+        }
         if let Ok(mut label) = queries.labels.get_mut(parts.pin_label) {
-            label.0 = if panel.mode == PanelMode::Pinned {
-                "◆".to_owned()
+            let text = if panel.mode == PanelMode::Pinned {
+                "◆"
             } else {
-                "◇".to_owned()
+                "◇"
             };
+            if label.0 != text {
+                label.0 = text.to_owned();
+            }
         }
         if let Some(title) = panel.active_page_id.as_deref().and_then(|active| {
             parts
@@ -1108,25 +1120,32 @@ fn present_panels(
                 .iter()
                 .find_map(|(id, title)| (id == active).then_some(title))
         }) && let Ok(mut label) = queries.labels.get_mut(parts.title_label)
+            && label.0 != *title
         {
             label.0.clone_from(title);
         }
         for (id, entity) in &parts.page_wrappers {
             if let Ok(mut page_node) = queries.nodes.get_mut(*entity) {
-                page_node.display = if panel.active_page_id.as_deref() == Some(id) {
+                let display = if panel.active_page_id.as_deref() == Some(id) {
                     Display::Flex
                 } else {
                     Display::None
                 };
+                if page_node.display != display {
+                    page_node.display = display;
+                }
             }
         }
         for (id, entity) in &parts.dot_labels {
             if let Ok(mut label) = queries.labels.get_mut(*entity) {
-                label.0 = if panel.active_page_id.as_deref() == Some(id) {
-                    "●".to_owned()
+                let text = if panel.active_page_id.as_deref() == Some(id) {
+                    "●"
                 } else {
-                    "○".to_owned()
+                    "○"
                 };
+                if label.0 != text {
+                    label.0 = text.to_owned();
+                }
             }
         }
     }
@@ -1575,6 +1594,129 @@ mod tests {
                 actual: vec!["other".to_owned()],
             }
         );
+    }
+
+    #[test]
+    fn repeated_panel_frame_preserves_change_ticks_but_real_updates_propagate() {
+        let registry = QuoinPageRegistry::new(
+            vec![spec("nav"), spec("places")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut frame = frame_for(&registry);
+        frame.panels[Edge::Left.index()].mapped = true;
+        frame.panels[Edge::Left.index()].mode = PanelMode::Revealed;
+        let mut world = World::new();
+        let pin = world.spawn(Text::new("")).id();
+        let title = world.spawn(Text::new("")).id();
+        let nav_dot = world.spawn(Text::new("")).id();
+        let places_dot = world.spawn(Text::new("")).id();
+        let nav_page = world.spawn(Node::default()).id();
+        let places_page = world.spawn(Node::default()).id();
+        let control = world.spawn(TabIndex(-1)).id();
+        let panel = world
+            .spawn((
+                QuoinPanelChrome {
+                    edge: Edge::Left,
+                    motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+                    pointer_ownership: QuoinPointerOwnership::NativeSurface,
+                },
+                QuoinPanelParts {
+                    pin_label: pin,
+                    title_label: title,
+                    page_titles: vec![
+                        ("nav".into(), "Navigation".into()),
+                        ("places".into(), "Places".into()),
+                    ],
+                    page_wrappers: vec![("nav".into(), nav_page), ("places".into(), places_page)],
+                    dot_labels: vec![("nav".into(), nav_dot), ("places".into(), places_dot)],
+                    controls: vec![control],
+                },
+                Node::default(),
+                UiTransform::default(),
+            ))
+            .id();
+        world.insert_resource(ShellFrameState(frame));
+        world.insert_resource(InputFocus::default());
+        world.insert_resource(QuoinCommittedMotionModes::hidden());
+        world.run_system_once(present_panels).unwrap();
+        world.clear_trackers();
+        world.run_system_once(present_panels).unwrap();
+        for entity in [pin, title, nav_dot, places_dot] {
+            assert!(!world.entity(entity).get_ref::<Text>().unwrap().is_changed());
+        }
+        for entity in [panel, nav_page, places_page] {
+            assert!(!world.entity(entity).get_ref::<Node>().unwrap().is_changed());
+        }
+        assert!(
+            !world
+                .entity(panel)
+                .get_ref::<UiTransform>()
+                .unwrap()
+                .is_changed()
+        );
+        assert!(
+            !world
+                .entity(control)
+                .get_ref::<TabIndex>()
+                .unwrap()
+                .is_changed()
+        );
+
+        // Pin and carousel changes must still reach the existing entities.
+        {
+            let mut frame = world.resource_mut::<ShellFrameState>();
+            let left = &mut frame.0.panels[Edge::Left.index()];
+            left.mode = PanelMode::Pinned;
+            left.active_page_id = Some("places".into());
+        }
+        world.run_system_once(present_panels).unwrap();
+        for entity in [pin, title, nav_dot, places_dot] {
+            assert!(world.entity(entity).get_ref::<Text>().unwrap().is_changed());
+        }
+        assert_eq!(world.get::<Text>(pin).unwrap().0, "◆");
+        assert_eq!(world.get::<Text>(title).unwrap().0, "Places");
+        assert_eq!(world.get::<Node>(nav_page).unwrap().display, Display::None);
+        assert_eq!(
+            world.get::<Node>(places_page).unwrap().display,
+            Display::Flex
+        );
+        assert!(
+            world
+                .entity(nav_page)
+                .get_ref::<Node>()
+                .unwrap()
+                .is_changed()
+        );
+        assert!(
+            world
+                .entity(places_page)
+                .get_ref::<Node>()
+                .unwrap()
+                .is_changed()
+        );
+
+        world.clear_trackers();
+        {
+            let mut frame = world.resource_mut::<ShellFrameState>();
+            let left = &mut frame.0.panels[Edge::Left.index()];
+            left.mode = PanelMode::Hidden;
+            left.mapped = false;
+        }
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(world.get::<Node>(panel).unwrap().display, Display::None);
+        assert!(world.entity(panel).get_ref::<Node>().unwrap().is_changed());
+        assert_eq!(world.get::<TabIndex>(control).unwrap().0, -1);
+        assert!(
+            world
+                .entity(control)
+                .get_ref::<TabIndex>()
+                .unwrap()
+                .is_changed()
+        );
+        assert!(world.get::<InteractionDisabled>(control).is_some());
     }
 
     #[test]

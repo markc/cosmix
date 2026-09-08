@@ -5,6 +5,8 @@
 
 use crate::core::Edge;
 use crate::runtime::{HostGeometry, ShellFrame, WakePolicy};
+mod layout;
+pub use layout::{PanelLayout, PanelRect, panel_layout};
 
 /// Presentation host for one output's four panel mounts.
 pub trait ShellHost {

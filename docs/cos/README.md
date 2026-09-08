@@ -27,7 +27,10 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[indexd](indexd.md)** — vector knowledge base / indexer.
 - **[desktop](desktop.md)** — the CosMix desktop: `cosmix-comp` (Smithay + Bevy Wayland compositor), the `ctk` toolkit and the native apps.
 - **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
-- **[quoin](quoin.md)** — four-edge layer-shell desktop furniture hosted through SCTK.
+- **[quoin](quoin.md)** — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.
+- **[cosmix-bg-showcase](cosmix-bg-showcase.md)** — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.
+- **[cosmix-capture](cosmix-capture.md)** — native Wayland screenshots and full-output MP4 recording controlled through Bus.
+- **[cosmix-wallpaper](cosmix-wallpaper.md)** — GPU-rendered flocking background with window avoidance, pointer repulsion and native Bus preferences.
 - **[agentd](agentd.md)** — agent supervision.
 - **[powerd](powerd.md)** — event-driven UPower battery and power state.
 - **[mprisd](mprisd.md)** — event-driven MPRIS2 media-player state and delegated controls.

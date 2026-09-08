@@ -4,7 +4,36 @@
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.
 
+## Optional F9 Bus action
+
+`--f9-bus <service> <verb>` arms an unmodified F9 press to send a native ABP
+request with an empty argument object to a local Bus service. For example,
+`--f9-bus bg-showcase boing.kick` connects the compositor key to the Boing
+scene's physical impulse. Both nested and live KMS input use this binding;
+the background surface keeps keyboard interactivity disabled. In a nested
+session the compositor's host window must have focus.
+
+The binding is absent unless explicitly configured, honours
+`--no-keybindings`, and does not run while the session is locked. A held key
+fires once until released. Delivery runs on a bounded worker, so waiting for
+the service cannot stall keyboard input. Failed requests are logged and never
+automatically retried. `--list-bindings --f9-bus <service> <verb>` includes the
+armed binding. The flag requires a build with Bus support.
+
+For small nested scene previews, `COSMIX_COMP_SERIAL_SCHEDULES=1` selects
+single-threaded ECS schedule execution to reduce dispatch overhead. This is an
+opt-in performance experiment; normal compositor scheduling is unchanged.
+
 ## Window switching and X11 placement
+
+Comp 0.51.0 includes an opt-in `native-quoin` feature. Together with
+`COSMIX_COMP_HUD_PROBE=1` and `COSMIX_COMP_NATIVE_QUOIN=1`, this embeds Quoin's
+real panels alongside native Boing in the compositor renderer. Application
+windows remain Wayland clients; their existing server-side decorations,
+caption actions and interactive move/resize handling remain in comp.
+Pinned native panels reserve usable space for maximised windows. See
+[Quoin's compositor host](quoin.md#experimental-compositor-host) for scope and
+remaining acceptance work.
 
 Alt+Tab cycles forward and Alt+Shift+Tab cycles backward through mapped,
 non-minimised managed windows in stable creation order. This is not an MRU
@@ -45,7 +74,7 @@ instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid `from`
 with Bus rc 10.
 
-The control plane exposes seven verbs:
+The control plane exposes eight verbs:
 
 - `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
 - `comp.info` returns service/build/backend provenance plus output and surface
@@ -62,12 +91,17 @@ The control plane exposes seven verbs:
   the name this compositor instance actually registered. The reply is truthful
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
-- `comp.props.set {path,value}` mutates one of the five mutable leaves (the
-  four corner properties plus `xwayland.enabled`) and returns
+- `comp.props.set {path,value}` mutates the four corner properties,
+  `windows.s<id>.band`, or `xwayland.enabled` and returns
   `{path,old,new}`; for the file-persisted `xwayland.enabled` the reply also
   carries `persisted` — `false` means the in-memory change and the changed
   event stand but the write to disk failed and the value will not survive
   restart.
+- `comp.pointer.watch` renews a three-second local pointer observation lease
+  and returns `{version:1,topic:"<service>.pointer.changed",lease_ms:3000}`.
+  Subscribe before calling; renew about once per second while observation is
+  wanted. This verb uses the same broker-proven local caller requirement as
+  property writes. The acknowledgement contains no pointer coordinates.
 
 The complete L2 read tree is:
 
@@ -80,7 +114,7 @@ surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 maximized,minimized,decoration,
                 layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
-               maximized,minimized,output}
+               maximized,minimized,output,band}
 stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
 decoration.{enabled,style}
@@ -104,6 +138,14 @@ sequence watermark across every topic, and `port.lost_count` is cumulative.
 `retrying`. `port.reply_timeouts` and `port.publish_timeouts` count their
 separate bounded lanes; both abandon a sink wait after two seconds.
 
+Window band writes accept `bottom` or `normal`. They move the complete window
+tree, including popups, behind normal windows or back into their normal band.
+Assignments last for the current session. Use the canonical ID returned by
+`comp.props.get`; aliases with leading zeroes are rejected. Other bands remain
+reserved for layer-shell and session-lock roles. Corner activation takes
+priority over client pointer constraints; reactivation waits for physical
+pointer motion out of the corner.
+
 The compositor publishes non-retained messages under the registered service
 namespace. The seat instance therefore uses `comp.*`, the default nested
 instance uses `comp-nested.*`, and `--bus-service NAME` moves the complete
@@ -120,6 +162,7 @@ below, so handlers do not depend on the instance name.
 | `<service>.corner.entered` | `corner.entered` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.left` | `corner.left` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.clicked` | `corner.clicked` | `{output,corner,dwell_ms,event_seq}` |
+| `<service>.pointer.changed` | `pointer.changed` | `{version:1,instance,output,position,valid,timestamp_ms,event_seq}` |
 
 `corner.clicked` observes a left-button press while a corner is engaged, carrying
 the same engagement dwell as entered/left. It does not consume the button event;
@@ -146,7 +189,7 @@ row path with `old:null,new:<full row>`, and removal emits the inverse.
 Mutations within an existing row remain leaf-granular.
 
 The sequence is process-global, strictly increasing and shared by property,
-surface, focus, output and corner records. If it reaches `u64::MAX`, that value
+surface, focus, output, corner and pointer records. If it reaches `u64::MAX`, that value
 is offered once and observation enters a terminal exhausted state rather than
 reusing a sequence. The outbox is one bounded 256-entry lane. On overflow the
 producer evicts one oldest record in fixed time and carries that record's loss
@@ -166,6 +209,120 @@ same ordering rule with `cause:"publisher.loss"`. A failed pending gap retries
 immediately on broker connection-state edges and on a single one-shot backoff
 timer (1 second, doubling to a 30-second cap); that timer exists only while the
 gap remains pending. After either gap, read a fresh property tree.
+
+Pointer observation reads the latest cursor state after protocol dispatch,
+with at least 34 ms between samples. Input handlers do not serialize or wait
+for the Bus. Renewing a lease requests a fresh sample even if the pointer is
+stationary; expiry leaves no publication timer or motion history. Multiple
+local observers share the bounded lease and publication lane.
+
+Valid samples contain the output's advertised name and `position:{x,y}` in
+output-local logical pixels. `timestamp_ms` is monotonic elapsed time within
+the compositor instance, not wall-clock time. Locking, pausing the KMS session,
+leaving the output or an invalid position produces
+`valid:false,output:null,position:null`. Retained client output globals do not
+keep a paused session's pointer valid. Pause and resume request fresh samples
+within the existing rate limit even when coordinates stay unchanged. No key
+or button data is included. These transient events are not retained by comp.
+
+Noded reserves `<service>.pointer.changed` publication to its registered owner
+and stamps `broker_service` on reserved event deliveries. Local consumers
+must check that stamp and `broker_origin:local`, plus instance and sequence;
+a topic header alone is not proof of publication. Keep only the latest
+sample, clear stale samples on disconnection/lock, and advance the snapshot
+fence when output geometry changes. Watch acknowledgements and samples may
+arrive in either order over separate connections; keep a bounded early sample
+with its receipt time until acknowledgement. A filtered global sequence need
+not be consecutive.
+
+The desktop's calloop 0.14 channel patch prevents unrelated child-source
+tokens from generating new wakeups. This fixes a session-management busy loop
+in the deferred libseat notifier; an inactive VT should wait for genuine
+session/input/control events rather than occupy a CPU core.
+
+Cursor projection compares resolved materials, transforms and visibility before
+writing them. Unchanged built-in and SHM client cursors therefore avoid repeated
+render-asset updates; new client content still invalidates its material binding
+when the image handle is reused. DMA-BUF cursors retain per-update material
+rebinding while their import owner reports pending render work. Live client-content
+rendering can skip unchanged frames; active-VT CPU costs still require measurement.
+
+The renderer also retains a protocol/cursor/asset/component scene revision independently of
+capture subscriptions. KMS binds the extracted revision to an acquired frame
+and reports it with a successful presentation; later scene changes cannot
+relabel a retained frame. Idle admission combines this revision with asynchronous
+asset/pipeline readiness and output lifecycle checks.
+
+Main-world observers run after the standard `Last` schedule for installed image,
+mesh, 2D material, shader and font assets. They track direct resource changes and
+read asset events independently of Bevy's renderer. Late edits and their delayed
+events each advance the revision; quiet asset maintenance does not. Bare asset
+stores are observed without replacing them or requiring an event plugin. This
+records demand, not GPU readiness or arbitrary component changes. Event-bearing
+turns require extraction before messages expire.
+
+The same post-Main observation schedule tracks the installed 2D scene's transform,
+visibility, sprite, mesh/material binding, text layout/style and camera components.
+Additions, changes, removals and despawns advance demand without consuming the
+renderer’s removal notifications. This catches layout completion using glyphs
+already present in an atlas. The observers run on one thread because they share
+the revision writer. Camera and projection observers compare their rendered
+values, so target-refresh bookkeeping does not perpetually demand another frame.
+Global clear-colour changes also advance demand. New render features must extend
+the component inventory.
+
+An idle turn still runs Main, including input, protocol, layout and capture
+maintenance. It skips extraction and rendering only for a ready output whose
+known scene revision matches a settled, genuinely presented frame. Pending
+render commands, acquired frames, capture/security presentations, DMA-BUF work
+or quiescence prevent idle. Checking queued commands retains them in their owner
+for normal processing or teardown. First-light animation and enabled diagnostic
+capture/DMA-BUF probes keep full rendering. Idle services the device-error hook,
+nonblocking device polling and Bevy's time handoff without acquiring another frame.
+
+Live KMS readiness carries the output key and generation through startup and
+resume. Both supervisors validate each complete frame-event batch against that
+identity before watchdog, telemetry, security acknowledgement or callback effects.
+A stale submission or cancellation therefore cannot renew output health or
+acknowledge another output's presentation. Terminal render failures retain their
+existing handling. Update requests also carry a sequence starting at one for
+each ready generation. The renderer rejects stale or skipped requests; both
+supervisors and pause reconciliation require the reply to match the exact
+outstanding request. Reports distinguish a full Main/extract/render pass, with
+its demand revision sampled after Main, from proven idle and lifecycle maintenance.
+Neither maintenance nor an empty frame-event batch certifies healthy idle or
+relaxes the submission watchdog.
+
+Each active renderer update has its own two-second response deadline. The
+coordinator waits against the earlier response or submission deadline; silent or
+late updates cannot pulse clients or acknowledge security presentation. A timely
+empty response does not extend the frame-submission budget. A response timeout
+has the distinct `kms-live-update-response-timeout` diagnostic. Validated idle
+suspends the submission requirement while keeping response checks active. New
+demand starts a fixed submission deadline that further empty replies cannot
+postpone. Idle waits use the interruptible coordinator mailbox at nominal output
+refresh cadence; callbacks occur at most once per interval. Idle does not count
+as a submitted frame or acknowledge security presentation. Registration, resume
+scene draining and transition budgets are unchanged.
+
+GPU asset preparation has a separate internal snapshot. It observes extracted
+image, mesh and installed 2D material IDs without consuming Bevy's queues, and
+retains pending replacements/removals until preparation reflects them. Successful
+KMS frame reports include the post-preparation snapshot. Retry work cannot look
+complete merely because no new extraction arrived. Pipeline compilation,
+DMA-BUF ownership and the final idle-admission decision remain separate.
+
+Pipeline settlement is sampled after drawing and capture, before presentation.
+One additional queue-processing pass exposes newly queued pipelines and completed
+asynchronous compilation; missing shaders/imports remain pending, while permanent
+shader errors are reported separately. New entries or pipelines becoming ready
+after drawing are flagged as requiring a later rendered frame. The snapshot is
+attached only to successful KMS presentation and is cleared during output teardown.
+This pass can start compilation and adds preparation cost; synchronous mode can
+compile within the call. It does not loop until pipelines settle or prove every
+intended draw was submitted. An independent 30-second settlement deadline prevents
+fallback presentations from indefinitely hiding pending assets or pipelines.
+The budget resets for a replacement output generation after resume.
 
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry
@@ -344,6 +501,19 @@ depends on the client's grab-break handling.
 
 ## Screen capture
 
+SHM publication copies bounded chunks while continuing to dispatch clients.
+Queued chunks keep the protocol loop runnable: they never wait for unrelated
+input or surface commits between copies. Once publication finishes or is
+cancelled, the loop resumes its normal blocking wait.
+On x86-64 CPUs with SSE4.1, unrotated GPU readback uses aligned streaming loads
+into cached CPU memory to avoid slow generic copies from write-combining
+mappings. Other CPUs retain the portable copy path.
+Capture reservations account for source, staging and converted pixel storage.
+They are capped at 512 MiB per client and 1 GiB globally, allowing three
+active full 4K SHM captures plus one retiring request per client. Request
+count caps remain four per client and eight globally. This bounded memory
+allowance overlaps readback latency without bypassing reservation accounting.
+
 Arc 4 provides `wlr-screencopy-unstable-v1` output capture for existing
 clients such as `grim`. A frame advertises one opaque `XRGB8888` shared-memory
 layout with an exact `width * 4` stride. Whole-output and logically clipped
@@ -418,6 +588,14 @@ the lease remains with the cancellable map job. Admission also requests a redraw
 copy is presented even when the output has no animation or other damage. Every
 admitted copy has a five-second absolute request deadline: this is a deadline on
 that one client operation, not a periodic compositor timer.
+
+Main-world maintenance retires expired or cancelled admissions before rendering,
+including PNG requests deferred for output readiness. It preserves live requests
+and their original deadlines, and leaves submitted jobs with their completion
+workers. Read-only demand checks match the capture source and KMS generation;
+waiting for damage or holding a PNG completion slot does not by itself require a
+render. The nested redirection path uses these checks to avoid preparing a target
+for stale work; live KMS idle admission uses the same non-consuming checks.
 
 Completion does not depend on a later render tick. The retirement worker sends
 its result directly through the calloop-backed protocol command channel, which

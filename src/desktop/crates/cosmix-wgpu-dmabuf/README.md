@@ -69,6 +69,14 @@ may temporarily have no `GpuImage`; that defers import rather than removing the
 registration. Unmap, destruction, or switching away from DMA-BUF explicitly
 unregisters it and retires the final buffer.
 
+`ImportedDmabufImages::has_pending_render_work()` provides a non-consuming
+snapshot of pending imports, image installation, backing retirement and probes.
+Retained `Applied` images and retirement references still needed by active uses
+do not force another render update. The query neither changes ownership nor
+fires release callbacks. A renderer must also check its own asset preparation,
+pipelines, scene damage and output lifecycle, and query again after admitting
+new main-world work; a false result alone does not certify whole-renderer idle.
+
 Current scope is alpha-bearing ARGB/ABGR desktop surfaces. XRGB is deliberately
 not advertised because Bevy's alpha-blended sprite path cannot force its
 undefined X channel opaque without a separate sampling pipeline. Multi-planar

@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use bevy::time::Real;
 use cosmix_props_core::tree::build_snapshot;
 use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
-use cosmix_shell::core::{Edge, PanelMode};
+use cosmix_shell::core::{Corner, Edge, PanelMode};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
     ShellSemanticVerb, semantic_shell_command,
@@ -27,6 +27,7 @@ pub(crate) struct QuoinPowerText;
 
 #[derive(Resource)]
 struct ShellBusState {
+    diagnostics: BusDiagnostics,
     power: PowerSync,
     ready_logged: bool,
     next_request_id: u64,
@@ -52,6 +53,7 @@ struct ShellBusState {
 impl Default for ShellBusState {
     fn default() -> Self {
         Self {
+            diagnostics: BusDiagnostics::default(),
             power: PowerSync::default(),
             ready_logged: false,
             next_request_id: 0x51_0000_0000,
@@ -62,11 +64,31 @@ impl Default for ShellBusState {
     }
 }
 
+#[derive(Default)]
+struct BusDiagnostics {
+    requests: u64,
+    rejected: u64,
+    accepted_mutations: u64,
+    max_dispatch_us: u64,
+}
+
+impl BusDiagnostics {
+    fn record(&mut self, rc: u8, mutation: bool, elapsed_us: u64) {
+        self.requests = self.requests.saturating_add(1);
+        self.rejected = self.rejected.saturating_add(u64::from(rc != 0));
+        self.accepted_mutations = self.accepted_mutations.saturating_add(u64::from(mutation));
+        self.max_dispatch_us = self.max_dispatch_us.max(elapsed_us);
+    }
+}
+
 pub(crate) struct ShellBusPlugin;
 
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
+            .init_resource::<crate::wallpaper::WallpaperState>()
+            .init_resource::<crate::demos::DemoState>()
+            .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input));
     }
 }
@@ -78,6 +100,11 @@ fn service_bus(
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut power_text: Query<&mut Text, With<QuoinPowerText>>,
+    mut wallpaper: (
+        ResMut<crate::wallpaper::WallpaperState>,
+        ResMut<cosmix_shell_host::LayerHostDeadline>,
+        ResMut<crate::demos::DemoState>,
+    ),
 ) {
     // This system is the app's single inbound drain + reply owner (see
     // `BusBridge::claim_inbound`); Quoin installs no `AppPortPlugin`.
@@ -89,6 +116,8 @@ fn service_bus(
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
+        wallpaper.0.event(&event, time.elapsed());
+        wallpaper.2.event(&event, time.elapsed());
         match event {
             BusBridgeEvent::Connection {
                 state: BusConnectionState::Connected,
@@ -137,6 +166,7 @@ fn service_bus(
         }
     }
     for message in bridge.drain_messages() {
+        wallpaper.0.message(&message, time.elapsed());
         match state.power.observe_message(message) {
             PowerAction::None => {}
             PowerAction::Changed => power_changed = true,
@@ -151,6 +181,8 @@ fn service_bus(
             }
         }
     }
+    wallpaper.0.tick(&bridge, time.elapsed(), &mut wallpaper.1);
+    wallpaper.2.tick(&bridge, time.elapsed(), &mut wallpaper.1);
     if power_changed {
         let rendered = state.power.render();
         for mut text in &mut power_text {
@@ -177,7 +209,37 @@ fn service_bus(
     }
 
     for request in bridge.drain_inbound() {
-        let (rc, body, command) = dispatch_shell_request(&request, &frame.0, time.elapsed());
+        let started = std::time::Instant::now();
+        let (rc, body, command) = if request.command == "shell.debug.status" {
+            (
+                0,
+                json!({
+                    "requests":state.diagnostics.requests,
+                    "rejected":state.diagnostics.rejected,
+                    "accepted_mutations":state.diagnostics.accepted_mutations,
+                    "max_dispatch_us":state.diagnostics.max_dispatch_us,
+                    "pending_replies":state.pending_replies.len(),
+                    "connected":state.live_generation.is_some(),
+                    "scope":"this process; dispatch excludes model application and transport"
+                })
+                .to_string(),
+                None,
+            )
+        } else {
+            dispatch_shell_request(&request, &frame.0, time.elapsed())
+        };
+        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        state.diagnostics.record(rc, command.is_some(), elapsed_us);
+        if command.is_some() || rc != 0 {
+            bevy::log::debug!(
+                command = request.command.as_str(),
+                rc,
+                dispatch_us = elapsed_us,
+                accepted_mutation = command.is_some(),
+                pending_replies = state.pending_replies.len(),
+                "QUOIN_BUS_DISPATCH"
+            );
+        }
         stash_or_respond(
             &bridge,
             &mut state,
@@ -283,7 +345,8 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set"]
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status"],
+            "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
     // The transport admits `app.*`/`action.*` on every inbound port; this
@@ -392,10 +455,25 @@ fn dispatch_shell_request(
             None,
         );
     }
-    let Some(edge) = argument(request, "edge").and_then(parse_edge) else {
+    let corner_command = request.command.starts_with("shell.corner.");
+    let selected_edge = if corner_command {
+        argument(request, "corner").and_then(|value| match value.as_str() {
+            "top-left" => Some(Corner::TopLeft.summoned_edge()),
+            "bottom-left" => Some(Corner::BottomLeft.summoned_edge()),
+            "bottom-right" => Some(Corner::BottomRight.summoned_edge()),
+            "top-right" => Some(Corner::TopRight.summoned_edge()),
+            _ => None,
+        })
+    } else {
+        argument(request, "edge").and_then(parse_edge)
+    };
+    let Some(edge) = selected_edge else {
         return (
             10,
-            json!({"error":"edge must be left, bottom, right or top"}).to_string(),
+            json!({"error":if corner_command {
+                "corner must be top-left, bottom-left, bottom-right or top-right"
+            } else { "edge must be left, bottom, right or top" }})
+            .to_string(),
             None,
         );
     };
@@ -420,11 +498,11 @@ fn dispatch_shell_request(
 
 fn semantic_verb(request: &InboundRequest) -> Option<ShellSemanticVerb> {
     Some(match request.command.as_str() {
-        "shell.panel.show" => ShellSemanticVerb::PanelShow,
-        "shell.panel.hide" => ShellSemanticVerb::PanelHide,
-        "shell.panel.toggle" => ShellSemanticVerb::PanelToggle,
-        "shell.panel.pin" => ShellSemanticVerb::PanelPin,
-        "shell.panel.unpin" => ShellSemanticVerb::PanelUnpin,
+        "shell.panel.show" | "shell.corner.show" => ShellSemanticVerb::PanelShow,
+        "shell.panel.hide" | "shell.corner.hide" => ShellSemanticVerb::PanelHide,
+        "shell.panel.toggle" | "shell.corner.toggle" => ShellSemanticVerb::PanelToggle,
+        "shell.panel.pin" | "shell.corner.pin" => ShellSemanticVerb::PanelPin,
+        "shell.panel.unpin" | "shell.corner.unpin" => ShellSemanticVerb::PanelUnpin,
         "shell.panel.page.next" => ShellSemanticVerb::PageNext,
         "shell.panel.page.prev" => ShellSemanticVerb::PagePrevious,
         "shell.panel.page.set" => ShellSemanticVerb::PageSet(argument(request, "id")?),
@@ -730,6 +808,53 @@ mod tests {
     }
 
     #[test]
+    fn corner_actions_share_panel_semantics_and_require_registered_callers() {
+        let frame = test_frame();
+        for (corner, edge) in [
+            ("top-left", "left"),
+            ("bottom-left", "bottom"),
+            ("bottom-right", "right"),
+            ("top-right", "top"),
+        ] {
+            for action in ["show", "hide", "toggle", "pin", "unpin"] {
+                let name = format!("shell.corner.{action}");
+                let corner_request = wire(&name, json!({"corner":corner}));
+                let panel_request = wire(&format!("shell.panel.{action}"), json!({"edge":edge}));
+                let (rc, body, command) =
+                    dispatch_shell_request(&corner_request, &frame, Default::default());
+                assert_eq!(rc, 0, "{corner} {action}: {body}");
+                assert_eq!(
+                    command.unwrap().kind,
+                    dispatch_shell_request(&panel_request, &frame, Default::default())
+                        .2
+                        .unwrap()
+                        .kind
+                );
+                let mut unregistered = request(&name);
+                unregistered.body = json!({"corner":corner}).to_string();
+                let (rc, _, command) =
+                    dispatch_shell_request(&unregistered, &frame, Default::default());
+                assert_ne!(rc, 0);
+                assert!(command.is_none());
+            }
+        }
+        for body in [
+            json!({}),
+            json!({"corner":"invalid"}),
+            json!({"corner":7}),
+            json!({"edge":"left"}),
+        ] {
+            let (rc, _, command) = dispatch_shell_request(
+                &wire("shell.corner.show", body),
+                &frame,
+                Default::default(),
+            );
+            assert_ne!(rc, 0);
+            assert!(command.is_none());
+        }
+    }
+
+    #[test]
     fn app_verbs_and_bad_page_arguments_get_precise_errors() {
         let frame = paged_frame();
         let (rc, body, command) =
@@ -897,10 +1022,9 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(bevy::MinimalPlugins)
             .add_message::<ShellCommand>()
-            .init_resource::<ShellBusState>()
             .insert_resource(ShellFrameState(test_frame()))
             .insert_resource(bridge)
-            .add_systems(Update, service_bus);
+            .add_plugins(ShellBusPlugin);
         app
     }
 
@@ -941,8 +1065,19 @@ mod tests {
         });
         app.update();
         let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1, "the Connected event issues one snapshot");
-        assert_eq!(calls[0].command, "power.props.get");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.command.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "power.props.get",
+                "wallpaper.props.get",
+                "background.status",
+                "capture.status"
+            ],
+            "each projection bootstraps once"
+        );
         let request_id = calls[0].request_id;
 
         // powerd is down: the snapshot fails, so the projection falls back to
@@ -991,8 +1126,17 @@ mod tests {
         peer.deliver_message(gap_change(2));
         app.update();
         assert_eq!(
-            peer.drain_calls().len(),
-            2,
+            peer.drain_calls()
+                .iter()
+                .map(|call| call.command.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "power.props.get",
+                "power.props.get",
+                "wallpaper.props.get",
+                "background.status",
+                "capture.status"
+            ],
             "drain_events must run before drain_messages"
         );
     }

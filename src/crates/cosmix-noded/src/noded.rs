@@ -3492,7 +3492,7 @@ async fn handle_noded_command(
                 resp.set("command", "topic.publish");
                 resp.set(
                     "error",
-                    "topic_reserved: only the registered owning service may publish to <svc>.props.changed, <svc>.props.records.changed, or <svc>.props.audit (SPEC 12 §15.5)",
+                    "topic_reserved: only the registered owning service may publish to <svc>.pointer.changed, <svc>.props.changed, <svc>.props.records.changed, or <svc>.props.audit",
                 );
                 let _ = tx.try_send(resp.to_wire());
                 return;

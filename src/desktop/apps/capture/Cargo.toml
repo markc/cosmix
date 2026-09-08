@@ -1,0 +1,24 @@
+[package]
+name = "cosmix-capture"
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Native Wayland screenshots and MP4 recording over the Cosmix Bus"
+
+[dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "signal", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

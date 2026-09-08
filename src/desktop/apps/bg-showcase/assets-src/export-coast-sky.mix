@@ -1,0 +1,2 @@
+# Run from package directory after fetching the pinned source EXR to media/source.
+print(run_argv_must(["blender", "--background", "--factory-startup", "--python-exit-code", "1", "--python", "assets-src/coast-sky.py"]))

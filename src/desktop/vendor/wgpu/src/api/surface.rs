@@ -39,6 +39,9 @@ pub struct Surface<'window> {
     // been created is is additionally wrapped in an option.
     pub(crate) config: Mutex<Option<SurfaceConfiguration>>,
 
+    #[cfg(std)]
+    pub(crate) diagnostic_identity: crate::diagnostics::SurfaceIdentity,
+
     /// Optionally, keep the source of the handle used for the surface alive.
     ///
     /// This is useful for platforms where the surface is created from a window and the surface
@@ -93,6 +96,11 @@ impl Surface<'_> {
     /// - Texture format requested is unsupported on the surface.
     /// - `config.width` or `config.height` is zero.
     pub fn configure(&self, device: &Device, config: &SurfaceConfiguration) {
+        #[cfg(std)]
+        let _diagnostic =
+            crate::diagnostics::begin(crate::diagnostics::Operation::SurfaceConfigure, || {
+                self.diagnostic_identity.get()
+            });
         self.inner.configure(&device.inner, config);
 
         let mut conf = self.config.lock();
@@ -118,6 +126,11 @@ impl Surface<'_> {
     /// See the documentation of [`CurrentSurfaceTexture`] for how each possible result
     /// should be handled.
     pub fn get_current_texture(&self) -> CurrentSurfaceTexture {
+        #[cfg(std)]
+        let _diagnostic =
+            crate::diagnostics::begin(crate::diagnostics::Operation::SurfaceAcquire, || {
+                self.diagnostic_identity.get()
+            });
         let (texture, status, detail) = self.inner.get_current_texture();
 
         let suboptimal = match status {
@@ -158,6 +171,8 @@ impl Surface<'_> {
                         descriptor,
                     },
                     presented: false,
+                    #[cfg(std)]
+                    diagnostic_surface: self.diagnostic_identity.assigned(),
                     detail,
                 };
                 if suboptimal {

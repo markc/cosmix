@@ -424,6 +424,16 @@ impl BackendData {
         }
     }
 
+    /// Client output globals survive a KMS pause; they do not imply that its
+    /// input session is active. Nested input activity uses cursor enter/leave.
+    #[cfg(feature = "bus")]
+    pub(crate) fn pointer_session_active(&self) -> bool {
+        match self {
+            Self::Winit(_) => true,
+            Self::Kms(data) => data.topology.is_active(),
+        }
+    }
+
     /// Perform backend-specific maintenance after one protocol dispatch.
     ///
     /// The nested backend owns one Smithay output that needs cleanup. The KMS

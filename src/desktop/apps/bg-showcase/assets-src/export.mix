@@ -1,0 +1,3 @@
+# Blender embedded Python is used only for asset authoring and export.
+# Run from the bg-showcase package directory.
+print(run_argv_must(["blender", "--background", "--factory-startup", "--python-exit-code", "1", "--python", "assets-src/observatory.py"]))

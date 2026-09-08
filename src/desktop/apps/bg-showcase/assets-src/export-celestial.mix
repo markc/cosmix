@@ -1,0 +1,2 @@
+# Run from the bg-showcase package directory. Python executes only in Blender.
+print(run_argv_must(["blender", "--background", "--factory-startup", "--python-exit-code", "1", "--python", "assets-src/celestial.py"]))

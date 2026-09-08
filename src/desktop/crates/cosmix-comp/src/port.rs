@@ -51,6 +51,7 @@ const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 pub(crate) enum PortCommand {
     Snapshot(PortRequest),
     Watch(PortReply),
+    PointerWatch(PortReply),
     Set(PortSetRequest),
     WatchState { active: bool, order: u64 },
 }
@@ -73,6 +74,10 @@ pub(crate) struct PortSetRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ControlReply {
+    PointerWatch {
+        topic: String,
+        lease_ms: u64,
+    },
     Watch {
         topic: String,
         event_seq: u64,
@@ -97,6 +102,10 @@ pub(crate) enum ControlReply {
 impl ControlReply {
     pub(crate) fn into_wire(self) -> (u8, Arc<str>) {
         match self {
+            Self::PointerWatch { topic, lease_ms } => (
+                0,
+                Arc::from(json!({"version":1,"topic":topic,"lease_ms":lease_ms}).to_string()),
+            ),
             Self::Watch {
                 topic,
                 event_seq,
@@ -159,6 +168,7 @@ impl ControlReply {
 
 pub(crate) enum PortControl {
     Watch(PortReply),
+    PointerWatch(PortReply),
     Set(PortSetRequest),
     WatchState { active: bool, order: u64 },
 }
@@ -167,6 +177,7 @@ impl PortControl {
     pub(crate) fn order(&self) -> u64 {
         match self {
             Self::Watch(request) => request.order,
+            Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
             Self::WatchState { order, .. } => *order,
         }
@@ -193,6 +204,14 @@ impl PortIngress {
         let (reply, receive) = tokio::sync::oneshot::channel();
         let order = self.next_control_order();
         self.admit(PortCommand::Watch(PortReply { order, reply }), receive)
+    }
+    pub(crate) fn request_pointer_watch(&self) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let order = self.next_control_order();
+        self.admit(
+            PortCommand::PointerWatch(PortReply { order, reply }),
+            receive,
+        )
     }
 
     pub(crate) fn request_set(&self, path: String, value: Value) -> Result<ControlAdmission, ()> {
@@ -910,7 +929,15 @@ fn handle_incoming(
         );
         return;
     }
-    if command.command == "comp.props.watch" {
+    if command.command == "comp.props.watch" || command.command == "comp.pointer.watch" {
+        if command.command == "comp.pointer.watch" && authorize_set(&command).is_err() {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("not_local")),
+            );
+            return;
+        }
         if malformed {
             queue_reply(
                 reply_sender,
@@ -930,7 +957,12 @@ fn handle_incoming(
                 return;
             }
         };
-        let admission = match ingress.request_watch() {
+        let requested = if command.command == "comp.pointer.watch" {
+            ingress.request_pointer_watch()
+        } else {
+            ingress.request_watch()
+        };
+        let admission = match requested {
             Ok(admission) => admission,
             Err(()) => {
                 queue_reply(

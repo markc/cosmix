@@ -482,6 +482,7 @@ fn a_started_runtime_reports_the_preparation_outcome_its_own_thread_reached() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
             decoration: DecorationStartup::default(),
         },
@@ -538,6 +539,7 @@ fn a_started_runtime_distinguishes_a_skipped_preparation_from_a_refused_one() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -643,6 +645,7 @@ fn runtime_with_failure_probe(
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -775,6 +778,7 @@ fn a_factory_error_reports_synchronously_and_does_not_fire_the_callback() {
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -834,6 +838,7 @@ fn a_panicking_registration_factory_fires_the_callback_and_fails_construction() 
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -1597,6 +1602,7 @@ impl KeybindingHarness {
             ecs_action_sender,
             kms_render_command_sender,
             keybindings_enabled,
+            f9_bus: None,
             binding_profile,
             vt_switch_requested,
             explicit_sync_exposure_mode,
@@ -4266,6 +4272,7 @@ fn live_syncobj_registry(
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: exposure_mode,
             decoration: DecorationStartup::default(),
         },
@@ -8955,6 +8962,7 @@ fn kms_wl_output_is_real_late_bound_and_stable_across_pause_resume() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -9598,6 +9606,7 @@ fn live_input_lifecycle_reconciles_the_intercepted_chord_before_suspend_and_resu
         },
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -9748,6 +9757,7 @@ fn kms_client_syncs_while_paused_and_its_frame_waits_for_resumed_submission() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -9917,6 +9927,7 @@ fn real_reserved_toggle_round_trips_logs_and_changes_forwarding() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -15554,6 +15565,152 @@ fn bufferless_window_geometry_commit_publishes_surface_and_window_x_changes() {
     );
 }
 
+#[cfg(feature = "bus")]
+#[test]
+fn pointer_watch_invalidates_on_kms_pause_with_retained_outputs_and_stationary_cursor() {
+    let (mut harness, ingress, observations) =
+        KeybindingHarness::new_with_port_backend(BackendKind::Kms, "kms");
+    let key = kms_security_test_key(226, "Pointer-session-1");
+    let snapshot = kms_security_test_snapshot(&key, 41);
+    submit_kms_security_lifecycle(
+        &mut harness,
+        KmsTopologyLifecycleEvent::Initial(snapshot.clone()),
+    );
+    harness.server.state.pointer_moved(20.5, 30.25, 1);
+    let cursor = *harness
+        .server
+        .state
+        .cursor_position_snapshot
+        .lock()
+        .unwrap();
+    let watch = ingress.request_pointer_watch().unwrap();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    drop(watch);
+    let samples = |records: Vec<port_observation::ObservationRecord>| {
+        records
+            .into_iter()
+            .filter_map(|record| match record {
+                port_observation::ObservationRecord::PointerChanged { sample, .. } => Some(sample),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let initial = samples(drain_observations(&observations));
+    assert_eq!(initial.len(), 1);
+    assert!(initial[0].valid);
+
+    for (event, expected_valid) in [
+        (KmsTopologyLifecycleEvent::Pause, false),
+        (KmsTopologyLifecycleEvent::Resume(snapshot), true),
+    ] {
+        submit_kms_security_lifecycle(&mut harness, event);
+        assert!(!harness.server.state.backend.port_outputs().is_empty());
+        assert_eq!(
+            *harness
+                .server
+                .state
+                .cursor_position_snapshot
+                .lock()
+                .unwrap(),
+            cursor
+        );
+        std::thread::sleep(pointer_observation::INTERVAL + Duration::from_millis(2));
+        port_observation::service_observations(&mut harness.server.state);
+        let emitted = samples(drain_observations(&observations));
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].valid, expected_valid);
+        assert_eq!(emitted[0].position.is_some(), expected_valid);
+        assert_eq!(emitted[0].output.is_some(), expected_valid);
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn pointer_watch_never_exposes_coordinates_while_locked_or_off_output() {
+    for locked in [false, true] {
+        let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+        if locked {
+            begin_test_session_lock(&mut harness);
+        } else {
+            harness
+                .server
+                .state
+                .cursor_position_snapshot
+                .lock()
+                .unwrap()
+                .on_output = false;
+        }
+        let watch = ingress.request_pointer_watch().unwrap();
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+        drop(watch);
+        let samples: Vec<_> = drain_observations(&observations)
+            .into_iter()
+            .filter_map(|record| match record {
+                port_observation::ObservationRecord::PointerChanged { sample, .. } => Some(sample),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(samples.len(), 1);
+        assert!(!samples[0].valid);
+        assert!(samples[0].position.is_none());
+        assert!(samples[0].output.is_none());
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn pointer_watch_publishes_authoritative_logical_coordinates_outside_input_handler() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let context = harness.server.state.port_context.clone().unwrap();
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let output = snapshot.outputs.values().next().unwrap();
+    let expected_name = output.name.clone();
+    harness
+        .server
+        .state
+        .pointer_moved(f64::from(output.x) + 20.5, f64::from(output.y) + 30.25, 1);
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(!drain_observations(&observations).iter().any(|r| matches!(
+        r,
+        port_observation::ObservationRecord::PointerChanged { .. }
+    )));
+
+    let watch = ingress
+        .request_pointer_watch()
+        .expect("pointer watch admitted");
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    drop(watch);
+    let samples: Vec<_> = drain_observations(&observations)
+        .into_iter()
+        .filter_map(|r| match r {
+            port_observation::ObservationRecord::PointerChanged { sample, event_seq } => {
+                Some((sample, event_seq))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].0.instance, context.instance);
+    assert_eq!(samples[0].0.output.as_deref(), Some(expected_name.as_str()));
+    assert!(samples[0].0.valid);
+    let position = samples[0].0.position.unwrap();
+    assert_eq!((position.x, position.y), (20.5, 30.25));
+    assert!(samples[0].1 > 0);
+    for time in 2..100 {
+        harness.server.state.pointer_moved(
+            f64::from(output.x) + f64::from(time),
+            f64::from(output.y) + 40.0,
+            time,
+        );
+    }
+    // The input path only mutates cursor state. It never queues serialized
+    // pointer history, even under a burst with an active lease.
+    assert!(!drain_observations(&observations).iter().any(|r| matches!(
+        r,
+        port_observation::ObservationRecord::PointerChanged { .. }
+    )));
+}
+
 #[test]
 fn subsurface_buffer_commit_never_applies_xdg_window_geometry() {
     let mut harness = KeybindingHarness::new(true);
@@ -16002,6 +16159,7 @@ fn xdg_configures_are_staged_and_popup_requires_a_mapped_parent() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -16173,6 +16331,7 @@ fn registry_round_trip_does_not_require_a_bevy_frame() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -16246,6 +16405,7 @@ fn assert_blocked_kms_path_keeps_protocol_live(
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -16293,6 +16453,7 @@ fn frame_callback_is_sent_before_first_buffer_commit() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -19263,6 +19424,7 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -19585,6 +19747,7 @@ fn touch_oracle_runtime(label: &str) -> (FakeInputInjector, WaylandRuntime, Unix
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -20291,6 +20454,7 @@ pub(crate) fn real_shm_scene_runtime_with_decoration(
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration,
         },
@@ -21023,6 +21187,7 @@ fn two_client_focus_runtime(
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -22805,6 +22970,7 @@ fn destroying_a_surface_does_not_enter_its_orphaned_descendant() {
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -23438,6 +23604,7 @@ fn resume_flush_refill_race_puts_newest_commit_in_the_first_render_drain() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -23627,6 +23794,7 @@ fn a_full_renderer_channel_does_not_stop_the_protocol_thread_serving_clients() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -23811,6 +23979,7 @@ fn shm_commit_reaches_the_renderer_pixel_exact_and_releases_the_buffer() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -24019,6 +24188,7 @@ fn frame_callbacks_are_frame_paced_and_reach_a_subsurface() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -24601,6 +24771,7 @@ fn a_second_xdg_surface_for_a_role_bearing_wl_surface_is_a_fatal_protocol_error(
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -24749,6 +24920,7 @@ fn a_second_role_object_on_one_xdg_surface_is_a_fatal_protocol_error() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -24841,6 +25013,7 @@ fn role_guard_runtime(label: &str) -> (WaylandRuntime, UnixStream) {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -25053,6 +25226,7 @@ fn a_role_less_wrapper_cannot_duplicate_the_live_popup_role() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -25314,6 +25488,7 @@ fn a_second_subsurface_on_a_live_subsurface_is_refused_before_this_compositor_se
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -25419,6 +25594,7 @@ fn a_live_subsurface_cannot_obtain_an_xdg_surface_wrapper() {
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -25536,6 +25712,7 @@ fn a_subsurface_destroyed_and_recreated_in_one_dispatch_publishes_its_removal() 
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -26168,6 +26345,7 @@ fn dmabuf_validation_runtime(
         Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
+            f9_bus: None,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
             decoration: DecorationStartup::default(),
         },
@@ -27842,6 +28020,83 @@ fn port_observation_reports_exclusive_focus_and_layer_usable_geometry_in_order()
         records => panic!("unexpected deterministic observation order: {records:?}"),
     };
     assert!(focus_sequence < output_sequence);
+}
+
+#[cfg(all(feature = "bus", feature = "native-quoin"))]
+#[test]
+fn native_panels_reconfigure_maximised_chrome_and_publish_work_area_changes() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    harness.server.state.resize_output(400, 300);
+    map_initial_test_toplevel(&mut harness);
+    let surface = test_toplevel_record(&harness).role.wl_surface().clone();
+    harness.server.state.request_maximized_state(&surface, true);
+    let wire = harness.sync();
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&wire));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let watch = ingress.request_watch().unwrap();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(runtime.block_on(watch.receive()).unwrap().into_wire().0, 0);
+    drain_observations(&observations);
+
+    for area in [
+        Some(cosmix_shell::host::PanelRect {
+            x: 40.0,
+            y: 30.0,
+            width: 300.0,
+            height: 220.0,
+        }),
+        None,
+    ] {
+        harness.server.state.set_native_work_area(area);
+        let wire = harness.sync();
+        let size = configured_toplevel_size(&wire);
+        let usable = harness.server.state.usable_output_rect();
+        let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+        let decorated =
+            test_toplevel_record(&harness).committed_decoration == SceneDecorationMode::ServerSide;
+        assert_eq!(
+            size.0 as f32
+                + if decorated {
+                    extents.left + extents.right
+                } else {
+                    0.0
+                },
+            usable.width
+        );
+        assert_eq!(
+            size.1 as f32
+                + if decorated {
+                    extents.top + extents.bottom
+                } else {
+                    0.0
+                },
+            usable.height
+        );
+        commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&wire));
+        port_observation::service_observations(&mut harness.server.state);
+        let records = drain_observations(&observations);
+        assert!(
+            records.iter().any(|record| matches!(record,
+                port_observation::ObservationRecord::OutputChanged { row, .. }
+                    if (row.usable.x, row.usable.y, row.usable.width, row.usable.height)
+                        == (usable.x, usable.y, usable.width, usable.height)
+            )),
+            "output geometry event missing: {records:?}"
+        );
+        assert!(records.iter().any(|record| matches!(record,
+            port_observation::ObservationRecord::PropsChanged { path, cause: "shell.work-area", .. }
+                if path.ends_with(".usable.width")
+        )), "watched usable-area leaf missing: {records:?}");
+        harness.server.state.set_native_work_area(area);
+        port_observation::service_observations(&mut harness.server.state);
+        assert!(
+            drain_observations(&observations).is_empty(),
+            "unchanged area must be silent"
+        );
+    }
 }
 
 #[cfg(feature = "bus")]
@@ -35963,13 +36218,15 @@ fn screencopy_s1a_14_admission_saturation_fails_at_job_and_byte_caps() {
     drop(primary_files);
     drop(second_files);
     let mut bytes = ScreencopyWireHarness::new(3);
-    bytes.harness.server.state.resize_output(4096, 4096);
+    // The SHM buffer fits, but its four resident copies exceed 512 MiB.
+    const { assert!(6144 * 6144 * 4 * 4 > MAX_CLIENT_CAPTURE_BYTES) };
+    bytes.harness.server.state.resize_output(6144, 6144);
     let (frame, advertised) = bytes.capture_output(false);
     assert_eq!(
         screencopy_buffer_words(&advertised, frame),
-        vec![wl_shm::Format::Xrgb8888 as u32, 4096, 4096, 16_384]
+        vec![wl_shm::Format::Xrgb8888 as u32, 6144, 6144, 24_576]
     );
-    let (_file, buffer) = bytes.shm_buffer(4096, 4096, 16_384);
+    let (_file, buffer) = bytes.shm_buffer(6144, 6144, 24_576);
     send_request(&mut bytes.harness.client, frame, 0, &words(&[buffer]));
     let events = bytes.harness.sync();
     assert!(events.iter().any(|event| event.0 == frame && event.1 == 3));
@@ -35979,6 +36236,87 @@ fn screencopy_s1a_14_admission_saturation_fails_at_job_and_byte_caps() {
         bytes.harness.server.state.capture_frames[&id].reserved_bytes,
         0
     );
+}
+
+#[test]
+fn screencopy_chunked_publication_runs_without_external_wakes_then_sleeps() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    wire.harness.server.state.resize_output(1024, 1024);
+    let (frame, _) = wire.capture_output(false);
+    let (_file, buffer) = wire.shm_buffer(1024, 1024, 4096);
+    let id = submit_primary_capture(&mut wire, frame, buffer);
+    // Drain setup traffic before making the idle copy runnable. No sync,
+    // renderer command or other client request wakes the loop below.
+    for _ in 0..4 {
+        wire.harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .unwrap();
+    }
+    inject_capture_halves(&mut wire.harness.server.state, id, 17, 3, 7);
+    let started = Instant::now();
+    let mut turns = 0;
+    while !wire.harness.server.state.capture_frames[&id].terminal {
+        wire.harness
+            .server
+            .dispatch_cycle(Some(Duration::from_millis(100)))
+            .unwrap();
+        turns += 1;
+        assert!(
+            turns <= 20,
+            "bounded copy must finish within its chunk count"
+        );
+    }
+    assert!(turns > 1, "fixture must exercise recursively queued chunks");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "queued chunks waited for the poll timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(!wire.harness.server.state.capture_frames[&id].write_scheduled);
+    let events = wire.harness.sync();
+    assert!(events.iter().any(|event| event.0 == frame && event.1 == 2));
+    assert!(!events.iter().any(|event| event.0 == frame && event.1 == 3));
+
+    // Keep the terminal record alive: it must not force a permanent hot loop.
+    // Several polls tolerate incidental setup/retirement wakes while proving
+    // the caller's timeout is restored once there is no runnable copy.
+    for _ in 0..4 {
+        wire.harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .unwrap();
+    }
+    let quiet = Instant::now();
+    for _ in 0..8 {
+        wire.harness
+            .server
+            .dispatch_cycle(Some(Duration::from_millis(100)))
+            .unwrap();
+    }
+    assert!(
+        quiet.elapsed() >= Duration::from_millis(400),
+        "terminal capture kept protocol dispatch spinning"
+    );
+}
+
+#[test]
+fn screencopy_video_budget_admits_three_active_4k_frames_plus_retirement() {
+    let frame = capture_reservation_bytes(
+        (3840, 2160),
+        CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+        },
+    )
+    .unwrap();
+    assert_eq!(frame, 3840 * 2160 * 4 * 4);
+    assert!(frame * 4 <= MAX_CLIENT_CAPTURE_BYTES);
+    assert!(frame * 5 > MAX_CLIENT_CAPTURE_BYTES);
+    assert!(frame * 8 <= MAX_GLOBAL_CAPTURE_BYTES);
+    assert!(frame * 9 > MAX_GLOBAL_CAPTURE_BYTES);
 }
 
 #[test]

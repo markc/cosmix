@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.50.0"
+version = "0.51.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -21,6 +21,8 @@ bus = [
     "dep:tokio",
 ]
 explicit-sync-live-test = []
+hud-probe = ["dep:cosmix-bg-boing", "bevy/bevy_pbr", "bevy/bevy_ui_render"]
+native-quoin = ["hud-probe", "dep:cosmix-quoin", "dep:cosmix-shell"]
 frame-capture = ["dep:signal-hook"]
 kms-live = [
     "dep:signal-hook",
@@ -49,6 +51,9 @@ name = "cosmix-screencopy-probe"
 path = "src/bin/cosmix-screencopy-probe.rs"
 
 [dependencies]
+cosmix-quoin = { path = "../../apps/quoin", optional = true }
+cosmix-shell = { path = "../cosmix-shell", features = ["chrome"], optional = true }
+cosmix-bg-boing = { path = "../cosmix-bg-boing", optional = true }
 bevy = { version = "=0.19.0", default-features = false, features = [
     "2d_bevy_render",
     "bevy_winit",
@@ -62,6 +67,7 @@ bevy = { version = "=0.19.0", default-features = false, features = [
 ] }
 cosmix-deco = { path = "../cosmix-deco" }
 cosmix-wgpu-dmabuf = { path = "../cosmix-wgpu-dmabuf" }
+wgpu = { version = "=29.0.4", default-features = false, features = ["std"] }
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo", optional = true }
 cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus", default-features = false, optional = true }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client", optional = true }
