@@ -13,6 +13,7 @@ members = [
     "apps/wallpaper",
     "apps/bg-showcase",
     "apps/capture",
+    "apps/media",
     "crates/cosmix-design",
     "crates/cosmix-comp",
     "crates/cosmix-deco",

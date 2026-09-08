@@ -1,0 +1,25 @@
+[package]
+name = "cosmix-media"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Native CosMix media player with CTK controls and Bus playback commands"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "media"
+display = "CosMix Media"
+engine = "bevy"
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "ui_bevy_render", "bevy_feathers", "accesskit_unix"] }
+ctk = { path = "../../ctk" }
+gstreamer = "0.24"
+gstreamer-app = "0.24"
+gstreamer-video = "0.24"
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "sync"] }

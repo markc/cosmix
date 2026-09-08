@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CosMix Media
+Comment=Play local audio and video
+Exec=cosmix-media %f
+Terminal=false
+Categories=AudioVideo;Player;
+MimeType=audio/mpeg;audio/mp4;video/mp4;audio/x-wav;audio/ogg;video/webm;
+StartupWMClass=dev.cosmix.media

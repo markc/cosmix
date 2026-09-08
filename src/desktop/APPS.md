@@ -61,3 +61,4 @@ centre/side-slot frame.
 | active | `tower` | CosMix Tower | Mesh mission control — verified node atlas, same-node citizen/daemon controls, live traffic animation, and persisted filters/layout |
 | active | `mail` | CosMix Mail | Frontend mail reader and composer (Bevy + ctk); reads the `maild` domain, which stays the backend server. Not a reused retired slug: the archived Bus/`ui.*` disp-skia client of the same name was never registered here and was carved out to `_attic/bus-display/` on 2026-07-20. Landed 2026-07-31 as the widget vertical slice — fixture corpus, no JMAP transport yet. |
 | active | `quoin` | CosMix Quoin | Furniture-tier desktop shell: four edge panels; Bus service `shell` |
+| active | `media` | CosMix Media | Native CTK audio/video player; local MP3/MP4 playback and Bus service `media` |

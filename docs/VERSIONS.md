@@ -107,6 +107,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-imeprobe` | 0.1.0 |
 | `cosmix-interactgui` | 0.1.1 |
 | `cosmix-mail` | 0.1.0 |
+| `cosmix-media` | 0.1.0 |
 | `cosmix-quoin` | 0.11.0 |
 | `cosmix-shell` | 0.8.6 |
 | `cosmix-shell-host` | 0.6.5 |
