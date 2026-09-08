@@ -276,6 +276,8 @@ impl Instance {
             _handle_source: None,
             inner: surface,
             config: Mutex::new(None),
+            #[cfg(std)]
+            diagnostic_identity: crate::diagnostics::SurfaceIdentity::default(),
         })
     }
 

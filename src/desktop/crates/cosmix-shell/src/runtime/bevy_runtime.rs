@@ -34,6 +34,11 @@ pub struct ShellFrameState(pub ShellFrame);
 #[derive(Resource, Clone, Debug, Default)]
 pub struct ShellEffects(pub Vec<ShellEffect>, pub Vec<Edge>);
 
+/// An embedded shell delegates session exit to its host's lifecycle owner.
+/// Without this resource the standalone shell emits Bevy's normal AppExit.
+#[derive(Resource, Clone)]
+pub struct ShellQuitHandler(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+
 /// Ordering seam used by chrome and hosts without exposing model internals.
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShellRuntimeSet {
@@ -103,6 +108,7 @@ fn update_model(
     mut frame: ResMut<ShellFrameState>,
     mut effects: ResMut<ShellEffects>,
     mut exit: MessageWriter<AppExit>,
+    quit_handler: Option<Res<ShellQuitHandler>>,
 ) {
     let now = time.elapsed();
     effects.0.clear();
@@ -145,7 +151,11 @@ fn update_model(
                 }
             }
             ShellCommandKind::Quit => {
-                exit.write(AppExit::Success);
+                if let Some(handler) = &quit_handler {
+                    (handler.0)();
+                } else {
+                    exit.write(AppExit::Success);
+                }
             }
             ShellCommandKind::Geometry(size) => runtime.model.set_geometry(*size),
             ShellCommandKind::Corner(event) => {
@@ -296,6 +306,28 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
         app
+    }
+
+    #[test]
+    fn embedded_quit_uses_host_lifecycle_without_exiting_render_app() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let requested = Arc::new(AtomicBool::new(false));
+        let flag = requested.clone();
+        let mut app = app();
+        app.insert_resource(ShellQuitHandler(Arc::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        })));
+        app.world_mut().write_message(ShellCommand {
+            output: OutputKey::new("DP-1").unwrap(),
+            at: Duration::ZERO,
+            kind: ShellCommandKind::Quit,
+        });
+        app.update();
+        assert!(requested.load(Ordering::SeqCst));
+        assert!(app.should_exit().is_none());
     }
 
     #[test]

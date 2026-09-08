@@ -442,13 +442,42 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/quoin.md"><div class="prose"><h1 id="cosmix-quoin">cosmix-quoin</h1>
+<h2 id="experimental-compositor-host">Experimental compositor host</h2>
+<p>Quoin 0.11.0 also exposes its application as a Rust library. Comp builds with
+<code>native-quoin</code> can opt in with <code>COSMIX_COMP_HUD_PROBE=1</code> and
+<code>COSMIX_COMP_NATIVE_QUOIN=1</code>. This first-output experiment renders the four
+real Quoin panels, native Boing and application window textures in the same
+Bevy renderer. Do not run the standalone Quoin executable in this mode: the
+embedded application owns the same <code>shell</code> Bus service.</p>
+<p>Both hosts reuse the page registry, content, chrome, theme, persistence and
+semantic Bus commands. The compositor host supplies panel mounts, logical
+geometry and pointer input. Panel movement uses the existing chrome animation;
+there are no panel Wayland buffers or panel swapchains. Pinned panel geometry
+updates comp's usable area, publishes output/property changes and reconfigures
+maximised windows including their decoration extents. Repeated unchanged work
+areas do not trigger another resize or notification. Application
+processes remain ordinary Wayland clients, with their existing comp-owned
+window decorations and move/resize policy.</p>
+<p>The native host forwards panel mouse buttons, scrolling and grip gestures to
+Bevy picking. A press beginning on a panel retains its release outside the
+panel; an existing application/window drag retains ownership. Session locking
+hides the native panels and cancels their pending pointer actions. Shell quit
+delegates to the compositor lifecycle rather than exiting its render App.</p>
+<p>This remains an opt-in integration experiment. It uses a continuously rendered
+native Boing background and does not yet provide native equivalents of the
+external showcase's scene-selection controls. Keyboard navigation, touch,
+multiple outputs and idle wake scheduling need separate native-host acceptance
+before this replaces the standalone shell. A compositor host must supply the
+normal <code>COSMIX_QUOIN_LAUNCHER</code> Mix hook and its session environment when app
+launches need to run under a separate desktop user.</p>
+<h2 id="standalone-layer-shell-host">Standalone layer-shell host</h2>
 <p><code>cosmix-quoin</code> is the Cosmix desktop furniture shell. It owns four independent
 <code>zwlr_layer_surface_v1</code> panels — left, bottom, right and top — and renders the
 existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are <code>dev.cosmix.quoin</code>.</p>
-<p>Arc 3 presents real layer-shell buffers through <code>cosmix-shell-host</code> 0.4.0,
-<code>cosmix-shell</code> 0.5.0 and SCTK 0.19.2. <code>cosmix-quoin</code> is 0.5.0;
-<code>cosmix-quoin-demo</code> remains a
+<p>Quoin presents real layer-shell buffers through <code>cosmix-shell-host</code>,
+<code>cosmix-shell</code> and SCTK. See <a href="/VERSIONS">component versions</a> for the
+current source versions. <code>cosmix-quoin-demo</code> remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.</p>
 <h2 id="output-and-scale">Output and scale</h2>
@@ -504,7 +533,7 @@ protocol mode, not the model's next desired mode. The host advances that latch
 only after a commit, or after completed role destruction for unmap, so pin and
 unpin cannot hand motion between protocol margin and chrome one frame early.</p>
 <h2 id="event-driven-wake-contract">Event-driven wake contract</h2>
-<p>There is no polling, refresh tick or fixed animation sleep. The calloop runner
+<p>There is no fixed rendering tick or animation sleep. The calloop runner
 coalesces work into one <code>app.update()</code> demand. <code>Idle</code> removes the model timer
 and blocks on the Wayland file descriptor when no configure or frame request
 is outstanding. <code>WakeAt</code> owns one replaceable absolute calloop timer.
@@ -518,6 +547,10 @@ requests, which no process lifetime reaches).</p>
 local time with an explicit numeric UTC offset. Persist timezone preferences
 through the operating system's timezone configuration; Quoin reuses that
 configuration on subsequent launches.</p>
+<p>Background preference reconciliation shares this deadline mechanism. It
+requests a fresh wallpaper snapshot once per second, including while panels
+are hidden, and also responds to Bus invalidations. Unchanged values do not
+rewrite widget text.</p>
 <p>Keyboard repeat shares this wake layer. The active key owns one replaceable
 absolute deadline; a due wake emits one coalesced repeat and arms the next
 deadline from the actual wake time. There is no per-key thread, catch-up burst,
@@ -565,8 +598,48 @@ registered caller and are translated to the same <code>ShellCommand</code> ingre
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
 persistence. <code>shell.quit</code> and the right Monitoring page's Quit Quoin button
 request a successful Bevy exit through the normal render and surface drain
-(<code>QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit</code>). There is no resize, arrangement, geometry or
-synthetic pointer/corner verb in this slice.</p>
+(<code>QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit</code>). <code>shell.panel.resize</code> accepts
+<code>edge</code> and <code>thickness_px</code> in the supported 120–500 range.</p>
+<p>Quoin 0.10.1 also accepts <code>shell.corner.{show,hide,toggle,pin,unpin}</code> with a
+<code>corner</code> argument. These use the same panel state machine and caller checks:</p>
+<table><thead><tr><th>Corner</th><th>Controlled panel</th></tr></thead><tbody>
+<tr><td><code>top-left</code></td><td>Left</td></tr>
+<tr><td><code>bottom-left</code></td><td>Bottom</td></tr>
+<tr><td><code>bottom-right</code></td><td>Right</td></tr>
+<tr><td><code>top-right</code></td><td>Top</td></tr>
+</tbody></table>
+<p>For example, a registered local Mix citizen can send
+<code>send shell shell.corner.show corner="top-left"</code> or
+<code>send shell shell.corner.pin corner="bottom-right"</code>.
+These are semantic commands; they do not move the pointer or fabricate
+compositor corner-observation notifications. Read back
+<code>shell.props.get path="panels.left.visible"</code> to verify the applied state.</p>
+<p><code>shell.debug.status</code> exposes process-lifetime request/rejection counts,
+accepted mutation counts, maximum dispatch time in microseconds, pending reply
+count and connection state. It excludes model application, transport delay and
+persistence; accepted mutations are not application receipts. Counters describe
+requests before the status request itself. Debug-level <code>QUOIN_BUS_DISPATCH</code>
+records mutation/rejection command names, return codes and dispatch time without
+logging argument bodies. Existing <code>QUOIN_REVEAL</code>, <code>QUOIN_CONCEAL</code> and <code>QUOIN_PIN</code>
+records report panel state-machine effects. Enable the module through the normal
+Bevy log filter, for example <code>RUST_LOG=info,cosmix_quoin::bus_service=debug</code>.</p>
+<p>The shell chrome avoids assigning unchanged text, display, transform and tab
+index values during animation updates. This preserves Bevy's change detection
+instead of repeatedly invalidating the same UI state. It does not change panel
+animation or the layer host's surface creation/retirement rules.</p>
+<h3 id="background-controls">Background controls</h3>
+<p>The right-hand System page has nine controls for
+<a href="/cos/cosmix-wallpaper">cosmix-wallpaper</a>: enabled, paused, palette, bird count,
+speed, pointer radius, window margin, frame limit and seed. Boolean buttons
+toggle, palette and numeric buttons cycle through common choices, and Seed
+advances the deterministic scene seed. The wallpaper property API accepts the
+full supported ranges.</p>
+<p>Quoin reads and writes the <code>wallpaper</code> service through its existing Bus
+connection. A successful write is followed by a fresh read before another
+activation is allowed. Controls retain keyboard focus during this exchange;
+hidden pages and unavailable services cannot activate them. Disconnects clear
+cached values, and reconnection fetches the current preferences. Wallpaper
+owns persistence, so Quoin and Mix control the same saved settings.</p>
 <h3 id="launch-state-and-lifecycle">Launch state and lifecycle</h3>
 <p>The bottom <code>launcher</code> page includes working Foot, Firefox and Thunderbird buttons.
 They start <code>foot</code>, <code>firefox</code> and <code>thunderbird</code> through argv, report startup and failures,
@@ -712,7 +785,25 @@ while Quoin's <code>None</code> and <code>OnDemand</code> panels redraw;</li>
 <li>keyboard repeat pausing rather than bursting under KMS load; and</li>
 <li>VT switch and seat re-add on a real session.</li>
 </ul>
-<h2 id="known-limits">Known limits</h2>
+<h2 id="background-demos-and-capture">Background demos and capture</h2>
+<p>The right panel's <strong>Demos</strong> tab selects Bloom, Shapes, Boing or Boids through
+the native <code>bg-showcase</code> Bus service. Camera toggles fixed/moving views for the
+three 3D scenes; Boing also has a Kick button. An optional compositor F9 binding
+can invoke the same <code>boing.kick</code> verb.</p>
+<p><strong>Save screenshot</strong> captures the complete selected output, including Quoin,
+the cursor and open windows. <strong>Record full screen MP4</strong> starts a silent 30 fps
+recording; click <strong>Stop recording MP4</strong> to finalise it. The native
+<code>cosmix-capture</code> citizen must be running on that Wayland session. Recordings
+have a five-minute ceiling. Pending and finalising states are distinct from
+<code>complete</code>, which displays the saved file path. Files default to
+<code>~/Videos/Cosmix</code> in the capture citizen's account, or its configured directory.</p>
+<p>These controls share Quoin's existing asynchronous Bus bridge, reconcile after
+reconnect and report unavailable services. They do not launch competing
+background processes. Session supervision starts one showcase and one capture
+citizen alongside the compositor. The existing System-page boids preferences
+can target the showcase with <code>COSMIX_QUOIN_BACKGROUND_SERVICE=bg-showcase</code>;
+the default <code>wallpaper</code> target supports the compatibility wallpaper binary.</p>
+<h2 id="host-limits">Host limits</h2>
 <p>This host deliberately supports one output runtime and one active device per
 input capability. It does not mirror panels across several outputs; pointer,
 keyboard and touch may come from different seats when the compositor splits
@@ -725,7 +816,89 @@ repeat is unavailable.</p>
 acknowledgement for a configure serial retained across unmap. If the
 compositor later tolerates stale post-unmap acknowledgements, a comp-side
 follow-up could make the cheaper attach-NULL path safe; this host does not
-assume that behaviour.</p></div></div>
+assume that behaviour.</p>
+<h2 id="frame-stall-diagnostics">Frame-stall diagnostics</h2>
+<p>Set <code>COSMIX_FRAME_TRACE=1</code> before launching Quoin, the compositor and a native
+scene host to emit bounded <code>FRAME_TRACE</code> records to stderr. Tracing is off by
+default. Records carry process identity, stage, monotonic start/end microseconds,
+wall duration and caller-thread CPU duration. Monotonic timestamps correlate
+processes on the same kernel; they are not cross-machine timestamps. Caller CPU
+excludes parallel worker CPU. Acquisition markers bound <code>prepare_windows</code> but
+may include other scheduler work; they are not GPU timestamps. Dispatch spans
+include intentional idle waits.</p>
+<p>Quoin and scene records separate main schedules, extraction, rendering and
+window acquisition. Quoin also records panel create/configure/unmap and render
+drains. Compositor records distinguish scene projection, rendering, GPU retirement,
+page-flip waiting and capture readback/packing. Background submission cadence is
+separate from physical output presentation and encoded video frame rate.</p>
+<p>Render-graph markers additionally separate command recording from graph submission.
+The host <code>render_tail</code> and compositor <code>comp_render_finalize</code> stages start after
+the render graph and end after Bevy's render system. They include its final GPU
+submission, window presentation and screenshot collection: a long tail does not
+by itself identify a slow presentation call. Nested spans overlap; do not add
+their durations together as independent frame costs. GPU-submission wall time
+can include driver waits and is not a measurement of GPU execution time.</p>
+<p>The vendored wgpu observer adds <code>wgpu_queue_submit</code>, <code>wgpu_surface_configure</code>,
+<code>wgpu_surface_acquire</code> and <code>wgpu_surface_present</code>. These bracket the original API
+calls, including any waits; an end record is not a success receipt. Surface
+<code>subject</code> IDs are process-local and survive reconfiguration, while recreated
+surfaces receive new IDs. Queue submissions use subject zero, not a queue ID.
+The observer is installed only for enabled tracing and performs no log I/O.</p>
+<p>Host <code>host_window_surface</code> records link a Bevy window (<code>subject</code>, Entity bits)
+to a wgpu surface (<code>detail</code>). <code>host_window_submitted</code> counts acquired textures
+consumed by Bevy for presentation, not displayed frames. Quoin's
+<code>quoin_panel_window_{left,right,top,bottom}</code> markers identify the panel's Bevy
+window. <code>quoin_panel_set_margin</code>, <code>quoin_panel_set_size</code>,
+<code>quoin_panel_frame_request</code> and <code>quoin_panel_frame_done</code> use that same window
+identity. These short event spans count placement, size and callback activity;
+they do not measure UI content changes. Compare them against submissions to
+identify redraws coinciding with movement before deciding they are redundant.</p>
+<p>The observer's same-thread nesting is bounded to 16 API calls. Deeper nested
+calls are suppressed without closing an outer span. Calls acquired before the
+observer was installed may have surface identity zero. Do not combine IDs
+between processes or sessions, or treat the count of submissions as scanout.</p>
+<p>Logging uses bounded queues and non-blocking sends, with a roughly 65,536-record
+process budget. Inspect sequence gaps and dropped/capped fields before treating
+a trace as complete. Writer-thread I/O can block without blocking frame-thread
+sends; initial recorder setup and diagnostic schedule markers still have overhead.
+Exclude startup and compare a final tracing-disabled run. No text-entry or Bus
+request bodies are recorded.</p>
+<p><code>COSMIX_QUOIN_PRESENT_MODE=fifo</code> is the default. The experimental
+<code>auto-no-vsync</code> override changes all Quoin panel swapchains for a controlled
+acquisition-wait comparison. It does not change the compositor's physical scanout
+mode, remove GPU lifetime barriers or promise smooth presentation. Compare the
+same panel sequence and stable pinned panels with capture disabled first.</p>
+<p>For a useful stall investigation, compare a warmed-up hidden scene, each panel
+show/hide, one pinned panel and all four pinned panels. Repeat with identical
+scene quality settings, then change one setting at a time. Run capture as a
+separate comparison. A nominal 60 fps limit or 30 fps MP4 header does not establish
+fresh-frame delivery at that rate; use interval distributions and actual display
+or capture completion counts. Keep GPU ownership, retirement and frame-callback
+barriers intact while investigating waits.</p>
+<p>Additional flow diagnostics include OS <code>tid</code>, <code>wgpu_queue_submit_inner</code>,
+<code>wgpu_queue_deferred_actions</code>, and <code>wgpu_device_poll</code> (subject 0 = Poll,
+1 = Wait). The compositor prefixes these stages with <code>comp_</code>. Overlapping a
+queue call and another thread's device wait is correlation, not proof of lock
+contention. These observations do not remove or shorten any GPU lifetime barrier.</p>
+<p><code>host_window_wayland</code> maps Entity bits to a client-local Wayland surface wire
+ID, including when a panel's Wayland surface is recreated. <code>scene_frame_requested</code>
+and <code>quoin_frame_requested</code> record surface wire ID and callback wire ID;
+the corresponding <code>*_frame_received</code> records observe Rust event dispatch,
+not socket arrival or successful acceptance of a callback generation. Pair wire
+IDs with the client process and time because Wayland can reuse them.</p>
+<p>Compositor <code>comp_surface_client</code> records carry SurfaceId, surface wire ID and
+peer PID. <code>comp_surface_buffer</code> associates the surface with a process-local
+buffer ObjectId hash. <code>comp_buffer_retain</code>, <code>comp_buffer_drop_owner</code> and
+<code>comp_buffer_release_queued</code> follow ownership tokens; hashes are diagnostic
+correlation values, not security identities. Release-queued observations are
+protocol enqueue events, not explicit-sync signal completion. Likewise,
+<code>comp_callback_done_queued</code> means a callback was enqueued, not delivered.</p>
+<p>The <code>comp_pulse_{sent,skipped}_{busy,idle}</code> events expose the existing callback
+cadence decision. Subject is submission count; detail and aux are coordinator
+observed time and the previous deadline in microseconds. Their difference is
+deadline lateness in that clock domain. A skipped busy pulse alone does not
+establish a lost display frame; correlate it with actual callback dispatch and
+client submissions. Cadence and rendering policy are unchanged by these probes.</p></div></div>
     </div>
 
 </main>

@@ -1,5 +1,30 @@
 # Vendored upstream sources
 
+## calloop 0.14.4: composed-channel idle wakeups
+
+Imported from the crates.io `calloop-0.14.4.crate` archive, SHA-256
+`4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7`.
+Its `.cargo_vcs_info.json` records upstream commit
+`7e4d3ac507b0b49dea2bc3b92d7eb2cc54dcd168`. The desktop patch routes Smithay's
+0.14 dependency here; the separate 0.13 dependency remains unchanged.
+
+The sole runtime change is in `src/sources/channel.rs`: re-ping a bounded
+channel batch only when its ping callback actually ran. Composite event
+sources legitimately forward a readiness token to each child. A child whose
+token did not match previously mistook this for an exhausted batch and pinged
+itself. Two child channels could then wake each other indefinitely. The
+deferred libseat notifier exposed this as a busy compositor session thread.
+One trailing space in the upstream changelog was removed for the diff check.
+
+`composed_channels_do_not_ping_each_other_for_unrelated_tokens` reproduces
+the composite-source pattern without a seat or GPU: one queued message must
+produce exactly one readiness dispatch across eight nonblocking loop rounds.
+It failed with eight dispatches before the fix. Run the full unit and doctest
+suite with `cargo test --manifest-path vendor/calloop/Cargo.toml`; verify
+source routing with `cargo tree -i calloop@0.14.4`. On an upstream update,
+recheck this regression and remove the patch once the upstream channel has
+equivalent wrong-token behaviour.
+
 ## Bumping a vendored crate: the whole procedure, in order
 
 Everything below this section is *why*. This is *what*, and it is the part you
@@ -445,8 +470,9 @@ anything.
 | imported | 2026-08-07 |
 | licences | MIT OR Apache-2.0; both licence files retained in each directory |
 
-`vendor/wgpu` and `vendor/wgpu-core` are the published crates, with one narrow
-API pipeline added. Stock `Device::create_texture_from_hal` is unchanged and
+`vendor/wgpu` and `vendor/wgpu-core` are the published crates, with the narrow
+initial-usage API pipeline described here and the optional diagnostic addition
+below. Stock `Device::create_texture_from_hal` is unchanged and
 continues to seed `TextureUses::UNINITIALIZED`. The additive
 `create_texture_from_hal_with_initial_usage` path carries one caller-supplied
 `TextureUses` through wgpu's public device API and core backend into
@@ -455,12 +481,19 @@ continues to seed `TextureUses::UNINITIALIZED`. The additive
 offline noop/HAL regression can observe the patched state before encoding the
 first `RESOURCE` use. No wgpu-hal source is patched.
 
-The only patched upstream files are:
+The initial-usage patch changes these upstream files:
 
 - `vendor/wgpu/src/api/device.rs`
 - `vendor/wgpu/src/backend/wgpu_core.rs`
 - `vendor/wgpu-core/src/device/global.rs`
 - `vendor/wgpu-core/src/device/resource.rs`
+
+The separate 2026-09-08 diagnostic addition is documented in
+`vendor/wgpu/README.md`. It adds `src/diagnostics.rs`, exports it from `src/lib.rs`
+under `cfg(std)`, and brackets queue submit and surface configure/acquire/present
+in `src/api/{device,queue,surface,surface_texture}.rs`; `src/api/instance.rs` initialises
+the lazy surface identity. It changes no GPU commands or lifetime barriers.
+Keep the observer pairing/disabled-path tests when rebasing this addition.
 
 The compositor bridge is the sole new-API caller. Its raw Vulkan acquire ends
 in `SHADER_READ_ONLY_OPTIMAL`, so it supplies `TextureUses::RESOURCE`; first

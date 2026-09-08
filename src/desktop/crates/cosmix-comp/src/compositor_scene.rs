@@ -43,6 +43,32 @@ use crate::{
 
 pub(crate) const CLIENT_CONTENT_Z_MIN: f32 = 0.0;
 pub(crate) const CLIENT_CONTENT_Z_MAX: f32 = 900.0;
+/// Sticky protocol/cursor/asset/component revision, independent of capture subscribers.
+/// This is an extraction watermark, not proof that assets or pipelines settled.
+/// Overflow becomes unknown instead of making an old revision look current.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Resource, bevy::render::extract_resource::ExtractResource,
+)]
+pub(crate) struct SceneContentRevision(pub(crate) Option<u64>);
+
+impl Default for SceneContentRevision {
+    fn default() -> Self {
+        Self(Some(0))
+    }
+}
+
+impl SceneContentRevision {
+    pub(crate) fn advance(&mut self) {
+        self.0 = self.0.and_then(|value| value.checked_add(1));
+    }
+}
+
+fn mark_scene_changed(world: &mut World) {
+    if let Some(mut revision) = world.get_resource_mut::<SceneContentRevision>() {
+        revision.advance();
+    }
+}
+
 const CURSOR_Z: f32 = 950.0;
 const LOCK_BLANK_FALLBACK_Z: f32 = 925.0;
 const DEFAULT_CURSOR_WIDTH: u32 = 16;
@@ -220,6 +246,10 @@ pub(crate) enum SceneCursorMode {
 impl Plugin for CompositorScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SurfaceEntities>()
+            .init_resource::<SceneContentRevision>()
+            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
+                SceneContentRevision,
+            >::default())
             .init_resource::<NestedSecurityPresentation>()
             .init_resource::<LockBlankScene>()
             .init_resource::<ClientSamplingContractLog>()
@@ -239,6 +269,77 @@ impl Plugin for CompositorScenePlugin {
         if self.cursor_mode == SceneCursorMode::HostCursor {
             app.add_systems(Last, project_host_cursor);
         }
+        crate::render_asset_readiness::configure(app);
+        crate::render_asset_demand::configure(app);
+        crate::render_component_demand::configure(app);
+    }
+
+    fn finish(&self, app: &mut App) {
+        // A small nested preview can spend more CPU dispatching worker threads
+        // than executing its systems. Keep this opt-in for workload comparison.
+        if std::env::var("COSMIX_COMP_SERIAL_SCHEDULES").as_deref() == Ok("1") {
+            configure_serial_schedules(app);
+            tracing::info!("COMPOSITOR_SERIAL_SCHEDULES enabled");
+        }
+    }
+}
+
+fn configure_serial_schedules(app: &mut App) {
+    use bevy::ecs::schedule::{ScheduleLabel, SingleThreadedExecutor};
+    use bevy::render::{ExtractSchedule, Render, RenderApp};
+    for label in [
+        First.intern(),
+        PreUpdate.intern(),
+        Update.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+    if let Some(render) = app.get_sub_app_mut(RenderApp) {
+        render.edit_schedule(Render, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+        render.edit_schedule(ExtractSchedule, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+            // Extraction commands must remain deferred to the render world.
+            schedule.set_apply_final_deferred(false);
+        });
+    }
+}
+
+#[cfg(test)]
+mod serial_schedule_tests {
+    use super::configure_serial_schedules;
+    use bevy::{
+        app::SubApp,
+        prelude::*,
+        render::{ExtractSchedule, RenderApp},
+    };
+
+    #[test]
+    fn serial_preview_keeps_extraction_commands_deferred() {
+        #[derive(Resource)]
+        struct Extracted;
+        let mut app = App::new();
+        let mut render = SubApp::new();
+        render.init_schedule(ExtractSchedule);
+        render.add_systems(ExtractSchedule, |mut commands: Commands| {
+            commands.insert_resource(Extracted);
+        });
+        app.insert_sub_app(RenderApp, render);
+        configure_serial_schedules(&mut app);
+        app.sub_app_mut(RenderApp).world_mut().schedule_scope(
+            ExtractSchedule,
+            |world, schedule| {
+                schedule.run(world);
+                assert!(!world.contains_resource::<Extracted>());
+                schedule.apply_deferred(world);
+                assert!(world.contains_resource::<Extracted>());
+            },
+        );
     }
 }
 
@@ -636,8 +737,23 @@ fn log_settled_client_sampling_contracts(world: &mut World) {
 }
 
 fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
+    let _trace = crate::frame_trace::span("comp_protocol_batch", events.len() as u64);
     let mut z_ranks_dirty = false;
     for event in events {
+        if matches!(
+            &event,
+            ProtocolEvent::SecurityScene { .. }
+                | ProtocolEvent::OutputResized { .. }
+                | ProtocolEvent::SurfaceUpserted { .. }
+                | ProtocolEvent::SurfaceRelayout { .. }
+                | ProtocolEvent::SurfaceUnmapped { .. }
+                | ProtocolEvent::SurfaceDestroyed { .. }
+                | ProtocolEvent::CursorUpdated { .. }
+                | ProtocolEvent::DmabufBufferDestroyed { .. }
+                | ProtocolEvent::DmabufCacheInvalidated
+        ) {
+            mark_scene_changed(world);
+        }
         match event {
             ProtocolEvent::SecurityScene {
                 active,
@@ -689,6 +805,9 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                             .and_then(|surface| surface_damage_region(world, surface.layout))
                     })
                     .collect::<Vec<_>>();
+                if !stale.is_empty() {
+                    mark_scene_changed(world);
+                }
                 mark_base_regions(world, damage);
                 for id in stale {
                     z_ranks_dirty |= remove_surface(world, id);
@@ -862,6 +981,13 @@ fn refresh_retained_capture_cursor(world: &mut World) {
     world
         .resource_mut::<crate::capture::RetainedCaptureCursor>()
         .0 = snapshot;
+}
+
+#[cfg(feature = "hud-probe")]
+pub(crate) fn security_scene_active(world: &World) -> bool {
+    world
+        .get_resource::<LockBlankScene>()
+        .is_some_and(|scene| scene.entity.is_some())
 }
 
 fn apply_security_scene(
@@ -1082,7 +1208,10 @@ fn project_host_cursor(
 fn sample_cursor_position(world: &mut World, position: CursorPositionSnapshot) {
     let old = capture_cursor_damage_bounds(world);
     let changed = world.resource::<CursorScene>().position != position;
-    world.resource_mut::<CursorScene>().position = position;
+    if changed {
+        mark_scene_changed(world);
+        world.resource_mut::<CursorScene>().position = position;
+    }
     refresh_cursor_entity(world);
     if changed {
         mark_cursor_regions(world, old, capture_cursor_damage_bounds(world));
@@ -1380,6 +1509,20 @@ fn upsert_client_cursor(
         opaque,
     });
     cursor.selection = ProjectedCursorSelection::Surface;
+    // A SHM replacement can install a new GPU texture under the same Image
+    // handle. Re-extract the existing material for this content commit even
+    // when its sampling values compare equal on the next cursor refresh.
+    let entity = cursor.entity;
+    if let Some(handle) = entity.and_then(|entity| {
+        world
+            .get::<MeshMaterial2d<ClientSurfaceMaterial>>(entity)
+            .map(|material| material.0.clone())
+    }) && let Some(material) = world
+        .resource_mut::<Assets<ClientSurfaceMaterial>>()
+        .get_mut(&handle)
+    {
+        material.into_inner();
+    }
 }
 
 fn clear_client_cursor(world: &mut World) {
@@ -1427,15 +1570,15 @@ fn refresh_cursor_entity(world: &mut World) {
         return;
     };
     if !position.on_output {
-        if let Ok(mut cursor_entity) = world.get_entity_mut(entity) {
-            cursor_entity.insert(Visibility::Hidden);
+        if world.get_entity(entity).is_ok() {
+            set_cursor_component(world, entity, Visibility::Hidden);
         }
         return;
     }
     match selection {
         ProjectedCursorSelection::Hidden => {
-            if let Ok(mut cursor_entity) = world.get_entity_mut(entity) {
-                cursor_entity.insert(Visibility::Hidden);
+            if world.get_entity(entity).is_ok() {
+                set_cursor_component(world, entity, Visibility::Hidden);
             }
         }
         ProjectedCursorSelection::Default => {
@@ -1551,7 +1694,18 @@ fn refresh_cursor_entity(world: &mut World) {
                 world.resource::<LogicalCanvasSize>().0,
                 scale120,
             );
-            replace_cursor_with_client_material(world, entity, material, transform);
+            // Keep rebinding while external-image work is pending. Content
+            // commits also invalidate their material in upsert_client_cursor,
+            // including replacements which retain the same Image handle.
+            let force_rebind = world
+                .resource::<CursorScene>()
+                .client
+                .as_ref()
+                .is_some_and(|client| client.buffer_kind == SurfaceBufferKind::Dmabuf)
+                && world
+                    .get_resource::<ImportedDmabufImages>()
+                    .is_none_or(ImportedDmabufImages::has_pending_render_work);
+            replace_cursor_with_client_material(world, entity, material, transform, force_rebind);
         }
     }
 }
@@ -2500,12 +2654,24 @@ pub(crate) fn refresh_sprite_material(world: &mut World, entity: Entity, sprite:
     let material = world
         .get::<MeshMaterial2d<SpriteMaterial>>(entity)
         .map(|material| material.0.clone());
-    if let Some(material) = material
-        && let Some(mut current) = world
-            .resource_mut::<Assets<SpriteMaterial>>()
-            .get_mut(&material)
-    {
-        *current = SpriteMaterial::from_sprite_mesh(sprite.clone());
+    if let Some(material) = material {
+        let replacement = SpriteMaterial::from_sprite_mesh(sprite.clone());
+        let materials = world.resource::<Assets<SpriteMaterial>>();
+        if materials
+            .get(&material)
+            .is_some_and(|current| *current != replacement)
+        {
+            *world
+                .resource_mut::<Assets<SpriteMaterial>>()
+                .get_mut(&material)
+                .expect("compared sprite material still exists") = replacement;
+        }
+    }
+}
+
+fn set_cursor_component<T: Component + PartialEq>(world: &mut World, entity: Entity, value: T) {
+    if world.get::<T>(entity) != Some(&value) {
+        world.entity_mut(entity).insert(value);
     }
 }
 
@@ -2527,9 +2693,9 @@ fn replace_cursor_with_sprite(
         .entity_mut(entity)
         .remove::<(MeshMaterial2d<ClientSurfaceMaterial>, NoFrustumCulling)>();
     refresh_sprite_material(world, entity, &sprite);
-    world
-        .entity_mut(entity)
-        .insert((sprite, transform, Visibility::Inherited));
+    set_cursor_component(world, entity, sprite);
+    set_cursor_component(world, entity, transform);
+    set_cursor_component(world, entity, Visibility::Inherited);
 }
 
 fn replace_cursor_with_client_material(
@@ -2537,15 +2703,24 @@ fn replace_cursor_with_client_material(
     entity: Entity,
     material: ClientSurfaceMaterial,
     transform: Transform,
+    force_rebind: bool,
 ) {
     let handle = world
         .get::<MeshMaterial2d<ClientSurfaceMaterial>>(entity)
         .map(|material| material.0.clone());
     let handle = if let Some(handle) = handle {
-        *world
-            .resource_mut::<Assets<ClientSurfaceMaterial>>()
-            .get_mut(&handle)
-            .expect("client cursor owns its material asset") = material;
+        if force_rebind
+            || world
+                .resource::<Assets<ClientSurfaceMaterial>>()
+                .get(&handle)
+                .expect("client cursor owns its material asset")
+                != &material
+        {
+            *world
+                .resource_mut::<Assets<ClientSurfaceMaterial>>()
+                .get_mut(&handle)
+                .expect("compared client cursor material still exists") = material;
+        }
         handle
     } else {
         world
@@ -2555,14 +2730,14 @@ fn replace_cursor_with_client_material(
     let mesh = world.resource::<ClientSurfaceRenderAssets>().mesh();
     world
         .entity_mut(entity)
-        .remove::<(SpriteMesh, MeshMaterial2d<SpriteMaterial>)>()
-        .insert((
-            mesh,
-            MeshMaterial2d(handle),
-            NoFrustumCulling,
-            transform,
-            Visibility::Inherited,
-        ));
+        .remove::<(SpriteMesh, MeshMaterial2d<SpriteMaterial>)>();
+    set_cursor_component(world, entity, mesh);
+    set_cursor_component(world, entity, MeshMaterial2d(handle));
+    if world.get::<NoFrustumCulling>(entity).is_none() {
+        world.entity_mut(entity).insert(NoFrustumCulling);
+    }
+    set_cursor_component(world, entity, transform);
+    set_cursor_component(world, entity, Visibility::Inherited);
 }
 
 fn apply_surface_layout_to_client_material(
@@ -3495,6 +3670,153 @@ mod tests {
                 .get::<CursorIcon>(window)
                 .and_then(CursorIcon::as_system),
             Some(&SystemCursorIcon::Default)
+        );
+    }
+
+    #[test]
+    fn unchanged_cursor_samples_do_not_dirty_render_assets_or_components() {
+        for image in [
+            CursorImage::Default,
+            CursorImage::Hidden,
+            CursorImage::Surface {
+                id: ObjectId::null(),
+                hotspot: (2, 3),
+                presentation: CursorPresentation {
+                    width: 16.0,
+                    height: 20.0,
+                    source: None,
+                    transform: SurfaceTransform::Normal,
+                },
+                frame: Some(frame(0x80)),
+            },
+        ] {
+            let (mut app, _sender) = software_cursor_scene_app();
+            app.init_resource::<Assets<SpriteMaterial>>();
+            app.update();
+            let entity = app.world().resource::<CursorScene>().entity.unwrap();
+            let sprite = app.world().get::<SpriteMesh>(entity).unwrap().clone();
+            let handle = app
+                .world_mut()
+                .resource_mut::<Assets<SpriteMaterial>>()
+                .add(SpriteMaterial::from_sprite_mesh(sprite));
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(MeshMaterial2d(handle));
+            apply_cursor_image(app.world_mut(), image);
+            let position = CursorPositionSnapshot {
+                x: 24.0,
+                y: 32.0,
+                on_output: true,
+                revision: 1,
+            };
+            sample_cursor_position(app.world_mut(), position);
+            app.world_mut().clear_trackers();
+            for _ in 0..3 {
+                sample_cursor_position(app.world_mut(), position);
+            }
+            assert!(
+                !app.world()
+                    .get_resource_ref::<Assets<SpriteMaterial>>()
+                    .unwrap()
+                    .is_changed()
+            );
+            assert!(
+                !app.world()
+                    .get_resource_ref::<Assets<ClientSurfaceMaterial>>()
+                    .unwrap()
+                    .is_changed()
+            );
+            assert!(
+                !app.world()
+                    .get_resource_ref::<CursorScene>()
+                    .unwrap()
+                    .is_changed()
+            );
+            let cursor = app.world().entity(entity);
+            assert!(!cursor.get_ref::<Transform>().unwrap().is_changed());
+            assert!(!cursor.get_ref::<Visibility>().unwrap().is_changed());
+            if let Some(sprite) = cursor.get_ref::<SpriteMesh>() {
+                assert!(!sprite.is_changed());
+            }
+            if let Some(material) = cursor.get_ref::<MeshMaterial2d<ClientSurfaceMaterial>>() {
+                assert!(!material.is_changed());
+            }
+        }
+    }
+
+    #[test]
+    fn stationary_shm_cursor_content_replacement_invalidates_its_material() {
+        let (mut app, _sender) = software_cursor_scene_app();
+        app.update();
+        let image = |byte| CursorImage::Surface {
+            id: ObjectId::null(),
+            hotspot: (2, 3),
+            presentation: CursorPresentation {
+                width: 16.0,
+                height: 20.0,
+                source: None,
+                transform: SurfaceTransform::Normal,
+            },
+            frame: Some(frame(byte)),
+        };
+        apply_cursor_image(app.world_mut(), image(0x40));
+        let entity = app.world().resource::<CursorScene>().entity.unwrap();
+        let image_handle = app
+            .world()
+            .resource::<CursorScene>()
+            .client
+            .as_ref()
+            .unwrap()
+            .image
+            .clone();
+        let material_handle = app
+            .world()
+            .get::<MeshMaterial2d<ClientSurfaceMaterial>>(entity)
+            .unwrap()
+            .0
+            .clone();
+        let sampling = app
+            .world()
+            .resource::<Assets<ClientSurfaceMaterial>>()
+            .get(&material_handle)
+            .unwrap()
+            .clone();
+        app.world_mut().clear_trackers();
+        apply_cursor_image(app.world_mut(), image(0x80));
+        assert_eq!(
+            app.world()
+                .resource::<CursorScene>()
+                .client
+                .as_ref()
+                .unwrap()
+                .image,
+            image_handle
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<ClientSurfaceMaterial>>()
+                .get(&material_handle),
+            Some(&sampling)
+        );
+        assert!(
+            app.world()
+                .get_resource_ref::<Assets<ClientSurfaceMaterial>>()
+                .unwrap()
+                .is_changed()
+        );
+        assert!(
+            app.world()
+                .get_resource_ref::<Assets<Image>>()
+                .unwrap()
+                .is_changed()
+        );
+        app.world_mut().clear_trackers();
+        refresh_cursor_entity(app.world_mut());
+        assert!(
+            !app.world()
+                .get_resource_ref::<Assets<ClientSurfaceMaterial>>()
+                .unwrap()
+                .is_changed()
         );
     }
 
@@ -5068,6 +5390,75 @@ mod tests {
             "detached child position {detached_position:?} differs from authoritative layout \
              position {detached_expected:?}"
         );
+    }
+
+    #[test]
+    fn scene_revision_tracks_changes_without_any_capture_subscriber() {
+        let (mut app, sender) = software_cursor_scene_app();
+        app.update();
+        assert!(
+            !app.world()
+                .contains_resource::<crate::capture::OutputDamageJournal>()
+        );
+        let revision = |app: &App| app.world().resource::<SceneContentRevision>().0.unwrap();
+        let initial = revision(&app);
+        app.update();
+        assert_eq!(revision(&app), initial, "a quiet turn has no scene change");
+        let id = SurfaceId(1);
+        for event in [
+            ProtocolEvent::SurfaceUpserted {
+                id,
+                scene: scene(layout(1)),
+                frame: frame(3),
+            },
+            ProtocolEvent::SurfaceUpserted {
+                id,
+                scene: scene(layout(1)),
+                frame: frame(4),
+            },
+            ProtocolEvent::SurfaceRelayout {
+                id,
+                scene: scene(layout(2)),
+            },
+            ProtocolEvent::SurfaceRoster { mapped: Vec::new() },
+            ProtocolEvent::CursorUpdated {
+                image: CursorImage::Hidden,
+            },
+            ProtocolEvent::OutputResized {
+                width: 321,
+                height: 241,
+            },
+        ] {
+            let before = revision(&app);
+            publish(&mut app, &sender, vec![event]);
+            assert!(revision(&app) > before);
+        }
+        let before = revision(&app);
+        publish(
+            &mut app,
+            &sender,
+            vec![ProtocolEvent::SurfaceRoster { mapped: Vec::new() }],
+        );
+        assert_eq!(revision(&app), before, "an unchanged roster stays quiet");
+        let position = CursorPositionSnapshot {
+            x: 20.0,
+            y: 30.0,
+            on_output: true,
+            revision: 1,
+        };
+        sample_cursor_position(app.world_mut(), position);
+        assert!(
+            revision(&app) > before,
+            "cursor sampling is outside the event batch"
+        );
+        let before = revision(&app);
+        sample_cursor_position(app.world_mut(), position);
+        assert_eq!(revision(&app), before);
+        app.world_mut().resource_mut::<SceneContentRevision>().0 = Some(u64::MAX);
+        mark_scene_changed(app.world_mut());
+        assert_eq!(app.world().resource::<SceneContentRevision>().0, None);
+        mark_scene_changed(app.world_mut());
+        assert_eq!(app.world().resource::<SceneContentRevision>().0, None);
     }
 
     #[test]

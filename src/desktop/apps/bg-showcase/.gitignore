@@ -1,0 +1,4 @@
+# Runtime media and editable binary originals belong in the external library.
+assets/
+assets-src/*.blend
+assets-src/*.blend1

@@ -1,10 +1,13 @@
 [package]
 name = "cosmix-shell-host"
-version = "0.5.3"
+version = "0.6.5"
 description = "SCTK layer-shell renderer host for Cosmix Quoin"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+
+[features]
+scene-3d = ["bevy/bevy_pbr"]
 
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = [
@@ -29,6 +32,8 @@ bevy = { version = "=0.19.0", default-features = false, features = [
 ] }
 bevy_winit = { version = "=0.19.1", default-features = false, features = ["wayland"] }
 calloop = { version = "=0.13.0", features = ["signals"] }
+rustix = { version = "1", features = ["time", "thread"] }
+wgpu = { version = "=29.0.4", default-features = false, features = ["std"] }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
 cosmix-shell = { path = "../cosmix-shell", default-features = false, features = ["chrome"] }

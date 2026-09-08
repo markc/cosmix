@@ -217,6 +217,8 @@ pub enum BindingAction {
     ToggleInterception,
     /// Ask the live KMS coordinator to switch to one Linux VT.
     SwitchVt(u8),
+    /// Enqueue the explicitly configured F9 native Bus action.
+    SendBusKey,
 }
 
 impl BindingAction {
@@ -229,6 +231,7 @@ impl BindingAction {
             Self::ExitNestedCompositor => "ExitNestedCompositor",
             Self::ToggleInterception => "ToggleInterception",
             Self::SwitchVt(_) => "SwitchVt",
+            Self::SendBusKey => "SendBusKey",
         }
     }
 
@@ -445,9 +448,24 @@ pub struct BindingState {
     /// releases for every Smithay-pressed key through this same dispatch path,
     /// reconciling the intercepted and forwarded sets together.
     intercepted: HashSet<u32>,
+    bus_key_pressed: Option<u32>,
 }
 
 impl BindingState {
+    pub(crate) fn with_bus_key(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.table.bindings.push(Binding {
+                id: "bus-f9",
+                keysym: keysyms::KEY_F9,
+                keysym_name: "F9",
+                modifiers: ModifierPattern::exact(ModifierSet::NONE),
+                action: BindingAction::SendBusKey,
+                reserved: false,
+            });
+        }
+        self
+    }
+
     pub fn new(table: BindingTable, enabled: bool) -> Self {
         Self {
             table,
@@ -455,6 +473,7 @@ impl BindingState {
             #[cfg(feature = "bus")]
             profile: BindingProfile::Nested,
             intercepted: HashSet::new(),
+            bus_key_pressed: None,
         }
     }
 
@@ -471,6 +490,7 @@ impl BindingState {
                 #[cfg(feature = "bus")]
                 profile,
                 intercepted: HashSet::new(),
+                bus_key_pressed: None,
             },
         }
     }
@@ -511,6 +531,9 @@ impl BindingState {
         let raw_code = keycode.raw();
 
         if !pressed {
+            if self.bus_key_pressed == Some(raw_code) {
+                self.bus_key_pressed = None;
+            }
             // Release path. Swallow if and only if we swallowed the press,
             // regardless of what the modifiers look like now, and regardless
             // of whether interception has since been turned off.
@@ -521,6 +544,9 @@ impl BindingState {
             };
         }
 
+        if self.bus_key_pressed == Some(raw_code) {
+            return KeyDisposition::SwallowRelease;
+        }
         let Some(keysym) = keysym else {
             return KeyDisposition::Forward;
         };
@@ -529,6 +555,9 @@ impl BindingState {
         };
 
         let action = binding.action;
+        if action == BindingAction::SendBusKey {
+            self.bus_key_pressed = Some(raw_code);
+        }
         self.intercepted.insert(raw_code);
         KeyDisposition::Act(action)
     }
@@ -545,11 +574,17 @@ impl BindingState {
     ) -> KeyDisposition {
         let raw_code = keycode.raw();
         if !pressed {
+            if self.bus_key_pressed == Some(raw_code) {
+                self.bus_key_pressed = None;
+            }
             return if self.intercepted.remove(&raw_code) {
                 KeyDisposition::SwallowRelease
             } else {
                 KeyDisposition::Forward
             };
+        }
+        if self.bus_key_pressed == Some(raw_code) {
+            return KeyDisposition::SwallowRelease;
         }
         let Some(keysym) = keysym else {
             return KeyDisposition::Forward;
@@ -644,6 +679,91 @@ fn quoted_list(items: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bus_key_release_while_locked_rearms_after_unlock_without_locked_action() {
+        let key = Keycode::from(75_u32);
+        let sym = Some(Keysym::from(keysyms::KEY_F9));
+        let mods = ModifiersState::default();
+        let mut state = BindingState::for_profile(BindingProfile::KmsLive, true).with_bus_key(true);
+        assert_eq!(
+            state.dispatch(key, true, sym, &mods),
+            KeyDisposition::Act(BindingAction::SendBusKey)
+        );
+        assert_eq!(
+            state.dispatch_session_locked(key, true, sym, &mods),
+            KeyDisposition::SwallowRelease
+        );
+        assert_eq!(
+            state.dispatch_session_locked(key, false, sym, &mods),
+            KeyDisposition::SwallowRelease
+        );
+        assert_eq!(
+            state.dispatch_session_locked(key, true, sym, &mods),
+            KeyDisposition::Forward
+        );
+        assert_eq!(
+            state.dispatch_session_locked(key, false, sym, &mods),
+            KeyDisposition::Forward
+        );
+        assert_eq!(
+            state.dispatch(key, true, sym, &mods),
+            KeyDisposition::Act(BindingAction::SendBusKey)
+        );
+    }
+
+    #[test]
+    fn bus_key_is_opt_in_and_fires_once_until_release() {
+        let key = Keycode::from(75_u32);
+        let sym = Some(Keysym::from(keysyms::KEY_F9));
+        let mods = ModifiersState::default();
+        for profile in [BindingProfile::Nested, BindingProfile::KmsLive] {
+            let mut ordinary = BindingState::for_profile(profile, true);
+            assert_eq!(
+                ordinary.dispatch(key, true, sym, &mods),
+                KeyDisposition::Forward
+            );
+            let mut state = BindingState::for_profile(profile, true).with_bus_key(true);
+            assert_eq!(
+                state.dispatch(key, true, sym, &mods),
+                KeyDisposition::Act(BindingAction::SendBusKey)
+            );
+            assert_eq!(
+                state.dispatch(key, true, sym, &mods),
+                KeyDisposition::SwallowRelease
+            );
+            state.toggle_interception();
+            assert_eq!(
+                state.dispatch(key, true, sym, &mods),
+                KeyDisposition::SwallowRelease
+            );
+            assert_eq!(
+                state.dispatch(
+                    key,
+                    true,
+                    sym,
+                    &ModifiersState {
+                        shift: true,
+                        ..mods
+                    }
+                ),
+                KeyDisposition::SwallowRelease
+            );
+            assert_eq!(
+                state.dispatch(key, false, sym, &mods),
+                KeyDisposition::SwallowRelease
+            );
+            assert_eq!(
+                state.dispatch(key, true, sym, &mods),
+                KeyDisposition::Forward
+            );
+            state.toggle_interception();
+            assert_eq!(
+                state.dispatch(key, true, sym, &mods),
+                KeyDisposition::Act(BindingAction::SendBusKey)
+            );
+        }
+    }
 
     fn mods(logo: bool, shift: bool, ctrl: bool) -> ModifiersState {
         ModifiersState {
