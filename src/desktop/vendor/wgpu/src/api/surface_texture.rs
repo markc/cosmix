@@ -11,6 +11,8 @@ pub struct SurfaceTexture {
     /// Accessible view of the frame.
     pub texture: Texture,
     pub(crate) presented: bool,
+    #[cfg(std)]
+    pub(crate) diagnostic_surface: u64,
     pub(crate) detail: dispatch::DispatchSurfaceOutputDetail,
 }
 #[cfg(send_sync)]
@@ -19,6 +21,14 @@ static_assertions::assert_impl_all!(SurfaceTexture: Send, Sync);
 crate::cmp::impl_eq_ord_hash_proxy!(SurfaceTexture => .texture.inner);
 
 impl SurfaceTexture {
+    /// Process-local identity used by the optional diagnostic observer.
+    /// Returns zero when no identity was assigned at acquisition (normally
+    /// because diagnostics were inactive). Clones retain the same identity.
+    #[cfg(std)]
+    pub fn diagnostic_surface_id(&self) -> u64 {
+        self.diagnostic_surface
+    }
+
     /// Schedule this texture to be presented on the owning surface.
     ///
     /// Needs to be called after any work on the texture is scheduled via [`Queue::submit`].
@@ -29,6 +39,11 @@ impl SurfaceTexture {
     /// state. If it is desired to do things such as request a frame callback, scale the surface using the viewporter
     /// or synchronize other double buffered state, then these operations should be done before the call to `present`.
     pub fn present(mut self) {
+        #[cfg(std)]
+        let _diagnostic =
+            crate::diagnostics::begin(crate::diagnostics::Operation::SurfacePresent, || {
+                self.diagnostic_surface
+            });
         self.presented = true;
         self.detail.present();
     }

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "status": "local-preview; public mirror not provisioned",
+  "assets": [
+    {
+      "id": "polyhaven-coast-sand03-diffuse-4k",
+      "path": "source/coast_sand_03_diff_4k.png",
+      "creator": "Rob Tuytel / Poly Haven",
+      "license": "CC0-1.0",
+      "source_url": "https://polyhaven.com/a/coast_sand_03",
+      "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/4k/coast_sand_03/coast_sand_03_diff_4k.png",
+      "sha256": "85430514a874618b18fb061fdd4348d41f1cffbdc0dbe800c5a759e0b4a24e45"
+    },
+    {
+      "id": "polyhaven-coast-sand03-normal-4k",
+      "path": "source/coast_sand_03_nor_gl_4k.png",
+      "creator": "Rob Tuytel / Poly Haven",
+      "license": "CC0-1.0",
+      "source_url": "https://polyhaven.com/a/coast_sand_03",
+      "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/4k/coast_sand_03/coast_sand_03_nor_gl_4k.png",
+      "sha256": "c532c0f19eae860f2c8488fe5a395381efadd1cef18fd0a1f72ef2cb5095a472"
+    },
+    {
+      "id": "cosmix-coast-sand-colour-v1",
+      "path": "coast/sand-basecolor.png",
+      "creator": "Rob Tuytel / Poly Haven; resized by Cosmix",
+      "license": "CC0-1.0",
+      "derived_from": "polyhaven-coast-sand03-diffuse-4k",
+      "recipe": "assets-src/coast-materials.py",
+      "sha256": "76bfd79706851ec2619c3bd18aff3c9b5519acdd362a29255504982e0192ba30",
+      "dimensions": [1024, 1024]
+    },
+    {
+      "id": "cosmix-coast-sand-normal-v1",
+      "path": "coast/sand-normal.png",
+      "creator": "Rob Tuytel / Poly Haven; resized by Cosmix",
+      "license": "CC0-1.0",
+      "derived_from": "polyhaven-coast-sand03-normal-4k",
+      "recipe": "assets-src/coast-materials.py",
+      "sha256": "98fd33cd72399e328e4aa816c854c44685d56b8759f9052117e2a138901edb39",
+      "dimensions": [1024, 1024]
+    },
+    {
+      "id": "polyhaven-cape-hill-4k",
+      "path": "source/cape_hill_4k.exr",
+      "creator": "Greg Zaal / Poly Haven",
+      "license": "CC0-1.0",
+      "license_url": "https://polyhaven.com/license",
+      "source_url": "https://polyhaven.com/a/cape_hill",
+      "download_url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/4k/cape_hill_4k.exr",
+      "bytes": 20554471,
+      "sha256": "d517b87cea3ad2d175b3e3fd5ec9a06c99c482a7b889392cba0f3be09f71cdd1"
+    },
+    {
+      "id": "cosmix-coast-display-sky-v1",
+      "path": "coast/skybox.png",
+      "creator": "Greg Zaal / Poly Haven; cubemap conversion by Cosmix",
+      "license": "CC0-1.0",
+      "derived_from": "polyhaven-cape-hill-4k",
+      "recipe": "assets-src/coast-sky.py",
+      "tool": "Blender 5.2.1 LTS embedded Python",
+      "bytes": 3025757,
+      "sha256": "fbec5a388d9f7ad768f7376a1ea77db869e87ca539305ad1a89a1c0e2c6bfa86",
+      "dimensions": [512, 3072],
+      "description": "Tonemapped six-face visual cubemap, not HDR irradiance"
+    },
+    {
+      "id": "cosmix-kinetic-observatory-v1",
+      "path": "kinetic-observatory.glb",
+      "license": "CC0-1.0",
+      "creator": "Cosmix project",
+      "recipe": "assets-src/observatory.py",
+      "sha256": "3cc3bfecc6644d20164dc6f64835de891bf11c452ac83848b42fc5885fa2f8bb"
+    },
+    {
+      "id": "cosmix-celestial-engine-v1",
+      "path": "celestial-engine.glb",
+      "license": "CC0-1.0",
+      "creator": "Cosmix project",
+      "recipe": "assets-src/celestial.py",
+      "sha256": "1c7e8993996686376fb7385492cdfbaf2a4cb4e8b3c4d0f48771ecc80e719502"
+    }
+  ]
+}

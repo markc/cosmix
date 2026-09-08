@@ -1,4 +1,4 @@
-//! SPEC 12 §15.5 — broker reservation of property event topics.
+//! Broker reservation of property (SPEC 12 §15.5) and pointer event topics.
 //!
 //! The property substrate publishes record/audit events on
 //! per-service topics, but those topics are not free for any peer to
@@ -9,6 +9,9 @@
 //!   from the owning service
 //!   (`<svc>` of the topic prefix) — anyone else faking publishes
 //!   would let one daemon spoof another's audit stream.
+//! - `<svc>.pointer.changed` has the same owner-only publication rule and
+//!   remains publicly subscribable. Reserved public event deliveries carry
+//!   the broker-authenticated owning service in `broker_service`.
 //! - Direct `topic.subscribe` to the private records/audit topics is refused
 //!   from **every** peer including the owning service itself. Subscribers go
 //!   through the higher-level `<svc>.props.watch` /
@@ -55,15 +58,20 @@ pub(crate) fn reserved_owner(name: &str) -> Option<&str> {
     None
 }
 
-/// Owner of any property event topic whose publisher is authoritative. The
+/// Owner of any property or pointer event topic whose publisher is authoritative. The
 /// flat `<svc>.props.changed` topic remains directly subscribable; only its
 /// publish side is reserved. Record/audit topics retain their stricter grant
 /// rules through [`reserved_owner`].
 pub(crate) fn publisher_owner(name: &str) -> Option<&str> {
-    reserved_owner(name).or_else(|| {
-        name.strip_suffix(PUBLIC_CHANGED_SUFFIX)
-            .filter(|owner| !owner.is_empty())
-    })
+    reserved_owner(name)
+        .or_else(|| {
+            name.strip_suffix(".pointer.changed")
+                .filter(|owner| !owner.is_empty())
+        })
+        .or_else(|| {
+            name.strip_suffix(PUBLIC_CHANGED_SUFFIX)
+                .filter(|owner| !owner.is_empty())
+        })
 }
 
 /// True iff this peer may publish to `name`. Non-reserved topics
@@ -157,6 +165,21 @@ mod tests {
         assert_eq!(publisher_owner("interact.props.changed"), Some("interact"));
         assert_eq!(reserved_owner("interact.props.changed"), None);
         assert!(may_subscribe("interact.props.changed"));
+    }
+
+    #[test]
+    fn pointer_observation_is_publicly_subscribable_but_owner_published() {
+        assert_eq!(publisher_owner("comp.pointer.changed"), Some("comp"));
+        assert_eq!(
+            publisher_owner("comp.test.pointer.changed"),
+            Some("comp.test")
+        );
+        assert_eq!(publisher_owner(".pointer.changed"), None);
+        assert_eq!(reserved_owner("comp.pointer.changed"), None);
+        assert!(may_subscribe("comp.pointer.changed"));
+        assert!(may_publish("comp.pointer.changed", "comp"));
+        assert!(!may_publish("comp.pointer.changed", "wallpaper"));
+        assert!(!may_publish("comp.pointer.changed", "anon-42"));
     }
 
     #[test]

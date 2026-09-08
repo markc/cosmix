@@ -453,6 +453,28 @@ impl DmabufValidator {
 }
 
 impl ImportedDmabufImages {
+    /// Snapshot whether this owner has import, installation, retirement or
+    /// probe work requiring a render update. Does not drain requests, release
+    /// backings or change ownership. Retained Applied images are not work.
+    ///
+    /// This is not a renderer-wide idle certificate: callers must separately
+    /// account for GPU asset preparation, pipelines, scene damage and output
+    /// lifecycle, and recheck after new main-world work is admitted.
+    pub fn has_pending_render_work(&self) -> bool {
+        let imports = self
+            .0
+            .lock()
+            .expect("DMA-BUF import registry mutex poisoned");
+        imports.debug.pending_output_probe
+            || !imports.debug.pending_sample_probes.is_empty()
+            || has_import_render_work(
+                &imports.active,
+                &imports.retired,
+                &imports.ownership_retired,
+                &imports.local_owned,
+            )
+    }
+
     /// Enable sealed live-path diagnostics before the first DMA-BUF is registered.
     ///
     /// Callers deliberately supply the switches instead of this library reading
@@ -1507,6 +1529,22 @@ fn releasable_retired_backings<T>(
         })
         .map(|imported| Arc::clone(&imported.backing))
         .collect()
+}
+
+fn has_import_render_work<T>(
+    active: &HashMap<AssetId<Image>, ImportState<ImportedUse<T>>>,
+    retired: &HashMap<AssetId<Image>, Vec<ImportedUse<T>>>,
+    ownership_retired: &[ImportedUse<T>],
+    local_owned: &HashSet<usize>,
+) -> bool {
+    active
+        .values()
+        .any(|state| matches!(state, ImportState::Pending(_) | ImportState::Imported(_)))
+        || retired.values().any(|backings| !backings.is_empty())
+        || ownership_retired.iter().any(|imported| {
+            let identity = Arc::as_ptr(&imported.backing) as usize;
+            local_owned.contains(&identity) && !active_retains_backing(active, identity)
+        })
 }
 
 fn take_retired_for_backings<T>(
@@ -2942,6 +2980,100 @@ mod tests {
             Some("previous texture")
         );
         assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_work_query_preserves_imports_probes_and_release_callbacks() {
+        let imports = ImportedDmabufImages::default();
+        assert!(!imports.has_pending_render_work());
+        imports.0.lock().unwrap().debug.pending_output_probe = true;
+        for _ in 0..3 {
+            assert!(imports.has_pending_render_work());
+        }
+        assert!(imports.take_output_probe_request());
+        assert!(!imports.has_pending_render_work());
+        let released = Arc::new(AtomicUsize::new(0));
+        let callback = released.clone();
+        let handle = imports
+            .import(
+                &mut Assets::<Image>::default(),
+                DmabufBufferId(70),
+                true,
+                dummy_descriptor(),
+                DmabufRelease::Explicit(Box::new(move || {
+                    callback.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .unwrap();
+        for _ in 0..3 {
+            assert!(imports.has_pending_render_work());
+        }
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            imports.0.lock().unwrap().active.get(&handle.id()),
+            Some(ImportState::Pending(_))
+        ));
+        imports.unregister(&handle);
+        assert!(!imports.has_pending_render_work());
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn settled_applied_backings_do_not_count_as_pending_render_work() {
+        let id = AssetId::<Image>::default();
+        let backing = Arc::new(7_usize);
+        let owned = HashSet::from([Arc::as_ptr(&backing) as usize]);
+        let make_use = || {
+            ImportedUse::new(
+                backing.clone(),
+                ReleaseLease::new(DmabufRelease::Explicit(Box::new(|| {}))),
+            )
+        };
+        let mut active = HashMap::from([(
+            id,
+            ImportState::Imported(ReadyImport {
+                current: make_use(),
+                previous: None,
+                newly_imported: true,
+                probe_after_acquire: false,
+            }),
+        )]);
+        let mut retired = HashMap::new();
+        assert!(has_import_render_work(&active, &retired, &[], &owned));
+        let (applied, displaced) = apply_import_state(active.remove(&id).unwrap());
+        assert!(displaced.is_empty());
+        active.insert(id, applied);
+        assert!(!has_import_render_work(&active, &retired, &[], &owned));
+        let awaiting_release = vec![make_use()];
+        assert!(!has_import_render_work(
+            &active,
+            &retired,
+            &awaiting_release,
+            &owned
+        ));
+        let retained = active.remove(&id).unwrap();
+        for _ in 0..3 {
+            assert!(has_import_render_work(
+                &active,
+                &retired,
+                &awaiting_release,
+                &owned
+            ));
+        }
+        assert_eq!(awaiting_release.len(), 1);
+        assert_eq!(owned.len(), 1);
+        assert!(!has_import_render_work(
+            &active,
+            &retired,
+            &awaiting_release,
+            &HashSet::new()
+        ));
+        retired.insert(id, vec![make_use()]);
+        assert!(has_import_render_work(&active, &retired, &[], &owned));
+        retired.get_mut(&id).unwrap().clear();
+        active.insert(id, ImportState::Idle);
+        assert!(!has_import_render_work(&active, &retired, &[], &owned));
+        drop(retained);
     }
 
     #[derive(Resource)]

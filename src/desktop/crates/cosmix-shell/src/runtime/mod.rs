@@ -15,5 +15,6 @@ pub use semantic::{ShellSemanticVerb, semantic_shell_command};
 
 #[cfg(feature = "chrome-core")]
 pub use bevy_runtime::{
-    ShellEffects, ShellFrameState, ShellRuntimePlugin, ShellRuntimeSet, replace_shell_model,
+    ShellEffects, ShellFrameState, ShellQuitHandler, ShellRuntimePlugin, ShellRuntimeSet,
+    replace_shell_model,
 };

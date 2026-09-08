@@ -145,7 +145,12 @@ fn activate(
     state.label = Some(format!("Starting {}…", app.label()));
 }
 
-fn start_request(mut state: ResMut<LauncherState>, wake: Res<LayerHostWake>) {
+fn start_request(mut state: ResMut<LauncherState>, wake: Option<Res<LayerHostWake>>) {
+    // A compositor host continuously advances its shared scene. Only the
+    // standalone reactive layer host needs the calloop wake callback.
+    let wake_callback: Arc<dyn Fn() + Send + Sync> = wake
+        .map(|wake| wake.callback())
+        .unwrap_or_else(|| Arc::new(|| {}));
     for app in LauncherApp::ALL {
         let state = &mut state.apps[app as usize];
         if !std::mem::take(&mut state.requested) {
@@ -158,26 +163,26 @@ fn start_request(mut state: ResMut<LauncherState>, wake: Res<LayerHostWake>) {
                 eprintln!("QUOIN_LAUNCH_FAILED app={command} error={error}");
                 state.busy = false;
                 state.label = Some(error);
-                (wake.callback())();
+                wake_callback();
                 continue;
             }
         };
         let feedback = state.feedback.clone();
-        let wake_callback = wake.callback();
+        let worker_wake = wake_callback.clone();
         let result = std::thread::Builder::new()
             .name("quoin-launcher".into())
             .spawn(move || {
                 let result = run_launcher(app, &argv, || {
-                    send_feedback(&feedback, &*wake_callback, LaunchFeedback::Started);
+                    send_feedback(&feedback, &*worker_wake, LaunchFeedback::Started);
                 });
-                send_feedback(&feedback, &*wake_callback, LaunchFeedback::Finished(result));
+                send_feedback(&feedback, &*worker_wake, LaunchFeedback::Finished(result));
             });
         if let Err(error) = result {
             state.busy = false;
             state.label = Some(format!("Could not start launcher worker: {error}"));
             eprintln!("QUOIN_LAUNCH_FAILED app={command} error={error}");
         }
-        (wake.callback())();
+        wake_callback();
     }
 }
 

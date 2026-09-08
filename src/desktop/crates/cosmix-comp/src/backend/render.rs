@@ -467,6 +467,7 @@ struct OutputFrameSource {
     current_ready_generation: Option<u64>,
     next_frame_token: u64,
     pending_frame_token: Option<u64>,
+    pending_scene_revision: Option<u64>,
     pending_present: Option<PresentOutputFrame>,
     pending_security_presentations: Vec<(u64, crate::protocol::SecurityPresentationTarget)>,
     pending_capture_presentations: Vec<crate::capture::PendingCapturePresentation>,
@@ -478,6 +479,7 @@ struct AcquiredOutputPresenter {
     key: OutputKey,
     generation: u64,
     frame_token: u64,
+    scene_revision: Option<u64>,
     present: PresentOutputFrame,
     security_presentations: Vec<(u64, crate::protocol::SecurityPresentationTarget)>,
     capture_presentations: Vec<crate::capture::PendingCapturePresentation>,
@@ -500,6 +502,11 @@ pub(crate) enum KmsRenderFrameEvent {
         generation: u64,
         key: OutputKey,
         frame_token: u64,
+        /// Protocol/cursor revision sampled at extraction, bound at acquire.
+        /// Does not certify that asynchronous assets or pipelines are ready.
+        scene_revision: Option<u64>,
+        asset_preparation: Option<crate::render_asset_readiness::AssetPreparationSnapshot>,
+        pipeline_readiness: Option<crate::render_pipeline_readiness::PipelineReadinessSnapshot>,
         timestamp: KmsPresentationTimestamp,
         security_epochs: Vec<u64>,
     },
@@ -519,6 +526,8 @@ pub(crate) struct KmsRenderTargets {
     frame_events: Option<Sender<KmsRenderFrameEvent>>,
     present_deadline: PresentDeadline,
     capture_reporter: Option<crate::protocol::CaptureCompletionReporter>,
+    asset_preparation: Option<crate::render_asset_readiness::AssetPreparationSnapshot>,
+    pipeline_readiness: Option<crate::render_pipeline_readiness::PipelineReadinessSnapshot>,
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     destructive_quiescence: Option<DestructiveQuiescenceLatch>,
 }
@@ -533,6 +542,8 @@ impl KmsRenderTargets {
             frame_events: None,
             present_deadline,
             capture_reporter: None,
+            asset_preparation: None,
+            pipeline_readiness: None,
             #[cfg(any(all(feature = "kms-live", not(test)), test))]
             destructive_quiescence: None,
         }
@@ -762,6 +773,42 @@ fn assert_non_pipelined_rendering(app: &App) -> Result<(), super::kms_live::KmsL
     Ok(())
 }
 
+/// Dispatch the live compositor's ECS systems serially. Explicit parallel
+/// preparation tasks remain available, while small systems no longer require
+/// a worker wake-up for every dependency edge. This changes neither the KMS
+/// update cadence nor the extraction/presentation ownership barriers.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn configure_live_schedule_dispatch(app: &mut App) {
+    use bevy::{
+        app::{First, Last, PostUpdate, PreUpdate, Update},
+        ecs::schedule::{ScheduleLabel, SingleThreadedExecutor},
+        render::ExtractSchedule,
+    };
+
+    for label in [
+        First.intern(),
+        PreUpdate.intern(),
+        Update.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+    if let Some(render) = app.get_sub_app_mut(RenderApp) {
+        render.edit_schedule(Render, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+        render.edit_schedule(ExtractSchedule, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+            // Executor replacement resets this flag. Keep extraction commands
+            // deferred until Render's ExtractCommands stage owns the world.
+            schedule.set_apply_final_deferred(false);
+        });
+    }
+}
+
 #[cfg(all(feature = "kms-live", not(test)))]
 fn build_live_render_app(
     renderer: cosmix_wgpu_dmabuf::ManualVulkanRenderer,
@@ -783,11 +830,18 @@ fn build_live_render_app(
     crate::frame_capture::install_from_environment(&mut app)
         .map_err(|error| super::kms_live::KmsLiveError::Setup(error.to_string()))?;
     install_live_scene(&mut app, scene_mode);
+    #[cfg(feature = "hud-probe")]
+    if scene_mode == LiveSceneMode::ClientContent {
+        hud_probe::install_from_environment(&mut app);
+    }
     app.insert_resource(FirstLiveRenderError::default())
         .insert_resource(RenderErrorHandler(stop_live_rendering_after_first_error));
     assert_non_pipelined_rendering(&app)?;
     app.finish();
     app.cleanup();
+    configure_live_schedule_dispatch(&mut app);
+    crate::frame_trace::install_render_phases(&mut app);
+    idle::configure(&mut app);
     tracing::info!(?scene_mode, "live headless Bevy App built");
     Ok(app)
 }
@@ -830,6 +884,7 @@ fn configure_live_dmabuf_debug(app: &mut App) {
     if !no_cache && !probe {
         return;
     }
+    app.insert_resource(idle::ContinuousRendering);
 
     app.world()
         .resource::<ImportedDmabufImages>()
@@ -1091,12 +1146,44 @@ fn stop_live_rendering_after_first_error(
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-fn update_live_app(app: &mut App) -> Result<(), super::kms_live::KmsLiveError> {
+fn update_live_app(app: &mut App) -> Result<LiveUpdateExecution, super::kms_live::KmsLiveError> {
+    update_live_app_with_idle(app, None)
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[path = "render_idle.rs"]
+mod idle;
+
+#[cfg(feature = "hud-probe")]
+#[path = "render_hud_probe.rs"]
+mod hud_probe;
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn update_live_app_with_idle(
+    app: &mut App,
+    output: Option<(&OutputKey, u64)>,
+) -> Result<LiveUpdateExecution, super::kms_live::KmsLiveError> {
+    let _trace = crate::frame_trace::span("comp_update", 0);
     // Production invariant: every full live update routes through this
     // function so renderer exit remains observable at the pump boundary.
-    app.update();
+    run_live_main_schedule(app);
+    let demand_revision = app
+        .world()
+        .get_resource::<crate::compositor_scene::SceneContentRevision>()
+        .and_then(|revision| revision.0);
+    let execution = if output
+        .is_some_and(|(key, generation)| idle::eligible(app, key, generation, demand_revision))
+    {
+        idle::finish_idle_update(app)?;
+        LiveUpdateExecution::HealthyIdle {
+            demand_revision: demand_revision.expect("idle requires known demand"),
+        }
+    } else {
+        finish_live_subapp_update(app);
+        LiveUpdateExecution::FullRender { demand_revision }
+    };
     let Some(exit) = app.should_exit() else {
-        return Ok(());
+        return Ok(execution);
     };
     let detail = app
         .world()
@@ -1113,14 +1200,123 @@ fn update_live_app(app: &mut App) -> Result<(), super::kms_live::KmsLiveError> {
     Err(super::kms_live::KmsLiveError::Setup(reason))
 }
 
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn run_live_main_schedule(app: &mut App) {
+    let _trace = crate::frame_trace::span("comp_main", 0);
+    // Keep protocol, capture admission and scene projection ahead of render
+    // extraction. SubApp::update would clear removals before extraction sees
+    // them; run_default_schedule deliberately retains those trackers.
+    app.main_mut().run_default_schedule();
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn finish_live_subapp_update(app: &mut App) {
+    // Match Bevy 0.19.1 SubApps::update ordering. Every sub-app still runs;
+    // separating the phases alone does not enable render skipping.
+    let apps = app.sub_apps_mut();
+    for sub_app in apps.sub_apps.values_mut() {
+        let trace = crate::frame_trace::span("comp_extract", 0);
+        sub_app.extract(apps.main.world_mut());
+        drop(trace);
+        let _trace = crate::frame_trace::span("comp_render", 0);
+        sub_app.update();
+    }
+    apps.main.world_mut().clear_trackers();
+}
+
 #[cfg(test)]
 pub(crate) type LiveRenderAdapter = LiveRenderEngine;
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LiveOutputRegistration {
     Pending,
-    Ready,
+    Ready { generation: u64, key: OutputKey },
+}
+
+/// Correlation is scoped to a ready output generation; its first sequence is 1.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LiveUpdateToken {
+    pub(crate) generation: u64,
+    pub(crate) key: OutputKey,
+    pub(crate) sequence: u64,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+impl LiveUpdateToken {
+    pub(crate) fn validate(&self, expected: &Self) -> Result<(), super::kms_live::KmsLiveError> {
+        let mismatch = if self.generation != expected.generation {
+            Some("kms-live-stale-generation")
+        } else if self.key != expected.key {
+            Some("kms-live-stale-output")
+        } else if self.sequence == 0 || self.sequence != expected.sequence {
+            Some("kms-live-stale-service-sequence")
+        } else {
+            None
+        };
+        if let Some(code) = mismatch {
+            return Err(super::kms_live::KmsLiveError::Setup(format!(
+                "{code}: update token {self:?} does not match expected {expected:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveUpdateExecution {
+    /// A complete Main/extract/render update ran; this does not imply a flip.
+    FullRender { demand_revision: Option<u64> },
+    /// Main completed and current presentation evidence permitted render skipping.
+    HealthyIdle { demand_revision: u64 },
+    /// Lifecycle/terminal work or a raced event prevented a healthy service report.
+    NotServiced,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Debug)]
+pub(crate) struct LiveUpdateReport {
+    pub(crate) token: LiveUpdateToken,
+    pub(crate) execution: LiveUpdateExecution,
+    pub(crate) frame_events: Vec<KmsRenderFrameEvent>,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Default, bevy::prelude::Resource)]
+struct LiveUpdateSequence {
+    generation: u64,
+    sequence: u64,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+impl LiveUpdateSequence {
+    fn claim(
+        &mut self,
+        token: &LiveUpdateToken,
+        generation: u64,
+        key: &OutputKey,
+    ) -> Result<(), super::kms_live::KmsLiveError> {
+        let sequence = if self.generation == generation {
+            self.sequence.checked_add(1)
+        } else {
+            Some(1)
+        }
+        .ok_or_else(|| {
+            super::kms_live::KmsLiveError::Setup(
+                "kms-live-service-sequence-exhausted: update sequence cannot wrap".into(),
+            )
+        })?;
+        token.validate(&LiveUpdateToken {
+            generation,
+            key: key.clone(),
+            sequence,
+        })?;
+        self.generation = generation;
+        self.sequence = sequence;
+        Ok(())
+    }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -1128,7 +1324,7 @@ pub(crate) enum LiveOutputRegistration {
 pub(crate) enum PumpReply {
     Started(Result<(), super::kms_live::KmsLiveError>),
     Registration(Result<LiveOutputRegistration, super::kms_live::KmsLiveError>),
-    Updated(Result<Vec<KmsRenderFrameEvent>, super::kms_live::KmsLiveError>),
+    Updated(Result<LiveUpdateReport, super::kms_live::KmsLiveError>),
     #[allow(dead_code)]
     TransitionBegun {
         generation: u64,
@@ -1155,22 +1351,51 @@ pub(crate) enum PumpReply {
 trait LivePumpUpdater {
     fn update_for_pump(
         &mut self,
-    ) -> Result<Vec<KmsRenderFrameEvent>, super::kms_live::KmsLiveError>;
+        token: LiveUpdateToken,
+    ) -> Result<LiveUpdateReport, super::kms_live::KmsLiveError>;
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl LivePumpUpdater for LiveRenderEngine {
     fn update_for_pump(
         &mut self,
-    ) -> Result<Vec<KmsRenderFrameEvent>, super::kms_live::KmsLiveError> {
-        self.update()?;
-        Ok(self.drain_frame_events())
+        token: LiveUpdateToken,
+    ) -> Result<LiveUpdateReport, super::kms_live::KmsLiveError> {
+        let app = self
+            .app
+            .as_mut()
+            .expect("live app exists while claiming update");
+        app.init_resource::<LiveUpdateSequence>();
+        app.world_mut().resource_mut::<LiveUpdateSequence>().claim(
+            &token,
+            self.generation,
+            &self.output,
+        )?;
+        let mut execution = self.update()?;
+        let frame_events = self.drain_frame_events();
+        if matches!(execution, LiveUpdateExecution::HealthyIdle { .. }) && !frame_events.is_empty()
+        {
+            execution = LiveUpdateExecution::NotServiced;
+        }
+        idle::observe_presentations(
+            self.app.as_mut().expect("live app"),
+            execution,
+            &frame_events,
+        )?;
+        Ok(LiveUpdateReport {
+            token,
+            execution,
+            frame_events,
+        })
     }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-fn live_pump_update_reply(current: &mut impl LivePumpUpdater) -> (PumpReply, bool) {
-    let result = current.update_for_pump();
+fn live_pump_update_reply(
+    current: &mut impl LivePumpUpdater,
+    token: LiveUpdateToken,
+) -> (PumpReply, bool) {
+    let result = current.update_for_pump(token);
     let failed = result.is_err();
     (PumpReply::Updated(result), failed)
 }
@@ -1462,7 +1687,10 @@ impl LiveRenderEngine {
         &mut self,
     ) -> Result<LiveOutputRegistration, super::kms_live::KmsLiveError> {
         if self.output_ready {
-            return Ok(LiveOutputRegistration::Ready);
+            return Ok(LiveOutputRegistration::Ready {
+                generation: self.generation,
+                key: self.output.clone(),
+            });
         }
         let output = self.output.clone();
         let app = self
@@ -1502,30 +1730,34 @@ impl LiveRenderEngine {
             )));
         }
         Ok(if self.output_ready {
-            LiveOutputRegistration::Ready
+            LiveOutputRegistration::Ready {
+                generation: self.generation,
+                key: self.output.clone(),
+            }
         } else {
             LiveOutputRegistration::Pending
         })
     }
 
     #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn update(&mut self) -> Result<(), super::kms_live::KmsLiveError> {
+    pub(crate) fn update(&mut self) -> Result<LiveUpdateExecution, super::kms_live::KmsLiveError> {
         let output = self.output.clone();
         let full_update = self.full_update_allowed();
-        {
+        let execution = {
             let app = self
                 .app
                 .as_mut()
                 .expect("live Bevy app exists while pumping");
             if full_update {
-                #[cfg(all(feature = "kms-live", not(test)))]
-                update_live_app(app)?;
-                #[cfg(not(all(feature = "kms-live", not(test))))]
-                update_live_app(app)?;
+                update_live_app_with_idle(
+                    app,
+                    self.output_ready.then_some((&output, self.generation)),
+                )?
             } else {
                 Self::run_registrar_only(app)?;
+                LiveUpdateExecution::NotServiced
             }
-        }
+        };
         if full_update {
             self.observe_destructive_quiescence()?;
         }
@@ -1553,7 +1785,7 @@ impl LiveRenderEngine {
                 "live render registrar stopped while frames were being pumped".into(),
             ));
         }
-        Ok(())
+        Ok(execution)
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -2139,7 +2371,7 @@ enum PumpCommand {
         scene_feed: Option<Box<ClientSceneFeed>>,
     },
     PollRegistration,
-    Update,
+    Update(LiveUpdateToken),
     #[allow(dead_code)]
     BeginTransition(Vec<super::kms::KmsRenderCommand>),
     #[allow(dead_code)]
@@ -2480,8 +2712,11 @@ impl LiveRenderPump {
     }
 
     #[cfg(all(feature = "kms-live", not(test)))]
-    pub(crate) fn update(&self) -> Result<(), super::kms_live::KmsLiveError> {
-        self.send_command(PumpCommand::Update)
+    pub(crate) fn update(
+        &self,
+        token: LiveUpdateToken,
+    ) -> Result<(), super::kms_live::KmsLiveError> {
+        self.send_command(PumpCommand::Update(token))
     }
 
     #[cfg(all(feature = "kms-live", not(test)))]
@@ -2867,11 +3102,11 @@ fn run_live_render_pump(
                     break;
                 }
             }
-            PumpCommand::Update => {
+            PumpCommand::Update(token) => {
                 let current = engine
                     .as_mut()
                     .expect("live render engine starts before updates");
-                let (reply, failed) = live_pump_update_reply(current);
+                let (reply, failed) = live_pump_update_reply(current, token);
                 send_pump_reply(&coordinator, reply)?;
                 if failed {
                     break;
@@ -3769,6 +4004,7 @@ impl LiveAtomicOwnership {
                 Ok(AcquiredOutputFrame {
                     view,
                     present: fallible_present_output_frame(move |_present_deadline| {
+                        let _trace = crate::frame_trace::span("comp_present", generation);
                         let mut unpresented_guard = unpresented_guard;
                         let wall_started = Instant::now();
                         let cpu_started = thread_cpu_time();
@@ -3785,7 +4021,10 @@ impl LiveAtomicOwnership {
                         // conditional trigger never fired. Wayland
                         // linux-drm-syncobj client sync is separate and IS
                         // implemented.
-                        if let Err(error) = state.pool.prove_rendering_complete(slot) {
+                        let trace = crate::frame_trace::span("comp_gpu_complete", generation);
+                        let complete = state.pool.prove_rendering_complete(slot);
+                        drop(trace);
+                        if let Err(error) = complete {
                             // The pool already moved a timed-out Rendering
                             // slot to HeldUntilSuspend; do not record it for a
                             // second post-retirement transition.
@@ -3802,7 +4041,9 @@ impl LiveAtomicOwnership {
                             .queue(slot)
                             .map_err(|error| atomic_platform_failure("slot queue", error))?;
                         unpresented_guard.disarm();
+                        let trace = crate::frame_trace::span("comp_pageflip", generation);
                         let outcome = state.presenter.present(slot, generation, deadline);
+                        drop(trace);
                         if matches!(outcome, Ok(PresentOutcome::Displayed)) {
                             let timestamp = state.presenter.take_displayed_timestamp().map(
                                 |(seconds, nanoseconds)| KmsPresentationTimestamp {
@@ -4340,7 +4581,7 @@ fn configure_render_app(
     render_app
         .insert_resource(targets)
         .insert_resource(KmsRenderCommands {
-            commands: Mutex::new(render_commands),
+            commands: Mutex::new(render_commands.into()),
             releases,
             quiescences,
         })
@@ -4368,6 +4609,15 @@ fn configure_render_app(
         )
         .add_systems(
             Render,
+            observe_pipeline_readiness
+                .after(RenderSystems::Render)
+                .after(render_system)
+                .after(crate::capture::CaptureRenderSet)
+                .after(clear_unwritten_output_frames)
+                .before(present_output_frames),
+        )
+        .add_systems(
+            Render,
             present_output_frames.after(clear_unwritten_output_frames),
         )
         .add_systems(
@@ -4386,7 +4636,10 @@ fn refresh_output_readiness(
         source.current_ready_generation = views
             .iter()
             .any(|(camera, _)| {
-                camera.target == Some(NormalizedRenderTarget::TextureView(source.handle))
+                // Order zero is the final client/HUD view. The optional native
+                // 3D underlay (-1) must not independently admit an output.
+                camera.order == 0
+                    && camera.target == Some(NormalizedRenderTarget::TextureView(source.handle))
             })
             .then_some(source.generation);
     }
@@ -4396,6 +4649,7 @@ fn acquire_output_frames(
     mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
     mut views: bevy::prelude::ResMut<ManualTextureViews>,
     security_presentations: Option<bevy::prelude::Res<NestedSecurityPresentation>>,
+    scene_revision: Option<bevy::prelude::Res<crate::compositor_scene::SceneContentRevision>>,
 ) {
     match targets.lifecycle.state() {
         KmsRenderLifecycleState::Active => {}
@@ -4509,6 +4763,7 @@ fn acquire_output_frames(
         source.pending_resume_first_flip = resume_first_flip;
         source.pending_presentation_timestamp = Some(presentation_timestamp);
         source.pending_frame_token = Some(frame_token);
+        source.pending_scene_revision = scene_revision.as_ref().and_then(|revision| revision.0);
     }
 }
 
@@ -4639,9 +4894,46 @@ enum RenderWorldCommand {
 
 #[derive(Resource)]
 struct KmsRenderCommands {
-    commands: Mutex<Receiver<RenderWorldCommand>>,
+    commands: Mutex<PeekableRenderCommands>,
     releases: KmsRenderInputSender<KmsRenderRelease>,
     quiescences: KmsRenderInputSender<KmsRenderQuiescence>,
+}
+
+struct PeekableRenderCommands {
+    receiver: Receiver<RenderWorldCommand>,
+    pending: Option<RenderWorldCommand>,
+}
+
+impl From<Receiver<RenderWorldCommand>> for PeekableRenderCommands {
+    fn from(receiver: Receiver<RenderWorldCommand>) -> Self {
+        Self {
+            receiver,
+            pending: None,
+        }
+    }
+}
+
+impl PeekableRenderCommands {
+    fn try_recv(&mut self) -> Result<RenderWorldCommand, TryRecvError> {
+        self.pending
+            .take()
+            .map_or_else(|| self.receiver.try_recv(), Ok)
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn has_pending(&mut self) -> bool {
+        if self.pending.is_some() {
+            return true;
+        }
+        match self.receiver.try_recv() {
+            Ok(command) => {
+                self.pending = Some(command);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => true,
+        }
+    }
 }
 
 impl Drop for KmsRenderCommands {
@@ -5376,7 +5668,7 @@ fn apply_render_world_commands(
     mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
     mut views: bevy::prelude::ResMut<ManualTextureViews>,
 ) {
-    let Ok(command_receiver) = commands.commands.lock() else {
+    let Ok(mut command_receiver) = commands.commands.lock() else {
         tracing::error!("KMS render command receiver was poisoned");
         return;
     };
@@ -5407,6 +5699,7 @@ fn apply_render_world_commands(
                         current_ready_generation: None,
                         next_frame_token: 0,
                         pending_frame_token: None,
+                        pending_scene_revision: None,
                         pending_present: None,
                         pending_security_presentations: Vec::new(),
                         pending_capture_presentations: Vec::new(),
@@ -5488,22 +5781,40 @@ fn apply_render_world_commands(
     }
 }
 
+fn observe_pipeline_readiness(
+    mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
+    cache: Option<bevy::prelude::ResMut<bevy::render::render_resource::PipelineCache>>,
+) {
+    targets.pipeline_readiness = None;
+    if targets.lifecycle.state() != KmsRenderLifecycleState::Active || targets.sources.is_empty() {
+        return;
+    }
+    if let Some(mut cache) = cache {
+        targets.pipeline_readiness = Some(crate::render_pipeline_readiness::process_after_draw(
+            &mut cache,
+        ));
+    }
+}
+
 fn present_output_frames(
     mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
     views: bevy::prelude::Query<(&ExtractedCamera, &ViewTarget)>,
     security_presentations: Option<bevy::prelude::Res<NestedSecurityPresentation>>,
     capture_reporter: Option<bevy::prelude::Res<crate::capture::CaptureReporterBridge>>,
+    assets: Option<bevy::prelude::Res<crate::render_asset_readiness::AssetPreparationStatus>>,
 ) {
     if targets.lifecycle.state() != KmsRenderLifecycleState::Active {
         return;
     }
+    targets.asset_preparation = assets.map(|status| status.snapshot());
 
     let extracted = targets
         .sources
         .iter()
         .map(|(key, source)| {
             let target = views.iter().find_map(|(camera, target)| {
-                (camera.target == Some(NormalizedRenderTarget::TextureView(source.handle)))
+                (camera.order == 0
+                    && camera.target == Some(NormalizedRenderTarget::TextureView(source.handle)))
                     .then_some(target)
             });
             ExtractedOutputView {
@@ -5555,7 +5866,8 @@ fn clear_unwritten_output_frames(
     let mut encoder = None;
     for source in targets.sources.values() {
         let Some((camera, target)) = views.iter().find(|(camera, _)| {
-            camera.target == Some(NormalizedRenderTarget::TextureView(source.handle))
+            camera.order == 0
+                && camera.target == Some(NormalizedRenderTarget::TextureView(source.handle))
         }) else {
             continue;
         };
@@ -5955,6 +6267,9 @@ fn present_selected_output_frames(
                     generation: presenter.generation,
                     key: presenter.key,
                     frame_token: presenter.frame_token,
+                    scene_revision: presenter.scene_revision,
+                    asset_preparation: targets.asset_preparation,
+                    pipeline_readiness: targets.pipeline_readiness,
                     timestamp,
                     security_epochs,
                 })
@@ -6025,6 +6340,7 @@ fn select_written_presenters(
                     .pending_frame_token
                     .take()
                     .expect("presentable frame owns its acquisition token"),
+                scene_revision: source.pending_scene_revision.take(),
                 present,
                 security_presentations: std::mem::take(&mut source.pending_security_presentations),
                 resume_first_flip: source.pending_resume_first_flip.take(),
@@ -6122,6 +6438,8 @@ fn drain_render_resources(
     targets: &mut KmsRenderTargets,
     views: &mut ManualTextureViews,
 ) {
+    targets.pipeline_readiness = None;
+    targets.asset_preparation = None;
     let removed_handles = targets
         .sources
         .iter()
@@ -6151,6 +6469,170 @@ fn drain_render_resources(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn live_update_sequence_rejects_replays_gaps_and_wrong_output_without_advancing() {
+        let key = blocked_output().key;
+        let mut sequence = LiveUpdateSequence::default();
+        let token = |generation, sequence| LiveUpdateToken {
+            generation,
+            key: key.clone(),
+            sequence,
+        };
+        sequence.claim(&token(4, 1), 4, &key).unwrap();
+        for stale in [
+            token(4, 0),
+            token(4, 1),
+            token(4, 3),
+            token(5, 2),
+            LiveUpdateToken {
+                key: OutputKey {
+                    device: key.device,
+                    connector_name: "Other-1".into(),
+                },
+                ..token(4, 2)
+            },
+        ] {
+            assert!(sequence.claim(&stale, 4, &key).is_err());
+            assert_eq!(sequence.sequence, 1);
+        }
+        sequence.claim(&token(4, 2), 4, &key).unwrap();
+        assert!(sequence.claim(&token(5, 2), 5, &key).is_err());
+        sequence.claim(&token(5, 1), 5, &key).unwrap();
+        sequence.sequence = u64::MAX;
+        assert!(
+            sequence
+                .claim(&token(5, 1), 5, &key)
+                .unwrap_err()
+                .to_string()
+                .contains("kms-live-service-sequence-exhausted")
+        );
+        assert_eq!(sequence.sequence, u64::MAX);
+    }
+
+    #[test]
+    fn live_update_report_samples_demand_after_main_before_extraction() {
+        use crate::compositor_scene::SceneContentRevision;
+        let mut app = App::new();
+        app.insert_resource(SceneContentRevision(Some(3)));
+        app.add_systems(
+            bevy::app::Last,
+            |mut revision: bevy::prelude::ResMut<SceneContentRevision>| {
+                revision.0 = Some(7);
+            },
+        );
+        let mut render = SubApp::new();
+        render.set_extract(|main, _| {
+            main.resource_mut::<SceneContentRevision>().0 = Some(9);
+        });
+        app.insert_sub_app(RenderApp, render);
+        assert_eq!(
+            update_live_app(&mut app).unwrap(),
+            LiveUpdateExecution::FullRender {
+                demand_revision: Some(7)
+            }
+        );
+        assert_eq!(app.world().resource::<SceneContentRevision>().0, Some(9));
+        assert_eq!(
+            update_live_app(&mut App::new()).unwrap(),
+            LiveUpdateExecution::FullRender {
+                demand_revision: None
+            }
+        );
+    }
+
+    #[test]
+    fn live_update_phases_preserve_startup_extraction_and_removal_tracking() {
+        use bevy::{ecs::schedule::ScheduleLabel, prelude::*};
+
+        #[derive(Component)]
+        struct RemovedMarker;
+        #[derive(Resource, Clone, Default)]
+        struct Trace(Arc<Mutex<Vec<(&'static str, usize)>>>);
+
+        let trace = Trace::default();
+        let mut app = App::new();
+        let victim = app.world_mut().spawn(RemovedMarker).id();
+        app.insert_resource(trace.clone());
+        app.add_systems(Startup, |trace: Res<Trace>| {
+            trace.0.lock().unwrap().push(("startup", 0));
+        });
+        app.add_systems(Update, move |mut commands: Commands, trace: Res<Trace>| {
+            trace.0.lock().unwrap().push(("main", 0));
+            commands.entity(victim).remove::<RemovedMarker>();
+        });
+        let mut render = SubApp::new();
+        render.update_schedule = Some(Render.intern());
+        render.init_schedule(Render);
+        render.insert_resource(trace.clone());
+        render.set_extract(|main, render| {
+            render
+                .resource::<Trace>()
+                .0
+                .lock()
+                .unwrap()
+                .push(("extract", main.removed::<RemovedMarker>().count()));
+        });
+        render.add_systems(Render, |trace: Res<Trace>| {
+            trace.0.lock().unwrap().push(("render", 0));
+        });
+        app.insert_sub_app(RenderApp, render);
+
+        run_live_main_schedule(&mut app);
+        assert_eq!(*trace.0.lock().unwrap(), [("startup", 0), ("main", 0)]);
+        assert_eq!(app.world().removed::<RemovedMarker>().count(), 1);
+        finish_live_subapp_update(&mut app);
+        update_live_app(&mut app).unwrap();
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            [
+                ("startup", 0),
+                ("main", 0),
+                ("extract", 1),
+                ("render", 0),
+                ("main", 0),
+                ("extract", 0),
+                ("render", 0),
+            ]
+        );
+        assert_eq!(app.world().removed::<RemovedMarker>().count(), 0);
+    }
+
+    #[test]
+    fn serial_live_dispatch_preserves_extraction_command_barrier() {
+        use bevy::{
+            ecs::schedule::{Schedule, ScheduleBuildSettings},
+            prelude::Commands,
+            render::ExtractSchedule,
+        };
+
+        #[derive(bevy::prelude::Resource)]
+        struct Extracted;
+
+        let mut app = App::new();
+        let mut render = SubApp::new();
+        let mut extract = Schedule::new(ExtractSchedule);
+        extract.set_build_settings(ScheduleBuildSettings {
+            auto_insert_apply_deferred: false,
+            ..Default::default()
+        });
+        extract.set_apply_final_deferred(false);
+        extract.add_systems(|mut commands: Commands| {
+            commands.insert_resource(Extracted);
+        });
+        render.add_schedule(extract);
+        app.insert_sub_app(RenderApp, render);
+        configure_live_schedule_dispatch(&mut app);
+        app.sub_app_mut(RenderApp).world_mut().schedule_scope(
+            ExtractSchedule,
+            |world, schedule| {
+                schedule.run(world);
+                assert!(!world.contains_resource::<Extracted>());
+                schedule.apply_deferred(world);
+                assert!(world.contains_resource::<Extracted>());
+            },
+        );
+    }
+
     use std::{
         collections::HashMap,
         fs::File,
@@ -6277,6 +6759,14 @@ pub(crate) mod tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("noop wgpu future unexpectedly remained pending"),
         }
+    }
+
+    pub(crate) fn noop_pipeline_cache() -> bevy::render::render_resource::PipelineCache {
+        let (plugin, _) = noop_render_plugin();
+        let RenderCreation::Manual(resources) = plugin.render_creation else {
+            panic!("NOOP test renderer must use manual resources");
+        };
+        bevy::render::render_resource::PipelineCache::new(resources.0, resources.3, true)
     }
 
     fn noop_render_plugin() -> (RenderPlugin, wgpu::Device) {
@@ -6485,6 +6975,104 @@ pub(crate) mod tests {
         client_content_frame_driver_inner(false, None, None, None, None, None)
     }
 
+    #[test]
+    fn live_idle_runs_main_without_acquisition_and_renders_new_demand() {
+        let (mut engine, _feed, presented, _, _) =
+            client_content_frame_driver_configured(false, None, None, None, None, None, true);
+        let main_updates = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&main_updates);
+        engine
+            .app
+            .as_mut()
+            .unwrap()
+            .add_systems(bevy::app::Update, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+        let mut sequence = 0;
+        let update = |engine: &mut LiveRenderEngine, sequence: &mut u64| {
+            *sequence += 1;
+            engine
+                .update_for_pump(LiveUpdateToken {
+                    generation: engine.generation,
+                    key: engine.output.clone(),
+                    sequence: *sequence,
+                })
+                .unwrap()
+        };
+        let mut idle_reached = false;
+        for _ in 0..120 {
+            if matches!(
+                update(&mut engine, &mut sequence).execution,
+                LiveUpdateExecution::HealthyIdle { .. }
+            ) {
+                idle_reached = true;
+                break;
+            }
+        }
+        assert!(
+            idle_reached,
+            "real asset/pipeline preparation must settle into idle: {}",
+            idle::diagnostic(
+                engine.app.as_ref().unwrap(),
+                &engine.output,
+                engine.generation
+            )
+        );
+        let presentations = presented.load(Ordering::SeqCst);
+        let main_before = main_updates.load(Ordering::SeqCst);
+        let acquired = engine
+            .app
+            .as_ref()
+            .unwrap()
+            .sub_app(RenderApp)
+            .world()
+            .resource::<KmsRenderTargets>()
+            .sources[&engine.output]
+            .next_frame_token;
+        for _ in 0..16 {
+            let report = update(&mut engine, &mut sequence);
+            assert!(matches!(
+                report.execution,
+                LiveUpdateExecution::HealthyIdle { .. }
+            ));
+            assert!(report.frame_events.is_empty());
+        }
+        assert_eq!(main_updates.load(Ordering::SeqCst), main_before + 16);
+        assert_eq!(presented.load(Ordering::SeqCst), presentations);
+        assert_eq!(
+            engine
+                .app
+                .as_ref()
+                .unwrap()
+                .sub_app(RenderApp)
+                .world()
+                .resource::<KmsRenderTargets>()
+                .sources[&engine.output]
+                .next_frame_token,
+            acquired
+        );
+
+        engine
+            .app
+            .as_mut()
+            .unwrap()
+            .world_mut()
+            .resource_mut::<crate::compositor_scene::SceneContentRevision>()
+            .advance();
+        let changed = update(&mut engine, &mut sequence);
+        assert!(matches!(
+            changed.execution,
+            LiveUpdateExecution::FullRender { .. }
+        ));
+        assert!(submitted_frames(&changed.frame_events) > 0);
+        assert!(presented.load(Ordering::SeqCst) > presentations);
+        assert!(matches!(
+            update(&mut engine, &mut sequence).execution,
+            LiveUpdateExecution::HealthyIdle { .. }
+        ));
+        engine.shutdown_inner().unwrap();
+    }
+
     fn decorated_client_content_frame_driver() -> ClientContentFrameDriver {
         client_content_frame_driver_inner(true, None, None, None, None, None)
     }
@@ -6497,6 +7085,26 @@ pub(crate) mod tests {
         add_failures: Option<Arc<AtomicUsize>>,
         terminal_teardown: Option<HeldTerminalTeardown>,
     ) -> ClientContentFrameDriver {
+        client_content_frame_driver_configured(
+            server_side_decoration,
+            destructive_release,
+            destroyed,
+            post_destroy_updates,
+            add_failures,
+            terminal_teardown,
+            false,
+        )
+    }
+
+    fn client_content_frame_driver_configured(
+        server_side_decoration: bool,
+        destructive_release: Option<Receiver<()>>,
+        destroyed: Option<Arc<AtomicBool>>,
+        post_destroy_updates: Option<Arc<AtomicUsize>>,
+        add_failures: Option<Arc<AtomicUsize>>,
+        terminal_teardown: Option<HeldTerminalTeardown>,
+        enable_idle: bool,
+    ) -> ClientContentFrameDriver {
         let (scene_events, feed) = ClientSceneFeed::test_channel();
         let (render_plugin, device) = noop_render_plugin();
         let mut app = App::new();
@@ -6507,6 +7115,9 @@ pub(crate) mod tests {
             ));
         }
         app.add_plugins(configure_live_headless_plugins(DefaultPlugins.build()).set(render_plugin));
+        if enable_idle {
+            app.add_plugins(crate::capture::CaptureServicePlugin);
+        }
         install_live_scene(&mut app, LiveSceneMode::ClientContent);
         let terminal_updates_stopped = Arc::new(AtomicBool::new(false));
         if let (Some(destroyed), Some(post_destroy_updates)) =
@@ -6544,6 +7155,10 @@ pub(crate) mod tests {
         .expect("frame-driver client scene starts");
         app.finish();
         app.cleanup();
+
+        if enable_idle {
+            idle::configure(&mut app);
+        }
 
         let presented = Arc::new(AtomicUsize::new(0));
         let output = blocked_output();
@@ -6590,7 +7205,7 @@ pub(crate) mod tests {
         while adapter
             .poll_output_registration()
             .expect("frame-driver registration remains healthy")
-            != LiveOutputRegistration::Ready
+            == LiveOutputRegistration::Pending
         {
             assert!(
                 Instant::now() < deadline,
@@ -6687,7 +7302,7 @@ pub(crate) mod tests {
         while adapter
             .poll_output_registration()
             .expect("first-light output registration remains healthy")
-            != LiveOutputRegistration::Ready
+            == LiveOutputRegistration::Pending
         {
             assert!(
                 Instant::now() < deadline,
@@ -7826,9 +8441,10 @@ pub(crate) mod tests {
         // Model an Update already admitted by receive_live_pump_command when
         // LiveRenderPump::begin_stop publishes the terminal frontier.
         adapter.stop_terminal_updates();
-        adapter
+        let execution = adapter
             .update()
             .expect("an admitted terminal update is reduced to registrar polling");
+        assert_eq!(execution, LiveUpdateExecution::NotServiced);
         assert_eq!(
             post_stop_updates.load(Ordering::SeqCst),
             0,
@@ -8268,7 +8884,7 @@ pub(crate) mod tests {
                 .poll_output_registration()
                 .expect("registration remains healthy")
             {
-                LiveOutputRegistration::Ready => break,
+                LiveOutputRegistration::Ready { .. } => break,
                 LiveOutputRegistration::Pending => {
                     assert!(Instant::now() < deadline, "output registration timed out");
                     thread::park_timeout(Duration::from_millis(1));
@@ -8438,6 +9054,14 @@ pub(crate) mod tests {
         assert_eq!(live_pump_quiesce_timeout(nominal).as_millis(), 3_283);
     }
 
+    fn test_update_token() -> LiveUpdateToken {
+        LiveUpdateToken {
+            generation: 1,
+            key: blocked_output().key,
+            sequence: 1,
+        }
+    }
+
     #[test]
     fn forced_render_error_sends_one_terminal_reply_and_stops_updates() {
         struct ForcedRenderErrorPump {
@@ -8447,10 +9071,14 @@ pub(crate) mod tests {
         impl LivePumpUpdater for ForcedRenderErrorPump {
             fn update_for_pump(
                 &mut self,
-            ) -> Result<Vec<KmsRenderFrameEvent>, crate::backend::kms_live::KmsLiveError>
-            {
-                update_live_app(&mut self.app)?;
-                Ok(Vec::new())
+                token: LiveUpdateToken,
+            ) -> Result<LiveUpdateReport, crate::backend::kms_live::KmsLiveError> {
+                let execution = update_live_app(&mut self.app)?;
+                Ok(LiveUpdateReport {
+                    token,
+                    execution,
+                    frame_events: Vec::new(),
+                })
             }
         }
 
@@ -8480,7 +9108,7 @@ pub(crate) mod tests {
         let mut pump = ForcedRenderErrorPump { app };
         let mut replies = Vec::new();
         for _queued_update in 0..2 {
-            let (reply, terminal) = live_pump_update_reply(&mut pump);
+            let (reply, terminal) = live_pump_update_reply(&mut pump, test_update_token());
             replies.push(reply);
             if terminal {
                 break;
@@ -8610,6 +9238,7 @@ pub(crate) mod tests {
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 9,
@@ -8702,6 +9331,7 @@ pub(crate) mod tests {
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 10,
@@ -8775,6 +9405,9 @@ pub(crate) mod tests {
                 generation: 10,
                 key,
                 frame_token: 1,
+                scene_revision: None,
+                asset_preparation: None,
+                pipeline_readiness: None,
                 timestamp: KmsPresentationTimestamp {
                     seconds: 1,
                     nanoseconds: 2,
@@ -8802,6 +9435,7 @@ pub(crate) mod tests {
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 11,
@@ -8872,18 +9506,25 @@ pub(crate) mod tests {
         impl LivePumpUpdater for DrainedPresentEvents {
             fn update_for_pump(
                 &mut self,
-            ) -> Result<Vec<KmsRenderFrameEvent>, crate::backend::kms_live::KmsLiveError>
-            {
-                Ok(self.0.try_iter().collect())
+                token: LiveUpdateToken,
+            ) -> Result<LiveUpdateReport, crate::backend::kms_live::KmsLiveError> {
+                Ok(LiveUpdateReport {
+                    token,
+                    execution: LiveUpdateExecution::FullRender {
+                        demand_revision: None,
+                    },
+                    frame_events: self.0.try_iter().collect(),
+                })
             }
         }
 
-        let (reply, failed) = live_pump_update_reply(&mut DrainedPresentEvents(frame_events));
+        let (reply, failed) =
+            live_pump_update_reply(&mut DrainedPresentEvents(frame_events), test_update_token());
         assert!(!failed);
         assert!(matches!(
             reply,
-            PumpReply::Updated(Ok(events))
-                if matches!(events.as_slice(), [KmsRenderFrameEvent::PresentationCancelled {
+            PumpReply::Updated(Ok(report))
+                if matches!(report.frame_events.as_slice(), [KmsRenderFrameEvent::PresentationCancelled {
                     generation: 11,
                     key: cancelled_key,
                     ..
@@ -8930,6 +9571,7 @@ pub(crate) mod tests {
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 61,
@@ -9318,6 +9960,7 @@ pub(crate) mod tests {
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 8,
@@ -9401,8 +10044,12 @@ pub(crate) mod tests {
             .get_mut(&key)
             .expect("current source")
             .current_ready_generation = Some(8);
+        world.insert_resource(crate::compositor_scene::SceneContentRevision(Some(7)));
         world.run_system_once(acquire_output_frames).unwrap();
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 1);
+
+        // Later extraction cannot relabel the already acquired frame.
+        world.insert_resource(crate::compositor_scene::SceneContentRevision(Some(8)));
 
         for _ in 0..3 {
             present_selected_output_frames(
@@ -9447,6 +10094,9 @@ pub(crate) mod tests {
                 generation: 8,
                 key,
                 frame_token: 1,
+                scene_revision: Some(7),
+                asset_preparation: None,
+                pipeline_readiness: None,
                 timestamp: KmsPresentationTimestamp {
                     seconds: 1,
                     nanoseconds: 2,
@@ -10242,6 +10892,22 @@ pub(crate) mod tests {
         assert!(
             has_configured_ordering(
                 graph,
+                system_node(graph, render_system),
+                system_node(graph, observe_pipeline_readiness),
+            ),
+            "pipeline observation must follow drawing"
+        );
+        assert!(
+            has_configured_ordering(
+                graph,
+                system_node(graph, observe_pipeline_readiness),
+                system_node(graph, present_output_frames),
+            ),
+            "pipeline observation must precede presentation"
+        );
+        assert!(
+            has_configured_ordering(
+                graph,
                 system_node(graph, present_output_frames),
                 system_node(graph, complete_render_quiescence),
             ),
@@ -10255,11 +10921,20 @@ pub(crate) mod tests {
         let output_handle = ManualTextureViewHandle(111);
         let retained_handle = ManualTextureViewHandle(112);
         let mut targets = KmsRenderTargets::new(PresentDeadline::unbounded_non_presenting());
+        targets.pipeline_readiness = Some(
+            crate::render_pipeline_readiness::PipelineReadinessSnapshot {
+                pipelines: 1,
+                pending: 0,
+                failed: 0,
+                changed_after_draw: false,
+            },
+        );
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 12,
@@ -10285,6 +10960,7 @@ pub(crate) mod tests {
 
         drain_render_resources(RenderDrainScope::AllThrough(12), &mut targets, &mut views);
 
+        assert_eq!(targets.pipeline_readiness, None);
         assert!(targets.sources.is_empty());
         assert!(!views.contains_key(&output_handle));
         assert!(
@@ -10372,7 +11048,7 @@ pub(crate) mod tests {
 
         let mut world = bevy::prelude::World::new();
         world.insert_resource(KmsRenderCommands {
-            commands: Mutex::new(command_receiver),
+            commands: Mutex::new(command_receiver.into()),
             releases: release_sender,
             quiescences: quiescence_sender,
         });
@@ -10387,6 +11063,7 @@ pub(crate) mod tests {
             OutputFrameSource {
                 next_frame_token: 0,
                 pending_frame_token: None,
+                pending_scene_revision: None,
                 pending_capture_presentations: Vec::new(),
                 pending_presentation_timestamp: None,
                 generation: 18,
@@ -10508,11 +11185,14 @@ pub(crate) mod tests {
                 key: first.key.clone(),
             })
             .expect("queue render deactivation");
-        drop(KmsRenderCommands {
-            commands: Mutex::new(command_receiver),
+        let commands = KmsRenderCommands {
+            commands: Mutex::new(command_receiver.into()),
             releases: worker.release_sender(),
             quiescences: worker.quiescence_sender(),
-        });
+        };
+        assert!(commands.commands.lock().unwrap().has_pending());
+        assert!(commands.commands.lock().unwrap().has_pending());
+        drop(commands);
 
         assert!(matches!(
             event_receiver.recv_timeout(Duration::from_secs(2)),
@@ -11162,7 +11842,7 @@ pub(crate) mod tests {
             terminal: None,
         });
         world.insert_resource(KmsRenderCommands {
-            commands: Mutex::new(render_receiver),
+            commands: Mutex::new(render_receiver.into()),
             releases,
             quiescences,
         });
@@ -11260,7 +11940,7 @@ pub(crate) mod tests {
             terminal: None,
         });
         world.insert_resource(KmsRenderCommands {
-            commands: Mutex::new(render_receiver),
+            commands: Mutex::new(render_receiver.into()),
             releases,
             quiescences,
         });
@@ -11390,7 +12070,7 @@ pub(crate) mod tests {
             terminal: None,
         });
         world.insert_resource(KmsRenderCommands {
-            commands: Mutex::new(render_receiver),
+            commands: Mutex::new(render_receiver.into()),
             releases,
             quiescences,
         });
@@ -11681,7 +12361,7 @@ pub(crate) mod tests {
         let (pump, barrier) =
             LiveRenderPump::blocked_for_test_with_cancel(Duration::from_millis(20), cancel);
         pump.commands
-            .try_send(PumpCommand::Update)
+            .try_send(PumpCommand::Update(test_update_token()))
             .expect("the capacity-one command mailbox is occupied");
 
         pump.cancel_generation_presentations(73);
@@ -11694,7 +12374,7 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             barrier.commands.recv_timeout(Duration::from_secs(1)),
-            Ok(PumpCommand::Update)
+            Ok(PumpCommand::Update(_))
         ));
         pump.begin_stop();
         barrier.wait_for_stop();
@@ -11743,7 +12423,7 @@ pub(crate) mod tests {
     fn latched_stop_prevents_a_queued_pump_command_from_executing() {
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(PumpCommand::Update)
+            .send(PumpCommand::Update(test_update_token()))
             .expect("queue one pump command");
         let stop = AtomicBool::new(true);
         assert!(

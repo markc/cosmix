@@ -104,7 +104,10 @@ use super::libinput_live::{
 use super::libinput_live::InputOpenGate;
 use super::render::LiveSceneMode;
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-use super::render::{KmsRenderFrameEvent, LiveOutputRegistration, PumpReply};
+use super::render::{
+    KmsRenderFrameEvent, LiveOutputRegistration, LiveUpdateExecution, LiveUpdateReport,
+    LiveUpdateToken, PumpReply,
+};
 #[cfg(all(feature = "kms-live", not(test)))]
 use super::resume_scanout::{
     ResumeModesetReason, ResumePresentationClassification, ResumeScanoutSnapshot,
@@ -126,6 +129,8 @@ const CONFIRMATION_NONCE_BYTES: usize = 4;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 const NO_SUBMIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+const UPDATE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 const LIVE_PUMP_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -382,6 +387,7 @@ struct PreparedLiveOperation {
     decoration: DecorationStartup,
     #[cfg(feature = "bus")]
     bus_service: String,
+    f9_bus: Option<crate::bus_key::BusKeyConfig>,
     output_scale: OutputScale120,
     selected_output: Option<super::kms::SelectedOutput>,
     resume_mode: Option<super::kms::ConnectorMode>,
@@ -4034,16 +4040,24 @@ fn authorise_observed(
 /// verification, or retain the verified wrapper outside this module-owned
 /// operation boundary.
 #[cfg(all(feature = "kms-live", not(test)))]
-pub(crate) fn execute_live(grant: KmsLiveGrant, bus_service: String) -> Result<(), KmsLiveError> {
-    match prepare_live_operation(&grant, bus_service)? {
+pub(crate) fn execute_live(
+    grant: KmsLiveGrant,
+    bus_service: String,
+    f9_bus: Option<crate::bus_key::BusKeyConfig>,
+) -> Result<(), KmsLiveError> {
+    match prepare_live_operation(&grant, bus_service, f9_bus)? {
         Some(prepared) => operate_verified(grant, prepared),
         None => Ok(()),
     }
 }
 
 #[cfg(any(not(feature = "kms-live"), test))]
-pub(crate) fn execute_live(grant: KmsLiveGrant, bus_service: String) -> Result<(), KmsLiveError> {
-    let prepared = prepare_live_operation(&grant, bus_service)?;
+pub(crate) fn execute_live(
+    grant: KmsLiveGrant,
+    bus_service: String,
+    f9_bus: Option<crate::bus_key::BusKeyConfig>,
+) -> Result<(), KmsLiveError> {
+    let prepared = prepare_live_operation(&grant, bus_service, f9_bus)?;
     operate_verified(grant, prepared)
 }
 
@@ -4051,6 +4065,7 @@ pub(crate) fn execute_live(grant: KmsLiveGrant, bus_service: String) -> Result<(
 fn prepare_live_operation(
     grant: &KmsLiveGrant,
     bus_service: String,
+    f9_bus: Option<crate::bus_key::BusKeyConfig>,
 ) -> Result<Option<PreparedLiveOperation>, KmsLiveError> {
     #[cfg(not(feature = "bus"))]
     drop(bus_service);
@@ -4142,6 +4157,7 @@ fn prepare_live_operation(
         decoration: grant.decoration.clone(),
         #[cfg(feature = "bus")]
         bus_service,
+        f9_bus,
         output_scale: grant.output_scale,
         selected_output: None,
         resume_mode: None,
@@ -4637,6 +4653,7 @@ fn build_session_device_owner(
 fn prepare_live_operation(
     _grant: &KmsLiveGrant,
     _bus_service: String,
+    _f9_bus: Option<crate::bus_key::BusKeyConfig>,
 ) -> Result<PreparedLiveOperation, KmsLiveError> {
     Ok(PreparedLiveOperation)
 }
@@ -4691,19 +4708,24 @@ fn atomic_commit_failure_is_pause_attributable(
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 struct SubmitWatchdog {
-    last_submitted_at: Duration,
+    required_since: Option<Duration>,
+    presented_revision: Option<u64>,
+    idle_admissible: bool,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl SubmitWatchdog {
     fn new(started_at: Duration) -> Self {
         Self {
-            last_submitted_at: started_at,
+            required_since: Some(started_at),
+            presented_revision: None,
+            idle_admissible: false,
         }
     }
 
     fn observe_submitted(&mut self, now: Duration) {
-        self.last_submitted_at = now;
+        self.required_since = Some(now);
+        self.idle_admissible = true;
     }
 
     fn observe_cancelled_cycle(&mut self, now: Duration) {
@@ -4711,11 +4733,40 @@ impl SubmitWatchdog {
         // is a lifecycle boundary, not evidence that a live output stopped
         // submitting, so it suspends the second independent kill clock. An
         // ordinary empty update never calls this method.
-        self.last_submitted_at = now;
+        self.required_since = Some(now);
+        self.idle_admissible = false;
     }
 
     fn no_submit_timed_out(&self, now: Duration) -> bool {
-        now.saturating_sub(self.last_submitted_at) >= NO_SUBMIT_TIMEOUT
+        self.required_since
+            .is_some_and(|since| now.saturating_sub(since) >= NO_SUBMIT_TIMEOUT)
+    }
+
+    fn deadline(&self) -> Option<Duration> {
+        self.required_since
+            .map(|since| since.saturating_add(NO_SUBMIT_TIMEOUT))
+    }
+
+    fn observe_execution(
+        &mut self,
+        execution: LiveUpdateExecution,
+        now: Duration,
+    ) -> Result<bool, KmsLiveError> {
+        if let LiveUpdateExecution::HealthyIdle { demand_revision } = execution {
+            if !self.idle_admissible || self.presented_revision != Some(demand_revision) {
+                return Err(KmsLiveError::Setup(
+                    "kms-live-unproven-idle: idle has no matching current presentation".into(),
+                ));
+            }
+            self.required_since = None;
+            Ok(true)
+        } else {
+            // Demand after idle starts a fixed deadline. Subsequent reports or
+            // further revisions cannot push it back without a real flip.
+            self.required_since.get_or_insert(now);
+            self.idle_admissible = false;
+            Ok(false)
+        }
     }
 }
 
@@ -5029,7 +5080,7 @@ impl LiveCoordinatorMailbox for SessionDeviceClient {
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 trait LivePumpControl {
     fn request_registration(&mut self) -> Result<(), KmsLiveError>;
-    fn request_update(&mut self) -> Result<(), KmsLiveError>;
+    fn request_update(&mut self, token: LiveUpdateToken) -> Result<(), KmsLiveError>;
     fn begin_stop(&mut self);
     fn nominal_refresh_interval(&self) -> Duration;
     fn begin_transition(&mut self, _commands: Vec<KmsRenderCommand>) -> Result<(), KmsLiveError> {
@@ -5065,8 +5116,8 @@ impl LivePumpControl for super::render::LiveRenderPump {
         self.poll_registration()
     }
 
-    fn request_update(&mut self) -> Result<(), KmsLiveError> {
-        self.update()
+    fn request_update(&mut self, token: LiveUpdateToken) -> Result<(), KmsLiveError> {
+        self.update(token)
     }
 
     fn begin_stop(&mut self) {
@@ -5151,11 +5202,11 @@ impl PartialEq for LiveSupervisionEnd {
 impl Eq for LiveSupervisionEnd {}
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OutstandingPumpCommand {
     Start,
     Registration,
-    Update,
+    Update(LiveUpdateToken),
     DrainScene { generation: u64 },
 }
 
@@ -5373,7 +5424,7 @@ where
         PumpWait::Reply(reply) => return Err(unexpected_pump_reply("start", reply)),
     }
 
-    let output_ready_at = loop {
+    let (output_ready_at, output_generation, output_key) = loop {
         pump.request_registration()?;
         match wait_for_pump_reply(
             mailbox,
@@ -5383,14 +5434,17 @@ where
             OutstandingPumpCommand::Registration,
         )? {
             PumpWait::End(end) => return Ok(end),
-            PumpWait::Reply(PumpReply::Registration(Ok(LiveOutputRegistration::Ready))) => {
+            PumpWait::Reply(PumpReply::Registration(Ok(LiveOutputRegistration::Ready {
+                generation,
+                key,
+            }))) => {
                 let ready_at = now();
                 tracing::info!(
                     elapsed_ms = ready_at.saturating_sub(registration_started_at).as_millis(),
                     "live KMS output ready"
                 );
                 output_ready(ready_at);
-                break ready_at;
+                break (ready_at, generation, key);
             }
             PumpWait::Reply(PumpReply::Registration(Ok(LiveOutputRegistration::Pending))) => {}
             PumpWait::Reply(PumpReply::Registration(Err(error))) => return Err(error),
@@ -5440,6 +5494,9 @@ where
 
     let mut policy = SubmitWatchdog::new(output_ready_at);
     let mut telemetry = SubmittedFrameTelemetry::new(output_ready_at);
+    let mut service_sequence = 0_u64;
+    let mut last_demand_revision = None;
+    let mut next_pulse_at = Duration::ZERO;
     loop {
         if let Some(end) = poll_terminal_event(mailbox)? {
             return Ok(end);
@@ -5448,23 +5505,32 @@ where
         // master is revoked. Its session and protocol peers still latch the
         // event independently; the coordinator waits on this mailbox and its
         // own deadline, never on the update or the pump thread.
-        pump.request_update()?;
-        let submit_deadline = policy.last_submitted_at.saturating_add(NO_SUBMIT_TIMEOUT);
-        let reply = match wait_for_pump_reply(
+        let token = next_update_token(output_generation, &output_key, &mut service_sequence)?;
+        let requested_at = now();
+        let response_deadline = requested_at.saturating_add(UPDATE_RESPONSE_TIMEOUT);
+        pump.request_update(token.clone())?;
+        let submit_deadline = policy.deadline();
+        let reply = match wait_for_update_reply(
             mailbox,
-            submit_deadline,
+            UpdateDeadlines {
+                response: response_deadline,
+                submission: submit_deadline,
+            },
             now,
-            "update",
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(token.clone()),
         )? {
             PumpWait::Reply(reply) => reply,
             PumpWait::End(end) => return Ok(end),
         };
         let observed_at = now();
-        let events = match reply {
+        let report = match reply {
             PumpReply::Updated(result) => result?,
             reply => return Err(unexpected_pump_reply("update", reply)),
         };
+        validate_update_report(&report, &token, &mut last_demand_revision)?;
+        require_update_response_deadline(response_deadline, observed_at)?;
+        let healthy_idle = policy.observe_execution(report.execution, requested_at)?;
+        let events = report.frame_events;
         observe_update_watchdog_evidence(&mut policy, &events, observed_at)?;
         let mut submissions = 0_usize;
         for event in events {
@@ -5473,8 +5539,10 @@ where
                     generation,
                     key,
                     security_epochs,
+                    scene_revision,
                     ..
                 } => {
+                    policy.presented_revision = scene_revision;
                     policy.observe_submitted(observed_at);
                     telemetry.observe(observed_at, generation, &key);
                     for presentation_epoch in security_epochs {
@@ -5488,7 +5556,7 @@ where
                         return await_external_pause_attribution_for_completed_update(
                             mailbox,
                             failure,
-                            submit_deadline,
+                            submit_deadline.unwrap_or(response_deadline),
                             now,
                             "active atomic authority-failure attribution",
                         );
@@ -5502,7 +5570,17 @@ where
                 }
             }
         }
-        pulse_client_frame_clock_for_update(submissions, pulse)?;
+        if let Some(end) = finish_service_cadence(
+            mailbox,
+            healthy_idle,
+            submissions,
+            &mut next_pulse_at,
+            pump.nominal_refresh_interval(),
+            now,
+            pulse,
+        )? {
+            return Ok(end);
+        }
     }
 }
 
@@ -5564,27 +5642,39 @@ where
     }
     let mut policy = SubmitWatchdog::new(resumed.ready_at);
     let mut telemetry = SubmittedFrameTelemetry::new(resumed.ready_at);
+    let mut service_sequence = 0_u64;
+    let mut last_demand_revision = None;
+    let mut next_pulse_at = Duration::ZERO;
     loop {
         if let Some(end) = poll_terminal_event(mailbox)? {
             return Ok(end);
         }
-        pump.request_update()?;
-        let submit_deadline = policy.last_submitted_at.saturating_add(NO_SUBMIT_TIMEOUT);
-        let reply = match wait_for_pump_reply(
+        let token = next_update_token(resumed.generation, &resumed.key, &mut service_sequence)?;
+        let requested_at = now();
+        let response_deadline = requested_at.saturating_add(UPDATE_RESPONSE_TIMEOUT);
+        pump.request_update(token.clone())?;
+        let submit_deadline = policy.deadline();
+        let reply = match wait_for_update_reply(
             mailbox,
-            submit_deadline,
+            UpdateDeadlines {
+                response: response_deadline,
+                submission: submit_deadline,
+            },
             &mut now,
-            "update",
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(token.clone()),
         )? {
             PumpWait::Reply(reply) => reply,
             PumpWait::End(end) => return Ok(end),
         };
         let observed_at = now();
-        let events = match reply {
+        let report = match reply {
             PumpReply::Updated(result) => result?,
             reply => return Err(unexpected_pump_reply("resumed update", reply)),
         };
+        validate_update_report(&report, &token, &mut last_demand_revision)?;
+        require_update_response_deadline(response_deadline, observed_at)?;
+        let healthy_idle = policy.observe_execution(report.execution, requested_at)?;
+        let events = report.frame_events;
         observe_update_watchdog_evidence(&mut policy, &events, observed_at)?;
         let mut submissions = 0_usize;
         for event in events {
@@ -5593,8 +5683,10 @@ where
                     generation,
                     key,
                     security_epochs,
+                    scene_revision,
                     ..
                 } => {
+                    policy.presented_revision = scene_revision;
                     require_resumed_frame_generation(resumed.generation, generation)?;
                     policy.observe_submitted(observed_at);
                     telemetry.observe(observed_at, generation, &key);
@@ -5611,7 +5703,7 @@ where
                         return await_external_pause_attribution_for_completed_update(
                             mailbox,
                             failure,
-                            submit_deadline,
+                            submit_deadline.unwrap_or(response_deadline),
                             &mut now,
                             "resumed atomic authority-failure attribution",
                         );
@@ -5620,18 +5712,138 @@ where
                 }
             }
         }
-        pulse_client_frame_clock_for_update(submissions, &mut pulse)?;
+        if let Some(end) = finish_service_cadence(
+            mailbox,
+            healthy_idle,
+            submissions,
+            &mut next_pulse_at,
+            pump.nominal_refresh_interval(),
+            &mut now,
+            &mut pulse,
+        )? {
+            return Ok(end);
+        }
     }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-fn pulse_client_frame_clock_for_update(
+#[allow(clippy::too_many_arguments)]
+fn finish_service_cadence<M: LiveCoordinatorMailbox>(
+    mailbox: &mut M,
+    healthy_idle: bool,
     submissions: usize,
+    next_pulse_at: &mut Duration,
+    nominal: Duration,
+    now: &mut impl FnMut() -> Duration,
     pulse: &mut impl FnMut() -> Result<(), KmsLiveError>,
-) -> Result<(), KmsLiveError> {
-    if submissions > 0 {
-        pulse()?;
+) -> Result<Option<LiveSupervisionEnd>, KmsLiveError> {
+    if healthy_idle {
+        // Idle has no pageflip wait. Bound service/callback cadence through the
+        // same interruptible coordinator mailbox used for renderer replies.
+        while now() < *next_pulse_at {
+            if let Some(event) =
+                mailbox.wait_for_event_timeout(next_pulse_at.saturating_sub(now()))?
+            {
+                return match event {
+                    LiveCoordinatorEvent::Pump(reply) => {
+                        Err(unexpected_pump_reply("idle pacing", reply))
+                    }
+                    event => match classify_pump_wait_event(event, None)? {
+                        PumpWait::End(end) => Ok(Some(end)),
+                        PumpWait::Reply(_) => unreachable!(),
+                    },
+                };
+            }
+        }
+        if let Some(end) = poll_terminal_event(mailbox)? {
+            return Ok(Some(end));
+        }
     }
+    let observed_at = now();
+    let pulse_deadline = *next_pulse_at;
+    if (healthy_idle || submissions > 0) && observed_at >= *next_pulse_at {
+        pulse()?;
+        // detail/aux share the coordinator's clock origin, not necessarily
+        // CLOCK_MONOTONIC's origin. Their signed difference is lateness in us.
+        // The trace timestamp correlates this decision with rendering/flips.
+        crate::frame_trace::event(
+            if healthy_idle {
+                "comp_pulse_sent_idle"
+            } else {
+                "comp_pulse_sent_busy"
+            },
+            || (
+                submissions as u64,
+                observed_at.as_micros().min(u128::from(u64::MAX)) as u64,
+                pulse_deadline.as_micros().min(u128::from(u64::MAX)) as u64,
+            ),
+        );
+        *next_pulse_at = observed_at.saturating_add(nominal);
+    } else {
+        crate::frame_trace::event(
+            if healthy_idle {
+                "comp_pulse_skipped_idle"
+            } else {
+                "comp_pulse_skipped_busy"
+            },
+            || (
+                submissions as u64,
+                observed_at.as_micros().min(u128::from(u64::MAX)) as u64,
+                pulse_deadline.as_micros().min(u128::from(u64::MAX)) as u64,
+            ),
+        );
+    }
+    Ok(None)
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn next_update_token(
+    generation: u64,
+    key: &OutputKey,
+    sequence: &mut u64,
+) -> Result<LiveUpdateToken, KmsLiveError> {
+    *sequence = sequence.checked_add(1).ok_or_else(|| {
+        KmsLiveError::Setup(
+            "kms-live-service-sequence-exhausted: update sequence cannot wrap".into(),
+        )
+    })?;
+    Ok(LiveUpdateToken {
+        generation,
+        key: key.clone(),
+        sequence: *sequence,
+    })
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn validate_update_report(
+    report: &LiveUpdateReport,
+    expected: &LiveUpdateToken,
+    last_demand_revision: &mut Option<u64>,
+) -> Result<(), KmsLiveError> {
+    report.token.validate(expected)?;
+    require_update_frame_identity(&report.frame_events, expected.generation, &expected.key)?;
+    let revision = match report.execution {
+        LiveUpdateExecution::FullRender { demand_revision } => demand_revision,
+        LiveUpdateExecution::HealthyIdle { demand_revision } => {
+            if !report.frame_events.is_empty() {
+                return Err(KmsLiveError::Setup(
+                    "kms-live-invalid-idle: idle report carries frame events".into(),
+                ));
+            }
+            Some(demand_revision)
+        }
+        LiveUpdateExecution::NotServiced => None,
+    };
+    if let Some(revision) = revision {
+        if last_demand_revision.is_some_and(|previous| revision < previous) {
+            return Err(KmsLiveError::Setup(
+                "kms-live-stale-demand: update demand revision regressed".into(),
+            ));
+        }
+        *last_demand_revision = Some(revision);
+    }
+    // Presentation evidence is checked by the active watchdog, not during
+    // reconciliation of an interrupted old request at a pause boundary.
     Ok(())
 }
 
@@ -5641,9 +5853,36 @@ fn require_resumed_frame_generation(expected: u64, observed: u64) -> Result<(), 
         Ok(())
     } else {
         Err(KmsLiveError::Setup(format!(
-            "kms-live-stale-generation: resumed frame generation {observed} does not match output generation {expected}"
+            "kms-live-stale-generation: frame generation {observed} does not match ready output generation {expected}"
         )))
     }
+}
+
+/// Validate the entire event batch before watchdog, telemetry, security or
+/// callback effects. In particular, a stale cancellation cannot renew health.
+/// Worker failures retain their existing terminal/pause-attribution handling.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn require_update_frame_identity(
+    events: &[KmsRenderFrameEvent],
+    expected_generation: u64,
+    expected_key: &OutputKey,
+) -> Result<(), KmsLiveError> {
+    for event in events {
+        let (generation, key) = match event {
+            KmsRenderFrameEvent::FrameSubmitted {
+                generation, key, ..
+            }
+            | KmsRenderFrameEvent::PresentationCancelled { generation, key } => (*generation, key),
+            KmsRenderFrameEvent::TerminalFailure(_) => continue,
+        };
+        require_resumed_frame_generation(expected_generation, generation)?;
+        if key != expected_key {
+            return Err(KmsLiveError::Setup(format!(
+                "kms-live-stale-output: frame output {key:?} does not match ready output {expected_key:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -5720,6 +5959,71 @@ fn await_external_pause_attribution_for_completed_update<M: LiveCoordinatorMailb
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Copy)]
+struct UpdateDeadlines {
+    response: Duration,
+    // No submission deadline may eventually be appropriate after validated idle.
+    // Active callers currently always supply one; response remains mandatory.
+    submission: Option<Duration>,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+impl UpdateDeadlines {
+    fn earliest(self) -> Duration {
+        self.submission
+            .map_or(self.response, |deadline| deadline.min(self.response))
+    }
+
+    fn timeout_error(self) -> KmsLiveError {
+        if self
+            .submission
+            .is_some_and(|deadline| deadline < self.response)
+        {
+            no_submit_timeout_error()
+        } else {
+            update_response_timeout_error()
+        }
+    }
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn require_update_response_deadline(
+    deadline: Duration,
+    observed_at: Duration,
+) -> Result<(), KmsLiveError> {
+    if observed_at >= deadline {
+        Err(update_response_timeout_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn wait_for_update_reply<M: LiveCoordinatorMailbox>(
+    mailbox: &mut M,
+    deadlines: UpdateDeadlines,
+    now: &mut impl FnMut() -> Duration,
+    outstanding_command: OutstandingPumpCommand,
+) -> Result<PumpWait, KmsLiveError> {
+    // Pending lifecycle/terminal events still win over a timeout. A queued
+    // successful reply must separately pass response and submission clocks
+    // before it can cause presentation or callback effects.
+    let event = if let Some(event) = mailbox.poll_event()? {
+        Some(event)
+    } else {
+        let observed_at = now();
+        if observed_at >= deadlines.earliest() {
+            return Err(deadlines.timeout_error());
+        }
+        mailbox.wait_for_event_timeout(deadlines.earliest().saturating_sub(observed_at))?
+    };
+    match event {
+        Some(event) => classify_pump_wait_event(event, Some(outstanding_command)),
+        None => Err(deadlines.timeout_error()),
+    }
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn wait_for_pump_reply<M: LiveCoordinatorMailbox>(
     mailbox: &mut M,
     deadline: Duration,
@@ -5728,7 +6032,7 @@ fn wait_for_pump_reply<M: LiveCoordinatorMailbox>(
     outstanding_command: OutstandingPumpCommand,
 ) -> Result<PumpWait, KmsLiveError> {
     if let Some(event) = mailbox.poll_event()? {
-        return classify_pump_wait_event(event, outstanding_command);
+        return classify_pump_wait_event(event, Some(outstanding_command));
     }
     let observed_at = now();
     if observed_at >= deadline {
@@ -5740,7 +6044,7 @@ fn wait_for_pump_reply<M: LiveCoordinatorMailbox>(
     }
     let event = mailbox.wait_for_event_timeout(deadline.saturating_sub(observed_at))?;
     match event {
-        Some(event) => classify_pump_wait_event(event, outstanding_command),
+        Some(event) => classify_pump_wait_event(event, Some(outstanding_command)),
         None => Err(if phase == "registration" || phase == "start" {
             registration_timeout_error()
         } else {
@@ -5752,7 +6056,7 @@ fn wait_for_pump_reply<M: LiveCoordinatorMailbox>(
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn classify_pump_wait_event(
     event: LiveCoordinatorEvent,
-    outstanding_command: OutstandingPumpCommand,
+    outstanding_command: Option<OutstandingPumpCommand>,
 ) -> Result<PumpWait, KmsLiveError> {
     match event {
         LiveCoordinatorEvent::Pump(reply) => Ok(PumpWait::Reply(reply)),
@@ -5765,7 +6069,7 @@ fn classify_pump_wait_event(
         LiveCoordinatorEvent::VtSwitchRequested(vt) => {
             Ok(PumpWait::End(LiveSupervisionEnd::VtSwitchRequested {
                 vt,
-                outstanding_command: Some(outstanding_command),
+                outstanding_command,
             }))
         }
         LiveCoordinatorEvent::PauseRequested {
@@ -5774,7 +6078,7 @@ fn classify_pump_wait_event(
         } => Ok(PumpWait::End(LiveSupervisionEnd::PauseRequested {
             generation,
             acknowledgement,
-            outstanding_command: Some(outstanding_command),
+            outstanding_command,
         })),
         LiveCoordinatorEvent::SessionPaused { .. }
         | LiveCoordinatorEvent::SessionPauseConfirmed { .. }
@@ -5830,15 +6134,16 @@ fn unexpected_session_lifecycle(phase: &'static str) -> KmsLiveError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LiveTransitionOutcome {
     Suspended { generation: u64 },
-    OutputReady { generation: u64 },
+    OutputReady { generation: u64, key: OutputKey },
     OutputFailed { generation: u64, reason: String },
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ResumedLiveOutput {
     ready_at: Duration,
     generation: u64,
+    key: OutputKey,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -5987,8 +6292,10 @@ fn reconcile_outstanding_pump_command<M: LiveCoordinatorMailbox>(
         (OutstandingPumpCommand::Registration, PumpReply::Registration(result)) => {
             result.map(|_status| ())
         }
-        (OutstandingPumpCommand::Update, PumpReply::Updated(result)) => {
-            reconcile_pause_updated_frame_events(result?, pause_cause)
+        (OutstandingPumpCommand::Update(token), PumpReply::Updated(result)) => {
+            let report = result?;
+            validate_update_report(&report, &token, &mut None)?;
+            reconcile_pause_updated_frame_events(report.frame_events, pause_cause)
         }
         (
             OutstandingPumpCommand::DrainScene {
@@ -6083,8 +6390,8 @@ fn drive_live_transition<M: LiveCoordinatorMailbox, P: LivePumpControl>(
                 KmsRenderReply::Suspended { generation } => {
                     return Ok(LiveTransitionOutcome::Suspended { generation });
                 }
-                KmsRenderReply::OutputReady { generation, .. } => {
-                    return Ok(LiveTransitionOutcome::OutputReady { generation });
+                KmsRenderReply::OutputReady { generation, key } => {
+                    return Ok(LiveTransitionOutcome::OutputReady { generation, key });
                 }
                 KmsRenderReply::OutputFailed {
                     generation, reason, ..
@@ -6118,6 +6425,17 @@ fn no_submit_timeout_error() -> KmsLiveError {
         "live KMS output reached the no-submit deadline"
     );
     KmsLiveError::Setup("live KMS output submitted no frame for 2s".into())
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn update_response_timeout_error() -> KmsLiveError {
+    tracing::error!(
+        timeout_ms = UPDATE_RESPONSE_TIMEOUT.as_millis(),
+        "live KMS renderer reached the update-response deadline"
+    );
+    KmsLiveError::Setup(
+        "kms-live-update-response-timeout: renderer did not complete its update within 2s".into(),
+    )
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -7226,7 +7544,7 @@ impl PreparedLiveOperation {
                 )
                 .map_err(ResumeAttemptFailure::Terminal)?
                 {
-                    LiveTransitionOutcome::OutputReady { generation } => {
+                    LiveTransitionOutcome::OutputReady { generation, key } => {
                         let ready_at = now();
                         self.session
                             .as_ref()
@@ -7260,6 +7578,7 @@ impl PreparedLiveOperation {
                         Ok(ResumedLiveOutput {
                             ready_at,
                             generation,
+                            key,
                         })
                     }
                     LiveTransitionOutcome::OutputFailed { reason, .. } => {
@@ -7739,6 +8058,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                 .expect("production preparation installs protocol GPU wiring"),
             crate::protocol::WaylandRuntimePolicy {
                 keybindings_enabled: true,
+                f9_bus: self.f9_bus.clone(),
                 explicit_sync_exposure_mode: crate::protocol::ExplicitSyncExposureMode::Production,
                 decoration: self.decoration.clone(),
             },
@@ -7761,6 +8081,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                 .expect("production preparation installs protocol GPU wiring"),
             crate::protocol::WaylandRuntimePolicy {
                 keybindings_enabled: true,
+                f9_bus: self.f9_bus.clone(),
                 explicit_sync_exposure_mode: crate::protocol::ExplicitSyncExposureMode::Production,
                 decoration: self.decoration.clone(),
             },
@@ -9175,6 +9496,9 @@ mod tests {
             generation: 1,
             key: pump_key(),
             frame_token: 1,
+            scene_revision: None,
+            asset_preparation: None,
+            pipeline_readiness: None,
             timestamp: super::super::render::KmsPresentationTimestamp {
                 seconds: 1,
                 nanoseconds: 2,
@@ -9306,7 +9630,7 @@ mod tests {
             Ok(())
         }
 
-        fn request_update(&mut self) -> Result<(), KmsLiveError> {
+        fn request_update(&mut self, _token: LiveUpdateToken) -> Result<(), KmsLiveError> {
             self.commands.push("update");
             Ok(())
         }
@@ -9359,7 +9683,7 @@ mod tests {
             unreachable!("release-order test enters at Suspend")
         }
 
-        fn request_update(&mut self) -> Result<(), KmsLiveError> {
+        fn request_update(&mut self, _token: LiveUpdateToken) -> Result<(), KmsLiveError> {
             unreachable!("release-order test enters at Suspend")
         }
 
@@ -9397,11 +9721,294 @@ mod tests {
     }
 
     fn ready_reply() -> Option<LiveCoordinatorEvent> {
-        pump_reply(PumpReply::Registration(Ok(LiveOutputRegistration::Ready)))
+        pump_reply(PumpReply::Registration(Ok(LiveOutputRegistration::Ready {
+            generation: 1,
+            key: pump_key(),
+        })))
     }
 
     fn updated_reply(events: Vec<KmsRenderFrameEvent>) -> Option<LiveCoordinatorEvent> {
-        pump_reply(PumpReply::Updated(Ok(events)))
+        updated_reply_with_token(events, update_token(1, 1))
+    }
+
+    fn update_token(generation: u64, sequence: u64) -> LiveUpdateToken {
+        LiveUpdateToken {
+            generation,
+            key: pump_key(),
+            sequence,
+        }
+    }
+
+    fn updated_reply_with_token(
+        events: Vec<KmsRenderFrameEvent>,
+        token: LiveUpdateToken,
+    ) -> Option<LiveCoordinatorEvent> {
+        pump_reply(PumpReply::Updated(Ok(LiveUpdateReport {
+            token,
+            execution: LiveUpdateExecution::FullRender {
+                demand_revision: None,
+            },
+            frame_events: events,
+        })))
+    }
+
+    #[test]
+    fn update_report_validation_preserves_demand_floor_and_request_identity() {
+        let expected = update_token(5, 7);
+        let mut report = LiveUpdateReport {
+            token: expected.clone(),
+            execution: LiveUpdateExecution::FullRender {
+                demand_revision: Some(9),
+            },
+            frame_events: vec![],
+        };
+        let mut floor = None;
+        validate_update_report(&report, &expected, &mut floor).unwrap();
+        assert_eq!(floor, Some(9));
+        for execution in [
+            LiveUpdateExecution::NotServiced,
+            LiveUpdateExecution::FullRender {
+                demand_revision: None,
+            },
+        ] {
+            report.execution = execution;
+            validate_update_report(&report, &expected, &mut floor).unwrap();
+            assert_eq!(floor, Some(9));
+        }
+        report.execution = LiveUpdateExecution::FullRender {
+            demand_revision: Some(8),
+        };
+        assert!(
+            validate_update_report(&report, &expected, &mut floor)
+                .unwrap_err()
+                .to_string()
+                .contains("kms-live-stale-demand")
+        );
+        assert_eq!(floor, Some(9));
+        report.execution = LiveUpdateExecution::FullRender {
+            demand_revision: Some(10),
+        };
+        for stale in [
+            update_token(4, 7),
+            update_token(5, 6),
+            update_token(5, 8),
+            LiveUpdateToken {
+                key: OutputKey {
+                    device: 226,
+                    connector_name: "Other-1".into(),
+                },
+                ..expected.clone()
+            },
+        ] {
+            report.token = stale;
+            assert!(validate_update_report(&report, &expected, &mut floor).is_err());
+            assert_eq!(floor, Some(9));
+        }
+        let mut sequence = u64::MAX;
+        assert!(next_update_token(5, &pump_key(), &mut sequence).is_err());
+        assert_eq!(sequence, u64::MAX);
+    }
+
+    #[test]
+    fn initial_and_resumed_supervision_reject_duplicate_and_skipped_update_reports() {
+        for resumed in [false, true] {
+            for sequence in [1, 3] {
+                let mut replies = Vec::new();
+                if !resumed {
+                    replies.extend([started_reply(), ready_reply()]);
+                }
+                replies.push(updated_reply(vec![submitted_event()]));
+                replies.push(updated_reply_with_token(
+                    vec![submitted_event()],
+                    update_token(1, sequence),
+                ));
+                let mut mailbox = SupervisorMailbox::new(replies, []);
+                let mut pump = SupervisorPump::at_60_hz();
+                let mut now = mailbox.now();
+                let pulses = Cell::new(0);
+                let mut pulse = || {
+                    pulses.set(pulses.get() + 1);
+                    Ok(())
+                };
+                let error = if resumed {
+                    supervise_resumed_live_render(
+                        &mut mailbox,
+                        &mut pump,
+                        ResumedLiveOutput {
+                            ready_at: Duration::ZERO,
+                            generation: 1,
+                            key: pump_key(),
+                        },
+                        now,
+                        |_| Ok(crate::protocol::EventFlushOutcome::Complete),
+                        pulse,
+                        |_, _, _| Ok(()),
+                    )
+                } else {
+                    supervise_live_render_inner(
+                        &mut mailbox,
+                        &mut pump,
+                        &mut now,
+                        &mut |_| {},
+                        &mut pulse,
+                        &mut |_, _, _| Ok(()),
+                    )
+                }
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("kms-live-stale-service-sequence"),
+                    "{error}"
+                );
+                assert_eq!(
+                    pulses.get(),
+                    1,
+                    "only the first real presentation may pulse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pause_reconciliation_rejects_a_reply_for_another_update() {
+        for token in [update_token(1, 1), update_token(1, 3), update_token(2, 2)] {
+            let mut mailbox = SupervisorMailbox::new(
+                [updated_reply_with_token(
+                    vec![atomic_commit_failure(libc::EACCES)],
+                    token,
+                )],
+                [],
+            );
+            let mut now = mailbox.now();
+            let error = reconcile_outstanding_pump_command(
+                &mut mailbox,
+                OutstandingPumpCommand::Update(update_token(1, 2)),
+                LivePauseCause::External,
+                Duration::from_secs(30),
+                &mut now,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("kms-live-stale-"), "{error}");
+        }
+    }
+
+    #[test]
+    fn initial_and_resumed_supervision_validate_whole_batch_before_effects() {
+        for resumed in [false, true] {
+            for wrong_key in [false, true] {
+                for cancelled in [false, true] {
+                    let mut valid = submitted_event();
+                    if let KmsRenderFrameEvent::FrameSubmitted {
+                        security_epochs, ..
+                    } = &mut valid
+                    {
+                        security_epochs.push(51);
+                    }
+                    let mut stale = if cancelled {
+                        presentation_cancelled_event(1)
+                    } else {
+                        submitted_event()
+                    };
+                    let (generation, key) = match &mut stale {
+                        KmsRenderFrameEvent::FrameSubmitted {
+                            generation, key, ..
+                        }
+                        | KmsRenderFrameEvent::PresentationCancelled { generation, key } => {
+                            (generation, key)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if wrong_key {
+                        key.connector_name.push_str("-stale");
+                    } else {
+                        *generation = 2;
+                    }
+                    let mut replies = Vec::new();
+                    if !resumed {
+                        replies.extend([started_reply(), ready_reply()]);
+                    }
+                    replies.push(updated_reply(vec![valid, stale]));
+                    let mut mailbox = SupervisorMailbox::new(replies, []);
+                    let mut pump = SupervisorPump::at_60_hz();
+                    let mut now = mailbox.now();
+                    let pulses = Cell::new(0);
+                    let acknowledgements = Cell::new(0);
+                    let mut pulse = || {
+                        pulses.set(pulses.get() + 1);
+                        Ok(())
+                    };
+                    let mut presented = |_, _, _| {
+                        acknowledgements.set(acknowledgements.get() + 1);
+                        Ok(())
+                    };
+                    let result = if resumed {
+                        supervise_resumed_live_render(
+                            &mut mailbox,
+                            &mut pump,
+                            ResumedLiveOutput {
+                                ready_at: Duration::ZERO,
+                                generation: 1,
+                                key: pump_key(),
+                            },
+                            now,
+                            |_| Ok(crate::protocol::EventFlushOutcome::Complete),
+                            pulse,
+                            presented,
+                        )
+                    } else {
+                        supervise_live_render_inner(
+                            &mut mailbox,
+                            &mut pump,
+                            &mut now,
+                            &mut |_| {},
+                            &mut pulse,
+                            &mut presented,
+                        )
+                    };
+                    let error = result.expect_err("readiness binds both key and generation");
+                    assert!(error.to_string().contains(if wrong_key {
+                        "kms-live-stale-output"
+                    } else {
+                        "kms-live-stale-generation"
+                    }));
+                    assert_eq!(pulses.get(), 0);
+                    assert_eq!(
+                        acknowledgements.get(),
+                        0,
+                        "even earlier valid events have no effects"
+                    );
+                    assert_eq!(
+                        pump.commands
+                            .iter()
+                            .filter(|command| **command == "update")
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_identity_validation_does_not_discard_terminal_failures() {
+        let failure = atomic_commit_failure(libc::EINVAL);
+        let events = vec![failure];
+        require_update_frame_identity(&events, 1, &pump_key()).unwrap();
+        assert!(matches!(
+            &events[..],
+            [KmsRenderFrameEvent::TerminalFailure(_)]
+        ));
+        let mut mailbox =
+            SupervisorMailbox::new([started_reply(), ready_reply(), updated_reply(events)], []);
+        let mut pump = SupervisorPump::at_60_hz();
+        let now = mailbox.now();
+        assert!(
+            supervise_live_render(&mut mailbox, &mut pump, now)
+                .expect_err("terminal evidence still terminates supervision")
+                .to_string()
+                .contains("kms-live-atomic-commit-hard-rejection")
+        );
     }
 
     #[test]
@@ -9543,7 +10150,10 @@ mod tests {
         .expect("the resumed generation reaches its first OutputReady");
         assert_eq!(
             outcome,
-            LiveTransitionOutcome::OutputReady { generation: 2 }
+            LiveTransitionOutcome::OutputReady {
+                generation: 2,
+                key: pump_key()
+            }
         );
 
         let active = baseline.observe_output_ready(Some(40));
@@ -9668,14 +10278,14 @@ mod tests {
             end,
             ActiveLiveOperationEnd::VtSwitchRequested {
                 vt: 4,
-                outstanding_command: Some(OutstandingPumpCommand::Update),
+                outstanding_command: Some(OutstandingPumpCommand::Update(update_token(1, 1))),
             }
         );
 
         let mut now = mailbox.now();
         reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
             LivePauseCause::SelfSwitch,
             Duration::from_secs(30),
             &mut now,
@@ -9839,7 +10449,10 @@ mod tests {
             panic!("external pause ended active supervision as {end:?}");
         };
         assert_eq!(generation, 2);
-        assert_eq!(outstanding_command, Some(OutstandingPumpCommand::Update));
+        assert_eq!(
+            outstanding_command,
+            Some(OutstandingPumpCommand::Update(update_token(1, 1)))
+        );
 
         let mut lifecycle = LiveCoordinatorLifecycle::active(1, Duration::ZERO);
         assert_eq!(
@@ -9851,7 +10464,7 @@ mod tests {
         let mut now = mailbox.now();
         reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
@@ -9884,7 +10497,10 @@ mod tests {
             [
                 // The completed update beats the session callback: this is
                 // the cycle-21 banked-gate ordering.
-                updated_reply(vec![atomic_commit_failure_for_generation(libc::EACCES, 61)]),
+                updated_reply_with_token(
+                    vec![atomic_commit_failure_for_generation(libc::EACCES, 61)],
+                    update_token(61, 1),
+                ),
                 Some(LiveCoordinatorEvent::PauseRequested {
                     generation: 62,
                     acknowledgement,
@@ -9923,6 +10539,7 @@ mod tests {
             ResumedLiveOutput {
                 ready_at: Duration::ZERO,
                 generation: 61,
+                key: pump_key(),
             },
             now,
             |_| Ok(crate::protocol::EventFlushOutcome::Complete),
@@ -10020,7 +10637,10 @@ mod tests {
                 &mut now,
             )
             .expect("fresh staged authority rebuilds the output"),
-            LiveTransitionOutcome::OutputReady { generation: 64 }
+            LiveTransitionOutcome::OutputReady {
+                generation: 64,
+                key: pump_key()
+            }
         );
         assert_eq!(
             lifecycle
@@ -10037,7 +10657,10 @@ mod tests {
     fn reply_carried_authority_failure_without_pause_remains_terminal() {
         let mut mailbox = SupervisorMailbox::new(
             [
-                updated_reply(vec![atomic_commit_failure_for_generation(libc::EACCES, 61)]),
+                updated_reply_with_token(
+                    vec![atomic_commit_failure_for_generation(libc::EACCES, 61)],
+                    update_token(61, 1),
+                ),
                 None,
             ],
             [],
@@ -10051,6 +10674,7 @@ mod tests {
             ResumedLiveOutput {
                 ready_at: Duration::ZERO,
                 generation: 61,
+                key: pump_key(),
             },
             now,
             |_| Ok(crate::protocol::EventFlushOutcome::Complete),
@@ -10108,7 +10732,10 @@ mod tests {
             panic!("external pause ended active supervision as {end:?}");
         };
         assert_eq!(generation, 2);
-        assert_eq!(outstanding_command, Some(OutstandingPumpCommand::Update));
+        assert_eq!(
+            outstanding_command,
+            Some(OutstandingPumpCommand::Update(update_token(1, 1)))
+        );
 
         let mut lifecycle = LiveCoordinatorLifecycle::active(1, Duration::ZERO);
         assert_eq!(
@@ -10120,7 +10747,7 @@ mod tests {
         let mut now = mailbox.now();
         reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
@@ -10148,13 +10775,18 @@ mod tests {
 
     #[test]
     fn cancelled_update_reconciles_as_no_submitted_frame() {
-        let mut mailbox =
-            SupervisorMailbox::new([updated_reply(vec![presentation_cancelled_event(17)])], []);
+        let mut mailbox = SupervisorMailbox::new(
+            [updated_reply_with_token(
+                vec![presentation_cancelled_event(17)],
+                update_token(17, 1),
+            )],
+            [],
+        );
         let mut now = mailbox.now();
 
         reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(17, 1)),
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
@@ -10172,7 +10804,7 @@ mod tests {
 
         let error = reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
             LivePauseCause::SelfSwitch,
             Duration::from_secs(30),
             &mut now,
@@ -10212,7 +10844,7 @@ mod tests {
                 PauseCollectingMailbox::new(&mut mailbox, &mut external_pause);
             reconcile_outstanding_pump_command(
                 &mut collecting_mailbox,
-                OutstandingPumpCommand::Update,
+                OutstandingPumpCommand::Update(update_token(1, 1)),
                 LivePauseCause::SelfSwitch,
                 Duration::from_secs(30),
                 &mut now,
@@ -10262,7 +10894,7 @@ mod tests {
 
         let error = reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
@@ -10293,7 +10925,7 @@ mod tests {
 
         let error = reconcile_outstanding_pump_command(
             &mut mailbox,
-            OutstandingPumpCommand::Update,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
@@ -10397,21 +11029,26 @@ mod tests {
         let mut mailbox = SupervisorMailbox::new(
             [
                 updated_reply(Vec::new()),
-                updated_reply(vec![KmsRenderFrameEvent::FrameSubmitted {
-                    generation: 1,
-                    key: pump_key(),
-                    frame_token: 1,
-                    timestamp: super::super::render::KmsPresentationTimestamp {
-                        seconds: 1,
-                        nanoseconds: 2,
-                    },
-                    security_epochs: vec![51],
-                }]),
-                updated_reply(vec![
-                    submitted_event(),
-                    submitted_event(),
-                    submitted_event(),
-                ]),
+                updated_reply_with_token(
+                    vec![KmsRenderFrameEvent::FrameSubmitted {
+                        generation: 1,
+                        key: pump_key(),
+                        frame_token: 1,
+                        scene_revision: None,
+                        asset_preparation: None,
+                        pipeline_readiness: None,
+                        timestamp: super::super::render::KmsPresentationTimestamp {
+                            seconds: 1,
+                            nanoseconds: 2,
+                        },
+                        security_epochs: vec![51],
+                    }],
+                    update_token(1, 2),
+                ),
+                updated_reply_with_token(
+                    vec![submitted_event(), submitted_event(), submitted_event()],
+                    update_token(1, 3),
+                ),
             ],
             [
                 None,
@@ -10428,6 +11065,11 @@ mod tests {
         );
         let mut pump = SupervisorPump::at_60_hz();
         let (frame_clock, pulse_probe) = crate::protocol::ClientFrameClock::test_channel();
+        mailbox.advances.extend([
+            Duration::ZERO,
+            pump.nominal_refresh_interval(),
+            pump.nominal_refresh_interval(),
+        ]);
         let flushes = Cell::new(0_u32);
         let displayed_security = RefCell::new(Vec::new());
         let now = mailbox.now();
@@ -10437,6 +11079,7 @@ mod tests {
             ResumedLiveOutput {
                 ready_at: Duration::ZERO,
                 generation: 1,
+                key: pump_key(),
             },
             now,
             |_| {
@@ -10494,7 +11137,7 @@ mod tests {
                 unreachable!("the resumed path is already registered")
             }
 
-            fn request_update(&mut self) -> Result<(), KmsLiveError> {
+            fn request_update(&mut self, _token: LiveUpdateToken) -> Result<(), KmsLiveError> {
                 self.commands.push("update");
                 Ok(())
             }
@@ -10554,6 +11197,7 @@ mod tests {
             ResumedLiveOutput {
                 ready_at: Duration::ZERO,
                 generation: 1,
+                key: pump_key(),
             },
             now,
             |_| {
@@ -10599,7 +11243,7 @@ mod tests {
                 unreachable!("the resumed path is already registered")
             }
 
-            fn request_update(&mut self) -> Result<(), KmsLiveError> {
+            fn request_update(&mut self, _token: LiveUpdateToken) -> Result<(), KmsLiveError> {
                 self.commands.push("update");
                 self.app.update();
                 let marker = self
@@ -10694,6 +11338,7 @@ mod tests {
             ResumedLiveOutput {
                 ready_at: Duration::ZERO,
                 generation: 1,
+                key: pump_key(),
             },
             now,
             |timeout| {
@@ -10768,6 +11413,7 @@ mod tests {
             ResumedLiveOutput {
                 ready_at: Duration::ZERO,
                 generation: 1,
+                key: pump_key(),
             },
             now,
             |_| {
@@ -10926,9 +11572,395 @@ mod tests {
 
         let error = supervise_live_render(&mut mailbox, &mut pump, now)
             .expect_err("an update without a reply reaches the coordinator deadline");
-        assert!(error.to_string().contains("no frame for 2s"));
+        assert!(
+            error
+                .to_string()
+                .contains("kms-live-update-response-timeout")
+        );
         assert_eq!(pump.commands, ["registration", "update"]);
         assert_eq!(pump.stops, 1);
+    }
+
+    #[test]
+    fn initial_and_resumed_updates_keep_response_and_submission_deadlines_independent() {
+        for resumed in [false, true] {
+            for late_reply in [false, true] {
+                let mut replies = Vec::new();
+                let mut advances = Vec::new();
+                if !resumed {
+                    replies.extend([started_reply(), ready_reply()]);
+                    advances.extend([Duration::ZERO, Duration::ZERO]);
+                }
+                let mut event = submitted_event();
+                if let KmsRenderFrameEvent::FrameSubmitted {
+                    security_epochs, ..
+                } = &mut event
+                {
+                    security_epochs.push(51);
+                }
+                replies.push(if late_reply {
+                    updated_reply(vec![event])
+                } else {
+                    None
+                });
+                advances.push(UPDATE_RESPONSE_TIMEOUT);
+                let mut mailbox = SupervisorMailbox::new(replies, []);
+                mailbox.advances.extend(advances);
+                let mut pump = SupervisorPump::at_60_hz();
+                let mut now = mailbox.now();
+                let mut pulse = || panic!("late or absent response cannot pulse clients");
+                let mut presented =
+                    |_, _, _| panic!("late or absent response cannot acknowledge security");
+                let error = if resumed {
+                    supervise_resumed_live_render(
+                        &mut mailbox,
+                        &mut pump,
+                        ResumedLiveOutput {
+                            ready_at: Duration::ZERO,
+                            generation: 1,
+                            key: pump_key(),
+                        },
+                        now,
+                        |_| Ok(crate::protocol::EventFlushOutcome::Complete),
+                        pulse,
+                        presented,
+                    )
+                } else {
+                    supervise_live_render_inner(
+                        &mut mailbox,
+                        &mut pump,
+                        &mut now,
+                        &mut |_| {},
+                        &mut pulse,
+                        &mut presented,
+                    )
+                }
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("kms-live-update-response-timeout"),
+                    "{error}"
+                );
+            }
+
+            let mut replies = Vec::new();
+            let mut advances = Vec::new();
+            if !resumed {
+                replies.extend([started_reply(), ready_reply()]);
+                advances.extend([Duration::ZERO, Duration::ZERO]);
+            }
+            // A successful response halfway through the submission budget does
+            // not restart that budget, even with a fresh request token next.
+            replies.extend([updated_reply(Vec::new()), None]);
+            advances.push(Duration::from_secs(1));
+            let mut mailbox = SupervisorMailbox::new(replies, []);
+            mailbox.advances.extend(advances);
+            let mut pump = SupervisorPump::at_60_hz();
+            let mut now = mailbox.now();
+            let mut pulse = || panic!("empty updates cannot pulse clients");
+            let error = if resumed {
+                supervise_resumed_live_render(
+                    &mut mailbox,
+                    &mut pump,
+                    ResumedLiveOutput {
+                        ready_at: Duration::ZERO,
+                        generation: 1,
+                        key: pump_key(),
+                    },
+                    now,
+                    |_| Ok(crate::protocol::EventFlushOutcome::Complete),
+                    pulse,
+                    |_, _, _| Ok(()),
+                )
+            } else {
+                supervise_live_render_inner(
+                    &mut mailbox,
+                    &mut pump,
+                    &mut now,
+                    &mut |_| {},
+                    &mut pulse,
+                    &mut |_, _, _| Ok(()),
+                )
+            }
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("submitted no frame for 2s"),
+                "{error}"
+            );
+            assert_eq!(mailbox.clock.get(), NO_SUBMIT_TIMEOUT);
+            assert_eq!(mailbox.waited_for.last(), Some(&Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn update_response_deadline_stays_bounded_without_submission_requirement() {
+        let deadlines = UpdateDeadlines {
+            response: Duration::from_secs(7),
+            submission: None,
+        };
+        let mut mailbox = SupervisorMailbox::new([None], []);
+        mailbox.clock.set(Duration::from_secs(5));
+        let mut now = mailbox.now();
+        let error = wait_for_update_reply(
+            &mut mailbox,
+            deadlines,
+            &mut now,
+            OutstandingPumpCommand::Update(update_token(1, 1)),
+        )
+        .err()
+        .expect("an unanswered update expires without a submission requirement");
+        assert!(
+            error
+                .to_string()
+                .contains("kms-live-update-response-timeout")
+        );
+        assert_eq!(mailbox.waited_for, [UPDATE_RESPONSE_TIMEOUT]);
+        assert_eq!(mailbox.clock.get(), deadlines.response);
+
+        // Even an expired wait must preserve a pending seat-loss event.
+        mailbox
+            .polls
+            .push_back(Some(LiveCoordinatorEvent::Signal(LiveSignal::Terminate)));
+        assert!(matches!(
+            wait_for_update_reply(
+                &mut mailbox,
+                deadlines,
+                &mut now,
+                OutstandingPumpCommand::Update(update_token(1, 1))
+            )
+            .unwrap(),
+            PumpWait::End(LiveSupervisionEnd::Signal(LiveSignal::Terminate))
+        ));
+    }
+
+    #[test]
+    fn idle_requires_presentation_and_new_demand_has_a_fixed_submission_deadline() {
+        let idle = LiveUpdateExecution::HealthyIdle { demand_revision: 7 };
+        let full = LiveUpdateExecution::FullRender {
+            demand_revision: Some(8),
+        };
+        let mut policy = SubmitWatchdog::new(Duration::ZERO);
+        assert!(policy.observe_execution(idle, Duration::ZERO).is_err());
+        policy.presented_revision = Some(7);
+        policy.observe_submitted(Duration::ZERO);
+        assert!(
+            policy
+                .observe_execution(idle, Duration::from_millis(16))
+                .unwrap()
+        );
+        assert_eq!(policy.deadline(), None);
+        assert!(!policy.no_submit_timed_out(Duration::from_secs(30)));
+        policy
+            .observe_execution(full, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(policy.deadline(), Some(Duration::from_secs(32)));
+        assert!(
+            policy
+                .observe_execution(idle, Duration::from_secs(31))
+                .is_err()
+        );
+        policy
+            .observe_execution(full, Duration::from_secs(31))
+            .unwrap();
+        assert_eq!(policy.deadline(), Some(Duration::from_secs(32)));
+        assert!(policy.no_submit_timed_out(Duration::from_secs(32)));
+        policy.observe_submitted(Duration::from_secs(31));
+        policy.presented_revision = Some(8);
+        assert!(
+            policy
+                .observe_execution(
+                    LiveUpdateExecution::HealthyIdle { demand_revision: 8 },
+                    Duration::from_secs(31)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn idle_service_is_paced_and_pause_interrupts_before_callback() {
+        let nominal = Duration::from_millis(16);
+        let mut mailbox = SupervisorMailbox::new([None, None], []);
+        let mut now = mailbox.now();
+        let mut next = nominal;
+        let pulses = Cell::new(0);
+        for _ in 0..2 {
+            assert!(
+                finish_service_cadence(
+                    &mut mailbox,
+                    true,
+                    0,
+                    &mut next,
+                    nominal,
+                    &mut now,
+                    &mut || {
+                        pulses.set(pulses.get() + 1);
+                        Ok(())
+                    }
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert_eq!(pulses.get(), 2);
+        assert_eq!(mailbox.clock.get(), nominal * 2);
+        assert_eq!(mailbox.waited_for, [nominal, nominal]);
+        let (acknowledgement, _) = observed_pause_acknowledgement();
+        mailbox
+            .waits
+            .push_back(Some(LiveCoordinatorEvent::PauseRequested {
+                generation: 2,
+                acknowledgement,
+            }));
+        assert!(matches!(
+            finish_service_cadence(
+                &mut mailbox,
+                true,
+                0,
+                &mut next,
+                nominal,
+                &mut now,
+                &mut || panic!("pause must win before callback")
+            )
+            .unwrap(),
+            Some(LiveSupervisionEnd::PauseRequested {
+                outstanding_command: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn real_submissions_cannot_pulse_twice_in_one_refresh_interval() {
+        let mut mailbox = SupervisorMailbox::new([], []);
+        let mut now = mailbox.now();
+        let mut next = Duration::ZERO;
+        let nominal = Duration::from_millis(16);
+        let pulses = Cell::new(0);
+        for _ in 0..3 {
+            finish_service_cadence(
+                &mut mailbox,
+                false,
+                1,
+                &mut next,
+                nominal,
+                &mut now,
+                &mut || {
+                    pulses.set(pulses.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(pulses.get(), 1);
+        mailbox.clock.set(nominal);
+        finish_service_cadence(
+            &mut mailbox,
+            false,
+            1,
+            &mut next,
+            nominal,
+            &mut now,
+            &mut || {
+                pulses.set(pulses.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(pulses.get(), 2);
+    }
+
+    #[test]
+    fn both_supervisors_accept_long_idle_but_still_timeout_a_missing_response() {
+        for resumed in [false, true] {
+            for hung in [false, true] {
+                let mut waits = Vec::new();
+                if !resumed {
+                    waits.extend([started_reply(), ready_reply()]);
+                }
+                let mut frame = submitted_event();
+                if let KmsRenderFrameEvent::FrameSubmitted {
+                    scene_revision,
+                    security_epochs,
+                    ..
+                } = &mut frame
+                {
+                    *scene_revision = Some(7);
+                    security_epochs.push(51);
+                }
+                waits.push(updated_reply(vec![frame]));
+                for sequence in 2..=131 {
+                    waits.push(pump_reply(PumpReply::Updated(Ok(LiveUpdateReport {
+                        token: update_token(1, sequence),
+                        execution: LiveUpdateExecution::HealthyIdle { demand_revision: 7 },
+                        frame_events: vec![],
+                    }))));
+                    waits.push(None); // interruptible nominal-refresh wait
+                }
+                waits.push(if hung {
+                    None
+                } else {
+                    Some(LiveCoordinatorEvent::Signal(LiveSignal::Terminate))
+                });
+                let mut mailbox = SupervisorMailbox::new(waits, []);
+                let mut pump = SupervisorPump::at_60_hz();
+                let mut now = mailbox.now();
+                let pulses = Cell::new(0);
+                let acknowledgements = Cell::new(0);
+                let mut pulse = || {
+                    pulses.set(pulses.get() + 1);
+                    Ok(())
+                };
+                let mut presented = |_, _, _| {
+                    acknowledgements.set(acknowledgements.get() + 1);
+                    Ok(())
+                };
+                let result = if resumed {
+                    supervise_resumed_live_render(
+                        &mut mailbox,
+                        &mut pump,
+                        ResumedLiveOutput {
+                            ready_at: Duration::ZERO,
+                            generation: 1,
+                            key: pump_key(),
+                        },
+                        now,
+                        |_| Ok(crate::protocol::EventFlushOutcome::Complete),
+                        pulse,
+                        presented,
+                    )
+                } else {
+                    supervise_live_render_inner(
+                        &mut mailbox,
+                        &mut pump,
+                        &mut now,
+                        &mut |_| {},
+                        &mut pulse,
+                        &mut presented,
+                    )
+                };
+                if hung {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("kms-live-update-response-timeout")
+                    );
+                } else {
+                    assert!(matches!(
+                        result.unwrap(),
+                        LiveSupervisionEnd::Signal(LiveSignal::Terminate)
+                    ));
+                }
+                assert!(mailbox.clock.get() > NO_SUBMIT_TIMEOUT);
+                assert_eq!(pulses.get(), 131);
+                assert_eq!(
+                    acknowledgements.get(),
+                    1,
+                    "idle never acknowledges presentation"
+                );
+            }
+        }
     }
 
     #[test]
@@ -11092,11 +12124,20 @@ mod tests {
             [
                 started_reply(),
                 ready_reply(),
-                updated_reply(vec![submitted_event()]),
+                updated_reply(Vec::new()),
+                updated_reply_with_token(vec![submitted_event()], update_token(1, 2)),
             ],
             [],
         );
-        mailbox.advances = [Duration::ZERO, Duration::ZERO, Duration::from_millis(2_200)].into();
+        // The second response arrives within its own two-second budget but
+        // after the original submission deadline. It cannot erase that debt.
+        mailbox.advances = [
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_millis(1_200),
+        ]
+        .into();
         let mut pump = SupervisorPump::at_60_hz();
         let now = mailbox.now();
 
@@ -11271,6 +12312,9 @@ mod tests {
             generation: 7,
             key: selected_output_for_test(41).key,
             frame_token: 1,
+            scene_revision: None,
+            asset_preparation: None,
+            pipeline_readiness: None,
             timestamp: super::super::render::KmsPresentationTimestamp {
                 seconds: 1,
                 nanoseconds: 2,
@@ -12744,7 +13788,7 @@ mod tests {
         assert!(matches!(
             classify_transition_wait_event(event, "external pausing test")
                 .expect("the discarded chord cannot become a setup error"),
-            PumpReply::Updated(Ok(events)) if events.is_empty()
+            PumpReply::Updated(Ok(report)) if report.frame_events.is_empty()
         ));
 
         assert_eq!(
@@ -14557,7 +15601,7 @@ mod tests {
                 "racing pause test",
             )
             .expect("the outstanding reply survives pause collection"),
-            PumpReply::Updated(Ok(events)) if events.is_empty()
+            PumpReply::Updated(Ok(report)) if report.frame_events.is_empty()
         ));
         let pause = collected.expect("the first external cause is retained");
         assert_eq!(pause.generation, 2);

@@ -166,3 +166,22 @@ Exactly which WGSL features `wgpu` supports depends on how you are using it:
 [naga]: https://github.com/gfx-rs/wgpu/tree/trunk/naga/
 [naga bugs]: https://github.com/gfx-rs/wgpu/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22naga%22
 
+## Cosmix diagnostic addition (2026-09-08)
+
+This vendored wgpu 29.0.4 includes an optional `cfg(std)` public
+`diagnostics` observer for queue submission and surface configure/acquire/present
+API boundaries, explicit device polling, and the backend/deferred-action portions
+of queue submission. Device-poll subject is 0 for Poll and 1 for Wait; it is not
+a device identity or proof that a fence was held throughout the span.
+It preserves the original API operations, ordering, iterator
+consumption and deferred actions. No observer means no clock reads or recording;
+the existing Cosmix opt-in recorder owns timing and bounded asynchronous output.
+Surface identities are private, lazy, process-local counters carried into the
+acquired texture; queue events use subject zero. The observer is installed once,
+cannot replace an existing owner, and must not block or re-enter wgpu. End events
+also occur on unwind and do not assert operation success. Observer panics are
+caught on unwind builds; panic-abort behaviour cannot be intercepted.
+
+The addition is limited to `src/diagnostics.rs` and small API boundary hooks.
+It adds no dependencies, rendering policy, public media or Bevy fork. Upstream
+wgpu licensing remains unchanged (MIT OR Apache-2.0).

@@ -2,17 +2,25 @@
 
 mod backend;
 mod bindings;
+mod bus_key;
 mod capture;
 mod chrome_frame_material;
 mod client_surface_material;
 mod compositor_scene;
 mod decoration;
 mod decoration_scene;
+mod frame_trace;
+#[cfg(feature = "native-quoin")]
+mod native_shell;
 #[cfg(feature = "frame-capture")]
 mod frame_capture;
 #[cfg(feature = "bus")]
 mod port;
 mod protocol;
+mod render_asset_demand;
+mod render_asset_readiness;
+mod render_component_demand;
+mod render_pipeline_readiness;
 mod shadow_material;
 
 use std::{env, error::Error, ffi::OsString, io, mem, process::ExitCode, time::Duration};
@@ -175,11 +183,14 @@ fn main() -> ExitCode {
         Ok(ParseOutcome::Run(cli)) => cli,
         Ok(ParseOutcome::ListBindings {
             keybindings_enabled,
+            f9_bus,
             profile,
         }) => {
             print!(
                 "{}",
-                bindings::BindingState::for_profile(profile, keybindings_enabled).to_strict_data()
+                bindings::BindingState::for_profile(profile, keybindings_enabled)
+                    .with_bus_key(f9_bus.is_some())
+                    .to_strict_data()
             );
             return ExitCode::SUCCESS;
         }
@@ -201,7 +212,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             };
         }
-        Ok(ParseOutcome::KmsLive { argv, bus_service }) => {
+        Ok(ParseOutcome::KmsLive {
+            argv,
+            bus_service,
+            f9_bus,
+        }) => {
             if let Err(error) = init_kms_live_tracing() {
                 eprintln!("kms-live tracing initialisation failed: {error}");
                 return ExitCode::FAILURE;
@@ -210,6 +225,7 @@ fn main() -> ExitCode {
                 Ok(grant) => match backend::kms_live::execute_live(
                     grant,
                     bus_service.unwrap_or_else(|| "comp".into()),
+                    f9_bus,
                 ) {
                     Ok(()) => {
                         return backend::kms_live::latched_signal_exit_code()
@@ -281,6 +297,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
             Default::default(),
             WaylandRuntimePolicy {
                 keybindings_enabled: cli.keybindings_enabled,
+                f9_bus: cli.f9_bus.clone(),
                 explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
                 decoration,
             },
@@ -350,6 +367,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
 
     let policy = WaylandRuntimePolicy {
         keybindings_enabled: cli.keybindings_enabled,
+        f9_bus: cli.f9_bus.clone(),
         explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
         decoration: decoration.clone(),
     };
@@ -430,6 +448,7 @@ Options:
   --socket <name>    Wayland socket name (default: cosmix-0)
   --bus-service      Override the Bus service name (default comp-nested/comp)
   --no-keybindings   Start with compositor key interception disabled
+  --f9-bus <service> <verb>  Send a native Bus request with {} on each F9 press
   --ssd              Explicitly enable server-side decorations (the default)
   --no-ssd           Disable server-side decorations
   --chrome <style>   Select mac, win11 or cosmix chrome (default mac; enables SSD)
@@ -454,6 +473,7 @@ struct Cli {
     backend: BackendKind,
     socket: String,
     keybindings_enabled: bool,
+    f9_bus: Option<bus_key::BusKeyConfig>,
     decoration: DecorationStartup,
     bus_service: Option<String>,
 }
@@ -462,6 +482,7 @@ enum ParseOutcome {
     Run(Box<Cli>),
     ListBindings {
         keybindings_enabled: bool,
+        f9_bus: Option<bus_key::BusKeyConfig>,
         profile: bindings::BindingProfile,
     },
     KmsProbe,
@@ -471,13 +492,42 @@ enum ParseOutcome {
     KmsLive {
         argv: Vec<OsString>,
         bus_service: Option<String>,
+        f9_bus: Option<bus_key::BusKeyConfig>,
     },
     Help,
+}
+
+fn extract_f9_bus(
+    args: Vec<OsString>,
+) -> Result<(Vec<OsString>, Option<bus_key::BusKeyConfig>), String> {
+    let mut remaining = Vec::new();
+    let mut config = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--f9-bus" {
+            if config.is_some() {
+                return Err("--f9-bus may only be supplied once".into());
+            }
+            let service = args
+                .next()
+                .and_then(|s| s.into_string().ok())
+                .ok_or("--f9-bus requires a service and verb")?;
+            let verb = args
+                .next()
+                .and_then(|s| s.into_string().ok())
+                .ok_or("--f9-bus requires a service and verb")?;
+            config = Some(bus_key::BusKeyConfig::parse(service, verb)?);
+        } else {
+            remaining.push(arg);
+        }
+    }
+    Ok((remaining, config))
 }
 
 impl Cli {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutcome, String> {
         let (args, bus_service) = extract_bus_service(args.into_iter().collect())?;
+        let (args, f9_bus) = extract_f9_bus(args)?;
         if args.first().and_then(|argument| argument.to_str()) == Some("kms-live") {
             if args.len() == 2 && matches!(args[1].to_str(), Some("--help" | "-h")) {
                 return Ok(ParseOutcome::Help);
@@ -485,6 +535,7 @@ impl Cli {
             return Ok(ParseOutcome::KmsLive {
                 argv: args,
                 bus_service,
+                f9_bus,
             });
         }
         let original_args = args.clone();
@@ -630,6 +681,7 @@ impl Cli {
                     return Ok(ParseOutcome::KmsLive {
                         argv: original_args,
                         bus_service,
+                        f9_bus,
                     });
                 }
                 Some("-h" | "--help") => return Ok(ParseOutcome::Help),
@@ -649,6 +701,7 @@ impl Cli {
                 || ssd.is_some()
                 || chrome.is_some()
                 || bus_service.is_some()
+                || f9_bus.is_some()
             {
                 return Err("--kms-probe must be supplied by itself".into());
             }
@@ -663,6 +716,7 @@ impl Cli {
                 || ssd.is_some()
                 || chrome.is_some()
                 || bus_service.is_some()
+                || f9_bus.is_some()
             {
                 return Err("--kms-watch must be supplied by itself".into());
             }
@@ -674,6 +728,7 @@ impl Cli {
             }
             return Ok(ParseOutcome::ListBindings {
                 keybindings_enabled,
+                f9_bus,
                 profile: binding_profile.unwrap_or(bindings::BindingProfile::Nested),
             });
         }
@@ -686,6 +741,7 @@ impl Cli {
             backend,
             socket: socket.unwrap_or_else(|| DEFAULT_SOCKET.into()),
             keybindings_enabled,
+            f9_bus,
             decoration: DecorationStartup::resolve(
                 ssd.unwrap_or(true) || chrome.is_some(),
                 chrome.unwrap_or(ChromeStyle::Mac),
@@ -1790,6 +1846,7 @@ mod tests {
                 backend: BackendKind::Winit,
                 socket: DEFAULT_SOCKET.into(),
                 keybindings_enabled: true,
+                f9_bus: None,
                 decoration: DecorationStartup::default(),
                 bus_service: None,
             }
@@ -1821,7 +1878,9 @@ mod tests {
             panic!("expected runnable CLI");
         };
         assert_eq!(cli.bus_service.as_deref(), Some("comp-test"));
-        let ParseOutcome::KmsLive { argv, bus_service } = parse(&[
+        let ParseOutcome::KmsLive {
+            argv, bus_service, ..
+        } = parse(&[
             "kms-live",
             "--device",
             "/dev/dri/card0",
@@ -1830,7 +1889,8 @@ mod tests {
             "--connector",
             "eDP-1",
         ])
-        .expect("valid KMS Bus name") else {
+        .expect("valid KMS Bus name")
+        else {
             panic!("expected live interlock arguments");
         };
         assert_eq!(bus_service.as_deref(), Some("comp-seat-test"));
@@ -1856,6 +1916,47 @@ mod tests {
             panic!("expected runnable CLI");
         };
         assert!(!cli.keybindings_enabled);
+    }
+
+    #[cfg(feature = "bus")]
+    #[test]
+    fn f9_bus_is_explicit_validated_and_forwarded_to_both_backends() {
+        let ParseOutcome::Run(cli) = parse(&["--nested", "--f9-bus", "demo", "demo.kick"]).unwrap()
+        else {
+            panic!("run expected")
+        };
+        assert_eq!(
+            cli.f9_bus.unwrap(),
+            bus_key::BusKeyConfig {
+                service: "demo".into(),
+                verb: "demo.kick".into()
+            }
+        );
+        let ParseOutcome::KmsLive { argv, f9_bus, .. } =
+            parse(&["kms-live", "--f9-bus", "demo", "demo.kick"]).unwrap()
+        else {
+            panic!("kms expected")
+        };
+        assert!(f9_bus.is_some());
+        assert_eq!(argv, vec![OsString::from("kms-live")]);
+        for args in [
+            vec!["--nested", "--f9-bus"],
+            vec!["--nested", "--f9-bus", "demo"],
+            vec!["--nested", "--f9-bus", "BAD", "demo.kick"],
+            vec!["--nested", "--f9-bus", "demo", "bad verb"],
+            vec![
+                "--nested",
+                "--f9-bus",
+                "demo",
+                "demo.kick",
+                "--f9-bus",
+                "demo",
+                "demo.kick",
+            ],
+            vec!["--kms-probe", "--f9-bus", "demo", "demo.kick"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]
@@ -2190,14 +2291,16 @@ mod tests {
     fn list_bindings_does_not_require_nested_mode_and_is_strict_data() {
         let ParseOutcome::ListBindings {
             keybindings_enabled,
+            f9_bus,
             profile,
         } = parse(&["--list-bindings"]).expect("valid arguments")
         else {
             panic!("expected binding-list CLI");
         };
         assert_eq!(profile, bindings::BindingProfile::Nested);
-        let listing =
-            bindings::BindingState::for_profile(profile, keybindings_enabled).to_strict_data();
+        let listing = bindings::BindingState::for_profile(profile, keybindings_enabled)
+            .with_bus_key(f9_bus.is_some())
+            .to_strict_data();
         let status = std::process::Command::new("/opt/cosmix/bin/mix")
             .args([
                 "-c",
@@ -2214,6 +2317,7 @@ mod tests {
     fn list_bindings_can_select_the_kms_live_profile() {
         let ParseOutcome::ListBindings {
             keybindings_enabled,
+            f9_bus,
             profile,
         } = parse(&["--list-bindings", "--binding-profile", "kms-live"])
             .expect("valid KMS-live binding listing")
@@ -2221,8 +2325,9 @@ mod tests {
             panic!("expected binding-list CLI");
         };
         assert_eq!(profile, bindings::BindingProfile::KmsLive);
-        let listing =
-            bindings::BindingState::for_profile(profile, keybindings_enabled).to_strict_data();
+        let listing = bindings::BindingState::for_profile(profile, keybindings_enabled)
+            .with_bus_key(f9_bus.is_some())
+            .to_strict_data();
         for vt in 1..=12 {
             assert!(listing.contains(&format!("\"id\": \"switch-vt-{vt}\"")));
         }
