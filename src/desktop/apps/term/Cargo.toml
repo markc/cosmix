@@ -1,0 +1,31 @@
+[package]
+name = "cosmix-term"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Native CosMix Wayland terminal with CTK menus"
+
+[[bin]]
+name = "term"
+path = "src/main.rs"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "term"
+display = "CosMix Term"
+engine = "bevy"
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "ui_bevy_render", "bevy_feathers", "accesskit_unix"] }
+ctk = { path = "../../ctk" }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+cosmix-app-identity = { path = "../../../crates/cosmix-app-identity" }
+rio-vt = { git = "https://github.com/raphamorim/rio", rev = "932c1a7d9e07b4db5924f7a0dd689e823c3a1442", default-features = false, features = ["pty"] }
+teletypewriter = { git = "https://github.com/raphamorim/rio", rev = "932c1a7d9e07b4db5924f7a0dd689e823c3a1442", default-features = false }
+swash = "0.2.10"
+libc = "0.2.189"

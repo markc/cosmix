@@ -1,0 +1,16 @@
+-- Run from the repository src/ directory on the build worker.
+-- Cargo selects the package cosmix-term; its binary is named term.
+$tree = run_argv(["cargo", "tree", "--locked", "-p", "cosmix-term", "--manifest-path", "desktop/Cargo.toml", "-e", "features"], {timeout: 600})
+if $tree["exit_code"] != 0 then
+  print($tree["stderr"])
+  print("GATE BLOCKED: cargo tree failed; an empty filter is not a pass")
+  exit(1)
+end
+$filter = run_argv(["rg", "-i", "x11|xcb|rio-window|softbuffer"], {stdin: $tree["stdout"]})
+print($filter["stdout"])
+if $filter["exit_code"] == 1 then
+  print("GATE PASS: cargo tree rc=0; forbidden dependency filter rc=1")
+  exit(0)
+end
+print("GATE FAIL: forbidden dependency or filter error")
+exit(1)
