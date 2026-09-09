@@ -33,26 +33,26 @@ There is one installable implementation per component. If a second rendering
 engine is maintained as a comparison arm, its package and binary are
 `cosmix-<slug>-<engine>`; it does not create another component identity.
 
-## Application shell
+## Application layout and desktop furniture
 
-Media is an explicit `DcsAppShell` exception: it uses CTK's conventional menu
-bar and native file requester above an unobstructed video area, with no DCS
-panel furniture.
+Policy clarified by Mark on 2026-09-09: Quoin owns desktop furniture. Its
+four corner-triggered edge panels are rendered inside the compositor.
+Individual applications must not reproduce that furniture or embed a
+Quoin-like shell around their content. The compositor manages window titles,
+borders, caption buttons, movement, resizing and fullscreen presentation.
 
-Other GUI apps render their chrome through ctk's shared `DcsAppShell` (menu bar,
-toolbar, DCS sidebars, centre, optional status row) — apps inject content
-entities into slots and never assemble or patch shell structure. Current
-consumers: Tower, FileMgr and Mail (2026-07-31). Studio deliberately stays off
-the shell for now: it has no sidebar content, and its transport/song
-footers are app essence, not shared chrome — don't copy its hand-assembly,
-and migrate it when it gains its first side panel (sample/song browser or
-channel/note inspector), not before (decision 2026-07-25). New apps must
-use the shell. Contract and procedure: `_doc/2026-07-25-dcs-app-shell.md`
-(control repo).
+Apps use shared CTK widgets for conventional menu bars and dropdown menus,
+toolbars, status rows and controls appropriate to their purpose. Application
+content can include sidebars, browsers, inspectors and transport controls when
+needed; adding one does not require adopting desktop panel furniture. Reuse
+the widgets and behaviour without imposing the same outer layout on every app.
 
-Quoin is the explicit `DcsAppShell` exception: it is desktop furniture with
-four independent edge roots, not an application injecting content into a
-centre/side-slot frame.
+Media's menu bar, native file requester and unobstructed video area illustrate
+this general direction; Media is not a special exception. The former mandate
+that new apps use `DcsAppShell`, including the instruction to migrate Studio
+when it gains a sidebar, is superseded. Existing consumers such as Tower,
+FileMgr and Mail retain their current implementation until deliberately
+updated; their use of `DcsAppShell` is not a template for new app furniture.
 
 ## Registry
 

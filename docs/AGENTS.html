@@ -485,6 +485,10 @@ defaults. Never hardcode an install path.</p>
 <ul>
 <li>Scripts are Mix. No Python; sh only for <code>bootstrap</code>.</li>
 <li>Docs for a behaviour change go in the same commit, in <code>docs/</code>.</li>
+<li>Desktop furniture belongs to compositor-hosted Quoin. Apps use conventional
+CTK menus and purpose-specific controls with compositor-managed window chrome;
+do not add Quoin-like panel furniture to individual apps. See
+<code>src/desktop/APPS.md</code> for the layout policy and legacy migration scope.</li>
 <li>Version-bump a crate when a consumer would observe the change.</li>
 <li>Public-safe architecture specifications belong in <code>docs/spec/</code>. Read their
 status and evidence labels: draft publication is not normative acceptance.
