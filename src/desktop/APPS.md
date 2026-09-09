@@ -35,7 +35,11 @@ engine is maintained as a comparison arm, its package and binary are
 
 ## Application shell
 
-GUI apps render their chrome through ctk's shared `DcsAppShell` (menu bar,
+Media is an explicit `DcsAppShell` exception: it uses CTK's conventional menu
+bar and native file requester above an unobstructed video area, with no DCS
+panel furniture.
+
+Other GUI apps render their chrome through ctk's shared `DcsAppShell` (menu bar,
 toolbar, DCS sidebars, centre, optional status row) — apps inject content
 entities into slots and never assemble or patch shell structure. Current
 consumers: Tower, FileMgr and Mail (2026-07-31). Studio deliberately stays off

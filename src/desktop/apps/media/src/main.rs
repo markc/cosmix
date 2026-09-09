@@ -2,20 +2,13 @@ mod bus;
 mod player;
 use bevy::{
     asset::RenderAssetUsages,
-    feathers::{
-        FeathersPlugins,
-        dark_theme::create_dark_theme,
-        theme::{ThemeBackgroundColor, ThemeTextColor, UiTheme},
-    },
-    picking::Pickable,
+    feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme},
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
-    ui_widgets::ScrollArea,
     window::{MonitorSelection, PrimaryWindow, WindowMode},
     winit::{UpdateMode, WinitSettings},
 };
 use ctk::prelude::*;
-use ctk::theme::tokens;
 use player::{Action, Player};
 use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
 
@@ -42,13 +35,8 @@ fn required_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
         std::process::exit(2)
     })
 }
-#[derive(Component, Clone)]
-enum Control {
-    Media(Action),
-    Volume(f64),
-    Mute,
-    Fullscreen,
-}
+#[derive(Resource, Default)]
+struct OpenPending(bool);
 
 fn main() {
     let mut options = Options {
@@ -68,7 +56,7 @@ fn main() {
             }
             "--help" => {
                 println!(
-                    "cosmix-media [FILE] [--directory DIR] [--service NAME]\nNative Wayland/CTK MP3/MP4 player. Space: pause; arrows: seek 10s; M: mute; F: fullscreen.\nBus: media.open/play/pause/toggle/stop/seek/volume/mute/status/props.get/quit.\nRequires GStreamer playbin, appsink, pulsesink and file codecs. Video currently uses CPU RGBA upload."
+                    "cosmix-media [FILE] [--directory DIR] [--service NAME]\nNative Wayland/CTK MP3/MP4 player. Ctrl+O: open; Space: pause; arrows: seek 10s; M: mute; F: fullscreen.\nBus: media.open/play/pause/toggle/stop/seek/volume/mute/status/props.get/quit.\nRequires GStreamer playbin, appsink, pulsesink and file codecs. Video currently uses CPU RGBA upload."
                 );
                 return;
             }
@@ -111,78 +99,63 @@ fn main() {
         .add_plugins((
             FeathersPlugins,
             CtkThemePlugin::default(),
-            DcsAppShellPlugin,
+            CtkWidgetsPlugin,
+            MenuBarPlugin,
+            FileRequesterPlugin,
         ))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_millis(16)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_millis(33)),
         })
+        .init_resource::<OpenPending>()
+        .add_observer(on_menu)
         .add_systems(Startup, setup)
-        .add_systems(Update, (controls, keyboard, refresh))
+        .add_systems(Update, open_shortcut.before(FileRequesterSystems))
+        .add_systems(Update, (file_results, keyboard).after(FileRequesterSystems))
+        .add_systems(Update, refresh)
         .run();
 }
-fn button(commands: &mut Commands, label: &str, control: Control) -> Entity {
-    let text = commands
-        .spawn((
-            Text::new(label),
-            TextFont::from_font_size(13.0),
-            ThemeTextColor(tokens::TEXT),
-            Pickable::IGNORE,
-        ))
-        .id();
-    commands
-        .spawn((
-            Button,
-            control,
-            Node {
-                padding: UiRect::axes(px(10), px(8)),
-                min_height: px(32),
-                flex_shrink: 0.0,
-                border_radius: BorderRadius::all(px(4)),
-                ..default()
-            },
-            ThemeBackgroundColor(tokens::CONTROL),
-        ))
-        .add_child(text)
-        .id()
-}
+
 fn setup(
     mut commands: Commands,
     mut theme: ResMut<UiTheme>,
     mut state: ResMut<ThemeState>,
     mut images: ResMut<Assets<Image>>,
-    options: Res<Options>,
 ) {
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut state, &ThemeSpec::builtin());
     commands.spawn(Camera2d);
-    let buttons = [
-        ("Play / Pause", Control::Media(Action::Toggle)),
-        ("Stop", Control::Media(Action::Stop)),
-        ("−10s", Control::Media(Action::Relative(-10.0))),
-        ("+10s", Control::Media(Action::Relative(10.0))),
-        ("Volume −", Control::Volume(-0.1)),
-        ("Volume +", Control::Volume(0.1)),
-        ("Mute", Control::Mute),
-        ("Fullscreen", Control::Fullscreen),
-    ]
-    .map(|(name, action)| button(&mut commands, name, action));
-    let toolbar = commands
-        .spawn(Node {
-            width: percent(100),
-            flex_direction: FlexDirection::Row,
-            flex_wrap: FlexWrap::Wrap,
-            column_gap: px(6),
-            padding: UiRect {
-                left: px(110),
-                right: px(90),
-                top: px(6),
-                bottom: px(6),
-            },
-            ..default()
-        })
-        .add_children(&buttons)
-        .id();
+    let menus = [
+        MenuDef {
+            label: "File".into(),
+            items: vec![
+                MenuItemDef::new("file.open", "Open…"),
+                MenuItemDef::new("app.quit", "Quit"),
+            ],
+        },
+        MenuDef {
+            label: "Playback".into(),
+            items: vec![
+                MenuItemDef::new("playback.toggle", "Play / Pause"),
+                MenuItemDef::new("playback.stop", "Stop"),
+                MenuItemDef::new("playback.back", "Back 10 seconds"),
+                MenuItemDef::new("playback.forward", "Forward 10 seconds"),
+            ],
+        },
+        MenuDef {
+            label: "Audio".into(),
+            items: vec![
+                MenuItemDef::new("audio.down", "Decrease volume"),
+                MenuItemDef::new("audio.up", "Increase volume"),
+                MenuItemDef::new("audio.mute", "Toggle mute"),
+            ],
+        },
+        MenuDef {
+            label: "View".into(),
+            items: vec![MenuItemDef::new("view.fullscreen", "Toggle fullscreen")],
+        },
+    ];
+    let menu = spawn_menu_bar(&mut commands, &menus);
     let image = images.add(Image::new_fill(
         Extent3d {
             width: 1,
@@ -208,7 +181,8 @@ fn setup(
         .spawn((
             Node {
                 width: percent(100),
-                height: percent(100),
+                flex_grow: 1.0,
+                flex_basis: px(0),
                 min_width: px(0),
                 min_height: px(0),
                 align_items: AlignItems::Center,
@@ -220,68 +194,17 @@ fn setup(
         ))
         .add_child(video)
         .id();
-    let mut paths: Vec<_> = std::fs::read_dir(&options.directory)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-                    ["mp3", "mp4", "m4a", "wav", "ogg", "webm"]
-                        .contains(&e.to_ascii_lowercase().as_str())
-                })
-        })
-        .take(128)
-        .collect();
-    paths.sort();
-    let mut items = vec![
-        commands
-            .spawn((
-                Text::new(format!("Files in {}", options.directory.display())),
-                TextFont::from_font_size(12.0),
-                ThemeTextColor(tokens::TEXT),
-                Node {
-                    padding: UiRect::all(px(8)),
-                    ..default()
-                },
-            ))
-            .id(),
-    ];
-    for path in paths {
-        let label = path.file_name().unwrap().to_string_lossy().into_owned();
-        items.push(button(
-            &mut commands,
-            &label,
-            Control::Media(Action::Open(path)),
-        ));
-    }
-    let files = commands
+    let status = spawn_status_bar(&mut commands, "File → Open… to choose media · Ctrl+O");
+    // The media player deliberately uses a conventional menu layout, without
+    // DCS panel furniture, at the user's request.
+    commands
         .spawn(Node {
             width: percent(100),
             height: percent(100),
             flex_direction: FlexDirection::Column,
-            row_gap: px(5),
-            overflow: Overflow::scroll_y(),
             ..default()
         })
-        .add_children(&items)
-        .insert(ScrollArea)
-        .id();
-    let status = spawn_status_bar(
-        &mut commands,
-        "Choose a file · MP3 / MP4 · Space: play/pause",
-    );
-    spawn_dcs_app_shell(
-        &mut commands,
-        DcsAppShellProps::new(DcsShellProps::new(
-            toolbar,
-            centre,
-            vec![DcsPanel::new("media", "Media files", files)],
-            vec![],
-        ))
-        .with_status_bar(status.root),
-    );
+        .add_children(&[menu, centre, status.root]);
     commands.insert_resource(View {
         image,
         video,
@@ -291,55 +214,130 @@ fn setup(
         last_status: String::new(),
     });
 }
-fn act(control: &Control, playback: &Playback, _window: &mut Window) {
-    match control {
-        Control::Media(action) => playback.0.send(action.clone()),
-        Control::Volume(delta) => {
-            let value = (playback.0.shared.lock().unwrap().status.volume + delta).clamp(0.0, 1.0);
-            playback.0.send(Action::Volume(value));
+
+fn request_open(
+    options: &Options,
+    pending: &mut OpenPending,
+    requests: &mut MessageWriter<FileRequest>,
+) {
+    if pending.0 {
+        return;
+    }
+    let mut request = FileRequest::open_file(FileRequestId(1), "Open media");
+    request.initial_directory = Some(options.directory.clone());
+    request.filters = vec![
+        FileFilter::new(
+            "Audio and video",
+            ["mp3", "mp4", "m4a", "wav", "ogg", "webm"],
+        ),
+        FileFilter::new("All files", std::iter::empty::<String>()),
+    ];
+    pending.0 = true;
+    requests.write(request);
+}
+fn on_menu(
+    event: On<MenuActivated>,
+    playback: Res<Playback>,
+    options: Res<Options>,
+    mut pending: ResMut<OpenPending>,
+    mut requests: MessageWriter<FileRequest>,
+) {
+    if event.id == "file.open" {
+        request_open(&options, &mut pending, &mut requests);
+        return;
+    }
+    let action = match event.id {
+        "app.quit" => Action::Quit,
+        "playback.toggle" => Action::Toggle,
+        "playback.stop" => Action::Stop,
+        "playback.back" => Action::Relative(-10.0),
+        "playback.forward" => Action::Relative(10.0),
+        "audio.down" | "audio.up" => {
+            let delta = if event.id == "audio.up" { 0.1 } else { -0.1 };
+            Action::Volume(
+                (playback.0.shared.lock().unwrap().status.volume + delta).clamp(0.0, 1.0),
+            )
         }
-        Control::Mute => {
-            let value = !playback.0.shared.lock().unwrap().status.muted;
-            playback.0.send(Action::Mute(value));
+        "audio.mute" => Action::Mute(!playback.0.shared.lock().unwrap().status.muted),
+        "view.fullscreen" => {
+            Action::Fullscreen(!playback.0.shared.lock().unwrap().status.fullscreen)
         }
-        Control::Fullscreen => {
-            let value = !playback.0.shared.lock().unwrap().status.fullscreen;
-            playback.0.send(Action::Fullscreen(value));
-        }
+        _ => return,
+    };
+    playback.0.send(action);
+}
+fn open_shortcut(
+    keys: Res<ButtonInput<KeyCode>>,
+    capture: Res<ModalCapture>,
+    options: Res<Options>,
+    mut pending: ResMut<OpenPending>,
+    mut requests: MessageWriter<FileRequest>,
+) {
+    if !capture.is_captured()
+        && (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
+        && keys.just_pressed(KeyCode::KeyO)
+    {
+        request_open(&options, &mut pending, &mut requests);
     }
 }
-fn controls(
-    query: Query<(&Interaction, &Control), Changed<Interaction>>,
+fn file_results(
+    mut results: MessageReader<FileRequestResult>,
+    mut pending: ResMut<OpenPending>,
+    mut options: ResMut<Options>,
     playback: Res<Playback>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    let Ok(mut window) = windows.single_mut() else {
-        return;
-    };
-    for (interaction, control) in &query {
-        if *interaction == Interaction::Pressed {
-            act(control, &playback, &mut window);
+    for result in results.read() {
+        if result.id != FileRequestId(1) {
+            continue;
+        }
+        pending.0 = false;
+        match &result.outcome {
+            FileRequestOutcome::Selected(paths) => {
+                if let Some(path) = paths.first() {
+                    if let Some(parent) = path.parent() {
+                        options.directory = parent.to_path_buf();
+                    }
+                    playback.0.send(Action::Open(path.clone()));
+                }
+            }
+            FileRequestOutcome::Failed(error) => {
+                playback.0.shared.lock().unwrap().status.error = Some(error.clone())
+            }
+            FileRequestOutcome::Cancelled => {}
         }
     }
 }
 fn keyboard(
     keys: Res<ButtonInput<KeyCode>>,
+    capture: Res<ModalCapture>,
+    pending: Res<OpenPending>,
     playback: Res<Playback>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    let Ok(mut window) = windows.single_mut() else {
+    if capture.is_captured()
+        || pending.0
+        || keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight)
+        || keys.pressed(KeyCode::AltLeft)
+        || keys.pressed(KeyCode::AltRight)
+    {
         return;
-    };
-    for (key, control) in [
-        (KeyCode::Space, Control::Media(Action::Toggle)),
-        (KeyCode::ArrowLeft, Control::Media(Action::Relative(-10.0))),
-        (KeyCode::ArrowRight, Control::Media(Action::Relative(10.0))),
-        (KeyCode::KeyM, Control::Mute),
-        (KeyCode::KeyF, Control::Fullscreen),
+    }
+    for (key, action) in [
+        (KeyCode::Space, Action::Toggle),
+        (KeyCode::ArrowLeft, Action::Relative(-10.0)),
+        (KeyCode::ArrowRight, Action::Relative(10.0)),
     ] {
         if keys.just_pressed(key) {
-            act(&control, &playback, &mut window);
+            playback.0.send(action);
         }
+    }
+    if keys.just_pressed(KeyCode::KeyM) {
+        let muted = playback.0.shared.lock().unwrap().status.muted;
+        playback.0.send(Action::Mute(!muted));
+    }
+    if keys.just_pressed(KeyCode::KeyF) {
+        let fullscreen = playback.0.shared.lock().unwrap().status.fullscreen;
+        playback.0.send(Action::Fullscreen(!fullscreen));
     }
 }
 fn refresh(
@@ -419,6 +417,8 @@ fn refresh(
     }
     let label = if let Some(error) = &status.error {
         format!("{} · {error}", status.phase)
+    } else if status.path.is_none() {
+        "File → Open… to choose media · Ctrl+O".into()
     } else {
         format!(
             "{} · {:.1} / {:.1} s · volume {:.0}%{} · {}",

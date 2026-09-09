@@ -443,18 +443,23 @@
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-media.md"><div class="prose"><h1 id="cosmix-media">CosMix Media</h1>
 <p><code>cosmix-media</code> is a Wayland-native Bevy/CTK player for local audio and video.
-Version 0.1.0 uses GStreamer inside the process for demuxing, decoding and a
+Version 0.1.1 uses GStreamer inside the process for demuxing, decoding and a
 shared audio/video playback clock. Audio uses <code>pulsesink</code>, compatible with
 PipeWire's PulseAudio server. It does not launch mpv, FFmpeg or an X11 window.</p>
 <p>Run <code>cosmix-media /absolute/path/movie.mp4</code>, or start without a file and choose
-one from the Media files sidebar. <code>--directory DIR</code> selects that list's directory
-(default <code>$HOME/Downloads</code>). It lists up to 128 supported-extension files at
-startup. This is a small file list, not a recursive media library or file manager.
+one with <strong>File → Open…</strong> (Ctrl+O). The native CTK file chooser opens initially
+in <code>--directory DIR</code> (default <code>$HOME/Downloads</code>) and remembers the last selected
+directory for this session.
 <code>--service NAME</code> changes the default Bus name <code>media</code> for multiple instances.</p>
-<p>The toolbar provides play/pause, stop, ten-second relative seeks, volume, mute
-and fullscreen. Space toggles playback; Left/Right seek; M toggles mute; F
-toggles fullscreen. Files can also be opened through the Bus. A separate native
-file picker, playlists, subtitles controls and network URLs are not implemented.</p>
+<p>The conventional menu bar replaces DCS panel furniture: <strong>File</strong> contains Open
+and Quit; <strong>Playback</strong> contains play/pause, stop and ten-second relative seeks;
+<strong>Audio</strong> contains volume and mute; <strong>View</strong> contains fullscreen. The video fills
+the remaining area above a small status row. There are no sidebars, pin/float
+controls or separate button toolbar.</p>
+<p>Space toggles playback; Left/Right seek; M toggles mute; F toggles fullscreen.
+Playback shortcuts are suspended while the file chooser is active. Files can
+also be opened through the Bus. Playlists, subtitle controls and network URLs
+are not implemented.</p>
 <h2 id="runtime-requirements">Runtime requirements</h2>
 <p>The Wayland session must be available through <code>WAYLAND_DISPLAY</code>. CTK builds
 with its Wayland platform feature; no X11 platform feature is requested.

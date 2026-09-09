@@ -1,20 +1,26 @@
 # CosMix Media
 
 `cosmix-media` is a Wayland-native Bevy/CTK player for local audio and video.
-Version 0.1.0 uses GStreamer inside the process for demuxing, decoding and a
+Version 0.1.1 uses GStreamer inside the process for demuxing, decoding and a
 shared audio/video playback clock. Audio uses `pulsesink`, compatible with
 PipeWire's PulseAudio server. It does not launch mpv, FFmpeg or an X11 window.
 
 Run `cosmix-media /absolute/path/movie.mp4`, or start without a file and choose
-one from the Media files sidebar. `--directory DIR` selects that list's directory
-(default `$HOME/Downloads`). It lists up to 128 supported-extension files at
-startup. This is a small file list, not a recursive media library or file manager.
+one with **File → Open…** (Ctrl+O). The native CTK file chooser opens initially
+in `--directory DIR` (default `$HOME/Downloads`) and remembers the last selected
+directory for this session.
 `--service NAME` changes the default Bus name `media` for multiple instances.
 
-The toolbar provides play/pause, stop, ten-second relative seeks, volume, mute
-and fullscreen. Space toggles playback; Left/Right seek; M toggles mute; F
-toggles fullscreen. Files can also be opened through the Bus. A separate native
-file picker, playlists, subtitles controls and network URLs are not implemented.
+The conventional menu bar replaces DCS panel furniture: **File** contains Open
+and Quit; **Playback** contains play/pause, stop and ten-second relative seeks;
+**Audio** contains volume and mute; **View** contains fullscreen. The video fills
+the remaining area above a small status row. There are no sidebars, pin/float
+controls or separate button toolbar.
+
+Space toggles playback; Left/Right seek; M toggles mute; F toggles fullscreen.
+Playback shortcuts are suspended while the file chooser is active. Files can
+also be opened through the Bus. Playlists, subtitle controls and network URLs
+are not implemented.
 
 ## Runtime requirements
 
