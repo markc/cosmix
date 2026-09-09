@@ -197,6 +197,16 @@ fn update(world: &mut World) {
                 .is_some_and(|c| c.is_active);
         #[cfg(feature = "native-quoin")]
         if world.contains_resource::<cosmix_quoin::native::NativeOutput>() {
+            let fullscreen = world
+                .get_resource::<crate::compositor_scene::SurfaceEntities>()
+                .is_some_and(|surfaces| {
+                    surfaces.surfaces.values().any(|s| {
+                        s.layout.visible
+                            && s.layout
+                                .toplevel
+                                .is_some_and(|t| t.focused && t.committed_fullscreen)
+                    })
+                });
             let size = world
                 .resource::<crate::compositor_scene::LogicalCanvasSize>()
                 .0;
@@ -212,8 +222,8 @@ fn update(world: &mut World) {
                 native.camera = Some(output.owner);
                 native.size = size;
                 native.name = name;
-                native.active = active;
-                native.pointer = (active && pointer.on_output)
+                native.active = active && !fullscreen;
+                native.pointer = (active && !fullscreen && pointer.on_output)
                     .then_some(Vec2::new(pointer.x as f32, pointer.y as f32));
             }
         }

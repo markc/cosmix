@@ -7406,6 +7406,7 @@ pub(crate) mod tests {
             decoration: crate::protocol::SceneDecorationMode::ServerSide,
             focused: true,
             committed_maximized: false,
+            committed_fullscreen: false,
             window_geometry: crate::protocol::SceneWindowGeometry {
                 x: 0.0,
                 y: 0.0,

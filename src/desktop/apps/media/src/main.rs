@@ -28,6 +28,7 @@ struct View {
     status: Entity,
     generation: u64,
     last_status: String,
+    chrome: [Entity; 2],
 }
 fn required_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
     args.next().unwrap_or_else(|| {
@@ -56,7 +57,7 @@ fn main() {
             }
             "--help" => {
                 println!(
-                    "cosmix-media [FILE] [--directory DIR] [--service NAME]\nNative Wayland/CTK MP3/MP4 player. Ctrl+O: open; Space: pause; arrows: seek 10s; M: mute; F: fullscreen.\nBus: media.open/play/pause/toggle/stop/seek/volume/mute/status/props.get/quit.\nRequires GStreamer playbin, appsink, pulsesink and file codecs. Video currently uses CPU RGBA upload."
+                    "cosmix-media [FILE] [--directory DIR] [--service NAME]\nNative Wayland/CTK MP3/MP4 player. Ctrl+O: open; Space: pause; arrows: seek 10s; M: mute; F: fullscreen; Escape: exit fullscreen.\nBus: media.open/play/pause/toggle/stop/seek/volume/mute/fullscreen/fullscreen.toggle/status/props.get/quit.\nRequires GStreamer playbin, appsink, pulsesink and file codecs. Video currently uses CPU RGBA upload."
                 );
                 return;
             }
@@ -212,6 +213,7 @@ fn setup(
         status: status.text,
         generation: 0,
         last_status: String::new(),
+        chrome: [menu, status.root],
     });
 }
 
@@ -259,9 +261,7 @@ fn on_menu(
             )
         }
         "audio.mute" => Action::Mute(!playback.0.shared.lock().unwrap().status.muted),
-        "view.fullscreen" => {
-            Action::Fullscreen(!playback.0.shared.lock().unwrap().status.fullscreen)
-        }
+        "view.fullscreen" => Action::ToggleFullscreen,
         _ => return,
     };
     playback.0.send(action);
@@ -336,8 +336,10 @@ fn keyboard(
         playback.0.send(Action::Mute(!muted));
     }
     if keys.just_pressed(KeyCode::KeyF) {
-        let fullscreen = playback.0.shared.lock().unwrap().status.fullscreen;
-        playback.0.send(Action::Fullscreen(!fullscreen));
+        playback.0.send(Action::ToggleFullscreen);
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        playback.0.send(Action::Fullscreen(false));
     }
 }
 fn refresh(
@@ -357,6 +359,18 @@ fn refresh(
         let mut shared = playback.0.shared.lock().unwrap();
         (shared.status.clone(), shared.frame.take())
     };
+    for entity in view.chrome {
+        if let Ok((mut node, _)) = nodes.get_mut(entity) {
+            let display = if status.fullscreen {
+                Display::None
+            } else {
+                Display::Flex
+            };
+            if node.display != display {
+                node.display = display;
+            }
+        }
+    }
     if let Ok(mut window) = windows.single_mut() {
         let mode = if status.fullscreen {
             WindowMode::BorderlessFullscreen(MonitorSelection::Current)

@@ -1768,6 +1768,11 @@ fn diff_surface_row(
             PropValue::Bool(new.maximized),
         ),
         (
+            "fullscreen",
+            PropValue::Bool(old.fullscreen),
+            PropValue::Bool(new.fullscreen),
+        ),
+        (
             "minimized",
             PropValue::Bool(old.minimized),
             PropValue::Bool(new.minimized),
@@ -1888,6 +1893,11 @@ fn diff_window_row(
             "maximized",
             PropValue::Bool(old.maximized),
             PropValue::Bool(new.maximized),
+        ),
+        (
+            "fullscreen",
+            PropValue::Bool(old.fullscreen),
+            PropValue::Bool(new.fullscreen),
         ),
         (
             "minimized",
@@ -2736,6 +2746,7 @@ mod tests {
             focused: false,
             activated: false,
             maximized: false,
+            fullscreen: false,
             minimized: false,
             decoration: Some("server"),
             layer: None,

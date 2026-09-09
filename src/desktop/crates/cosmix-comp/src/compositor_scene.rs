@@ -4362,6 +4362,7 @@ mod tests {
                 decoration: SceneDecorationMode::ServerSide,
                 focused: true,
                 committed_maximized: false,
+                committed_fullscreen: false,
                 window_geometry: SceneWindowGeometry {
                     x: 0.0,
                     y: 0.0,
@@ -4459,6 +4460,7 @@ mod tests {
                 decoration: SceneDecorationMode::ServerSide,
                 focused: true,
                 committed_maximized: false,
+                committed_fullscreen: false,
                 window_geometry: SceneWindowGeometry {
                     x: 0.0,
                     y: 0.0,

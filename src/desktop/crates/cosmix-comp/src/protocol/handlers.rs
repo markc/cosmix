@@ -178,6 +178,9 @@ impl CompositorHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.requested_fullscreen = false;
+            record.committed_fullscreen = false;
+            record.fullscreen_restore_band = None;
             record.committed_maximized = false;
             record.normal_restore = None;
             record.pending_window_state = None;
@@ -216,7 +219,10 @@ impl CompositorHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    requested_fullscreen: false,
+                    fullscreen_restore_band: None,
                     committed_maximized: false,
+                    committed_fullscreen: false,
                     normal_restore: None,
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
@@ -791,6 +797,9 @@ impl WlrLayerShellHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.requested_fullscreen = false;
+            record.committed_fullscreen = false;
+            record.fullscreen_restore_band = None;
             record.committed_maximized = false;
             record.normal_restore = None;
             record.pending_window_state = None;
@@ -826,7 +835,10 @@ impl WlrLayerShellHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    requested_fullscreen: false,
+                    fullscreen_restore_band: None,
                     committed_maximized: false,
+                    committed_fullscreen: false,
                     normal_restore: None,
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
@@ -991,6 +1003,9 @@ impl XdgShellHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.requested_fullscreen = false;
+            record.committed_fullscreen = false;
+            record.fullscreen_restore_band = None;
             record.committed_maximized = false;
             record.normal_restore = None;
             record.pending_window_state = None;
@@ -1026,7 +1041,10 @@ impl XdgShellHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    requested_fullscreen: false,
+                    fullscreen_restore_band: None,
                     committed_maximized: false,
+                    committed_fullscreen: false,
                     normal_restore: None,
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
@@ -1205,6 +1223,9 @@ impl XdgShellHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.requested_fullscreen = false;
+            record.committed_fullscreen = false;
+            record.fullscreen_restore_band = None;
             record.committed_maximized = false;
             record.normal_restore = None;
             record.pending_window_state = None;
@@ -1240,7 +1261,10 @@ impl XdgShellHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    requested_fullscreen: false,
+                    fullscreen_restore_band: None,
                     committed_maximized: false,
+                    committed_fullscreen: false,
                     normal_restore: None,
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
@@ -1304,7 +1328,7 @@ impl XdgShellHandler for WaylandState {
         let Some(record) = self.surfaces.get(&surface.wl_surface().id()) else {
             return;
         };
-        if record.committed_maximized {
+        if record.committed_maximized || record.committed_fullscreen {
             return;
         }
         self.interactive_pointer = Some(InteractivePointer::Move {
@@ -1346,7 +1370,7 @@ impl XdgShellHandler for WaylandState {
         let Some(record) = self.surfaces.get(&surface.wl_surface().id()) else {
             return;
         };
-        if record.committed_maximized {
+        if record.committed_maximized || record.committed_fullscreen {
             return;
         }
         let surface_id = record.id;
@@ -1387,7 +1411,11 @@ impl XdgShellHandler for WaylandState {
         surface: ToplevelSurface,
         _output: Option<wl_output_protocol::WlOutput>,
     ) {
-        let _ = self.send_pending_toplevel_configure(surface.wl_surface(), true);
+        self.request_fullscreen_state(surface.wl_surface(), true);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.request_fullscreen_state(surface.wl_surface(), false);
     }
 
     fn ack_configure(&mut self, surface: WlSurface, configure: Configure) {
@@ -1704,6 +1732,9 @@ impl SessionLockHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.requested_fullscreen = false;
+            record.committed_fullscreen = false;
+            record.fullscreen_restore_band = None;
             record.committed_maximized = false;
             record.normal_restore = None;
             record.pending_window_state = None;
@@ -1739,7 +1770,10 @@ impl SessionLockHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    requested_fullscreen: false,
+                    fullscreen_restore_band: None,
                     committed_maximized: false,
+                    committed_fullscreen: false,
                     normal_restore: None,
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
@@ -1952,6 +1986,7 @@ impl SeatHandler for WaylandState {
             .filter(|record| record.role.managed_toplevel())
             .map(|record| record.role.wl_surface().clone())
             .collect::<Vec<_>>();
+        let mut demoted_fullscreen = false;
         for surface in toplevels {
             let active = focused_root
                 .as_ref()
@@ -1963,11 +1998,27 @@ impl SeatHandler for WaylandState {
             if changed && let Some(record) = self.surfaces.get_mut(&surface.id()) {
                 record.focused = active;
                 sync_toplevel_scene_state(record);
-                if record.mapped && record.committed_decoration == SceneDecorationMode::ServerSide {
+                if record.mapped
+                    && (record.committed_fullscreen
+                        || record.committed_decoration == SceneDecorationMode::ServerSide)
+                {
                     self.events.push(ProtocolEvent::SurfaceRelayout {
                         id: record.id,
                         scene: record.scene_snapshot(),
                     });
+                }
+            }
+            if changed {
+                let band = self.surfaces.get(&surface.id()).and_then(|record| {
+                    record.committed_fullscreen.then_some(if active {
+                        StackBand::Top
+                    } else {
+                        record.fullscreen_restore_band.unwrap_or(StackBand::Normal)
+                    })
+                });
+                if let Some(band) = band {
+                    self.restack_role_tree(&surface, band, "fullscreen.focus");
+                    demoted_fullscreen |= !active;
                 }
             }
             match self.surfaces.get(&surface.id()).map(|record| &record.role) {
@@ -1993,6 +2044,13 @@ impl SeatHandler for WaylandState {
                     }
                 }
                 _ => {}
+            }
+        }
+        if demoted_fullscreen {
+            // Focus arbitration can raise the target before invoking us.
+            // Finish demotions first, then place that target above them.
+            if let Some(surface) = focused_root.as_ref() {
+                self.raise_surface(surface);
             }
         }
         tracing::info!(
@@ -2204,7 +2262,10 @@ impl InputMethodHandler for WaylandState {
                 decoration_object_bound: false,
                 committed_decoration: SceneDecorationMode::Unbound,
                 requested_maximized: false,
+                requested_fullscreen: false,
+                fullscreen_restore_band: None,
                 committed_maximized: false,
+                committed_fullscreen: false,
                 normal_restore: None,
                 pending_window_state: None,
                 configured_window_states: Vec::new(),

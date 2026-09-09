@@ -2742,7 +2742,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.51.0"
+version = "0.51.1"
 dependencies = [
  "bevy",
  "chrono",
@@ -2937,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-media"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "cosmix-lib-client",

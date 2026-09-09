@@ -84,6 +84,7 @@ pub enum Action {
     Volume(f64),
     Mute(bool),
     Fullscreen(bool),
+    ToggleFullscreen,
     Quit,
 }
 pub struct Request {
@@ -201,6 +202,7 @@ pub fn parse(command: &str, body: &str) -> Result<Action, String> {
         "media.fullscreen" => {
             Action::Fullscreen(value["value"].as_bool().ok_or("value must be boolean")?)
         }
+        "media.fullscreen.toggle" => Action::ToggleFullscreen,
         "media.quit" => Action::Quit,
         _ => return Err("unknown media command".into()),
     })
@@ -356,6 +358,10 @@ fn apply(
             shared.lock().unwrap().status.muted = v;
         }
         Action::Fullscreen(v) => shared.lock().unwrap().status.fullscreen = v,
+        Action::ToggleFullscreen => {
+            let mut s = shared.lock().unwrap();
+            s.status.fullscreen = !s.status.fullscreen;
+        }
         other => {
             let snapshot = shared.lock().unwrap().status.clone();
             if snapshot.path.is_none() {
@@ -534,5 +540,23 @@ mod tests {
         assert!(parse("media.pause", "{\"path\":\"/tmp/a\"}").is_err());
         assert!(parse("media.seek", "{\"seconds\":-1}").is_err());
         assert!(parse("media.mute", "{\"value\":\"true\"}").is_err());
+        assert!(parse("media.fullscreen.toggle", "{\"value\":true}").is_err());
+    }
+    #[test]
+    fn queued_fullscreen_toggles_use_worker_state() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let quit = AtomicBool::new(false);
+        for expected in [true, false] {
+            apply(
+                pipeline.upcast_ref(),
+                parse("media.fullscreen.toggle", "{}").unwrap(),
+                &shared,
+                &quit,
+            )
+            .unwrap();
+            assert_eq!(shared.lock().unwrap().status.fullscreen, expected);
+        }
     }
 }

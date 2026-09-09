@@ -492,6 +492,7 @@ pub(crate) struct ToplevelSceneState {
     pub(crate) decoration: SceneDecorationMode,
     pub(crate) focused: bool,
     pub(crate) committed_maximized: bool,
+    pub(crate) committed_fullscreen: bool,
     pub(crate) window_geometry: SceneWindowGeometry,
     pub(crate) chrome_pointer: ChromePointerSceneState,
 }
@@ -541,6 +542,7 @@ struct NormalRestore {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WindowStateSnapshot {
     maximized: bool,
+    fullscreen: bool,
     window_origin: (f32, f32),
     client_size: (i32, i32),
     normal_restore: Option<NormalRestore>,
@@ -4660,9 +4662,14 @@ fn sync_toplevel_scene_state(record: &mut SurfaceRecord) {
         // renderer selects SSD chrome purely on `decoration == ServerSide`
         // and never learns which protocol the window arrived through.
         (role, Some(window_geometry)) if role.managed_toplevel() => Some(ToplevelSceneState {
-            decoration: record.committed_decoration,
+            decoration: if record.committed_fullscreen {
+                SceneDecorationMode::Unbound
+            } else {
+                record.committed_decoration
+            },
             focused: record.focused,
             committed_maximized: record.committed_maximized,
+            committed_fullscreen: record.committed_fullscreen,
             window_geometry,
             chrome_pointer: record.chrome_pointer,
         }),
@@ -4693,7 +4700,10 @@ struct SurfaceRecord {
     decoration_object_bound: bool,
     committed_decoration: SceneDecorationMode,
     requested_maximized: bool,
+    requested_fullscreen: bool,
+    fullscreen_restore_band: Option<StackBand>,
     committed_maximized: bool,
+    pub(crate) committed_fullscreen: bool,
     normal_restore: Option<NormalRestore>,
     pending_window_state: Option<WindowStateSnapshot>,
     configured_window_states: Vec<ConfigureWindowStateSnapshot>,
@@ -12168,6 +12178,7 @@ impl WaylandState {
             .filter_map(|record| {
                 if !record.layout.visible
                     || !record.role.managed_toplevel()
+                    || record.committed_fullscreen
                     || record.committed_decoration != SceneDecorationMode::ServerSide
                 {
                     return None;
@@ -12313,6 +12324,7 @@ impl WaylandState {
             return false;
         };
         if !record.mapped
+            || record.committed_fullscreen
             || record.committed_decoration != SceneDecorationMode::ServerSide
             || !record.role.managed_toplevel()
         {
@@ -12622,7 +12634,10 @@ impl WaylandState {
             return;
         };
         sync_toplevel_scene_state(record);
-        if record.mapped && record.committed_decoration == SceneDecorationMode::ServerSide {
+        if record.mapped
+            && !record.committed_fullscreen
+            && record.committed_decoration == SceneDecorationMode::ServerSide
+        {
             self.events.push(ProtocolEvent::SurfaceRelayout {
                 id: record.id,
                 scene: record.scene_snapshot(),
@@ -12738,6 +12753,24 @@ impl WaylandState {
         self.restack_role_tree(surface, band, "wayland.focus");
     }
 
+    fn raise_focused_toplevel_after_fullscreen(&mut self) {
+        let Some(surface) = self
+            .keyboard
+            .current_focus()
+            .and_then(|focus| focus.owned_surface())
+        else {
+            return;
+        };
+        let root = canonical_root_surface(&self.popup_manager, &surface);
+        if self
+            .surfaces
+            .get(&root.id())
+            .is_some_and(|r| r.mapped && r.role.managed_toplevel())
+        {
+            self.raise_surface(&root);
+        }
+    }
+
     /// Move a mapped toplevel between the two operator-reachable stack bands
     /// (a bottom-band window sits behind every normal window — the
     /// "maximised game behind the desktop" mode). Returns the (old, new)
@@ -12759,10 +12792,13 @@ impl WaylandState {
             return None;
         }
         let old = record.layout.z.band;
+        let surface = record.role.wl_surface().clone();
+        if record.committed_fullscreen {
+            self.surfaces.get_mut(&object)?.fullscreen_restore_band = Some(band);
+        }
         if old == band {
             return Some((old.name(), band.name()));
         }
-        let surface = record.role.wl_surface().clone();
         self.restack_role_tree(&surface, band, cause);
         Some((old.name(), band.name()))
     }
@@ -13282,9 +13318,31 @@ impl WaylandState {
     }
 
     fn request_maximized_state(&mut self, surface: &WlSurface, maximized: bool) {
+        let fullscreen = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|r| r.requested_fullscreen);
+        self.request_window_state(surface, maximized, fullscreen);
+    }
+
+    fn request_fullscreen_state(&mut self, surface: &WlSurface, fullscreen: bool) {
+        let maximized = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|r| r.requested_maximized);
+        self.request_window_state(surface, maximized, fullscreen);
+    }
+
+    fn request_window_state(&mut self, surface: &WlSurface, maximized: bool, fullscreen: bool) {
         self.cancel_chrome_pointer_grab_for_surface(surface, true);
+        if fullscreen
+            && interactive_surface(self.interactive_pointer.as_ref()).is_some_and(|s| s == surface)
+        {
+            self.finish_interactive_pointer(false);
+        }
         self.titlebar_click_candidate = None;
         let output = self.usable_output_rect();
+        let full_output = self.logical_output_rect();
         let extents = DecoExtents::of(&self.decoration.theme);
         let theme = self.decoration.theme.clone();
         let configured_server_side = compositor::with_states(surface, |states| {
@@ -13337,7 +13395,16 @@ impl WaylandState {
                 _ => {}
             }
             normal_restore.server_side = server_side;
-            let (window_origin, client_size, retained_restore) = if maximized {
+            let (window_origin, client_size, retained_restore) = if fullscreen {
+                (
+                    (full_output.x, full_output.y),
+                    (
+                        full_output.width.round().max(1.0) as i32,
+                        full_output.height.round().max(1.0) as i32,
+                    ),
+                    Some(normal_restore),
+                )
+            } else if maximized {
                 let outer = vec2(output.width, output.height);
                 let content = if server_side {
                     extents.content_size_for_window(outer)
@@ -13362,12 +13429,14 @@ impl WaylandState {
             };
             let snapshot = WindowStateSnapshot {
                 maximized,
+                fullscreen,
                 window_origin,
                 client_size,
                 normal_restore: retained_restore,
             };
             record.requested_maximized = maximized;
-            if maximized {
+            record.requested_fullscreen = fullscreen;
+            if maximized || fullscreen {
                 record.normal_restore = Some(normal_restore);
             }
             record.pending_window_state = Some(snapshot);
@@ -13379,6 +13448,11 @@ impl WaylandState {
 
         toplevel.with_pending_state(|state| {
             state.size = Some(snapshot.client_size.into());
+            if fullscreen {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            } else {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            }
             if maximized {
                 state.states.set(xdg_toplevel::State::Maximized);
             } else {
@@ -13396,7 +13470,9 @@ impl WaylandState {
             .values()
             .filter(|record| {
                 matches!(record.role, SurfaceRole::Toplevel(_))
-                    && (record.committed_maximized
+                    && (record.committed_fullscreen
+                        || record.requested_fullscreen
+                        || record.committed_maximized
                         || record.requested_maximized
                         || record.pending_window_state.is_some())
             })
@@ -13459,7 +13535,9 @@ impl WaylandState {
             }
             #[cfg(feature = "bus")]
             observed_toplevels.push(record.id);
-            if record.committed_maximized
+            if record.committed_fullscreen
+                || record.requested_fullscreen
+                || record.committed_maximized
                 || record.requested_maximized
                 || record.pending_window_state.is_some()
             {
@@ -14107,6 +14185,10 @@ impl WaylandState {
         surface: &WlSurface,
         scene_commit: SceneCommitCachedState,
     ) {
+        let previous_fullscreen = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|r| r.committed_fullscreen);
         let extents = DecoExtents::of(&self.decoration.theme);
         let (shifted, clear_chrome_pointer, chrome_scene_changed) = {
             let Some(record) = self.surfaces.get_mut(&surface.id()) else {
@@ -14130,8 +14212,10 @@ impl WaylandState {
                 (true, false) => (-extents.left, -extents.top),
                 _ => (0.0, 0.0),
             };
-            record.window_origin.0 += delta.0;
-            record.window_origin.1 += delta.1;
+            if !record.committed_fullscreen {
+                record.window_origin.0 += delta.0;
+                record.window_origin.1 += delta.1;
+            }
             if let Some(restore) = record.normal_restore.as_mut() {
                 let server_side = record.committed_decoration == SceneDecorationMode::ServerSide;
                 match (restore.server_side, server_side) {
@@ -14152,9 +14236,10 @@ impl WaylandState {
                 self.committed_window_state_transitions
                     .push(window_state.maximized);
                 record.committed_maximized = window_state.maximized;
+                record.committed_fullscreen = window_state.fullscreen;
                 record.window_origin = window_state.window_origin;
                 record.configured_size = window_state.client_size;
-                record.normal_restore = if window_state.maximized {
+                record.normal_restore = if window_state.maximized || window_state.fullscreen {
                     window_state.normal_restore.or(record.normal_restore)
                 } else {
                     None
@@ -14183,8 +14268,45 @@ impl WaylandState {
                     || scene_commit.acknowledged_window_state.is_some(),
             )
         };
-        if clear_chrome_pointer {
+        let restack = self.surfaces.get_mut(&surface.id()).and_then(|record| {
+            if previous_fullscreen == record.committed_fullscreen {
+                return None;
+            }
+            if record.committed_fullscreen {
+                record.fullscreen_restore_band = Some(record.layout.z.band);
+                Some(if record.focused {
+                    StackBand::Top
+                } else {
+                    record.layout.z.band
+                })
+            } else {
+                Some(
+                    record
+                        .fullscreen_restore_band
+                        .take()
+                        .unwrap_or(StackBand::Normal),
+                )
+            }
+        });
+        if let Some(band) = restack {
+            let focused = self.surfaces.get(&surface.id()).is_some_and(|r| r.focused);
+            self.restack_role_tree(surface, band, "window.fullscreen");
+            if !focused {
+                self.raise_focused_toplevel_after_fullscreen();
+            }
+        }
+        if clear_chrome_pointer
+            || previous_fullscreen
+                != self
+                    .surfaces
+                    .get(&surface.id())
+                    .is_some_and(|r| r.committed_fullscreen)
+        {
             self.cancel_chrome_pointer_grab_for_surface(surface, true);
+            if interactive_surface(self.interactive_pointer.as_ref()).is_some_and(|s| s == surface)
+            {
+                self.finish_interactive_pointer(true);
+            }
             self.reset_chrome_pointer_tracking(&surface.id());
         }
         if let Some((id, delta)) = shifted {

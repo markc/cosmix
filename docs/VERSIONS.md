@@ -99,7 +99,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bg-boing` | 0.1.0 |
 | `cosmix-bg-showcase` | 0.2.2 |
 | `cosmix-capture` | 0.1.2 |
-| `cosmix-comp` | 0.51.0 |
+| `cosmix-comp` | 0.51.1 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.5 |
@@ -107,7 +107,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-imeprobe` | 0.1.0 |
 | `cosmix-interactgui` | 0.1.1 |
 | `cosmix-mail` | 0.1.0 |
-| `cosmix-media` | 0.1.1 |
+| `cosmix-media` | 0.1.2 |
 | `cosmix-quoin` | 0.11.0 |
 | `cosmix-shell` | 0.8.6 |
 | `cosmix-shell-host` | 0.6.5 |

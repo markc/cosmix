@@ -154,6 +154,7 @@ pub(crate) struct SurfaceSnapshot {
     pub(crate) focused: bool,
     pub(crate) activated: bool,
     pub(crate) maximized: bool,
+    pub(crate) fullscreen: bool,
     pub(crate) minimized: bool,
     pub(crate) decoration: Option<&'static str>,
     pub(crate) layer: Option<LayerSnapshot>,
@@ -180,6 +181,7 @@ pub(crate) struct WindowSnapshot {
     pub(crate) height: f32,
     pub(crate) focused: bool,
     pub(crate) maximized: bool,
+    pub(crate) fullscreen: bool,
     pub(crate) minimized: bool,
     pub(crate) output: Option<String>,
     pub(crate) band: &'static str,
@@ -435,6 +437,7 @@ flat_snapshot!(
     height,
     focused,
     maximized,
+    fullscreen,
     minimized,
     output,
     band,
@@ -545,6 +548,7 @@ impl SurfaceSnapshot {
             ["focused"] => serialise_selected(&self.focused),
             ["activated"] => serialise_selected(&self.activated),
             ["maximized"] => serialise_selected(&self.maximized),
+            ["fullscreen"] => serialise_selected(&self.fullscreen),
             ["minimized"] => serialise_selected(&self.minimized),
             ["decoration"] => serialise_selected(&self.decoration),
             ["layer"] => serialise_selected(&self.layer),
@@ -560,7 +564,8 @@ impl SurfaceSnapshot {
             [
                 "id" | "role" | "mapped" | "visible" | "x" | "y" | "width" | "height" | "band"
                 | "sequence" | "tree_index" | "parent" | "output" | "title" | "app_id" | "focused"
-                | "activated" | "maximized" | "minimized" | "decoration" | "foreign_id",
+                | "activated" | "maximized" | "fullscreen" | "minimized" | "decoration"
+                | "foreign_id",
             ] => Some(SnapshotNodeKind::Leaf),
             ["layer"] => Some(if self.layer.is_some() {
                 SnapshotNodeKind::Object
@@ -703,6 +708,7 @@ fn project_surface_row(
         focused: record.focused,
         activated: record.focused,
         maximized: record.committed_maximized,
+        fullscreen: record.committed_fullscreen,
         minimized: record.minimized,
         decoration: matches!(record.role, SurfaceRole::Toplevel(_))
             .then_some(decoration_name(record.committed_decoration)),
@@ -725,6 +731,7 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         height: surface.height,
         focused: surface.focused,
         maximized: surface.maximized,
+        fullscreen: surface.fullscreen,
         minimized: surface.minimized,
         output: surface.output.clone(),
         band: surface.band,
@@ -1273,6 +1280,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Committed maximized state"
     ),
     descriptor!(
+        &[L("surfaces"), S, L("fullscreen")],
+        Bool,
+        "Committed Wayland fullscreen state"
+    ),
+    descriptor!(
         &[L("surfaces"), S, L("minimized")],
         Bool,
         "Compositor minimized state"
@@ -1351,6 +1363,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         &[L("windows"), S, L("maximized")],
         Bool,
         "Committed maximized state"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("fullscreen")],
+        Bool,
+        "Committed Wayland fullscreen state"
     ),
     descriptor!(
         &[L("windows"), S, L("minimized")],
@@ -1863,6 +1880,7 @@ mod tests {
             focused: false,
             activated: false,
             maximized: false,
+            fullscreen: false,
             minimized: false,
             decoration: None,
             layer: Some(LayerSnapshot {
@@ -1892,6 +1910,7 @@ mod tests {
             focused: true,
             activated: true,
             maximized: false,
+            fullscreen: false,
             minimized: false,
             decoration: Some("server"),
             layer: None,
@@ -1949,6 +1968,7 @@ mod tests {
                 height: toplevel.height,
                 focused: toplevel.focused,
                 maximized: toplevel.maximized,
+                fullscreen: toplevel.fullscreen,
                 minimized: toplevel.minimized,
                 output: toplevel.output.clone(),
                 band: toplevel.band,

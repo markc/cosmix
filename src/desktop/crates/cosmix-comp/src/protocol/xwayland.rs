@@ -1877,6 +1877,9 @@ impl WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = decoration;
             record.requested_maximized = false;
+            record.requested_fullscreen = false;
+            record.committed_fullscreen = false;
+            record.fullscreen_restore_band = None;
             record.committed_maximized = false;
             record.normal_restore = None;
             record.pending_window_state = None;
@@ -1912,7 +1915,10 @@ impl WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: decoration,
                     requested_maximized: false,
+                    requested_fullscreen: false,
+                    fullscreen_restore_band: None,
                     committed_maximized: false,
+                    committed_fullscreen: false,
                     normal_restore: None,
                     pending_window_state: None,
                     configured_window_states: Vec::new(),

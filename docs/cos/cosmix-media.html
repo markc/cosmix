@@ -457,6 +457,9 @@ and Quit; <strong>Playback</strong> contains play/pause, stop and ten-second rel
 the remaining area above a small status row. There are no sidebars, pin/float
 controls or separate button toolbar.</p>
 <p>Space toggles playback; Left/Right seek; M toggles mute; F toggles fullscreen.
+View → Toggle fullscreen performs the same action; Escape exits fullscreen.
+Fullscreen hides the player's menu and status bar, leaving the video fitted
+inside the output with its aspect ratio preserved.
 Playback shortcuts are suspended while the file chooser is active. Files can
 also be opened through the Bus. Playlists, subtitle controls and network URLs
 are not implemented.</p>
@@ -488,6 +491,7 @@ deploy it on the trusted desktop Bus.</p>
 <tr><td><code>media.seek</code></td><td><code>{"seconds":30}</code> (absolute, keyframe seek)</td></tr>
 <tr><td><code>media.volume</code></td><td><code>{"value":0.8}</code> (0–1)</td></tr>
 <tr><td><code>media.mute</code>, <code>media.fullscreen</code></td><td><code>{"value":true}</code></td></tr>
+<tr><td><code>media.fullscreen.toggle</code></td><td><code>{}</code></td></tr>
 <tr><td><code>media.status</code></td><td><code>{}</code></td></tr>
 <tr><td><code>media.props.get</code></td><td><code>{"path":"position"}</code> or <code>{}</code> for the complete snapshot</td></tr>
 <tr><td><code>media.quit</code></td><td><code>{}</code></td></tr>
@@ -500,8 +504,18 @@ position and video frames are the evidence of actual playback. <code>ended</code
 <code>replaced_frames</code> counts those superseded before Bevy consumed them. These are
 not hardware decoder throughput or compositor presentation statistics.
 <code>fullscreen</code> is also a requested state: the compositor must honour the Wayland
-fullscreen request. CosMix Comp 0.51.0 currently acknowledges it without changing
-window geometry; use the compositor's maximise control in that version.</p>
+fullscreen request. CosMix Comp 0.51.1 applies fullscreen at the acknowledged
+surface commit, hides compositor decorations and focused native Quoin panels,
+and restores the previous window geometry on exit. The compositor's
+<code>windows.&lt;id&gt;.fullscreen</code> property reports the committed state; the player's
+flag reports the request. Earlier compositor versions only acknowledged it.</p>
+<p>For example, from Mix on a desktop Bus:</p>
+<pre><code class="language-mix">send media media.fullscreen.toggle
+send media media.toggle
+send media media.fullscreen value=false
+</code></pre>
+<p>The menu, keyboard and Bus all enqueue the same worker actions. Two queued
+fullscreen toggles therefore cancel each other even before the UI refreshes.</p>
 <h2 id="rendering-and-limits">Rendering and limits</h2>
 <p>Decoding, pipeline state changes and seeks run on a dedicated worker. The
 command queue holds at most 32 requests. Appsink retains at most two frames;

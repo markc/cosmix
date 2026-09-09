@@ -11277,6 +11277,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         decoration: SceneDecorationMode::ClientSide,
         focused: false,
         committed_maximized: false,
+        committed_fullscreen: false,
         chrome_pointer: ChromePointerSceneState::default(),
         window_geometry: SceneWindowGeometry {
             x: 3.0,
@@ -11289,6 +11290,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         decoration: SceneDecorationMode::ServerSide,
         focused: true,
         committed_maximized: true,
+        committed_fullscreen: false,
         chrome_pointer: ChromePointerSceneState {
             hovered_button: Some(CaptionButton::Close),
             cluster_hovered: true,
@@ -11377,6 +11379,7 @@ fn standalone_decorated_relayout_is_overtaken_by_either_tombstone() {
             decoration: SceneDecorationMode::ServerSide,
             focused: true,
             committed_maximized: false,
+            committed_fullscreen: false,
             chrome_pointer: ChromePointerSceneState::default(),
             window_geometry: SceneWindowGeometry {
                 x: 7.0,
@@ -11422,6 +11425,7 @@ fn dirty_recovery_upsert_preserves_latest_title() {
         decoration: SceneDecorationMode::ServerSide,
         focused: true,
         committed_maximized: true,
+        committed_fullscreen: false,
         chrome_pointer: ChromePointerSceneState {
             hovered_button: Some(CaptionButton::Minimize),
             cluster_hovered: true,
@@ -11476,6 +11480,7 @@ fn roster_and_dirty_recovery_publish_a_complete_decorated_toplevel_snapshot() {
         decoration: SceneDecorationMode::ServerSide,
         focused: true,
         committed_maximized: false,
+        committed_fullscreen: false,
         chrome_pointer: ChromePointerSceneState {
             hovered_button: Some(CaptionButton::Maximize),
             cluster_hovered: true,
@@ -11787,6 +11792,175 @@ fn request_test_maximized(
         &[],
     );
     harness.sync()
+}
+
+fn request_test_fullscreen(
+    harness: &mut KeybindingHarness,
+    fullscreen: bool,
+) -> Vec<(u32, u16, Vec<u8>)> {
+    let output = words(&[0]);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        if fullscreen { 11 } else { 12 },
+        if fullscreen { &output } else { &[] },
+    );
+    harness.sync()
+}
+
+#[test]
+fn fullscreen_waits_for_committed_ack_and_restores_window_geometry() {
+    let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let original = h.server.state.surfaces[&object].window_origin;
+    let geometry = h.server.state.surfaces[&object]
+        .committed_window_geometry
+        .unwrap();
+    let original_size = (geometry.width as i32, geometry.height as i32);
+    let original_band = h.server.state.surfaces[&object].layout.z.band;
+    let traffic = request_test_fullscreen(&mut h, true);
+    let output = h.server.state.logical_output_rect();
+    assert_eq!(
+        configured_toplevel_size(&traffic),
+        (output.width as i32, output.height as i32)
+    );
+    assert!(!h.server.state.surfaces[&object].committed_fullscreen);
+    assert_eq!(h.server.state.surfaces[&object].window_origin, original);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let record = &h.server.state.surfaces[&object];
+    assert!(record.committed_fullscreen);
+    assert_eq!(record.window_origin, (output.x, output.y));
+    assert_eq!(record.layout.z.band, StackBand::Top);
+    assert_eq!(
+        record.layout.toplevel.unwrap().decoration,
+        SceneDecorationMode::Unbound
+    );
+    let traffic = request_test_fullscreen(&mut h, false);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let record = &h.server.state.surfaces[&object];
+    assert!(!record.committed_fullscreen);
+    assert_eq!(record.window_origin, original);
+    assert_eq!(record.configured_size, original_size);
+    assert_eq!(record.layout.z.band, original_band);
+    assert_eq!(
+        record.layout.toplevel.unwrap().decoration,
+        SceneDecorationMode::ServerSide
+    );
+}
+
+#[test]
+fn fullscreen_preserves_maximized_and_normal_restore_across_reconfigure() {
+    let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let normal = h.server.state.surfaces[&object].window_origin;
+    let traffic = request_test_maximized(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let maximized = h.server.state.surfaces[&object].window_origin;
+    let traffic = request_test_fullscreen(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    h.server.state.reconfigure_window_states_for_output();
+    let traffic = h.sync();
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let traffic = request_test_fullscreen(&mut h, false);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    assert!(h.server.state.surfaces[&object].committed_maximized);
+    assert_eq!(h.server.state.surfaces[&object].window_origin, maximized);
+    let traffic = request_test_maximized(&mut h, false);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    assert_eq!(h.server.state.surfaces[&object].window_origin, normal);
+}
+
+#[test]
+fn fullscreen_decoration_destruction_keeps_output_origin() {
+    let (mut h, _, object, decoration) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let traffic = request_test_fullscreen(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let origin = h.server.state.surfaces[&object].window_origin;
+    send_request(&mut h.client, decoration, 0, &[]);
+    h.sync();
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    h.dispatch_client();
+    let record = &h.server.state.surfaces[&object];
+    assert!(record.committed_fullscreen);
+    assert_eq!(record.window_origin, origin);
+    assert_eq!(record.committed_decoration, SceneDecorationMode::ClientSide);
+    assert!(!record.normal_restore.unwrap().server_side);
+}
+
+#[test]
+fn fullscreen_commit_cancels_moves_and_resizes_started_before_ack() {
+    for resize in [false, true] {
+        let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+        let traffic = request_test_fullscreen(&mut h, true);
+        let surface = h.server.state.surfaces[&object].role.wl_surface().clone();
+        // A valid client grab can arrive after configure but before the
+        // fullscreen buffer commits. Cancelling only at request time is insufficient.
+        h.server.state.interactive_pointer = Some(if resize {
+            InteractivePointer::Resize {
+                surface,
+                edges: xdg_toplevel::ResizeEdge::BottomRight,
+                start_pointer: (0.0, 0.0),
+                start_origin: (40.0, 60.0),
+                start_size: (240, 120),
+            }
+        } else {
+            InteractivePointer::Move {
+                surface,
+                start_pointer: (0.0, 0.0),
+                start_origin: (40.0, 60.0),
+            }
+        });
+        commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+        assert!(h.server.state.interactive_pointer.is_none());
+        let origin = h.server.state.surfaces[&object].window_origin;
+        let size = h.server.state.surfaces[&object].configured_size;
+        assert!(!h.server.state.update_interactive_pointer(100.0, 100.0));
+        assert_eq!(h.server.state.surfaces[&object].window_origin, origin);
+        assert_eq!(h.server.state.surfaces[&object].configured_size, size);
+    }
+}
+
+#[test]
+fn restoring_normal_window_places_it_above_unfocused_fullscreen() {
+    let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    // Bands have independent sequence counters. A Top sequence must never be
+    // copied into Normal during demotion, even if it is much higher.
+    for _ in 0..100 {
+        h.server.state.allocate_stack_key(StackBand::Top);
+    }
+    let other = map_test_undecorated_toplevel(&mut h);
+    let other_surface = h.server.state.surfaces[&other].role.wl_surface().clone();
+    h.server.state.minimize_toplevel(&other_surface);
+    let traffic = request_test_fullscreen(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    assert!(h.server.state.surfaces[&object].focused);
+    h.server.state.restore_most_recently_minimized();
+    assert!(h.server.state.surfaces[&other].focused);
+    assert!(!h.server.state.surfaces[&object].focused);
+    assert!(h.server.state.surfaces[&other].layout.z > h.server.state.surfaces[&object].layout.z);
+    assert_eq!(
+        h.server.state.surfaces[&object].layout.z.band,
+        StackBand::Normal
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn fullscreen_exit_retains_explicit_bus_band_change() {
+    let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let traffic = request_test_fullscreen(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let id = h.server.state.surfaces[&object].id;
+    assert!(
+        h.server
+            .state
+            .set_window_band(id, StackBand::Bottom, "test")
+            .is_some()
+    );
+    let traffic = request_test_fullscreen(&mut h, false);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    assert_eq!(
+        h.server.state.surfaces[&object].layout.z.band,
+        StackBand::Bottom
+    );
 }
 
 fn chrome_button_point(harness: &KeybindingHarness, wanted: CaptionButton) -> (f64, f64) {
@@ -14210,6 +14384,7 @@ fn ssd_off_wire_and_committed_scene_state_remain_client_side() {
             decoration: SceneDecorationMode::ClientSide,
             focused: true,
             committed_maximized: false,
+            committed_fullscreen: false,
             chrome_pointer: ChromePointerSceneState::default(),
             window_geometry: SceneWindowGeometry {
                 x: 0.0,

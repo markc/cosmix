@@ -24,6 +24,26 @@ For small nested scene previews, `COSMIX_COMP_SERIAL_SCHEDULES=1` selects
 single-threaded ECS schedule execution to reduce dispatch overhead. This is an
 opt-in performance experiment; normal compositor scheduling is unchanged.
 
+## Wayland fullscreen
+
+Comp 0.51.1 honours `xdg_toplevel` fullscreen and unfullscreen requests.
+Fullscreen uses the primary logical output's complete rectangle, including
+space otherwise reserved for panels. The optional client output hint is not
+selected yet. State and geometry change together when the client commits its
+acknowledged configure; sending or acknowledging a configure alone does not
+move the visible window.
+
+Compositor decorations disappear in fullscreen. While that window has keyboard
+focus, it is raised into the top band and native Quoin panels and hotspots are
+hidden. Switching focus restores its previous stacking band and Quoin, allowing
+other applications to remain usable. Leaving fullscreen restores the previous
+normal geometry, or the maximised layout if it was maximised first. Restored
+normal geometry is clamped to the current usable area after output changes.
+
+Bus properties `windows.<id>.fullscreen` and `surfaces.<id>.fullscreen` expose
+the committed state and emit normal property observation deltas. Application
+commands such as `media.fullscreen` initiate the request through Wayland.
+
 ## Window switching and X11 placement
 
 Comp 0.51.0 includes an opt-in `native-quoin` feature. Together with
@@ -111,10 +131,10 @@ outputs.o_<slug>.{name,default,x,y,width,height,scale,refresh_mhz,
                   usable.{x,y,width,height}}
 surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
-                maximized,minimized,decoration,
+                maximized,fullscreen,minimized,decoration,
                 layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
-               maximized,minimized,output,band}
+               maximized,fullscreen,minimized,output,band}
 stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
 decoration.{enabled,style}

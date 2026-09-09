@@ -2228,6 +2228,7 @@ mod tests {
                 decoration,
                 focused,
                 committed_maximized: false,
+                committed_fullscreen: false,
                 chrome_pointer: ChromePointerSceneState::default(),
                 window_geometry: SceneWindowGeometry {
                     x: 0.0,
@@ -3169,6 +3170,7 @@ mod tests {
         let maximised = SurfaceLayout {
             toplevel: Some(ToplevelSceneState {
                 committed_maximized: true,
+                committed_fullscreen: false,
                 ..normal.toplevel.expect("toplevel")
             }),
             ..normal
@@ -3352,6 +3354,7 @@ mod tests {
         let maximised = SurfaceLayout {
             toplevel: Some(ToplevelSceneState {
                 committed_maximized: true,
+                committed_fullscreen: false,
                 ..normal.toplevel.expect("toplevel")
             }),
             ..normal
@@ -3849,6 +3852,7 @@ mod tests {
         let maximised = SurfaceLayout {
             toplevel: Some(ToplevelSceneState {
                 committed_maximized: true,
+                committed_fullscreen: false,
                 ..normal.toplevel.expect("toplevel")
             }),
             ..normal
@@ -3898,6 +3902,7 @@ mod tests {
         let updated = SurfaceLayout {
             toplevel: Some(ToplevelSceneState {
                 committed_maximized: true,
+                committed_fullscreen: false,
                 chrome_pointer: ChromePointerSceneState {
                     hovered_button: Some(CaptionButton::Maximize),
                     cluster_hovered: true,

@@ -18,6 +18,9 @@ the remaining area above a small status row. There are no sidebars, pin/float
 controls or separate button toolbar.
 
 Space toggles playback; Left/Right seek; M toggles mute; F toggles fullscreen.
+View → Toggle fullscreen performs the same action; Escape exits fullscreen.
+Fullscreen hides the player's menu and status bar, leaving the video fitted
+inside the output with its aspect ratio preserved.
 Playback shortcuts are suspended while the file chooser is active. Files can
 also be opened through the Bus. Playlists, subtitle controls and network URLs
 are not implemented.
@@ -57,6 +60,7 @@ deploy it on the trusted desktop Bus.
 | `media.seek` | `{"seconds":30}` (absolute, keyframe seek) |
 | `media.volume` | `{"value":0.8}` (0–1) |
 | `media.mute`, `media.fullscreen` | `{"value":true}` |
+| `media.fullscreen.toggle` | `{}` |
 | `media.status` | `{}` |
 | `media.props.get` | `{"path":"position"}` or `{}` for the complete snapshot |
 | `media.quit` | `{}` |
@@ -69,8 +73,22 @@ position and video frames are the evidence of actual playback. `ended` is EOS.
 `replaced_frames` counts those superseded before Bevy consumed them. These are
 not hardware decoder throughput or compositor presentation statistics.
 `fullscreen` is also a requested state: the compositor must honour the Wayland
-fullscreen request. CosMix Comp 0.51.0 currently acknowledges it without changing
-window geometry; use the compositor's maximise control in that version.
+fullscreen request. CosMix Comp 0.51.1 applies fullscreen at the acknowledged
+surface commit, hides compositor decorations and focused native Quoin panels,
+and restores the previous window geometry on exit. The compositor's
+`windows.<id>.fullscreen` property reports the committed state; the player's
+flag reports the request. Earlier compositor versions only acknowledged it.
+
+For example, from Mix on a desktop Bus:
+
+```mix
+send media media.fullscreen.toggle
+send media media.toggle
+send media media.fullscreen value=false
+```
+
+The menu, keyboard and Bus all enqueue the same worker actions. Two queued
+fullscreen toggles therefore cancel each other even before the UI refreshes.
 
 ## Rendering and limits
 
