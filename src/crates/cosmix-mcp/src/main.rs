@@ -383,8 +383,16 @@ const TERM_REPLY_MAX: usize = 1_048_576;
 fn term_reply(value: serde_json::Value) -> Result<String, String> {
     let text = match value {
         serde_json::Value::String(text) => text,
+        // NodedClient.call() maps an EMPTY success body to Value::Null; render
+        // it as an empty string, not the literal "null" (an empty tabs/panes
+        // listing or a blank snapshot must not corrupt into "null").
+        serde_json::Value::Null => String::new(),
         value => value.to_string(),
     };
+    // Forward-cap: the reply is already received/materialised by call() (bounded
+    // by the broker's frame limit); this stops an oversized reply reaching the
+    // MCP client. It is not a receive-time cap — a native receive limit would be
+    // needed for that, tracked with the P0-I self-asserted-service gap.
     if text.len() > TERM_REPLY_MAX {
         return Err("Term reply exceeds 1048576 bytes".into());
     }
@@ -2726,6 +2734,8 @@ mod tests {
             "screen\ntext"
         );
         assert!(term_reply(serde_json::json!("x".repeat(TERM_REPLY_MAX + 1))).is_err());
+        // An empty Bus reply arrives as Value::Null; render it as "", never "null".
+        assert_eq!(term_reply(serde_json::Value::Null).unwrap(), "");
     }
 
     use super::*;

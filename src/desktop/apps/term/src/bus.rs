@@ -59,7 +59,9 @@ fn handle(
             .join("\n")),
         "term.tab.new" => tabs.open().map(|id| format!("opened id={id}")),
         "term.tab.select" => {
-            let id = args["id"].as_u64().unwrap();
+            let id = args["id"]
+                .as_u64()
+                .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             // select wakes the event loop; refresh compares View.rendered_id
             // with active_id and uploads even without a PTY damage event.
             if tabs.select(id) {
@@ -69,7 +71,9 @@ fn handle(
             }
         }
         "term.tab.close" => {
-            let id = args["id"].as_u64().unwrap();
+            let id = args["id"]
+                .as_u64()
+                .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             let (outcome, removed) = tabs.close(id);
             drop(tabs);
             cleanup.submit(removed.into_iter().collect());
@@ -93,7 +97,11 @@ fn handle(
             .join("\n")),
         // VERIFY: term.pane.split handler — validated JSON direction, new active ID.
         "term.pane.split" => {
-            let dir = parse_dir(args["dir"].as_str().unwrap())?;
+            let dir = parse_dir(
+                args["dir"]
+                    .as_str()
+                    .ok_or_else(|| "internal: term verb/args desync (dir)".to_string())?,
+            )?;
             tabs.split_active(dir).map(|id| {
                 format!(
                     "split id={id} dir={}",
@@ -106,7 +114,9 @@ fn handle(
             })
         }
         "term.pane.select" => {
-            let id = args["id"].as_u64().unwrap();
+            let id = args["id"]
+                .as_u64()
+                .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             if tabs.focus(id) {
                 Ok(format!("selected id={id}"))
             } else {
@@ -142,7 +152,11 @@ fn handle(
                 // VERIFY: term.type extracts validated text, never the JSON envelope.
                 terminal
                     .listener
-                    .type_text(args["text"].as_str().unwrap())
+                    .type_text(
+                        args["text"]
+                            .as_str()
+                            .ok_or_else(|| "internal: term verb/args desync (text)".to_string())?,
+                    )
                     .map(|_| {
                         "DIAGNOSTIC synthetic keys queued; inspect input_written for actual writes"
                             .into()
