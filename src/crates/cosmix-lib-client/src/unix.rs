@@ -254,11 +254,16 @@ fn verify_path(path: &Path, account: BrokerAccount) -> Result<PathSnapshot, Conn
 // BUS-014 allows only one canonical spelling. JSON duplicates and known-field
 // types are then checked by lib-bus read_principal.
 pub(crate) fn principal_header_is_unique(wire: &str) -> bool {
+    let Some(content) = wire.strip_prefix("---\n") else {
+        return false;
+    };
+    // Match the compatibility parser's boundary, including unterminated
+    // headers. The opening delimiter must not terminate the scan.
+    let headers = content
+        .split_once("\n---\n")
+        .map_or(content, |(headers, _)| headers);
     let mut seen = false;
-    for line in wire.lines() {
-        if line == "---" {
-            break;
-        }
+    for line in headers.lines() {
         if let Some((key, _)) = line.split_once(':')
             && key.trim().eq_ignore_ascii_case("broker_principal")
         {
@@ -296,14 +301,24 @@ mod tests {
     #[test]
     fn principal_duplicates_are_detected_before_compatibility_parse() {
         assert!(principal_header_is_unique(
-            "bus: 1\nbroker_principal: {}\n---\nbroker_principal: body"
+            "---\nbus: 1\nbroker_principal: {}\n---\nbroker_principal: body"
         ));
         for key in ["broker_principal", "BROKER_PRINCIPAL", "Broker_Principal"] {
             assert!(!principal_header_is_unique(&format!(
-                "broker_principal: {{}}\n{key}: {{}}\n---\n"
+                "---\nbroker_principal: {{}}\n{key}: {{}}\n---\n"
             )));
         }
-        assert!(!principal_header_is_unique("BROKER_PRINCIPAL: {}\n---\n"));
-        assert!(!principal_header_is_unique(" broker_principal: {}\n---\n"));
+        assert!(!principal_header_is_unique(
+            "---\nBROKER_PRINCIPAL: {}\n---\n"
+        ));
+        assert!(!principal_header_is_unique(
+            "---\n broker_principal: {}\n---\n"
+        ));
+        assert!(!principal_header_is_unique(
+            "---\nbroker_principal: {}\nbroker_principal: {}"
+        ));
+        assert!(principal_header_is_unique(
+            "---\nbus: 1\n---\nBROKER_PRINCIPAL: body"
+        ));
     }
 }

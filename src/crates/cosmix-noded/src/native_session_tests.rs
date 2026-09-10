@@ -481,3 +481,33 @@ async fn client_rejects_wrong_endpoint_owner_and_server_credentials_without_fall
         Err(ConnectError::PeerCredentials)
     ));
 }
+
+#[tokio::test]
+async fn client_explicit_development_endpoint_requires_protected_path() {
+    use cosmix_client::{ConnectError, NodedClient};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let broker = Broker::start().await;
+    let mut options = client_options(&broker);
+    options.endpoint = Some(broker.root.join("alias.sock"));
+    symlink(
+        broker.root.join("bus.sock"),
+        options.endpoint.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        NodedClient::connect_unix("symlink", &broker.url, &options, None).await,
+        Err(ConnectError::EndpointOwnership)
+    ));
+    options.endpoint = Some(broker.root.join("bus.sock"));
+    std::fs::set_permissions(&broker.root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(matches!(
+        NodedClient::connect_unix("writable", &broker.url, &options, None).await,
+        Err(ConnectError::EndpointOwnership)
+    ));
+    std::fs::set_permissions(&broker.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    options.endpoint = Some("relative/bus.sock".into());
+    assert!(matches!(
+        NodedClient::connect_unix("relative", &broker.url, &options, None).await,
+        Err(ConnectError::InvalidEndpoint)
+    ));
+}
