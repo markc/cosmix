@@ -96,6 +96,12 @@ fn fixture_process() {
             }
             assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) }, 0);
         }
+        "canonical" => {
+            let t = tty_modes(tty.as_ref().unwrap().as_raw_fd());
+            assert_ne!(t.c_lflag & libc::ICANON, 0);
+            assert_ne!(t.c_lflag & libc::ECHO, 0);
+            fs::write(report.with_extension("canonical"), "yes").unwrap();
+        }
         "exit" | "identity" => {}
         _ => panic!("unknown fixture mode"),
     }
@@ -277,7 +283,7 @@ fn foreground_barrier_and_fast_exit_pipeline() {
         assert_eq!(y[1], y[2], "last target ran only after terminal transfer");
         assert_ne!(x[1], p.shell.id() as i32);
         assert_eq!(
-            unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) },
+            unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) },
             p.shell.id() as i32
         );
         assert!(!alive(x[0]) && !alive(y[0]), "every member reaped");
@@ -320,11 +326,11 @@ fn stop_bg_fg_and_terminal_modes() {
     p.command("bg");
     wait_for(|| state(j[0]) != Some('T'));
     assert_eq!(
-        unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) },
+        unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) },
         p.shell.id() as i32
     );
     p.send("fg\n");
-    wait_for(|| unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) } == j[1]);
+    wait_for(|| unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) } == j[1]);
     p.send("\x03");
     p.until(PROMPT);
     p.command(&p.fixture("stop-modes", "modes"));
@@ -337,6 +343,42 @@ fn stop_bg_fg_and_terminal_modes() {
     // restored canonical mode by stopping it after launch in another test.
     assert_ne!(t.c_oflag & libc::OPOST, 0);
     assert!(p.command("print(2468)").contains("2468"));
+    p.command(&p.fixture("canonical", "cooked"));
+    assert!(p.home.path().join("cooked.canonical").exists());
+}
+
+#[test]
+fn monitor_reaps_without_a_prompt_iteration() {
+    let mut p = Pty::interactive();
+    p.command(&format!("{} &", p.fixture("hold", "background")));
+    let bg = p.report("background");
+    // While the evaluator is blocked waiting for another foreground child,
+    // the independent monitor must reap this background child immediately.
+    p.send(&format!("{}\n", p.fixture("hold", "foreground")));
+    let fg = p.report("foreground");
+    unsafe {
+        libc::kill(bg[0], libc::SIGTERM);
+    }
+    wait_for(|| !alive(bg[0]));
+    assert!(alive(fg[0]));
+    p.send("\x03");
+    p.until(PROMPT);
+}
+
+#[test]
+fn close_reports_hup_ignoring_survivor_without_kill_escalation() {
+    let mut p = Pty::interactive();
+    p.command(&format!("{} &", p.fixture("ignore-hup", "survivor")));
+    let j = p.report("survivor");
+    let start = Instant::now();
+    p.send("\x04");
+    p.until("survived HUP/CONT grace");
+    wait_for(|| p.shell.try_wait().unwrap().is_some());
+    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(
+        alive(j[0]),
+        "close policy must not silently escalate to SIGKILL"
+    );
 }
 
 #[test]
@@ -347,7 +389,7 @@ fn background_read_gets_sigttin_and_tostop_write_stops() {
     wait_for(|| state(r[0]) == Some('T'));
     assert!(p.command("jobs").contains("Stopped"));
     p.send("fg\n");
-    wait_for(|| unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) } == r[1]);
+    wait_for(|| unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) } == r[1]);
     p.send("x\n");
     p.until(PROMPT);
     assert!(!alive(r[0]));
@@ -396,7 +438,7 @@ fn nested_shell_foreground_and_parent_restoration() {
     let mut p = Pty::interactive();
     p.send(&format!("{}\n", env!("CARGO_BIN_EXE_mix")));
     p.until(PROMPT);
-    let nested = unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) };
+    let nested = unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) };
     assert_ne!(nested, p.shell.id() as i32);
     p.command(&p.fixture("identity", "nested-job"));
     let job = p.report("nested-job");
@@ -405,7 +447,7 @@ fn nested_shell_foreground_and_parent_restoration() {
     p.send("\x04");
     p.until(PROMPT);
     assert_eq!(
-        unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) },
+        unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) },
         p.shell.id() as i32
     );
 }
@@ -415,7 +457,7 @@ fn noninteractive_ssh_style_command_never_takes_terminal_or_group() {
     // PTY allocated, controlling terminal present, yet explicit -c policy.
     let source = "print(pid()); run_stream([\"/bin/true\"])";
     let mut p = Pty::new(&["-c", source], false, true);
-    let original = unsafe { libc::tcgetpgrp(p.slave.as_raw_fd()) };
+    let original = unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) };
     assert_eq!(original, p.shell.id() as i32);
     wait_for(|| p.shell.try_wait().unwrap().is_some());
     assert!(p.shell.wait().unwrap().success());

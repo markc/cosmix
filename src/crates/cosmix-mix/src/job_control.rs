@@ -636,6 +636,14 @@ pub fn stage_entry() {
     let (Some(g), Some(e), Some(program)) = (parse(2), parse(3), args.get(4)) else {
         std::process::exit(126);
     };
+    // The hidden entry is not an authority boundary, but malformed argv must
+    // never construct File from an invalid or multiply-owned descriptor.
+    if g == e
+        || unsafe { libc::fcntl(g, libc::F_GETFD) } < 0
+        || unsafe { libc::fcntl(e, libc::F_GETFD) } < 0
+    {
+        std::process::exit(126);
+    }
     let mut gate = unsafe { File::from_raw_fd(g) };
     let mut error = unsafe { File::from_raw_fd(e) };
     unsafe {
@@ -649,4 +657,47 @@ pub fn stage_entry() {
     let err = Command::new(program).args(&args[5..]).exec();
     let _ = error.write_all(&err.raw_os_error().unwrap_or(libc::EIO).to_ne_bytes());
     std::process::exit(127);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn job(states: &[MemberState]) -> Job {
+        Job {
+            id: 1,
+            pgid: 1,
+            command: "fixture".into(),
+            members: states
+                .iter()
+                .enumerate()
+                .map(|(i, state)| Member {
+                    pid: i as i32 + 1,
+                    state: *state,
+                })
+                .collect(),
+            modes: None,
+            foreground: false,
+        }
+    }
+    #[test]
+    fn aggregate_stop_and_completion_require_every_live_member() {
+        use MemberState::*;
+        assert_eq!(
+            job(&[Stopped(libc::SIGTSTP), Running]).state(),
+            JobState::Running
+        );
+        assert_eq!(
+            job(&[Stopped(libc::SIGTTIN), Exited(0)]).state(),
+            JobState::Stopped
+        );
+        assert_eq!(
+            job(&[Stopped(libc::SIGTSTP), Stopped(libc::SIGTTOU)]).state(),
+            JobState::Stopped
+        );
+        let completed = job(&[Signalled(libc::SIGPIPE), Exited(7)]);
+        assert_eq!(completed.state(), JobState::Done);
+        assert_eq!(completed.code(), 7);
+        assert_eq!(job(&[Exited(0), Signalled(libc::SIGINT)]).code(), 130);
+        assert_eq!(job(&[Exited(0), Lost]).code(), 1);
+    }
 }
