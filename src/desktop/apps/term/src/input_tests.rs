@@ -282,6 +282,172 @@ fn menu_activation_is_bounds_safe() {
 struct Bubbled(Vec<KeyCode>);
 
 #[test]
+fn pane_shortcuts_split_focus_close_and_consume_repeats() {
+    let Some((mut app, window)) = fixture() else {
+        return;
+    };
+    app.init_resource::<Bubbled>();
+    app.world_mut().entity_mut(window).observe(
+        |event: On<FocusedInput<KeyboardInput>>, mut seen: ResMut<Bubbled>| {
+            seen.0.push(event.input.key_code);
+        },
+    );
+    let first = app
+        .world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .active_tab()
+        .active_pane;
+    chord(&mut app, window, KeyCode::KeyE);
+    app.update();
+    let second = app
+        .world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .active_tab()
+        .active_pane;
+    assert_ne!(first, second);
+    assert_eq!(
+        app.world()
+            .resource::<Core>()
+            .0
+            .lock()
+            .unwrap()
+            .leaves()
+            .len(),
+        2
+    );
+    for key in [
+        KeyCode::KeyE,
+        KeyCode::KeyO,
+        KeyCode::KeyX,
+        KeyCode::ArrowLeft,
+    ] {
+        input(&mut app, window, key, ButtonState::Pressed, true);
+    }
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<Core>()
+            .0
+            .lock()
+            .unwrap()
+            .leaves()
+            .len(),
+        2
+    );
+    assert_eq!(
+        app.world()
+            .resource::<Core>()
+            .0
+            .lock()
+            .unwrap()
+            .active_tab()
+            .active_pane,
+        second
+    );
+    press(&mut app, window, KeyCode::ArrowLeft);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<Core>()
+            .0
+            .lock()
+            .unwrap()
+            .active_tab()
+            .active_pane,
+        first
+    );
+    press(&mut app, window, KeyCode::KeyO);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<Core>()
+            .0
+            .lock()
+            .unwrap()
+            .leaves()
+            .len(),
+        3
+    );
+    press(&mut app, window, KeyCode::KeyX);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<Core>()
+            .0
+            .lock()
+            .unwrap()
+            .leaves()
+            .len(),
+        2
+    );
+    let seen = &app.world().resource::<Bubbled>().0;
+    for key in [
+        KeyCode::KeyE,
+        KeyCode::KeyO,
+        KeyCode::KeyX,
+        KeyCode::ArrowLeft,
+    ] {
+        assert!(!seen.contains(&key), "pane shortcut leaked: {key:?}");
+    }
+}
+
+#[test]
+fn pane_shortcuts_require_menu_focus_and_exact_modifiers() {
+    for blocked in 0..6 {
+        let Some((mut app, window)) = fixture() else {
+            return;
+        };
+        match blocked {
+            0 => {
+                let dropdown = app.world().resource::<View>().dropdowns[0].0;
+                app.world_mut().get_mut::<Node>(dropdown).unwrap().display = Display::Flex;
+            }
+            1 => {
+                app.world_mut()
+                    .resource_mut::<InputFocus>()
+                    .set(window, FocusCause::Navigated);
+            }
+            2 => {
+                app.world_mut().resource_mut::<ModalCapture>().acquire(
+                    ctk::modal_capture::ModalCaptureOwner {
+                        kind: "test",
+                        entity: None,
+                    },
+                    ctk::modal_capture::ModalCaptureLayer(1),
+                );
+            }
+            3 => press(&mut app, window, KeyCode::AltLeft),
+            4 => press(&mut app, window, KeyCode::SuperLeft),
+            _ => {}
+        }
+        if blocked == 5 {
+            press(&mut app, window, KeyCode::ControlLeft);
+            press(&mut app, window, KeyCode::KeyE);
+        } else {
+            chord(&mut app, window, KeyCode::KeyE);
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Core>()
+                .0
+                .lock()
+                .unwrap()
+                .leaves()
+                .len(),
+            1,
+            "blocked case {blocked}"
+        );
+    }
+}
+
+#[test]
 fn unmapped_control_key_propagates_but_encoded_letter_does_not() {
     let Some((mut app, window)) = fixture() else {
         return;
