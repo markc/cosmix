@@ -196,7 +196,7 @@ impl Controller {
             old_signals: Vec::new(),
             committed: false,
         };
-        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        for sig in [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
             let mut old = unsafe { std::mem::zeroed() };
             let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
             ignore.sa_sigaction = libc::SIG_IGN;
@@ -371,6 +371,7 @@ impl Controller {
         // baseline. Terminal modes alone cannot identify user intent beyond
         // this explicit policy.
         if !stopped
+            && job.modes.is_none()
             && job
                 .members
                 .iter()

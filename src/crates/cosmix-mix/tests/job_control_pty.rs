@@ -478,9 +478,13 @@ fn background_nested_shell_waits_for_foreground_admission() {
     p.command(&format!("{} &", env!("CARGO_BIN_EXE_mix")));
     wait_for(|| p.command("jobs").contains("Stopped"));
     p.send("fg\n");
-    p.until(PROMPT);
+    let entered = p.until(PROMPT);
     let nested = unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) };
-    assert_ne!(nested, p.shell.id() as i32);
+    assert_ne!(
+        nested,
+        p.shell.id() as i32,
+        "foreground response: {entered:?}"
+    );
     p.send("\x04");
     p.until(PROMPT);
     assert_eq!(
