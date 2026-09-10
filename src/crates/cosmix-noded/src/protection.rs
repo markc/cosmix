@@ -39,20 +39,70 @@ impl TrafficClass {
         {
             return Self::NativeSession;
         }
-        if message.command_name() == Some("topic.publish")
-            && message
-                .get("name")
-                .is_some_and(|name| crate::props_reservation::reserved_owner(name).is_some())
-        {
-            return Self::NativeSession;
-        }
         Self::Legacy
+    }
+}
+
+/// Protection survives correlation consumption/disconnect for the BROKER-018
+/// retention horizon. Overflow over-protects all unknown responses until the
+/// lost tombstones would expire; it never evicts protection early.
+#[derive(Default)]
+pub(crate) struct ResponseProtection {
+    entries: std::collections::HashMap<String, std::time::Instant>,
+    overflow_until: Option<std::time::Instant>,
+}
+impl ResponseProtection {
+    const HORIZON: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    const LIMIT: usize = 65_536;
+    pub(crate) fn retain(&mut self, id: &str, class: TrafficClass) {
+        if !class.protected() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.entries.len() >= Self::LIMIT {
+            self.entries.retain(|_, deadline| *deadline > now);
+        }
+        let deadline = now + Self::HORIZON;
+        if self.entries.len() < Self::LIMIT || self.entries.contains_key(id) {
+            self.entries.insert(id.to_owned(), deadline);
+        } else {
+            self.overflow_until = Some(deadline);
+        }
+    }
+    pub(crate) fn class(&self, id: &str) -> TrafficClass {
+        let now = std::time::Instant::now();
+        if self.entries.get(id).is_some_and(|until| *until > now)
+            || self.overflow_until.is_some_and(|until| until > now)
+        {
+            TrafficClass::NativeSession
+        } else {
+            TrafficClass::Legacy
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tombstones_are_bounded_and_overflow_never_exposes_payloads() {
+        let mut history = ResponseProtection::default();
+        let future = std::time::Instant::now() + ResponseProtection::HORIZON;
+        for id in 0..ResponseProtection::LIMIT {
+            history.entries.insert(id.to_string(), future);
+        }
+        history.retain("overflow", TrafficClass::NativeSession);
+        assert_eq!(history.entries.len(), ResponseProtection::LIMIT);
+        assert!(history.class("overflow").protected());
+        assert!(history.class("unknown").protected());
+        history.overflow_until = Some(std::time::Instant::now());
+        assert_eq!(history.class("unknown"), TrafficClass::Legacy);
+        assert!(history.class("0").protected());
+        history
+            .entries
+            .insert("0".into(), std::time::Instant::now());
+        assert_eq!(history.class("0"), TrafficClass::Legacy);
+    }
     #[test]
     fn classification_is_broker_owned_and_monotonic() {
         let forged = BusMessage::new()

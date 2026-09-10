@@ -587,8 +587,13 @@ setuid, do not retroactively change that connection's principal. This boundary
 is accepted; obtaining a new principal requires a new connection.</p>
 <p>The listener path MUST resolve as <code>cosmix_path(Run)/noded/bus.sock</code>. A system
 unit MUST pin <code>COSMIX_RUN</code> to its system runtime root (<code>%t/cosmix</code>); node
-configuration key <code>noded.unix_socket</code> MUST publish the absolute endpoint path.
-Clients MUST use that key when present, otherwise <code>/run/cosmix/noded/bus.sock</code>;
+configuration key <code>noded.unix_socket</code> MAY explicitly select the absolute endpoint.
+When available, the broker MUST publish its actual bound absolute endpoint as
+<code>extensions["native-session-endpoint"]</code> in <code>noded.ping</code>, alongside
+<code>"native-session":"1"</code>. When unavailable, both entries MUST be absent.
+Clients MUST resolve an explicit endpoint option first, then that config key,
+then the ping-discovered endpoint, otherwise <code>/run/cosmix/noded/bus.sock</code>;
+discovery is a locator only and MUST NOT confer trust or bypass endpoint checks.
 they MUST NOT resolve the system socket through their own XDG runtime directory.
 The directory MUST be traversable
 by local users and writable only by the broker account or root; socket mode
@@ -611,7 +616,10 @@ header from untrusted input before stamping its own value. This applies to
 requests, correlated responses, events and inner topic envelopes at every
 delivery boundary; it MUST preserve BROKER-003/004 and responder-channel checks.
 Mesh ingress MUST NOT import a claimed remote Unix UID as local authority.
-Unverified TCP/mesh deliveries MUST omit this header. A direct broker control
+Deliveries <strong>to</strong> unverified transports (including TCP and mesh) MUST omit this
+header, even when the sender has a verified Unix principal. Only deliveries to
+verified LocalUnix connections may carry it; this also gates retained replay
+and inner topic envelopes. A direct broker control
 reply is authenticated by its endpoint and pending-response association, not
 by a fabricated Unix caller stamp.</p>
 <p>Required object fields are <code>version:1</code>, <code>assurance</code> (<code>local-unix</code> or

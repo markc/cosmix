@@ -1,7 +1,7 @@
 ---
 title: Cosmix specification suite
-version: 0.3.2
-amends: suite-0.3.1
+version: 0.3.3
+amends: suite-0.3.2
 status: accepted
 date: 2026-09-10
 ---
@@ -76,6 +76,18 @@ This section is the suite-level change record required by GOV-002/003;
 accepted meta-documents (the handover, the compatibility profile) carry their
 own records. Chapter entries name every chapter whose version moved in the
 suite revision.
+
+- **0.3.3, amending suite-0.3.2 (2026-09-10)** — chapter 04 → 0.1.3.
+  **GOV-002 disposition:** BUS-014 is **clarified**: destination transport gates
+  principal disclosure; TCP/mesh egress strips even genuine Unix sender stamps.
+  BUS-013 endpoint publication is **changed** to advertise the actual bound path
+  in ping, with explicit/config/discovered/system client precedence. Discovery
+  remains untrusted until existing endpoint verification succeeds. Both profile
+  requirements remain intended pending the full acceptance fixtures.
+  Compatibility: ordinary TCP clients retain their wire contract and receive
+  no identity metadata; the additive ping locator repairs dev-root discovery.
+  BROKER-002/003 and BROKER-012 are **retained**; no legacy registration,
+  response-ownership or loss-without-disconnect rule changes. HTML regenerated.
 
 - **0.3.2, amending suite-0.3.1 (2026-09-10)** — native-session S0 contract:
   04 → 0.1.2 (Unix/WebSocket binding, trusted metadata, validation and exact

@@ -766,7 +766,11 @@ fn metadata_event(observation: &Observation<'_>) -> EventBody {
     let bounded = |value: Option<&str>| {
         value.map(|s| {
             if observation.class.protected() {
-                s.chars().take(128).collect()
+                let mut end = s.len().min(128);
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                s[..end].to_owned()
             } else {
                 s.to_owned()
             }
@@ -779,7 +783,11 @@ fn metadata_event(observation: &Observation<'_>) -> EventBody {
         outcome: observation.outcome,
         message_type: classify_message_type(observation.message),
         from: bounded(observation.message.from_addr()),
-        to: bounded(observation.message.to_addr()),
+        to: bounded(observation.message.to_addr().filter(|to| {
+            !observation.class.protected()
+                || cosmix_bus::bus::is_valid_label(to)
+                || cosmix_bus::bus::BusTarget::parse(to).is_some()
+        })),
         verb: bounded(observation.message.command_name()),
         size: observation
             .canonical_size
@@ -1086,6 +1094,22 @@ pub(crate) fn response_wire(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protected_metadata_bounds_utf8_bytes_and_rejects_unvalidated_targets() {
+        let message = cosmix_bus::bus::BusMessage::new()
+            .with_header("to", "not a routing target")
+            .with_header("command", &"界".repeat(100));
+        let observation = super::Observation::canonical(
+            super::Direction::Local,
+            super::Outcome::Rejected,
+            &message,
+            None,
+        )
+        .with_class(crate::protection::TrafficClass::NativeSession);
+        let event = super::metadata_event(&observation);
+        assert!(event.to.is_none());
+        assert_eq!(event.verb.unwrap().len(), 126);
+    }
     use super::*;
 
     fn message(command: &str) -> BusMessage {

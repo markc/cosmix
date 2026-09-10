@@ -128,6 +128,7 @@ pub struct BodyFilter {
 
 #[derive(Clone)]
 pub struct Subscription {
+    verified_destination: bool,
     pub id: SubscriptionId,
     pub peer: String,
     pub kind: SubKind,
@@ -257,7 +258,7 @@ mod native_session_tests {
         let (publisher, _publisher_rx) = mpsc::channel(8);
         let (live, mut live_rx) = mpsc::channel(8);
         broker
-            .subscribe_topic("native.snapshot", "live", live)
+            .subscribe_topic_verified("native.snapshot", "live", live, None, true)
             .await;
         let inner = BusMessage::new()
             .with_header("command", "snapshot")
@@ -282,7 +283,7 @@ mod native_session_tests {
         broker.remove_peer("publisher", &publisher).await;
         let (replay, mut replay_rx) = mpsc::channel(8);
         broker
-            .subscribe_topic("native.snapshot", "later", replay)
+            .subscribe_topic_verified("native.snapshot", "later", replay, None, true)
             .await;
         let replay = bus::parse(&replay_rx.recv().await.unwrap()).unwrap();
         assert_eq!(
@@ -432,8 +433,16 @@ impl SubscriptionBroker {
         tx: &mpsc::Sender<String>,
         wire: &str,
         class: crate::protection::TrafficClass,
+        verified_destination: bool,
     ) -> Result<(), mpsc::error::TrySendError<String>> {
-        let result = tx.try_send(wire.to_owned());
+        let delivery = if !verified_destination && wire.contains("broker_principal:") {
+            let mut message = bus::parse(wire).expect("broker-owned snapshot");
+            cosmix_bus::native_session::strip_principal(&mut message);
+            message.to_wire()
+        } else {
+            wire.to_owned()
+        };
+        let result = tx.try_send(delivery);
         if class.protected()
             && let Some(observe) = &self.observe
             && observe.is_active()
@@ -571,12 +580,11 @@ impl SubscriptionBroker {
         }
         cosmix_bus::native_session::stamp_principal(&mut inner, principal)
             .map_err(|_| PublishError::MalformedPayload)?;
-        let traffic_class =
-            if principal.is_some() || crate::props_reservation::reserved_owner(name).is_some() {
-                crate::protection::TrafficClass::NativeSession
-            } else {
-                crate::protection::TrafficClass::command(&inner)
-            };
+        let traffic_class = if principal.is_some() {
+            crate::protection::TrafficClass::NativeSession
+        } else {
+            crate::protection::TrafficClass::command(&inner)
+        };
 
         // Extract the body's namespace field once per publish for
         // filtered fan-out (§ SPEC 12 §15.5 — `<svc>.props.records.changed`
@@ -670,7 +678,12 @@ impl SubscriptionBroker {
                         }
                         continue;
                     }
-                    match self.send_snapshot(&sub.tx, &wire, traffic_class) {
+                    match self.send_snapshot(
+                        &sub.tx,
+                        &wire,
+                        traffic_class,
+                        sub.verified_destination,
+                    ) {
                         Ok(()) => delivered += 1,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(
@@ -746,6 +759,18 @@ impl SubscriptionBroker {
         tx: mpsc::Sender<String>,
         filter: Option<BodyFilter>,
     ) -> (SubscriptionId, bool, u64, Vec<Notification>) {
+        self.subscribe_topic_verified(name, peer, tx, filter, false)
+            .await
+    }
+
+    pub(crate) async fn subscribe_topic_verified(
+        &self,
+        name: &str,
+        peer: &str,
+        tx: mpsc::Sender<String>,
+        filter: Option<BodyFilter>,
+        verified_destination: bool,
+    ) -> (SubscriptionId, bool, u64, Vec<Notification>) {
         let id = Self::topic_sub_id(peer, name, filter.as_ref());
 
         // Idempotency: if the peer is already subscribed with this exact
@@ -787,6 +812,7 @@ impl SubscriptionBroker {
             inner.subscriptions.insert(
                 id.clone(),
                 Subscription {
+                    verified_destination,
                     id: id.clone(),
                     peer: peer.to_string(),
                     kind: SubKind::Topic {
@@ -869,7 +895,7 @@ impl SubscriptionBroker {
         // and tells us authoritatively that the channel is dead.
         if let Some((wire, class)) = &replay
             && matches!(
-                self.send_snapshot(&tx, wire, *class),
+                self.send_snapshot(&tx, wire, *class, verified_destination),
                 Err(mpsc::error::TrySendError::Closed(_))
             )
         {
@@ -1227,6 +1253,7 @@ impl SubscriptionBroker {
         inner.subscriptions.insert(
             id.clone(),
             Subscription {
+                verified_destination: false,
                 id: id.clone(),
                 peer: peer.to_string(),
                 kind: SubKind::UiEvent {

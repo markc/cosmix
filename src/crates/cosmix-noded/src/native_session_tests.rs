@@ -20,11 +20,19 @@ impl Broker {
         Self::start_with_unix(true).await
     }
     async fn start_with_unix(unix: bool) -> Self {
+        Self::start_mode(unix, false).await
+    }
+    async fn start_mode(unix: bool, unavailable: bool) -> Self {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = probe.local_addr().unwrap().to_string();
         drop(probe);
         let root =
             std::env::temp_dir().join(format!("cosmix-native-{:032x}", rand::random::<u128>()));
+        if unavailable {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(run(
             RunConfig {
@@ -117,7 +125,7 @@ async fn register<S: AsyncRead + AsyncWrite + Unpin>(socket: &mut WebSocketStrea
 #[tokio::test]
 async fn p0i_06_native_ingress_principal_and_responder_channel_binding() {
     let broker = Broker::start().await;
-    let mut service = broker.tcp().await;
+    let mut service = broker.unix().await;
     register(&mut service, "service-a").await;
     let mut attacker = broker.tcp().await;
     register(&mut attacker, "attacker-a").await;
@@ -171,11 +179,7 @@ async fn p0i_06_native_ingress_principal_and_responder_channel_binding() {
     assert_eq!(reply.get("id"), Some("original-id"));
     assert_eq!(reply.from_addr(), Some("service-a"));
     assert_eq!(reply.body.trim(), "legitimate response");
-    assert_eq!(
-        read_principal(&reply).unwrap(),
-        None,
-        "TCP responder never receives Unix authority"
-    );
+    assert!(read_principal(&reply).unwrap().is_some());
 
     send(&mut attacker, &message).await;
     let tcp_request = receive(&mut service).await;
@@ -200,7 +204,7 @@ async fn p0i_06_native_ingress_principal_and_responder_channel_binding() {
     )
     .await;
     let reverse = receive(&mut caller).await;
-    assert_eq!(read_principal(&reverse).unwrap(), None);
+    assert!(read_principal(&reverse).unwrap().is_some());
     send(
         &mut caller,
         &request("probe.reverse", "service-a", reverse.get("id").unwrap())
@@ -286,6 +290,14 @@ async fn protected_requests_responses_and_recipient_events_never_reach_tap_paylo
 #[tokio::test]
 async fn unix_binary_frames_refused_and_bootstrap_is_strict_but_not_enabled_as_state_machine() {
     let broker = Broker::start().await;
+    let mut legacy = broker.tcp().await;
+    for command in ["noded.session.lifecycle", "noded.session.lifecycle.gap"] {
+        send(&mut legacy, &request(command, "noded", "reserved")).await;
+        let response = receive(&mut legacy).await;
+        assert_eq!(response.get("rc"), Some("10"));
+        assert_eq!(response.get("id"), Some("reserved"));
+        assert_eq!(response.body, r#"{"error":"reserved_name"}"#);
+    }
     let mut socket = broker.unix().await;
     send(
         &mut socket,
@@ -350,6 +362,178 @@ fn malformed_bootstrap_prescan_keeps_only_bounded_correlation() {
         invalid_bootstrap_envelope(&duplicate, command).get("id"),
         None
     );
+    let padded = raw.replace("command:", " command :");
+    assert_eq!(raw_session_command(&padded), Some("noded.session.prove"));
+    assert!(cosmix_bus::native_session::parse_bootstrap(padded.as_bytes()).is_err());
+}
+
+#[tokio::test]
+async fn protected_late_response_after_disconnect_and_duplicate_after_completion() {
+    for disconnected in [true, false] {
+        let broker = Broker::start().await;
+        let mut observer = broker.tcp().await;
+        register(&mut observer, "audit-observer").await;
+        send(
+            &mut observer,
+            &request("noded.observe.start", "noded", "observe")
+                .with_body(r#"{"filter":{"verbs":["probe.*"]},"body":"redacted"}"#),
+        )
+        .await;
+        assert_eq!(receive(&mut observer).await.get("rc"), Some("0"));
+        let mut service = broker.tcp().await;
+        register(&mut service, "late-service").await;
+        let mut caller = broker.unix().await;
+        register(&mut caller, "late-caller").await;
+        send(
+            &mut caller,
+            &request("probe.echo", "late-service", "original").with_body("PRIVATE-LATE-SENTINEL"),
+        )
+        .await;
+        let routed = receive(&mut service).await;
+        assert!(
+            read_principal(&routed).unwrap().is_none(),
+            "TCP egress strips Unix metadata"
+        );
+        let response = request("probe.echo", "late-caller", routed.get("id").unwrap())
+            .with_header("type", "response")
+            .with_header("rc", "0")
+            .with_body("PRIVATE-LATE-SENTINEL");
+        if disconnected {
+            caller.close(None).await.unwrap();
+            // Test-only synchronisation: absence is published only after the
+            // caller's pending entries have been drained into tombstones.
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    send(
+                        &mut service,
+                        &request("noded.list", "noded", "cleanup-barrier"),
+                    )
+                    .await;
+                    if !receive(&mut service).await.body.contains("late-caller") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            send(&mut service, &response).await;
+            assert_eq!(
+                receive(&mut caller).await.body.trim(),
+                "PRIVATE-LATE-SENTINEL"
+            );
+        }
+        send(&mut service, &response).await;
+        for _ in 0..if disconnected { 2 } else { 3 } {
+            let event = receive(&mut observer).await;
+            assert!(!event.to_wire().contains("PRIVATE-LATE-SENTINEL"));
+            let body: serde_json::Value = serde_json::from_str(&event.body).unwrap();
+            assert_eq!(body["payload_omitted"], "native_session_protected");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_unix_keeps_tcp_ready_and_dev_endpoint_is_discoverable() {
+    use cosmix_client::{NodedClient, UnixConnectOptions, UnixConnectOutcome};
+    let unavailable = Broker::start_mode(true, true).await;
+    let tcp = NodedClient::connect("fallback-check", &unavailable.url)
+        .await
+        .unwrap();
+    let ping = tcp
+        .call("noded", "noded.ping", serde_json::Value::Null)
+        .await
+        .unwrap();
+    assert!(ping["extensions"]["native-session"].is_null());
+    assert!(ping["extensions"]["native-session-endpoint"].is_null());
+    assert!(
+        NodedClient::connect_unix(
+            "required",
+            &unavailable.url,
+            &client_options(&unavailable),
+            None
+        )
+        .await
+        .is_err()
+    );
+    tcp.close().await;
+    let broker = Broker::start().await;
+    let mut options = UnixConnectOptions::new(client_options(&broker).broker_account);
+    options.require_native_session = true;
+    // Neither explicit nor configured path: ping discovers the real dev-root
+    // listener, then endpoint/peer verification authenticates it.
+    let UnixConnectOutcome::VerifiedUnix(connection) =
+        NodedClient::connect_unix("discovered", &broker.url, &options, None)
+            .await
+            .unwrap()
+    else {
+        panic!("required profile downgraded")
+    };
+    let ping = connection
+        .client()
+        .call("noded", "noded.ping", serde_json::Value::Null)
+        .await
+        .unwrap();
+    assert_eq!(
+        ping["extensions"]["native-session-endpoint"],
+        broker.root.join("bus.sock").to_str().unwrap()
+    );
+    connection.client().close().await;
+}
+
+#[tokio::test]
+async fn tcp_only_reserved_topic_keeps_legacy_observation_without_fanout_events() {
+    let broker = Broker::start().await;
+    let mut owner = broker.tcp().await;
+    register(&mut owner, "maild").await;
+    let mut subscriber = broker.tcp().await;
+    register(&mut subscriber, "legacy-reader").await;
+    let mut observer = broker.tcp().await;
+    register(&mut observer, "audit-observer").await;
+    send(
+        &mut observer,
+        &request("noded.observe.start", "noded", "observe")
+            .with_body(r#"{"filter":{"verbs":["maild.props.*","noded.ping"]},"body":"redacted"}"#),
+    )
+    .await;
+    assert_eq!(receive(&mut observer).await.get("rc"), Some("0"));
+    let grant = request("noded.props.subscribe_grant", "noded", "grant")
+        .with_header("topic", "maild.props.records.changed")
+        .with_header("target_peer", "legacy-reader")
+        .with_header("namespace", "maild.accounts");
+    send(&mut owner, &grant).await;
+    assert_eq!(receive(&mut owner).await.get("rc"), Some("0"));
+    let inner = BusMessage::new()
+        .with_header("command", "maild.props.records.changed")
+        .with_header("type", "event")
+        .with_body(r#"{"namespace":"maild.accounts","value":"legacy"}"#);
+    send(
+        &mut owner,
+        &request("topic.publish", "noded", "publish")
+            .with_header("name", "maild.props.records.changed")
+            .with_body(&inner.to_wire()),
+    )
+    .await;
+    assert_eq!(receive(&mut owner).await.get("rc"), Some("0"));
+    assert!(receive(&mut subscriber).await.body.contains("legacy"));
+    let mut replay = broker.tcp().await;
+    register(&mut replay, "legacy-replay").await;
+    send(
+        &mut owner,
+        &grant.with_header("target_peer", "legacy-replay"),
+    )
+    .await;
+    assert_eq!(receive(&mut owner).await.get("rc"), Some("0"));
+    assert!(receive(&mut replay).await.body.contains("legacy"));
+    send(&mut owner, &request("noded.ping", "noded", "barrier")).await;
+    receive(&mut owner).await;
+    // At the pre-S1 baseline, inner fan-out/replay had no observe events.
+    // The first matching observation must still be this ordered ping barrier.
+    let event = receive(&mut observer).await;
+    let body: serde_json::Value = serde_json::from_str(&event.body).unwrap();
+    assert_eq!(body["verb"], "noded.ping");
+    assert_ne!(body["payload_omitted"], "native_session_protected");
 }
 
 fn client_options(broker: &Broker) -> cosmix_client::UnixConnectOptions {
@@ -416,8 +600,8 @@ async fn p0i_06_client_verified_delivery_and_tcp_has_no_trusted_context() {
         .unwrap();
     assert_eq!(delivery.command().from, "ordinary-tcp");
     assert!(delivery.trusted_context().is_none());
-    // Even a real stamp received by an ordinary TCP service remains raw data:
-    // NodedClient/IncomingCommand provide no trusted-context accessor.
+    // Unix caller metadata must not leave over the TCP recipient transport.
+    // IncomingCommand also provides no trusted-context accessor.
     let mut raw = tcp.incoming_async().await.unwrap();
     send(
         &mut caller,
@@ -428,7 +612,7 @@ async fn p0i_06_client_verified_delivery_and_tcp_has_no_trusted_context() {
         .await
         .unwrap()
         .unwrap();
-    assert!(raw.header("broker_principal").is_some());
+    assert!(raw.header("broker_principal").is_none());
     tcp.close().await;
     service.client().close().await;
 }

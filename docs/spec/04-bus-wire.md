@@ -1,7 +1,7 @@
 ---
 title: Bus wire format and command contracts
 chapter: 4
-version: 0.1.2
+version: 0.1.3
 status: draft
 date: 2026-09-10
 ---
@@ -186,8 +186,13 @@ is accepted; obtaining a new principal requires a new connection.
 
 The listener path MUST resolve as `cosmix_path(Run)/noded/bus.sock`. A system
 unit MUST pin `COSMIX_RUN` to its system runtime root (`%t/cosmix`); node
-configuration key `noded.unix_socket` MUST publish the absolute endpoint path.
-Clients MUST use that key when present, otherwise `/run/cosmix/noded/bus.sock`;
+configuration key `noded.unix_socket` MAY explicitly select the absolute endpoint.
+When available, the broker MUST publish its actual bound absolute endpoint as
+`extensions["native-session-endpoint"]` in `noded.ping`, alongside
+`"native-session":"1"`. When unavailable, both entries MUST be absent.
+Clients MUST resolve an explicit endpoint option first, then that config key,
+then the ping-discovered endpoint, otherwise `/run/cosmix/noded/bus.sock`;
+discovery is a locator only and MUST NOT confer trust or bypass endpoint checks.
 they MUST NOT resolve the system socket through their own XDG runtime directory.
 The directory MUST be traversable
 by local users and writable only by the broker account or root; socket mode
@@ -212,7 +217,10 @@ header from untrusted input before stamping its own value. This applies to
 requests, correlated responses, events and inner topic envelopes at every
 delivery boundary; it MUST preserve BROKER-003/004 and responder-channel checks.
 Mesh ingress MUST NOT import a claimed remote Unix UID as local authority.
-Unverified TCP/mesh deliveries MUST omit this header. A direct broker control
+Deliveries **to** unverified transports (including TCP and mesh) MUST omit this
+header, even when the sender has a verified Unix principal. Only deliveries to
+verified LocalUnix connections may carry it; this also gates retained replay
+and inner topic envelopes. A direct broker control
 reply is authenticated by its endpoint and pending-response association, not
 by a fabricated Unix caller stamp.
 

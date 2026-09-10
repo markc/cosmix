@@ -8,7 +8,8 @@ The Unix listener stamps kernel-verified local principals and protects their
 traffic from tap and observer payload capture. Ping advertises `native-session:1`
 when this ingress is active. The listener uses `noded.unix_socket` when configured, otherwise
 `cosmix_path(Run)/noded/bus.sock`; system units pin `COSMIX_RUN=%t/cosmix`.
-Client endpoint resolution uses the configured key, otherwise
+Client endpoint resolution uses an explicit option, the configured key, the
+ping-advertised `native-session-endpoint`, otherwise
 `/run/cosmix/noded/bus.sock`, independently of client XDG directories.
 
 The contracts remain [BUS-013–017](../../spec/04-bus-wire.md) and
@@ -24,7 +25,9 @@ store classification separately from publisher attribution; replays preserve
 both without consulting a live publisher route. Observe emits metadata with
 `payload_omitted: native_session_protected`; tap omits protected frames entirely.
 TCP/D2 callers never acquire a Unix principal assertion; local recipient
-services receive the verified Unix sender's stamp regardless of their transport.
+services receive the verified Unix sender's stamp only over verified Unix
+destination transports. TCP/mesh egress strips all principal metadata, including
+live topic fan-out and retained replay.
 
 Native traffic is node-local in S1: it is refused at mesh egress because the
 legacy mesh wire has no protected-classification propagation contract. This
@@ -37,7 +40,9 @@ Ordinary `NodedClient::connect` and config-layer default helpers stay on TCP.
 `UnixConnectOptions` with a trusted configured `BrokerAccount` (UID and primary
 GID, resolved by the application, never assumed to equal the caller).
 Endpoint precedence is the explicit option, the supplied `noded.unix_socket`
-value, then `/run/cosmix/noded/bus.sock`. The config crate's opt-in
+value, the ping-discovered path, then `/run/cosmix/noded/bus.sock`. Ping supplies
+only a locator: it cannot authorise an endpoint or trigger application traffic.
+The config crate's opt-in
 `client_helpers::unix_connect_options` supplies that config value without a
 reverse dependency from lib-client.
 
@@ -58,6 +63,23 @@ context denotes an unverified sender or a direct broker message. A typed stamp
 is not a live lease: retained deliveries remain historical, and session-bound
 authorisation will require S2 lease checks. Use `client().close()` for explicit
 connection teardown, as with the existing client.
+
+The listener walks ancestry with directory FDs and `openat(O_NOFOLLOW)`, and
+uses the held parent through `/proc/self/fd` for bind and cleanup. Socket chmod
+targets a pinned inode; only newly created directories receive mode 0755.
+Existing non-traversable directories are refused without widening permissions.
+Root and the broker account remain trusted: they can rename a protected directory
+or unlink its socket, causing unavailability, but other users cannot redirect
+these anchored operations. Listener failure logs its reason and leaves TCP ready,
+with neither native extension entry advertised. This applies to all bind failures;
+no runtime bind failure is treated as a fatal configuration contradiction.
+
+Protected correlation tombstones last 15 minutes after completion or removal,
+matching the correlation-retention horizon. The fixed 65,536-entry bound never
+evicts protection early: overflow conservatively omits all orphan-response
+payloads until the lost tombstones would expire. Legacy-only reserved property
+topics retain their prior observation behaviour; a topic name alone confers no
+native classification.
 
 Term and grant-bearing Mix will require Unix in S3 and generate no
 mesh-destined traffic in v1. Unix mesh-egress refusal remains fail-closed;

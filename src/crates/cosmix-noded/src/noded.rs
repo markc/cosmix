@@ -139,6 +139,7 @@ type TapSubscribers = Arc<RwLock<Vec<mpsc::Sender<String>>>>;
 /// response wire before delivering it back. SPEC 18 Phase 2 WS5
 /// uncovered this against concurrent `mix -c` fan-outs.
 struct PendingResponse {
+    caller_verified: bool,
     traffic_class: TrafficClass,
     caller_tx: mpsc::Sender<String>,
     /// Exact recipient connection; a reused service name is not reply authority.
@@ -168,6 +169,7 @@ struct PendingResponse {
 /// under the write lock in a single step ([`Self::take`]); the prior
 /// shape's get-then-write split was race-prone under duplicate ids.
 struct PendingResponseTable {
+    protection: std::sync::Mutex<crate::protection::ResponseProtection>,
     next_id: AtomicU64,
     map: RwLock<HashMap<String, PendingResponse>>,
 }
@@ -175,6 +177,7 @@ struct PendingResponseTable {
 impl PendingResponseTable {
     fn new() -> Self {
         Self {
+            protection: Default::default(),
             next_id: AtomicU64::new(1),
             map: RwLock::new(HashMap::new()),
         }
@@ -200,10 +203,12 @@ impl PendingResponseTable {
             caller_service,
             responder_tx,
             TrafficClass::Legacy,
+            false,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn register_classified(
         &self,
         msg: &mut BusMessage,
@@ -211,6 +216,7 @@ impl PendingResponseTable {
         caller_service: Option<&str>,
         responder_tx: &mpsc::Sender<String>,
         traffic_class: TrafficClass,
+        caller_verified: bool,
     ) -> Option<String> {
         let caller_id = msg.get("id")?.to_string();
         // §14 class from the Bus `type` (request/unset → rpc; the table only
@@ -232,6 +238,7 @@ impl PendingResponseTable {
         self.map.write().await.insert(
             broker_id.clone(),
             PendingResponse {
+                caller_verified,
                 traffic_class,
                 caller_tx: caller_tx.clone(),
                 responder_tx: responder_tx.clone(),
@@ -251,7 +258,15 @@ impl PendingResponseTable {
     /// acquisition — there is no read-then-write split, so duplicate
     /// take attempts behave as last-writer-wins exactly once.
     async fn take(&self, broker_id: &str) -> Option<PendingResponse> {
-        self.map.write().await.remove(broker_id)
+        let mut map = self.map.write().await;
+        let entry = map.remove(broker_id);
+        if let Some(entry) = &entry {
+            self.protection
+                .lock()
+                .expect("protection lock")
+                .retain(broker_id, entry.traffic_class);
+        }
+        entry
     }
 
     /// An incorrect responder must neither complete nor consume the request.
@@ -265,10 +280,24 @@ impl PendingResponseTable {
             .get(broker_id)
             .is_some_and(|entry| entry.responder_tx.same_channel(responder_tx))
         {
-            pending.remove(broker_id)
+            let entry = pending.remove(broker_id);
+            if let Some(entry) = &entry {
+                self.protection
+                    .lock()
+                    .expect("protection lock")
+                    .retain(broker_id, entry.traffic_class);
+            }
+            entry
         } else {
             None
         }
+    }
+
+    async fn response_class(&self, id: &str) -> TrafficClass {
+        let map = self.map.read().await;
+        map.get(id)
+            .map(|entry| entry.traffic_class)
+            .unwrap_or_else(|| self.protection.lock().expect("protection lock").class(id))
     }
 
     /// Remove and return every pending entry whose caller is `caller_tx`
@@ -290,13 +319,22 @@ impl PendingResponseTable {
             .map(|(bid, _)| bid.clone())
             .collect();
         ids.into_iter()
-            .filter_map(|bid| map.remove(&bid).map(|p| (bid, p)))
+            .filter_map(|bid| {
+                map.remove(&bid).map(|p| {
+                    self.protection
+                        .lock()
+                        .expect("protection lock")
+                        .retain(&bid, p.traffic_class);
+                    (bid, p)
+                })
+            })
             .collect()
     }
 }
 
 #[derive(Clone)]
 struct AppState {
+    native_session_endpoint: Option<PathBuf>,
     broker_epoch: HexBytes<16>,
     principal: Option<BrokerPrincipal>,
     native_session_available: bool,
@@ -495,13 +533,15 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         crate::authority::Posture::Unverified { .. } => (false, 0),
     };
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    let unix_listener = if crate::native_ingress::ENABLED {
-        match unix_socket.as_deref() {
-            Some(path) => Some(crate::native_ingress::bind(path).await?),
-            None => None,
-        }
-    } else {
-        None
+    let unix_listener = match unix_socket.as_deref() {
+        Some(path) => match crate::native_ingress::bind(path).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::error!(endpoint = %path.display(), error = %format!("{error:#}"), "native-session unavailable; continuing with TCP only");
+                None
+            }
+        },
+        None => None,
     };
     let listener_port = listener.local_addr()?.port();
     // SPEC 13 §9a B1 self-check — is the listener bound to our own WG IP?
@@ -764,6 +804,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     let state = AppState {
         broker_epoch: HexBytes(rand::random()),
         principal: None,
+        native_session_endpoint: unix_socket.clone().filter(|_| unix_listener.is_some()),
         native_session_available: unix_listener.is_some(),
         registry,
         pending_responses,
@@ -1811,11 +1852,29 @@ async fn ws_handler(
 async fn unix_ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<crate::native_ingress::UnixPeer>,
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
 ) -> axum::response::Response {
     let Some(transport) = peer.0 else {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     };
+    if let TransportIdentity::LocalUnix { uid, gid, peer_pid } = &transport {
+        let principal = BrokerPrincipal {
+            version: PrincipalVersion::V1,
+            assurance: Assurance::LocalUnix,
+            owner_node: state.node_name.clone(),
+            unix_uid: *uid,
+            unix_gid: *gid,
+            peer_pid: *peer_pid,
+            broker_epoch: state.broker_epoch,
+            connection_id: HexBytes(rand::random()),
+            session: None,
+        };
+        if let Err(error) = principal.validate() {
+            tracing::error!(%error, "refusing Unix upgrade: invalid broker principal");
+            return axum::http::StatusCode::FORBIDDEN.into_response();
+        }
+        state.principal = Some(principal);
+    }
     ws.max_message_size(WS_MAX_MESSAGE_BYTES)
         .max_frame_size(bus::WS_MAX_FRAME_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, state, transport))
@@ -1837,8 +1896,9 @@ fn raw_session_command(text: &str) -> Option<&str> {
         .take_while(|line| *line != "---")
         .filter_map(|line| line.split_once(':'))
         .find_map(|(key, value)| {
-            (key.eq_ignore_ascii_case("command") && value.trim().starts_with("noded.session."))
-                .then_some(value.trim())
+            (key.trim().eq_ignore_ascii_case("command")
+                && value.trim().starts_with("noded.session."))
+            .then_some(value.trim())
         })
 }
 
@@ -1860,7 +1920,7 @@ fn invalid_bootstrap_envelope(text: &str, command: &str) -> BusMessage {
         .lines()
         .take_while(|line| *line != "---")
         .filter_map(|line| line.split_once(':'))
-        .filter(|(key, _)| key.eq_ignore_ascii_case("id"));
+        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("id"));
     if let Some((_, id)) = ids.next() {
         let id = id.trim();
         if ids.next().is_none()
@@ -1875,19 +1935,8 @@ fn invalid_bootstrap_envelope(text: &str, command: &str) -> BusMessage {
 }
 
 async fn handle_socket(socket: WebSocket, mut state: AppState, transport: TransportIdentity) {
-    if let TransportIdentity::LocalUnix { uid, gid, peer_pid } = &transport {
+    if matches!(&transport, TransportIdentity::LocalUnix { .. }) {
         state.observe = state.observe.for_class(TrafficClass::NativeSession);
-        state.principal = Some(BrokerPrincipal {
-            version: PrincipalVersion::V1,
-            assurance: Assurance::LocalUnix,
-            owner_node: state.node_name.clone(),
-            unix_uid: *uid,
-            unix_gid: *gid,
-            peer_pid: *peer_pid,
-            broker_epoch: state.broker_epoch,
-            connection_id: HexBytes(rand::random()),
-            session: None,
-        });
     }
     // Preserve the existing IP-based D2 and broker-origin inputs. Unix callers
     // are local; their UID authority is a separate transport assertion.
@@ -1967,6 +2016,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         }
     }
 
+    let connection_observe = state.observe.clone();
     loop {
         // SPEC 13 §9a (2-c-2c) — read the next frame OR honour a reload-teardown
         // close. `biased` checks the close first so a pending teardown wins
@@ -2013,9 +2063,29 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         };
 
         strip_principal(&mut bus_msg);
-        let mut state = state.clone();
-        state.observe = state.observe.for_class(TrafficClass::command(&bus_msg));
+        let response_class = if bus_msg.message_type() == Some("response") {
+            if let Some(id) = bus_msg.get("id") {
+                state.pending_responses.response_class(id).await
+            } else {
+                TrafficClass::Legacy
+            }
+        } else {
+            TrafficClass::Legacy
+        };
+        state.observe =
+            connection_observe.for_class(TrafficClass::command(&bus_msg).merge(response_class));
         if broker_only_session_event(&bus_msg) {
+            let mut reply = BusMessage::new()
+                .with_header("type", "response")
+                .with_header("rc", "10");
+            if let Some(id) = bus_msg.get("id") {
+                reply.set("id", id);
+            }
+            if let Some(command) = bus_msg.command_name() {
+                reply.set("command", command);
+            }
+            reply.body = r#"{"error":"reserved_name"}"#.into();
+            let _ = tx.try_send(reply.to_wire());
             continue;
         }
         // S1 supplies the wire profile, not S2's session state machine. Validate
@@ -2129,7 +2199,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                         service_name.as_deref(),
                         pending.caller_service.as_deref(),
                         broker_origin_for_delivery(source_ip, &state.bind),
-                        state.principal.as_ref(),
+                        state.principal.as_ref().filter(|_| pending.caller_verified),
                     );
                     if observe.is_active() {
                         let outcome = match pending.caller_tx.try_send(wire.clone()) {
@@ -2443,9 +2513,6 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 canonicalize_routed_from_in_place(&mut bus_msg, service_name.as_deref());
                 let origin = broker_origin_for_delivery(source_ip, &state.bind);
                 stamp_broker_origin(&mut bus_msg, origin);
-                if stamp_principal(&mut bus_msg, state.principal.as_ref()).is_err() {
-                    continue;
-                }
                 let canonical_text = bus_msg.to_wire();
                 // `route_local` mutates `bus_msg`'s `id` to the broker-local
                 // rewrite. Use the wire bytes it returns (id-rewritten) for
@@ -3083,8 +3150,21 @@ async fn route_local(
         // id-less messages — fire-and-forget skips the correlation table
         // entirely.
         let broker_id = pending_responses
-            .register_classified(msg, caller_tx, caller_service, &target_tx, traffic_class)
+            .register_classified(
+                msg,
+                caller_tx,
+                caller_service,
+                &target_tx,
+                traffic_class,
+                state.principal.is_some(),
+            )
             .await;
+        // Destination transport, not merely sender identity, gates metadata.
+        let principal = state.principal.as_ref().filter(|_| {
+            reg.get(service)
+                .is_some_and(|e| e.traffic_class.protected())
+        });
+        stamp_principal(msg, principal).expect("principal validated at upgrade");
         let (wire, delivery) = {
             let _fence = state
                 .delivery_fence
@@ -3649,6 +3729,11 @@ async fn handle_noded_command(
                 let mut body: serde_json::Value =
                     serde_json::from_str(&resp.body).expect("static ping JSON");
                 body["extensions"]["native-session"] = "1".into();
+                body["extensions"]["native-session-endpoint"] = state
+                    .native_session_endpoint
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .into();
                 resp.body = body.to_string();
             }
             let _ = tx.try_send(resp.to_wire());
@@ -3884,7 +3969,13 @@ async fn handle_noded_command(
             }
             let (sub_id, replayed, seq, notices) = state
                 .broker
-                .subscribe_topic(&name, &peer_id, tx.clone())
+                .subscribe_topic_verified(
+                    &name,
+                    &peer_id,
+                    tx.clone(),
+                    None,
+                    state.principal.is_some(),
+                )
                 .await;
             let mut resp = respond("0");
             resp.set("command", "topic.subscribe");
@@ -4160,10 +4251,11 @@ async fn handle_noded_command(
             // the target reconnects (the registry refresh) instead.
             let target_tx = {
                 let reg = state.registry.read().await;
-                reg.get(&target_peer).map(|e| e.tx.clone())
+                reg.get(&target_peer)
+                    .map(|e| (e.tx.clone(), e.traffic_class.protected()))
             };
-            let target_tx = match target_tx {
-                Some(t) if !t.is_closed() => t,
+            let (target_tx, target_verified) = match target_tx {
+                Some((t, verified)) if !t.is_closed() => (t, verified),
                 _ => {
                     let mut resp = respond("10");
                     resp.set("command", "noded.props.subscribe_grant");
@@ -4177,7 +4269,13 @@ async fn handle_noded_command(
             };
             let (sub_id, _replayed, _seq, notices) = state
                 .broker
-                .subscribe_topic_filtered(&topic, &target_peer, target_tx, Some(filter))
+                .subscribe_topic_verified(
+                    &topic,
+                    &target_peer,
+                    target_tx,
+                    Some(filter),
+                    target_verified,
+                )
                 .await;
             let mut resp = respond("0");
             resp.set("command", "noded.props.subscribe_grant");
@@ -4238,7 +4336,13 @@ async fn handle_noded_command(
             let topic = crate::props::PROPS_CHANGED_TOPIC;
             let (sub_id, replayed, seq, notices) = state
                 .broker
-                .subscribe_topic(topic, &peer_id, tx.clone())
+                .subscribe_topic_verified(
+                    topic,
+                    &peer_id,
+                    tx.clone(),
+                    None,
+                    state.principal.is_some(),
+                )
                 .await;
             let mut resp = respond("0");
             resp.set("command", "props.watch");
@@ -5007,6 +5111,7 @@ mod tests {
         AppState {
             broker_epoch: super::HexBytes([1; 16]),
             principal: None,
+            native_session_endpoint: None,
             native_session_available: false,
             registry: Arc::new(RwLock::new(HashMap::new())),
             pending_responses: Arc::new(PendingResponseTable::new()),

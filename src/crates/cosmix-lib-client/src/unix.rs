@@ -44,7 +44,8 @@ impl UnixConnectOptions {
         }
     }
 
-    /// Explicit endpoint, then `noded.unix_socket`, then the system endpoint.
+    /// Synchronous explicit/config/system resolution. `connect_unix` inserts
+    /// ping discovery before this system fallback when both options are absent.
     /// Never consults XDG_RUNTIME_DIR, COSMIX_RUN or the caller's home.
     pub fn resolved_endpoint(&self) -> &Path {
         self.endpoint
@@ -125,12 +126,12 @@ impl VerifiedConnection {
 /// Context authenticates the stamp, not a current session lease: cached and
 /// retained deliveries still require BROKER-020/PROP-025 lease enforcement.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// fn forge(command: cosmix_client::IncomingCommand) {
 ///     let _ = cosmix_client::VerifiedCommand::new(command, None);
 /// }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// fn trust_raw(command: cosmix_client::IncomingCommand) {
 ///     let _ = command.trusted_context();
 /// }
@@ -154,7 +155,9 @@ impl VerifiedCommand {
 
 impl NodedClient {
     /// Explicit Unix opt-in; ordinary `connect` remains unchanged. Native
-    /// session clients MUST set `require_native_session`. Unix is node-local
+    /// session clients MUST set `require_native_session`. Resolution is explicit
+    /// endpoint, config, ping-discovered locator, then system default. Every
+    /// candidate is verified; discovery never establishes authority. Unix is node-local
     /// in v1: mesh-destined traffic is refused, with no transparent TCP retry.
     pub async fn connect_unix(
         service_name: &str,
@@ -162,7 +165,11 @@ impl NodedClient {
         options: &UnixConnectOptions,
         provenance: Option<cosmix_bus::RegisterProvenance>,
     ) -> Result<UnixConnectOutcome, ConnectError> {
-        match connect_verified(service_name, options, provenance.clone()).await {
+        let mut resolved = options.clone();
+        if resolved.endpoint.is_none() && resolved.configured_endpoint.is_none() {
+            resolved.configured_endpoint = discover_endpoint(tcp_url).await;
+        }
+        match connect_verified(service_name, &resolved, provenance.clone()).await {
             Ok(connection) => Ok(UnixConnectOutcome::VerifiedUnix(connection)),
             Err(unix_error)
                 if !options.require_native_session && options.allow_unverified_tcp_fallback =>
@@ -175,6 +182,30 @@ impl NodedClient {
             Err(error) => Err(error),
         }
     }
+}
+
+/// TCP discovery supplies a locator only, never authority. Every discovered
+/// endpoint undergoes the same ownership/peer-credential/version verification.
+/// This read does not register a service or send any application/grant traffic.
+async fn discover_endpoint(tcp_url: &str) -> Option<PathBuf> {
+    let timeout = std::time::Duration::from_secs(2);
+    let client = tokio::time::timeout(timeout, NodedClient::connect_anonymous(tcp_url))
+        .await
+        .ok()?
+        .ok()?;
+    let ping = tokio::time::timeout(
+        timeout,
+        client.call("noded", "noded.ping", serde_json::Value::Null),
+    )
+    .await;
+    client.close().await;
+    let value = ping.ok()?.ok()?;
+    if value["extensions"]["native-session"].as_str() != Some("1") {
+        return None;
+    }
+    value["extensions"]["native-session-endpoint"]
+        .as_str()
+        .map(PathBuf::from)
 }
 
 async fn connect_verified(

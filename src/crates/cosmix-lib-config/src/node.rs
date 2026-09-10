@@ -319,7 +319,7 @@ impl NodedConfig {
             .unwrap_or_else(|| "/run/cosmix/noded/bus.sock".into())
     }
 
-    /// A broker publishes its resolved endpoint in node configuration. System
+    /// A broker publishes its resolved endpoint through noded.ping. System
     /// units pin COSMIX_RUN; development installs retain the common path rules.
     pub fn broker_unix_endpoint(&self) -> std::path::PathBuf {
         self.unix_socket
@@ -1037,6 +1037,10 @@ mod tests {
                 .is_err()
         );
         let config: super::NodedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.broker_unix_endpoint(),
+            crate::cosmix_path(crate::CosmixDir::Run).join("noded/bus.sock")
+        );
         assert_eq!(
             config.unix_endpoint(),
             std::path::PathBuf::from("/run/cosmix/noded/bus.sock")
