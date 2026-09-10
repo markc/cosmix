@@ -43,6 +43,7 @@ cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
 rustyline = "15"
 dirs = "6"
 libc = "0.2"
+signal-hook = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "time", "signal"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

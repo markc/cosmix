@@ -1,0 +1,650 @@
+//! Interactive process ownership. No evaluator, editor or Bus dependencies.
+//!
+//! Only this controller consumes wait statuses for registered interactive
+//! children. Captured runners and noninteractive children never enter it.
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
+const STAGE_ARG: &str = "--internal-job-stage";
+
+#[derive(Clone, Default)]
+pub enum ExecutionPolicy {
+    /// Includes SSH -c, scripts and serve. Never initialise terminal ownership.
+    #[default]
+    NonInteractive,
+    Interactive {
+        controller: Arc<Controller>,
+        return_on_stop: bool,
+    },
+}
+
+impl ExecutionPolicy {
+    /// Future async host seam: source currently waits through stops instead of
+    /// inventing completion of a suspended evaluator invocation.
+    pub fn sourced(&self) -> Self {
+        match self {
+            Self::Interactive { controller, .. } => Self::Interactive {
+                controller: controller.clone(),
+                return_on_stop: false,
+            },
+            Self::NonInteractive => Self::NonInteractive,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberState {
+    Running,
+    Stopped(i32),
+    Exited(i32),
+    Signalled(i32),
+    Lost,
+}
+impl MemberState {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Exited(_) | Self::Signalled(_) | Self::Lost)
+    }
+    fn code(self) -> i32 {
+        match self {
+            Self::Exited(c) => c,
+            Self::Stopped(s) | Self::Signalled(s) => 128 + s,
+            _ => 1,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Stopped,
+    Done,
+}
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub pid: i32,
+    pub state: MemberState,
+}
+#[derive(Clone)]
+pub struct Job {
+    pub id: usize,
+    pub pgid: i32,
+    pub command: String,
+    pub members: Vec<Member>,
+    pub modes: Option<libc::termios>,
+    pub foreground: bool,
+}
+impl Job {
+    pub fn state(&self) -> JobState {
+        if self.members.iter().all(|m| m.state.terminal()) {
+            JobState::Done
+        } else if self
+            .members
+            .iter()
+            .filter(|m| !m.state.terminal())
+            .all(|m| matches!(m.state, MemberState::Stopped(_)))
+        {
+            JobState::Stopped
+        } else {
+            JobState::Running
+        }
+    }
+    fn code(&self) -> i32 {
+        self.members.last().map(|m| m.state.code()).unwrap_or(1)
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Outcome {
+    pub code: i32,
+    pub background: bool,
+    pub stopped: bool,
+}
+
+struct State {
+    jobs: BTreeMap<usize, Job>,
+    next_id: usize,
+    closing: bool,
+    closed: bool,
+}
+struct Shared {
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+pub struct Controller {
+    shared: Arc<Shared>,
+    tty: File,
+    shell_pgid: i32,
+    parent_pgid: i32,
+    signals: signal_hook::iterator::Handle,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    old_signals: Vec<(i32, libc::sigaction)>,
+}
+
+fn modes(fd: i32) -> io::Result<libc::termios> {
+    let mut t = std::mem::MaybeUninit::uninit();
+    if unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { t.assume_init() })
+}
+fn set_modes(fd: i32, t: &libc::termios) -> io::Result<()> {
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn foreground(fd: i32, pgid: i32) -> io::Result<()> {
+    if unsafe { libc::tcsetpgrp(fd, pgid) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+impl Controller {
+    /// Called ONLY from the interactive entry point. A redirected stdin or
+    /// missing controlling terminal declines job management without mutation.
+    pub fn interactive() -> io::Result<Option<Arc<Self>>> {
+        if unsafe { libc::isatty(0) } == 0 || unsafe { libc::tcgetpgrp(0) } < 0 {
+            return Ok(None);
+        }
+        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+        let fd = tty.as_raw_fd();
+        let parent_pgid = unsafe { libc::getpgrp() };
+        while unsafe { libc::tcgetpgrp(fd) } != unsafe { libc::getpgrp() } {
+            // A nested background shell asks its parent for foregrounding.
+            unsafe {
+                libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+                libc::kill(0, libc::SIGTTIN);
+            }
+        }
+        let mut old_signals = Vec::new();
+        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+            let mut old = unsafe { std::mem::zeroed() };
+            let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
+            ignore.sa_sigaction = libc::SIG_IGN;
+            unsafe {
+                libc::sigemptyset(&mut ignore.sa_mask);
+                libc::sigaction(sig, &ignore, &mut old);
+            }
+            old_signals.push((sig, old));
+        }
+        let shell_pgid = unsafe { libc::getpid() };
+        if unsafe { libc::getpgrp() } != shell_pgid && unsafe { libc::setpgid(0, 0) } < 0 {
+            for (sig, old) in &old_signals {
+                unsafe {
+                    libc::sigaction(*sig, old, std::ptr::null_mut());
+                }
+            }
+            return Err(io::Error::last_os_error());
+        }
+        foreground(fd, shell_pgid)?;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                jobs: BTreeMap::new(),
+                next_id: 1,
+                closing: false,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        });
+        let mut events = signal_hook::iterator::Signals::new([libc::SIGCHLD, libc::SIGHUP])?;
+        let signals = events.handle();
+        let monitor = shared.clone();
+        let worker = std::thread::Builder::new()
+            .name("mix-jobs".into())
+            .spawn(move || {
+                for signal in events.forever() {
+                    if signal == libc::SIGHUP {
+                        close_jobs(&monitor);
+                        // HUP is a session shutdown, not evaluator cancellation.
+                        std::process::exit(128 + libc::SIGHUP);
+                    }
+                    reap(&monitor);
+                    if monitor.state.lock().unwrap().closing {
+                        close_jobs(&monitor);
+                    }
+                }
+            })?;
+        Ok(Some(Arc::new(Self {
+            shared,
+            tty,
+            shell_pgid,
+            parent_pgid,
+            signals,
+            worker: Mutex::new(Some(worker)),
+            old_signals,
+        })))
+    }
+
+    /// Owned snapshots are the attachment point for stage A; no publication
+    /// or external callbacks occur under the controller lock.
+    pub fn snapshot(&self) -> Vec<Job> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn register(
+        &self,
+        pgid: i32,
+        children: Vec<Child>,
+        command: String,
+        foreground: bool,
+    ) -> usize {
+        let mut s = self.shared.state.lock().unwrap();
+        let id = s.next_id;
+        s.next_id += 1;
+        // Dropping Child does not reap; from here only the monitor waits.
+        let members = children
+            .into_iter()
+            .map(|c| Member {
+                pid: c.id() as i32,
+                state: MemberState::Running,
+            })
+            .collect();
+        s.jobs.insert(
+            id,
+            Job {
+                id,
+                pgid,
+                command,
+                members,
+                modes: None,
+                foreground,
+            },
+        );
+        drop(s);
+        self.wake();
+        id
+    }
+    fn wake(&self) {
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGCHLD);
+        }
+    }
+    pub fn take_terminal(&self, pgid: i32) -> io::Result<TerminalLease<'_>> {
+        let saved = modes(self.tty.as_raw_fd())?;
+        foreground(self.tty.as_raw_fd(), pgid)?;
+        Ok(TerminalLease {
+            controller: self,
+            saved,
+        })
+    }
+    pub fn finish(
+        &self,
+        id: usize,
+        background: bool,
+        return_on_stop: bool,
+        lease: Option<TerminalLease<'_>>,
+    ) -> io::Result<Outcome> {
+        if background {
+            let s = self.shared.state.lock().unwrap();
+            let job = &s.jobs[&id];
+            println!("[{}] {}", id, job.pgid);
+            return Ok(Outcome {
+                code: 0,
+                background: true,
+                stopped: false,
+            });
+        }
+        let mut s = self.shared.state.lock().unwrap();
+        loop {
+            let job = &s.jobs[&id];
+            if job.state() == JobState::Done || (return_on_stop && job.state() == JobState::Stopped)
+            {
+                break;
+            }
+            s = self.shared.changed.wait(s).unwrap();
+        }
+        let job = s.jobs.get_mut(&id).unwrap();
+        let stopped = job.state() == JobState::Stopped;
+        let code = if stopped {
+            job.members
+                .iter()
+                .find_map(|m| {
+                    if let MemberState::Stopped(sig) = m.state {
+                        Some(128 + sig)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1)
+        } else {
+            job.code()
+        };
+        if stopped {
+            job.modes = modes(self.tty.as_raw_fd()).ok();
+        }
+        job.foreground = false;
+        drop(s);
+        drop(lease); // cooked shell ownership before any prompt/notification
+        if stopped {
+            println!("[{}] Stopped", id);
+        } else {
+            self.shared.state.lock().unwrap().jobs.remove(&id);
+        }
+        Ok(Outcome {
+            code,
+            background: false,
+            stopped,
+        })
+    }
+    pub fn foreground_job(&self, id: Option<usize>) -> io::Result<i32> {
+        let job = self.select(id)?;
+        let lease = self.take_terminal(job.pgid)?;
+        if let Some(t) = job.modes {
+            set_modes(self.tty.as_raw_fd(), &t)?;
+        }
+        self.continue_job(job.id, true)?;
+        println!("{}", job.command);
+        Ok(self.finish(job.id, false, true, Some(lease))?.code)
+    }
+    pub fn background_job(&self, id: Option<usize>) -> io::Result<()> {
+        let job = self.select(id)?;
+        self.continue_job(job.id, false)?;
+        println!("[{}] Running {}", job.id, job.command);
+        Ok(())
+    }
+    fn select(&self, id: Option<usize>) -> io::Result<Job> {
+        let s = self.shared.state.lock().unwrap();
+        let j = match id {
+            Some(id) => s.jobs.get(&id),
+            None => s.jobs.values().rev().find(|j| j.state() != JobState::Done),
+        };
+        j.filter(|j| j.state() != JobState::Done)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such live job"))
+    }
+    fn continue_job(&self, id: usize, fg: bool) -> io::Result<()> {
+        let mut s = self.shared.state.lock().unwrap();
+        let job = s
+            .jobs
+            .get_mut(&id)
+            .ok_or_else(|| io::Error::other("job disappeared"))?;
+        if unsafe { libc::kill(-job.pgid, libc::SIGCONT) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for m in &mut job.members {
+            if matches!(m.state, MemberState::Stopped(_)) {
+                m.state = MemberState::Running;
+            }
+        }
+        job.foreground = fg;
+        Ok(())
+    }
+    pub fn notify_done(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        s.jobs.retain(|id, j| {
+            if !j.foreground && j.state() == JobState::Done {
+                println!("[{}] Done {}", id, j.command);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    pub fn abort_launch(&self, id: usize) {
+        {
+            let s = self.shared.state.lock().unwrap();
+            if let Some(j) = s.jobs.get(&id) {
+                unsafe {
+                    libc::kill(-j.pgid, libc::SIGKILL);
+                }
+            }
+        }
+        self.wake();
+        let mut s = self.shared.state.lock().unwrap();
+        while s.jobs.get(&id).is_some_and(|j| j.state() != JobState::Done) {
+            s = self.shared.changed.wait(s).unwrap();
+        }
+        s.jobs.remove(&id);
+    }
+    pub fn shutdown(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.closing = true;
+        self.wake();
+        while !state.closed {
+            state = self.shared.changed.wait(state).unwrap();
+        }
+    }
+}
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.shutdown();
+        self.signals.close();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
+        let _ = foreground(self.tty.as_raw_fd(), self.parent_pgid);
+        for (sig, old) in &self.old_signals {
+            unsafe {
+                libc::sigaction(*sig, old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+pub struct TerminalLease<'a> {
+    controller: &'a Controller,
+    saved: libc::termios,
+}
+impl Drop for TerminalLease<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid)
+            .and_then(|_| set_modes(self.controller.tty.as_raw_fd(), &self.saved))
+        {
+            eprintln!("mix: terminal restore: {e}");
+        }
+    }
+}
+
+fn reap(shared: &Shared) {
+    let mut s = shared.state.lock().unwrap();
+    for job in s.jobs.values_mut() {
+        for member in &mut job.members {
+            if member.state.terminal() {
+                continue;
+            }
+            loop {
+                let mut status = 0;
+                let rc = unsafe {
+                    libc::waitpid(
+                        member.pid,
+                        &mut status,
+                        libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
+                    )
+                };
+                if rc == 0 {
+                    break;
+                }
+                if rc < 0 {
+                    if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    member.state = MemberState::Lost;
+                    break;
+                }
+                member.state = if libc::WIFEXITED(status) {
+                    MemberState::Exited(libc::WEXITSTATUS(status))
+                } else if libc::WIFSIGNALED(status) {
+                    MemberState::Signalled(libc::WTERMSIG(status))
+                } else if libc::WIFSTOPPED(status) {
+                    MemberState::Stopped(libc::WSTOPSIG(status))
+                } else {
+                    MemberState::Running
+                };
+                if member.state.terminal() {
+                    break;
+                }
+            }
+        }
+    }
+    shared.changed.notify_all();
+}
+fn close_jobs(shared: &Shared) {
+    {
+        let mut s = shared.state.lock().unwrap();
+        if s.closed {
+            return;
+        }
+        s.closing = true;
+        for job in s.jobs.values().filter(|j| j.state() != JobState::Done) {
+            unsafe {
+                libc::kill(-job.pgid, libc::SIGHUP);
+                libc::kill(-job.pgid, libc::SIGCONT);
+            }
+        }
+    }
+    let end = Instant::now() + CLOSE_GRACE;
+    loop {
+        reap(shared);
+        let mut s = shared.state.lock().unwrap();
+        if s.jobs.values().all(|j| j.state() == JobState::Done) {
+            s.closed = true;
+            shared.changed.notify_all();
+            return;
+        }
+        if Instant::now() >= end {
+            for j in s.jobs.values().filter(|j| j.state() != JobState::Done) {
+                eprintln!(
+                    "mix: job {} (pgid {}) survived HUP/CONT grace",
+                    j.id, j.pgid
+                );
+            }
+            s.closed = true;
+            shared.changed.notify_all();
+            return;
+        }
+        drop(s);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn pipe() -> io::Result<(File, File)> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+/// The barrier is AFTER exec of this binary, never inside pre_exec. Thus
+/// Command::spawn's exec-error pipe closes before the trampoline blocks.
+pub struct Stage {
+    pub command: Command,
+    gate: File,
+    error: File,
+    inherited: (File, File),
+}
+impl Stage {
+    pub fn new(program: &str, args: &[String], pgid: i32) -> io::Result<Self> {
+        let (gate_read, gate) = pipe()?;
+        let (error, error_write) = pipe()?;
+        let g = gate_read.as_raw_fd();
+        let e = error_write.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([STAGE_ARG, &g.to_string(), &e.to_string(), program])
+            .args(args);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, pgid) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                for sig in [
+                    libc::SIGINT,
+                    libc::SIGQUIT,
+                    libc::SIGTSTP,
+                    libc::SIGTTIN,
+                    libc::SIGTTOU,
+                    libc::SIGCHLD,
+                    libc::SIGHUP,
+                    libc::SIGPIPE,
+                ] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                let mut empty = std::mem::zeroed();
+                libc::sigemptyset(&mut empty);
+                libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+                if libc::fcntl(g, libc::F_SETFD, 0) < 0 || libc::fcntl(e, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(Self {
+            command,
+            gate,
+            error,
+            inherited: (gate_read, error_write),
+        })
+    }
+    pub fn spawn(&mut self, pgid: i32) -> io::Result<Child> {
+        let child = self.command.spawn()?;
+        let pid = child.id() as i32;
+        let group = if pgid == 0 { pid } else { pgid };
+        if unsafe { libc::setpgid(pid, group) } < 0 && unsafe { libc::getpgid(pid) } != group {
+            // Caller must still own/reap this child; group assignment in the
+            // trampoline pre_exec succeeded, so this is an invariant failure.
+            eprintln!("mix: child {pid} changed group during launch");
+        }
+        Ok(child)
+    }
+    pub fn release(mut self) -> io::Result<()> {
+        drop(self.inherited);
+        self.gate.write_all(&[1])?;
+        drop(self.gate);
+        let mut errno = Vec::new();
+        self.error.by_ref().take(4).read_to_end(&mut errno)?;
+        if errno.is_empty() {
+            Ok(())
+        } else if let Ok(bytes) = <[u8; 4]>::try_from(errno) {
+            Err(io::Error::from_raw_os_error(i32::from_ne_bytes(bytes)))
+        } else {
+            Err(io::Error::other("incomplete stage exec acknowledgement"))
+        }
+    }
+}
+
+/// Private argv entry, dispatched before runtime/evaluator/startup hooks.
+pub fn stage_entry() {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_none_or(|v| v != STAGE_ARG) {
+        return;
+    }
+    let parse = |i: usize| {
+        args.get(i)
+            .and_then(|v| v.to_str())
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|fd| *fd > 2)
+    };
+    let (Some(g), Some(e), Some(program)) = (parse(2), parse(3), args.get(4)) else {
+        std::process::exit(126);
+    };
+    let mut gate = unsafe { File::from_raw_fd(g) };
+    let mut error = unsafe { File::from_raw_fd(e) };
+    unsafe {
+        libc::fcntl(e, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let mut byte = [0];
+    if gate.read_exact(&mut byte).is_err() || byte[0] != 1 {
+        std::process::exit(126);
+    }
+    drop(gate);
+    let err = Command::new(program).args(&args[5..]).exec();
+    let _ = error.write_all(&err.raw_os_error().unwrap_or(libc::EIO).to_ne_bytes());
+    std::process::exit(127);
+}

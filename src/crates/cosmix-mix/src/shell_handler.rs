@@ -55,11 +55,19 @@ enum MixProbe {
 /// Stateless adapter; aliases are passed in per-call by the evaluator
 /// so changes made by `alias` statements earlier in the same sourced
 /// file are visible to later shell-fallback lines.
-pub struct ReplShellHandler;
+pub struct ReplShellHandler {
+    policy: crate::job_control::ExecutionPolicy,
+}
 
 impl ReplShellHandler {
     pub fn new() -> Self {
-        Self
+        Self {
+            policy: crate::job_control::ExecutionPolicy::NonInteractive,
+        }
+    }
+
+    pub fn with_policy(policy: crate::job_control::ExecutionPolicy) -> Self {
+        Self { policy }
     }
 
     /// Mix-side parser probe. `Ok(())` if the line parses as Mix;
@@ -170,7 +178,10 @@ impl ReplShellHandler {
                     _ => {}
                 }
             }
-            return match exec::execute_pipeline(&pipeline) {
+            return match exec::execute_pipeline_with_policy(&pipeline, &self.policy) {
+                Ok(PipelineResult::Managed(outcome)) => {
+                    Ok((ShellExecResult::Status(outcome.code), commands))
+                }
                 Ok(PipelineResult::Done(status)) => {
                     Ok((ShellExecResult::Status(exec::exit_code(status)), commands))
                 }
@@ -184,7 +195,7 @@ impl ReplShellHandler {
             };
         }
 
-        let outcome = exec::execute_command_list_outcome(&items, vars, None);
+        let outcome = exec::execute_command_list_with_policy(&items, vars, None, &self.policy);
         Ok((ShellExecResult::Status(outcome.code), outcome.commands))
     }
 }

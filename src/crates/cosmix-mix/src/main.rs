@@ -26,6 +26,7 @@ mod bus;
 mod completion;
 mod cosmix_paths;
 mod exec;
+mod job_control;
 mod jobs;
 mod lint;
 mod meta;
@@ -839,6 +840,7 @@ fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelud
                         }
                     }
                     return match exec::execute_pipeline(&pipeline) {
+                        Ok(exec::PipelineResult::Managed(_)) => unreachable!("noninteractive policy"),
                         Ok(exec::PipelineResult::Done(status)) => exec::exit_code(status),
                         // One-shot `-c`: the process exits immediately, so the
                         // `&` child is re-parented to init and reaped there —
@@ -1490,6 +1492,7 @@ fn check_syntax(source: &str, filename: &str) -> i32 {
 const MAIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 fn main() {
+    job_control::stage_entry();
     let handle = std::thread::Builder::new()
         .name("mix-eval".into())
         .stack_size(MAIN_STACK_SIZE)
