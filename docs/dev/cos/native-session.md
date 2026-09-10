@@ -19,6 +19,24 @@ this foundation does not establish a session-bound principal.
 Valid bootstrap requests currently receive structured `UNSUPPORTED`; malformed
 bootstrap requests are rejected by the strict wire parser. No grants are minted.
 
+## S2 first boundary: reserve the allocation namespace
+
+The BROKER-017 shape `^[tc][0-9a-z]{1,7}-[a-z2-7]{22}$` is now refused by
+`noded.register` on every ingress, including brokers without a Unix listener.
+Refusal returns `rc:10` with `reserved_name` and preserves any previous
+registration on that connection. Leading-zero and overflowing UID lookalikes
+are reserved too; the check does not depend on allocation state or interpret
+the displayed UID as authority. Neighbouring legacy names remain valid.
+
+The p0i-02 namespace slice exercises TCP and real Unix WebSocket connections,
+pre-claim refusal, retained alias authority and forged `from` canonicalisation.
+The allocator, records, proof handling, leases, notices and typed client commands
+are still pending. No attached identity is exposed before those lifecycle
+protections exist. The broker starts with an empty, non-persistent registry;
+there is no live profile-activation switch in this boundary.
+
+## Observation and transport boundary
+
 Observation classification follows native senders, native recipients, correlated
 responses, bootstrap commands and private property topics. Retained snapshots
 store classification separately from publisher attribution; replays preserve

@@ -3503,6 +3503,16 @@ async fn handle_noded_command(
                 let _ = tx.try_send(resp.to_wire());
                 return;
             }
+            // BROKER-017 reserves the SHAPE, including unissued names and
+            // non-canonical UID lookalikes. This precedes provenance parsing
+            // and registry mutation on every ingress, even without Unix.
+            if reserved_session_name(&from) {
+                let mut resp = respond("10");
+                resp.set("error", "reserved_name");
+                resp.body = r#"{"error":"reserved_name"}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
 
             // Build the registry record from the provenance the citizen
             // supplied in the register body (all optional — absent for an
@@ -4414,6 +4424,24 @@ async fn handle_noded_command(
             let _ = tx.try_send(resp.to_wire());
         }
     }
+}
+
+/// BROKER-017: deliberately does not decode the UID. Leading-zero and
+/// overflowing encodings are reserved just like canonically issued names.
+fn reserved_session_name(name: &str) -> bool {
+    let Some((prefix, suffix)) = name.split_once('-') else {
+        return false;
+    };
+    let bytes = prefix.as_bytes();
+    (2..=8).contains(&bytes.len())
+        && matches!(bytes[0], b't' | b'c')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && suffix.len() == 22
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
 }
 
 fn valid_service_name(name: &str) -> bool {

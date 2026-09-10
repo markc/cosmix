@@ -1,4 +1,4 @@
-//! p0i-06 S1: exercise real Axum listeners, routing and response ownership.
+//! Native-session fixtures: real Axum listeners, routing and response ownership.
 use super::*;
 use cosmix_bus::native_session::{PRINCIPAL_HEADER, read_principal};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -82,6 +82,114 @@ fn request(command: &str, to: &str, id: &str) -> BusMessage {
         .with_header("command", command)
         .with_header("to", to)
         .with_header("id", id)
+}
+
+#[test]
+fn reserved_session_namespace_matches_shape_not_canonical_uid() {
+    let suffix = "abcdefghijklmnopqrstuvwxyz234567";
+    for kind in ['t', 'c'] {
+        for uid in ["0", "1", "rs", "1z141z3", "00", "0000000", "zzzzzzz"] {
+            // Exercise every allowed suffix symbol, not just 'a'.
+            for symbol in suffix.chars() {
+                let name = format!("{kind}{uid}-{}", symbol.to_string().repeat(22));
+                assert!(valid_service_name(&name));
+                assert!(reserved_session_name(&name), "{name}");
+            }
+        }
+    }
+    for name in [
+        "",
+        "t",
+        "t-aaaaaaaaaaaaaaaaaaaaaa",
+        "t12345678-aaaaaaaaaaaaaaaaaaaaaa",
+        "x0-aaaaaaaaaaaaaaaaaaaaaa",
+        "t0-aaaaaaaaaaaaaaaaaaaaa",
+        "t0-aaaaaaaaaaaaaaaaaaaaaaa",
+        "t0-aaaaaaaaaaaaaaaaaaaaa0",
+        "t0-aaaaaaaaaaaaaaaaaaaaa1",
+        "t0-aaaaaaaaaaaaaaaaaaaaa8",
+        "t0-aaaaaaaaaaaaaaaaaaaaa9",
+        "t0-aaaaaaaaaaaaaaaaaaaaaA",
+        "t0-aaaaaaaaaaaaaaaaaaaaa-",
+        "tA-aaaaaaaaaaaaaaaaaaaaaa",
+        "té-aaaaaaaaaaaaaaaaaaaaaa",
+        "t0-aaaaaaaaaaaaaaaaaaaaé",
+        "t0-aaaaaaaaaaaaaaaaaaaaaa\n",
+    ] {
+        assert!(!reserved_session_name(name), "{name:?}");
+    }
+}
+
+async fn assert_preclaim_refused<S: AsyncRead + AsyncWrite + Unpin>(
+    caller: &mut WebSocketStream<S>,
+    recipient: &mut WebSocketStream<tokio::net::UnixStream>,
+) {
+    // No allocations exist. Refusal must not depend on an issued-name lookup.
+    for name in [
+        "t0-aaaaaaaaaaaaaaaaaaaaaa",
+        "c1-234567aaaaaaaaaaaaaaaa",
+        "t00-aaaaaaaaaaaaaaaaaaaaaa",
+        "czzzzzzz-aaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        send(
+            caller,
+            &request("noded.register", "noded.test-node.bus", "preclaim").with_header("from", name),
+        )
+        .await;
+        let reply = receive(caller).await;
+        assert_eq!(reply.get("id"), Some("preclaim"));
+        assert_eq!(reply.get("rc"), Some("10"));
+        assert_eq!(reply.get("error"), Some("reserved_name"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply.body).unwrap(),
+            serde_json::json!({"error": "reserved_name"})
+        );
+
+        // Refusal must preserve the connection's previous registration and
+        // canonicalisation authority. Also test that a forged reserved `from`
+        // on ordinary routed traffic cannot establish that identity.
+        send(
+            caller,
+            &request("probe.event", "namespace-recipient", "after-refusal")
+                .with_header("type", "event")
+                .with_header("from", name),
+        )
+        .await;
+        assert_eq!(receive(recipient).await.from_addr(), Some("legacy-owner"));
+    }
+}
+
+#[tokio::test]
+async fn p0i_02_reserved_preclaims_refused_on_tcp_and_unix() {
+    let broker = Broker::start().await;
+    let mut recipient = broker.unix().await;
+    register(&mut recipient, "namespace-recipient").await;
+    let mut tcp = broker.tcp().await;
+    register(&mut tcp, "legacy-owner").await;
+    assert_preclaim_refused(&mut tcp, &mut recipient).await;
+    // Release the ordinary alias before testing the other ingress. Awaiting
+    // deregistration makes this independent of connection-cleanup scheduling.
+    send(&mut tcp, &request("noded.deregister", "noded", "release")).await;
+    assert_eq!(receive(&mut tcp).await.get("rc"), Some("0"));
+    let mut unix = broker.unix().await;
+    register(&mut unix, "legacy-owner").await;
+    assert_preclaim_refused(&mut unix, &mut recipient).await;
+    // A neighbouring legacy name outside the reserved shape still registers.
+    register(&mut unix, "t0-aaaaaaaaaaaaaaaaaaaaa1").await;
+}
+
+#[tokio::test]
+async fn p0i_02_reserved_preclaim_refused_without_unix_listener() {
+    let broker = Broker::start_with_unix(false).await;
+    let mut tcp = broker.tcp().await;
+    send(
+        &mut tcp,
+        &request("noded.register", "noded", "preclaim")
+            .with_header("from", "t0-aaaaaaaaaaaaaaaaaaaaaa"),
+    )
+    .await;
+    assert_eq!(receive(&mut tcp).await.get("error"), Some("reserved_name"));
+    register(&mut tcp, "legacy-after-refusal").await;
 }
 
 #[tokio::test]
