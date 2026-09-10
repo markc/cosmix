@@ -312,6 +312,24 @@ mod tests {
         drop(removed);
     }
     #[test]
+    fn cleanup_queue_returns_without_waiting_for_terminal_lock() {
+        let Some(tabs) = fixture() else {
+            return;
+        };
+        let set = Mutex::new(tabs);
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let terminal = set.lock().unwrap().active_terminal();
+        let held = terminal.lock().unwrap();
+        let removed = set.lock().unwrap().shutdown();
+        cleanup.submit(removed);
+        assert!(set.try_lock().unwrap().is_empty());
+        assert_eq!(set.lock().unwrap().pending.load(Ordering::Acquire), 1);
+        drop(held);
+        drop(cleanup);
+        worker.join().unwrap();
+        assert_eq!(set.lock().unwrap().pending.load(Ordering::Acquire), 0);
+    }
+    #[test]
     fn open_list_and_select() {
         let Some(mut tabs) = fixture() else {
             return;

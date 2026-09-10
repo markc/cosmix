@@ -58,7 +58,7 @@ fn reset_modifiers(
     mut lost: MessageReader<bevy::input::keyboard::KeyboardFocusLost>,
     mut modifiers: ResMut<Modifiers>,
 ) {
-    if lost.read().next().is_some() {
+    if lost.read().count() > 0 {
         *modifiers = Modifiers::default();
     }
 }
@@ -156,6 +156,12 @@ fn main() {
         .add_systems(
             PreUpdate,
             reset_modifiers.before(bevy::input_focus::InputFocusSystems::Dispatch),
+        )
+        // Focus-loss and key messages have separate streams. Clear both before
+        // routing and after dispatch so an old press in that batch cannot latch.
+        .add_systems(
+            PreUpdate,
+            reset_modifiers.after(bevy::input_focus::InputFocusSystems::Dispatch),
         )
         .add_observer(keyboard)
         .add_observer(on_menu)
@@ -470,10 +476,6 @@ fn keyboard(
             return;
         }
     }
-    let open = view
-        .dropdowns
-        .iter()
-        .position(|(e, _)| nodes.get(*e).is_ok_and(|n| n.display != Display::None));
     if let Some(index) = open {
         // Immutable event target is never replayed after dismissal.
         event.propagate(false);

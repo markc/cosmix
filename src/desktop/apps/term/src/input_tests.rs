@@ -20,6 +20,10 @@ fn fixture() -> Option<(App, Entity)> {
     .add_systems(
         PreUpdate,
         reset_modifiers.before(InputFocusSystems::Dispatch),
+    )
+    .add_systems(
+        PreUpdate,
+        reset_modifiers.after(InputFocusSystems::Dispatch),
     );
     let window = app
         .world_mut()
@@ -235,6 +239,31 @@ fn focus_loss_clears_event_order_modifiers() {
 }
 
 #[test]
+fn focus_loss_with_modifier_press_in_same_batch_does_not_latch() {
+    let Some((mut app, window)) = fixture() else {
+        return;
+    };
+    press(&mut app, window, KeyCode::ControlLeft);
+    press(&mut app, window, KeyCode::ShiftLeft);
+    app.world_mut().write_message(KeyboardFocusLost);
+    app.update();
+    press(&mut app, window, KeyCode::KeyT);
+    app.update();
+    assert_eq!(count(&app), 1);
+}
+
+#[test]
+fn releasing_one_modifier_side_keeps_other_side_held() {
+    let mut modifiers = Modifiers::default();
+    modifiers.update(KeyCode::ControlLeft, ButtonState::Pressed);
+    modifiers.update(KeyCode::ControlRight, ButtonState::Pressed);
+    modifiers.update(KeyCode::ControlLeft, ButtonState::Released);
+    assert!(modifiers.ctrl());
+    modifiers.update(KeyCode::ControlRight, ButtonState::Released);
+    assert!(!modifiers.ctrl());
+}
+
+#[test]
 fn menu_activation_is_bounds_safe() {
     let Some((mut app, window)) = fixture() else {
         return;
@@ -244,5 +273,29 @@ fn menu_activation_is_bounds_safe() {
     app.world_mut().resource_mut::<View>().menu_item = usize::MAX;
     press(&mut app, window, KeyCode::Enter);
     app.update();
+    assert_eq!(count(&app), 1);
+}
+
+#[derive(Resource, Default)]
+struct Bubbled(Vec<KeyCode>);
+
+#[test]
+fn unmapped_control_key_propagates_but_encoded_letter_does_not() {
+    let Some((mut app, window)) = fixture() else {
+        return;
+    };
+    app.init_resource::<Bubbled>();
+    app.world_mut().entity_mut(window).observe(
+        |event: On<FocusedInput<KeyboardInput>>, mut seen: ResMut<Bubbled>| {
+            seen.0.push(event.input.key_code);
+        },
+    );
+    press(&mut app, window, KeyCode::ControlLeft);
+    press(&mut app, window, KeyCode::F1);
+    press(&mut app, window, KeyCode::KeyW);
+    app.update();
+    let seen = &app.world().resource::<Bubbled>().0;
+    assert!(seen.contains(&KeyCode::F1));
+    assert!(!seen.contains(&KeyCode::KeyW));
     assert_eq!(count(&app), 1);
 }
