@@ -326,7 +326,7 @@ impl Controller {
         id: usize,
         background: bool,
         return_on_stop: bool,
-        lease: Option<TerminalLease<'_>>,
+        mut lease: Option<TerminalLease<'_>>,
     ) -> io::Result<Outcome> {
         if background {
             let s = self.shared.state.lock().unwrap();
@@ -365,6 +365,21 @@ impl Controller {
         };
         if stopped {
             job.modes = modes(self.tty.as_raw_fd()).ok();
+        }
+        // Preserve deliberate cooked-mode changes such as `stty tostop`.
+        // Raw/noncanonical leakage, signals and suspension restore the shell
+        // baseline. Terminal modes alone cannot identify user intent beyond
+        // this explicit policy.
+        if !stopped
+            && job
+                .members
+                .iter()
+                .all(|m| matches!(m.state, MemberState::Exited(_)))
+            && let Some(lease) = &mut lease
+            && let Ok(current) = modes(self.tty.as_raw_fd())
+            && current.c_lflag & (libc::ICANON | libc::ISIG) == (libc::ICANON | libc::ISIG)
+        {
+            lease.saved = current;
         }
         job.foreground = false;
         drop(s);
@@ -482,6 +497,7 @@ pub struct TerminalLease<'a> {
 }
 impl Drop for TerminalLease<'_> {
     fn drop(&mut self) {
+        *self.controller.shared.shell_modes.lock().unwrap() = self.saved;
         if let Err(e) = foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid)
             .and_then(|_| set_modes(self.controller.tty.as_raw_fd(), &self.saved))
         {

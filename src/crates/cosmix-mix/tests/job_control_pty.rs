@@ -473,6 +473,23 @@ fn nested_shell_foreground_and_parent_restoration() {
 }
 
 #[test]
+fn background_nested_shell_waits_for_foreground_admission() {
+    let mut p = Pty::interactive();
+    p.command(&format!("{} &", env!("CARGO_BIN_EXE_mix")));
+    wait_for(|| p.command("jobs").contains("Stopped"));
+    p.send("fg\n");
+    p.until(PROMPT);
+    let nested = unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) };
+    assert_ne!(nested, p.shell.id() as i32);
+    p.send("\x04");
+    p.until(PROMPT);
+    assert_eq!(
+        unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) },
+        p.shell.id() as i32
+    );
+}
+
+#[test]
 fn noninteractive_ssh_style_command_never_takes_terminal_or_group() {
     // PTY allocated, controlling terminal present, yet explicit -c policy.
     let source = "print(pid()); run_stream([\"/bin/true\"])";
