@@ -25,6 +25,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use base64::Engine as _;
 use cosmix_bus::bus::{self, BusMessage, BusTarget};
+use cosmix_bus::native_session::TransportIdentity;
 use cosmix_config::node::AdmissionMode;
 use cosmix_mesh::{MeshConfig, MeshInbound, MeshPeers, PeerConfig, ReconcileReport};
 use futures_util::{SinkExt, StreamExt};
@@ -1731,10 +1732,20 @@ async fn ws_handler(
     // MAX_MESSAGE_BYTES) so neither ingress path is unbounded.
     ws.max_message_size(WS_MAX_MESSAGE_BYTES)
         .max_frame_size(bus::WS_MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, source_ip))
+        .on_upgrade(move |socket| {
+            handle_socket(socket, state, TransportIdentity::LegacyTcp { source_ip })
+        })
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, source_ip: std::net::IpAddr) {
+async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportIdentity) {
+    // Preserve the existing IP-based D2 and broker-origin inputs. Unix callers
+    // are local; their UID authority is a separate transport assertion.
+    let source_ip = match &transport {
+        TransportIdentity::LegacyTcp { source_ip } | TransportIdentity::Mesh { source_ip, .. } => {
+            *source_ip
+        }
+        TransportIdentity::LocalUnix { .. } => std::net::Ipv4Addr::LOCALHOST.into(),
+    };
     let (mut ws_sink, mut ws_stream) = socket.split();
     // The source address as a string for §17 event fields (2-c-2a) — the
     // trustworthy correlator on a would-refuse and the same-node classifier
