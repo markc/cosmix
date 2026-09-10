@@ -41,6 +41,8 @@ cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
 # rather than depending on cos-side `cosmix-lib-config` /
 # `cosmix-lib-daemon` — mix has no cos dependency.
 rustyline = "15"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 dirs = "6"
 libc = "0.2"
 signal-hook = "0.3"
