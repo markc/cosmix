@@ -1229,7 +1229,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-lib-bus"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-noded"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "arc-swap",
