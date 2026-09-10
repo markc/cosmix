@@ -5,6 +5,7 @@ mod config_precedence_tests;
 #[cfg(test)]
 mod input_tests;
 mod metrics;
+mod panes;
 mod raster;
 mod tabs;
 mod terminal;
@@ -82,8 +83,10 @@ struct Core(Arc<Mutex<TabSet>>, tabs::Cleanup);
 struct Painter(Mutex<raster::Raster>);
 #[derive(Resource)]
 struct View {
-    image: Handle<Image>,
     terminal: Entity,
+    pane_views: Vec<PaneView>,
+    pane_root: Option<Entity>,
+    tree_state: Option<(u64, u64)>,
     centre: Entity,
     menu: Entity,
     dropdowns: Vec<(Entity, Vec<(Entity, &'static str)>)>,
@@ -92,14 +95,24 @@ struct View {
     tab_bar: Entity,
     tab_buttons: Vec<Entity>,
     tab_state: Vec<(u64, bool, String)>,
-    rendered_id: Option<u64>,
+
     open_menu: Option<usize>,
-    cols: u16,
-    rows: u16,
+
     /// Device-pixel scale the Raster is currently built for; refresh rebuilds
     /// it (and forces a re-render) when the window's fractional scale changes.
     scale: f32,
     last_frame: Instant,
+}
+
+struct PaneView {
+    id: u64,
+    container: Entity,
+    entity: Entity,
+    image: Handle<Image>,
+    cols: u16,
+    rows: u16,
+    rendered: bool,
+    active: bool,
 }
 
 // VERIFY: precedence — the only font override resolution, reused at every scale.
@@ -205,7 +218,7 @@ fn main() {
         )
         .add_observer(keyboard)
         .add_observer(on_menu)
-        .add_systems(Update, (menu_focus, sync_tabs))
+        .add_systems(Update, (menu_focus, sync_tabs, sync_panes).chain())
         .add_systems(PostUpdate, refresh.after(bevy::ui::UiSystems::Layout))
         .run();
     let removed = terminal.lock().unwrap().shutdown();
@@ -219,7 +232,6 @@ fn setup(
     mut commands: Commands,
     mut theme: ResMut<UiTheme>,
     mut theme_state: ResMut<ThemeState>,
-    mut images: ResMut<Assets<Image>>,
     core: Res<Core>,
     proxy: Res<EventLoopProxyWrapper>,
     mut focus: ResMut<InputFocus>,
@@ -246,33 +258,6 @@ fn setup(
         .map(|menu| menu.items.iter().map(|item| item.id).collect())
         .collect();
     let menu = spawn_menu_bar(&mut commands, &menus);
-    let mut placeholder = Image::new_fill(
-        Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    // Nearest sampling: the grid texture is rendered at physical resolution and
-    // displayed 1:1, so never smear it with the default linear filter.
-    placeholder.sampler = ImageSampler::nearest();
-    let image = images.add(placeholder);
-    let terminal = commands
-        .spawn((
-            ImageNode::new(image.clone()),
-            Node {
-                flex_shrink: 0.0,
-                ..default()
-            },
-        ))
-        .observe(|click: On<Pointer<Click>>, mut focus: ResMut<InputFocus>| {
-            focus.set(click.entity, FocusCause::Pressed);
-        })
-        .id();
     let centre = commands
         .spawn((
             Node {
@@ -285,7 +270,6 @@ fn setup(
             },
             BackgroundColor(Color::BLACK),
         ))
-        .add_child(terminal)
         .id();
     let tab_bar = commands
         .spawn(Node {
@@ -303,10 +287,12 @@ fn setup(
             ..default()
         })
         .add_children(&[menu, tab_bar, centre]);
-    focus.set(terminal, FocusCause::Navigated);
+    focus.set(centre, FocusCause::Navigated);
     commands.insert_resource(View {
-        image,
-        terminal,
+        terminal: centre,
+        pane_views: Vec::new(),
+        pane_root: None,
+        tree_state: None,
         centre,
         menu,
         dropdowns: Vec::new(),
@@ -315,10 +301,7 @@ fn setup(
         tab_bar,
         tab_buttons: Vec::new(),
         tab_state: Vec::new(),
-        rendered_id: None,
         open_menu: None,
-        cols: 80,
-        rows: 24,
         scale: 1.0,
         last_frame: Instant::now(),
     });
@@ -482,7 +465,7 @@ fn keyboard(
         .iter()
         .position(|(e, _)| nodes.get(*e).is_ok_and(|n| n.display != Display::None));
     if open.is_none()
-        && event.focused_entity == view.terminal
+        && terminal_focused(&view, event.focused_entity)
         && !capture.is_captured()
         && ctrl
         && !modifiers.alt_or_super()
@@ -497,6 +480,48 @@ fn keyboard(
             KeyCode::KeyW if shift => {
                 if !event.input.repeat {
                     menu_action("tab.close", &core);
+                }
+                true
+            }
+            KeyCode::KeyE
+            | KeyCode::KeyO
+            | KeyCode::KeyX
+            | KeyCode::ArrowLeft
+            | KeyCode::ArrowRight
+            | KeyCode::ArrowUp
+            | KeyCode::ArrowDown
+                if shift =>
+            {
+                if !event.input.repeat {
+                    let mut tabs = core.0.lock().unwrap();
+                    if !tabs.is_empty() {
+                        let removed = match event.input.key_code {
+                            KeyCode::KeyE | KeyCode::KeyO => {
+                                let dir = if event.input.key_code == KeyCode::KeyE {
+                                    panes::SplitDir::Vertical
+                                } else {
+                                    panes::SplitDir::Horizontal
+                                };
+                                if let Err(error) = tabs.split_active(dir) {
+                                    eprintln!("split pane: {error}");
+                                }
+                                None
+                            }
+                            KeyCode::KeyX => tabs.close_active().1,
+                            key => {
+                                let dir = match key {
+                                    KeyCode::ArrowLeft => panes::Direction::Left,
+                                    KeyCode::ArrowRight => panes::Direction::Right,
+                                    KeyCode::ArrowUp => panes::Direction::Up,
+                                    _ => panes::Direction::Down,
+                                };
+                                tabs.focus_dir(dir);
+                                None
+                            }
+                        };
+                        drop(tabs);
+                        core.1.submit(removed.into_iter().collect());
+                    }
                 }
                 true
             }
@@ -549,7 +574,7 @@ fn keyboard(
         }
         return;
     }
-    if capture.is_captured() || event.focused_entity != view.terminal {
+    if capture.is_captured() || !terminal_focused(&view, event.focused_entity) {
         return;
     }
     if modifiers.alt_or_super() {
@@ -602,13 +627,196 @@ fn keyboard(
         event.propagate(false);
     }
 }
+fn terminal_focused(view: &View, entity: Entity) -> bool {
+    entity == view.terminal
+        || view
+            .pane_views
+            .iter()
+            .any(|pane| pane.entity == entity || pane.container == entity)
+}
+
+fn spawn_pane_tree(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    tree: &panes::PaneTree,
+    views: &mut Vec<PaneView>,
+) -> Entity {
+    use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor};
+    use ctk::theme::tokens;
+    match tree {
+        panes::PaneTree::Leaf(pane) => {
+            let id = pane.id;
+            let mut placeholder = Image::new_fill(
+                Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[0, 0, 0, 255],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            );
+            placeholder.sampler = ImageSampler::nearest();
+            let image = images.add(placeholder);
+            let entity = commands
+                .spawn((
+                    ImageNode::new(image.clone()),
+                    Node {
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
+                ))
+                .id();
+            let container = commands
+                .spawn((
+                    Node {
+                        width: percent(100),
+                        height: percent(100),
+                        min_width: px(0),
+                        min_height: px(0),
+                        border: UiRect::all(px(1)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BorderColor::DEFAULT,
+                    ThemeBorderColor(tokens::BORDER),
+                ))
+                .add_child(entity)
+                .observe(
+                    move |_: On<Pointer<Click>>,
+                          core: Res<Core>,
+                          mut view: ResMut<View>,
+                          mut focus: ResMut<InputFocus>| {
+                        if core.0.lock().unwrap().focus(id) {
+                            view.terminal = entity;
+                            focus.set(entity, FocusCause::Pressed);
+                        }
+                    },
+                )
+                .id();
+            views.push(PaneView {
+                id,
+                container,
+                entity,
+                image,
+                cols: 80,
+                rows: 24,
+                rendered: false,
+                active: false,
+            });
+            container
+        }
+        panes::PaneTree::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let vertical = *dir == panes::SplitDir::Vertical;
+            let root = commands
+                .spawn(Node {
+                    width: percent(100),
+                    height: percent(100),
+                    min_width: px(0),
+                    min_height: px(0),
+                    flex_direction: if vertical {
+                        FlexDirection::Row
+                    } else {
+                        FlexDirection::Column
+                    },
+                    ..default()
+                })
+                .id();
+            // A zero basis divides the space left AFTER the fixed divider.
+            // These weighted slots contain the recursively mirrored subtrees.
+            for (index, (tree, weight)) in [(first, *ratio), (second, 1.0 - ratio)]
+                .into_iter()
+                .enumerate()
+            {
+                if index == 1 {
+                    let divider = commands
+                        .spawn((
+                            Node {
+                                width: if vertical { px(3) } else { percent(100) },
+                                height: if vertical { percent(100) } else { px(3) },
+                                flex_shrink: 0.0,
+                                ..default()
+                            },
+                            ThemeBackgroundColor(tokens::BORDER),
+                        ))
+                        .id();
+                    commands.entity(root).add_child(divider);
+                }
+                let slot = commands
+                    .spawn(Node {
+                        flex_basis: px(0),
+                        flex_grow: weight,
+                        min_width: px(0),
+                        min_height: px(0),
+                        width: if vertical { Val::Auto } else { percent(100) },
+                        height: if vertical { percent(100) } else { Val::Auto },
+                        overflow: Overflow::clip(),
+                        ..default()
+                    })
+                    .id();
+                let child = spawn_pane_tree(commands, images, tree, views);
+                commands.entity(slot).add_child(child);
+                commands.entity(root).add_child(slot);
+            }
+            root
+        }
+    }
+}
+
+fn sync_panes(
+    mut commands: Commands,
+    core: Res<Core>,
+    mut view: ResMut<View>,
+    mut images: ResMut<Assets<Image>>,
+    mut focus: ResMut<InputFocus>,
+) {
+    let tabs = core.0.lock().unwrap();
+    if tabs.is_empty() {
+        return;
+    }
+    let state = (tabs.active_id(), tabs.active_tab().revision);
+    let restore_focus = focus
+        .get()
+        .is_some_and(|entity| terminal_focused(&view, entity));
+    if view.tree_state != Some(state) {
+        if let Some(root) = view.pane_root.take() {
+            commands.entity(root).despawn();
+        }
+        view.pane_views.clear();
+        let root = spawn_pane_tree(
+            &mut commands,
+            &mut images,
+            &tabs.active_tab().tree,
+            &mut view.pane_views,
+        );
+        commands.entity(view.centre).add_child(root);
+        view.pane_root = Some(root);
+        view.tree_state = Some(state);
+    }
+    let active = tabs.active_tab().active_pane;
+    if let Some(pane) = view.pane_views.iter().find(|pane| pane.id == active) {
+        let entity = pane.entity;
+        view.terminal = entity;
+        if restore_focus && focus.get() != Some(entity) {
+            focus.set(entity, FocusCause::Navigated);
+        }
+    }
+}
+
 fn refresh(
     core: Res<Core>,
     painter: Res<Painter>,
     settings: Res<config::Settings>,
     mut view: ResMut<View>,
     mut images: ResMut<Assets<Image>>,
-    mut nodes: Query<(&ComputedNode, &mut Node)>,
+    mut nodes: Query<(&ComputedNode, &UiGlobalTransform, &mut Node)>,
+    mut borders: Query<&mut bevy::feathers::theme::ThemeBorderColor>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let removed = core.0.lock().unwrap().reap_exited();
@@ -618,104 +826,132 @@ fn refresh(
         exit.write(AppExit::Success);
         return;
     }
-    let id = tabs.active_id();
-    let mut switched = view.rendered_id != Some(id);
-    let active = tabs.active_terminal();
-    let terminal = active.lock().unwrap();
-    let now = Instant::now();
-    {
-        let mut stats = terminal.stats.lock().unwrap();
-        stats.frames += 1;
-        stats.frame.add(now - view.last_frame);
+    // A Bus mutation or an exit after Update must wait for its new layout.
+    if view.tree_state != Some((tabs.active_id(), tabs.active_tab().revision)) {
+        return;
     }
+    let now = Instant::now();
+    let elapsed = now - view.last_frame;
     view.last_frame = now;
     let mut painter = painter.0.lock().unwrap();
-    // Rebuild the Raster at the window's real device scale so glyphs are
-    // rasterised at physical resolution rather than upscaled (HiDPI blur fix).
-    let logical_size = nodes.get(view.centre).ok().map(|(computed, _)| {
-        let inv = computed.inverse_scale_factor();
-        let scale = if inv > 0.0 { 1.0 / inv } else { 1.0 };
-        (computed.size() * inv, scale)
-    });
-    if let Some((_, scale)) = logical_size
-        && (scale - view.scale).abs() > 0.01
-    {
+    let mut rebuilt = false;
+    let Ok((centre, centre_transform, _)) = nodes.get(view.centre) else {
+        return;
+    };
+    let inv = centre.inverse_scale_factor();
+    let origin = centre_transform.affine().translation * inv - centre.size() * inv / 2.0;
+    let scale = if inv > 0.0 { 1.0 / inv } else { 1.0 };
+    if (scale - view.scale).abs() > 0.01 {
         match raster::Raster::new(scale, settings.config.font_px, settings.config.cursor) {
-            Ok(rebuilt) => {
-                *painter = rebuilt;
-                switched = true;
+            Ok(next) => {
+                *painter = next;
+                rebuilt = true;
             }
-            // Latch the attempt either way so a persistent failure does not
-            // re-read the font and log every frame; keep the working painter.
             Err(e) => eprintln!("raster rebuild at scale {scale}: {e}"),
         }
         view.scale = scale;
     }
-    if let Some((size, _)) = logical_size {
-        let lw = painter.logical_width().max(1.0);
-        let lh = painter.logical_height().max(1.0);
-        let cols = ((size.x / lw) as u16).clamp(2, 240.min((4096 / painter.width) as u16));
-        let rows = ((size.y / lh) as u16).clamp(1, 100.min((4096 / painter.height) as u16));
-        if size.x > 0.0 && size.y > 0.0 && (switched || (cols, rows) != (view.cols, view.rows)) {
-            terminal.resize(
-                cols,
-                rows,
-                cols * painter.width as u16,
-                rows * painter.height as u16,
-            );
-            tabs.resized(id, cols, rows);
-            view.cols = cols;
-            view.rows = rows;
-            // Node sizing (in LOGICAL px) is done once in the tail block below,
-            // against the actual rendered texture, so it can't disagree with it.
+    let active_id = tabs.active_tab().active_pane;
+    for pane in &mut view.pane_views {
+        let Some(terminal) = tabs.pane_by_id(pane.id) else {
+            continue;
+        };
+        let terminal = terminal.lock().unwrap();
+        {
+            let mut stats = terminal.stats.lock().unwrap();
+            stats.frames += 1;
+            stats.frame.add(elapsed);
         }
-    }
-    let damaged = terminal.take_damage();
-    if !switched && !damaged {
-        return;
-    }
-    let screen = terminal.screen(true);
-    view.rendered_id = Some(id);
-    let rgba = painter.render(&screen);
-    let converted = Instant::now();
-    terminal
-        .stats
-        .lock()
-        .unwrap()
-        .vt_rgba
-        .add(converted - screen.updated);
-    let width = screen.cols as u32 * painter.width;
-    let height = screen.rows as u32 * painter.height;
-    if let Some(mut image) = images.get_mut(&view.image) {
-        let mut next = Image::new(
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            rgba,
-            TextureFormat::Rgba8UnormSrgb,
-            RenderAssetUsages::default(),
-        );
-        next.sampler = ImageSampler::nearest();
-        *image = next;
-        let mut stats = terminal.stats.lock().unwrap();
-        stats.rgba_upload.add(converted.elapsed());
-        stats.uploads += 1;
-    }
-    // Size the on-screen node in LOGICAL px: the texture is `width`×`height`
-    // PHYSICAL device px, so dividing by the raster's scale maps it 1:1 to
-    // physical pixels with no stretch (the HiDPI crispness contract).
-    let node_w = px(width as f32 / painter.scale);
-    let node_h = px(height as f32 / painter.scale);
-    if let Ok((_, mut node)) = nodes.get_mut(view.terminal)
-        && (node.width != node_w || node.height != node_h)
-    {
-        node.width = node_w;
-        node.height = node_h;
-        // Layout has already run; request the one follow-up frame needed
-        // for new image geometry, including initial startup under reactive mode.
-        terminal.listener.wake();
+        let active = pane.id == active_id;
+        let switched = rebuilt || !pane.rendered || active != pane.active;
+        if let Ok(mut border) = borders.get_mut(pane.container) {
+            let token = if active {
+                ctk::theme::tokens::CONTROL_ACTIVE
+            } else {
+                ctk::theme::tokens::BORDER
+            };
+            if border.0 != token {
+                border.0 = token;
+            }
+        }
+        // VERIFY: per-leaf resize+HiDPI node sizing — logical allocation,
+        // physical PTY/texture pixels, logical image pixels divided by scale.
+        if let Ok((computed, transform, _)) = nodes.get(pane.container) {
+            let inv = computed.inverse_scale_factor();
+            let outer = computed.size() * inv;
+            let position = transform.affine().translation * inv - outer / 2.0 - origin;
+            tabs.geometry(
+                pane.id,
+                panes::Geometry {
+                    x: position.x,
+                    y: position.y,
+                    w: outer.x,
+                    h: outer.y,
+                },
+            );
+            let size = (outer - Vec2::splat(2.0)).max(Vec2::ZERO);
+            let cols = ((size.x / painter.logical_width().max(1.0)) as u16)
+                .clamp(2, 240.min((4096 / painter.width) as u16));
+            let rows = ((size.y / painter.logical_height().max(1.0)) as u16)
+                .clamp(1, 100.min((4096 / painter.height) as u16));
+            if size.x > 0.0 && size.y > 0.0 && (switched || (cols, rows) != (pane.cols, pane.rows))
+            {
+                terminal.resize(
+                    cols,
+                    rows,
+                    cols * painter.width as u16,
+                    rows * painter.height as u16,
+                );
+                tabs.resized(pane.id, cols, rows);
+                pane.cols = cols;
+                pane.rows = rows;
+            }
+        }
+        let damaged = terminal.take_damage();
+        if !switched && !damaged {
+            continue;
+        }
+        // VERIFY: per-leaf render — all visible leaves consume their own damage.
+        let mut screen = terminal.screen(true);
+        screen.cursor_visible &= active;
+        pane.active = active;
+        pane.rendered = true;
+        let rgba = painter.render(&screen);
+        let converted = Instant::now();
+        terminal
+            .stats
+            .lock()
+            .unwrap()
+            .vt_rgba
+            .add(converted - screen.updated);
+        let width = screen.cols as u32 * painter.width;
+        let height = screen.rows as u32 * painter.height;
+        if let Some(mut image) = images.get_mut(&pane.image) {
+            let mut next = Image::new(
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                rgba,
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            );
+            next.sampler = ImageSampler::nearest();
+            *image = next;
+            let mut stats = terminal.stats.lock().unwrap();
+            stats.rgba_upload.add(converted.elapsed());
+            stats.uploads += 1;
+        }
+        let node_w = px(width as f32 / painter.scale);
+        let node_h = px(height as f32 / painter.scale);
+        if let Ok((_, _, mut node)) = nodes.get_mut(pane.entity)
+            && (node.width != node_w || node.height != node_h)
+        {
+            node.width = node_w;
+            node.height = node_h;
+            terminal.listener.wake();
+        }
     }
 }

@@ -45,7 +45,9 @@ fn fixture() -> Option<(App, Entity)> {
     let (cleanup, _) = tabs::Cleanup::start().unwrap();
     app.insert_resource(Core(Arc::new(Mutex::new(TabSet::new().unwrap())), cleanup));
     app.insert_resource(View {
-        image: Handle::default(),
+        pane_views: vec![],
+        pane_root: None,
+        tree_state: None,
         terminal,
         centre: terminal,
         menu,
@@ -55,10 +57,7 @@ fn fixture() -> Option<(App, Entity)> {
         tab_bar: menu,
         tab_buttons: vec![],
         tab_state: vec![],
-        rendered_id: None,
         open_menu: None,
-        cols: 80,
-        rows: 24,
         scale: 1.0,
         last_frame: Instant::now(),
     });

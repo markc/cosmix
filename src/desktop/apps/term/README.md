@@ -1,4 +1,4 @@
-# CosMix Term tabs
+# CosMix Term tabs and panes
 
 The `cosmix-term` package supplies the `term` binary and Wayland app ID
 `dev.cosmix.term`. Help → About shows the component and crate version.
@@ -6,11 +6,26 @@ Children start in `$HOME` with the startup-selected `TERM` (see below).
 PTY damage wakes the reactive event loop (focused/unfocused: 16/33 ms).
 The preserved core retains `TERM_SPIKE_FONT`, ASCII input, a steady
 cursor, cell clipping and diagnostic timing rings. Shaping, wide/combining
-glyph layout and panes remain later work.
+glyph layout remain later work.
 
-Each tab owns one independent Mix PTY and terminal Machine. Background output
-continues draining. The active tab alone is rasterised; switching tabs forces
-a complete upload, including switches requested through the Bus.
+Each tab owns a binary split tree of independent Mix PTYs and terminal Machines.
+Background output continues draining. Every pane in the active tab is rasterised
+on its own damage; switching tabs forces a complete upload. Each leaf retains
+the physical texture / logical node / nearest sampler HiDPI contract. Only the
+active pane draws its cursor and themed focus accent. Split nodes become rows
+(vertical splits) or columns (horizontal splits), with a 3px themed divider.
+The flex subtree rebuilds only on active-tree changes or tab switches.
+
+Ctrl+Shift+E splits side-by-side; Ctrl+Shift+O splits top/bottom. New panes
+become active. Ctrl+Shift+X closes the active pane and promotes its sibling;
+closing a tab's last pane closes that tab. Click a pane to focus it, or use
+Ctrl+Shift+Arrow keys: focus chooses the nearest leaf centre in the requested
+half-plane using cached logical layout geometry, with in-order ties. Before
+the first layout it uses proportional tree geometry. These shortcuts require
+terminal focus, closed menus, exact modifiers and a non-repeated key press.
+There is a shared 32-terminal cap across all tabs and panes; terminals pending
+bounded cleanup continue to occupy their slots. Exited panes collapse their
+parent without closing surviving siblings.
 
 Use the themed tab buttons to select a tab and `+` to create one. File contains
 New Tab, Close Tab and Quit. Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the
@@ -22,7 +37,13 @@ the end. Closing the last tab quits after bounded terminal shutdown.
 The diagnostic `term` Bus service accepts body-only numeric IDs for
 `term.tab.select` and `term.tab.close`. `term.tab.new` opens and activates a tab;
 `term.tabs` lists stable IDs, selection, titles, dimensions and child PIDs.
-`term.snapshot` and `term.type` target the active tab. Requests remain limited
+`term.snapshot` and `term.type` target the active pane. `term.panes` lists the
+active tab's pane IDs, active flags, cached dimensions/PIDs and logical x/y/w/h
+(zero geometry until layout). `term.pane.split` accepts body-only
+`h|horizontal|v|vertical`; `term.pane.select` accepts a numeric pane ID belonging
+to the active tab; `term.pane.close` closes its active pane. IDs are monotonic
+across tabs and never reused in the process. Pane verbs retain the diagnostic
+P0-I identity gate. Requests remain limited
 to 8192 bytes and replies to a two-second timeout. This self-asserted service
 is diagnostic only: authenticated per-instance identity remains gated on P0-I.
 
