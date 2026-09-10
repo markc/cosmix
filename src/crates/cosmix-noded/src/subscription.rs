@@ -260,6 +260,10 @@ mod native_session_tests {
         broker
             .subscribe_topic_verified("native.snapshot", "live", live, None, true)
             .await;
+        let (tcp_live, mut tcp_live_rx) = mpsc::channel(8);
+        broker
+            .subscribe_topic("native.snapshot", "tcp-live", tcp_live)
+            .await;
         let inner = BusMessage::new()
             .with_header("command", "snapshot")
             .with_header("type", "event")
@@ -280,7 +284,15 @@ mod native_session_tests {
             .unwrap();
         let live = bus::parse(&live_rx.recv().await.unwrap()).unwrap();
         assert_eq!(read_principal(&live).unwrap(), Some(principal()));
+        let tcp_live = bus::parse(&tcp_live_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(read_principal(&tcp_live).unwrap(), None);
         broker.remove_peer("publisher", &publisher).await;
+        let (tcp_replay, mut tcp_replay_rx) = mpsc::channel(8);
+        broker
+            .subscribe_topic("native.snapshot", "tcp-replay", tcp_replay)
+            .await;
+        let tcp_replay = bus::parse(&tcp_replay_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(read_principal(&tcp_replay).unwrap(), None);
         let (replay, mut replay_rx) = mpsc::channel(8);
         broker
             .subscribe_topic_verified("native.snapshot", "later", replay, None, true)
@@ -319,7 +331,7 @@ mod native_session_tests {
         broker
             .subscribe_topic("native.snapshot", "third", third)
             .await;
-        for _ in 0..3 {
+        for _ in 0..5 {
             let wire = tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
                 .await
                 .unwrap()
@@ -724,6 +736,7 @@ impl SubscriptionBroker {
     ///
     /// Thin wrapper around [`Self::subscribe_topic_filtered`] with no
     /// filter — every publish to `name` is delivered to this subscriber.
+    #[cfg(test)]
     pub async fn subscribe_topic(
         &self,
         name: &str,
@@ -752,6 +765,7 @@ impl SubscriptionBroker {
     /// replayed to the new subscriber. The 0→1 `topic.active` notice is
     /// driven by overall subscriber count (across all filter variants),
     /// not per-filter count — publishers don't reason about filter scope.
+    #[cfg(test)]
     pub async fn subscribe_topic_filtered(
         &self,
         name: &str,
