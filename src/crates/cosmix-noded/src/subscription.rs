@@ -554,6 +554,11 @@ impl SubscriptionBroker {
             });
         }
 
+        // Avoid invoking the legacy raw-prefix diagnostic on confidential or
+        // malformed UTF-8-boundary text. Its error embeds caller bytes.
+        if !inner_body.starts_with("---\n") {
+            return Err(PublishError::MalformedPayload);
+        }
         let mut inner = match bus::parse(inner_body) {
             Ok(m) => m,
             Err(_) => return Err(PublishError::MalformedPayload),

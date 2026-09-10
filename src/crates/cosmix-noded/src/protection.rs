@@ -8,6 +8,48 @@ pub(crate) enum TrafficClass {
     NativeSession,
 }
 
+impl TrafficClass {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        if self == Self::NativeSession || other == Self::NativeSession {
+            Self::NativeSession
+        } else {
+            Self::Legacy
+        }
+    }
+    pub(crate) fn protected(self) -> bool {
+        self == Self::NativeSession
+    }
+
+    pub(crate) fn command(message: &BusMessage) -> Self {
+        if message
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("command") && v.starts_with("noded.session."))
+        {
+            return Self::NativeSession;
+        }
+        // Check the inner command before topic/property canonicalisation.
+        if message.command_name() == Some("topic.publish")
+            && message.body.starts_with("---\n")
+            && bus::parse(&message.body).is_ok_and(|inner| {
+                inner
+                    .command_name()
+                    .is_some_and(|c| c.starts_with("noded.session."))
+            })
+        {
+            return Self::NativeSession;
+        }
+        if message.command_name() == Some("topic.publish")
+            && message
+                .get("name")
+                .is_some_and(|name| crate::props_reservation::reserved_owner(name).is_some())
+        {
+            return Self::NativeSession;
+        }
+        Self::Legacy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,46 +79,5 @@ mod tests {
                 .merge(TrafficClass::NativeSession)
                 .protected()
         );
-    }
-}
-
-impl TrafficClass {
-    pub(crate) fn merge(self, other: Self) -> Self {
-        if self == Self::NativeSession || other == Self::NativeSession {
-            Self::NativeSession
-        } else {
-            Self::Legacy
-        }
-    }
-    pub(crate) fn protected(self) -> bool {
-        self == Self::NativeSession
-    }
-
-    pub(crate) fn command(message: &BusMessage) -> Self {
-        if message
-            .headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("command") && v.starts_with("noded.session."))
-        {
-            return Self::NativeSession;
-        }
-        // Check the inner command before topic/property canonicalisation.
-        if message.command_name() == Some("topic.publish")
-            && bus::parse(&message.body).is_ok_and(|inner| {
-                inner
-                    .command_name()
-                    .is_some_and(|c| c.starts_with("noded.session."))
-            })
-        {
-            return Self::NativeSession;
-        }
-        if message.command_name() == Some("topic.publish")
-            && message
-                .get("name")
-                .is_some_and(|name| crate::props_reservation::reserved_owner(name).is_some())
-        {
-            return Self::NativeSession;
-        }
-        Self::Legacy
     }
 }

@@ -281,10 +281,23 @@ pub enum AdmissionMode {
 pub struct NodedConfig {
     pub port: u16,
     /// Published system broker endpoint (BUS-013), independent of client XDG.
+    #[serde(deserialize_with = "absolute_unix_socket")]
     pub unix_socket: Option<std::path::PathBuf>,
     pub mesh_config: Option<String>,
     /// SPEC 13 §9a D2 admission posture (off | observe | enforce). Default off.
     pub admission: AdmissionMode,
+}
+
+fn absolute_unix_socket<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::path::PathBuf>, D::Error> {
+    let path = Option::<std::path::PathBuf>::deserialize(deserializer)?;
+    if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err(serde::de::Error::custom(
+            "noded.unix_socket must be absolute",
+        ));
+    }
+    Ok(path)
 }
 
 impl Default for NodedConfig {
@@ -1019,6 +1032,10 @@ pub fn require_node_config() -> Result<NodeConfig> {
 mod tests {
     #[test]
     fn native_endpoint_defaults_to_system_path_not_client_runtime() {
+        assert!(
+            serde_json::from_str::<super::NodedConfig>(r#"{"unix_socket":"relative.sock"}"#)
+                .is_err()
+        );
         let config: super::NodedConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(
             config.unix_endpoint(),

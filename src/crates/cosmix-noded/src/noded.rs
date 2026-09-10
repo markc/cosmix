@@ -1828,6 +1828,52 @@ fn broker_only_session_event(msg: &BusMessage) -> bool {
     )
 }
 
+/// Identify bootstrap before the compatibility parser can allocate/copy its
+/// body or discard duplicate evidence. No body is scanned or allocated here.
+fn raw_session_command(text: &str) -> Option<&str> {
+    text.strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))?
+        .lines()
+        .take_while(|line| *line != "---")
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(key, value)| {
+            (key.eq_ignore_ascii_case("command") && value.trim().starts_with("noded.session."))
+                .then_some(value.trim())
+        })
+}
+
+/// Bounded correlation-only envelope for an invalid bootstrap request. A
+/// duplicate ID is not usable correlation; no caller payload survives here.
+fn invalid_bootstrap_envelope(text: &str, command: &str) -> BusMessage {
+    let mut message = BusMessage::new().with_header(
+        "command",
+        if command.len() <= 128 {
+            command
+        } else {
+            "noded.session.invalid"
+        },
+    );
+    let mut ids = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+        .unwrap_or("")
+        .lines()
+        .take_while(|line| *line != "---")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| key.eq_ignore_ascii_case("id"));
+    if let Some((_, id)) = ids.next() {
+        let id = id.trim();
+        if ids.next().is_none()
+            && !id.is_empty()
+            && id.len() <= 128
+            && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
+            message.set("id", id);
+        }
+    }
+    message
+}
+
 async fn handle_socket(socket: WebSocket, mut state: AppState, transport: TransportIdentity) {
     if let TransportIdentity::LocalUnix { uid, gid, peer_pid } = &transport {
         state.observe = state.observe.for_class(TrafficClass::NativeSession);
@@ -1935,15 +1981,27 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             Message::Close(_) => break,
             _ => continue,
         };
-        let mut bus_msg = match bus::parse(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!("Invalid Bus message: {e}");
-                let err = BusMessage::new()
-                    .with_header("rc", "10")
-                    .with_header("error", &format!("Invalid Bus message: {e}"));
-                let _ = tx.try_send(err.to_wire());
-                continue;
+        // The legacy framing diagnostic includes raw input. Native failures
+        // must never copy those bytes into diagnostics (or slice UTF-8 there).
+        if state.principal.is_some() && !text.starts_with("---\n") {
+            break;
+        }
+        let mut bus_msg = if let Some(command) = raw_session_command(&text) {
+            match cosmix_bus::native_session::parse_bootstrap(text.as_bytes()) {
+                Ok(request) => request.message,
+                Err(_) => invalid_bootstrap_envelope(&text, command),
+            }
+        } else {
+            match bus::parse(&text) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!("Invalid Bus message: {e}");
+                    let err = BusMessage::new()
+                        .with_header("rc", "10")
+                        .with_header("error", &format!("Invalid Bus message: {e}"));
+                    let _ = tx.try_send(err.to_wire());
+                    continue;
+                }
             }
         };
 
@@ -3713,6 +3771,13 @@ async fn handle_noded_command(
 
         // ── Topic pub/sub (see 2026-04-10-topic-pubsub-v1.md § 3.11) ──
         "topic.publish" => {
+            if !msg.body.starts_with("---\n") {
+                let mut resp = respond("10");
+                resp.set("command", "topic.publish");
+                resp.body = subscription::PublishError::MalformedPayload.error_body();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             // Check before reserved-property canonicalisation can erase command.
             if bus::parse(&msg.body).is_ok_and(|inner| broker_only_session_event(&inner)) {
                 let mut resp = respond("10");

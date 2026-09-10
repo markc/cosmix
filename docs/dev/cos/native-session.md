@@ -23,7 +23,8 @@ responses, bootstrap commands and private property topics. Retained snapshots
 store classification separately from publisher attribution; replays preserve
 both without consulting a live publisher route. Observe emits metadata with
 `payload_omitted: native_session_protected`; tap omits protected frames entirely.
-TCP/D2 clients receive no Unix principal assertion.
+TCP/D2 callers never acquire a Unix principal assertion; local recipient
+services receive the verified Unix sender's stamp regardless of their transport.
 
 Native traffic is node-local in S1: it is refused at mesh egress because the
 legacy mesh wire has no protected-classification propagation contract. This

@@ -306,6 +306,19 @@ async fn unix_binary_frames_refused_and_bootstrap_is_strict_but_not_enabled_as_s
         serde_json::from_str::<serde_json::Value>(&receive(&mut socket).await.body).unwrap()["error_code"],
         "INVALID_ARGUMENT"
     );
+    send(
+        &mut socket,
+        &request("noded.session.hello", "noded", "oversize")
+            .with_header("native-session", "1")
+            .with_body(&"p".repeat(20_000)),
+    )
+    .await;
+    let oversize = receive(&mut socket).await;
+    assert_eq!(oversize.get("id"), Some("oversize"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&oversize.body).unwrap()["error_code"],
+        "INVALID_ARGUMENT"
+    );
     socket
         .send(WsMessage::Binary(b"binary is refused".to_vec().into()))
         .await
@@ -317,4 +330,21 @@ async fn unix_binary_frames_refused_and_bootstrap_is_strict_but_not_enabled_as_s
         next,
         None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))
     ));
+}
+
+#[test]
+fn malformed_bootstrap_prescan_keeps_only_bounded_correlation() {
+    let raw = request("noded.session.prove", "noded", "proof")
+        .with_body(&"private".repeat(10_000))
+        .to_wire();
+    let command = raw_session_command(&raw).unwrap();
+    let minimal = invalid_bootstrap_envelope(&raw, command);
+    assert!(minimal.body.is_empty());
+    assert_eq!(minimal.headers.len(), 2);
+    assert_eq!(minimal.get("id"), Some("proof"));
+    let duplicate = raw.replace("id: proof", "id: proof\nID: duplicate");
+    assert_eq!(
+        invalid_bootstrap_envelope(&duplicate, command).get("id"),
+        None
+    );
 }

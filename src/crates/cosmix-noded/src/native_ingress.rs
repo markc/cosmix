@@ -68,7 +68,10 @@ pub(crate) async fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
         if !meta.file_type().is_socket() || meta.uid() != uid {
             bail!("refusing to replace non-socket or foreign-owned Unix endpoint");
         }
-        match UnixStream::connect(path).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), UnixStream::connect(path))
+            .await
+            .context("existing Unix endpoint probe deadline")?
+        {
             Ok(_) => bail!("Unix broker endpoint is already listening"),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 let current = std::fs::symlink_metadata(path)?;
