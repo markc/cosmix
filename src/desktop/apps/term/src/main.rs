@@ -1,6 +1,7 @@
 mod bus;
 mod metrics;
 mod raster;
+mod tabs;
 mod terminal;
 
 use bevy::{
@@ -15,13 +16,14 @@ use bevy::{
 use cosmix_app_identity::AppIdentity;
 use ctk::prelude::*;
 use std::{
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use terminal::{Key as TerminalKey, Terminal};
+use tabs::TabSet;
+use terminal::Key as TerminalKey;
 
 #[derive(Resource)]
-struct Core(Arc<Mutex<Terminal>>);
+struct Core(Arc<Mutex<TabSet>>);
 #[derive(Resource)]
 struct Painter(Mutex<raster::Raster>);
 #[derive(Resource)]
@@ -30,7 +32,12 @@ struct View {
     terminal: Entity,
     centre: Entity,
     menu: Entity,
-    dropdowns: Vec<(Entity, Entity)>,
+    dropdowns: Vec<(Entity, Vec<Entity>)>,
+    menu_item: usize,
+    tab_bar: Entity,
+    tab_buttons: Vec<Entity>,
+    tab_state: Vec<(u64, bool)>,
+    rendered_id: Option<u64>,
     open_menu: Option<usize>,
     cols: u16,
     rows: u16,
@@ -57,11 +64,11 @@ fn main() {
     });
     // The preserved core launches Mix in HOME with TERM=xterm-256color.
     // Product terminfo xterm-rio is P2.2.
-    let terminal = Arc::new(Mutex::new(Terminal::start().unwrap_or_else(|e| {
+    let terminal = Arc::new(Mutex::new(TabSet::new().unwrap_or_else(|e| {
         eprintln!("PTY startup: {e}");
         std::process::exit(1)
     })));
-    bus::start(terminal.clone());
+    let bus = bus::start(terminal.clone());
     App::new()
         .insert_resource(Core(terminal.clone()))
         .insert_resource(Painter(Mutex::new(painter)))
@@ -88,10 +95,12 @@ fn main() {
         .add_systems(PostStartup, bind_menu)
         .add_observer(keyboard)
         .add_observer(on_menu)
-        .add_systems(Update, menu_focus)
+        .add_systems(Update, (menu_focus, sync_tabs))
         .add_systems(PostUpdate, refresh.after(bevy::ui::UiSystems::Layout))
         .run();
     terminal.lock().unwrap().shutdown();
+    // Let a last-tab Bus close finish its bounded reply before process exit.
+    let _ = bus.join();
 }
 fn setup(
     mut commands: Commands,
@@ -110,7 +119,11 @@ fn setup(
         &[
             MenuDef {
                 label: "File".into(),
-                items: vec![MenuItemDef::new("app.quit", "Quit")],
+                items: vec![
+                    MenuItemDef::new("tab.new", "New Tab"),
+                    MenuItemDef::new("tab.close", "Close Tab"),
+                    MenuItemDef::new("app.quit", "Quit"),
+                ],
             },
             MenuDef {
                 label: "Help".into(),
@@ -155,6 +168,14 @@ fn setup(
         ))
         .add_child(terminal)
         .id();
+    let tab_bar = commands
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            flex_shrink: 0.0,
+            column_gap: px(4),
+            ..default()
+        })
+        .id();
     commands
         .spawn(Node {
             width: percent(100),
@@ -162,7 +183,7 @@ fn setup(
             flex_direction: FlexDirection::Column,
             ..default()
         })
-        .add_children(&[menu, centre]);
+        .add_children(&[menu, tab_bar, centre]);
     focus.set(terminal, FocusCause::Navigated);
     commands.insert_resource(View {
         image,
@@ -170,6 +191,11 @@ fn setup(
         centre,
         menu,
         dropdowns: Vec::new(),
+        menu_item: 0,
+        tab_bar,
+        tab_buttons: Vec::new(),
+        tab_state: Vec::new(),
+        rendered_id: None,
         open_menu: None,
         cols: 80,
         rows: 24,
@@ -180,6 +206,52 @@ fn setup(
         let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }));
 }
+fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
+    let tabs = core.0.lock().unwrap().list();
+    let state: Vec<_> = tabs.iter().map(|tab| (tab.id, tab.active)).collect();
+    if state == view.tab_state {
+        return;
+    }
+    for button in view.tab_buttons.drain(..) {
+        commands.entity(button).despawn();
+    }
+    view.tab_state = state;
+    for tab in tabs {
+        let id = tab.id;
+        let button = ctk::button::spawn_button(
+            &mut commands,
+            ButtonDef::text(tab.title).variant(if tab.active {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Default
+            }),
+        );
+        commands.entity(button).observe(
+            move |_: On<bevy::ui_widgets::Activate>,
+                  core: Res<Core>,
+                  view: Res<View>,
+                  mut focus: ResMut<InputFocus>| {
+                core.0.lock().unwrap().select(id);
+                focus.set(view.terminal, FocusCause::Pressed);
+            },
+        );
+        commands.entity(view.tab_bar).add_child(button);
+        view.tab_buttons.push(button);
+    }
+    let button = ctk::button::spawn_button(&mut commands, ButtonDef::text("+"));
+    commands.entity(button).observe(
+        |_: On<bevy::ui_widgets::Activate>,
+         core: Res<Core>,
+         view: Res<View>,
+         mut focus: ResMut<InputFocus>| {
+            menu_action("tab.new", &core);
+            focus.set(view.terminal, FocusCause::Pressed);
+        },
+    );
+    commands.entity(view.tab_bar).add_child(button);
+    view.tab_buttons.push(button);
+}
+
 fn bind_menu(mut view: ResMut<View>, children: Query<&Children>, nodes: Query<&Node>) {
     // CTK exposes no bar open-state API. Isolate its current public Node tree
     // adapter here: bar -> anchor -> absolute dropdown. Fail closed on drift.
@@ -196,8 +268,8 @@ fn bind_menu(mut view: ResMut<View>, children: Query<&Children>, nodes: Query<&N
                             .expect("CTK menu entries")
                             .iter()
                             .collect();
-                        assert_eq!(entries.len(), 1, "CTK menu entry structure changed");
-                        view.dropdowns.push((entity, entries[0]));
+                        assert!(!entries.is_empty(), "CTK menu entry structure changed");
+                        view.dropdowns.push((entity, entries));
                     }
                 }
             }
@@ -215,8 +287,9 @@ fn menu_focus(mut view: ResMut<View>, nodes: Query<&Node>, mut focus: ResMut<Inp
         .position(|(e, _)| nodes.get(*e).is_ok_and(|n| n.display != Display::None));
     if open != view.open_menu {
         view.open_menu = open;
+        view.menu_item = 0;
         focus.set(
-            open.map_or(view.terminal, |index| view.dropdowns[index].1),
+            open.map_or(view.terminal, |index| view.dropdowns[index].1[0]),
             FocusCause::Navigated,
         );
     }
@@ -230,11 +303,19 @@ fn menu_action(id: &str, core: &Core) {
             "CosMix Term · component=term · version={}",
             env!("CARGO_PKG_VERSION")
         ),
-        "app.quit" => {
-            let core = core.0.lock().unwrap();
-            core.listener.quit.store(true, Ordering::Release);
-            core.listener.wake();
+        "tab.new" => {
+            if let Err(e) = core.0.lock().unwrap().open() {
+                eprintln!("new tab: {e}");
+            }
         }
+        "tab.close" => {
+            let mut tabs = core.0.lock().unwrap();
+            if !tabs.is_empty() {
+                let id = tabs.active_id();
+                tabs.close(id);
+            }
+        }
+        "app.quit" => core.0.lock().unwrap().shutdown(),
         _ => {}
     }
 }
@@ -250,6 +331,37 @@ fn keyboard(
     if event.input.state != ButtonState::Pressed {
         return;
     }
+    // Intercept app shortcuts before menu handling and before the PTY route.
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if ctrl && !capture.is_captured() {
+        let handled = match event.input.key_code {
+            KeyCode::KeyT if shift => {
+                if !event.input.repeat {
+                    menu_action("tab.new", &core);
+                }
+                true
+            }
+            KeyCode::KeyW if shift => {
+                if !event.input.repeat {
+                    menu_action("tab.close", &core);
+                }
+                true
+            }
+            KeyCode::PageDown | KeyCode::PageUp => {
+                core.0
+                    .lock()
+                    .unwrap()
+                    .cycle(event.input.key_code == KeyCode::PageDown);
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            event.propagate(false);
+            return;
+        }
+    }
     let open = view
         .dropdowns
         .iter()
@@ -259,11 +371,23 @@ fn keyboard(
         event.propagate(false);
         match event.input.key_code {
             KeyCode::ArrowDown | KeyCode::ArrowUp | KeyCode::Tab => {
-                focus.set(view.dropdowns[index].1, FocusCause::Navigated);
+                let count = view.dropdowns[index].1.len();
+                let backwards = event.input.key_code == KeyCode::ArrowUp
+                    || (event.input.key_code == KeyCode::Tab && shift);
+                view.menu_item = (view.menu_item + if backwards { count - 1 } else { 1 }) % count;
+                focus.set(
+                    view.dropdowns[index].1[view.menu_item],
+                    FocusCause::Navigated,
+                );
             }
             KeyCode::Enter | KeyCode::Escape => {
                 if event.input.key_code == KeyCode::Enter {
-                    menu_action(["app.quit", "help.about"][index], &core);
+                    let id = if index == 0 {
+                        ["tab.new", "tab.close", "app.quit"][view.menu_item]
+                    } else {
+                        "help.about"
+                    };
+                    menu_action(id, &core);
                 }
                 if let Ok(mut node) = nodes.get_mut(view.dropdowns[index].0) {
                     node.display = Display::None;
@@ -278,7 +402,6 @@ fn keyboard(
     if capture.is_captured() || event.focused_entity != view.terminal {
         return;
     }
-    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
         return;
     }
@@ -301,7 +424,12 @@ fn keyboard(
         }
     };
     let at = Instant::now();
-    let terminal = core.0.lock().unwrap();
+    let tabs = core.0.lock().unwrap();
+    if tabs.is_empty() {
+        return;
+    }
+    let active = tabs.active_terminal();
+    let terminal = active.lock().unwrap();
     if let Some(key) = key {
         if let Err(e) = terminal.listener.key(key, at) {
             eprintln!("input: {e}");
@@ -323,11 +451,16 @@ fn refresh(
     mut nodes: Query<(&ComputedNode, &mut Node)>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let terminal = core.0.lock().unwrap();
-    if terminal.listener.quit.load(Ordering::Acquire) {
+    let mut tabs = core.0.lock().unwrap();
+    tabs.reap_exited();
+    if tabs.is_empty() {
         exit.write(AppExit::Success);
         return;
     }
+    let id = tabs.active_id();
+    let switched = view.rendered_id != Some(id);
+    let active = tabs.active_terminal();
+    let terminal = active.lock().unwrap();
     let now = Instant::now();
     {
         let mut stats = terminal.stats.lock().unwrap();
@@ -342,7 +475,7 @@ fn refresh(
             .clamp(2, 240.min((4096 / painter.width) as u16));
         let rows = ((size.y / painter.height as f32) as u16)
             .clamp(1, 100.min((4096 / painter.height) as u16));
-        if size.x > 0.0 && size.y > 0.0 && (cols, rows) != (view.cols, view.rows) {
+        if size.x > 0.0 && size.y > 0.0 && (switched || (cols, rows) != (view.cols, view.rows)) {
             terminal.resize(
                 cols,
                 rows,
@@ -353,10 +486,12 @@ fn refresh(
             view.rows = rows;
         }
     }
-    if !terminal.take_damage() {
+    let damaged = terminal.take_damage();
+    if !switched && !damaged {
         return;
     }
     let screen = terminal.screen(true);
+    view.rendered_id = Some(id);
     let rgba = painter.render(&screen);
     let converted = Instant::now();
     terminal
