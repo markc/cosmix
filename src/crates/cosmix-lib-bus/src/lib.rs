@@ -1,4 +1,5 @@
 pub mod bus;
+pub mod native_session;
 pub mod service_info;
 
 pub use service_info::{NodeInfo, RegisterProvenance, SCHEMA_VERSION, ServiceInfo};
