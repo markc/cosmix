@@ -775,6 +775,7 @@ fn sync_panes(
     mut view: ResMut<View>,
     mut images: ResMut<Assets<Image>>,
     mut focus: ResMut<InputFocus>,
+    borders: Query<&bevy::feathers::theme::ThemeBorderColor>,
 ) {
     let tabs = core.0.lock().unwrap();
     if tabs.is_empty() {
@@ -801,12 +802,17 @@ fn sync_panes(
     }
     let active = tabs.active_tab().active_pane;
     for pane in &view.pane_views {
-        if !pane.rendered || pane.active != (pane.id == active) {
-            let token = if pane.id == active {
-                ctk::theme::tokens::CONTROL_ACTIVE
-            } else {
-                ctk::theme::tokens::BORDER
-            };
+        let token = if pane.id == active {
+            ctk::theme::tokens::CONTROL_ACTIVE
+        } else {
+            ctk::theme::tokens::BORDER
+        };
+        // The Bus can change focus after Update but before refresh: compare
+        // the installed border token, independently of the last drawn cursor.
+        if !borders
+            .get(pane.container)
+            .is_ok_and(|border| border.0 == token)
+        {
             commands
                 .entity(pane.container)
                 .insert(bevy::feathers::theme::ThemeBorderColor(token));

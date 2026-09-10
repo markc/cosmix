@@ -282,6 +282,93 @@ fn menu_activation_is_bounds_safe() {
 struct Bubbled(Vec<KeyCode>);
 
 #[test]
+fn pane_subtree_is_stable_on_focus_and_repairs_late_bus_border() {
+    let Some((mut app, _)) = fixture() else {
+        return;
+    };
+    app.init_resource::<Assets<Image>>()
+        .add_systems(Update, sync_panes);
+    app.update();
+    let original_root = app.world().resource::<View>().pane_root.unwrap();
+    let first = app
+        .world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .active_tab()
+        .active_pane;
+    let second = app
+        .world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .split_active(panes::SplitDir::Vertical)
+        .unwrap();
+    app.update();
+    let split_root = app.world().resource::<View>().pane_root.unwrap();
+    assert_ne!(original_root, split_root);
+    assert!(app.world().get_entity(original_root).is_err());
+    assert_eq!(
+        app.world().get::<Node>(split_root).unwrap().flex_direction,
+        FlexDirection::Row
+    );
+    let views = &app.world().resource::<View>().pane_views;
+    assert_eq!(views.len(), 2);
+    assert_ne!(views[0].image.id(), views[1].image.id());
+    let first_container = views[0].container;
+    let second_container = views[1].container;
+    app.world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .focus(first);
+    // Simulate refresh seeing the Bus focus before sync_panes sees it.
+    for pane in &mut app.world_mut().resource_mut::<View>().pane_views {
+        pane.rendered = true;
+        pane.active = pane.id == first;
+    }
+    app.update();
+    assert_eq!(app.world().resource::<View>().pane_root, Some(split_root));
+    assert_eq!(
+        app.world()
+            .get::<bevy::feathers::theme::ThemeBorderColor>(first_container)
+            .unwrap()
+            .0,
+        ctk::theme::tokens::CONTROL_ACTIVE
+    );
+    assert_eq!(
+        app.world()
+            .get::<bevy::feathers::theme::ThemeBorderColor>(second_container)
+            .unwrap()
+            .0,
+        ctk::theme::tokens::BORDER
+    );
+    app.world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .focus(second);
+    app.update();
+    assert_eq!(app.world().resource::<View>().pane_root, Some(split_root));
+    let removed = app
+        .world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .close_active()
+        .1;
+    drop(removed);
+    app.update();
+    assert_ne!(app.world().resource::<View>().pane_root, Some(split_root));
+    assert_eq!(app.world().resource::<View>().pane_views.len(), 1);
+}
+
+#[test]
 fn pane_shortcuts_split_focus_close_and_consume_repeats() {
     let Some((mut app, window)) = fixture() else {
         return;
