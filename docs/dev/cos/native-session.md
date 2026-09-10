@@ -74,10 +74,15 @@ these anchored operations. Listener failure logs its reason and leaves TCP ready
 with neither native extension entry advertised. This applies to all bind failures;
 no runtime bind failure is treated as a fatal configuration contradiction.
 
-Protected correlation tombstones last 15 minutes after completion or removal,
-matching the correlation-retention horizon. The fixed 65,536-entry bound never
-evicts protection early: overflow conservatively omits all orphan-response
-payloads until the lost tombstones would expire. Legacy-only reserved property
+Protected correlation tombstones retain precision for 15 minutes after completion
+or removal, with a fixed 65,536-entry bound. This is not a confidentiality deadline.
+Before enqueueing protected traffic, the broker sets a sticky bit on the recipient
+connection, shared across its aliases. That connection's responses remain protected
+for its entire lifetime, including duplicates and orphans after tombstone expiry;
+no clock clears the bit. This conservatively covers correlated responses too.
+Only connection teardown discards it; pure-legacy connections never set it.
+Cache overflow also conservatively omits unknown-response payloads during its
+horizon. Legacy-only reserved property
 topics retain their prior observation behaviour; a topic name alone confers no
 native classification.
 

@@ -327,10 +327,19 @@ mod native_session_tests {
                 .unwrap()
                 .body,
         );
-        let (third, _third_rx) = mpsc::channel(8);
+        let (third, mut third_rx) = mpsc::channel(8);
         broker
             .subscribe_topic("native.snapshot", "third", third)
             .await;
+        let third_wire = third_rx.recv().await.unwrap();
+        let mut actual_sizes = vec![
+            live.to_wire().len(),
+            tcp_live.to_wire().len(),
+            tcp_replay.to_wire().len(),
+            replay.to_wire().len(),
+            third_wire.len(),
+        ];
+        let mut observed_sizes = Vec::new();
         for _ in 0..5 {
             let wire = tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
                 .await
@@ -340,9 +349,16 @@ mod native_session_tests {
             assert!(!wire.contains("broker_principal"));
             let event = bus::parse(&wire).unwrap();
             let body: serde_json::Value = serde_json::from_str(&event.body).unwrap();
+            observed_sizes.push(body["size"].as_u64().unwrap() as usize);
             assert_eq!(body["payload_omitted"], "native_session_protected");
             assert!(body["payload"].is_null());
         }
+        actual_sizes.sort_unstable();
+        observed_sizes.sort_unstable();
+        assert_eq!(
+            observed_sizes, actual_sizes,
+            "observation sizes describe destination envelopes"
+        );
     }
 
     #[tokio::test]
@@ -454,11 +470,11 @@ impl SubscriptionBroker {
         } else {
             wire.to_owned()
         };
-        let result = tx.try_send(delivery);
+        let result = tx.try_send(delivery.clone());
         if class.protected()
             && let Some(observe) = &self.observe
             && observe.is_active()
-            && let Ok(message) = bus::parse(wire)
+            && let Ok(message) = bus::parse(&delivery)
         {
             use crate::observe::{Direction, Observation, Outcome};
             let outcome = match &result {
@@ -471,7 +487,7 @@ impl SubscriptionBroker {
                     Direction::Local,
                     outcome,
                     &message,
-                    wire,
+                    &delivery,
                     message.get("id"),
                 )
                 .with_class(class),

@@ -124,7 +124,7 @@ pub(crate) async fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
 fn anchored_parent(parent: &Path, uid: u32) -> Result<std::fs::File> {
     let mut directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open("/")?;
     let mut location = PathBuf::from("/");
     for component in parent.components() {
@@ -135,7 +135,7 @@ fn anchored_parent(parent: &Path, uid: u32) -> Result<std::fs::File> {
         // protect broker-owned children; the immediate parent must be protected.
         check_directory(&directory, uid, false)?;
         let name = std::ffi::CString::new(name.as_encoded_bytes())?;
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: live directory fd and NUL-terminated component, no pointers retained.
         let mut fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         let mut created = false;
@@ -154,7 +154,12 @@ fn anchored_parent(parent: &Path, uid: u32) -> Result<std::fs::File> {
         // SAFETY: openat returned a new owned fd.
         directory = unsafe { std::fs::File::from_raw_fd(fd) };
         if created {
-            directory.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            // fchmod rejects O_PATH descriptors. Resolve the held inode via
+            // procfs, as for socket chmod; no pathname component is re-walked.
+            std::fs::set_permissions(
+                format!("/proc/self/fd/{}", directory.as_raw_fd()),
+                std::fs::Permissions::from_mode(0o755),
+            )?;
         }
         location.push(component);
         check_directory(&directory, uid, location == parent)?;
@@ -187,6 +192,30 @@ mod tests {
         std::env::temp_dir()
             .join(format!("cosmix-uds-{:032x}", rand::random::<u128>()))
             .join("bus.sock")
+    }
+
+    #[tokio::test]
+    async fn traversal_only_ancestor_requires_no_read_permission() {
+        let path = path();
+        let root = path.parent().unwrap();
+        std::fs::create_dir(root).unwrap();
+        // Owner wx, everyone else x: simulate the unprivileged traversal of
+        // a root-owned 0711 ancestor without requiring chown or setuid.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let endpoint = root.join("created/bus.sock");
+        let (listener, guard) = bind(&endpoint).await.unwrap();
+        // Also pins the traversal-only flags when this test runs as root.
+        // SAFETY: guard owns this live fd; F_GETFL takes no variadic argument.
+        assert_ne!(
+            unsafe { libc::fcntl(guard._parent.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
+            0
+        );
+        assert_eq!(std::fs::metadata(root).unwrap().mode() & 0o777, 0o311);
+        drop(listener);
+        drop(guard);
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir(root.join("created")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]

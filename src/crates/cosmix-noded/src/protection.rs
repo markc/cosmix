@@ -43,15 +43,23 @@ impl TrafficClass {
     }
 }
 
-/// Protection survives correlation consumption/disconnect for the BROKER-018
-/// retention horizon. Overflow over-protects all unknown responses until the
-/// lost tombstones would expire; it never evicts protection early.
+/// Correlation precision cache, not a confidentiality deadline. The responder's
+/// connection-lifetime sticky bit is the unconditional backstop after expiry.
+/// Overflow conservatively protects unknown responses during this cache horizon.
 #[derive(Default)]
 pub(crate) struct ResponseProtection {
     entries: std::collections::HashMap<String, std::time::Instant>,
     overflow_until: Option<std::time::Instant>,
 }
 impl ResponseProtection {
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&mut self) {
+        let past = std::time::Instant::now() - Self::HORIZON;
+        for deadline in self.entries.values_mut() {
+            *deadline = past;
+        }
+        self.overflow_until = None;
+    }
     const HORIZON: std::time::Duration = std::time::Duration::from_secs(15 * 60);
     const LIMIT: usize = 65_536;
     pub(crate) fn retain(&mut self, id: &str, class: TrafficClass) {

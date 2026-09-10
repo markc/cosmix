@@ -109,6 +109,7 @@ fn warn_drop(last_at_ms: &AtomicU64, dropped: &AtomicU64, mk: impl FnOnce(u64) -
 /// `info.name` mirrors the registry key.
 #[derive(Clone)]
 pub(crate) struct ServiceEntry {
+    protected_responses: Arc<AtomicBool>,
     traffic_class: TrafficClass,
     tx: mpsc::Sender<String>,
     info: cosmix_bus::ServiceInfo,
@@ -293,7 +294,10 @@ impl PendingResponseTable {
         }
     }
 
-    async fn response_class(&self, id: &str) -> TrafficClass {
+    async fn response_class(&self, id: &str, protected_responder: bool) -> TrafficClass {
+        if protected_responder {
+            return TrafficClass::NativeSession;
+        }
         let map = self.map.read().await;
         map.get(id)
             .map(|entry| entry.traffic_class)
@@ -334,6 +338,7 @@ impl PendingResponseTable {
 
 #[derive(Clone)]
 struct AppState {
+    protected_responses: Arc<AtomicBool>,
     native_session_endpoint: Option<PathBuf>,
     broker_epoch: HexBytes<16>,
     principal: Option<BrokerPrincipal>,
@@ -802,6 +807,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     let change_bus = crate::props::ChangeBus::new(broker.clone());
 
     let state = AppState {
+        protected_responses: Default::default(),
         broker_epoch: HexBytes(rand::random()),
         principal: None,
         native_session_endpoint: unix_socket.clone().filter(|_| unix_listener.is_some()),
@@ -1935,6 +1941,9 @@ fn invalid_bootstrap_envelope(text: &str, command: &str) -> BusMessage {
 }
 
 async fn handle_socket(socket: WebSocket, mut state: AppState, transport: TransportIdentity) {
+    // Shared with every alias registered on this connection, never with a
+    // successor connection. No clock or correlation cleanup clears this bit.
+    state.protected_responses = Default::default();
     if matches!(&transport, TransportIdentity::LocalUnix { .. }) {
         state.observe = state.observe.for_class(TrafficClass::NativeSession);
     }
@@ -2065,7 +2074,12 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         strip_principal(&mut bus_msg);
         let response_class = if bus_msg.message_type() == Some("response") {
             if let Some(id) = bus_msg.get("id") {
-                state.pending_responses.response_class(id).await
+                state
+                    .pending_responses
+                    .response_class(id, state.protected_responses.load(Ordering::Acquire))
+                    .await
+            } else if state.protected_responses.load(Ordering::Acquire) {
+                TrafficClass::NativeSession
             } else {
                 TrafficClass::Legacy
             }
@@ -3182,6 +3196,14 @@ async fn route_local(
                 msg.set(crate::subscription::BROKER_SERVICE_HEADER, origin_service);
             }
             let wire = msg.to_wire();
+            // Mark before enqueue: a fast recipient may respond immediately.
+            // Failed enqueue may conservatively protect this connection too.
+            if traffic_class.protected() {
+                reg.get(service)
+                    .expect("recipient remains locked")
+                    .protected_responses
+                    .store(true, Ordering::Release);
+            }
             let delivery = target_tx.try_send(wire.clone());
             (wire, delivery)
         };
@@ -3562,6 +3584,7 @@ async fn handle_noded_command(
                 reg.insert(
                     from.clone(),
                     ServiceEntry {
+                        protected_responses: state.protected_responses.clone(),
                         traffic_class: if state.principal.is_some() {
                             TrafficClass::NativeSession
                         } else {
@@ -5109,6 +5132,7 @@ mod tests {
         let broker = Arc::new(SubscriptionBroker::new());
         let started = Instant::now();
         AppState {
+            protected_responses: Default::default(),
             broker_epoch: super::HexBytes([1; 16]),
             principal: None,
             native_session_endpoint: None,
@@ -6387,6 +6411,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_response_stays_protected_after_tombstone_expiry() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let observe = crate::observe::ObserveManager::new(vec!["test-observer".into()]);
+        observe.spawn_drainer();
+        let (observer, mut observed) = mpsc::channel(8);
+        observe
+            .start(
+                Some("test-observer"),
+                true,
+                &observer,
+                Some("start"),
+                r#"{"body":"redacted"}"#,
+            )
+            .unwrap();
+        observed.recv().await.unwrap();
+        state.observe = observe.for_class(super::TrafficClass::NativeSession);
+        let sticky = Arc::new(AtomicBool::new(false));
+        let (target, mut received) = mpsc::channel(8);
+        state.registry.write().await.insert(
+            "responder".into(),
+            super::ServiceEntry {
+                protected_responses: sticky.clone(),
+                traffic_class: super::TrafficClass::Legacy,
+                tx: target.clone(),
+                info: Default::default(),
+            },
+        );
+        let (caller, _caller_rx) = mpsc::channel(8);
+        let mut request = BusMessage::new()
+            .with_header("id", "request")
+            .with_header("command", "probe.echo")
+            .with_header("to", "responder");
+        super::route_local(
+            &state,
+            "responder",
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &super::SessionAdmission::default(),
+            None,
+        )
+        .await;
+        received.recv().await.unwrap();
+        assert!(
+            sticky.load(Ordering::Acquire),
+            "real delivery sets connection protection"
+        );
+        let id = request.get("id").unwrap();
+        state
+            .pending_responses
+            .take_response(id, &target)
+            .await
+            .unwrap();
+        state
+            .pending_responses
+            .protection
+            .lock()
+            .unwrap()
+            .expire_for_test();
+        assert_eq!(
+            state.pending_responses.response_class(id, false).await,
+            super::TrafficClass::Legacy,
+            "cache has expired; a fresh legacy connection has no sticky authority"
+        );
+        let class = state
+            .pending_responses
+            .response_class(id, sticky.load(Ordering::Acquire))
+            .await;
+        assert!(class.protected());
+        let late = BusMessage::new()
+            .with_header("type", "response")
+            .with_header("id", id)
+            .with_header("command", "probe.echo")
+            .with_body("POST-EXPIRY-SECRET");
+        observe
+            .for_class(class)
+            .observe(crate::observe::Observation::canonical(
+                crate::observe::Direction::Local,
+                crate::observe::Outcome::Rejected,
+                &late,
+                Some(id),
+            ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!event.contains("POST-EXPIRY-SECRET"));
+        assert!(event.contains("native_session_protected"));
+    }
+
+    #[tokio::test]
     async fn mesh_delivery_identity_requires_proof_owner_and_direct_source() {
         for case in [
             "valid",
@@ -6424,6 +6540,7 @@ mod tests {
                 registry.insert(
                     "bridge-beta".into(),
                     super::ServiceEntry {
+                        protected_responses: Default::default(),
                         traffic_class: super::TrafficClass::Legacy,
                         tx: if case == "wrong-owner" {
                             other
@@ -6436,6 +6553,7 @@ mod tests {
                 registry.insert(
                     "desktop".into(),
                     super::ServiceEntry {
+                        protected_responses: Default::default(),
                         traffic_class: super::TrafficClass::Legacy,
                         tx: target,
                         info: Default::default(),
@@ -6497,6 +6615,7 @@ mod tests {
             registry.insert(
                 "bridge-beta".into(),
                 super::ServiceEntry {
+                    protected_responses: Default::default(),
                     traffic_class: super::TrafficClass::Legacy,
                     tx: caller.clone(),
                     info: Default::default(),
@@ -6505,6 +6624,7 @@ mod tests {
             registry.insert(
                 "desktop".into(),
                 super::ServiceEntry {
+                    protected_responses: Default::default(),
                     traffic_class: super::TrafficClass::Legacy,
                     tx: target,
                     info: Default::default(),
