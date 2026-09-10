@@ -44,6 +44,7 @@ MCP tools exposed:
 | Group | Tools |
 |---|---|
 | Bus | `bus_call`, `bus_list_services`, `bus_node_info`, `bus_list_peers`, `noded_ping` |
+| Term | `term_list`, `term_snapshot`, `term_type`, `term_tab`, `term_pane` |
 | Logs | `log_tail`, `log_search` |
 | Knowledge | `context_search`, `index_workspace`, `knowledge_digest`, `knowledge_brief` |
 | Skills | `skills_retrieve`, `skills_store`, `skills_refine`, `skills_list`, `skills_delete`, `skills_graduate` |
@@ -54,6 +55,41 @@ MCP tools exposed:
 The knowledge protocol in practice: `context_search` before a non-trivial task
 → do the work → `skills_store` what you learned → `skills_refine` if you used a
 retrieved skill → `*_feedback` to score the chunks you used.
+
+## Term diagnostic tools
+
+Since cosmix-mcp 0.5.0, five dedicated tools drive CosMix Term over ABP.
+The self-asserted `term` service is diagnostic pending authenticated
+per-instance identity (P0-I). These tools reuse the Bus client and central
+per-call metrics. Replies are bounded to 1 MiB.
+
+| Tool | Arguments | Behaviour |
+|---|---|---|
+| `term_list` | `{}` | Read-only JSON arrays `tabs` and `panes`: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic. |
+| `term_snapshot` | `{}` | Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings. |
+| `term_type` | `{"text":"echo hello\n"}` | DIAGNOSTIC keyboard-encoder input; newline is Enter. Not the authenticated input API. |
+| `term_tab` | `{"op":"new"}`, `{"op":"select","id":1}`, `{"op":"close","id":1}` | Create/select/close a tab; closing the last tab quits. |
+| `term_pane` | `{"op":"split","dir":"h"}`, `{"op":"select","id":1}`, `{"op":"close"}` | Split/select/close active-tab panes; closing the last pane closes the tab. |
+
+The MCP schemas use String for text/op, optional u64 for id, and optional
+String for dir. Invalid operations, missing required ids/directions, and
+invalid split directions return errors without an ABP call.
+
+Term 0.3.0 changes every `term.*` request to a JSON object:
+
+| Bus verb | JSON body |
+|---|---|
+| `term.snapshot`, `term.tabs`, `term.tab.new`, `term.panes`, `term.pane.close` | `{}` |
+| `term.type` | `{"text":"..."}` |
+| `term.tab.select`, `term.tab.close`, `term.pane.select` | `{"id":1}` (non-negative u64 integer) |
+| `term.pane.split` | `{"dir":"h"}` (h, horizontal, v, vertical) |
+
+An empty body means `{}` only for no-argument verbs. The 8192-byte request
+limit includes JSON syntax and escaping (8181 plain ASCII text bytes fit).
+Non-JSON, non-object bodies, unknown fields, missing/wrongly typed values,
+invalid directions and oversized requests fail before mutation (ABP rc=10).
+Existing reply shapes, verb names, INFO/HELP diagnostic identity gating and
+keyboard encoding remain unchanged. Raw-body callers must migrate.
 
 ## Where it fits
 

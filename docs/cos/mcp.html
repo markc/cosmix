@@ -474,6 +474,7 @@ lifecycle is Claude Code's.</p>
 <p>MCP tools exposed:</p>
 <table><thead><tr><th>Group</th><th>Tools</th></tr></thead><tbody>
 <tr><td>Bus</td><td><code>bus_call</code>, <code>bus_list_services</code>, <code>bus_node_info</code>, <code>bus_list_peers</code>, <code>noded_ping</code></td></tr>
+<tr><td>Term</td><td><code>term_list</code>, <code>term_snapshot</code>, <code>term_type</code>, <code>term_tab</code>, <code>term_pane</code></td></tr>
 <tr><td>Logs</td><td><code>log_tail</code>, <code>log_search</code></td></tr>
 <tr><td>Knowledge</td><td><code>context_search</code>, <code>index_workspace</code>, <code>knowledge_digest</code>, <code>knowledge_brief</code></td></tr>
 <tr><td>Skills</td><td><code>skills_retrieve</code>, <code>skills_store</code>, <code>skills_refine</code>, <code>skills_list</code>, <code>skills_delete</code>, <code>skills_graduate</code></td></tr>
@@ -484,6 +485,34 @@ lifecycle is Claude Code's.</p>
 <p>The knowledge protocol in practice: <code>context_search</code> before a non-trivial task
 → do the work → <code>skills_store</code> what you learned → <code>skills_refine</code> if you used a
 retrieved skill → <code>*_feedback</code> to score the chunks you used.</p>
+<h2 id="term-diagnostic-tools">Term diagnostic tools</h2>
+<p>Since cosmix-mcp 0.5.0, five dedicated tools drive CosMix Term over ABP.
+The self-asserted <code>term</code> service is diagnostic pending authenticated
+per-instance identity (P0-I). These tools reuse the Bus client and central
+per-call metrics. Replies are bounded to 1 MiB.</p>
+<table><thead><tr><th>Tool</th><th>Arguments</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td><code>term_list</code></td><td><code>{}</code></td><td>Read-only JSON arrays <code>tabs</code> and <code>panes</code>: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic.</td></tr>
+<tr><td><code>term_snapshot</code></td><td><code>{}</code></td><td>Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings.</td></tr>
+<tr><td><code>term_type</code></td><td><code>{"text":"echo hello\n"}</code></td><td>DIAGNOSTIC keyboard-encoder input; newline is Enter. Not the authenticated input API.</td></tr>
+<tr><td><code>term_tab</code></td><td><code>{"op":"new"}</code>, <code>{"op":"select","id":1}</code>, <code>{"op":"close","id":1}</code></td><td>Create/select/close a tab; closing the last tab quits.</td></tr>
+<tr><td><code>term_pane</code></td><td><code>{"op":"split","dir":"h"}</code>, <code>{"op":"select","id":1}</code>, <code>{"op":"close"}</code></td><td>Split/select/close active-tab panes; closing the last pane closes the tab.</td></tr>
+</tbody></table>
+<p>The MCP schemas use String for text/op, optional u64 for id, and optional
+String for dir. Invalid operations, missing required ids/directions, and
+invalid split directions return errors without an ABP call.</p>
+<p>Term 0.3.0 changes every <code>term.*</code> request to a JSON object:</p>
+<table><thead><tr><th>Bus verb</th><th>JSON body</th></tr></thead><tbody>
+<tr><td><code>term.snapshot</code>, <code>term.tabs</code>, <code>term.tab.new</code>, <code>term.panes</code>, <code>term.pane.close</code></td><td><code>{}</code></td></tr>
+<tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td></tr>
+<tr><td><code>term.tab.select</code>, <code>term.tab.close</code>, <code>term.pane.select</code></td><td><code>{"id":1}</code> (non-negative u64 integer)</td></tr>
+<tr><td><code>term.pane.split</code></td><td><code>{"dir":"h"}</code> (h, horizontal, v, vertical)</td></tr>
+</tbody></table>
+<p>An empty body means <code>{}</code> only for no-argument verbs. The 8192-byte request
+limit includes JSON syntax and escaping (8181 plain ASCII text bytes fit).
+Non-JSON, non-object bodies, unknown fields, missing/wrongly typed values,
+invalid directions and oversized requests fail before mutation (ABP rc=10).
+Existing reply shapes, verb names, INFO/HELP diagnostic identity gating and
+keyboard encoding remain unchanged. Raw-body callers must migrate.</p>
 <h2 id="where-it-fits">Where it fits</h2>
 <p>Depends on the Bus client from <a href="https://github.com/markc/cosmix">bus</a>
 (<code>cosmix-lib-client</code>), <code>cosmix-lib-skills</code> for the skill loop, and the embedded

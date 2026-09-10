@@ -317,6 +317,117 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
 
 // --- Bus tool params ---
 
+// VERIFY: dedicated Term MCP argument schemas.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TermTypeParams {
+    /// Diagnostic synthetic input; max 8192 UTF-8 bytes including JSON envelope on the wire.
+    text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TermTabParams {
+    /// Operation: new, select, or close.
+    op: String,
+    /// Required for select and close.
+    id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TermPaneParams {
+    /// Operation: split, select, or close (active pane).
+    op: String,
+    /// Required for split: h, v, horizontal, or vertical.
+    dir: Option<String>,
+    /// Required for select.
+    id: Option<u64>,
+}
+
+fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value), String> {
+    match p.op.as_str() {
+        "new" => Ok(("term.tab.new", serde_json::json!({}))),
+        "select" | "close" => {
+            let id = p.id.ok_or("id is required for select/close")?;
+            Ok((
+                if p.op == "select" {
+                    "term.tab.select"
+                } else {
+                    "term.tab.close"
+                },
+                serde_json::json!({"id": id}),
+            ))
+        }
+        _ => Err("op must be new|select|close".into()),
+    }
+}
+
+fn term_pane_request(p: TermPaneParams) -> Result<(&'static str, serde_json::Value), String> {
+    match p.op.as_str() {
+        "close" => Ok(("term.pane.close", serde_json::json!({}))),
+        "select" => Ok((
+            "term.pane.select",
+            serde_json::json!({"id": p.id.ok_or("id is required for select")?}),
+        )),
+        "split" => {
+            let dir = p.dir.ok_or("dir is required for split")?;
+            if !matches!(dir.as_str(), "h" | "v" | "horizontal" | "vertical") {
+                return Err("dir must be h|v|horizontal|vertical".into());
+            }
+            Ok(("term.pane.split", serde_json::json!({"dir": dir})))
+        }
+        _ => Err("op must be split|select|close".into()),
+    }
+}
+
+const TERM_REPLY_MAX: usize = 1_048_576;
+
+fn term_reply(value: serde_json::Value) -> Result<String, String> {
+    let text = match value {
+        serde_json::Value::String(text) => text,
+        value => value.to_string(),
+    };
+    if text.len() > TERM_REPLY_MAX {
+        return Err("Term reply exceeds 1048576 bytes".into());
+    }
+    Ok(text)
+}
+
+// Preserve titles with spaces; numeric fields follow the final " cols=" marker.
+fn term_listing(text: &str, tabs: bool) -> Result<serde_json::Value, String> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut row = serde_json::Map::new();
+        let fields = if tabs {
+            let (prefix, rest) = line
+                .split_once(" title=")
+                .ok_or("invalid Term tab listing")?;
+            let (title, suffix) = rest
+                .rsplit_once(" cols=")
+                .ok_or("invalid Term tab dimensions")?;
+            row.insert("title".into(), serde_json::json!(title));
+            format!("{prefix} cols={suffix}")
+        } else {
+            line.to_string()
+        };
+        for field in fields.split_whitespace() {
+            let (key, value) = field.split_once('=').ok_or("invalid Term listing field")?;
+            let value = if key == "active" {
+                serde_json::json!(
+                    value
+                        .parse::<bool>()
+                        .map_err(|_| "invalid Term active flag")?
+                )
+            } else {
+                serde_json::from_str::<serde_json::Number>(value)
+                    .map(serde_json::Value::Number)
+                    .map_err(|_| "invalid Term listing number")?
+            };
+            row.insert(key.into(), value);
+        }
+        rows.push(serde_json::Value::Object(row));
+    }
+    Ok(serde_json::Value::Array(rows))
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BusCallParams {
     /// Target service name (e.g. "edit", "view", "mon")
@@ -539,6 +650,82 @@ impl CosmixMcp {
 #[tool_router]
 impl CosmixMcp {
     // ---- Bus tools ----
+
+    /// Read-only tab and active-tab pane listing (ids, active flags, dimensions, pids,
+    /// geometry) from CosMix Term over ABP. Sequential reads are not atomic.
+    /// The term service is a self-asserted diagnostic surface pending authenticated
+    /// per-instance identity (P0-I).
+    #[tool]
+    async fn term_list(&self) -> String {
+        let result: Result<String, String> = async {
+            let noded = self.noded().await?;
+            let tabs = term_reply(noded.call("term", "term.tabs", serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let panes = term_reply(noded.call("term", "term.panes", serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            term_reply(serde_json::json!({"tabs": term_listing(&tabs, true)?, "panes": term_listing(&panes, false)?}))
+        }.await;
+        result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
+    }
+
+    /// Read-only active screen text, dimensions, cursor, pid and diagnostic timings
+    /// from CosMix Term over ABP (reply bounded to 1 MiB).
+    /// The term service is a self-asserted diagnostic surface pending authenticated
+    /// per-instance identity (P0-I).
+    #[tool]
+    async fn term_snapshot(&self) -> String {
+        self.term_request("term.snapshot", serde_json::json!({}))
+            .await
+    }
+
+    /// DIAGNOSTIC synthetic input to CosMix Term over ABP, not the authenticated
+    /// input API. The term service is a self-asserted diagnostic surface pending
+    /// authenticated per-instance identity (P0-I). Text uses the keyboard encoder;
+    /// newline is Enter. JSON request is limited to 8192 bytes.
+    #[tool]
+    async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> String {
+        // VERIFY: MCP Term tool is a thin structured-argument ABP translation.
+        self.term_request("term.type", serde_json::json!({"text": p.text}))
+            .await
+    }
+
+    /// Create, select or close a tab in CosMix Term over ABP; select/close require id.
+    /// Closing the last tab quits. The term service is a self-asserted diagnostic
+    /// surface pending authenticated per-instance identity (P0-I).
+    #[tool]
+    async fn term_tab(&self, Parameters(p): Parameters<TermTabParams>) -> String {
+        match term_tab_request(p) {
+            Ok((verb, args)) => self.term_request(verb, args).await,
+            Err(e) => format!("ERROR: {e}"),
+        }
+    }
+
+    /// Split, select or close the active pane in CosMix Term over ABP.
+    /// Split requires dir, select requires id; closing the last pane closes its tab.
+    /// The term service is a self-asserted diagnostic surface pending authenticated
+    /// per-instance identity (P0-I).
+    #[tool]
+    async fn term_pane(&self, Parameters(p): Parameters<TermPaneParams>) -> String {
+        match term_pane_request(p) {
+            Ok((verb, args)) => self.term_request(verb, args).await,
+            Err(e) => format!("ERROR: {e}"),
+        }
+    }
+
+    async fn term_request(&self, verb: &str, args: serde_json::Value) -> String {
+        if args.to_string().len() > 8192 {
+            return "ERROR: request exceeds 8192 bytes".into();
+        }
+        let result: Result<String, String> = async {
+            let noded = self.noded().await?;
+            term_reply(
+                noded
+                    .call("term", verb, args)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        }
+        .await;
+        result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
+    }
 
     /// Call an Bus command on a cosmix service and return the response.
     #[tool]
@@ -2443,6 +2630,104 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn term_translations_and_listing() {
+        use super::*;
+        for (op, verb) in [
+            ("new", "term.tab.new"),
+            ("select", "term.tab.select"),
+            ("close", "term.tab.close"),
+        ] {
+            let (actual, args) = term_tab_request(TermTabParams {
+                op: op.into(),
+                id: Some(7),
+            })
+            .unwrap();
+            assert_eq!(actual, verb);
+            assert_eq!(
+                args,
+                if op == "new" {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"id":7})
+                }
+            );
+        }
+        for op in ["select", "close", "invalid"] {
+            assert!(
+                term_tab_request(TermTabParams {
+                    op: op.into(),
+                    id: None
+                })
+                .is_err()
+            );
+        }
+        for dir in ["h", "v", "horizontal", "vertical"] {
+            assert_eq!(
+                term_pane_request(TermPaneParams {
+                    op: "split".into(),
+                    dir: Some(dir.into()),
+                    id: None
+                })
+                .unwrap(),
+                ("term.pane.split", serde_json::json!({"dir":dir}))
+            );
+        }
+        for (op, dir) in [
+            ("split", None),
+            ("split", Some("bad")),
+            ("select", None),
+            ("invalid", None),
+        ] {
+            assert!(
+                term_pane_request(TermPaneParams {
+                    op: op.into(),
+                    dir: dir.map(String::from),
+                    id: None
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(
+            term_pane_request(TermPaneParams {
+                op: "close".into(),
+                dir: None,
+                id: None
+            })
+            .unwrap(),
+            ("term.pane.close", serde_json::json!({}))
+        );
+        assert_eq!(
+            term_pane_request(TermPaneParams {
+                op: "select".into(),
+                dir: None,
+                id: Some(9)
+            })
+            .unwrap(),
+            ("term.pane.select", serde_json::json!({"id":9}))
+        );
+        let tabs = term_listing(
+            "id=1 active=true title=Mix shell cols=80 rows=24 child_pid=123",
+            true,
+        )
+        .unwrap();
+        assert_eq!(tabs[0]["title"], "Mix shell");
+        assert_eq!(tabs[0]["active"], true);
+        assert_eq!(tabs[0]["cols"], 80);
+        let panes = term_listing(
+            "id=2 active=false cols=40 rows=24 child_pid=124 x=0 y=1.5 w=320 h=480",
+            false,
+        )
+        .unwrap();
+        assert_eq!(panes[0]["y"], 1.5);
+        assert!(term_listing("bad", true).is_err());
+        assert_eq!(
+            term_reply(serde_json::json!("screen\ntext")).unwrap(),
+            "screen\ntext"
+        );
+        assert!(term_reply(serde_json::json!("x".repeat(TERM_REPLY_MAX + 1))).is_err());
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -37,18 +37,25 @@ shortcuts are intercepted before terminal input. Open menus suspend PTY input.
 Closing the active tab selects its right neighbour, or the left neighbour at
 the end. Closing the last tab quits after bounded terminal shutdown.
 
-The diagnostic `term` Bus service accepts body-only numeric IDs for
+The diagnostic `term` Bus service accepts JSON objects, including `{"id":42}` for
 `term.tab.select` and `term.tab.close`. `term.tab.new` opens and activates a tab;
 `term.tabs` lists stable IDs, selection, titles, dimensions and child PIDs.
 `term.snapshot` and `term.type` target the active pane. `term.panes` lists the
 active tab's pane IDs, active flags, cached dimensions/PIDs and logical x/y/w/h
-(zero geometry until layout). `term.pane.split` accepts body-only
-`h|horizontal|v|vertical`; `term.pane.select` accepts a numeric pane ID belonging
+(zero geometry until layout). `term.pane.split` accepts
+`{"dir":"h"}` (also horizontal, v, vertical); `term.pane.select` accepts `{"id":42}` belonging
 to the active tab; `term.pane.close` closes its active pane. IDs are monotonic
 across tabs and never reused in the process. Pane verbs retain the diagnostic
 P0-I identity gate. Requests remain limited
 to 8192 bytes and replies to a two-second timeout. This self-asserted service
 is diagnostic only: authenticated per-instance identity remains gated on P0-I.
+
+No-argument verbs require `{}` (an empty body is also accepted).
+`term.type` requires `{"text":"echo hello\n"}`; the JSON envelope and escaping
+count towards the 8192-byte request cap. Invalid JSON, non-object bodies,
+unexpected fields and missing or wrongly typed arguments are rejected before
+mutation. IDs are non-negative u64 integers. This breaks raw-body callers as
+of Term 0.3.0. See the [MCP Term contracts](../../../../docs/cos/mcp.md).
 
 Headless tab tests launch real Mix children where `/opt/cosmix/bin/mix` exists
 and print an explicit skip otherwise. The existing terminal core tests remain
