@@ -1,9 +1,9 @@
 ---
 title: Property model, validation and mutation
 chapter: 6
-version: 0.2.2
+version: 0.2.3
 status: draft
-date: 2026-09-05
+date: 2026-09-10
 ---
 
 # Property model, validation and mutation
@@ -276,6 +276,72 @@ semantic changes require an explicit service-version compatibility decision.
 Namespace migration follows chapter 07. Cross-node world aggregation, generic
 activity retention, a service-wide schema registry and dynamic watch predicates
 remain proposed, not implied features.
+
+## 8. Native session authority (intended)
+
+PROP-024/025 are proposed implementation contracts for the accepted native
+session direction, not verified-source claims. They extend PROP-013/018 for
+profile participants; existing services retain their checked behaviour.
+
+**PROP-024 — Authenticated session context (intended).** On an authenticated
+native-session broker connection, `PeerIdentity.unix_uid` and `unix_gid` MUST
+come only from the trusted BUS-014 request context. Supplementary groups remain
+unknown unless separately verified. `PeerIdentity` MUST support an optional
+typed session identity containing broker epoch, record/instance/incarnation,
+parent/pane scope, role, binding generation, capabilities and remaining-lease delta
+from that context. It MUST NOT overload `signed_ident`, infer scope from
+`service_name`, or accept body/header assertions as verified identity. Absence
+of the optional context preserves legacy construction; it grants no native
+session authority. Remote node assurance MUST NOT become a local Unix UID.
+
+The property owner MUST share BROKER-023's policy and current target checks
+with its verb handlers. `AuthPolicy` remains a synchronous capability mapping;
+an eligible unexpired cached lease check satisfies the lease requirement.
+Fresh checks run outside resolution per lease window or on lifecycle gap;
+resolution MUST NOT block on a Bus call and grants no authority without the
+required cache. Once available, the request may be resolved again.
+Pane scope and live generation MUST also be checked at mutation commitment,
+using pane-scoped namespaces or an equivalent owner gate. A broad namespace
+write capability MUST NOT bypass these checks. Policy belongs to the target
+Term and MUST be read from the recipient's own record, never a caller stamp.
+Default-open ambient same-UID owner access is unattended, including an independent
+connection from a child; restricted mode requires explicit grants. Read state, read contents,
+input, execute, layout and termination rights remain distinct. Schema visibility,
+public metadata and attribution fallbacks are not proof of authority. Existing
+property capability token comparisons and PROP-015 numeric errors remain intact;
+session bootstrap errors use BUS-017 rather than replacing property errors.
+
+**PROP-025 — Private watch and observation (intended).** Native-session private
+watch/audit grants MUST bind the recipient's verified UID, broker epoch,
+connection and authorised namespace/pane scope, plus record, incarnation and
+binding generation when session-bound. A verified ambient owner need not
+register a service or session record to watch under default-open policy.
+For a bound caller the owner MUST establish BROKER-020's conservative local
+deadline through a cached unexpired check or a fresh `lease.check` completed
+outside resolution before installing delivery. The broker MUST
+register the watch's lifecycle dependency atomically with installation; owners
+MUST process BROKER-022 notices idempotently and revoke affected watches. On a
+sticky lifecycle-gap event they MUST invalidate cached lifecycle authority and
+resynchronise outside resolution before relying on it. Notices and gaps are
+best-effort accelerators, not acknowledgement-driven delivery guarantees.
+Revocation, connection loss or that deadline MUST invalidate delivery no later
+than the recorded deadline, unless a fresh stamped request plus correlated
+check refreshes it. Merely receiving a delta, broker renew, or a replay does
+not refresh the watch. Ambient owner watches have no caller lease and end on
+connection loss or explicit owner revocation. Reconnect requires renewed
+authorisation before replay or live events. Owners and recipients MUST reject stale queued authority;
+retained publisher context is historical attribution, not a live capability.
+General direct subscriptions MUST NOT bypass the owner check.
+
+Private read/write responses, watch/audit requests, replay snapshots and live
+events MUST retain broker-owned protected classification through routing and
+retention. Their payloads MUST NOT enter tap, observe payload capture or general
+diagnostic logs, even for an allowlisted observer; BROKER-024 permits only its
+bounded metadata fields. This rule is additional to schema secret redaction:
+terminal text may contain secrets without a secret-marked field. Public flat
+summaries remain possible only with an explicit non-sensitive owner contract;
+they MUST NOT republish protected contents. No delivery or confidentiality
+guarantee is established merely by adding fields to `PeerIdentity`.
 
 ## Evidence and validation
 

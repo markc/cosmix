@@ -1,9 +1,9 @@
 ---
 title: Managed Daemon Identity Profile — Retained Contract
 chapter: 10a
-version: 0.2.1
+version: 0.2.2
 status: draft
-date: 2026-09-05
+date: 2026-09-10
 ---
 
 # Managed Daemon Identity Profile — Retained Contract
@@ -15,6 +15,22 @@ This is intended normative detail retained during refactoring, not a fresh attes
 Examples and verification pseudocode are descriptive legacy material, not scripts to execute. Production paths use `/opt/cosmix/bin`; where a legacy example conflicts with that convention, the discrepancy is retained for explicit correction rather than silently authorising an alternate install. Cross-references to other legacy chapter numbers resolve through the migration map. The distribution surveys and change history are retained in the private historical snapshot, not republished as current platform facts.
 
 ## 1. Introduction
+
+**DAEMON-PROFILE-002 — Dynamic session boundary (intended).** Dynamic
+user-session identities are a separate, accepted design direction, with
+implementation pending under the proposed
+[`native-session: 1` wire profile](04-bus-wire.md#native-session-wire-profile-intended)
+and [broker contract](05-broker-topics.md#native-session-identity-intended).
+They MUST be broker-allocated under a kernel-verified user principal and
+generation-qualified Term/pane ownership. They are not fixed daemon identities,
+MUST NOT allocate POSIX accounts from the 600–699 citizen band, and MUST NOT
+change this registry or existing managed serve-mode identities. Default-open
+same-UID owner trust and opt-in restricted grants-only access follow BROKER-023.
+Policy belongs to the target Term, not the caller or a PID-derived identity.
+Version 1 lifetime is Term-owned, not a verified login-session root.
+The parent key has Term-process lifetime and no secret store in version 1:
+a restarted Term MUST restart its children; broker restart permits in-place
+recovery only while the original Term process and keys survive.
 
 **Registry reconciliation — version 1.4.6.** The
 [accepted authority handover](authority-handover.md) reconciles the missing

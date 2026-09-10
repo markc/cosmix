@@ -569,7 +569,202 @@ parser alone is not a message-byte gate. Topic payloads have a separate
 Sensitive operations MUST define redaction and protected transport explicitly;
 the textual format itself offers no confidentiality. WireGuard membership
 does not validate request content or replace per-command authorisation.</p>
+<h2 id="native-session-wire-profile-intended">Native session wire profile (intended)</h2>
+<p>The <code>native-session: 1</code> direction is accepted; BUS-013–017 are proposed
+contracts awaiting implementation and acceptance evidence. They do not describe
+the checked source above. Chapter <a href="/spec/05-broker-topics#native-session-identity-intended">05</a>
+defines commands, identity state and policy.</p>
+<p><strong>BUS-013 — Local transport (intended).</strong> The profile MUST carry ABP in
+WebSocket text messages over a Unix-domain <code>SOCK_STREAM</code> connection, using an
+HTTP/1.1 WebSocket upgrade at <code>/ws</code>. One text message is one ABP envelope;
+BUS-011 limits apply. Binary messages MUST be refused. This is a persistent
+broker ingress, distinct from the existing EOF-framed Unix helper in BUS-001;
+neither helper nor a separate control protocol substitutes for this ingress.
+The broker MUST obtain UID, primary GID and peer PID using <code>SO_PEERCRED</code> on
+the accepted socket. Caller-supplied provenance is not kernel identity.
+<code>SO_PEERCRED</code> is a connect-time snapshot: later credential changes, including
+setuid, do not retroactively change that connection's principal. This boundary
+is accepted; obtaining a new principal requires a new connection.</p>
+<p>The listener path MUST resolve as <code>cosmix_path(Run)/noded/bus.sock</code>. A system
+unit MUST pin <code>COSMIX_RUN</code> to its system runtime root (<code>%t/cosmix</code>); node
+configuration key <code>noded.unix_socket</code> MUST publish the absolute endpoint path.
+Clients MUST use that key when present, otherwise <code>/run/cosmix/noded/bus.sock</code>;
+they MUST NOT resolve the system socket through their own XDG runtime directory.
+The directory MUST be traversable
+by local users and writable only by the broker account or root; socket mode
+is <code>0666</code>. Clients MUST verify protected endpoint ownership and server peer
+credentials against the configured broker account before trusting metadata.
+Explicitly configured development endpoints require the same ownership checks.
+No fixed numeric broker UID is assumed.</p>
+<p>The broker MUST advertise <code>"native-session":"1"</code> alongside BROKER-005's
+extension entries in <code>noded.ping</code> only when this profile is available. An
+advertisement returned over TCP does not make TCP eligible: Unix ingress is
+mandatory for this profile. Grant-bearing clients MUST
+require it and MUST NOT downgrade to TCP on any authentication failure. Legacy
+TCP/WebSocket and D2 mesh clients remain supported without verified-UID authority.
+Headless nodes use the same system listener; no desktop or per-user broker is
+required. Shared wire/client types MUST NOT depend on cos-side configuration.</p>
+<p><strong>BUS-014 — Trusted principal envelope (intended).</strong> <code>broker_principal</code> is a
+reserved, lowercase header containing one compact JSON object, at most 4096
+UTF-8 bytes. A broker MUST strip every ASCII-case-insensitive spelling of this
+header from untrusted input before stamping its own value. This applies to
+requests, correlated responses, events and inner topic envelopes at every
+delivery boundary; it MUST preserve BROKER-003/004 and responder-channel checks.
+Mesh ingress MUST NOT import a claimed remote Unix UID as local authority.
+Unverified TCP/mesh deliveries MUST omit this header. A direct broker control
+reply is authenticated by its endpoint and pending-response association, not
+by a fabricated Unix caller stamp.</p>
+<p>Required object fields are <code>version:1</code>, <code>assurance</code> (<code>local-unix</code> or
+<code>session-bound</code>), <code>owner_node</code> (configured node label), <code>unix_uid</code>, <code>unix_gid</code>
+(u32 JSON integers), <code>peer_pid</code> (u32 integer, diagnostic only), <code>broker_epoch</code>
+and <code>connection_id</code> (BUS-016 identifiers), and <code>session</code> (null for <code>local-unix</code>).
+For <code>session-bound</code>, <code>session</code> contains the BROKER-021 identity record's
+<code>record_id</code>, <code>instance_id</code>, <code>incarnation</code>, <code>role</code>, <code>parent_instance</code>,
+<code>parent_incarnation</code>, <code>pane_id</code>, <code>pane_generation</code>, <code>binding_generation</code>,
+<code>capabilities</code>, and <code>lease_remaining_ms</code> with BUS-016's u64 decimal-string
+encoding. The broker MUST compute remaining milliseconds immediately before
+delivery enqueue, as the minimum across the record and its live ancestors,
+clamped at zero. A recipient MUST NOT turn this into a fresh
+lease by adding it to receive time: queue delay could extend authority.
+BROKER-020's correlated lease check provides the conservative local deadline
+across time namespaces. Connection <code>assurance</code> is distinct from discovery's
+<code>record_assurance</code> (BROKER-021).
+Supplementary groups MUST remain unknown unless separately verified.</p>
+<p>Recipients MUST require exactly one canonical header, a supported version and
+valid typed fields on an authenticated broker transport before exposing a
+trusted request context. Missing, malformed or duplicate-case metadata MUST NOT
+gain authority. Future unknown object fields MAY be ignored. Discovery records,
+raw JSON deserialisation and retained publisher stamps do not establish current
+mutation authority; recipients MUST check live scope and generation.
+Retained topic deliveries MUST preserve publish-time principal attribution,
+not stamp the subscriber as publisher or refresh an expired publisher lease.</p>
+<p><strong>BUS-015 — Bootstrap validation (intended).</strong> Every <code>noded.session.*</code> request
+MUST use <code>bus: 1</code>, <code>type: request</code>, <code>to: noded</code>, a non-empty ASCII token
+<code>id</code> of at most 128 bytes, <code>native-session: 1</code>, and an exact command from
+BROKER-018. ID bytes MUST be in <code>0x21..0x7e</code> (no whitespace); retained mutations
+additionally require the monotonically increasing decimal ID in BROKER-018.
+Arguments MUST be a JSON object in the body. Requests MUST be
+bounded to 16 KiB total, with at most 32 header lines and 16 levels of JSON
+nesting, before unbounded allocation. Parsing MUST reject missing envelope
+delimiters, malformed headers, duplicate header keys (including ASCII case
+variants), duplicate JSON members at any depth, unknown command arguments,
+invalid UTF-8, trailing non-whitespace JSON, and wrong types or encodings.
+Only <code>bus</code>, <code>type</code>, <code>to</code>, <code>id</code>, <code>native-session</code>, <code>command</code> and optional <code>from</code>
+are accepted request headers after BUS-014 stripping. <code>from</code> has no authority.
+Responses MUST explicitly carry correlated <code>id</code>, <code>command</code>, <code>type: response</code>,
+<code>bus: 1</code>, <code>native-session: 1</code> and <code>rc</code>; absent <code>rc</code> is not success here.
+These gates MUST run before identity/authority mutation; an identifiable failed
+prove still consumes only its own connection's challenge slot (BROKER-019).
+Conformance REQUIRES a
+duplicate-preserving parse or raw pre-scan in <code>cosmix-lib-bus</code>: the existing
+BTreeMap header parser and last-wins JSON parsing destroy duplicate evidence,
+which a validation layer above them cannot recover. Nullable schema fields
+MUST be present with JSON null when absent; omission is an error. A Serde
+<code>Option&lt;T&gt;</code> default accepting a missing member does not satisfy this contract.
+Legacy commands retain their existing validation contract.</p>
+<p><strong>BUS-016 — Proof encoding (intended).</strong> Keys are Ed25519 public keys (32 raw
+bytes); proofs are standard Ed25519 signatures (64 bytes), not Ed25519ph.
+Verifiers MUST reject invalid/non-canonical encodings and weak/small-order
+keys or signatures using strict verification. Wire byte strings use lowercase
+hexadecimal with exactly two characters per byte, without prefixes or whitespace.
+All identifier fields below are independent random 16-byte values, encoded as
+32 hex characters; the nonce is 32 random bytes. Optional identifiers are
+present and JSON null when absent, never omitted, empty or an all-zero sentinel.
+Generation,
+pane-ID and millisecond fields are u64 values encoded in JSON as canonical
+decimal strings (<code>0</code> or a nonzero digit followed by digits). UIDs are u32 JSON
+integers. Generation counters begin at 1 and MUST NOT wrap; an unattached
+pending record uses binding generation <code>0</code> as specified by BROKER-020.</p>
+<p>The signed transcript is the following concatenation, in exactly this order.
+<code>u16/u32/u64</code> mean unsigned big-endian integers; <code>LP(s)</code> means a u16 UTF-8 byte
+length followed by exactly those bytes; no NUL or newline is added. <code>OPT16(x)</code>
+is byte <code>00</code> for null, otherwise byte <code>01</code> followed by 16 decoded bytes.
+<code>OPT64(x)</code> uses the same presence byte followed by a u64 when present.
+<code>OPT32(x)</code> uses the same presence byte followed by 32 decoded bytes when present.</p>
+<table><thead><tr><th>Order</th><th>Field</th><th>Bytes</th></tr></thead><tbody>
+<tr><td>1</td><td>Domain/version</td><td>ASCII <code>cosmix.native-session.proof</code> followed by byte <code>00</code>, then u16 <code>1</code></td></tr>
+<tr><td>2</td><td><code>purpose</code></td><td>One byte: <code>01</code> = <code>enrol</code>, <code>02</code> = <code>resume</code></td></tr>
+<tr><td>3</td><td><code>broker_epoch</code></td><td>16 decoded bytes</td></tr>
+<tr><td>4</td><td><code>connection_id</code></td><td>16 decoded bytes</td></tr>
+<tr><td>5</td><td><code>challenge_id</code></td><td>16 decoded bytes</td></tr>
+<tr><td>6</td><td><code>nonce</code></td><td>32 decoded bytes</td></tr>
+<tr><td>7</td><td><code>grant_id</code></td><td>OPT16; required for enrol, null for resume</td></tr>
+<tr><td>8</td><td><code>record_id</code></td><td>16 decoded bytes</td></tr>
+<tr><td>9</td><td><code>instance_id</code></td><td>16 decoded bytes</td></tr>
+<tr><td>10</td><td><code>incarnation</code></td><td>16 decoded bytes</td></tr>
+<tr><td>11</td><td><code>unix_uid</code></td><td>u32</td></tr>
+<tr><td>12</td><td><code>parent_instance</code></td><td>OPT16</td></tr>
+<tr><td>13</td><td><code>parent_incarnation</code></td><td>OPT16</td></tr>
+<tr><td>14</td><td><code>parent_key_hash</code></td><td>OPT32 of SHA-256 of parent's raw public key; present-null for Term</td></tr>
+<tr><td>15</td><td><code>pane_id</code></td><td>OPT64</td></tr>
+<tr><td>16</td><td><code>pane_generation</code></td><td>OPT64</td></tr>
+<tr><td>17</td><td><code>role</code></td><td>LP of exact ASCII role</td></tr>
+<tr><td>18</td><td><code>public_key_hash</code></td><td>SHA-256 of the 32 raw public-key bytes, 32 raw digest bytes</td></tr>
+<tr><td>19</td><td><code>capabilities_hash</code></td><td>SHA-256 of capability encoding below, 32 raw digest bytes</td></tr>
+<tr><td>20</td><td><code>binding_generation</code></td><td>u64 proposed attachment generation</td></tr>
+<tr><td>21</td><td><code>grant_expires_ms</code></td><td>OPT64; required for enrol, null for resume</td></tr>
+<tr><td>22</td><td><code>challenge_expires_ms</code></td><td>u64</td></tr>
+</tbody></table>
+<p>Capability encoding is u16 count followed by LP of each capability token,
+sorted by ascending ASCII bytes, without duplicates. BROKER-023 defines the
+tokens; no JSON, whitespace or separators enter this encoding. Non-null hashes
+are represented as 64 lowercase hex characters in challenge JSON. Deadlines
+are broker-host <code>CLOCK_BOOTTIME</code> milliseconds, meaningful only with its epoch;
+only the broker evaluates proof expiry. Provers treat these absolute values as
+opaque signed fields; they MUST NOT compare them with a potentially different
+time namespace's clock. A deadline is expired at <code>now &gt;= value</code> on the broker.</p>
+<p>The challenge response MUST contain exactly these named fields (domain/version
+is implicit), plus the optional unsigned <code>wake_error</code> from BROKER-018 and no
+secret material. <code>wake_error</code> is outside the signed transcript. Broker fields come from stored records
+and the requesting connection, including <code>grant_id</code> found by the public-key
+selector in BROKER-018. Enrol proposes binding generation <code>1</code>; resume proposes
+the current generation plus one. The prover MUST compare scope and key hashes
+with its expected descriptor before signing. After restart, a key-selected
+challenge from the authenticated broker supplies the replacement descriptor;
+the child key, owner UID, parent-key hash, role, pane ID and capability hash MUST
+match retained expectations. The parent key alone anchors continuity. Parent
+instance/incarnation MAY change within an epoch or across epochs when the new
+pending grant has the same retained parent-key hash. Those random IDs identify
+scope and MUST NOT be ordered or required to be non-decreasing. Pane-generation
+monotonicity applies within a <code>(parent_instance,pane_id)</code>, not across a newly
+allocated parent instance. The parent-key hash comes from the parent's allocation-proven key, not a
+grant argument. Verification MUST reconstruct
+the bytes from stored challenge state, never trust proof-supplied replacement
+fields, and compare epoch, connection and current record generation atomically
+with commitment. ABP IDs and JSON member order are not signed bytes.</p>
+<p>Allocation also requires proof of the submitted public key. <code>session.hello</code> is
+a convenience read, not a gate: allocate MUST accept a valid proof whether or
+not this connection called hello. Sign the concatenation: ASCII
+<code>cosmix.native-session.allocate</code>, byte <code>00</code>,
+u16 <code>1</code>, 16 raw broker-epoch bytes, 16 raw connection-ID bytes, 32 raw public-key
+bytes, then LP of the effective policy (<code>default-open</code> if omitted). Use the
+same strict Ed25519 and hexadecimal signature encoding. Verification uses this
+connection's stored context and submitted key/policy before allocation. It
+proves key possession, not executable identity; a captured proof cannot allocate
+on another connection/epoch. Normal allocation retry rules remain BROKER-018's.</p>
+<p><strong>BUS-017 — Session errors (intended).</strong> Success is <code>rc: 0</code> with the command's
+JSON result. Refusal is <code>rc: 10</code> with
+<code>{"error_code":"INVALID_ARGUMENT","message":"...","details":{}}</code>.
+Codes are <code>INVALID_ARGUMENT</code>, <code>FORBIDDEN</code>, <code>NOT_FOUND</code>, <code>STALE_GENERATION</code>,
+<code>CONFLICT</code>, <code>EXPIRED</code>, <code>RESOURCE_LIMIT</code> and <code>UNSUPPORTED</code>; broker service failure
+uses <code>rc: 20</code>, <code>UNAVAILABLE</code>. <code>details</code> is always an object and MAY contain
+<code>field</code> (schema field name), <code>limit</code> (u64 decimal string), or
+<code>retry_after_ms</code> (u64 decimal string), or <code>reason</code> (a command-defined token).
+Consumers MUST tolerate unknown detail fields. Nonexistent and unauthorised
+record/key/grant selectors MUST return the identical rc and body:
+<code>rc: 10</code>, <code>{"error_code":"FORBIDDEN","message":"forbidden","details":{}}</code>.
+No diagnostic may distinguish absent from another UID's resource.
+The sole addition is BROKER-018's optional top-level <code>wake_error</code>, determined
+only by the requester's interest quota: absent and unowned lookups under the
+same quota conditions MUST still have identical errors, including that field.
+Authorised state conflicts use BROKER-018's reason tokens. Proof/key errors MUST NOT echo
+submitted material. Malformed requests
+without a usable correlation ID MUST close the connection without mutation.
+Transport loss/timeout remain local client failures, not invented peer results;
+a timeout does not prove an allocation or proof failed to commit.</p>
 <h2 id="evidence-and-acceptance">Evidence and acceptance</h2>
+<p>BUS-013–017 have no implementation evidence locations or passing acceptance
+results yet. The sources below support the checked legacy profile only.</p>
 <p>Source: <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-bus/src/bus.rs">wire types, parsers, validators and address tests</a>,
 <a href="https://github.com/markc/cosmix/blob/96d12fdf3fa3dfb2bf86b5bdc02d8ec4f9a415be/src/crates/cosmix-lib-client/src/native.rs">native client</a>.</p>
 <p>Acceptance must cover canonical round-trips, malformed delimiters, duplicate

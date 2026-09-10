@@ -1,9 +1,9 @@
 ---
 title: Cosmix specification suite
-version: 0.3.1
-amends: suite-0.3.0
+version: 0.3.2
+amends: suite-0.3.1
 status: accepted
-date: 2026-09-05
+date: 2026-09-10
 ---
 
 # Cosmix specifications
@@ -77,6 +77,33 @@ accepted meta-documents (the handover, the compatibility profile) carry their
 own records. Chapter entries name every chapter whose version moved in the
 suite revision.
 
+- **0.3.2, amending suite-0.3.1 (2026-09-10)** — native-session S0 contract:
+  04 → 0.1.2 (Unix/WebSocket binding, trusted metadata, validation and exact
+  proof bytes); 05 → 0.2.2 (allocation, key-based bootstrap/recovery, lifecycle,
+  discovery, quotas, recipient policy and fixtures); 06 → 0.2.3 (trusted peer
+  context and protected watch delivery); 10a → 0.2.2 (dynamic identity boundary).
+  All additions remain **intended**, awaiting implementation and acceptance
+  fixtures; no runtime or deployment evidence is added. Generated HTML follows
+  these sources, including this suite index.
+  **GOV-002 disposition:** BUS-013–017, BROKER-016–025, PROP-024/025 and
+  DAEMON-PROFILE-002 are **added, intended, no change to checked requirements**.
+  BROKER-005 is **clarified** only by an intended extension-advertisement note;
+  its checked entries and wire shape are retained. BROKER-002/003 are **retained**
+  as legacy name-to-connection contracts. BROKER-012's notification-loss-without-
+  disconnect semantics are **retained for the native-session profile**: lifecycle
+  notices are best effort, with a sticky gap indicator and lease-expiry backstop,
+  no ACK/retry timer or slow-consumer disconnect.
+  Recovery clarifications in this revision retain parent-key continuity within
+  and across broker epochs, bounded/degraded wake registration, bounded recipient
+  dependencies, and synchronous cached authorisation with checks outside resolution.
+  Accepted design defaults are Unix ingress, default-open same-UID owner trust with opt-in restricted target
+  policy, and Term-owned lifetime. Login-session roots and remote delegation
+  are **deferred**. Compatibility: the reserved session-name shape and stronger
+  parsing, proof, quota, lifecycle and observation rules apply to the new profile;
+  existing citizens, TCP/WS registration outside that shape and D2 admission
+  retain their checked contracts. Reserved-shape conflicts prevent activation,
+  never evict a legacy citizen. No existing requirement IDs are renumbered or
+  removed; no crate or existing wire version is bumped by this documentary stage.
 - **0.3.1, amending suite-0.3.0** — traceability amendment from the GOV-008
   independent review (four-batch cold review + one consolidated fix round,
   2026-09-05; agent-prepared under the handover's article VII disposition).

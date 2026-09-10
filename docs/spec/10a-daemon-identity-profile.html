@@ -446,6 +446,21 @@
 <p>This is intended normative detail retained during refactoring, not a fresh attestation of deployed accounts, unit effectiveness or generator availability. Dated statements such as “present”, “shipped”, “verified”, version frontiers and rollout coverage remain historical assertions until supported by a current conformance record. The main <a href="/spec/10-daemon-agent-operation">daemon chapter</a> explains the implementation boundary. No existing allocation is changed by publication.</p>
 <p>Examples and verification pseudocode are descriptive legacy material, not scripts to execute. Production paths use <code>/opt/cosmix/bin</code>; where a legacy example conflicts with that convention, the discrepancy is retained for explicit correction rather than silently authorising an alternate install. Cross-references to other legacy chapter numbers resolve through the migration map. The distribution surveys and change history are retained in the private historical snapshot, not republished as current platform facts.</p>
 <h2 id="1-introduction">1. Introduction</h2>
+<p><strong>DAEMON-PROFILE-002 — Dynamic session boundary (intended).</strong> Dynamic
+user-session identities are a separate, accepted design direction, with
+implementation pending under the proposed
+<a href="/spec/04-bus-wire#native-session-wire-profile-intended"><code>native-session: 1</code> wire profile</a>
+and <a href="/spec/05-broker-topics#native-session-identity-intended">broker contract</a>.
+They MUST be broker-allocated under a kernel-verified user principal and
+generation-qualified Term/pane ownership. They are not fixed daemon identities,
+MUST NOT allocate POSIX accounts from the 600–699 citizen band, and MUST NOT
+change this registry or existing managed serve-mode identities. Default-open
+same-UID owner trust and opt-in restricted grants-only access follow BROKER-023.
+Policy belongs to the target Term, not the caller or a PID-derived identity.
+Version 1 lifetime is Term-owned, not a verified login-session root.
+The parent key has Term-process lifetime and no secret store in version 1:
+a restarted Term MUST restart its children; broker restart permits in-place
+recovery only while the original Term process and keys survive.</p>
 <p><strong>Registry reconciliation — version 1.4.6.</strong> The
 <a href="/spec/authority-handover">accepted authority handover</a> reconciles the missing
 1.4.5/1.4.6 rows against the
