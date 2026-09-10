@@ -41,7 +41,9 @@ Copy [term.example.conf.mix](term.example.conf.mix) to
 The existing CosMix strict-data parser reads this file once; it cannot execute
 Mix code. Missing, unreadable, malformed or invalid files log once to stderr
 and use all defaults. Unknown keys are rejected. There is no automatic write
-or live reload.
+or live reload. Only regular files of at most 64 KiB are accepted. Non-regular
+paths (including FIFOs) are opened nonblocking and rejected with one diagnostic;
+oversized files also use defaults without parsing a truncated prefix.
 
 | Key | Values | Default |
 | --- | --- | --- |
@@ -69,7 +71,9 @@ directory. Use `infocmp -x xterm-rio` to check the installed entry.
 
 At startup Term runs `infocmp -x xterm-rio` directly, without a shell, discarding
 its output. Success selects `TERM=xterm-rio` for every child; missing infocmp,
-missing terminfo or any probe failure selects `TERM=xterm-256color`. This uses
+missing terminfo or any probe failure selects `TERM=xterm-256color`. The probe
+has a one-second deadline; a timed-out child is killed and reaped before using
+the fallback. This uses
 infocmp's normal `TERMINFO`, `TERMINFO_DIRS`, user and system database lookup,
 including database formats handled by the installed ncurses tools. Term never
 runs tic or installs terminfo. The selected name is visible in `--print-config`;
