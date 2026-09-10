@@ -279,7 +279,7 @@ fn term_lookup(path: &Path) -> Option<std::path::PathBuf> {
         "which",
         vec![Value::String(path.to_str()?.to_string())],
     ) {
-        Ok(Some(Value::String(found))) => std::path::absolute(found).ok(),
+        Ok(Some(Value::String(ref found))) => std::path::absolute(found).ok(),
         _ => None,
     }
 }
@@ -1682,7 +1682,7 @@ mod gui_tests {
         );
         assert!(error.starts_with("mix --gui: the CosMix Term frontend is not installed"));
         assert!(error.ends_with("Install the desktop package."));
-        for winner in 0..3 {
+        for (winner, expected) in seen.iter().enumerate() {
             let mut index = 0;
             let found = resolve_term(None, Some("/test-root".into()), |path| {
                 let selected = index == winner;
@@ -1690,7 +1690,7 @@ mod gui_tests {
                 selected.then(|| path.to_path_buf())
             })
             .unwrap();
-            assert_eq!(found, seen[winner]);
+            assert_eq!(&found, expected);
             assert_eq!(index, winner + 1);
         }
     }
