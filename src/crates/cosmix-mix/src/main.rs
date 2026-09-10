@@ -284,6 +284,30 @@ fn term_lookup(path: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Refuse a resolved frontend that is not a launchable executable IMAGE — an
+/// ELF binary or a `#!` script. This is what stops execvp's ENOEXEC→/bin/sh
+/// fallback from running an arbitrary +x text file as a shell (empirically a
+/// silent `exit 0`). Read errors are treated as "not launchable".
+#[cfg(unix)]
+fn require_executable_image(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    let n = fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let is_elf = n >= 4 && head == *b"\x7fELF";
+    let is_shebang = n >= 2 && head[..2] == *b"#!";
+    if is_elf || is_shebang {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is not a launchable executable (expected an ELF binary or a #! script); \
+             refusing to run it as a shell",
+            path.display()
+        ))
+    }
+}
+
 fn run_gui() -> i32 {
     // P2.2c starts a fresh instance. Requesting a window from an existing
     // instance over Bus is deferred until authenticated per-user identity
@@ -299,9 +323,21 @@ fn run_gui() -> i32 {
             return 1;
         }
     };
+    // A resolved +x file that is neither an ELF image nor a `#!` script would
+    // hit execvp's POSIX ENOEXEC fallback to /bin/sh: it would silently run the
+    // file AS a shell script and exit 0 without ever launching a frontend
+    // (spawn-and-wait has the same fallback). Refuse it so `--gui` can never
+    // succeed by running a non-frontend as a shell.
+    #[cfg(unix)]
+    if let Err(error) = require_executable_image(&frontend) {
+        eprintln!("mix --gui: {error}");
+        return 1;
+    }
     // Use Command's direct argv execution, as exec::command_for does for
-    // external programs. Keep cwd, environment and stdio inherited. Re-read
-    // OS argv so frontend arguments retain their original bytes.
+    // external programs. Keep cwd, environment and stdio inherited. Forward
+    // OS argv unchanged (any non-UTF-8 argv would already have aborted the
+    // process at the initial env::args() collection — a pre-existing,
+    // binary-wide limitation, not something --gui can widen).
     let forwarded = env::args_os().skip_while(|arg| arg != "--gui").skip(1);
     let mut command = process::Command::new(&frontend);
     command.args(forwarded);
@@ -1667,6 +1703,36 @@ fn real_main() -> i32 {
 #[cfg(test)]
 mod gui_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn require_executable_image_rejects_non_elf_non_shebang() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mix-gui-image-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let write_exec = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            let mut f = fs::File::create(&p).unwrap();
+            f.write_all(bytes).unwrap();
+            let mut perm = f.metadata().unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&p, perm).unwrap();
+            p
+        };
+        // ELF magic and a #! script are launchable images and pass.
+        let elf = write_exec("elfish", b"\x7fELF\x02\x01\x01");
+        assert!(require_executable_image(&elf).is_ok());
+        let script = write_exec("scripty", b"#!/bin/sh\nexit 0\n");
+        assert!(require_executable_image(&script).is_ok());
+        // A +x bare-shell file (no shebang) is exactly the ENOEXEC→/bin/sh trap
+        // and MUST be rejected so `--gui` cannot silently exit 0 running a shell.
+        let bare = write_exec("bareshell", b"echo hi\nexit 0\n");
+        assert!(require_executable_image(&bare).is_err());
+        // A missing path is not launchable.
+        assert!(require_executable_image(&dir.join("nope")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn resolution_order_and_missing_frontend() {
