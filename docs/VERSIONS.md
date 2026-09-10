@@ -38,8 +38,8 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.82.0 |
-| `cosmix-mix` | 0.83.0 |
+| `cosmix-lib-mix` | 0.83.2 |
+| `cosmix-mix` | 0.83.2 |
 | `mix-bench` | 0.1.0 |
 
 ## cos
@@ -76,7 +76,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-maild-auth` | 0.2.0 |
 | `cosmix-maild-bayesian` | 0.6.1 |
 | `cosmix-maild-rules` | 0.2.2 |
-| `cosmix-mcp` | 0.4.0 |
+| `cosmix-mcp` | 0.5.0 |
 | `cosmix-mds` | 0.2.2 |
 | `cosmix-mesh-sign` | 0.8.0 |
 | `cosmix-midicomp` | 0.3.0 |
@@ -112,6 +112,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-shell` | 0.8.6 |
 | `cosmix-shell-host` | 0.6.5 |
 | `cosmix-studio` | 0.4.5 |
+| `cosmix-term` | 0.3.1 |
 | `cosmix-tower` | 0.5.2 |
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
@@ -123,4 +124,4 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 
 ---
 
-49 crates in `$COSMIX/src` and 23 in the separate `$COSMIX/src/desktop` workspace.
+49 crates in `$COSMIX/src` and 25 in the separate `$COSMIX/src/desktop` workspace.
