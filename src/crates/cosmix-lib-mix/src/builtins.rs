@@ -304,9 +304,9 @@ builtin_table! {
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
     ("random_password", CapabilityClass::Pure, "system",  "Generate an alphanumeric password (default len 16, no O/o, guaranteed upper+lower+digit)", contract!((len?: number) -> string)),
-    ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy}", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool}); effects[must_use, blocking]; failure[returns_result])),
+    ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy, stdout_truncated, stderr_truncated}; max_output optionally caps local capture bytes per stream (omitted: unbounded)", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
-    ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream; truncated stdout normally makes decode:\"data\" fail. Omit decode and inspect stdout_truncated/stderr_truncated to distinguish truncation from malformed remote output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). pid must be a whole NUMBER and is not coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0, which would make the reaping waitpid() collect an arbitrary child of this process group and then report a boolean as alive (strict since v0.52.0)", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
@@ -3506,7 +3506,7 @@ fn builtin_run(args: Vec<Value>) -> MixResult<Option<Value>> {
     let cmd = args[0].to_mix_string();
     let timeout_s = parse_timeout_opt("run", args.get(1), 0)?;
     let argv = vec!["sh".to_string(), "-c".to_string(), cmd.clone()];
-    let outcome = run_with_timeout(&argv, None, timeout_s, "run")?;
+    let outcome = run_with_timeout(&argv, None, timeout_s, "run", None)?;
     if outcome.interrupted {
         return Err(MixError::RuntimeError {
             span: None,
@@ -4706,7 +4706,7 @@ fn builtin_run_rc(args: Vec<Value>) -> MixResult<Option<Value>> {
     let cmd = args[0].to_mix_string();
     let timeout_s = parse_timeout_opt("run_rc", args.get(1), 0)?;
     let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
-    let outcome = run_with_timeout(&argv, None, timeout_s, "run_rc")?;
+    let outcome = run_with_timeout(&argv, None, timeout_s, "run_rc", None)?;
     let mut map = indexmap::IndexMap::new();
     map.insert("rc".into(), Value::Number(outcome.exit_code as f64));
     map.insert(
@@ -6326,6 +6326,7 @@ fn builtin_random_password(args: Vec<Value>) -> MixResult<Option<Value>> {
 #[derive(Debug, Clone)]
 struct SshOpts {
     timeout: u64,
+    max_output: Option<usize>,
     connect_timeout: u64,
     multiplex: bool,
     batch: bool,
@@ -6342,6 +6343,7 @@ impl Default for SshOpts {
     fn default() -> Self {
         Self {
             timeout: 30,
+            max_output: None,
             connect_timeout: 10,
             multiplex: false,
             batch: true,
@@ -6359,6 +6361,8 @@ impl Default for SshOpts {
 struct SshOutcome {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     exit_code: i32,
     timed_out: bool,
     interrupted: bool,
@@ -6390,6 +6394,7 @@ fn is_valid_env_key(k: &str) -> bool {
 
 const SSH_OPT_KEYS: &[&str] = &[
     "timeout",
+    "max_output",
     "connect_timeout",
     "multiplex",
     "batch",
@@ -6633,6 +6638,24 @@ fn parse_ssh_opts(v: Option<&Value>) -> MixResult<SshOpts> {
     }
     if let Some(v) = map.get("connect_timeout") {
         opts.connect_timeout = parse_nonneg_int_opt("ssh_run", "connect_timeout", v)?;
+    }
+    if let Some(v) = map.get("max_output") {
+        let invalid = || MixError::RuntimeError {
+            span: None,
+            msg: concat!(
+                "ssh_run: max_output must be a positive integer number of bytes ",
+                "within 2^53-1 and usize::MAX"
+            )
+            .into(),
+        };
+        let n = extract_number(v, InputPolicy::NumberOnly).ok_or_else(invalid)?;
+        // Match run_argv's exact-integer/platform bound, but SSH requires
+        // a positive limit; omission alone preserves unbounded capture.
+        let n = as_count("ssh_run: max_output", n, usize::MAX).map_err(|_| invalid())?;
+        if n == 0 {
+            return Err(invalid());
+        }
+        opts.max_output = Some(n);
     }
     if let Some(v) = map.get("multiplex") {
         opts.multiplex = parse_bool_opt("multiplex", v)?;
@@ -6927,6 +6950,8 @@ fn ssh_result_map(host: &str, o: SshOutcome, elapsed: std::time::Duration) -> Va
         Value::Number(elapsed.as_millis() as f64),
     );
     m.insert("host".into(), Value::String(host.to_string()));
+    m.insert("stdout_truncated".into(), Value::Bool(o.stdout_truncated));
+    m.insert("stderr_truncated".into(), Value::Bool(o.stderr_truncated));
     m.insert("timed_out".into(), Value::Bool(o.timed_out));
     m.insert("interrupted".into(), Value::Bool(o.interrupted));
     m.insert("utf8_lossy".into(), Value::Bool(utf8_lossy));
@@ -8998,6 +9023,7 @@ fn run_with_timeout(
     stdin: Option<&str>,
     timeout_s: u64,
     caller: &str,
+    max_output: Option<usize>,
 ) -> MixResult<SshOutcome> {
     let outcome = run_process(&ProcSpec {
         argv,
@@ -9009,7 +9035,7 @@ fn run_with_timeout(
         cwd: None,
         env: &[],
         clear_env: false,
-        max_output: None,
+        max_output,
         stream: false,
     })
     .map_err(|e| match e {
@@ -9033,6 +9059,8 @@ fn run_with_timeout(
     Ok(SshOutcome {
         stdout: outcome.stdout,
         stderr: outcome.stderr,
+        stdout_truncated: outcome.stdout_truncated,
+        stderr_truncated: outcome.stderr_truncated,
         exit_code: outcome.exit_code,
         timed_out: outcome.timed_out,
         interrupted: outcome.interrupted,
@@ -9106,14 +9134,26 @@ fn builtin_ssh_run(args: Vec<Value>) -> MixResult<Option<Value>> {
         };
         let argv = build_ssh_argv(&host, interpreter, &opts);
         let started = std::time::Instant::now();
-        let outcome = run_with_timeout(&argv, Some(&driver), opts.timeout, "ssh_run")?;
+        let outcome = run_with_timeout(
+            &argv,
+            Some(&driver),
+            opts.timeout,
+            "ssh_run",
+            opts.max_output,
+        )?;
         return Ok(Some(ssh_result_map(&host, outcome, started.elapsed())));
     }
 
     let remote_cmd = build_remote_command(&args[1], &opts)?;
     let argv = build_ssh_argv(&host, &remote_cmd, &opts);
     let started = std::time::Instant::now();
-    let outcome = run_with_timeout(&argv, opts.stdin.as_deref(), opts.timeout, "ssh_run")?;
+    let outcome = run_with_timeout(
+        &argv,
+        opts.stdin.as_deref(),
+        opts.timeout,
+        "ssh_run",
+        opts.max_output,
+    )?;
     Ok(Some(ssh_result_map(&host, outcome, started.elapsed())))
 }
 
@@ -9223,7 +9263,8 @@ const REMOTE_MIX_STDIN_CMD: &str = "/opt/cosmix/bin/mix -";
 /// `ssh_run(host, "mix -", {stdin: source})` idiom.
 ///
 /// Returns the same map as `ssh_run` ({ok, stdout, stderr, exit_code,
-/// duration_ms, host, timed_out, interrupted, utf8_lossy}). If `opts`
+/// duration_ms, host, timed_out, interrupted, utf8_lossy,
+/// stdout_truncated, stderr_truncated}). If `opts`
 /// carries `decode: "data"` or `decode: "json"` and the run succeeded
 /// (`ok`), the trimmed stdout is parsed and added under `value` (via
 /// `data_parse` / `json_parse` respectively) — the common "get a
@@ -20775,6 +20816,68 @@ mod ssh_helpers_tests {
     }
 
     #[test]
+    fn parse_ssh_opts_max_output() {
+        assert_eq!(parse_ssh_opts(None).unwrap().max_output, None);
+        for n in [
+            1.0,
+            134_217_728.0,
+            (usize::MAX as f64).min(9_007_199_254_740_991.0),
+        ] {
+            let opts = map_of(&[("max_output", Value::Number(n))]);
+            assert_eq!(
+                parse_ssh_opts(Some(&opts)).unwrap().max_output,
+                Some(n as usize)
+            );
+        }
+        for v in [
+            Value::Number(0.0),
+            Value::Number(-1.0),
+            Value::Number(1.5),
+            Value::Number(9_007_199_254_740_992.0),
+            Value::Number(f64::NAN),
+            Value::Number(f64::INFINITY),
+            Value::String("16".into()),
+            Value::Bool(true),
+            Value::Nil,
+        ] {
+            let opts = map_of(&[("max_output", v)]);
+            let err = parse_ssh_opts(Some(&opts)).unwrap_err().to_string();
+            assert!(
+                err.contains("ssh_run: max_output must be a positive integer"),
+                "{err}"
+            );
+        }
+        if usize::BITS < 53 {
+            let opts = map_of(&[("max_output", Value::Number(usize::MAX as f64 + 1.0))]);
+            assert!(parse_ssh_opts(Some(&opts)).is_err());
+        }
+    }
+
+    #[test]
+    fn ssh_mix_forwards_max_output_validation() {
+        let err = ssh_mix_err(vec![
+            Value::String("alpha".into()),
+            Value::String("print(1)".into()),
+            map_of(&[("max_output", Value::Number(0.0))]),
+        ]);
+        assert!(
+            err.contains("ssh_run: max_output must be a positive integer"),
+            "{err}"
+        );
+        // A later local validation error proves a valid limit traverses the
+        // ssh_mix option forwarding path, without contacting a remote host.
+        let err = ssh_mix_err(vec![
+            Value::String("alpha".into()),
+            Value::String("print(1)".into()),
+            map_of(&[
+                ("max_output", Value::Number(16.0)),
+                ("cwd", Value::String("bad\0path".into())),
+            ]),
+        ]);
+        assert!(err.contains("ssh_run: NUL byte in cwd"), "{err}");
+    }
+
+    #[test]
     fn parse_ssh_opts_non_map_errors() {
         let v = Value::String("oops".into());
         assert!(parse_ssh_opts(Some(&v)).is_err());
@@ -21030,11 +21133,47 @@ mod ssh_helpers_tests {
         let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
         crate::interrupt::_test_clear();
         let argv = sh("printf 'hi'; exit 7");
-        let outcome = run_with_timeout(&argv, None, 5, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 5, "test", None).expect("spawn ok");
         assert_eq!(outcome.exit_code, 7);
         assert!(!outcome.timed_out);
         assert!(!outcome.interrupted);
         assert_eq!(outcome.stdout, b"hi");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_capture_limits_each_stream_and_preserves_unbounded_default() {
+        let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
+        crate::interrupt::_test_clear();
+        // Exercise the real SSH capture adapter without a remote: tee copies
+        // stdin to both pipes. Exceed pipe capacity to also verify draining.
+        let argv = vec!["tee".into(), "/dev/stderr".into()];
+        let input = "x".repeat(128 * 1024);
+        for (limit, expected_len, truncated) in [
+            (Some(16), 16, true),
+            (Some(input.len()), input.len(), false),
+            (None, input.len(), false),
+        ] {
+            let outcome = run_with_timeout(&argv, Some(&input), 5, "ssh_run", limit).unwrap();
+            assert_eq!(outcome.exit_code, 0);
+            assert!(!outcome.timed_out);
+            assert_eq!(outcome.stdout, input.as_bytes()[..expected_len]);
+            assert_eq!(outcome.stderr, input.as_bytes()[..expected_len]);
+            let Value::Map(ref result) =
+                super::ssh_result_map("alpha", outcome, std::time::Duration::ZERO)
+            else {
+                panic!("expected SSH result map")
+            };
+            assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
+            assert_eq!(
+                result.get("stdout_truncated"),
+                Some(&Value::Bool(truncated))
+            );
+            assert_eq!(
+                result.get("stderr_truncated"),
+                Some(&Value::Bool(truncated))
+            );
+        }
     }
 
     #[test]
@@ -21043,7 +21182,7 @@ mod ssh_helpers_tests {
         crate::interrupt::_test_clear();
         let argv = sh("printf 'pre'; sleep 5");
         let started = std::time::Instant::now();
-        let outcome = run_with_timeout(&argv, None, 1, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 1, "test", None).expect("spawn ok");
         let elapsed = started.elapsed();
         assert!(outcome.timed_out, "expected timed_out");
         assert!(!outcome.interrupted, "interrupt must not be set");
@@ -21076,7 +21215,7 @@ mod ssh_helpers_tests {
             .expect("flag wired")
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let argv = sh("sleep 5");
-        let outcome = run_with_timeout(&argv, None, 0, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 0, "test", None).expect("spawn ok");
         assert!(outcome.interrupted, "expected interrupted");
         assert!(!outcome.timed_out, "timed_out must be false");
         assert_eq!(outcome.exit_code, -2, "interrupt sentinel");
@@ -21095,7 +21234,7 @@ mod ssh_helpers_tests {
         // With both interrupt pre-set AND a 1s timeout configured,
         // the tie-breaker says interrupt wins.
         let argv = sh("sleep 5");
-        let outcome = run_with_timeout(&argv, None, 1, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 1, "test", None).expect("spawn ok");
         assert!(outcome.interrupted);
         assert!(!outcome.timed_out);
         assert_eq!(outcome.exit_code, -2);
@@ -21109,7 +21248,7 @@ mod ssh_helpers_tests {
         // Quick child; verifies that timeout_s=0 doesn't somehow trip
         // the deadline check on the first poll.
         let argv = sh("exit 0");
-        let outcome = run_with_timeout(&argv, None, 0, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 0, "test", None).expect("spawn ok");
         assert_eq!(outcome.exit_code, 0);
         assert!(!outcome.timed_out);
         assert!(!outcome.interrupted);
@@ -21144,7 +21283,7 @@ mod ssh_helpers_tests {
         crate::interrupt::_test_clear();
         let argv = sh("trap '' TERM; sleep 5");
         let started = std::time::Instant::now();
-        let outcome = run_with_timeout(&argv, None, 1, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 1, "test", None).expect("spawn ok");
         let elapsed = started.elapsed();
         assert!(outcome.timed_out, "expected timed_out");
         assert!(!outcome.interrupted, "interrupt must not be set");
@@ -21166,7 +21305,7 @@ mod ssh_helpers_tests {
         let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
         crate::interrupt::_test_clear();
         let argv = sh("printf 'OUT'; printf 'ERR' >&2; exit 0");
-        let outcome = run_with_timeout(&argv, None, 5, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 5, "test", None).expect("spawn ok");
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.stdout, b"OUT");
         assert_eq!(outcome.stderr, b"ERR");
@@ -21177,7 +21316,8 @@ mod ssh_helpers_tests {
         let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
         crate::interrupt::_test_clear();
         let argv = sh("cat");
-        let outcome = run_with_timeout(&argv, Some("hello stdin"), 5, "test").expect("spawn ok");
+        let outcome =
+            run_with_timeout(&argv, Some("hello stdin"), 5, "test", None).expect("spawn ok");
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.stdout, b"hello stdin");
     }
@@ -21220,7 +21360,7 @@ mod ssh_helpers_tests {
         });
         let argv = sh("trap '' TERM; while :; do :; done");
         let started = std::time::Instant::now();
-        let outcome = run_with_timeout(&argv, None, 0, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 0, "test", None).expect("spawn ok");
         let elapsed = started.elapsed();
         sidecar.join().unwrap();
         assert!(outcome.interrupted, "expected interrupted=true");
@@ -21253,7 +21393,7 @@ mod ssh_helpers_tests {
         // outcome should map to 128 + SIGTERM = 143 (Unix), not the
         // -1/-2/-3 sentinels reserved for timeout/interrupt/unknown.
         let argv = sh("kill -TERM $$ ; sleep 1");
-        let outcome = run_with_timeout(&argv, None, 5, "test").expect("spawn ok");
+        let outcome = run_with_timeout(&argv, None, 5, "test", None).expect("spawn ok");
         assert!(!outcome.timed_out);
         assert!(!outcome.interrupted);
         #[cfg(unix)]
@@ -24021,12 +24161,7 @@ mod bytes_tests {
             let mut ws = tungstenite::accept(stream).unwrap();
             ws.close(None).ok();
             // Drive the close handshake until the peer answers or errors.
-            loop {
-                match ws.read() {
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
+            while ws.read().is_ok() {}
         });
         let h = builtin_ws_connect(vec![Value::String(format!("ws://127.0.0.1:{port}/"))])
             .unwrap()

@@ -210,12 +210,13 @@ end
     assert!(err.contains("deliberate fault"), "{err}");
     assert!(err.contains("handler remains registered"), "{err}");
     // Observable half 2: the health hook fired exactly once.
-    let faults = runtime.faults.borrow();
-    assert_eq!(faults.len(), 1, "{faults:?}");
-    assert!(faults[0].contains("play.note[0]"), "{faults:?}");
+    {
+        let faults = runtime.faults.borrow();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(faults[0].contains("play.note[0]"), "{faults:?}");
+    }
 
     // And the citizen still dispatches afterwards.
-    drop(faults);
     s.eval
         .dispatch_event(mk_event("play.note", "D4", &[]))
         .await

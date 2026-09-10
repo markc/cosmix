@@ -79,11 +79,12 @@ Actual output:
 path=/srv/app dir; still-data
 ```
 
-The result map always has these nine keys:
+The result map always has these eleven keys:
 
 ```text
 stdout  stderr  exit_code  ok  duration_ms  host
 timed_out  interrupted  utf8_lossy
+stdout_truncated  stderr_truncated
 ```
 
 The exit-status key is **`exit_code`**, not `rc`. Reading `$r["rc"]` yields
@@ -160,7 +161,9 @@ ssh_run("-oProxyCommand=touch /tmp/pwned", "echo hi")
   host:        "node1", -- echoed back, handy for logging
   timed_out:   false,   -- true if killed by opts.timeout
   interrupted: false,   -- true if killed by Ctrl-C
-  utf8_lossy:  false    -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
+  utf8_lossy:  false,   -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
+  stdout_truncated: false, -- true if local stdout capture is incomplete
+  stderr_truncated: false  -- true if local stderr capture is incomplete
 }
 ```
 
@@ -201,7 +204,7 @@ stdout=[]
 stderr=[ssh: connect to host 192.0.2.1 port 22: Connection timed out]
 ```
 
-The full key set (every call returns all nine):
+The full key set (every call returns all eleven):
 
 ```text
 stdout
@@ -213,6 +216,8 @@ host
 timed_out
 interrupted
 utf8_lossy
+stdout_truncated
+stderr_truncated
 ```
 
 ### The `.ok` predicate — there is no `ssh_ok` / `ssh_try`
@@ -299,7 +304,8 @@ $r = ssh_mix("example.com", $source, {
 })
 ```
 
-- **Returns the same map as `ssh_run`** (all nine keys). With `decode`, a tenth key `value` is added on success.
+- **Returns the same map as `ssh_run`** (all eleven keys). With `decode`, a twelfth key `value` is added on success.
+- **`max_output` bounds local capture**, independently for stdout and stderr. Truncated stdout will normally make `decode: "data"` (or `"json"`) raise a parse error. To distinguish truncation from malformed remote output, omit `decode`, check `stdout_truncated`/`stderr_truncated`, then parse complete output yourself. The limit does not change a remote `run_argv` limit.
 - **`decode: "data"` or `decode: "json"`** parses the trimmed stdout into `.value` (via `data_parse` / `json_parse`) — the common "get a structured value back from the remote" case. Pair it with [`data_encode`](data.md) on the remote side, as above. `decode: "json"` needs the `json` feature (the `mix` binary has it; a bare library build without it errors — use `decode: "data"`). On failure (`ok == false`) no `value` key is added — check `.ok` first.
 - **`bindings` is a typed data channel:** it is a map from names to strict-data-encodable Mix values. Each key must match `[A-Za-z_][A-Za-z0-9_]*`; each value is strict-data-encoded locally and prepended to the shipped source as a `$name = value` assignment. Strings, numbers, bools, `nil`, lists, and maps retain their types, including nested values. Bytes and buffers have no strict-data representation and raise `OPTION_INVALID` locally; encode binary data explicitly (for example with base64) and decode it remotely.
 - **No binding name is reserved.** Names such as `args` and `argv` are legal. Bindings run first, so the caller source may legally rebind any of them; this is convenience and injection safety, not isolation.
@@ -426,6 +432,7 @@ Every key is optional; unknown keys raise an error. `ssh_mix` takes the same map
 |---|---|---|---|
 | `timeout` | int (**seconds**) | `30` | Hard wall-clock deadline. `0` disables it. On expiry: SIGKILL the process group, `timed_out = true`, `exit_code = -1`. |
 | `connect_timeout` | int (seconds) | `10` | Passed as ssh's `-o ConnectTimeout=`. Bounds the connect phase only. |
+| `max_output` | positive int (bytes) | unbounded | Maximum bytes retained locally per stream, before UTF-8 conversion and trailing whitespace trimming. Must be a whole number from 1 through the smaller of 2^53−1 and the platform's `usize::MAX`; zero, negatives and non-numbers are rejected. Excess bytes are drained and discarded; `stdout_truncated` / `stderr_truncated` identifies each incomplete capture. |
 | `multiplex` | bool | `false` | Connection reuse via `ControlMaster=auto` / `ControlPath=$HOME/.ssh/cm-%C` / `ControlPersist=60s`. See the caveat below. |
 | `batch` | bool | `true` | `-o BatchMode=yes` — never prompt for a password/passphrase; fail instead. Keep it on for unattended scripts. |
 | `strict_host_key` | string | `"accept-new"` | `-o StrictHostKeyChecking=`. One of `yes`, `no`, `accept-new`, `ask`. |
@@ -435,11 +442,16 @@ Every key is optional; unknown keys raise an error. `ssh_mix` takes the same map
 | `stdin` | string | — | Fed to the remote command's stdin over the local ssh pipe. May contain NULs (binary payloads). Conflicts with `env` under the secure transports (§"Remote env"). |
 | `extra_ssh_args` | list of strings | `[]` | Extra argv inserted before the host: `["-p", "2222"]`, `["-J", "jump"]`, `["-o", "IdentitiesOnly=yes"]`. Always followed by the `--` host guard. |
 
+Omitting `max_output` preserves unbounded local capture. The truncation flags
+are also true when capture is abandoned at a deadline, even without a limit.
+Truncation does not change `ok` or `exit_code`; `ssh_must` still returns stdout
+on a zero exit status, so use `ssh_run` to inspect capture completeness.
+
 ### Verified option errors (raised locally, before any ssh)
 
 ```mix
 ssh_run("node1", "echo hi", { foo: 1 })
--- Runtime error: ssh_run: unknown opts key "foo" (allowed: timeout, connect_timeout,
+-- Runtime error: ssh_run: unknown opts key "foo" (allowed: timeout, max_output, connect_timeout,
 --   multiplex, batch, strict_host_key, env, env_transport, cwd, stdin, extra_ssh_args)
 
 ssh_run("node1", "echo hi", { timeout: "soon" })
