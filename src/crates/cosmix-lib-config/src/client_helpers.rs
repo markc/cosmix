@@ -20,6 +20,20 @@ use cosmix_client::NodedClient;
 
 use crate::node::load_node_config;
 
+/// Explicit Unix opt-in options using the configured system broker endpoint.
+/// Existing default connect helpers remain TCP. The account is supplied by
+/// trusted application configuration, never inferred from the calling user.
+/// Configuration errors propagate; they must not silently select a different
+/// authenticated endpoint. Set `require_native_session` for grant-bearing use.
+#[cfg(unix)]
+pub fn unix_connect_options(
+    account: cosmix_client::BrokerAccount,
+) -> Result<cosmix_client::UnixConnectOptions> {
+    let mut options = cosmix_client::UnixConnectOptions::new(account);
+    options.configured_endpoint = load_node_config()?.and_then(|cfg| cfg.noded.unix_socket);
+    Ok(options)
+}
+
 /// Resolve the broker WebSocket URL from `node.conf.mix`, falling back to
 /// **loopback** (`127.0.0.1`) — never another node's WG IP.
 ///

@@ -18,19 +18,19 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use anyhow::{Context, Result};
 use cosmix_bus::bus::{self, BusMessage};
-use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::bounded::{
     BoundedIncomingEvent, BoundedIncomingReceiver, BoundedIncomingSender, bounded_incoming_channel,
 };
 use crate::types::IncomingCommand;
 
-type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WsSink = std::pin::Pin<
+    Box<dyn futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send>,
+>;
 type PendingMap = HashMap<String, oneshot::Sender<BusMessage>>;
 
 pub(crate) enum NativeIncomingReceiver {
@@ -48,13 +48,23 @@ impl NativeIncomingReceiver {
 }
 
 enum NativeIncomingSender {
+    #[cfg(unix)]
+    Verified(mpsc::UnboundedSender<crate::unix::VerifiedCommand>),
     Unbounded(mpsc::UnboundedSender<IncomingCommand>),
     Bounded(BoundedIncomingSender),
 }
 
 impl NativeIncomingSender {
-    fn send(&self, command: IncomingCommand) -> bool {
+    fn send(
+        &self,
+        command: IncomingCommand,
+        _principal: Option<cosmix_bus::native_session::BrokerPrincipal>,
+    ) -> bool {
         match self {
+            #[cfg(unix)]
+            Self::Verified(tx) => tx
+                .send(crate::unix::VerifiedCommand::new(command, _principal))
+                .is_ok(),
             Self::Unbounded(sender) => sender.send(command).is_ok(),
             Self::Bounded(sender) => sender.try_send(command),
         }
@@ -239,6 +249,52 @@ impl std::fmt::Display for RegistrationRejected {
 impl std::error::Error for RegistrationRejected {}
 
 impl NodedClient {
+    #[cfg(unix)]
+    pub(crate) async fn from_verified_unix(
+        socket: WebSocketStream<tokio::net::UnixStream>,
+        service_name: &str,
+        provenance: Option<cosmix_bus::RegisterProvenance>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<crate::unix::VerifiedCommand>)> {
+        let (sink, stream) = socket.split();
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(Self::reader_loop(
+            stream,
+            pending.clone(),
+            NativeIncomingSender::Verified(tx),
+            connected.clone(),
+            service_name.into(),
+        ));
+        let mut guard = AbortOnDrop::new(reader.abort_handle());
+        let client = Self {
+            service_name: RwLock::new(service_name.into()),
+            sink: Arc::new(Mutex::new(Box::pin(sink))),
+            pending,
+            incoming_rx: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+            connected,
+            reader_handle: Mutex::new(Some(reader)),
+            provenance,
+        };
+        // Authenticate the profile before registering or handing out context.
+        let setup = async {
+            let ping = client
+                .call("noded", "noded.ping", serde_json::Value::Null)
+                .await?;
+            if ping["extensions"]["native-session"].as_str() != Some("1") {
+                return Err(crate::unix::ConnectError::UnsupportedVersion.into());
+            }
+            client.register().await
+        }
+        .await;
+        if let Err(error) = setup {
+            client.close().await;
+            return Err(error);
+        }
+        guard.disarm();
+        Ok((client, rx))
+    }
     /// Connect to the broker at the given URL and register as a named service.
     pub async fn connect(service_name: &str, noded_url: &str) -> Result<Self> {
         Self::connect_with_provenance(service_name, noded_url, None).await
@@ -270,7 +326,7 @@ impl NodedClient {
             .context("failed to connect to broker")?;
 
         let (sink, stream) = ws_stream.split();
-        let sink = Arc::new(Mutex::new(sink));
+        let sink = Arc::new(Mutex::new(Box::pin(sink) as WsSink));
         let pending: Arc<StdMutex<PendingMap>> = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
         let (incoming_tx, incoming_rx) = incoming_channel(bounded_capacity);
@@ -331,7 +387,7 @@ impl NodedClient {
             .context("failed to connect to broker")?;
 
         let (sink, stream) = ws_stream.split();
-        let sink = Arc::new(Mutex::new(sink));
+        let sink = Arc::new(Mutex::new(Box::pin(sink) as WsSink));
         let pending: Arc<StdMutex<PendingMap>> = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
         let (incoming_tx, incoming_rx) = incoming_channel(None);
@@ -921,18 +977,23 @@ impl NodedClient {
         Ok(())
     }
 
-    async fn reader_loop(
-        mut stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    async fn reader_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        mut stream: futures_util::stream::SplitStream<WebSocketStream<S>>,
         pending: Arc<StdMutex<PendingMap>>,
         incoming_tx: NativeIncomingSender,
         connected: Arc<AtomicBool>,
         service_name: String,
     ) {
+        #[cfg(unix)]
+        let verified = matches!(&incoming_tx, NativeIncomingSender::Verified(_));
+        #[cfg(not(unix))]
+        let verified = false;
         while let Some(result) = stream.next().await {
             let data = match result {
                 Ok(Message::Text(text)) => text.to_string(),
                 Ok(Message::Close(_)) => break,
                 Ok(Message::Ping(_)) => continue,
+                Ok(Message::Binary(_)) if verified => break,
                 Ok(_) => continue,
                 Err(e) => {
                     tracing::warn!("{service_name}: WebSocket error: {e}");
@@ -940,12 +1001,24 @@ impl NodedClient {
                 }
             };
 
+            #[cfg(unix)]
+            if verified && !crate::unix::principal_header_is_unique(&data) {
+                break;
+            }
             let msg = match bus::parse(&data) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::debug!("{service_name}: failed to parse Bus message: {e}");
                     continue;
                 }
+            };
+            let principal = if verified {
+                match cosmix_bus::native_session::read_principal(&msg) {
+                    Ok(principal) => principal,
+                    Err(_) => break,
+                }
+            } else {
+                None
             };
 
             let msg_id = msg.get("id").map(|s| s.to_string());
@@ -997,7 +1070,7 @@ impl NodedClient {
                     body: msg.body.clone(),
                     headers: msg.headers.clone(),
                 };
-                if !incoming_tx.send(cmd) {
+                if !incoming_tx.send(cmd, principal) {
                     tracing::debug!("{service_name}: incoming channel closed");
                     break;
                 }

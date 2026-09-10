@@ -17,6 +17,9 @@ impl Drop for Broker {
 }
 impl Broker {
     async fn start() -> Self {
+        Self::start_with_unix(true).await
+    }
+    async fn start_with_unix(unix: bool) -> Self {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -32,7 +35,7 @@ impl Broker {
                 spec_dir: None,
                 admission_mode: AdmissionMode::Off,
                 observe_allowed_services: vec!["audit-observer".into()],
-                unix_socket: Some(root.join("bus.sock")),
+                unix_socket: unix.then(|| root.join("bus.sock")),
             },
             ready_tx,
         ));
@@ -347,4 +350,134 @@ fn malformed_bootstrap_prescan_keeps_only_bounded_correlation() {
         invalid_bootstrap_envelope(&duplicate, command).get("id"),
         None
     );
+}
+
+fn client_options(broker: &Broker) -> cosmix_client::UnixConnectOptions {
+    // SAFETY: process credential reads have no preconditions.
+    let mut options = cosmix_client::UnixConnectOptions::new(cosmix_client::BrokerAccount {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    });
+    options.configured_endpoint = Some(broker.root.join("bus.sock"));
+    options.require_native_session = true;
+    options
+}
+
+#[tokio::test]
+async fn p0i_06_client_verified_delivery_and_tcp_has_no_trusted_context() {
+    use cosmix_client::{NodedClient, UnixConnectOutcome};
+    let broker = Broker::start().await;
+    let options = client_options(&broker);
+    let UnixConnectOutcome::VerifiedUnix(mut service) =
+        NodedClient::connect_unix("verified-service", &broker.url, &options, None)
+            .await
+            .unwrap()
+    else {
+        panic!("required connection downgraded")
+    };
+    let mut caller = broker.unix().await;
+    register(&mut caller, "verified-caller").await;
+    send(
+        &mut caller,
+        &request("probe.echo", "verified-service", "context")
+            .with_header("BROKER_PRINCIPAL", "forged")
+            .with_body("request"),
+    )
+    .await;
+    let delivery = tokio::time::timeout(std::time::Duration::from_secs(3), service.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.command().from, "verified-caller");
+    assert_eq!(
+        delivery.trusted_context().unwrap().unix_uid,
+        options.broker_account.uid
+    );
+    service
+        .client()
+        .respond(delivery.command(), 0, "legitimate reply")
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut caller).await.body.trim(), "legitimate reply");
+
+    let tcp = NodedClient::connect("ordinary-tcp", &broker.url)
+        .await
+        .unwrap();
+    tcp.send_raw(
+        &request("probe.event", "verified-service", "tcp")
+            .with_header("type", "event")
+            .with_header("broker_principal", "forged"),
+    )
+    .await
+    .unwrap();
+    let delivery = tokio::time::timeout(std::time::Duration::from_secs(3), service.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.command().from, "ordinary-tcp");
+    assert!(delivery.trusted_context().is_none());
+    // Even a real stamp received by an ordinary TCP service remains raw data:
+    // NodedClient/IncomingCommand provide no trusted-context accessor.
+    let mut raw = tcp.incoming_async().await.unwrap();
+    send(
+        &mut caller,
+        &request("probe.event", "ordinary-tcp", "raw").with_header("type", "event"),
+    )
+    .await;
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(3), raw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(raw.header("broker_principal").is_some());
+    tcp.close().await;
+    service.client().close().await;
+}
+
+#[tokio::test]
+async fn client_required_unix_never_downgrades_and_fallback_is_typed_unverified() {
+    use cosmix_client::{ConnectError, NodedClient, UnixConnectOutcome};
+    let broker = Broker::start_with_unix(false).await;
+    let mut options = client_options(&broker);
+    options.allow_unverified_tcp_fallback = true;
+    assert!(matches!(
+        NodedClient::connect_unix("required", &broker.url, &options, None).await,
+        Err(ConnectError::Io(_))
+    ));
+    // A TCP-only broker is alive and useful, but it cannot satisfy the profile.
+    options.require_native_session = false;
+    let UnixConnectOutcome::UnverifiedTcp { client, unix_error } =
+        NodedClient::connect_unix("fallback", &broker.url, &options, None)
+            .await
+            .unwrap()
+    else {
+        panic!("TCP fallback must be explicitly unverified")
+    };
+    assert!(matches!(unix_error, ConnectError::Io(_)));
+    assert!(
+        client
+            .call("noded", "noded.ping", serde_json::Value::Null)
+            .await
+            .unwrap()["pong"]
+            == true
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn client_rejects_wrong_endpoint_owner_and_server_credentials_without_fallback() {
+    use cosmix_client::{ConnectError, NodedClient};
+    let broker = Broker::start().await;
+    let mut options = client_options(&broker);
+    options.allow_unverified_tcp_fallback = true;
+    options.broker_account.uid = options.broker_account.uid.wrapping_add(1);
+    assert!(matches!(
+        NodedClient::connect_unix("wrong-owner", &broker.url, &options, None).await,
+        Err(ConnectError::EndpointOwnership)
+    ));
+    options = client_options(&broker);
+    options.broker_account.gid = options.broker_account.gid.wrapping_add(1);
+    assert!(matches!(
+        NodedClient::connect_unix("wrong-peer", &broker.url, &options, None).await,
+        Err(ConnectError::PeerCredentials)
+    ));
 }

@@ -44,6 +44,14 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{NameCollision, NodedClient, RegistrationRejected};
 
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::{
+    BrokerAccount, ConnectError, UnixConnectOptions, UnixConnectOutcome, VerifiedCommand,
+    VerifiedConnection,
+};
+
 #[cfg(not(target_arch = "wasm32"))]
 mod supervised;
 #[cfg(not(target_arch = "wasm32"))]
