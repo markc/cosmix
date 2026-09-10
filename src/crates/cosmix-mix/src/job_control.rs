@@ -608,7 +608,9 @@ impl Stage {
         self.gate.write_all(&[1])?;
         drop(self.gate);
         let mut errno = Vec::new();
-        self.error.by_ref().take(4).read_to_end(&mut errno)?;
+        Read::by_ref(&mut self.error)
+            .take(4)
+            .read_to_end(&mut errno)?;
         if errno.is_empty() {
             Ok(())
         } else if let Ok(bytes) = <[u8; 4]>::try_from(errno) {
