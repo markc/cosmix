@@ -38,6 +38,11 @@ use crate::observe::{
     Direction as ObserveDirection, Observation, ObserveError, ObserveManager,
     Outcome as ObserveOutcome,
 };
+use crate::protection::TrafficClass;
+
+#[cfg(test)]
+#[path = "native_session_tests.rs"]
+mod native_session_tests;
 use crate::subscription::{
     self, BrokerOrigin, JANITOR_INTERVAL, Notification, SubscriptionBroker, TopicInfo,
     stamp_broker_origin, strip_broker_origin,
@@ -104,6 +109,7 @@ fn warn_drop(last_at_ms: &AtomicU64, dropped: &AtomicU64, mk: impl FnOnce(u64) -
 /// `info.name` mirrors the registry key.
 #[derive(Clone)]
 pub(crate) struct ServiceEntry {
+    traffic_class: TrafficClass,
     tx: mpsc::Sender<String>,
     info: cosmix_bus::ServiceInfo,
 }
@@ -133,6 +139,7 @@ type TapSubscribers = Arc<RwLock<Vec<mpsc::Sender<String>>>>;
 /// response wire before delivering it back. SPEC 18 Phase 2 WS5
 /// uncovered this against concurrent `mix -c` fan-outs.
 struct PendingResponse {
+    traffic_class: TrafficClass,
     caller_tx: mpsc::Sender<String>,
     /// Exact recipient connection; a reused service name is not reply authority.
     responder_tx: mpsc::Sender<String>,
@@ -179,12 +186,31 @@ impl PendingResponseTable {
     /// was id-less (fire-and-forget — no reply correlation needed).
     /// Caller must re-serialise `msg` *after* calling this if the
     /// previous wire bytes are still in use.
+    #[cfg(test)]
     async fn register(
         &self,
         msg: &mut BusMessage,
         caller_tx: &mpsc::Sender<String>,
         caller_service: Option<&str>,
         responder_tx: &mpsc::Sender<String>,
+    ) -> Option<String> {
+        self.register_classified(
+            msg,
+            caller_tx,
+            caller_service,
+            responder_tx,
+            TrafficClass::Legacy,
+        )
+        .await
+    }
+
+    async fn register_classified(
+        &self,
+        msg: &mut BusMessage,
+        caller_tx: &mpsc::Sender<String>,
+        caller_service: Option<&str>,
+        responder_tx: &mpsc::Sender<String>,
+        traffic_class: TrafficClass,
     ) -> Option<String> {
         let caller_id = msg.get("id")?.to_string();
         // §14 class from the Bus `type` (request/unset → rpc; the table only
@@ -206,6 +232,7 @@ impl PendingResponseTable {
         self.map.write().await.insert(
             broker_id.clone(),
             PendingResponse {
+                traffic_class,
                 caller_tx: caller_tx.clone(),
                 responder_tx: responder_tx.clone(),
                 observer_correlation_id: caller_id.clone(),
@@ -630,10 +657,17 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
                 }
             };
 
-            let target_tx = {
+            let (target_tx, target_class) = {
                 let registry = registry_for_mesh.read().await;
-                registry.get(&service).map(|entry| entry.tx.clone())
+                (
+                    registry.get(&service).map(|entry| entry.tx.clone()),
+                    registry
+                        .get(&service)
+                        .map(|entry| entry.traffic_class)
+                        .unwrap_or_default(),
+                )
             };
+            let observe_for_mesh = observe_for_mesh.for_class(target_class);
             let mut observed_wire = None;
             let outcome = if let Some(target_tx) = target_tx {
                 let canonical_wire = msg.to_wire();
@@ -698,7 +732,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
 
     let pending_responses: PendingResponses = Arc::new(PendingResponseTable::new());
     let tap_subscribers: TapSubscribers = Arc::new(RwLock::new(Vec::new()));
-    let broker = Arc::new(SubscriptionBroker::new());
+    let broker = Arc::new(SubscriptionBroker::with_observe(observe.clone()));
 
     // Janitor: periodically purge stale topic snapshots past the orphan timeout
     // grace period. See src/_doc/2026-04-10-topic-pubsub-v1.md § 10.3.1.
@@ -1796,6 +1830,7 @@ fn broker_only_session_event(msg: &BusMessage) -> bool {
 
 async fn handle_socket(socket: WebSocket, mut state: AppState, transport: TransportIdentity) {
     if let TransportIdentity::LocalUnix { uid, gid, peer_pid } = &transport {
+        state.observe = state.observe.for_class(TrafficClass::NativeSession);
         state.principal = Some(BrokerPrincipal {
             version: PrincipalVersion::V1,
             assurance: Assurance::LocalUnix,
@@ -1913,7 +1948,60 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         };
 
         strip_principal(&mut bus_msg);
+        let mut state = state.clone();
+        state.observe = state.observe.for_class(TrafficClass::command(&bus_msg));
         if broker_only_session_event(&bus_msg) {
+            continue;
+        }
+        // S1 supplies the wire profile, not S2's session state machine. Validate
+        // before returning an explicit unsupported result; never mutate identity.
+        if bus_msg
+            .command_name()
+            .is_some_and(|c| c.starts_with("noded.session."))
+            && bus_msg.message_type() != Some("response")
+        {
+            let validation = cosmix_bus::native_session::parse_bootstrap(text.as_bytes());
+            let Some(id) = bus_msg.get("id").filter(|id| {
+                !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
+            }) else {
+                break;
+            };
+            let error = cosmix_bus::native_session::SessionError {
+                error_code: if validation.is_ok() {
+                    cosmix_bus::native_session::ErrorCode::Unsupported
+                } else {
+                    cosmix_bus::native_session::ErrorCode::InvalidArgument
+                },
+                message: if validation.is_ok() {
+                    "session commands are not available"
+                } else {
+                    "invalid session request"
+                }
+                .into(),
+                details: Default::default(),
+            };
+            let reply = BusMessage::new()
+                .with_header("bus", "1")
+                .with_header("native-session", "1")
+                .with_header("type", "response")
+                .with_header("rc", "10")
+                .with_header("id", id)
+                .with_header("command", bus_msg.command_name().unwrap_or("noded.session"))
+                .with_body(&serde_json::to_string(&error).expect("session error"));
+            canonicalize_connection_from(&mut bus_msg, service_name.as_deref());
+            state.observe.observe(Observation::canonical(
+                ObserveDirection::Local,
+                ObserveOutcome::Rejected,
+                &bus_msg,
+                bus_msg.get("id"),
+            ));
+            deliver_observed_response(
+                &state.observe,
+                &tx,
+                &reply,
+                ObserveDirection::Local,
+                reply.get("id"),
+            );
             continue;
         }
 
@@ -1969,6 +2057,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         if bus_msg.message_type() == Some("response") {
             if let Some(id) = bus_msg.get("id").map(|s| s.to_string()) {
                 if let Some(pending) = state.pending_responses.take_response(&id, &tx).await {
+                    let observe = state.observe.for_class(pending.traffic_class);
                     let wire = canonicalize_correlated_response(
                         &mut bus_msg,
                         &pending.caller_id,
@@ -1977,13 +2066,13 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                         broker_origin_for_delivery(source_ip, &state.bind),
                         state.principal.as_ref(),
                     );
-                    if state.observe.is_active() {
+                    if observe.is_active() {
                         let outcome = match pending.caller_tx.try_send(wire.clone()) {
                             Ok(()) => ObserveOutcome::Delivered,
                             Err(mpsc::error::TrySendError::Full(_)) => ObserveOutcome::Dropped,
                             Err(mpsc::error::TrySendError::Closed(_)) => ObserveOutcome::Rejected,
                         };
-                        state.observe.observe(Observation::from_message(
+                        observe.observe(Observation::from_message(
                             ObserveDirection::Local,
                             outcome,
                             &bus_msg,
@@ -2317,19 +2406,41 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                     &state.tap_subscribers,
                     observed_wire,
                     route_result.target_tx.as_ref(),
+                    route_result.traffic_class,
                 )
                 .await;
                 if observing {
-                    state.observe.observe(Observation::from_message(
-                        ObserveDirection::Local,
-                        route_result.outcome,
-                        &bus_msg,
-                        observed_wire,
-                        correlation_id.as_deref(),
-                    ));
+                    state.observe.observe(
+                        Observation::from_message(
+                            ObserveDirection::Local,
+                            route_result.outcome,
+                            &bus_msg,
+                            observed_wire,
+                            correlation_id.as_deref(),
+                        )
+                        .with_class(route_result.traffic_class),
+                    );
                 }
             }
             Route::RemoteMesh { target } => {
+                // There is no cross-node native-session classification or UID
+                // delegation contract in v1. Do not export protected traffic to
+                // a legacy hop whose observers cannot retain its classification.
+                if state.observe.traffic_class().protected() {
+                    let mut reply = BusMessage::new().with_header("type", "response").with_header("rc", "10")
+                        .with_body(r#"{"error_code":"UNSUPPORTED","message":"native session traffic is node-local","details":{}}"#);
+                    if let Some(id) = bus_msg.get("id") {
+                        reply.set("id", id);
+                    }
+                    deliver_observed_response(
+                        &state.observe,
+                        &tx,
+                        &reply,
+                        ObserveDirection::Local,
+                        reply.get("id"),
+                    );
+                    continue;
+                }
                 canonicalize_routed_from_in_place(&mut bus_msg, service_name.as_deref());
                 // Only a local registered source acquires a direct-hop service
                 // assertion. A relay cannot borrow this node's clipboard grant.
@@ -2873,6 +2984,7 @@ fn deliver_observed_response(
 /// [`PendingResponse`] for the SPEC 18 Phase 2 WS5 incident that uncovered
 /// this.
 struct LocalRouteResult {
+    traffic_class: TrafficClass,
     target_tx: Option<mpsc::Sender<String>>,
     forwarded_wire: Option<String>,
     outcome: ObserveOutcome,
@@ -2891,8 +3003,14 @@ async fn route_local(
 ) -> LocalRouteResult {
     let registry = &state.registry;
     let pending_responses = &state.pending_responses;
-    let observe = &state.observe;
     let reg = registry.read().await;
+    let traffic_class = state.observe.traffic_class().merge(
+        reg.get(service)
+            .map(|e| e.traffic_class)
+            .unwrap_or_default(),
+    );
+    let scoped_observe = state.observe.for_class(traffic_class);
+    let observe = &scoped_observe;
     if let Some(target_tx) = reg.get(service).map(|e| e.tx.clone()) {
         // Register pending BEFORE rewriting the wire bytes so the
         // broker_id we insert under matches the id we serialise into the
@@ -2900,7 +3018,7 @@ async fn route_local(
         // id-less messages — fire-and-forget skips the correlation table
         // entirely.
         let broker_id = pending_responses
-            .register(msg, caller_tx, caller_service, &target_tx)
+            .register_classified(msg, caller_tx, caller_service, &target_tx, traffic_class)
             .await;
         let (wire, delivery) = {
             let _fence = state
@@ -2924,6 +3042,7 @@ async fn route_local(
         };
         match delivery {
             Ok(()) => LocalRouteResult {
+                traffic_class,
                 target_tx: Some(target_tx),
                 forwarded_wire: Some(wire),
                 outcome: ObserveOutcome::Delivered,
@@ -2968,6 +3087,7 @@ async fn route_local(
                 // Target didn't receive the wire — tap should fall back to the
                 // canonical pre-route bytes, not these undelivered ones.
                 LocalRouteResult {
+                    traffic_class,
                     target_tx: Some(target_tx),
                     forwarded_wire: None,
                     outcome: ObserveOutcome::Dropped,
@@ -3011,6 +3131,7 @@ async fn route_local(
                     err.get("id"),
                 );
                 LocalRouteResult {
+                    traffic_class,
                     target_tx: None,
                     forwarded_wire: Some(wire),
                     outcome: ObserveOutcome::Rejected,
@@ -3034,6 +3155,7 @@ async fn route_local(
             err.get("id"),
         );
         LocalRouteResult {
+            traffic_class,
             target_tx: None,
             forwarded_wire: None,
             outcome: ObserveOutcome::Rejected,
@@ -3053,7 +3175,11 @@ async fn broadcast_tap(
     tap_subscribers: &TapSubscribers,
     raw: &str,
     exclude: Option<&mpsc::Sender<String>>,
+    traffic_class: TrafficClass,
 ) {
+    if traffic_class.protected() {
+        return;
+    }
     let taps = tap_subscribers.read().await;
     if taps.is_empty() {
         return;
@@ -3291,6 +3417,11 @@ async fn handle_noded_command(
                 reg.insert(
                     from.clone(),
                     ServiceEntry {
+                        traffic_class: if state.principal.is_some() {
+                            TrafficClass::NativeSession
+                        } else {
+                            TrafficClass::Legacy
+                        },
                         tx: tx.clone(),
                         info,
                     },
@@ -6116,6 +6247,7 @@ mod tests {
                 registry.insert(
                     "bridge-beta".into(),
                     super::ServiceEntry {
+                        traffic_class: super::TrafficClass::Legacy,
                         tx: if case == "wrong-owner" {
                             other
                         } else {
@@ -6127,6 +6259,7 @@ mod tests {
                 registry.insert(
                     "desktop".into(),
                     super::ServiceEntry {
+                        traffic_class: super::TrafficClass::Legacy,
                         tx: target,
                         info: Default::default(),
                     },
@@ -6187,6 +6320,7 @@ mod tests {
             registry.insert(
                 "bridge-beta".into(),
                 super::ServiceEntry {
+                    traffic_class: super::TrafficClass::Legacy,
                     tx: caller.clone(),
                     info: Default::default(),
                 },
@@ -6194,6 +6328,7 @@ mod tests {
             registry.insert(
                 "desktop".into(),
                 super::ServiceEntry {
+                    traffic_class: super::TrafficClass::Legacy,
                     tx: target,
                     info: Default::default(),
                 },

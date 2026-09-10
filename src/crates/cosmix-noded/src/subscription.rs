@@ -196,6 +196,8 @@ pub struct Notification {
 // ── Internal state ──
 
 struct CachedSnapshot {
+    /// Persisted independently of headers and of the publisher's live route.
+    traffic_class: crate::protection::TrafficClass,
     /// The annotated inner Bus message (with `topic` + `topic_seq` headers
     /// already injected). Cloned and re-rendered per delivery so we can
     /// toggle the `topic_stale` header without mutating the cache.
@@ -212,6 +214,167 @@ struct CachedSnapshot {
     /// to skip snapshot replay when a filter is set and doesn't match.
     /// `None` if the body wasn't JSON or had no top-level `namespace`.
     body_namespace: Option<String>,
+}
+
+#[cfg(test)]
+mod native_session_tests {
+    use super::*;
+    use crate::protection::TrafficClass;
+    use cosmix_bus::native_session::{
+        Assurance, BrokerPrincipal, HexBytes, PrincipalVersion, read_principal, strip_principal,
+    };
+
+    fn principal() -> BrokerPrincipal {
+        BrokerPrincipal {
+            version: PrincipalVersion::V1,
+            assurance: Assurance::LocalUnix,
+            owner_node: "node-a".into(),
+            unix_uid: 1000,
+            unix_gid: 1000,
+            peer_pid: 10,
+            broker_epoch: HexBytes([1; 16]),
+            connection_id: HexBytes([2; 16]),
+            session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn publisher_stamp_and_protection_survive_retained_replay_and_route_loss() {
+        let observe = crate::observe::ObserveManager::new(vec!["audit-observer".into()]);
+        observe.spawn_drainer();
+        let (observer, mut observed) = mpsc::channel(32);
+        observe
+            .start(
+                Some("audit-observer"),
+                true,
+                &observer,
+                Some("start"),
+                r#"{"body":"redacted"}"#,
+            )
+            .unwrap();
+        observed.recv().await.unwrap();
+        let broker = SubscriptionBroker::with_observe(observe);
+        let (publisher, _publisher_rx) = mpsc::channel(8);
+        let (live, mut live_rx) = mpsc::channel(8);
+        broker
+            .subscribe_topic("native.snapshot", "live", live)
+            .await;
+        let inner = BusMessage::new()
+            .with_header("command", "snapshot")
+            .with_header("type", "event")
+            .with_header("BROKER_PRINCIPAL", "forgery")
+            .with_header("Broker_Principal", "another forgery")
+            .with_body(r#"{"value":"PRIVATE-SNAPSHOT"}"#);
+        broker
+            .publish_with_principal(
+                "native.snapshot",
+                &inner.to_wire(),
+                "publisher",
+                publisher.clone(),
+                BrokerOrigin::Local,
+                true,
+                Some(&principal()),
+            )
+            .await
+            .unwrap();
+        let live = bus::parse(&live_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(read_principal(&live).unwrap(), Some(principal()));
+        broker.remove_peer("publisher", &publisher).await;
+        let (replay, mut replay_rx) = mpsc::channel(8);
+        broker
+            .subscribe_topic("native.snapshot", "later", replay)
+            .await;
+        let replay = bus::parse(&replay_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(
+            read_principal(&replay).unwrap(),
+            Some(principal()),
+            "do not stamp subscriber as publisher"
+        );
+        assert_eq!(replay.get("topic_stale"), Some("true"));
+        assert_eq!(
+            broker.topics.read().await["native.snapshot"]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .traffic_class,
+            TrafficClass::NativeSession
+        );
+
+        // Even removal of the cached attribution header cannot downgrade the
+        // separately retained observation class.
+        strip_principal(
+            &mut broker
+                .topics
+                .write()
+                .await
+                .get_mut("native.snapshot")
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .body,
+        );
+        let (third, _third_rx) = mpsc::channel(8);
+        broker
+            .subscribe_topic("native.snapshot", "third", third)
+            .await;
+        for _ in 0..3 {
+            let wire = tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!wire.contains("PRIVATE-SNAPSHOT"));
+            assert!(!wire.contains("broker_principal"));
+            let event = bus::parse(&wire).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&event.body).unwrap();
+            assert_eq!(body["payload_omitted"], "native_session_protected");
+            assert!(body["payload"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_inner_forgery_stripped_and_lifecycle_not_retainable() {
+        let broker = SubscriptionBroker::new();
+        let (publisher, _) = mpsc::channel(8);
+        let inner = BusMessage::new()
+            .with_header("BROKER_PRINCIPAL", "forged")
+            .with_header("broker_principal", "forged")
+            .with_body("ordinary body");
+        broker
+            .publish(
+                "legacy.snapshot",
+                &inner.to_wire(),
+                "legacy",
+                publisher.clone(),
+                true,
+            )
+            .await
+            .unwrap();
+        let (sub, mut rx) = mpsc::channel(8);
+        broker
+            .subscribe_topic("legacy.snapshot", "reader", sub)
+            .await;
+        assert_eq!(
+            read_principal(&bus::parse(&rx.recv().await.unwrap()).unwrap()).unwrap(),
+            None
+        );
+        for command in ["noded.session.lifecycle", "noded.session.lifecycle.gap"] {
+            let inner = BusMessage::new().with_header("command", command);
+            assert!(matches!(
+                broker
+                    .publish(
+                        "forged.lifecycle",
+                        &inner.to_wire(),
+                        "legacy",
+                        publisher.clone(),
+                        true
+                    )
+                    .await,
+                Err(PublishError::ReservedName)
+            ));
+        }
+        assert!(!broker.topics.read().await.contains_key("forged.lifecycle"));
+    }
 }
 
 struct TopicState {
@@ -232,6 +395,7 @@ struct BrokerInner {
 
 /// The shared subscription broker.
 pub struct SubscriptionBroker {
+    observe: Option<std::sync::Arc<crate::observe::ObserveManager>>,
     inner: RwLock<BrokerInner>,
     topics: RwLock<HashMap<String, TopicState>>,
 }
@@ -245,12 +409,54 @@ impl Default for SubscriptionBroker {
 impl SubscriptionBroker {
     pub fn new() -> Self {
         Self {
+            observe: None,
             inner: RwLock::new(BrokerInner {
                 subscriptions: HashMap::new(),
                 by_peer: HashMap::new(),
             }),
             topics: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn with_observe(observe: std::sync::Arc<crate::observe::ObserveManager>) -> Self {
+        Self {
+            observe: Some(observe),
+            ..Self::new()
+        }
+    }
+
+    /// Protected fan-out/replay never enters tap. Its optional observer gets
+    /// metadata only, with the cached class rather than a live publisher lookup.
+    fn send_snapshot(
+        &self,
+        tx: &mpsc::Sender<String>,
+        wire: &str,
+        class: crate::protection::TrafficClass,
+    ) -> Result<(), mpsc::error::TrySendError<String>> {
+        let result = tx.try_send(wire.to_owned());
+        if class.protected()
+            && let Some(observe) = &self.observe
+            && observe.is_active()
+            && let Ok(message) = bus::parse(wire)
+        {
+            use crate::observe::{Direction, Observation, Outcome};
+            let outcome = match &result {
+                Ok(()) => Outcome::Delivered,
+                Err(mpsc::error::TrySendError::Full(_)) => Outcome::Dropped,
+                Err(mpsc::error::TrySendError::Closed(_)) => Outcome::Rejected,
+            };
+            observe.observe(
+                Observation::from_message(
+                    Direction::Local,
+                    outcome,
+                    &message,
+                    wire,
+                    message.get("id"),
+                )
+                .with_class(class),
+            );
+        }
+        result
     }
 
     // ── Identity helpers ──
@@ -360,6 +566,12 @@ impl SubscriptionBroker {
         }
         cosmix_bus::native_session::stamp_principal(&mut inner, principal)
             .map_err(|_| PublishError::MalformedPayload)?;
+        let traffic_class =
+            if principal.is_some() || crate::props_reservation::reserved_owner(name).is_some() {
+                crate::protection::TrafficClass::NativeSession
+            } else {
+                crate::protection::TrafficClass::command(&inner)
+            };
 
         // Extract the body's namespace field once per publish for
         // filtered fan-out (§ SPEC 12 §15.5 — `<svc>.props.records.changed`
@@ -406,6 +618,7 @@ impl SubscriptionBroker {
             if retain {
                 let size = wire.len();
                 state.snapshot = Some(CachedSnapshot {
+                    traffic_class,
                     body: inner.clone(),
                     seq,
                     published_by: from.to_string(),
@@ -452,7 +665,7 @@ impl SubscriptionBroker {
                         }
                         continue;
                     }
-                    match sub.tx.try_send(wire.clone()) {
+                    match self.send_snapshot(&sub.tx, &wire, traffic_class) {
                         Ok(()) => delivered += 1,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(
@@ -603,7 +816,7 @@ impl SubscriptionBroker {
                     if snap.stale_since.is_some() {
                         msg.set("topic_stale", "true");
                     }
-                    Some(msg.to_wire())
+                    Some((msg.to_wire(), snap.traffic_class))
                 });
                 let seq = state.snapshot.as_ref().map(|s| s.seq).unwrap_or(0);
 
@@ -649,9 +862,9 @@ impl SubscriptionBroker {
         // tick is the catch-all for that path; this only handles the
         // narrow race where replay is the very first delivery attempt
         // and tells us authoritatively that the channel is dead.
-        if let Some(wire) = &replay
+        if let Some((wire, class)) = &replay
             && matches!(
-                tx.try_send(wire.clone()),
+                self.send_snapshot(&tx, wire, *class),
                 Err(mpsc::error::TrySendError::Closed(_))
             )
         {

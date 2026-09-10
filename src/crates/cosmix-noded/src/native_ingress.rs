@@ -8,8 +8,8 @@ use axum::serve::IncomingStream;
 use cosmix_bus::native_session::TransportIdentity;
 use tokio::net::{UnixListener, UnixStream};
 
-// Activated with observation protection in the next coherent stage.
-pub(crate) const ENABLED: bool = false;
+// Enabled only after native delivery and observation protection are wired.
+pub(crate) const ENABLED: bool = true;
 
 #[derive(Clone)]
 pub(crate) struct UnixPeer(pub Option<TransportIdentity>);

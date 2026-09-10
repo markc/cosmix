@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::protection::TrafficClass;
 use cosmix_bus::bus::{BusMessage, BusTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,6 +67,7 @@ impl BodyMode {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Observation<'a> {
+    class: TrafficClass,
     pub direction: Direction,
     pub outcome: Outcome,
     pub message: &'a BusMessage,
@@ -82,6 +84,7 @@ impl<'a> Observation<'a> {
         correlation_id: Option<&'a str>,
     ) -> Self {
         Self {
+            class: TrafficClass::command(message),
             direction,
             outcome,
             message,
@@ -100,12 +103,18 @@ impl<'a> Observation<'a> {
         correlation_id: Option<&'a str>,
     ) -> Self {
         Self {
+            class: TrafficClass::command(message),
             direction,
             outcome,
             message,
             canonical_size: None,
             correlation_id,
         }
+    }
+
+    pub(crate) fn with_class(mut self, class: TrafficClass) -> Self {
+        self.class = self.class.merge(class);
+        self
     }
 }
 
@@ -237,11 +246,13 @@ impl ObserveError {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ObserveManager {
-    allowed_services: Vec<String>,
-    next_id: AtomicU64,
-    active_subscriptions: AtomicUsize,
-    inner: Mutex<Inner>,
+    allowed_services: Arc<Vec<String>>,
+    next_id: Arc<AtomicU64>,
+    active_subscriptions: Arc<AtomicUsize>,
+    inner: Arc<Mutex<Inner>>,
+    class: TrafficClass,
 }
 
 impl ObserveManager {
@@ -260,11 +271,27 @@ impl ObserveManager {
             })
             .collect();
         Arc::new(Self {
-            allowed_services,
-            next_id: AtomicU64::new(1),
-            active_subscriptions: AtomicUsize::new(0),
-            inner: Mutex::new(Inner::default()),
+            allowed_services: Arc::new(allowed_services),
+            next_id: Arc::new(AtomicU64::new(1)),
+            active_subscriptions: Arc::new(AtomicUsize::new(0)),
+            inner: Arc::new(Mutex::new(Inner::default())),
+            class: TrafficClass::Legacy,
         })
+    }
+
+    /// Shares subscriptions, quotas and queues; changes only the trusted
+    /// delivery context. Protection can increase, never downgrade.
+    pub(crate) fn for_class(self: &Arc<Self>, class: TrafficClass) -> Arc<Self> {
+        if self.class.merge(class) == self.class {
+            return self.clone();
+        }
+        let mut scoped = self.as_ref().clone();
+        scoped.class = self.class.merge(class);
+        Arc::new(scoped)
+    }
+
+    pub(crate) fn traffic_class(&self) -> TrafficClass {
+        self.class
     }
 
     pub(crate) fn spawn_drainer(self: &Arc<Self>) {
@@ -390,6 +417,7 @@ impl ObserveManager {
     }
 
     pub(crate) fn observe(&self, observation: Observation<'_>) {
+        let observation = observation.with_class(self.class);
         // The zero-subscriber production hot path is exactly one relaxed
         // atomic load: no clone, allocation, serialisation, or mutex.
         if !self.is_active() {
@@ -735,31 +763,47 @@ fn endpoint_matches(message: &BusMessage, service: &str) -> bool {
 }
 
 fn metadata_event(observation: &Observation<'_>) -> EventBody {
+    let bounded = |value: Option<&str>| {
+        value.map(|s| {
+            if observation.class.protected() {
+                s.chars().take(128).collect()
+            } else {
+                s.to_owned()
+            }
+        })
+    };
     EventBody {
         seq: 0,
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         direction: observation.direction,
         outcome: observation.outcome,
         message_type: classify_message_type(observation.message),
-        from: observation.message.from_addr().map(ToString::to_string),
-        to: observation.message.to_addr().map(ToString::to_string),
-        verb: observation.message.command_name().map(ToString::to_string),
+        from: bounded(observation.message.from_addr()),
+        to: bounded(observation.message.to_addr()),
+        verb: bounded(observation.message.command_name()),
         size: observation
             .canonical_size
             .unwrap_or_else(|| observation.message.to_wire().len()),
-        correlation_id: observation.correlation_id.map(ToString::to_string),
+        correlation_id: bounded(observation.correlation_id),
         rc: observation
             .message
             .get("rc")
             .and_then(|value| value.parse().ok()),
         dropped_count: 0,
         payload: None,
-        payload_omitted: Some("disabled"),
+        payload_omitted: Some(if observation.class.protected() {
+            "native_session_protected"
+        } else {
+            "disabled"
+        }),
     }
 }
 
 fn redacted_event(observation: &Observation<'_>) -> EventBody {
     let mut event = metadata_event(observation);
+    if observation.class.protected() {
+        return event;
+    }
     if !payload_policy_allows(observation) {
         event.payload_omitted = Some("policy");
         return event;

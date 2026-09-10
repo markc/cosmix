@@ -20,6 +20,7 @@ mod noded;
 mod observe;
 mod props;
 mod props_reservation;
+mod protection;
 mod routing;
 mod spec;
 mod spec_release;
