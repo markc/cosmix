@@ -4,6 +4,8 @@ mod config;
 mod config_precedence_tests;
 #[cfg(test)]
 mod input_tests;
+#[cfg(test)]
+mod layout_tests;
 mod metrics;
 mod panes;
 mod raster;
@@ -827,6 +829,13 @@ fn sync_panes(
     }
 }
 
+/// Layout resolves and rounds each border in physical pixels independently.
+fn pane_interior(computed: &ComputedNode) -> Vec2 {
+    let border = computed.border();
+    let insets = Vec2::new(border.left + border.right, border.top + border.bottom);
+    (computed.size() - insets).max(Vec2::ZERO) * computed.inverse_scale_factor()
+}
+
 fn refresh(
     core: Res<Core>,
     painter: Res<Painter>,
@@ -896,7 +905,7 @@ fn refresh(
                     h: outer.y,
                 },
             );
-            let size = (outer - Vec2::splat(2.0)).max(Vec2::ZERO);
+            let size = pane_interior(computed);
             let cols = ((size.x / painter.logical_width().max(1.0)) as u16)
                 .clamp(2, 240.min((4096 / painter.width) as u16));
             let rows = ((size.y / painter.logical_height().max(1.0)) as u16)

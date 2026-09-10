@@ -15,13 +15,16 @@ the physical texture / logical node / nearest sampler HiDPI contract. Only the
 active pane draws its cursor and themed focus accent. Split nodes become rows
 (vertical splits) or columns (horizontal splits), with a 3px themed divider.
 The flex subtree rebuilds only on active-tree changes or tab switches.
+Cell allocations subtract resolved physical border insets before converting
+the interior to logical pixels, including at fractional display scales.
 
 Ctrl+Shift+E splits side-by-side; Ctrl+Shift+O splits top/bottom. New panes
 become active. Ctrl+Shift+X closes the active pane and promotes its sibling;
 closing a tab's last pane closes that tab. Click a pane to focus it, or use
 Ctrl+Shift+Arrow keys: focus chooses the nearest leaf centre in the requested
 half-plane using cached logical layout geometry, with in-order ties. Before
-the first layout it uses proportional tree geometry. These shortcuts require
+the first layout, and after a split or collapse until layout measures the new
+tree, it uses proportional tree geometry. These shortcuts require
 terminal focus, closed menus, exact modifiers and a non-repeated key press.
 There is a shared 32-terminal cap across all tabs and panes; terminals pending
 bounded cleanup continue to occupy their slots. Exited panes collapse their

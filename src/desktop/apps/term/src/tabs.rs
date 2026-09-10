@@ -237,6 +237,7 @@ impl TabSet {
         tab.active_pane = id;
         self.revision += 1;
         tab.revision = self.revision;
+        self.invalidate_geometry(self.active);
         self.notify();
         Ok(id)
     }
@@ -247,6 +248,11 @@ impl TabSet {
         self.tabs[self.active].active_pane = id;
         self.notify();
         true
+    }
+    fn invalidate_geometry(&mut self, index: usize) {
+        for (pane, _) in self.tabs[index].tree.leaves(Geometry::default()) {
+            self.metadata.get_mut(&pane.id).unwrap().geometry = Geometry::default();
+        }
     }
     pub fn focus_dir(&mut self, dir: Direction) -> bool {
         if self.is_empty() {
@@ -306,6 +312,7 @@ impl TabSet {
         self.pending.fetch_add(1, Ordering::AcqRel);
         self.revision += 1;
         tab.revision = self.revision;
+        self.invalidate_geometry(index);
         self.notify();
         (
             Outcome::Remaining(count),
@@ -567,6 +574,46 @@ mod tests {
         tabs.select(first);
         assert!(!tabs.focus(other));
         assert!(!tabs.focus(u64::MAX));
+        drop(tabs.shutdown());
+    }
+    #[test]
+    fn close_then_focus_discards_old_rectangles_without_refresh() {
+        let Some(mut tabs) = fixture() else {
+            return;
+        };
+        let left = tabs.active_tab().active_pane;
+        let top = tabs.split_active(SplitDir::Vertical).unwrap();
+        let bottom = tabs.split_active(SplitDir::Horizontal).unwrap();
+        for (id, x, y, w, h) in [
+            (left, 0.0, 0.0, 400.0, 600.0),
+            (top, 403.0, 0.0, 400.0, 298.0),
+            (bottom, 403.0, 301.0, 400.0, 299.0),
+        ] {
+            tabs.geometry(id, Geometry { x, y, w, h });
+        }
+        drop(tabs.close_active().1);
+        assert_eq!(tabs.active_tab().active_pane, top);
+        assert!(tabs.leaves().iter().all(|pane| pane.geometry.w == 0.0));
+        // The old top rectangle would make Down jump sideways to the left.
+        assert!(!tabs.focus_dir(Direction::Down));
+        assert_eq!(tabs.active_tab().active_pane, top);
+        assert!(tabs.focus_dir(Direction::Left));
+        assert_eq!(tabs.active_tab().active_pane, left);
+        assert!(!tabs.focus_dir(Direction::Up));
+        assert!(tabs.focus_dir(Direction::Right));
+        assert_eq!(tabs.active_tab().active_pane, top);
+        // A split also invalidates previously measured surviving leaves.
+        tabs.geometry(
+            left,
+            Geometry {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 600.0,
+            },
+        );
+        tabs.split_active(SplitDir::Horizontal).unwrap();
+        assert!(tabs.leaves().iter().all(|pane| pane.geometry.w == 0.0));
         drop(tabs.shutdown());
     }
     #[test]
