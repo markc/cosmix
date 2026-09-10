@@ -2178,7 +2178,7 @@ pub(crate) fn undefined_function_hint(name: &str, user_fns: &HashSet<String>) ->
         if d == 0 || d > threshold {
             continue;
         }
-        if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+        if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, cand.to_string()));
         }
     }
@@ -2197,7 +2197,7 @@ pub(crate) fn undefined_variable_hint(name: &str, in_scope: &[String]) -> Option
         if d == 0 || d > threshold {
             continue;
         }
-        if best.map_or(true, |(bd, _)| d < bd) {
+        if best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, cand.as_str()));
         }
     }

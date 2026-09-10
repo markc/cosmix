@@ -5622,6 +5622,8 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     // cross the thread boundary; the worker flattens any error to owned
     // `(code, message)` strings, which the caller thread turns back into either
     // a process_result error map (DATA) or a re-raised error.
+    // Keep the worker slot's synchronisation and owned error representation explicit.
+    #[allow(clippy::type_complexity)]
     let slots: Vec<Mutex<Option<Result<ProcOutcome, (String, String)>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -17460,13 +17462,13 @@ fn builtin_ws_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args_between("ws_recv", &args, 1, 2)?;
     let id = ws_handle_arg("ws_recv", &args)?;
     let mut timeout_seconds = 30.0;
-    if let Some(v) = args.get(1) {
-        if !matches!(v, Value::Nil) {
-            timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
-                ws_err("ws_recv()", format!("timeout must be a number, got {}", v.type_name()))
-            })?;
-            as_duration("ws_recv(): timeout", timeout_seconds)?;
-        }
+    if let Some(v) = args.get(1)
+        && !matches!(v, Value::Nil)
+    {
+        timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+            ws_err("ws_recv()", format!("timeout must be a number, got {}", v.type_name()))
+        })?;
+        as_duration("ws_recv(): timeout", timeout_seconds)?;
     }
     // Same take-out/put-back discipline as ws_send: the registry mutex is
     // never held across the blocking read.
@@ -17805,7 +17807,7 @@ fn tcp_fill(name: &str, conn: &mut tcp_client::Conn, timeout_seconds: f64, max: 
     // fine: tcp_recv serves buffered bytes first and the caller polls
     // again, and tcp_recv_line loops. `max` bounds the RETURN/line size,
     // not a single kernel read.
-    let mut tmp = vec![0u8; max.min(256 * 1024).max(1)];
+    let mut tmp = vec![0u8; max.clamp(1, 256 * 1024)];
     // Bound the EINTR retry loop: in the mix CLI only SIGINT is handled
     // (and it sets the interrupt flag, caught below), but an embedder that
     // installs a periodic signal handler without the flag could otherwise
@@ -18535,6 +18537,8 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
 
 /// One GET/HEAD exchange against the static root. Never raises — every
 /// failure becomes an HTTP status on the wire.
+// Preserve the explicit request options without changing the serving signature.
+#[allow(clippy::too_many_arguments)]
 fn http_serve_one(
     stream: &mut std::net::TcpStream,
     root: &std::path::Path,

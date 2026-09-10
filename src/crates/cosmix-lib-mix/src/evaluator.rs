@@ -5422,10 +5422,11 @@ impl Evaluator {
                 let coded = info.code != "RUNTIME_ERROR"
                     && info.code != "USER_DIE"
                     && info.code != "CAPABILITY_DENIED";
-                if coded && !info.message.contains("mix man") {
-                    if let Some(topic) = crate::builtins::man_topic_for_builtin(name) {
-                        info.message.push_str(&format!(" (see: mix man {topic})"));
-                    }
+                if coded
+                    && !info.message.contains("mix man")
+                    && let Some(topic) = crate::builtins::man_topic_for_builtin(name)
+                {
+                    info.message.push_str(&format!(" (see: mix man {topic})"));
                 }
                 info.frames.push(Frame {
                     kind: FrameKind::Builtin,

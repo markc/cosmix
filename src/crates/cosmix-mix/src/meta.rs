@@ -803,13 +803,13 @@ fn cmd_status(eval: &Evaluator, version: &str) {
 /// healthy and what am I talking to". Each line is ✓ (fine), ⚠ (a caveat with
 /// the fix), or ✗ (broken with the fix). Deliberately LOCAL and small: version
 /// + provenance, compiled features, prelude, manual, stats DB, Bus if
-/// configured — no fleet awareness, no config validation beyond its own (those
-/// are the hub's tools). Returns the number of ✗ lines so a caller / CI can key
-/// on the exit status.
-/// One-shot `mix doctor`: run the health check and return its exit code (0
-/// healthy, 1 if any ✗). The CLI path calls this instead of going through
-/// `dispatch`, so the exit status can gate `mix doctor && …` without the
-/// REPL-killing `process::exit` that a shared-dispatch arm would need.
+///   configured — no fleet awareness, no config validation beyond its own (those
+///   are the hub's tools). Returns the number of ✗ lines so a caller / CI can key
+///   on the exit status.
+///   One-shot `mix doctor`: run the health check and return its exit code (0
+///   healthy, 1 if any ✗). The CLI path calls this instead of going through
+///   `dispatch`, so the exit status can gate `mix doctor && …` without the
+///   REPL-killing `process::exit` that a shared-dispatch arm would need.
 pub fn run_doctor(eval: &Evaluator, version: &str) -> i32 {
     cmd_doctor(eval, version)
 }
