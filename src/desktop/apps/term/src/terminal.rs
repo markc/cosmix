@@ -299,6 +299,26 @@ pub struct Terminal {
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
 }
+/// Bounded WNOHANG reap of a single direct child (mirrors the shutdown reaper):
+/// used on a start-time Machine-spawn failure so the SIGHUP'd child can't zombie.
+/// ECHILD means it was already reaped; timeout logs and returns rather than hang.
+fn reap_child(pid: i32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid
+            || (rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("DIAGNOSTIC start-failure child reap timed out for pid {pid}");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 impl Terminal {
     pub fn start() -> Result<Self, String> {
         if std::path::Path::new("/.flatpak-info").exists() {
@@ -348,7 +368,19 @@ impl Terminal {
         )
         .map_err(|e| e.to_string())?;
         listener.writes.lock().unwrap().sender = Some(machine.channel());
-        let thread = machine.spawn();
+        // machine.spawn() delegates to std::thread::Builder::spawn().expect(),
+        // which panics under thread exhaustion. If it does, the child we just
+        // created is dropped together with the Machine — Child::drop sends
+        // SIGHUP but never waits — which would leave a zombie. Catch the panic,
+        // reap the (now-signalled) child, and surface an error instead.
+        let thread =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.spawn())) {
+                Ok(thread) => thread,
+                Err(_) => {
+                    reap_child(pid, Duration::from_millis(1800));
+                    return Err("terminal Machine thread failed to start".into());
+                }
+            };
         listener.dirty();
         Ok(Self {
             listener,
