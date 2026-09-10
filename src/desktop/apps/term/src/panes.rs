@@ -103,6 +103,20 @@ impl PaneTree {
             _ => {}
         }
     }
+    pub fn sibling_focus(&self, id: u64) -> Option<u64> {
+        match self {
+            Self::Leaf(_) => None,
+            Self::Split { first, second, .. } => {
+                if matches!(first.as_ref(), Self::Leaf(pane) if pane.id == id) {
+                    Some(second.leaves(Geometry::default())[0].0.id)
+                } else if matches!(second.as_ref(), Self::Leaf(pane) if pane.id == id) {
+                    Some(first.leaves(Geometry::default())[0].0.id)
+                } else {
+                    first.sibling_focus(id).or_else(|| second.sibling_focus(id))
+                }
+            }
+        }
+    }
     // VERIFY: pane close collapse — removing a child promotes the intact sibling.
     pub fn without(self, id: u64) -> Option<Self> {
         match self {

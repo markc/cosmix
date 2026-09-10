@@ -293,12 +293,13 @@ impl TabSet {
         };
         let tab = &mut self.tabs[index];
         let terminal = tab.tree.pane_by_id(id).unwrap().terminal.clone();
+        let sibling = tab.tree.sibling_focus(id);
         let Some(tree) = tab.tree.clone().without(id) else {
             return self.close(self.tabs[index].id);
         };
         tab.tree = tree;
         if tab.active_pane == id {
-            tab.active_pane = tab.tree.leaves(Geometry::default())[0].0.id;
+            tab.active_pane = sibling.expect("non-final pane has a sibling");
         }
         let count = tab.tree.leaves(Geometry::default()).len();
         self.metadata.remove(&id);
@@ -477,6 +478,7 @@ mod tests {
             vec![first_pane, second, third]
         );
         assert_eq!(tabs.close_active().0, Outcome::Remaining(2));
+        assert_eq!(tabs.active_tab().active_pane, second);
         assert!(tabs.pane_by_id(third).is_none());
         assert!(matches!(tabs.active_tab().tree, PaneTree::Split { .. }));
         tabs.focus(second);
@@ -557,7 +559,7 @@ mod tests {
         assert_eq!(tabs.active_tab().active_pane, left);
         assert!(!tabs.focus_dir(Direction::Left));
         assert!(tabs.focus_dir(Direction::Right));
-        assert_eq!(tabs.active_tab().active_pane, top);
+        assert_eq!(tabs.active_tab().active_pane, bottom);
         let first = tabs.active_id();
         tabs.open().unwrap();
         let other = tabs.active_tab().active_pane;

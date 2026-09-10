@@ -800,6 +800,18 @@ fn sync_panes(
         view.tree_state = Some(state);
     }
     let active = tabs.active_tab().active_pane;
+    for pane in &view.pane_views {
+        if !pane.rendered || pane.active != (pane.id == active) {
+            let token = if pane.id == active {
+                ctk::theme::tokens::CONTROL_ACTIVE
+            } else {
+                ctk::theme::tokens::BORDER
+            };
+            commands
+                .entity(pane.container)
+                .insert(bevy::feathers::theme::ThemeBorderColor(token));
+        }
+    }
     if let Some(pane) = view.pane_views.iter().find(|pane| pane.id == active) {
         let entity = pane.entity;
         view.terminal = entity;
@@ -816,7 +828,6 @@ fn refresh(
     mut view: ResMut<View>,
     mut images: ResMut<Assets<Image>>,
     mut nodes: Query<(&ComputedNode, &UiGlobalTransform, &mut Node)>,
-    mut borders: Query<&mut bevy::feathers::theme::ThemeBorderColor>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let removed = core.0.lock().unwrap().reap_exited();
@@ -864,16 +875,6 @@ fn refresh(
         }
         let active = pane.id == active_id;
         let switched = rebuilt || !pane.rendered || active != pane.active;
-        if let Ok(mut border) = borders.get_mut(pane.container) {
-            let token = if active {
-                ctk::theme::tokens::CONTROL_ACTIVE
-            } else {
-                ctk::theme::tokens::BORDER
-            };
-            if border.0 != token {
-                border.0 = token;
-            }
-        }
         // VERIFY: per-leaf resize+HiDPI node sizing — logical allocation,
         // physical PTY/texture pixels, logical image pixels divided by scale.
         if let Ok((computed, transform, _)) = nodes.get(pane.container) {
