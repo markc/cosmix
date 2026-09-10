@@ -19,6 +19,13 @@ pub struct JobTable {
     next_id: usize,
 }
 
+impl Drop for JobTable {
+    fn drop(&mut self) {
+        // Do not depend on evaluator Rc graphs releasing their policy clone.
+        self.shutdown();
+    }
+}
+
 impl JobTable {
     pub fn new() -> Self {
         JobTable {

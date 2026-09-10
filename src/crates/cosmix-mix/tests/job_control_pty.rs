@@ -114,7 +114,6 @@ struct Pty {
     home: tempfile::TempDir,
     pending: String,
     jobs: Vec<i32>,
-    sync_counter: usize,
 }
 impl Pty {
     fn new(args: &[&str], redirected: bool, controlling: bool) -> Self {
@@ -122,6 +121,9 @@ impl Pty {
     }
     fn spawn(args: &[&str], redirected: bool, controlling: bool, traced: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
+        // Stable executable name even if another build replaces Cargo's test
+        // binary while this process is running.
+        fs::copy("/proc/self/exe", home.path().join("fixture")).unwrap();
         fs::write(
             home.path().join(".mixrc"),
             "fn prompt()\nreturn \"P0J> \"\nend\n",
@@ -189,7 +191,6 @@ impl Pty {
             home,
             pending: String::new(),
             jobs: vec![],
-            sync_counter: 0,
         }
     }
     fn interactive() -> Self {
@@ -202,15 +203,16 @@ impl Pty {
     }
     fn until(&mut self, marker: &str) -> String {
         if marker == PROMPT {
-            // A repaint while typing also contains the prompt. Synchronise
-            // through an actual next evaluation, never mistake that repaint
-            // for completion of the foreground job. Match an entire output
-            // line so the echoed source cannot satisfy this barrier.
-            self.sync_counter += 1;
-            let token = format!("__p0j_sync_{}__", self.sync_counter);
-            self.send(&format!("print(\"{token}\")\n"));
-            return self.until(&format!("\r\n{token}\r\n"));
+            // Fixture-specific rustyline lifecycle boundary: a repaint does
+            // not re-enable bracketed paste. Wait for a NEW readline before
+            // recognising its prompt. Never inject typeahead into a job.
+            let mut out = self.read_until("\x1b[?2004h");
+            out.push_str(&self.read_until(PROMPT));
+            return out;
         }
+        self.read_until(marker)
+    }
+    fn read_until(&mut self, marker: &str) -> String {
         let end = Instant::now() + LIMIT;
         loop {
             if let Some(i) = self.pending.find(marker) {
@@ -250,7 +252,7 @@ impl Pty {
         format!(
             "P0J_MODE={mode} P0J_REPORT={} {} --exact fixture_process --nocapture",
             self.home.path().join(name).display(),
-            std::env::current_exe().unwrap().display()
+            self.home.path().join("fixture").display()
         )
     }
     fn report(&mut self, name: &str) -> Vec<i32> {

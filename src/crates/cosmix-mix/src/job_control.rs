@@ -148,6 +148,31 @@ fn foreground(fd: i32, pgid: i32) -> io::Result<()> {
     Ok(())
 }
 
+struct SetupGuard<'a> {
+    tty: &'a File,
+    parent_pgid: i32,
+    old_signals: Vec<(i32, libc::sigaction)>,
+    committed: bool,
+}
+impl Drop for SetupGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = foreground(self.tty.as_raw_fd(), self.parent_pgid);
+        if unsafe { libc::getpgrp() } != self.parent_pgid {
+            unsafe {
+                libc::setpgid(0, self.parent_pgid);
+            }
+        }
+        for (sig, old) in &self.old_signals {
+            unsafe {
+                libc::sigaction(*sig, old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 impl Controller {
     /// Called ONLY from the interactive entry point. A redirected stdin or
     /// missing controlling terminal declines job management without mutation.
@@ -165,24 +190,26 @@ impl Controller {
                 libc::kill(0, libc::SIGTTIN);
             }
         }
-        let mut old_signals = Vec::new();
+        let mut setup = SetupGuard {
+            tty: &tty,
+            parent_pgid,
+            old_signals: Vec::new(),
+            committed: false,
+        };
         for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
             let mut old = unsafe { std::mem::zeroed() };
             let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
             ignore.sa_sigaction = libc::SIG_IGN;
             unsafe {
                 libc::sigemptyset(&mut ignore.sa_mask);
-                libc::sigaction(sig, &ignore, &mut old);
+                if libc::sigaction(sig, &ignore, &mut old) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
-            old_signals.push((sig, old));
+            setup.old_signals.push((sig, old));
         }
         let shell_pgid = unsafe { libc::getpid() };
         if unsafe { libc::getpgrp() } != shell_pgid && unsafe { libc::setpgid(0, 0) } < 0 {
-            for (sig, old) in &old_signals {
-                unsafe {
-                    libc::sigaction(*sig, old, std::ptr::null_mut());
-                }
-            }
             return Err(io::Error::last_os_error());
         }
         foreground(fd, shell_pgid)?;
@@ -220,6 +247,9 @@ impl Controller {
                     }
                 }
             })?;
+        setup.committed = true;
+        let old_signals = std::mem::take(&mut setup.old_signals);
+        drop(setup);
         Ok(Some(Arc::new(Self {
             shared,
             tty,
