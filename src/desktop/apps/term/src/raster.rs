@@ -10,12 +10,22 @@ pub struct Raster {
     data: Vec<u8>,
     context: ScaleContext,
     cache: HashMap<(char, bool, [u8; 3]), Option<Image>>,
+    /// Cell dimensions in PHYSICAL device pixels: the texture is rasterised at
+    /// the display's true resolution so the compositor never has to upscale
+    /// (which, on a fractional-scale HiDPI output, is what makes text blurry).
     pub width: u32,
     pub height: u32,
+    /// Device-pixels-per-logical-pixel this Raster was built for. The on-screen
+    /// node is sized at `width/scale` logical px so the texture maps 1:1 to
+    /// physical pixels. Rebuild the Raster when the window's scale changes.
+    pub scale: f32,
+    px: f32,
     baseline: i32,
 }
 impl Raster {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(scale: f32) -> Result<Self, String> {
+        let scale = scale.clamp(0.5, 8.0);
+        let px = 18.0 * scale;
         let path = if let Some(path) = std::env::var_os("TERM_SPIKE_FONT") {
             PathBuf::from(path)
         } else {
@@ -37,21 +47,22 @@ impl Raster {
             .map_err(|e| format!("font {}: {e}; set TERM_SPIKE_FONT", path.display()))?;
         let font = FontRef::from_index(&data, 0)
             .ok_or("Invalid font; set TERM_SPIKE_FONT to a TTF/OTF font")?;
-        let metrics = font.metrics(&[]).scale(18.0);
+        let metrics = font.metrics(&[]).scale(px);
         let advance = font
             .glyph_metrics(&[])
-            .scale(18.0)
+            .scale(px)
             .advance_width(font.charmap().map('M'));
         let width = advance.ceil().max(1.0) as u32;
         let height = (metrics.ascent + metrics.descent.abs() + metrics.leading)
             .ceil()
             .max(1.0) as u32;
         let baseline = metrics.ascent.ceil() as i32;
-        if width > 128 || height > 256 {
-            return Err("font metrics exceed spike cell limits".into());
+        // Physical-pixel cells scale with the display; allow generous HiDPI room.
+        if width > 512 || height > 1024 {
+            return Err("font metrics exceed cell limits".into());
         }
         eprintln!(
-            "DIAGNOSTIC font={} cell={width}x{height}; bold=regular+brighter colour",
+            "DIAGNOSTIC font={} scale={scale} cell={width}x{height} (physical px); bold=regular+brighter colour",
             path.display()
         );
         Ok(Self {
@@ -60,8 +71,17 @@ impl Raster {
             cache: HashMap::new(),
             width,
             height,
+            scale,
+            px,
             baseline,
         })
+    }
+    /// Logical (unscaled) cell dimensions, for sizing the on-screen node.
+    pub fn logical_width(&self) -> f32 {
+        self.width as f32 / self.scale
+    }
+    pub fn logical_height(&self) -> f32 {
+        self.height as f32 / self.scale
     }
     pub fn render(&mut self, screen: &Screen) -> Vec<u8> {
         let width = screen.cols * self.width as usize;
@@ -86,7 +106,7 @@ impl Raster {
                     self.cache.clear();
                 }
                 let font = FontRef::from_index(&self.data, 0).unwrap();
-                let mut scaler = self.context.builder(font).size(18.0).hint(true).build();
+                let mut scaler = self.context.builder(font).size(self.px).hint(true).build();
                 let glyph = Render::new(&[Source::Outline])
                     .format(Format::Alpha)
                     .render(&mut scaler, font.charmap().map(cell.c));

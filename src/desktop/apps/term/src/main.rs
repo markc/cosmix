@@ -7,6 +7,7 @@ mod terminal;
 use bevy::{
     asset::RenderAssetUsages,
     feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme},
+    image::ImageSampler,
     input::{ButtonState, keyboard::KeyboardInput},
     input_focus::{FocusCause, FocusedInput, InputFocus},
     prelude::*,
@@ -41,6 +42,9 @@ struct View {
     open_menu: Option<usize>,
     cols: u16,
     rows: u16,
+    /// Device-pixel scale the Raster is currently built for; refresh rebuilds
+    /// it (and forces a re-render) when the window's fractional scale changes.
+    scale: f32,
     last_frame: Instant,
 }
 
@@ -58,7 +62,10 @@ fn main() {
         eprintln!("term requires a native Wayland session");
         std::process::exit(1);
     }
-    let painter = raster::Raster::new().unwrap_or_else(|e| {
+    // Start at scale 1.0; `refresh` rebuilds the Raster at the window's real
+    // fractional scale once the surface is configured, so text is rasterised
+    // at physical resolution and never upscaled (the HiDPI blur fix).
+    let painter = raster::Raster::new(1.0).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });
@@ -131,7 +138,7 @@ fn setup(
             },
         ],
     );
-    let image = images.add(Image::new_fill(
+    let mut placeholder = Image::new_fill(
         Extent3d {
             width: 1,
             height: 1,
@@ -141,7 +148,11 @@ fn setup(
         &[0, 0, 0, 255],
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
-    ));
+    );
+    // Nearest sampling: the grid texture is rendered at physical resolution and
+    // displayed 1:1, so never smear it with the default linear filter.
+    placeholder.sampler = ImageSampler::nearest();
+    let image = images.add(placeholder);
     let terminal = commands
         .spawn((
             ImageNode::new(image.clone()),
@@ -199,6 +210,7 @@ fn setup(
         open_menu: None,
         cols: 80,
         rows: 24,
+        scale: 1.0,
         last_frame: Instant::now(),
     });
     let proxy = (**proxy).clone();
@@ -458,7 +470,7 @@ fn refresh(
         return;
     }
     let id = tabs.active_id();
-    let switched = view.rendered_id != Some(id);
+    let mut switched = view.rendered_id != Some(id);
     let active = tabs.active_terminal();
     let terminal = active.lock().unwrap();
     let now = Instant::now();
@@ -469,12 +481,30 @@ fn refresh(
     }
     view.last_frame = now;
     let mut painter = painter.0.lock().unwrap();
-    if let Ok((computed, _)) = nodes.get(view.centre) {
-        let size = computed.size() * computed.inverse_scale_factor();
-        let cols = ((size.x / painter.width as f32) as u16)
-            .clamp(2, 240.min((4096 / painter.width) as u16));
-        let rows = ((size.y / painter.height as f32) as u16)
-            .clamp(1, 100.min((4096 / painter.height) as u16));
+    // Rebuild the Raster at the window's real device scale so glyphs are
+    // rasterised at physical resolution rather than upscaled (HiDPI blur fix).
+    let logical_size = nodes.get(view.centre).ok().map(|(computed, _)| {
+        let inv = computed.inverse_scale_factor();
+        let scale = if inv > 0.0 { 1.0 / inv } else { 1.0 };
+        (computed.size() * inv, scale)
+    });
+    if let Some((_, scale)) = logical_size
+        && (scale - view.scale).abs() > 0.01
+    {
+        match raster::Raster::new(scale) {
+            Ok(rebuilt) => {
+                *painter = rebuilt;
+                view.scale = scale;
+                switched = true;
+            }
+            Err(e) => eprintln!("raster rebuild at scale {scale}: {e}"),
+        }
+    }
+    if let Some((size, _)) = logical_size {
+        let lw = painter.logical_width().max(1.0);
+        let lh = painter.logical_height().max(1.0);
+        let cols = ((size.x / lw) as u16).clamp(2, 240.min((4096 / painter.width) as u16));
+        let rows = ((size.y / lh) as u16).clamp(1, 100.min((4096 / painter.height) as u16));
         if size.x > 0.0 && size.y > 0.0 && (switched || (cols, rows) != (view.cols, view.rows)) {
             terminal.resize(
                 cols,
@@ -484,6 +514,12 @@ fn refresh(
             );
             view.cols = cols;
             view.rows = rows;
+            // Size the on-screen node in LOGICAL px so the physical texture
+            // (cols*width device px) maps 1:1 to physical pixels — no stretch.
+            if let Ok((_, mut node)) = nodes.get_mut(view.terminal) {
+                node.width = px(cols as f32 * lw);
+                node.height = px(rows as f32 * lh);
+            }
         }
     }
     let damaged = terminal.take_damage();
@@ -503,7 +539,7 @@ fn refresh(
     let width = screen.cols as u32 * painter.width;
     let height = screen.rows as u32 * painter.height;
     if let Some(mut image) = images.get_mut(&view.image) {
-        *image = Image::new(
+        let mut next = Image::new(
             Extent3d {
                 width,
                 height,
@@ -514,6 +550,8 @@ fn refresh(
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
+        next.sampler = ImageSampler::nearest();
+        *image = next;
         let mut stats = terminal.stats.lock().unwrap();
         stats.rgba_upload.add(converted.elapsed());
         stats.uploads += 1;
