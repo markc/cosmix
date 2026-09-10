@@ -832,7 +832,7 @@ fn sync_panes(
 /// Layout resolves and rounds each border in physical pixels independently.
 fn pane_interior(computed: &ComputedNode) -> Vec2 {
     let border = computed.border();
-    let insets = Vec2::new(border.left + border.right, border.top + border.bottom);
+    let insets = border.min_inset + border.max_inset;
     (computed.size() - insets).max(Vec2::ZERO) * computed.inverse_scale_factor()
 }
 

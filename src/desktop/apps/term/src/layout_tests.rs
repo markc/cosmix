@@ -1,6 +1,6 @@
 use super::*;
 use bevy::camera::{CameraPlugin, ComputedCameraValues, RenderTargetInfo, Viewport};
-use bevy::ui::{BorderRect, UiPlugin, UiSystems};
+use bevy::ui::{UiPlugin, UiSystems};
 
 #[test]
 fn physical_borders_preserve_exact_cell_allocations_at_fractional_scales() {
@@ -8,10 +8,8 @@ fn physical_borders_preserve_exact_cell_allocations_at_fractional_scales() {
         let painter = raster::Raster::new(scale, 13.0, config::Cursor::Underline).unwrap();
         // Asymmetric resolved borders ensure all four insets are respected.
         let border = BorderRect {
-            left: 1.0,
-            right: 2.0,
-            top: 2.0,
-            bottom: 1.0,
+            min_inset: Vec2::new(1.0, 2.0),
+            max_inset: Vec2::new(2.0, 1.0),
         };
         for (cols, rows) in [(2, 1), (79, 23), (80, 24), (137, 61)] {
             for delta in [-1.0, 0.0, 1.0] {
@@ -101,7 +99,7 @@ fn layout_app() -> App {
         CameraPlugin,
         ImagePlugin::default(),
         bevy::image::TextureAtlasPlugin,
-        MeshPlugin,
+        bevy::mesh::MeshPlugin,
         bevy::input::InputPlugin,
         bevy::picking::PickingPlugin,
         bevy::text::TextPlugin,
@@ -273,7 +271,7 @@ fn scheduled_refresh_survives_bus_mutations_between_update_and_post_update() {
                 .world()
                 .get::<bevy::feathers::theme::ThemeBorderColor>(pane.container)
                 .unwrap()
-                .0;
+                .0.clone();
             assert_eq!(
                 token,
                 if pane.active {
