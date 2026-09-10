@@ -102,6 +102,7 @@ fn layout_app() -> App {
         bevy::mesh::MeshPlugin,
         bevy::input::InputPlugin,
         bevy::picking::PickingPlugin,
+        bevy::picking::InteractionPlugin,
         bevy::text::TextPlugin,
         UiPlugin,
     ));
