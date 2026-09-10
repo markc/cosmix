@@ -219,6 +219,18 @@ struct CachedSnapshot {
 
 #[cfg(test)]
 mod native_session_tests {
+    #[tokio::test]
+    async fn principal_text_in_body_does_not_rewrite_unstamped_snapshot_bytes() {
+        let broker = super::SubscriptionBroker::new();
+        let wire = "---\ncommand: snapshot\ntype: event\n---\nbody broker_principal: text\n\n  ";
+        for verified in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            broker
+                .send_snapshot(&tx, wire, crate::protection::TrafficClass::Legacy, verified)
+                .unwrap();
+            assert_eq!(rx.recv().await.unwrap(), wire);
+        }
+    }
     use super::*;
     use crate::protection::TrafficClass;
     use cosmix_bus::native_session::{
@@ -463,10 +475,18 @@ impl SubscriptionBroker {
         class: crate::protection::TrafficClass,
         verified_destination: bool,
     ) -> Result<(), mpsc::error::TrySendError<String>> {
-        let delivery = if !verified_destination && wire.contains("broker_principal:") {
+        let delivery = if !verified_destination {
             let mut message = bus::parse(wire).expect("broker-owned snapshot");
-            cosmix_bus::native_session::strip_principal(&mut message);
-            message.to_wire()
+            if message
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("broker_principal"))
+            {
+                cosmix_bus::native_session::strip_principal(&mut message);
+                message.to_wire()
+            } else {
+                wire.to_owned()
+            }
         } else {
             wire.to_owned()
         };

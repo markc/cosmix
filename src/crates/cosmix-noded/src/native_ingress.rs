@@ -39,10 +39,16 @@ impl Connected<IncomingStream<'_, UnixListener>> for UnixPeer {
 
 /// Hold until the server stops. Never unlink a replacement endpoint on drop.
 pub(crate) struct SocketGuard {
+    endpoint: PathBuf,
     _parent: std::fs::File,
     path: PathBuf,
     dev: u64,
     ino: u64,
+}
+impl SocketGuard {
+    pub(crate) fn endpoint(&self) -> &Path {
+        &self.endpoint
+    }
 }
 impl Drop for SocketGuard {
     fn drop(&mut self) {
@@ -74,6 +80,8 @@ pub(crate) async fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     let directory = anchored_parent(parent, uid)?;
     // Linux has no bindat. /proc/self/fd resolves through our held directory
     // descriptor, so ancestor renames cannot redirect bind/chmod/unlink.
+    // Accessible procfs is a hard dependency. Failure leaves TCP-only service;
+    // there is no fallback to unanchored filesystem operations.
     let anchored = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(
         path.file_name()
             .context("Unix endpoint requires a filename")?,
@@ -98,9 +106,14 @@ pub(crate) async fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
             Err(e) => return Err(e).context("probe existing Unix endpoint"),
         }
     }
+    // Before chmod, mode is 0777 & ~umask. A restrictive umask can briefly
+    // refuse a racing connect; this does not widen access beyond final 0666
+    // (socket execute bits do not grant access).
     let listener = UnixListener::bind(path)?;
     let meta = std::fs::symlink_metadata(path)?;
     let guard = SocketGuard {
+        endpoint: std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))?
+            .join(path.file_name().context("bound socket filename")?),
         _parent: directory,
         path: path.to_owned(),
         dev: meta.dev(),
@@ -118,6 +131,14 @@ pub(crate) async fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
         format!("/proc/self/fd/{}", inode.as_raw_fd()),
         std::fs::Permissions::from_mode(0o666),
     )?;
+    let resolved = std::fs::symlink_metadata(guard.endpoint())?;
+    if guard.endpoint().to_str().is_none()
+        || !guard.endpoint().is_absolute()
+        || resolved.dev() != pinned.dev()
+        || resolved.ino() != pinned.ino()
+    {
+        bail!("resolved endpoint does not identify the bound socket");
+    }
     Ok((listener, guard))
 }
 
@@ -177,6 +198,9 @@ fn check_directory(directory: &std::fs::File, uid: u32, immediate: bool) -> Resu
         bail!("socket ancestor is group/world writable without a permitted sticky root");
     }
     if meta.mode() & 0o111 != 0o111 {
+        // Deliberate dev-tier limitation: even broker-owned 0700 HOME
+        // ancestors fail BUS-013's shared ingress contract. Never widen HOME;
+        // configure a protected, traversable endpoint outside it instead.
         bail!(
             "existing socket ancestor is not user-traversable; refusing to widen its permissions"
         );
@@ -192,6 +216,24 @@ mod tests {
         std::env::temp_dir()
             .join(format!("cosmix-uds-{:032x}", rand::random::<u128>()))
             .join("bus.sock")
+    }
+
+    #[tokio::test]
+    async fn private_home_ancestor_is_refused_without_changing_permissions() {
+        let root = path().parent().unwrap().to_owned();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = bind(&root.join("project/run/noded/bus.sock")).await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not user-traversable")
+        );
+        assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        assert!(!root.join("project").exists());
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]
@@ -240,6 +282,7 @@ mod tests {
         assert!(bind(&parent.join("alias/bus.sock")).await.is_err());
         std::fs::remove_file(parent.join("alias")).unwrap();
         let (listener, guard) = bind(&path).await.unwrap();
+        assert_eq!(guard.endpoint(), std::fs::canonicalize(&path).unwrap());
         let moved = parent.with_extension("moved");
         std::fs::rename(parent, &moved).unwrap();
         std::fs::create_dir(parent).unwrap();

@@ -1,9 +1,9 @@
 ---
 title: Bus wire format and command contracts
 chapter: 4
-version: 0.1.3
+version: 0.1.4
 status: draft
-date: 2026-09-10
+date: 2026-09-11
 ---
 
 # Bus wire format and command contracts
@@ -193,7 +193,7 @@ When available, the broker MUST publish its actual bound absolute endpoint as
 Clients MUST resolve an explicit endpoint option first, then that config key,
 then the ping-discovered endpoint, otherwise `/run/cosmix/noded/bus.sock`;
 discovery is a locator only and MUST NOT confer trust or bypass endpoint checks.
-they MUST NOT resolve the system socket through their own XDG runtime directory.
+Clients MUST NOT resolve the system socket through their own XDG runtime directory.
 The directory MUST be traversable
 by local users and writable only by the broker account or root; socket mode
 is `0666`. Clients MUST verify protected endpoint ownership and server peer

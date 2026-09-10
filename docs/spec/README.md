@@ -1,9 +1,9 @@
 ---
 title: Cosmix specification suite
-version: 0.3.3
-amends: suite-0.3.2
+version: 0.3.4
+amends: suite-0.3.3
 status: accepted
-date: 2026-09-10
+date: 2026-09-11
 ---
 
 # Cosmix specifications
@@ -77,7 +77,13 @@ accepted meta-documents (the handover, the compatibility profile) carry their
 own records. Chapter entries name every chapter whose version moved in the
 suite revision.
 
-- **0.3.3, amending suite-0.3.2 (2026-09-10)** — chapter 04 → 0.1.3.
+- **0.3.4, amending suite-0.3.3 (2026-09-11)** — chapter 04 → 0.1.4.
+  Correct BUS-013's orphaned subject and chapter date (0.1.3 was amended on
+  September 11). **GOV-002 disposition:** all requirements are **retained**;
+  this is an editorial correction with no wire or compatibility change.
+  Chapter and suite-index HTML regenerated.
+
+- **0.3.3, amending suite-0.3.2 (2026-09-11)** — chapter 04 → 0.1.3.
   **GOV-002 disposition:** BUS-014 is **clarified**: destination transport gates
   principal disclosure; TCP/mesh egress strips even genuine Unix sender stamps.
   BUS-013 endpoint publication is **changed** to advertise the actual bound path

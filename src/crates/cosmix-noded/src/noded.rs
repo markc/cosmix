@@ -264,7 +264,7 @@ impl PendingResponseTable {
         if let Some(entry) = &entry {
             self.protection
                 .lock()
-                .expect("protection lock")
+                .unwrap_or_else(|error| error.into_inner())
                 .retain(broker_id, entry.traffic_class);
         }
         entry
@@ -285,7 +285,7 @@ impl PendingResponseTable {
             if let Some(entry) = &entry {
                 self.protection
                     .lock()
-                    .expect("protection lock")
+                    .unwrap_or_else(|error| error.into_inner())
                     .retain(broker_id, entry.traffic_class);
             }
             entry
@@ -301,7 +301,12 @@ impl PendingResponseTable {
         let map = self.map.read().await;
         map.get(id)
             .map(|entry| entry.traffic_class)
-            .unwrap_or_else(|| self.protection.lock().expect("protection lock").class(id))
+            .unwrap_or_else(|| {
+                self.protection
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .class(id)
+            })
     }
 
     /// Remove and return every pending entry whose caller is `caller_tx`
@@ -327,7 +332,7 @@ impl PendingResponseTable {
                 map.remove(&bid).map(|p| {
                     self.protection
                         .lock()
-                        .expect("protection lock")
+                        .unwrap_or_else(|error| error.into_inner())
                         .retain(&bid, p.traffic_class);
                     (bid, p)
                 })
@@ -342,7 +347,6 @@ struct AppState {
     native_session_endpoint: Option<PathBuf>,
     broker_epoch: HexBytes<16>,
     principal: Option<BrokerPrincipal>,
-    native_session_available: bool,
     registry: Registry,
     pending_responses: PendingResponses,
     tap_subscribers: TapSubscribers,
@@ -810,8 +814,9 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         protected_responses: Default::default(),
         broker_epoch: HexBytes(rand::random()),
         principal: None,
-        native_session_endpoint: unix_socket.clone().filter(|_| unix_listener.is_some()),
-        native_session_available: unix_listener.is_some(),
+        native_session_endpoint: unix_listener
+            .as_ref()
+            .map(|(_, guard)| guard.endpoint().to_owned()),
         registry,
         pending_responses,
         tap_subscribers,
@@ -1875,7 +1880,9 @@ async fn unix_ws_handler(
             connection_id: HexBytes(rand::random()),
             session: None,
         };
-        if let Err(error) = principal.validate() {
+        // Prove field validity AND the serialized header-size bound before
+        // delivery may rely on the immutable connection principal.
+        if let Err(error) = stamp_principal(&mut BusMessage::new(), Some(&principal)) {
             tracing::error!(%error, "refusing Unix upgrade: invalid broker principal");
             return axum::http::StatusCode::FORBIDDEN.into_response();
         }
@@ -3748,15 +3755,12 @@ async fn handle_noded_command(
             resp.set("command", "noded.ping");
             resp.body =
                 r#"{"pong": true, "extensions": {"core": "1.0", "topic": "1.0", "observe": "1.0"}}"#.to_string();
-            if state.native_session_available {
+            if let Some(endpoint) = &state.native_session_endpoint {
                 let mut body: serde_json::Value =
                     serde_json::from_str(&resp.body).expect("static ping JSON");
                 body["extensions"]["native-session"] = "1".into();
-                body["extensions"]["native-session-endpoint"] = state
-                    .native_session_endpoint
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .into();
+                body["extensions"]["native-session-endpoint"] =
+                    endpoint.to_string_lossy().into_owned().into();
                 resp.body = body.to_string();
             }
             let _ = tx.try_send(resp.to_wire());
@@ -5136,7 +5140,6 @@ mod tests {
             broker_epoch: super::HexBytes([1; 16]),
             principal: None,
             native_session_endpoint: None,
-            native_session_available: false,
             registry: Arc::new(RwLock::new(HashMap::new())),
             pending_responses: Arc::new(PendingResponseTable::new()),
             tap_subscribers: Arc::new(RwLock::new(Vec::new())),

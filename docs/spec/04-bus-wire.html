@@ -594,7 +594,7 @@ When available, the broker MUST publish its actual bound absolute endpoint as
 Clients MUST resolve an explicit endpoint option first, then that config key,
 then the ping-discovered endpoint, otherwise <code>/run/cosmix/noded/bus.sock</code>;
 discovery is a locator only and MUST NOT confer trust or bypass endpoint checks.
-they MUST NOT resolve the system socket through their own XDG runtime directory.
+Clients MUST NOT resolve the system socket through their own XDG runtime directory.
 The directory MUST be traversable
 by local users and writable only by the broker account or root; socket mode
 is <code>0666</code>. Clients MUST verify protected endpoint ownership and server peer

@@ -23,6 +23,9 @@ impl Broker {
         Self::start_mode(unix, false).await
     }
     async fn start_mode(unix: bool, unavailable: bool) -> Self {
+        Self::start_named(unix, unavailable, "test-node".into()).await
+    }
+    async fn start_named(unix: bool, unavailable: bool, node: String) -> Self {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -37,7 +40,7 @@ impl Broker {
         let task = tokio::spawn(run(
             RunConfig {
                 listen: listen.clone(),
-                node: "test-node".into(),
+                node,
                 wg_ip: "127.0.0.1".into(),
                 mesh_config_path: None,
                 spec_dir: None,
@@ -79,6 +82,26 @@ fn request(command: &str, to: &str, id: &str) -> BusMessage {
         .with_header("command", command)
         .with_header("to", to)
         .with_header("id", id)
+}
+
+#[tokio::test]
+async fn oversized_node_principal_refuses_unix_upgrade_without_panicking() {
+    let broker = Broker::start_named(true, false, "n".repeat(4096)).await;
+    for _ in 0..2 {
+        let socket = tokio::net::UnixStream::connect(broker.root.join("bus.sock"))
+            .await
+            .unwrap();
+        let error = tokio_tungstenite::client_async("ws://localhost/ws", socket)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == 403)
+        );
+    }
+    let mut tcp = broker.tcp().await;
+    send(&mut tcp, &request("noded.ping", "noded", "alive")).await;
+    assert_eq!(receive(&mut tcp).await.get("rc"), Some("0"));
 }
 async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     socket: &mut WebSocketStream<S>,

@@ -68,6 +68,10 @@ The listener walks ancestry with directory FDs and `openat(O_NOFOLLOW)`, and
 uses the held parent through `/proc/self/fd` for bind and cleanup. Socket chmod
 targets a pinned inode; only newly created directories receive mode 0755.
 Existing non-traversable directories are refused without widening permissions.
+This includes single-user development roots beneath a broker-owned 0700 HOME:
+the shared BUS-013 ingress contract still requires user-traversable ancestry.
+Such setups must configure a protected endpoint outside HOME; the broker logs
+the refusal and remains TCP-only. HOME permissions are never widened.
 Root and the broker account remain trusted: they can rename a protected directory
 or unlink its socket, causing unavailability, but other users cannot redirect
 these anchored operations. Listener failure logs its reason and leaves TCP ready,
