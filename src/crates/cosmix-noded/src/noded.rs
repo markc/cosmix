@@ -1922,7 +1922,14 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
 
     // SPEC 13 §9a (2-c-2b) — the per-session admission record, folded from each
     // admit response and consulted by the register-time enforce gate below.
-    let mut session_adm = SessionAdmission::default();
+    let mut session_adm = match &transport {
+        TransportIdentity::Mesh { admission, .. } => SessionAdmission {
+            admitted_node: admission.admitted_node.clone(),
+            last_detail: admission.last_detail,
+            response_seen: admission.response_seen,
+        },
+        _ => SessionAdmission::default(),
+    };
 
     // SPEC 13 §9a (2-c-2c) — the close lever for the enforce revocation
     // teardown. The read loop `select!`s on it; the reload watcher calls
@@ -2484,7 +2491,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 // There is no cross-node native-session classification or UID
                 // delegation contract in v1. Do not export protected traffic to
                 // a legacy hop whose observers cannot retain its classification.
-                if state.observe.traffic_class().protected() {
+                if state.principal.is_some() {
                     let mut reply = BusMessage::new().with_header("type", "response").with_header("rc", "10")
                         .with_body(r#"{"error_code":"UNSUPPORTED","message":"native session traffic is node-local","details":{}}"#);
                     if let Some(id) = bus_msg.get("id") {
@@ -3771,21 +3778,6 @@ async fn handle_noded_command(
 
         // ── Topic pub/sub (see 2026-04-10-topic-pubsub-v1.md § 3.11) ──
         "topic.publish" => {
-            if !msg.body.starts_with("---\n") {
-                let mut resp = respond("10");
-                resp.set("command", "topic.publish");
-                resp.body = subscription::PublishError::MalformedPayload.error_body();
-                let _ = tx.try_send(resp.to_wire());
-                return;
-            }
-            // Check before reserved-property canonicalisation can erase command.
-            if bus::parse(&msg.body).is_ok_and(|inner| broker_only_session_event(&inner)) {
-                let mut resp = respond("10");
-                resp.set("command", "topic.publish");
-                resp.body = r#"{"error":"reserved_name"}"#.into();
-                let _ = tx.try_send(resp.to_wire());
-                return;
-            }
             let name = match msg.get("name") {
                 Some(n) if !n.is_empty() => n.to_string(),
                 _ => {
@@ -3810,6 +3802,21 @@ async fn handle_noded_command(
             }
             // retain defaults to true per § 3.11.2
             let retain = msg.get("retain").map(|v| v != "false").unwrap_or(true);
+            if !msg.body.starts_with("---\n") {
+                let mut resp = respond("10");
+                resp.set("command", "topic.publish");
+                resp.body = subscription::PublishError::MalformedPayload.error_body();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
+            // Check before reserved-property canonicalisation can erase command.
+            if bus::parse(&msg.body).is_ok_and(|inner| broker_only_session_event(&inner)) {
+                let mut resp = respond("10");
+                resp.set("command", "topic.publish");
+                resp.body = r#"{"error":"reserved_name"}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             // SPEC 12 §15.5 defense-in-depth (Codex C10b BLOCKER fix):
             // for reserved topics, strip every caller-supplied Bus
             // routing header from the inner so granted subscribers
