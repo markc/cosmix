@@ -273,13 +273,12 @@ pub fn parse_bootstrap(input: &[u8]) -> Result<BootstrapRequest, WireError> {
         Some("noded.session.lease.check") => SessionCommand::LeaseCheck(args(body)?),
         _ => return Err(WireError("unknown session command")),
     };
-    if command.retained_mutation() {
-        if id.starts_with('0')
+    if command.retained_mutation()
+        && (id.starts_with('0')
             || !id.bytes().all(|b| b.is_ascii_digit())
-            || id.parse::<u64>().is_err()
-        {
-            return Err(WireError("invalid mutation id"));
-        }
+            || id.parse::<u64>().is_err())
+    {
+        return Err(WireError("invalid mutation id"));
     }
     message.body = body.to_owned();
     Ok(BootstrapRequest { message, command })
