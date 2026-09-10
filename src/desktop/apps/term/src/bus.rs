@@ -1,4 +1,4 @@
-use crate::tabs::{Outcome, TabSet};
+use crate::tabs::{Cleanup, Outcome, TabSet};
 use cosmix_client::{BoundedIncomingEvent, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
@@ -6,7 +6,7 @@ use std::{
 };
 
 pub const HELP: &str = "term: tabbed Wayland Mix terminal\nDIAGNOSTIC surface — full ABP control (windows/tabs/panes/sessions per SPEC) is P3a, gated on authenticated per-instance identity (P0-I); this self-asserted `term` name is a placeholder, not the shipped multi-user identity.\nINFO / HELP\nterm.tabs: list id, active, title, cols, rows, child_pid\nterm.tab.new: open and activate a tab\nterm.tab.select: select numeric id from body\nterm.tab.close: close numeric id from body; last tab quits\nThese tab verbs are DIAGNOSTIC too; real per-instance identity is P0-I.\nterm.snapshot: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type: DIAGNOSTIC ONLY; ASCII synthetic keys to the active tab through the keyboard encoder, max 8192 bytes; newline=Enter, tab, backspace, Ctrl+C/D supported. Not a product input API.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
-pub fn start(terminal: Arc<Mutex<TabSet>>) -> std::thread::JoinHandle<()> {
+pub fn start(terminal: Arc<Mutex<TabSet>>, cleanup: Cleanup) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new().name("term-bus".into()).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("Bus runtime");
         runtime.block_on(async move {
@@ -23,7 +23,7 @@ pub fn start(terminal: Arc<Mutex<TabSet>>) -> std::thread::JoinHandle<()> {
                             None => break,
                         };
                         let result = if command.body.len() > 8192 { Err("request exceeds 8192 bytes".into()) } else {
-                            handle(&mut terminal.lock().unwrap(), &command.command, &command.body)
+                            handle(&terminal, &cleanup, &command.command, &command.body)
                         };
                         let (rc,body) = match result { Ok(body) => (0,body), Err(error) => (10,error) };
                         let _ = tokio::time::timeout(Duration::from_secs(2),client.respond(&command,rc,&body)).await;
@@ -35,7 +35,13 @@ pub fn start(terminal: Arc<Mutex<TabSet>>) -> std::thread::JoinHandle<()> {
     }).expect("Bus thread")
 }
 
-fn handle(tabs: &mut TabSet, verb: &str, body: &str) -> Result<String, String> {
+fn handle(
+    set: &Mutex<TabSet>,
+    cleanup: &Cleanup,
+    verb: &str,
+    body: &str,
+) -> Result<String, String> {
+    let mut tabs = set.lock().unwrap();
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(HELP.into()),
         "term.tabs" => Ok(tabs
@@ -62,7 +68,10 @@ fn handle(tabs: &mut TabSet, verb: &str, body: &str) -> Result<String, String> {
         }
         "term.tab.close" => {
             let id = parse_id(body)?;
-            match tabs.close(id) {
+            let (outcome, removed) = tabs.close(id);
+            drop(tabs);
+            cleanup.submit(removed.into_iter().collect());
+            match outcome {
                 Outcome::Unknown => Err(format!("unknown tab id={id}")),
                 Outcome::Remaining(count) => Ok(format!("closed id={id} remaining={count}")),
                 Outcome::Empty => Ok(format!("closed id={id} last")),

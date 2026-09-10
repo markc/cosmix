@@ -27,6 +27,21 @@ callers through admitted noded connections.
 
 ## How it hangs together
 
+CosMix Term (`apps/term`) has a menu bar and tabs, with one Mix terminal pane
+per tab. It admits at most 32 terminals, including pending closes. Closing
+removes a tab immediately; one cleanup worker performs bounded terminal
+shutdown outside the shared tab lock. Closing the last tab exits the app.
+Tab listings use cached dimensions and process metadata, without copying grids.
+
+With the terminal focused, menus closed and no modal capture, Ctrl+Shift+T/W
+opens/closes a tab and Ctrl+PageUp/PageDown changes tabs. These shortcuts require
+exact modifiers and do not repeat. The basic shell encoder supports printable
+ASCII, Enter, Backspace, Tab, arrows, Escape, Home, End, Delete, PageUp/PageDown
+and Ctrl+A through Ctrl+Z. Modifier state follows keyboard event order and resets
+on keyboard focus loss. This is not kitty or modifyOtherKeys support. The
+`term.*` Bus surface remains diagnostic, pending authenticated per-instance
+identity (P0-I) and full ABP control (P3a).
+
 `cosmix-comp` is one process with three planes and strict ownership:
 
 - **Protocol** — Smithay on calloop owns all authoritative state: surfaces,

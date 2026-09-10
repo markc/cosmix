@@ -130,6 +130,13 @@ pub enum Key {
     Right,
     Interrupt,
     Eof,
+    Escape,
+    Home,
+    End,
+    Delete,
+    PageUp,
+    PageDown,
+    Control(char),
 }
 pub fn encode(key: Key) -> Vec<u8> {
     match key {
@@ -144,6 +151,14 @@ pub fn encode(key: Key) -> Vec<u8> {
         Key::Left => b"\x1b[D".to_vec(),
         Key::Interrupt => vec![3],
         Key::Eof => vec![4],
+        Key::Escape => vec![27],
+        Key::Home => b"\x1b[H".to_vec(),
+        Key::End => b"\x1b[F".to_vec(),
+        Key::Delete => b"\x1b[3~".to_vec(),
+        Key::PageUp => b"\x1b[5~".to_vec(),
+        Key::PageDown => b"\x1b[6~".to_vec(),
+        Key::Control(c) if c.is_ascii_alphabetic() => vec![c.to_ascii_lowercase() as u8 - b'a' + 1],
+        Key::Control(_) => Vec::new(),
     }
 }
 pub fn encode_text(text: &str) -> Result<Vec<u8>, String> {
@@ -649,5 +664,26 @@ mod tests {
         );
         assert_eq!(encode(Key::Up), b"\x1b[A");
         assert!(encode_text("aé").is_err());
+    }
+    #[test]
+    fn basic_shell_encodings() {
+        for (key, bytes) in [
+            (Key::Escape, &b"\x1b"[..]),
+            (Key::Home, &b"\x1b[H"[..]),
+            (Key::End, &b"\x1b[F"[..]),
+            (Key::Delete, &b"\x1b[3~"[..]),
+            (Key::PageUp, &b"\x1b[5~"[..]),
+            (Key::PageDown, &b"\x1b[6~"[..]),
+        ] {
+            assert_eq!(encode(key), bytes);
+        }
+        for c in b'a'..=b'z' {
+            assert_eq!(encode(Key::Control(c as char)), [c - b'a' + 1]);
+            assert_eq!(
+                encode(Key::Control((c as char).to_ascii_uppercase())),
+                [c - b'a' + 1]
+            );
+        }
+        assert!(encode(Key::Control('1')).is_empty());
     }
 }

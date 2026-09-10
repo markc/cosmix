@@ -1,10 +1,54 @@
 use crate::terminal::{Terminal, Wake};
-use std::sync::{Arc, Mutex, atomic::Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+
+const MAX_TABS: usize = 32;
+
+#[derive(Clone)]
+pub struct Cleanup(std::sync::mpsc::SyncSender<Vec<Removed>>);
+impl Cleanup {
+    pub fn start() -> std::io::Result<(Self, std::thread::JoinHandle<()>)> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Removed>>(MAX_TABS);
+        let worker = std::thread::Builder::new()
+            .name("term-cleanup".into())
+            .spawn(move || {
+                for removed in receiver {
+                    drop(removed);
+                }
+            })?;
+        Ok((Self(sender), worker))
+    }
+    /// Called only after releasing the set lock. Admission bounds the total
+    /// queued terminals, so the queue cannot fill with non-empty batches.
+    pub fn submit(&self, removed: Vec<Removed>) {
+        if !removed.is_empty() {
+            let _ = self.0.send(removed);
+        }
+    }
+}
+
+/// Owns teardown after the caller releases the TabSet lock. Pending closes
+/// retain their admission slot until bounded shutdown has completed.
+pub struct Removed {
+    terminal: Arc<Mutex<Terminal>>,
+    pending: Arc<AtomicUsize>,
+}
+impl Drop for Removed {
+    fn drop(&mut self) {
+        self.terminal.lock().unwrap().shutdown();
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub struct Tab {
     pub id: u64,
     pub title: String,
     pub terminal: Arc<Mutex<Terminal>>,
+    cols: usize,
+    rows: usize,
+    child_pid: i32,
 }
 
 pub struct TabSet {
@@ -13,6 +57,7 @@ pub struct TabSet {
     next_id: u64,
     wake: Option<Wake>,
     closing: bool,
+    pending: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,16 +84,28 @@ impl TabSet {
             next_id: 1,
             wake: None,
             closing: false,
+            pending: Arc::new(AtomicUsize::new(0)),
         };
         set.open()?;
         Ok(set)
     }
 
     pub fn open(&mut self) -> Result<u64, String> {
+        self.open_with(Terminal::start)
+    }
+
+    fn open_with(
+        &mut self,
+        start: impl FnOnce() -> Result<Terminal, String> + std::panic::UnwindSafe,
+    ) -> Result<u64, String> {
         if self.closing {
             return Err("application closing".into());
         }
-        let terminal = Terminal::start()?;
+        if self.tabs.len() + self.pending.load(Ordering::Acquire) >= MAX_TABS {
+            return Err("tab limit (32) reached".into());
+        }
+        let terminal = std::panic::catch_unwind(start)
+            .map_err(|_| "terminal startup panicked".to_string())??;
         if let Some(wake) = &self.wake {
             terminal.set_wake(wake.clone());
         }
@@ -57,6 +114,9 @@ impl TabSet {
         self.tabs.push(Tab {
             id,
             title: "mix".into(),
+            cols: 80,
+            rows: 24,
+            child_pid: terminal.pid,
             terminal: Arc::new(Mutex::new(terminal)),
         });
         self.active = self.tabs.len() - 1;
@@ -64,12 +124,16 @@ impl TabSet {
         Ok(id)
     }
 
-    pub fn close(&mut self, id: u64) -> Outcome {
+    pub fn close(&mut self, id: u64) -> (Outcome, Option<Removed>) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
-            return Outcome::Unknown;
+            return (Outcome::Unknown, None);
         };
         let tab = self.tabs.remove(index);
-        tab.terminal.lock().unwrap().shutdown();
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let removed = Some(Removed {
+            terminal: tab.terminal,
+            pending: self.pending.clone(),
+        });
         if index < self.active {
             self.active -= 1;
         }
@@ -77,10 +141,10 @@ impl TabSet {
         if self.tabs.is_empty() {
             self.closing = true;
             self.notify();
-            return Outcome::Empty;
+            return (Outcome::Empty, removed);
         }
         self.notify();
-        Outcome::Remaining(self.tabs.len())
+        (Outcome::Remaining(self.tabs.len()), removed)
     }
 
     pub fn select(&mut self, id: u64) -> bool {
@@ -110,22 +174,24 @@ impl TabSet {
         self.tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| {
-                let terminal = tab.terminal.lock().unwrap();
-                let screen = terminal.screen(false);
-                TabInfo {
-                    id: tab.id,
-                    title: tab.title.clone(),
-                    active: index == self.active,
-                    cols: screen.cols,
-                    rows: screen.rows,
-                    child_pid: terminal.pid,
-                }
+            .map(|(index, tab)| TabInfo {
+                id: tab.id,
+                title: tab.title.clone(),
+                active: index == self.active,
+                cols: tab.cols,
+                rows: tab.rows,
+                child_pid: tab.child_pid,
             })
             .collect()
     }
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+    pub fn resized(&mut self, id: u64, cols: u16, rows: u16) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.cols = usize::from(cols);
+            tab.rows = usize::from(rows);
+        }
     }
     pub fn cycle(&mut self, forward: bool) {
         if self.is_empty() {
@@ -146,7 +212,7 @@ impl TabSet {
             wake();
         }
     }
-    pub fn reap_exited(&mut self) {
+    pub fn reap_exited(&mut self) -> Vec<Removed> {
         let ids: Vec<_> = self
             .tabs
             .iter()
@@ -160,15 +226,15 @@ impl TabSet {
             })
             .map(|tab| tab.id)
             .collect();
-        for id in ids {
-            self.close(id);
-        }
+        ids.into_iter().filter_map(|id| self.close(id).1).collect()
     }
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) -> Vec<Removed> {
         self.closing = true;
+        let mut removed = Vec::new();
         while let Some(tab) = self.tabs.last() {
-            self.close(tab.id);
+            removed.extend(self.close(tab.id).1);
         }
+        removed
     }
 }
 
@@ -181,6 +247,69 @@ mod tests {
             return None;
         }
         Some(TabSet::new().expect("real Mix PTY"))
+    }
+    #[test]
+    fn cap_includes_pending_close_and_recovers() {
+        let Some(mut tabs) = fixture() else {
+            return;
+        };
+        for _ in 1..MAX_TABS {
+            tabs.open().unwrap();
+        }
+        assert_eq!(tabs.open(), Err("tab limit (32) reached".into()));
+        let id = tabs.active_id();
+        let (_, removed) = tabs.close(id);
+        assert_eq!(tabs.open(), Err("tab limit (32) reached".into()));
+        drop(removed);
+        assert!(tabs.open().is_ok());
+        drop(tabs.shutdown());
+    }
+    #[test]
+    fn startup_panic_does_not_poison_set() {
+        let Some(tabs) = fixture() else {
+            return;
+        };
+        let set = Mutex::new(tabs);
+        {
+            let mut tabs = set.lock().unwrap();
+            assert_eq!(
+                tabs.open_with(|| panic!("injected spawn failure")),
+                Err("terminal startup panicked".into())
+            );
+        }
+        assert_eq!(set.lock().unwrap().list().len(), 1);
+    }
+    #[test]
+    fn metadata_does_not_lock_terminal_and_tracks_resize() {
+        let Some(mut tabs) = fixture() else {
+            return;
+        };
+        let id = tabs.active_id();
+        let terminal = tabs.active_terminal();
+        let guard = terminal.lock().unwrap();
+        tabs.resized(id, 100, 30);
+        let info = tabs.list();
+        assert_eq!((info[0].cols, info[0].rows), (100, 30));
+        assert_eq!(info[0].child_pid, guard.pid);
+    }
+    #[test]
+    fn close_releases_set_before_teardown() {
+        let Some(tabs) = fixture() else {
+            return;
+        };
+        let set = Mutex::new(tabs);
+        let terminal = set.lock().unwrap().active_terminal();
+        let terminal_guard = terminal.lock().unwrap();
+        let removed = {
+            let mut tabs = set.lock().unwrap();
+            let id = tabs.active_id();
+            let (outcome, removed) = tabs.close(id);
+            assert_eq!(outcome, Outcome::Empty);
+            removed
+        };
+        assert!(set.try_lock().unwrap().is_empty());
+        drop(terminal_guard);
+        drop(removed);
     }
     #[test]
     fn open_list_and_select() {
@@ -206,11 +335,11 @@ mod tests {
         };
         let first = tabs.active_id();
         let second = tabs.open().unwrap();
-        assert_eq!(tabs.close(first), Outcome::Remaining(1));
+        assert_eq!(tabs.close(first).0, Outcome::Remaining(1));
         assert_eq!(tabs.active_id(), second);
         assert!(tabs.by_id(first).is_none());
         assert!(tabs.list()[0].active);
-        assert_eq!(tabs.close(first), Outcome::Unknown);
+        assert_eq!(tabs.close(first).0, Outcome::Unknown);
     }
     #[test]
     fn close_active_selects_neighbour_and_last_is_empty() {
@@ -221,11 +350,11 @@ mod tests {
         let middle = tabs.open().unwrap();
         let last = tabs.open().unwrap();
         tabs.select(middle);
-        assert_eq!(tabs.close(middle), Outcome::Remaining(2));
+        assert_eq!(tabs.close(middle).0, Outcome::Remaining(2));
         assert_eq!(tabs.active_id(), last);
-        assert_eq!(tabs.close(last), Outcome::Remaining(1));
+        assert_eq!(tabs.close(last).0, Outcome::Remaining(1));
         assert_eq!(tabs.active_id(), first);
-        assert_eq!(tabs.close(first), Outcome::Empty);
+        assert_eq!(tabs.close(first).0, Outcome::Empty);
         assert!(tabs.is_empty());
         assert!(tabs.open().is_err());
     }

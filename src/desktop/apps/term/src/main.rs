@@ -1,4 +1,6 @@
 mod bus;
+#[cfg(test)]
+mod input_tests;
 mod metrics;
 mod raster;
 mod tabs;
@@ -23,8 +25,56 @@ use std::{
 use tabs::TabSet;
 use terminal::Key as TerminalKey;
 
+/// Event-order state, independent of ButtonInput's end-of-batch snapshot.
+#[derive(Resource, Default)]
+struct Modifiers([bool; 8]);
+impl Modifiers {
+    fn update(&mut self, key: KeyCode, state: ButtonState) {
+        let index = match key {
+            KeyCode::ControlLeft => 0,
+            KeyCode::ControlRight => 1,
+            KeyCode::ShiftLeft => 2,
+            KeyCode::ShiftRight => 3,
+            KeyCode::AltLeft => 4,
+            KeyCode::AltRight => 5,
+            KeyCode::SuperLeft => 6,
+            KeyCode::SuperRight => 7,
+            _ => return,
+        };
+        self.0[index] = state == ButtonState::Pressed;
+    }
+    fn ctrl(&self) -> bool {
+        self.0[0] || self.0[1]
+    }
+    fn shift(&self) -> bool {
+        self.0[2] || self.0[3]
+    }
+    fn alt_or_super(&self) -> bool {
+        self.0[4..].iter().any(|held| *held)
+    }
+}
+
+fn reset_modifiers(
+    mut lost: MessageReader<bevy::input::keyboard::KeyboardFocusLost>,
+    mut modifiers: ResMut<Modifiers>,
+) {
+    if lost.read().next().is_some() {
+        *modifiers = Modifiers::default();
+    }
+}
+
+fn control_letter(input: &KeyboardInput) -> Option<char> {
+    let text = match &input.logical_key {
+        bevy::input::keyboard::Key::Character(text) => Some(text.as_str()),
+        _ => input.text.as_deref(),
+    }?;
+    let mut chars = text.chars();
+    let c = chars.next()?;
+    (c.is_ascii_alphabetic() && chars.next().is_none()).then_some(c)
+}
+
 #[derive(Resource)]
-struct Core(Arc<Mutex<TabSet>>);
+struct Core(Arc<Mutex<TabSet>>, tabs::Cleanup);
 #[derive(Resource)]
 struct Painter(Mutex<raster::Raster>);
 #[derive(Resource)]
@@ -33,11 +83,12 @@ struct View {
     terminal: Entity,
     centre: Entity,
     menu: Entity,
-    dropdowns: Vec<(Entity, Vec<Entity>)>,
+    dropdowns: Vec<(Entity, Vec<(Entity, &'static str)>)>,
+    menu_ids: Vec<Vec<&'static str>>,
     menu_item: usize,
     tab_bar: Entity,
     tab_buttons: Vec<Entity>,
-    tab_state: Vec<(u64, bool)>,
+    tab_state: Vec<(u64, bool, String)>,
     rendered_id: Option<u64>,
     open_menu: Option<usize>,
     cols: u16,
@@ -75,9 +126,10 @@ fn main() {
         eprintln!("PTY startup: {e}");
         std::process::exit(1)
     })));
-    let bus = bus::start(terminal.clone());
+    let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
+    let bus = bus::start(terminal.clone(), cleanup.clone());
     App::new()
-        .insert_resource(Core(terminal.clone()))
+        .insert_resource(Core(terminal.clone(), cleanup.clone()))
         .insert_resource(Painter(Mutex::new(painter)))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -100,14 +152,22 @@ fn main() {
         })
         .add_systems(Startup, setup)
         .add_systems(PostStartup, bind_menu)
+        .init_resource::<Modifiers>()
+        .add_systems(
+            PreUpdate,
+            reset_modifiers.before(bevy::input_focus::InputFocusSystems::Dispatch),
+        )
         .add_observer(keyboard)
         .add_observer(on_menu)
         .add_systems(Update, (menu_focus, sync_tabs))
         .add_systems(PostUpdate, refresh.after(bevy::ui::UiSystems::Layout))
         .run();
-    terminal.lock().unwrap().shutdown();
+    let removed = terminal.lock().unwrap().shutdown();
+    cleanup.submit(removed);
     // Let a last-tab Bus close finish its bounded reply before process exit.
     let _ = bus.join();
+    drop(cleanup);
+    let _ = reaper.join();
 }
 fn setup(
     mut commands: Commands,
@@ -121,23 +181,25 @@ fn setup(
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
     commands.spawn(Camera2d);
-    let menu = spawn_menu_bar(
-        &mut commands,
-        &[
-            MenuDef {
-                label: "File".into(),
-                items: vec![
-                    MenuItemDef::new("tab.new", "New Tab"),
-                    MenuItemDef::new("tab.close", "Close Tab"),
-                    MenuItemDef::new("app.quit", "Quit"),
-                ],
-            },
-            MenuDef {
-                label: "Help".into(),
-                items: vec![MenuItemDef::new("help.about", "About")],
-            },
-        ],
-    );
+    let menus = [
+        MenuDef {
+            label: "File".into(),
+            items: vec![
+                MenuItemDef::new("tab.new", "New Tab"),
+                MenuItemDef::new("tab.close", "Close Tab"),
+                MenuItemDef::new("app.quit", "Quit"),
+            ],
+        },
+        MenuDef {
+            label: "Help".into(),
+            items: vec![MenuItemDef::new("help.about", "About")],
+        },
+    ];
+    let menu_ids = menus
+        .iter()
+        .map(|menu| menu.items.iter().map(|item| item.id).collect())
+        .collect();
+    let menu = spawn_menu_bar(&mut commands, &menus);
     let mut placeholder = Image::new_fill(
         Extent3d {
             width: 1,
@@ -202,6 +264,7 @@ fn setup(
         centre,
         menu,
         dropdowns: Vec::new(),
+        menu_ids,
         menu_item: 0,
         tab_bar,
         tab_buttons: Vec::new(),
@@ -220,7 +283,10 @@ fn setup(
 }
 fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
     let tabs = core.0.lock().unwrap().list();
-    let state: Vec<_> = tabs.iter().map(|tab| (tab.id, tab.active)).collect();
+    let state: Vec<_> = tabs
+        .iter()
+        .map(|tab| (tab.id, tab.active, tab.title.clone()))
+        .collect();
     if state == view.tab_state {
         return;
     }
@@ -280,7 +346,20 @@ fn bind_menu(mut view: ResMut<View>, children: Query<&Children>, nodes: Query<&N
                             .expect("CTK menu entries")
                             .iter()
                             .collect();
-                        assert!(!entries.is_empty(), "CTK menu entry structure changed");
+                        let ids = view
+                            .menu_ids
+                            .get(view.dropdowns.len())
+                            .cloned()
+                            .unwrap_or_default();
+                        // Fail closed on structural drift: never guess which child is an action.
+                        let entries = if entries.len() == ids.len() {
+                            entries.into_iter().zip(ids).collect()
+                        } else {
+                            eprintln!(
+                                "CTK menu entry structure changed; keyboard activation disabled"
+                            );
+                            Vec::new()
+                        };
                         view.dropdowns.push((entity, entries));
                     }
                 }
@@ -301,7 +380,8 @@ fn menu_focus(mut view: ResMut<View>, nodes: Query<&Node>, mut focus: ResMut<Inp
         view.open_menu = open;
         view.menu_item = 0;
         focus.set(
-            open.map_or(view.terminal, |index| view.dropdowns[index].1[0]),
+            open.and_then(|index| view.dropdowns[index].1.first().map(|entry| entry.0))
+                .unwrap_or(view.terminal),
             FocusCause::Navigated,
         );
     }
@@ -324,29 +404,43 @@ fn menu_action(id: &str, core: &Core) {
             let mut tabs = core.0.lock().unwrap();
             if !tabs.is_empty() {
                 let id = tabs.active_id();
-                tabs.close(id);
+                let removed = tabs.close(id).1;
+                drop(tabs);
+                core.1.submit(removed.into_iter().collect());
             }
         }
-        "app.quit" => core.0.lock().unwrap().shutdown(),
+        "app.quit" => {
+            let removed = core.0.lock().unwrap().shutdown();
+            core.1.submit(removed);
+        }
         _ => {}
     }
 }
 fn keyboard(
     mut event: On<FocusedInput<KeyboardInput>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut modifiers: ResMut<Modifiers>,
     core: Res<Core>,
     mut view: ResMut<View>,
     mut nodes: Query<&mut Node>,
     mut focus: ResMut<InputFocus>,
     capture: Res<ModalCapture>,
 ) {
+    modifiers.update(event.input.key_code, event.input.state);
     if event.input.state != ButtonState::Pressed {
         return;
     }
-    // Intercept app shortcuts before menu handling and before the PTY route.
-    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    if ctrl && !capture.is_captured() {
+    let ctrl = modifiers.ctrl();
+    let shift = modifiers.shift();
+    let open = view
+        .dropdowns
+        .iter()
+        .position(|(e, _)| nodes.get(*e).is_ok_and(|n| n.display != Display::None));
+    if open.is_none()
+        && event.focused_entity == view.terminal
+        && !capture.is_captured()
+        && ctrl
+        && !modifiers.alt_or_super()
+    {
         let handled = match event.input.key_code {
             KeyCode::KeyT if shift => {
                 if !event.input.repeat {
@@ -360,11 +454,13 @@ fn keyboard(
                 }
                 true
             }
-            KeyCode::PageDown | KeyCode::PageUp => {
-                core.0
-                    .lock()
-                    .unwrap()
-                    .cycle(event.input.key_code == KeyCode::PageDown);
+            KeyCode::PageDown | KeyCode::PageUp if !shift => {
+                if !event.input.repeat {
+                    core.0
+                        .lock()
+                        .unwrap()
+                        .cycle(event.input.key_code == KeyCode::PageDown);
+                }
                 true
             }
             _ => false,
@@ -384,22 +480,22 @@ fn keyboard(
         match event.input.key_code {
             KeyCode::ArrowDown | KeyCode::ArrowUp | KeyCode::Tab => {
                 let count = view.dropdowns[index].1.len();
+                if count == 0 {
+                    return;
+                }
                 let backwards = event.input.key_code == KeyCode::ArrowUp
                     || (event.input.key_code == KeyCode::Tab && shift);
                 view.menu_item = (view.menu_item + if backwards { count - 1 } else { 1 }) % count;
                 focus.set(
-                    view.dropdowns[index].1[view.menu_item],
+                    view.dropdowns[index].1[view.menu_item].0,
                     FocusCause::Navigated,
                 );
             }
             KeyCode::Enter | KeyCode::Escape => {
                 if event.input.key_code == KeyCode::Enter {
-                    let id = if index == 0 {
-                        ["tab.new", "tab.close", "app.quit"][view.menu_item]
-                    } else {
-                        "help.about"
-                    };
-                    menu_action(id, &core);
+                    if let Some((_, id)) = view.dropdowns[index].1.get(view.menu_item) {
+                        menu_action(id, &core);
+                    }
                 }
                 if let Ok(mut node) = nodes.get_mut(view.dropdowns[index].0) {
                     node.display = Display::None;
@@ -414,17 +510,19 @@ fn keyboard(
     if capture.is_captured() || event.focused_entity != view.terminal {
         return;
     }
-    if keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
+    if modifiers.alt_or_super() {
         return;
     }
     let key = if ctrl {
-        match event.input.key_code {
-            KeyCode::KeyC => Some(TerminalKey::Interrupt),
-            KeyCode::KeyD => Some(TerminalKey::Eof),
-            _ => None,
-        }
+        control_letter(&event.input).map(TerminalKey::Control)
     } else {
         match event.input.key_code {
+            KeyCode::Escape => Some(TerminalKey::Escape),
+            KeyCode::Home => Some(TerminalKey::Home),
+            KeyCode::End => Some(TerminalKey::End),
+            KeyCode::Delete => Some(TerminalKey::Delete),
+            KeyCode::PageUp => Some(TerminalKey::PageUp),
+            KeyCode::PageDown => Some(TerminalKey::PageDown),
             KeyCode::Enter => Some(TerminalKey::Enter),
             KeyCode::Backspace => Some(TerminalKey::Backspace),
             KeyCode::Tab => Some(TerminalKey::Tab),
@@ -442,18 +540,25 @@ fn keyboard(
     }
     let active = tabs.active_terminal();
     let terminal = active.lock().unwrap();
+    let mut sent = false;
     if let Some(key) = key {
         if let Err(e) = terminal.listener.key(key, at) {
             eprintln!("input: {e}");
+        } else {
+            sent = true;
         }
     } else if !ctrl && let Some(text) = &event.input.text {
         for c in text.chars().filter(|c| c.is_ascii() && !c.is_control()) {
             if let Err(e) = terminal.listener.key(TerminalKey::Char(c), at) {
                 eprintln!("input: {e}");
+            } else {
+                sent = true;
             }
         }
     }
-    event.propagate(false);
+    if sent {
+        event.propagate(false);
+    }
 }
 fn refresh(
     core: Res<Core>,
@@ -463,8 +568,9 @@ fn refresh(
     mut nodes: Query<(&ComputedNode, &mut Node)>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    let removed = core.0.lock().unwrap().reap_exited();
+    core.1.submit(removed);
     let mut tabs = core.0.lock().unwrap();
-    tabs.reap_exited();
     if tabs.is_empty() {
         exit.write(AppExit::Success);
         return;
@@ -514,6 +620,7 @@ fn refresh(
                 cols * painter.width as u16,
                 rows * painter.height as u16,
             );
+            tabs.resized(id, cols, rows);
             view.cols = cols;
             view.rows = rows;
             // Node sizing (in LOGICAL px) is done once in the tail block below,
