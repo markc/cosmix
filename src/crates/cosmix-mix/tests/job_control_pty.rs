@@ -114,9 +114,13 @@ struct Pty {
     home: tempfile::TempDir,
     pending: String,
     jobs: Vec<i32>,
+    sync_counter: usize,
 }
 impl Pty {
     fn new(args: &[&str], redirected: bool, controlling: bool) -> Self {
+        Self::spawn(args, redirected, controlling, false)
+    }
+    fn spawn(args: &[&str], redirected: bool, controlling: bool, traced: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
         fs::write(
             home.path().join(".mixrc"),
@@ -171,6 +175,9 @@ impl Pty {
                 if controlling && libc::ioctl(1, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                if traced && libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -182,6 +189,7 @@ impl Pty {
             home,
             pending: String::new(),
             jobs: vec![],
+            sync_counter: 0,
         }
     }
     fn interactive() -> Self {
@@ -193,6 +201,16 @@ impl Pty {
         self.master.write_all(text.as_bytes()).unwrap();
     }
     fn until(&mut self, marker: &str) -> String {
+        if marker == PROMPT {
+            // A repaint while typing also contains the prompt. Synchronise
+            // through an actual next evaluation, never mistake that repaint
+            // for completion of the foreground job. Match an entire output
+            // line so the echoed source cannot satisfy this barrier.
+            self.sync_counter += 1;
+            let token = format!("__p0j_sync_{}__", self.sync_counter);
+            self.send(&format!("print(\"{token}\")\n"));
+            return self.until(&format!("\r\n{token}\r\n"));
+        }
         let end = Instant::now() + LIMIT;
         loop {
             if let Some(i) = self.pending.find(marker) {
@@ -511,4 +529,85 @@ fn fixture_path_has_no_shell_metacharacters() {
             .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
     );
     assert!(Path::new(env!("CARGO_BIN_EXE_mix")).is_absolute());
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn ssh_dash_c_has_zero_shell_group_or_terminal_handoff_syscalls() {
+    use std::collections::BTreeSet;
+    // This is an actual syscall audit of -c on an allocated controlling PTY,
+    // not a test whose isatty guard makes the assertion vacuous. Follow shell
+    // threads only; captured subprocess group setup is explicitly permitted.
+    let p = Pty::spawn(
+        &["-c", "print(run_argv([\"/bin/true\"]).exit_code)"],
+        false,
+        true,
+        true,
+    );
+    let pid = p.shell.id() as i32;
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFSTOPPED(status));
+    let opts = libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_EXITKILL;
+    assert_eq!(
+        unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts) },
+        0
+    );
+    assert_eq!(unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) }, 0);
+    let mut tids = BTreeSet::from([pid]);
+    let deadline = Instant::now() + LIMIT;
+    while !tids.is_empty() {
+        assert!(Instant::now() < deadline, "syscall audit deadline");
+        for tid in tids.iter().copied().collect::<Vec<_>>() {
+            let rc = unsafe { libc::waitpid(tid, &mut status, libc::WNOHANG | libc::__WALL) };
+            if rc == 0 {
+                continue;
+            }
+            assert_eq!(rc, tid);
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                if tid == pid {
+                    assert!(libc::WIFEXITED(status));
+                    assert_eq!(libc::WEXITSTATUS(status), 0);
+                }
+                tids.remove(&tid);
+                continue;
+            }
+            let sig = libc::WSTOPSIG(status);
+            if status >> 16 == libc::PTRACE_EVENT_CLONE {
+                let mut child: libc::c_ulong = 0;
+                assert_eq!(
+                    unsafe { libc::ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut child) },
+                    0
+                );
+                tids.insert(child as i32);
+            }
+            if sig == (libc::SIGTRAP | 0x80) {
+                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe { libc::ptrace(libc::PTRACE_GETREGS, tid, 0, &mut regs) },
+                    0
+                );
+                assert_ne!(
+                    regs.orig_rax,
+                    libc::SYS_setpgid as u64,
+                    "-c changed shell process grouping"
+                );
+                assert!(
+                    !(regs.orig_rax == libc::SYS_ioctl as u64 && regs.rsi == libc::TIOCSPGRP),
+                    "-c attempted terminal handoff"
+                );
+            }
+            let deliver =
+                if sig == libc::SIGTRAP || sig == (libc::SIGTRAP | 0x80) || sig == libc::SIGSTOP {
+                    0
+                } else {
+                    sig
+                };
+            assert_eq!(
+                unsafe { libc::ptrace(libc::PTRACE_SYSCALL, tid, 0, deliver) },
+                0
+            );
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
 }

@@ -115,6 +115,7 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    shell_modes: Mutex<libc::termios>,
 }
 
 pub struct Controller {
@@ -193,16 +194,23 @@ impl Controller {
                 closed: false,
             }),
             changed: Condvar::new(),
+            shell_modes: Mutex::new(modes(fd)?),
         });
         let mut events = signal_hook::iterator::Signals::new([libc::SIGCHLD, libc::SIGHUP])?;
         let signals = events.handle();
         let monitor = shared.clone();
+        let monitor_tty = tty.try_clone()?;
         let worker = std::thread::Builder::new()
             .name("mix-jobs".into())
             .spawn(move || {
                 for signal in events.forever() {
                     if signal == libc::SIGHUP {
                         close_jobs(&monitor);
+                        let _ = foreground(monitor_tty.as_raw_fd(), shell_pgid);
+                        let _ = set_modes(
+                            monitor_tty.as_raw_fd(),
+                            &monitor.shell_modes.lock().unwrap(),
+                        );
                         // HUP is a session shutdown, not evaluator cancellation.
                         std::process::exit(128 + libc::SIGHUP);
                     }
@@ -276,6 +284,7 @@ impl Controller {
     }
     pub fn take_terminal(&self, pgid: i32) -> io::Result<TerminalLease<'_>> {
         let saved = modes(self.tty.as_raw_fd())?;
+        *self.shared.shell_modes.lock().unwrap() = saved;
         foreground(self.tty.as_raw_fd(), pgid)?;
         Ok(TerminalLease {
             controller: self,
