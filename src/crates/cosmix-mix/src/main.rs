@@ -240,6 +240,90 @@ fn print_help() {
     // a markdown-friendly discovery overview that signposts `mix builtins`
     // for the full function remit rather than duplicating it here.
     print!("{}", meta::help_overview_string(VERSION));
+    println!(
+        "  --gui [args...]  Launch a fresh Term frontend (COSMIX_TERM_BIN overrides); Bus window reuse deferred until authenticated per-user identity (P0-I)."
+    );
+}
+
+/// Resolve installed Term only; the injected lookup keeps tests independent of
+/// the host installation and environment. An explicit override fails closed.
+fn resolve_term(
+    override_bin: Option<std::ffi::OsString>,
+    cosmix: Option<std::ffi::OsString>,
+    mut lookup: impl FnMut(&Path) -> Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = override_bin {
+        return lookup(Path::new(&path)).ok_or_else(|| {
+            "mix --gui: COSMIX_TERM_BIN must name an executable frontend file".to_string()
+        });
+    }
+    if let Some(root) = cosmix
+        && let Some(path) = lookup(&Path::new(&root).join("bin/term"))
+    {
+        return Ok(path);
+    }
+    lookup(Path::new("/opt/cosmix/bin/term"))
+        .or_else(|| lookup(Path::new("term")))
+        .ok_or_else(|| "mix --gui: the CosMix Term frontend is not installed (looked for $COSMIX/bin/term, /opt/cosmix/bin/term, term on PATH). Install the desktop package.".to_string())
+}
+
+/// Reuse the public `which` builtin's regular-file + kernel X_OK check,
+/// including ACLs. Absolute candidates bypass PATH inside that same builtin.
+fn term_lookup(path: &Path) -> Option<std::path::PathBuf> {
+    let path = if path == Path::new("term") {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).ok()?
+    };
+    match cosmix_mix::builtins::call_builtin(
+        "which",
+        vec![Value::String(path.to_str()?.to_string())],
+    ) {
+        Ok(Some(Value::String(found))) => std::path::absolute(found).ok(),
+        _ => None,
+    }
+}
+
+fn run_gui() -> i32 {
+    // P2.2c starts a fresh instance. Requesting a window from an existing
+    // instance over Bus is deferred until authenticated per-user identity
+    // (P0-I) exists; do not guess an instance or fake a Bus request here.
+    let frontend = match resolve_term(
+        env::var_os("COSMIX_TERM_BIN"),
+        env::var_os("COSMIX"),
+        term_lookup,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    // Use Command's direct argv execution, as exec::command_for does for
+    // external programs. Keep cwd, environment and stdio inherited. Re-read
+    // OS argv so frontend arguments retain their original bytes.
+    let forwarded = env::args_os().skip_while(|arg| arg != "--gui").skip(1);
+    let mut command = process::Command::new(&frontend);
+    command.args(forwarded);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        eprintln!(
+            "mix --gui: exec {} failed: {error}; trying spawn-and-wait",
+            frontend.display()
+        );
+    }
+    match command.status() {
+        Ok(status) => exec::exit_code(status),
+        Err(error) => {
+            eprintln!(
+                "mix --gui: could not launch {}: {error}",
+                frontend.display()
+            );
+            1
+        }
+    }
 }
 
 /// One-shot stats subcommand: load stats from disk, dispatch, exit.
@@ -1467,6 +1551,7 @@ fn real_main() -> i32 {
                 i += 1;
                 continue;
             }
+            "--gui" => return run_gui(),
             "--serve" => {
                 i += 1;
                 if i >= args.len() {
@@ -1577,6 +1662,58 @@ fn real_main() -> i32 {
 
     // If we get here with no script, start REPL
     repl::run_repl()
+}
+
+#[cfg(test)]
+mod gui_tests {
+    use super::*;
+
+    #[test]
+    fn resolution_order_and_missing_frontend() {
+        let mut seen = Vec::new();
+        let error = resolve_term(None, Some("/test-root".into()), |path| {
+            seen.push(path.to_path_buf());
+            None
+        })
+        .unwrap_err();
+        assert_eq!(
+            seen,
+            ["/test-root/bin/term", "/opt/cosmix/bin/term", "term"].map(std::path::PathBuf::from)
+        );
+        assert!(error.starts_with("mix --gui: the CosMix Term frontend is not installed"));
+        assert!(error.ends_with("Install the desktop package."));
+        for winner in 0..3 {
+            let mut index = 0;
+            let found = resolve_term(None, Some("/test-root".into()), |path| {
+                let selected = index == winner;
+                index += 1;
+                selected.then(|| path.to_path_buf())
+            })
+            .unwrap();
+            assert_eq!(found, seen[winner]);
+            assert_eq!(index, winner + 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_override_and_rejections() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fake-term");
+        fs::write(&file, b"test fixture, never executed").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_term(Some(file.clone().into_os_string()), None, term_lookup).unwrap(),
+            file
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        for path in [&file, dir.path(), &dir.path().join("missing")] {
+            let error =
+                resolve_term(Some(path.as_os_str().to_owned()), None, term_lookup).unwrap_err();
+            assert!(error.contains("COSMIX_TERM_BIN must name an executable"));
+        }
+    }
 }
 
 #[cfg(test)]
