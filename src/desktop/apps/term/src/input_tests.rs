@@ -29,7 +29,10 @@ fn fixture() -> Option<(App, Entity)> {
         .world_mut()
         .spawn((Window::default(), PrimaryWindow))
         .id();
-    let terminal = app.world_mut().spawn_empty().id();
+    let terminal = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(window)))
+        .id();
     let menu = app.world_mut().spawn(Node::default()).id();
     let dropdown = app
         .world_mut()
@@ -295,7 +298,7 @@ fn unmapped_control_key_propagates_but_encoded_letter_does_not() {
     press(&mut app, window, KeyCode::KeyW);
     app.update();
     let seen = &app.world().resource::<Bubbled>().0;
-    assert!(seen.contains(&KeyCode::F1));
-    assert!(!seen.contains(&KeyCode::KeyW));
+    assert!(seen.contains(&KeyCode::F1), "bubbled keys: {seen:?}");
+    assert!(!seen.contains(&KeyCode::KeyW), "bubbled keys: {seen:?}");
     assert_eq!(count(&app), 1);
 }

@@ -494,10 +494,10 @@ fn keyboard(
                 );
             }
             KeyCode::Enter | KeyCode::Escape => {
-                if event.input.key_code == KeyCode::Enter {
-                    if let Some((_, id)) = view.dropdowns[index].1.get(view.menu_item) {
-                        menu_action(id, &core);
-                    }
+                if event.input.key_code == KeyCode::Enter
+                    && let Some((_, id)) = view.dropdowns[index].1.get(view.menu_item)
+                {
+                    menu_action(id, &core);
                 }
                 if let Ok(mut node) = nodes.get_mut(view.dropdowns[index].0) {
                     node.display = Display::None;
