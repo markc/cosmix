@@ -25,9 +25,14 @@ pub struct Raster {
 impl Raster {
     pub fn new(scale: f32) -> Result<Self, String> {
         let scale = scale.clamp(0.5, 8.0);
-        // 15 logical px is a comfortable terminal density; the ×scale makes it
-        // physical so it stays crisp on HiDPI. (Cell metrics derive from this.)
-        let px = 15.0 * scale;
+        // Logical font size (device-independent); TERM_FONT_PX overrides the
+        // default. ×scale makes it physical so it stays crisp on HiDPI.
+        let logical_px = std::env::var("TERM_FONT_PX")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| (6.0..=48.0).contains(v))
+            .unwrap_or(13.0);
+        let px = logical_px * scale;
         let path = if let Some(path) = std::env::var_os("TERM_SPIKE_FONT") {
             PathBuf::from(path)
         } else {
