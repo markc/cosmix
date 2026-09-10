@@ -159,11 +159,11 @@ ssh_run("-oProxyCommand=touch /tmp/pwned", "echo hi")
   ok:          true,    -- convenience: exit_code == 0 (a real bool)
   duration_ms: 142,     -- wall-clock from spawn to exit
   host:        "node1", -- echoed back, handy for logging
+  stdout_truncated: false, -- true if local stdout capture is incomplete
+  stderr_truncated: false, -- true if local stderr capture is incomplete
   timed_out:   false,   -- true if killed by opts.timeout
   interrupted: false,   -- true if killed by Ctrl-C
-  utf8_lossy:  false,   -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
-  stdout_truncated: false, -- true if local stdout capture is incomplete
-  stderr_truncated: false  -- true if local stderr capture is incomplete
+  utf8_lossy:  false    -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
 }
 ```
 
@@ -305,7 +305,7 @@ $r = ssh_mix("example.com", $source, {
 ```
 
 - **Returns the same map as `ssh_run`** (all eleven keys). With `decode`, a twelfth key `value` is added on success.
-- **`max_output` bounds local capture**, independently for stdout and stderr. Truncated stdout will normally make `decode: "data"` (or `"json"`) raise a parse error. To distinguish truncation from malformed remote output, omit `decode`, check `stdout_truncated`/`stderr_truncated`, then parse complete output yourself. The limit does not change a remote `run_argv` limit.
+- **`max_output` bounds local capture**, independently for stdout and stderr. A truncated stdout **refuses to decode**: `decode: "data"` (or `"json"`) raises rather than parsing partial data, because a truncated prefix of valid output can itself parse as a smaller, *wrong* value (`12345` capped mid-number decodes as `12`). To work with partial output, omit `decode`, check `stdout_truncated`/`stderr_truncated`, and parse what you need yourself. The limit does not change a remote `run_argv` limit.
 - **`decode: "data"` or `decode: "json"`** parses the trimmed stdout into `.value` (via `data_parse` / `json_parse`) — the common "get a structured value back from the remote" case. Pair it with [`data_encode`](data.md) on the remote side, as above. `decode: "json"` needs the `json` feature (the `mix` binary has it; a bare library build without it errors — use `decode: "data"`). On failure (`ok == false`) no `value` key is added — check `.ok` first.
 - **`bindings` is a typed data channel:** it is a map from names to strict-data-encodable Mix values. Each key must match `[A-Za-z_][A-Za-z0-9_]*`; each value is strict-data-encoded locally and prepended to the shipped source as a `$name = value` assignment. Strings, numbers, bools, `nil`, lists, and maps retain their types, including nested values. Bytes and buffers have no strict-data representation and raise `OPTION_INVALID` locally; encode binary data explicitly (for example with base64) and decode it remotely.
 - **No binding name is reserved.** Names such as `args` and `argv` are legal. Bindings run first, so the caller source may legally rebind any of them; this is convenience and injection safety, not isolation.
@@ -446,6 +446,14 @@ Omitting `max_output` preserves unbounded local capture. The truncation flags
 are also true when capture is abandoned at a deadline, even without a limit.
 Truncation does not change `ok` or `exit_code`; `ssh_must` still returns stdout
 on a zero exit status, so use `ssh_run` to inspect capture completeness.
+
+Two deliberate edges. `max_output: 0` is **rejected** here, although `run_argv`
+treats 0 as unbounded — an SSH capture bound exists to be a bound, and "omit
+the key" already spells unbounded; the divergence is loud (a local raise), not
+silent. And a cap that cuts inside a multibyte UTF-8 sequence leaves an invalid
+final byte, so the lossy decode inserts U+FFFD and `utf8_lossy` reads true —
+beside `stdout_truncated: true` that usually means local truncation damage,
+not invalid remote output.
 
 ### Verified option errors (raised locally, before any ssh)
 

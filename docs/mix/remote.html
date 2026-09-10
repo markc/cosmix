@@ -551,11 +551,11 @@ ssh_run(host, command, opts)      -- opts: a map (see below)
   ok:          true,    -- convenience: exit_code == 0 (a real bool)
   duration_ms: 142,     -- wall-clock from spawn to exit
   host:        "node1", -- echoed back, handy for logging
+  stdout_truncated: false, -- true if local stdout capture is incomplete
+  stderr_truncated: false, -- true if local stderr capture is incomplete
   timed_out:   false,   -- true if killed by opts.timeout
   interrupted: false,   -- true if killed by Ctrl-C
-  utf8_lossy:  false,   -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
-  stdout_truncated: false, -- true if local stdout capture is incomplete
-  stderr_truncated: false  -- true if local stderr capture is incomplete
+  utf8_lossy:  false    -- true if a pipe held invalid UTF-8 (replaced with U+FFFD)
 }
 </code></pre>
 <p><code>exit_code</code> carries sentinels for local outcomes that aren't a real remote exit status:</p>
@@ -658,7 +658,7 @@ $r = ssh_mix("example.com", $source, {
 </code></pre>
 <ul>
 <li><strong>Returns the same map as <code>ssh_run</code></strong> (all eleven keys). With <code>decode</code>, a twelfth key <code>value</code> is added on success.</li>
-<li><strong><code>max_output</code> bounds local capture</strong>, independently for stdout and stderr. Truncated stdout will normally make <code>decode: "data"</code> (or <code>"json"</code>) raise a parse error. To distinguish truncation from malformed remote output, omit <code>decode</code>, check <code>stdout_truncated</code>/<code>stderr_truncated</code>, then parse complete output yourself. The limit does not change a remote <code>run_argv</code> limit.</li>
+<li><strong><code>max_output</code> bounds local capture</strong>, independently for stdout and stderr. A truncated stdout <strong>refuses to decode</strong>: <code>decode: "data"</code> (or <code>"json"</code>) raises rather than parsing partial data, because a truncated prefix of valid output can itself parse as a smaller, <em>wrong</em> value (<code>12345</code> capped mid-number decodes as <code>12</code>). To work with partial output, omit <code>decode</code>, check <code>stdout_truncated</code>/<code>stderr_truncated</code>, and parse what you need yourself. The limit does not change a remote <code>run_argv</code> limit.</li>
 <li><strong><code>decode: "data"</code> or <code>decode: "json"</code></strong> parses the trimmed stdout into <code>.value</code> (via <code>data_parse</code> / <code>json_parse</code>) — the common "get a structured value back from the remote" case. Pair it with <a href="/mix/data"><code>data_encode</code></a> on the remote side, as above. <code>decode: "json"</code> needs the <code>json</code> feature (the <code>mix</code> binary has it; a bare library build without it errors — use <code>decode: "data"</code>). On failure (<code>ok == false</code>) no <code>value</code> key is added — check <code>.ok</code> first.</li>
 <li><strong><code>bindings</code> is a typed data channel:</strong> it is a map from names to strict-data-encodable Mix values. Each key must match <code>[A-Za-z_][A-Za-z0-9_]*</code>; each value is strict-data-encoded locally and prepended to the shipped source as a <code>$name = value</code> assignment. Strings, numbers, bools, <code>nil</code>, lists, and maps retain their types, including nested values. Bytes and buffers have no strict-data representation and raise <code>OPTION_INVALID</code> locally; encode binary data explicitly (for example with base64) and decode it remotely.</li>
 <li><strong>No binding name is reserved.</strong> Names such as <code>args</code> and <code>argv</code> are legal. Bindings run first, so the caller source may legally rebind any of them; this is convenience and injection safety, not isolation.</li>
@@ -783,6 +783,13 @@ locally; <code>ssh_mix</code> remains the path for arbitrary multi-step remote M
 are also true when capture is abandoned at a deadline, even without a limit.
 Truncation does not change <code>ok</code> or <code>exit_code</code>; <code>ssh_must</code> still returns stdout
 on a zero exit status, so use <code>ssh_run</code> to inspect capture completeness.</p>
+<p>Two deliberate edges. <code>max_output: 0</code> is <strong>rejected</strong> here, although <code>run_argv</code>
+treats 0 as unbounded — an SSH capture bound exists to be a bound, and "omit
+the key" already spells unbounded; the divergence is loud (a local raise), not
+silent. And a cap that cuts inside a multibyte UTF-8 sequence leaves an invalid
+final byte, so the lossy decode inserts U+FFFD and <code>utf8_lossy</code> reads true —
+beside <code>stdout_truncated: true</code> that usually means local truncation damage,
+not invalid remote output.</p>
 <h3 id="verified-option-errors-raised-locally-before-any-ssh">Verified option errors (raised locally, before any ssh)</h3>
 <pre><code class="language-mix">ssh_run("node1", "echo hi", { foo: 1 })
 -- Runtime error: ssh_run: unknown opts key "foo" (allowed: timeout, max_output, connect_timeout,

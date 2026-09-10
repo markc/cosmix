@@ -304,9 +304,9 @@ builtin_table! {
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
     ("random_password", CapabilityClass::Pure, "system",  "Generate an alphanumeric password (default len 16, no O/o, guaranteed upper+lower+digit)", contract!((len?: number) -> string)),
-    ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy, stdout_truncated, stderr_truncated}; max_output optionally caps local capture bytes per stream (omitted: unbounded)", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool}); effects[must_use, blocking]; failure[returns_result])),
+    ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy, stdout_truncated, stderr_truncated}; max_output optionally caps local capture bytes per stream (omitted: unbounded; 0 is REJECTED — unlike run_argv, where 0 means unbounded — omit the key instead). A cap that cuts mid-UTF-8-sequence makes the lossy decode insert U+FFFD, so utf8_lossy: true beside stdout_truncated: true may be local truncation damage, not remote garbage", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
-    ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream; truncated stdout normally makes decode:\"data\" fail. Omit decode and inspect stdout_truncated/stderr_truncated to distinguish truncation from malformed remote output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). pid must be a whole NUMBER and is not coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0, which would make the reaping waitpid() collect an arbitrary child of this process group and then report a boolean as alive (strict since v0.52.0)", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
@@ -9368,37 +9368,62 @@ fn builtin_ssh_mix(args: Vec<Value>) -> MixResult<Option<Value>> {
     // Optionally decode stdout into `value` on success.
     if let (Some(mode), Some(Value::Map(m))) = (decode_mode, result.as_mut()) {
         // CoW: freshly built by ssh_run above (sole owner) — in-place.
-        let m = Rc::make_mut(m);
-        let ok = matches!(m.get("ok"), Some(Value::Bool(true)));
-        if ok {
-            let stdout = match m.get("stdout") {
-                Some(Value::String(s)) => s.trim().to_string(),
-                _ => String::new(),
-            };
-            let parsed = if mode == "data" {
-                builtin_data_parse(vec![Value::String(stdout)])?
-            } else {
-                // decode:"json" needs the json feature; without it, error
-                // rather than failing to compile the bare crate (the call
-                // was previously unguarded — a no-default-features build
-                // of cosmix-lib-mix didn't compile at all).
-                #[cfg(feature = "json")]
-                {
-                    builtin_json_parse(vec![Value::String(stdout)])?
-                }
-                #[cfg(not(feature = "json"))]
-                {
-                    return Err(MixError::RuntimeError {
-                        span: None,
-                        msg: "ssh_mix: decode:\"json\" requires the json feature (use decode:\"data\")"
-                            .into(),
-                    });
-                }
-            };
-            m.insert("value".into(), parsed.unwrap_or(Value::Nil));
-        }
+        decode_ssh_stdout(Rc::make_mut(m), &mode)?;
     }
     Ok(result)
+}
+
+/// Decode a successful ssh_mix result's stdout into its `value` field.
+///
+/// A stdout truncated by `max_output` REFUSES to decode: a truncated prefix
+/// of valid strict-data/JSON can itself parse as a smaller, wrong value
+/// (`count: 12345` capped mid-number decodes as `count: 12`), so silently
+/// decoding partial data would hand back corrupt results with `ok: true`.
+/// Callers that want partial output inspect `stdout`/`stdout_truncated`
+/// without `decode`.
+fn decode_ssh_stdout(
+    m: &mut indexmap::IndexMap<String, Value>,
+    mode: &str,
+) -> MixResult<()> {
+    if !matches!(m.get("ok"), Some(Value::Bool(true))) {
+        return Ok(());
+    }
+    if matches!(m.get("stdout_truncated"), Some(Value::Bool(true))) {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: "ssh_mix: stdout was truncated by max_output; refusing to decode \
+                  partial data (a truncated prefix can parse as a smaller, wrong \
+                  value) — raise the limit, or omit decode and inspect \
+                  stdout/stdout_truncated"
+                .into(),
+        });
+    }
+    let stdout = match m.get("stdout") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    };
+    let parsed = if mode == "data" {
+        builtin_data_parse(vec![Value::String(stdout)])?
+    } else {
+        // decode:"json" needs the json feature; without it, error
+        // rather than failing to compile the bare crate (the call
+        // was previously unguarded — a no-default-features build
+        // of cosmix-lib-mix didn't compile at all).
+        #[cfg(feature = "json")]
+        {
+            builtin_json_parse(vec![Value::String(stdout)])?
+        }
+        #[cfg(not(feature = "json"))]
+        {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: "ssh_mix: decode:\"json\" requires the json feature (use decode:\"data\")"
+                    .into(),
+            });
+        }
+    };
+    m.insert("value".into(), parsed.unwrap_or(Value::Nil));
+    Ok(())
 }
 
 /// run_argv option keys that ssh_exec routes INTO the remote run_argv
@@ -21174,6 +21199,57 @@ mod ssh_helpers_tests {
                 Some(&Value::Bool(truncated))
             );
         }
+    }
+
+    #[test]
+    fn decode_ssh_stdout_refuses_truncated_and_parses_complete() {
+        // A truncated prefix of valid data can parse as a smaller, WRONG
+        // value ("12345" capped at 2 bytes decodes as 12) — the guard must
+        // refuse rather than decode it.
+        let mut m = indexmap::IndexMap::new();
+        m.insert("ok".to_string(), Value::Bool(true));
+        m.insert("stdout".to_string(), Value::String("count: 12".into()));
+        m.insert("stdout_truncated".to_string(), Value::Bool(true));
+        let err = super::decode_ssh_stdout(&mut m, "data").unwrap_err().to_string();
+        assert!(err.contains("refusing to decode"), "{err}");
+        assert!(!m.contains_key("value"), "no value on refusal");
+
+        // Untruncated output decodes as before.
+        m.insert("stdout_truncated".to_string(), Value::Bool(false));
+        m.insert("stdout".to_string(), Value::String("count: 12345".into()));
+        super::decode_ssh_stdout(&mut m, "data").unwrap();
+        let Some(Value::Map(value)) = m.get("value") else {
+            panic!("expected decoded map value")
+        };
+        assert_eq!(value.get("count"), Some(&Value::Number(12345.0)));
+
+        // A failed remote command is untouched, truncated or not.
+        let mut failed = indexmap::IndexMap::new();
+        failed.insert("ok".to_string(), Value::Bool(false));
+        failed.insert("stdout_truncated".to_string(), Value::Bool(true));
+        super::decode_ssh_stdout(&mut failed, "data").unwrap();
+        assert!(!failed.contains_key("value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_truncation_mid_utf8_flags_lossy() {
+        // Documented interaction: a byte cap cutting inside a multibyte
+        // character makes the lossy decode insert U+FFFD, so utf8_lossy
+        // reads true even though the REMOTE output was valid UTF-8. Pinned
+        // here so a future exact-byte check knows what it is changing.
+        let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
+        crate::interrupt::_test_clear();
+        let argv = vec!["tee".into(), "/dev/stderr".into()];
+        let input = "A€Z"; // '€' is 3 bytes; cap after its first byte.
+        let outcome = run_with_timeout(&argv, Some(input), 5, "ssh_run", Some(2)).unwrap();
+        let Value::Map(ref result) =
+            super::ssh_result_map("alpha", outcome, std::time::Duration::ZERO)
+        else {
+            panic!("expected SSH result map")
+        };
+        assert_eq!(result.get("stdout_truncated"), Some(&Value::Bool(true)));
+        assert_eq!(result.get("utf8_lossy"), Some(&Value::Bool(true)));
     }
 
     #[test]
