@@ -494,11 +494,13 @@ fn refresh(
         match raster::Raster::new(scale) {
             Ok(rebuilt) => {
                 *painter = rebuilt;
-                view.scale = scale;
                 switched = true;
             }
+            // Latch the attempt either way so a persistent failure does not
+            // re-read the font and log every frame; keep the working painter.
             Err(e) => eprintln!("raster rebuild at scale {scale}: {e}"),
         }
+        view.scale = scale;
     }
     if let Some((size, _)) = logical_size {
         let lw = painter.logical_width().max(1.0);
@@ -514,12 +516,8 @@ fn refresh(
             );
             view.cols = cols;
             view.rows = rows;
-            // Size the on-screen node in LOGICAL px so the physical texture
-            // (cols*width device px) maps 1:1 to physical pixels — no stretch.
-            if let Ok((_, mut node)) = nodes.get_mut(view.terminal) {
-                node.width = px(cols as f32 * lw);
-                node.height = px(rows as f32 * lh);
-            }
+            // Node sizing (in LOGICAL px) is done once in the tail block below,
+            // against the actual rendered texture, so it can't disagree with it.
         }
     }
     let damaged = terminal.take_damage();
@@ -556,11 +554,16 @@ fn refresh(
         stats.rgba_upload.add(converted.elapsed());
         stats.uploads += 1;
     }
+    // Size the on-screen node in LOGICAL px: the texture is `width`×`height`
+    // PHYSICAL device px, so dividing by the raster's scale maps it 1:1 to
+    // physical pixels with no stretch (the HiDPI crispness contract).
+    let node_w = px(width as f32 / painter.scale);
+    let node_h = px(height as f32 / painter.scale);
     if let Ok((_, mut node)) = nodes.get_mut(view.terminal)
-        && (node.width != px(width as f32) || node.height != px(height as f32))
+        && (node.width != node_w || node.height != node_h)
     {
-        node.width = px(width as f32);
-        node.height = px(height as f32);
+        node.width = node_w;
+        node.height = node_h;
         // Layout has already run; request the one follow-up frame needed
         // for new image geometry, including initial startup under reactive mode.
         terminal.listener.wake();
