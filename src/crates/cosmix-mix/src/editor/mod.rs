@@ -15,6 +15,7 @@ use buffer::{Buffer, EditError};
 pub struct Generation {
     /// Opaque attachment generation supplied by the session owner, not identity.
     pub session: u64,
+    /// Zero identifies startup; BeginPrompt must use a strictly newer counter.
     pub prompt: u64,
 }
 
@@ -160,7 +161,7 @@ impl Editor {
     pub fn new(session: u64) -> Self {
         Self {
             session,
-            generation: None,
+            generation: Some(Generation { session, prompt: 0 }),
             profile: None,
             state: State::Idle,
             buffer: Buffer::default(),
@@ -333,8 +334,8 @@ impl Editor {
         };
         Ok(reply)
     }
-    /// Future line-submission owner calls this after restoring modes through
-    /// its normal readline completion path. No speculative next prompt.
+    /// Admission owner consumes a suspended reservation after its final
+    /// identity/deadline/revision checks. No speculative next prompt.
     /// Only a suspended reservation may be consumed here; human-line return
     /// requires a separate terminal-restored completion seam in the input lane.
     pub fn consume_reservation(
@@ -560,5 +561,98 @@ mod tests {
         assert!(p.allows_command("fg"));
         assert!(!p.allows_command("print"));
         assert!(PromptProfile::Primary(String::new()).allows_completion());
+    }
+
+    #[test]
+    fn startup_shutdown_and_mode_entry_failure() {
+        let mut e = Editor::new(7);
+        let t = token(
+            e.command(Command::Shutdown {
+                generation: Generation {
+                    session: 7,
+                    prompt: 0,
+                },
+            })
+            .unwrap(),
+        );
+        assert_eq!(e.state(), State::RestoringForShutdown);
+        assert!(matches!(
+            e.modes_completed(t, true),
+            Ok(Reply::RestoredAndStopped { .. })
+        ));
+        let mut e = Editor::new(7);
+        let t = token(
+            e.command(Command::BeginPrompt {
+                generation: G,
+                profile: PromptProfile::Continuation,
+            })
+            .unwrap(),
+        );
+        assert_eq!(e.modes_completed(t, false), Err(ProtocolError::ModeFailure));
+        assert_eq!(e.edit(Buffer::backspace), Err(ProtocolError::InvalidState));
+    }
+
+    #[test]
+    fn command_state_matrix_and_exhaustion() {
+        for state in [
+            State::Idle,
+            State::Activating,
+            State::Editing,
+            State::RestoringForSuspend,
+            State::Suspended,
+            State::RestoringForShutdown,
+            State::Stopped,
+            State::Failed,
+        ] {
+            let mut base = editing(PromptProfile::Primary(String::new()));
+            base.state = state;
+            let mut e = base.clone();
+            let begin = e.command(Command::BeginPrompt {
+                generation: Generation { prompt: 2, ..G },
+                profile: PromptProfile::Continuation,
+            });
+            assert_eq!(begin.is_ok(), state == State::Idle);
+            if begin.is_err() {
+                assert_eq!(e, base);
+            }
+            let mut e = base.clone();
+            let resume = e.command(Command::Resume {
+                generation: G,
+                edit_revision: 0,
+            });
+            assert_eq!(resume.is_ok(), state == State::Suspended);
+            if resume.is_err() {
+                assert_eq!(e, base);
+            }
+            let mut e = base.clone();
+            let effect = suspend(&mut e);
+            assert_eq!(
+                matches!(effect, Effect::Modes { .. }),
+                state == State::Editing
+            );
+            if state != State::Editing {
+                assert_eq!(e, base);
+            }
+            let mut e = base.clone();
+            assert_eq!(
+                e.command(Command::Shutdown { generation: G }).is_ok(),
+                state != State::Stopped
+            );
+        }
+        let mut e = editing(PromptProfile::Primary(String::new()));
+        e.serial = u64::MAX;
+        let before = e.clone();
+        assert_eq!(
+            e.command(Command::SuspendRequested {
+                generation: G,
+                edit_revision: 0
+            }),
+            Err(ProtocolError::Exhausted)
+        );
+        assert_eq!(e, before);
+        e.revision = u64::MAX;
+        let before = e.clone();
+        assert_eq!(e.edit(|b| b.insert("x")), Err(ProtocolError::Exhausted));
+        assert_eq!(e, before);
     }
 }

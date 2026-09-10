@@ -432,4 +432,58 @@ mod tests {
         assert_eq!(b.insert("x"), Err(EditError::RevisionExhausted));
         assert_eq!(b.text(), "ab");
     }
+
+    #[test]
+    fn disabled_rings_and_nonadjacent_kills() {
+        let mut b = Buffer::new(Limits {
+            bytes: 20,
+            undo_entries: 0,
+            kill_entries: 0,
+        });
+        b.insert("abc").unwrap();
+        b.kill(0..3, false).unwrap();
+        assert!(!b.undo().unwrap());
+        assert!(!b.yank().unwrap());
+        let mut b = Buffer::default();
+        b.insert("abcdef").unwrap();
+        b.kill(0..1, false).unwrap();
+        b.kill(2..3, false).unwrap();
+        b.yank().unwrap();
+        assert_eq!(b.text(), "bcdef");
+        b.yank_pop().unwrap();
+        assert_eq!(b.text(), "bcaef");
+    }
+
+    #[test]
+    fn grapheme_merging_yank_cannot_pop_a_partial_cluster() {
+        let mut b = Buffer::default();
+        b.insert("\u{301}").unwrap();
+        b.kill(0..b.text().len(), false).unwrap();
+        b.insert("e").unwrap();
+        b.yank().unwrap();
+        assert_eq!(b.text(), "e\u{301}");
+        assert!(!b.yank_pop().unwrap());
+        b.undo().unwrap();
+        assert_eq!(b.text(), "e");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_edit_chains_keep_grapheme_boundaries(ops in proptest::collection::vec(0u8..12, 0..100)) {
+            let mut b = Buffer::new(Limits { bytes: 1024, undo_entries: 10, kill_entries: 5 });
+            for op in ops {
+                let revision = b.revision();
+                let result = match op {
+                    0 => b.insert("e"), 1 => b.insert("\u{301}"),
+                    2 => b.insert("👩‍👩‍👧‍👦"), 3 => b.insert("界"),
+                    4 => b.left(), 5 => b.right(), 6 => b.backspace(), 7 => b.delete(),
+                    8 => b.undo(), 9 => b.redo(), 10 => b.kill(0..b.cursor(), true), _ => b.yank(),
+                };
+                proptest::prop_assert!(result.is_ok() || result == Err(EditError::Limit));
+                proptest::prop_assert!(b.is_boundary(b.cursor()));
+                proptest::prop_assert!(b.revision() >= revision);
+                proptest::prop_assert!(b.text().len() <= 1024);
+            }
+        }
+    }
 }
