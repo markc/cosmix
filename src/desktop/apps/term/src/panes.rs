@@ -100,7 +100,11 @@ impl PaneTree {
                     second.split(id, dir, pane);
                 }
             }
-            _ => {}
+            // Unreachable by construction: `active_pane` is always an extant
+            // leaf. If a future change breaks that invariant this arm would
+            // silently drop `pane` and leak its child — fail loudly in debug
+            // so the regression surfaces in tests rather than as a mystery leak.
+            _ => debug_assert!(false, "PaneTree::split: pane id {id} is not an extant leaf"),
         }
     }
     pub fn sibling_focus(&self, id: u64) -> Option<u64> {
