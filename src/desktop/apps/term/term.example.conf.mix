@@ -1,0 +1,18 @@
+-- CosMix Term startup configuration (strict data; never executes Mix code).
+-- Copy to $XDG_CONFIG_HOME/cosmix/term.conf.mix, or when XDG_CONFIG_HOME
+-- is unset, ~/.config/cosmix/term.conf.mix. All keys are optional.
+-- Missing, malformed or invalid files log once and use all defaults.
+
+-- Logical pixels, number in 6..48. Valid TERM_FONT_PX overrides this value.
+-- Invalid TERM_FONT_PX is ignored; the file value (or default 13) remains.
+font_px: 13
+
+-- History lines per tab, integer in 0..1000000; 0 disables history.
+-- Default 1000 preserves the existing Crosswords history limit.
+scrollback: 1000
+
+-- Steady cursor: "block" (inverted cell) or "underline" (default).
+cursor: "underline"
+
+-- TERM is detected, not configurable: xterm-rio when infocmp can resolve it,
+-- otherwise xterm-256color. `term --print-config` reports the selected TERM.

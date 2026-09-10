@@ -1,4 +1,5 @@
 mod bus;
+mod config;
 #[cfg(test)]
 mod input_tests;
 mod metrics;
@@ -99,6 +100,62 @@ struct View {
     last_frame: Instant,
 }
 
+// VERIFY: precedence — the only font override resolution, reused at every scale.
+fn resolve_config(
+    mut config: config::Config,
+    env_font: Option<&str>,
+    term: &'static str,
+) -> config::Settings {
+    if let Some(px) = env_font
+        .and_then(|value| value.parse().ok())
+        .filter(|px| config::valid_font(*px))
+    {
+        config.font_px = px;
+    }
+    config::Settings { config, term }
+}
+
+#[cfg(test)]
+mod config_precedence_tests {
+    use super::*;
+
+    #[test]
+    fn env_over_file_over_default() {
+        let defaults = config::Config::default();
+        assert_eq!(
+            resolve_config(defaults, None, "xterm-256color")
+                .config
+                .font_px,
+            13.0
+        );
+        let file: config::Config = cosmix_config::from_conf_mix_str("font_px: 18").unwrap();
+        assert_eq!(
+            resolve_config(file, None, "xterm-256color").config.font_px,
+            18.0
+        );
+        assert_eq!(
+            resolve_config(file, Some("21.5"), "xterm-rio")
+                .config
+                .font_px,
+            21.5
+        );
+        for invalid in ["bad", "NaN", "inf", "5", "49", ""] {
+            assert_eq!(
+                resolve_config(file, Some(invalid), "xterm-rio")
+                    .config
+                    .font_px,
+                18.0
+            );
+        }
+        let settings = resolve_config(defaults, Some("16"), "xterm-rio");
+        let printed = serde_json::to_value(settings).unwrap();
+        assert_eq!(printed["TERM"], "xterm-rio");
+        assert_eq!(printed["font_px"], 16.0);
+        assert_eq!(printed["scrollback"], 1000);
+        assert_eq!(printed["cursor"], "underline");
+    }
+}
+
 fn main() {
     let identity = AppIdentity {
         slug: "term",
@@ -106,7 +163,27 @@ fn main() {
     };
     assert!(identity.validate().is_ok());
     if std::env::args().any(|arg| arg == "--help") {
-        println!("{}\nFont: TERM_SPIKE_FONT=/path/to/font.ttf", bus::HELP);
+        println!(
+            "{}\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--print-config: print resolved startup settings and exit",
+            bus::HELP
+        );
+        return;
+    }
+    let path = config::config_path(
+        std::env::var_os("XDG_CONFIG_HOME").map(Into::into),
+        std::env::var_os("HOME").map(Into::into),
+    );
+    let settings = resolve_config(
+        config::load(path.as_deref()),
+        std::env::var("TERM_FONT_PX").ok().as_deref(),
+        config::selected_term(),
+    );
+    // VERIFY: print-config — no Wayland, font, PTY or Bus initialisation.
+    if std::env::args().any(|arg| arg == "--print-config") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&settings).expect("validated config")
+        );
         return;
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
@@ -116,19 +193,21 @@ fn main() {
     // Start at scale 1.0; `refresh` rebuilds the Raster at the window's real
     // fractional scale once the surface is configured, so text is rasterised
     // at physical resolution and never upscaled (the HiDPI blur fix).
-    let painter = raster::Raster::new(1.0).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1)
-    });
-    // The preserved core launches Mix in HOME with TERM=xterm-256color.
-    // Product terminfo xterm-rio is P2.2.
-    let terminal = Arc::new(Mutex::new(TabSet::new().unwrap_or_else(|e| {
-        eprintln!("PTY startup: {e}");
-        std::process::exit(1)
-    })));
+    let painter = raster::Raster::new(1.0, settings.config.font_px, settings.config.cursor)
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        });
+    let terminal = Arc::new(Mutex::new(TabSet::with_settings(settings).unwrap_or_else(
+        |e| {
+            eprintln!("PTY startup: {e}");
+            std::process::exit(1)
+        },
+    )));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
     let bus = bus::start(terminal.clone(), cleanup.clone());
     App::new()
+        .insert_resource(settings)
         .insert_resource(Core(terminal.clone(), cleanup.clone()))
         .insert_resource(Painter(Mutex::new(painter)))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -565,6 +644,7 @@ fn keyboard(
 fn refresh(
     core: Res<Core>,
     painter: Res<Painter>,
+    settings: Res<config::Settings>,
     mut view: ResMut<View>,
     mut images: ResMut<Assets<Image>>,
     mut nodes: Query<(&ComputedNode, &mut Node)>,
@@ -599,7 +679,7 @@ fn refresh(
     if let Some((_, scale)) = logical_size
         && (scale - view.scale).abs() > 0.01
     {
-        match raster::Raster::new(scale) {
+        match raster::Raster::new(scale, settings.config.font_px, settings.config.cursor) {
             Ok(rebuilt) => {
                 *painter = rebuilt;
                 switched = true;

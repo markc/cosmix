@@ -320,7 +320,7 @@ fn reap_child(pid: i32, timeout: Duration) {
     }
 }
 impl Terminal {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(settings: crate::config::Settings) -> Result<Self, String> {
         if std::path::Path::new("/.flatpak-info").exists() {
             return Err("spike requires native session (controlling PTY)".into());
         }
@@ -339,7 +339,7 @@ impl Terminal {
             listener.clone(),
             WindowId::from(0),
             0,
-            1000,
+            settings.config.scrollback,
         )));
         let home = std::env::var("HOME").map_err(|_| "HOME is required")?;
         // Explicit program + empty argv: native create_pty_with_spawn selects
@@ -348,7 +348,7 @@ impl Terminal {
             Some("/opt/cosmix/bin/mix"),
             vec![],
             &Some(home),
-            Some(vec![("TERM".into(), "xterm-256color".into())]),
+            Some(vec![("TERM".into(), settings.term.into())]),
             80,
             24,
             800,

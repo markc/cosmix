@@ -7,6 +7,7 @@ use swash::{
 };
 
 pub struct Raster {
+    cursor: crate::config::Cursor,
     data: Vec<u8>,
     context: ScaleContext,
     cache: HashMap<(char, bool, [u8; 3]), Option<Image>>,
@@ -23,15 +24,9 @@ pub struct Raster {
     baseline: i32,
 }
 impl Raster {
-    pub fn new(scale: f32) -> Result<Self, String> {
+    pub fn new(scale: f32, logical_px: f32, cursor: crate::config::Cursor) -> Result<Self, String> {
         let scale = scale.clamp(0.5, 8.0);
-        // Logical font size (device-independent); TERM_FONT_PX overrides the
-        // default. ×scale makes it physical so it stays crisp on HiDPI.
-        let logical_px = std::env::var("TERM_FONT_PX")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| (6.0..=48.0).contains(v))
-            .unwrap_or(13.0);
+        // Startup resolves logical size once; scale makes it physical for HiDPI.
         let px = logical_px * scale;
         let path = if let Some(path) = std::env::var_os("TERM_SPIKE_FONT") {
             PathBuf::from(path)
@@ -73,6 +68,7 @@ impl Raster {
             path.display()
         );
         Ok(Self {
+            cursor,
             data,
             context: ScaleContext::new(),
             cache: HashMap::new(),
@@ -145,12 +141,28 @@ impl Raster {
                 }
             }
         }
-        // A steady underline cursor; blinking/presentation timing is out of scope.
+        // Steady cursor; invert a block so its glyph remains readable.
         let (cx, cy) = screen.cursor;
         if screen.cursor_visible && cx < screen.cols && cy < screen.rows {
-            for x in cx * self.width as usize..(cx + 1) * self.width as usize {
-                let offset = (((cy + 1) * self.height as usize - 1) * width + x) * 4;
-                rgba[offset..offset + 4].copy_from_slice(&[220, 220, 220, 255]);
+            let bottom = (cy + 1) * self.height as usize;
+            let top = match self.cursor {
+                crate::config::Cursor::Block => cy * self.height as usize,
+                crate::config::Cursor::Underline => bottom - 1,
+            };
+            for y in top..bottom {
+                for x in cx * self.width as usize..(cx + 1) * self.width as usize {
+                    let offset = (y * width + x) * 4;
+                    match self.cursor {
+                        crate::config::Cursor::Block => {
+                            for channel in &mut rgba[offset..offset + 3] {
+                                *channel = 255 - *channel;
+                            }
+                        }
+                        crate::config::Cursor::Underline => {
+                            rgba[offset..offset + 4].copy_from_slice(&[220, 220, 220, 255]);
+                        }
+                    }
+                }
             }
         }
         rgba

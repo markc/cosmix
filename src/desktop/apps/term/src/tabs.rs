@@ -52,6 +52,7 @@ pub struct Tab {
 }
 
 pub struct TabSet {
+    settings: crate::config::Settings,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
@@ -77,8 +78,17 @@ pub struct TabInfo {
 }
 
 impl TabSet {
+    #[cfg(test)]
     pub fn new() -> Result<Self, String> {
+        Self::with_settings(crate::config::Settings {
+            config: crate::config::Config::default(),
+            term: "xterm-256color",
+        })
+    }
+
+    pub fn with_settings(settings: crate::config::Settings) -> Result<Self, String> {
         let mut set = Self {
+            settings,
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
@@ -91,7 +101,8 @@ impl TabSet {
     }
 
     pub fn open(&mut self) -> Result<u64, String> {
-        self.open_with(Terminal::start)
+        let settings = self.settings;
+        self.open_with(move || Terminal::start(settings))
     }
 
     fn open_with(
