@@ -32,12 +32,15 @@ end
 fn apply_layout($name)
   if $name == "split" then
     $r = send "term" "term.pane.split" dir="v"
+    if $rc != 0 then raise("TERM_SEND", "split failed: " .. to_string($rc) .. " " .. to_string($r)) end
     print("layout split — " .. trim("" .. $r))
   elif $name == "dev" then
     -- One tab exists at launch; two more make the edit/build/run trio.
     $r1 = send "term" "term.tab.new" body=""
+    if $rc != 0 then raise("TERM_SEND", "first new tab failed: " .. to_string($rc) .. " " .. to_string($r1)) end
     $r2 = send "term" "term.tab.new" body=""
-    print("layout dev — three tabs (" .. trim("" .. $r1) .. "; " .. trim("" .. $r2) .. ")")
+    if $rc != 0 then raise("TERM_SEND", "second new tab failed (first tab remains): " .. to_string($rc) .. " " .. to_string($r2)) end
+    print("layout dev — added two tabs (" .. trim("" .. $r1) .. "; " .. trim("" .. $r2) .. ")")
   else
     raise("TERM_LAYOUT", "unknown layout: " .. $name .. " (known: split, dev)")
   end
@@ -64,6 +67,9 @@ else
 end
 
 $running = term_running()
+if $running and (($cmd == "focus" and len($a) >= 2) or ($cmd == "layout" and len($a) >= 3)) then
+  print("requested directory not applied: " .. $dir .. " — running Term's diagnostic verbs cannot carry cwd; this lands with P3a identity")
+end
 
 -- open always launches; focus/layout launch only when nothing is running.
 $need_launch = false
@@ -78,8 +84,11 @@ if $need_launch then
   -- TERM_CWD is inherited by the detached child (space-safe, no shell quoting);
   -- `mix --gui` resolves the Term frontend and the child shell starts in $dir.
   export TERM_CWD = $dir
-  $mix = "/proc/" .. to_string(pid()) .. "/exe"
-  $pid = spawn($mix .. " --gui", "/dev/null", "/dev/null")
+  -- Resolve while this launcher is alive; another Term may answer INFO at once.
+  $resolved = run_argv(["readlink", "-f", "/proc/" .. to_string(pid()) .. "/exe"])
+  $mix = "/opt/cosmix/bin/mix"
+  if $resolved.ok and trim($resolved.stdout) != "" then $mix = trim($resolved.stdout) end
+  $pid = spawn(shell_quote($mix) .. " --gui", "/dev/null", "/dev/null")
   print("launched Term (pid " .. to_string($pid) .. ") with its shell in " .. $dir)
   -- Wait (bounded) for the new instance to register before driving it.
   $i = 0
@@ -93,6 +102,7 @@ end
 if $cmd == "focus" then
   if $running then
     $r = send "term" "term.tab.new" body=""
+    if $rc != 0 then raise("TERM_SEND", "new tab failed: " .. to_string($rc) .. " " .. to_string($r)) end
     print("reused running Term — opened a new tab (" .. trim("" .. $r) .. ")")
   else
     print("no running Term — opened a new one in " .. $dir)

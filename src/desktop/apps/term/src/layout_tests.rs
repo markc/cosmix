@@ -216,6 +216,7 @@ fn assert_synced(app: &App) {
 #[test]
 fn scheduled_refresh_survives_bus_mutations_between_update_and_post_update() {
     let mut app = layout_app();
+    app.insert_resource(NotifyTx(None));
     let shared = app.world().resource::<Core>().0.clone();
     let (first_tab, first_pane, other_tab) = {
         let mut tabs = shared.lock().unwrap();

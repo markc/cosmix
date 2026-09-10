@@ -345,10 +345,10 @@ fn run_gui() -> i32 {
     // directory. Stamp the invoking cwd as TERM_CWD so the frontend's child
     // shell starts there, but never override an explicit TERM_CWD a caller
     // (a desktop launcher targeting a project) already set.
-    if env::var_os("TERM_CWD").is_none() {
-        if let Ok(cwd) = env::current_dir() {
-            command.env("TERM_CWD", cwd);
-        }
+    if env::var_os("TERM_CWD").is_none()
+        && let Ok(cwd) = env::current_dir()
+    {
+        command.env("TERM_CWD", cwd);
     }
     #[cfg(unix)]
     {

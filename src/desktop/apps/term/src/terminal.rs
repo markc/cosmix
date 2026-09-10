@@ -319,6 +319,24 @@ fn reap_child(pid: i32, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<String, String> {
+    term_cwd
+        .filter(|dir| {
+            if dir.is_empty() || !std::path::Path::new(dir).is_dir() {
+                return false;
+            }
+            let Ok(path) = std::ffi::CString::new(dir.as_bytes()) else {
+                return false;
+            };
+            // SAFETY: path is NUL-terminated and alive for this effective-ID check.
+            unsafe {
+                libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+            }
+        })
+        .or(home)
+        .ok_or_else(|| "HOME is required".into())
+}
+
 impl Terminal {
     pub fn start(settings: crate::config::Settings) -> Result<Self, String> {
         if std::path::Path::new("/.flatpak-info").exists() {
@@ -344,27 +362,35 @@ impl Terminal {
         // "Open here": a valid TERM_CWD directory is the child shell's working
         // directory (the desktop launcher / `mix --gui` stamps it from the
         // invoking cwd). Absent or invalid, fall back to HOME so a bare
-        // desktop launch keeps its historical home-directory default. A
-        // non-directory TERM_CWD is ignored rather than trusted — the child
-        // must never start in a path that does not resolve.
-        let cwd = std::env::var("TERM_CWD")
-            .ok()
-            .filter(|dir| !dir.is_empty() && std::path::Path::new(dir).is_dir())
-            .or_else(|| std::env::var("HOME").ok())
-            .ok_or("HOME is required")?;
-        // Explicit program + empty argv: native create_pty_with_spawn selects
+        // desktop launch keeps its historical home-directory default.
+        // The pinned PTY API takes String; non-UTF-8 TERM_CWD falls back to HOME.
+        let home = std::env::var("HOME").ok();
+        let cwd = launch_directory(std::env::var("TERM_CWD").ok(), home.clone())?;
+        // The PTY API only adds environment entries. env removes TERM_CWD in
+        // the child before execing Mix, without mutating our threaded process's
+        // environment; later mix --gui launches can stamp their own cwd.
+        // Explicit program + argv: native create_pty_with_spawn selects
         // setsid + TIOCSCTTY (Flatpak's non-controlling branch refused above).
-        let pty = teletypewriter::create_pty_with_spawn(
-            Some("/opt/cosmix/bin/mix"),
-            vec![],
-            &Some(cwd),
-            Some(vec![("TERM".into(), settings.term.into())]),
-            80,
-            24,
-            800,
-            480,
-        )
-        .map_err(|e| e.to_string())?;
+        let spawn = |dir: String| {
+            teletypewriter::create_pty_with_spawn(
+                Some("/usr/bin/env"),
+                vec!["-u".into(), "TERM_CWD".into(), "/opt/cosmix/bin/mix".into()],
+                &Some(dir),
+                Some(vec![("TERM".into(), settings.term.into())]),
+                80,
+                24,
+                800,
+                480,
+            )
+        };
+        // Search access can change after the probe. A spawn/chdir error gets
+        // one HOME retry, rather than reporting completion for an unrun shell.
+        let pty = spawn(cwd.clone())
+            .or_else(|error| match home {
+                Some(home) if home != cwd => spawn(home),
+                _ => Err(error),
+            })
+            .map_err(|e| e.to_string())?;
         let pid = *pty.child.pid;
         let machine = Machine::new(
             grid.clone(),
@@ -565,6 +591,27 @@ mod tests {
     use super::*;
     use rio_vt::corcovado;
     use std::os::{fd::AsRawFd, unix::net::UnixStream};
+
+    #[test]
+    fn launch_directory_selects_valid_cwd_or_home() {
+        let home = Some("/home/example".to_string());
+        assert_eq!(
+            launch_directory(Some("/".into()), home.clone()).unwrap(),
+            "/"
+        );
+        for cwd in [
+            None,
+            Some("".into()),
+            Some("/dev/null".into()),
+            Some("/dev/null/missing".into()),
+        ] {
+            assert_eq!(
+                launch_directory(cwd, home.clone()).unwrap(),
+                "/home/example"
+            );
+        }
+        assert!(launch_directory(None, None).is_err());
+    }
 
     // Headless pollable byte-stream fixture. Machine still owns scheduling,
     // parsing and damage events; this test never launches a GUI or shell.

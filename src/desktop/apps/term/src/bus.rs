@@ -15,7 +15,7 @@ pub fn start(
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("Bus runtime");
         runtime.block_on(async move {
             let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options("term", &cosmix_config::client_helpers::resolve_noded_url()).bounded_incoming(16).connect()).await;
-            let client = match result { Ok(Ok(client)) => client, _ => { eprintln!("term Bus unavailable or connection timed out"); return; } };
+            let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("term Bus unavailable or connection timed out"); return; } };
             let Some(mut incoming) = client.incoming_bounded() else { return; };
             // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
             // or closes at shutdown. `recv()` on a closed channel returns `None`
@@ -24,19 +24,22 @@ pub fn start(
             // re-polled, while the loop keeps serving Bus verbs until the TabSet
             // empties.
             let mut notify_open = true;
+            let mut notifications = tokio::task::JoinSet::new();
             while !terminal.lock().unwrap().is_empty() {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {},
                     note = notify_rx.recv(), if notify_open => {
-                        // Fire-and-forget "task complete" notification. interactd
-                        // absent (unregistered `interact` service) is the common
-                        // desktop-less case and its error is ignored, not logged
-                        // per-exit.
+                        // Sink writes can block under backpressure. Poll them in
+                        // separate tracked tasks so verbs remain serviceable.
                         match note {
-                            Some(note) => notify_complete(&client, &note).await,
+                            Some(note) => {
+                                let client = client.clone();
+                                notifications.spawn(async move { notify_complete(&client, &note).await });
+                            },
                             None => notify_open = false,
                         }
                     },
+                    _ = notifications.join_next(), if !notifications.is_empty() => {},
                     event = incoming.recv() => {
                         let command = match event {
                             Some(BoundedIncomingEvent::Command(c)) => c,
@@ -51,16 +54,48 @@ pub fn start(
                     }
                 }
             }
+            // The final reap can queue notes just after the TabSet becomes
+            // empty. Wait for channel closure and outstanding sends together,
+            // under one total deadline (not two seconds per pane).
+            drain_notifications(&mut notify_rx, &mut notifications, |note| {
+                let client = client.clone();
+                async move { notify_complete(&client, &note).await }
+            }, Duration::from_secs(2)).await;
             let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
         });
     }).expect("Bus thread")
 }
 
+async fn drain_notifications<F, Fut>(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    send: F,
+    budget: Duration,
+) where
+    F: Fn(CompletionNote) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let _ = tokio::time::timeout(budget, async {
+        let mut open = true;
+        while open || !tasks.is_empty() {
+            tokio::select! {
+                note = receiver.recv(), if open => match note {
+                    Some(note) => { tasks.spawn(send(note)); },
+                    None => open = false,
+                },
+                _ = tasks.join_next(), if !tasks.is_empty() => {},
+            }
+        }
+    })
+    .await;
+    tasks.abort_all();
+}
+
 /// Emit one `interact.notify` (notify.v1) for a self-exited pane. Best-effort:
 /// a 2s timeout bounds a wedged broker and every failure (interactd absent,
 /// transport error, timeout) is swallowed — a missing desktop notification must
-/// never disturb the terminal. `dedupe_key` is per-pane so a rapid re-exit
-/// coalesces rather than stacking.
+/// never disturb the terminal. `dedupe_key` is a stable per-pane key; pane IDs
+/// are never reused, so it does not coalesce separate exits.
 async fn notify_complete(client: &SupervisedClient, note: &CompletionNote) {
     let body = serde_json::json!({
         "summary": format!("Terminal shell exited — {}", note.tab_title),
@@ -70,9 +105,9 @@ async fn notify_complete(client: &SupervisedClient, note: &CompletionNote) {
         "icon": { "lucide": "terminal" },
         "dedupe_key": format!("term-pane-{}", note.pane_id),
     });
-    // `send` is fire-and-forget: it returns once the frame is dispatched, never
-    // waiting on interactd, so a completion notify cannot stall the verb-serving
-    // select loop. One DIAGNOSTIC line makes the otherwise-invisible dispatch
+    // `send` waits for the WebSocket sink write, which can stall under
+    // backpressure; callers run this future in a separate task. It does not
+    // wait for interactd's reply. One DIAGNOSTIC line makes dispatch
     // observable (an absent `interact` service surfaces here as a send error).
     match tokio::time::timeout(
         Duration::from_secs(2),
@@ -81,7 +116,10 @@ async fn notify_complete(client: &SupervisedClient, note: &CompletionNote) {
     .await
     {
         Ok(Ok(())) => {
-            eprintln!("DIAGNOSTIC term completion-notify dispatched: pane {}", note.pane_id)
+            eprintln!(
+                "DIAGNOSTIC term completion-notify dispatched: pane {}",
+                note.pane_id
+            )
         }
         Ok(Err(error)) => {
             eprintln!("DIAGNOSTIC term completion-notify not dispatched: {error}")
@@ -277,6 +315,80 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notification_drain_keeps_final_reap_and_bounds_blocked_sends() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut tasks = tokio::task::JoinSet::new();
+                // Simulate the last reap queuing notes after the verb loop ends.
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    for pane_id in 1..=3 {
+                        tx.send(CompletionNote {
+                            pane_id,
+                            tab_title: "test".into(),
+                            child_pid: 1,
+                        })
+                        .unwrap();
+                    }
+                });
+                drain_notifications(
+                    &mut rx,
+                    &mut tasks,
+                    |_| {
+                        let delivered = delivered.clone();
+                        async move {
+                            delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    },
+                    Duration::from_secs(1),
+                )
+                .await;
+                assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 3);
+                assert!(tasks.is_empty());
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                for pane_id in 1..=3 {
+                    tx.send(CompletionNote {
+                        pane_id,
+                        tab_title: "test".into(),
+                        child_pid: 1,
+                    })
+                    .unwrap();
+                }
+                // A backpressured send stays pending while another task makes
+                // progress; an open producer must not prevent the total deadline.
+                let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    drain_notifications(
+                        &mut rx,
+                        &mut tasks,
+                        |_| {
+                            let started = started.clone();
+                            async move {
+                                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                std::future::pending::<()>().await;
+                            }
+                        },
+                        Duration::from_millis(30),
+                    ),
+                )
+                .await
+                .expect("shared drain deadline");
+                assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+                while let Some(result) = tasks.join_next().await {
+                    assert!(result.unwrap_err().is_cancelled());
+                }
+                drop(tx);
+            });
+    }
+
     #[test]
     fn pane_body_parsers() {
         assert_eq!(parse_dir("h"), Ok(crate::panes::SplitDir::Horizontal));

@@ -848,6 +848,8 @@ fn pane_interior(computed: &ComputedNode) -> Vec2 {
     (computed.size() - insets).max(Vec2::ZERO) * computed.inverse_scale_factor()
 }
 
+// Bevy injects these independent resources/queries as system parameters.
+#[allow(clippy::too_many_arguments)]
 fn refresh(
     core: Res<Core>,
     notify: Res<NotifyTx>,
