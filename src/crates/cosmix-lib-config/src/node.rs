@@ -280,6 +280,8 @@ pub enum AdmissionMode {
 #[serde(default)]
 pub struct NodedConfig {
     pub port: u16,
+    /// Published system broker endpoint (BUS-013), independent of client XDG.
+    pub unix_socket: Option<std::path::PathBuf>,
     pub mesh_config: Option<String>,
     /// SPEC 13 §9a D2 admission posture (off | observe | enforce). Default off.
     pub admission: AdmissionMode,
@@ -289,9 +291,27 @@ impl Default for NodedConfig {
     fn default() -> Self {
         Self {
             port: 4200,
+            unix_socket: None,
             mesh_config: None,
             admission: AdmissionMode::Off,
         }
+    }
+}
+
+impl NodedConfig {
+    /// Client resolution must never derive the system endpoint from user XDG.
+    pub fn unix_endpoint(&self) -> std::path::PathBuf {
+        self.unix_socket
+            .clone()
+            .unwrap_or_else(|| "/run/cosmix/noded/bus.sock".into())
+    }
+
+    /// A broker publishes its resolved endpoint in node configuration. System
+    /// units pin COSMIX_RUN; development installs retain the common path rules.
+    pub fn broker_unix_endpoint(&self) -> std::path::PathBuf {
+        self.unix_socket
+            .clone()
+            .unwrap_or_else(|| crate::cosmix_path(crate::CosmixDir::Run).join("noded/bus.sock"))
     }
 }
 
@@ -997,6 +1017,25 @@ pub fn require_node_config() -> Result<NodeConfig> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_endpoint_defaults_to_system_path_not_client_runtime() {
+        let config: super::NodedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.unix_endpoint(),
+            std::path::PathBuf::from("/run/cosmix/noded/bus.sock")
+        );
+        let config: super::NodedConfig =
+            serde_json::from_str(r#"{"unix_socket":"/run/example/bus.sock"}"#).unwrap();
+        assert_eq!(
+            config.unix_endpoint(),
+            std::path::PathBuf::from("/run/example/bus.sock")
+        );
+        assert_eq!(config.broker_unix_endpoint(), config.unix_endpoint());
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["unix_socket"],
+            "/run/example/bus.sock"
+        );
+    }
     use super::*;
     use std::collections::HashSet;
 

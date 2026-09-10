@@ -25,7 +25,10 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use base64::Engine as _;
 use cosmix_bus::bus::{self, BusMessage, BusTarget};
-use cosmix_bus::native_session::TransportIdentity;
+use cosmix_bus::native_session::{
+    Assurance, BrokerPrincipal, HexBytes, PrincipalVersion, TransportIdentity, stamp_principal,
+    strip_principal,
+};
 use cosmix_config::node::AdmissionMode;
 use cosmix_mesh::{MeshConfig, MeshInbound, MeshPeers, PeerConfig, ReconcileReport};
 use futures_util::{SinkExt, StreamExt};
@@ -267,6 +270,9 @@ impl PendingResponseTable {
 
 #[derive(Clone)]
 struct AppState {
+    broker_epoch: HexBytes<16>,
+    principal: Option<BrokerPrincipal>,
+    native_session_available: bool,
     registry: Registry,
     pending_responses: PendingResponses,
     tap_subscribers: TapSubscribers,
@@ -402,6 +408,8 @@ enum AdmitOutcome {
 // ── Entry point ──
 
 pub struct RunConfig {
+    /// None disables native ingress for isolated legacy test brokers.
+    pub unix_socket: Option<PathBuf>,
     pub listen: String,
     pub node: String,
     pub wg_ip: String,
@@ -413,6 +421,7 @@ pub struct RunConfig {
 
 pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()> {
     let RunConfig {
+        unix_socket,
         listen,
         node,
         wg_ip,
@@ -459,6 +468,14 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         crate::authority::Posture::Unverified { .. } => (false, 0),
     };
     let listener = tokio::net::TcpListener::bind(&listen).await?;
+    let unix_listener = if crate::native_ingress::ENABLED {
+        match unix_socket.as_deref() {
+            Some(path) => Some(crate::native_ingress::bind(path).await?),
+            None => None,
+        }
+    } else {
+        None
+    };
     let listener_port = listener.local_addr()?.port();
     // SPEC 13 §9a B1 self-check — is the listener bound to our own WG IP?
     // Start-immutable; computed once and shared with the reload watcher.
@@ -526,6 +543,10 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
             let peer = inbound.peer;
             let connection_generation = inbound.connection_generation;
             let mut msg = inbound.message;
+            strip_principal(&mut msg);
+            if broker_only_session_event(&msg) {
+                continue;
+            }
             // Load once before any observation-only allocation. When false,
             // mesh ingress still canonicalises and serialises exactly what
             // delivery requires, but retains no correlation string or second
@@ -707,6 +728,9 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     let change_bus = crate::props::ChangeBus::new(broker.clone());
 
     let state = AppState {
+        broker_epoch: HexBytes(rand::random()),
+        principal: None,
+        native_session_available: unix_listener.is_some(),
         registry,
         pending_responses,
         tap_subscribers,
@@ -776,7 +800,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
 
     let app = Router::new()
         .route("/ws", axum::routing::get(ws_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
     tracing::info!(node = %node, "Broker listening on ws://{}", listen);
 
@@ -788,11 +812,24 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     // correlator on a would-refuse (the claimed `source_node` is unverified
     // there) and the input to the same-node-origin classifier the enforce gate
     // (2-c-2b) uses — never the proof, only the local-vs-network boundary.
-    axum::serve(
+    let tcp_server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    );
+    if let Some((listener, _socket_guard)) = unix_listener {
+        let unix_app = Router::new()
+            .route("/ws", axum::routing::get(unix_ws_handler))
+            .with_state(state);
+        tokio::try_join!(async { tcp_server.await }, async {
+            axum::serve(
+                listener,
+                unix_app.into_make_service_with_connect_info::<crate::native_ingress::UnixPeer>(),
+            )
+            .await
+        })?;
+    } else {
+        tcp_server.await?;
+    }
 
     Ok(())
 }
@@ -1737,7 +1774,40 @@ async fn ws_handler(
         })
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportIdentity) {
+async fn unix_ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<crate::native_ingress::UnixPeer>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    let Some(transport) = peer.0 else {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    };
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(bus::WS_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, transport))
+}
+
+fn broker_only_session_event(msg: &BusMessage) -> bool {
+    matches!(
+        msg.command_name(),
+        Some("noded.session.lifecycle" | "noded.session.lifecycle.gap")
+    )
+}
+
+async fn handle_socket(socket: WebSocket, mut state: AppState, transport: TransportIdentity) {
+    if let TransportIdentity::LocalUnix { uid, gid, peer_pid } = &transport {
+        state.principal = Some(BrokerPrincipal {
+            version: PrincipalVersion::V1,
+            assurance: Assurance::LocalUnix,
+            owner_node: state.node_name.clone(),
+            unix_uid: *uid,
+            unix_gid: *gid,
+            peer_pid: *peer_pid,
+            broker_epoch: state.broker_epoch,
+            connection_id: HexBytes(rand::random()),
+            session: None,
+        });
+    }
     // Preserve the existing IP-based D2 and broker-origin inputs. Unix callers
     // are local; their UID authority is a separate transport assertion.
     let source_ip = match &transport {
@@ -1785,7 +1855,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportI
     // rides the per-session `tx`, so it serialises ahead of any later reply.
     // `challenge_id` is held only to reap the entry on socket close.
     let mut challenge_id: Option<String> = None;
-    if state.admission_mode != AdmissionMode::Off {
+    if state.admission_mode != AdmissionMode::Off && state.principal.is_none() {
         // Snapshot the epoch + mesh, then DROP the authority guard before the
         // awaited `issue()` (don't pin the Arc across the await).
         let inputs = match &state.authority.load().posture {
@@ -1826,10 +1896,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportI
         };
         let text = match msg {
             Message::Text(t) => t.to_string(),
+            Message::Binary(_) if state.principal.is_some() => break,
             Message::Close(_) => break,
             _ => continue,
         };
-
         let mut bus_msg = match bus::parse(&text) {
             Ok(m) => m,
             Err(e) => {
@@ -1841,6 +1911,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportI
                 continue;
             }
         };
+
+        strip_principal(&mut bus_msg);
+        if broker_only_session_event(&bus_msg) {
+            continue;
+        }
 
         // SPEC 13 §9a (2-c-1b) — the D2 admission response. It carries
         // `type:response`, so it MUST be intercepted by command HERE, before the
@@ -1900,6 +1975,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportI
                         service_name.as_deref(),
                         pending.caller_service.as_deref(),
                         broker_origin_for_delivery(source_ip, &state.bind),
+                        state.principal.as_ref(),
                     );
                     if state.observe.is_active() {
                         let outcome = match pending.caller_tx.try_send(wire.clone()) {
@@ -2213,6 +2289,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportI
                 canonicalize_routed_from_in_place(&mut bus_msg, service_name.as_deref());
                 let origin = broker_origin_for_delivery(source_ip, &state.bind);
                 stamp_broker_origin(&mut bus_msg, origin);
+                if stamp_principal(&mut bus_msg, state.principal.as_ref()).is_err() {
+                    continue;
+                }
                 let canonical_text = bus_msg.to_wire();
                 // `route_local` mutates `bus_msg`'s `id` to the broker-local
                 // rewrite. Use the wire bytes it returns (id-rewritten) for
@@ -2297,6 +2376,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, transport: TransportI
                                 ));
                             }
                             stamp_broker_origin(&mut resp, BrokerOrigin::Mesh);
+                            strip_principal(&mut resp);
+                            if broker_only_session_event(&resp) {
+                                return;
+                            }
                             let response_wire = resp.to_wire();
                             if let Some(observation) = pending_observation.as_ref() {
                                 let outcome = match tx_clone.try_send(response_wire.clone()) {
@@ -2635,6 +2718,7 @@ fn canonicalize_routed_from(
 /// their [`ObserveManager::is_active`] gate.
 fn canonicalize_routed_from_in_place(msg: &mut BusMessage, peer_id: Option<&str>) {
     strip_broker_origin(msg);
+    strip_principal(msg);
     match peer_id {
         Some(service) => msg.set("from", service),
         None => {
@@ -2645,6 +2729,7 @@ fn canonicalize_routed_from_in_place(msg: &mut BusMessage, peer_id: Option<&str>
 
 fn canonicalize_connection_from(message: &mut BusMessage, service_name: Option<&str>) {
     strip_broker_origin(message);
+    strip_principal(message);
     match service_name {
         Some(service) => message.set("from", service),
         None => {
@@ -2712,6 +2797,7 @@ fn canonicalize_correlated_response(
     responder_service: Option<&str>,
     caller_service: Option<&str>,
     responder_origin: BrokerOrigin,
+    principal: Option<&BrokerPrincipal>,
 ) -> String {
     message.set("id", caller_id);
     match responder_service {
@@ -2727,6 +2813,10 @@ fn canonicalize_correlated_response(
         }
     }
     stamp_broker_origin(message, responder_origin);
+    // Only broker-built context enters this helper. Strip even on failure.
+    if stamp_principal(message, principal).is_err() {
+        strip_principal(message);
+    }
     message.to_wire()
 }
 
@@ -3359,6 +3449,12 @@ async fn handle_noded_command(
             resp.set("command", "noded.ping");
             resp.body =
                 r#"{"pong": true, "extensions": {"core": "1.0", "topic": "1.0", "observe": "1.0"}}"#.to_string();
+            if state.native_session_available {
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&resp.body).expect("static ping JSON");
+                body["extensions"]["native-session"] = "1".into();
+                resp.body = body.to_string();
+            }
             let _ = tx.try_send(resp.to_wire());
         }
 
@@ -3486,6 +3582,14 @@ async fn handle_noded_command(
 
         // ── Topic pub/sub (see 2026-04-10-topic-pubsub-v1.md § 3.11) ──
         "topic.publish" => {
+            // Check before reserved-property canonicalisation can erase command.
+            if bus::parse(&msg.body).is_ok_and(|inner| broker_only_session_event(&inner)) {
+                let mut resp = respond("10");
+                resp.set("command", "topic.publish");
+                resp.body = r#"{"error":"reserved_name"}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             let name = match msg.get("name") {
                 Some(n) if !n.is_empty() => n.to_string(),
                 _ => {
@@ -3522,13 +3626,14 @@ async fn handle_noded_command(
             let body_ref: &str = canonical_body.as_deref().unwrap_or(&msg.body);
             match state
                 .broker
-                .publish_with_origin(
+                .publish_with_principal(
                     &name,
                     body_ref,
                     &peer_id,
                     tx.clone(),
                     broker_origin_for_delivery(source_ip, &state.bind),
                     retain,
+                    state.principal.as_ref(),
                 )
                 .await
             {
@@ -4697,6 +4802,9 @@ mod tests {
         let broker = Arc::new(SubscriptionBroker::new());
         let started = Instant::now();
         AppState {
+            broker_epoch: super::HexBytes([1; 16]),
+            principal: None,
+            native_session_available: false,
             registry: Arc::new(RwLock::new(HashMap::new())),
             pending_responses: Arc::new(PendingResponseTable::new()),
             tap_subscribers: Arc::new(RwLock::new(Vec::new())),
@@ -5022,6 +5130,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    unix_socket: None,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5106,6 +5215,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    unix_socket: None,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5257,6 +5367,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    unix_socket: None,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5886,6 +5997,7 @@ mod tests {
             Some("responder"),
             Some("caller"),
             super::broker_origin_for_delivery("192.0.2.99".parse().unwrap(), "192.0.2.5:4200"),
+            None,
         );
         let delivered = bus_mod::parse(&wire).unwrap();
         assert_eq!(delivered.get("id"), Some("caller-9"));

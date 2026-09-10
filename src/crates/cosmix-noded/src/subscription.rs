@@ -323,6 +323,21 @@ impl SubscriptionBroker {
         origin: BrokerOrigin,
         retain: bool,
     ) -> Result<(u64, usize, Vec<Notification>), PublishError> {
+        self.publish_with_principal(name, inner_body, from, from_tx, origin, retain, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_with_principal(
+        &self,
+        name: &str,
+        inner_body: &str,
+        from: &str,
+        from_tx: mpsc::Sender<String>,
+        origin: BrokerOrigin,
+        retain: bool,
+        principal: Option<&cosmix_bus::native_session::BrokerPrincipal>,
+    ) -> Result<(u64, usize, Vec<Notification>), PublishError> {
         if name.starts_with('$') {
             return Err(PublishError::ReservedName);
         }
@@ -337,6 +352,14 @@ impl SubscriptionBroker {
             Ok(m) => m,
             Err(_) => return Err(PublishError::MalformedPayload),
         };
+        if matches!(
+            inner.command_name(),
+            Some("noded.session.lifecycle" | "noded.session.lifecycle.gap")
+        ) {
+            return Err(PublishError::ReservedName);
+        }
+        cosmix_bus::native_session::stamp_principal(&mut inner, principal)
+            .map_err(|_| PublishError::MalformedPayload)?;
 
         // Extract the body's namespace field once per publish for
         // filtered fan-out (§ SPEC 12 §15.5 — `<svc>.props.records.changed`

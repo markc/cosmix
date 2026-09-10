@@ -1850,6 +1850,7 @@ dependencies = [
  "cosmix-lib-props-store",
  "ed25519-dalek",
  "futures-util",
+ "libc",
  "mimalloc",
  "notify",
  "rand 0.8.7",

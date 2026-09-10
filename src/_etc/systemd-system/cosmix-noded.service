@@ -22,7 +22,7 @@ Group=cosmix-noded
 StateDirectory=cosmix/noded
 StateDirectoryMode=0750
 RuntimeDirectory=cosmix/noded
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 ConfigurationDirectory=cosmix/noded
 ConfigurationDirectoryMode=0755
 WorkingDirectory=%S/cosmix/noded
@@ -49,6 +49,7 @@ Environment=HOME=%S/cosmix/noded
 # explicitly via the documented env-var precedence so the resolver finds
 # the canonical file regardless of HOME.
 Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+Environment=COSMIX_RUN=%t/cosmix
 ExecStart=/opt/cosmix/bin/cosmix-noded serve --listen ${LISTEN} --node ${NODE} --mesh-config %E/cosmix/noded/config.conf.mix
 Restart=on-failure
 RestartSec=5s
