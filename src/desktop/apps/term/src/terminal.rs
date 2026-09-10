@@ -319,6 +319,10 @@ fn reap_child(pid: i32, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+/// The canonical system Mix — the only shell Term spawns (mandate: Mix is the
+/// shell). Probed for executability before spawn; see `Terminal::start`.
+const MIX_BIN: &str = "/opt/cosmix/bin/mix";
+
 fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<String, String> {
     term_cwd
         .filter(|dir| {
@@ -369,12 +373,26 @@ impl Terminal {
         // The PTY API only adds environment entries. env removes TERM_CWD in
         // the child before execing Mix, without mutating our threaded process's
         // environment; later mix --gui launches can stamp their own cwd.
+        // env(1) in front of Mix hides a missing/non-executable Mix from the
+        // spawn error path: env itself execs fine, then exits 126/127 inside
+        // the pty, which would read as a spontaneous shell exit (and notify).
+        // Probe the real target up front so startup fails loudly instead; the
+        // probe-to-exec race is a broken install mid-launch, not a state this
+        // check needs to survive.
+        let mix_bin = std::ffi::CString::new(MIX_BIN).map_err(|e| e.to_string())?;
+        // SAFETY: mix_bin is NUL-terminated and alive for this effective-ID check.
+        let mix_executable = unsafe {
+            libc::faccessat(libc::AT_FDCWD, mix_bin.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+        };
+        if !mix_executable {
+            return Err(format!("{MIX_BIN} is not installed or not executable"));
+        }
         // Explicit program + argv: native create_pty_with_spawn selects
         // setsid + TIOCSCTTY (Flatpak's non-controlling branch refused above).
         let spawn = |dir: String| {
             teletypewriter::create_pty_with_spawn(
                 Some("/usr/bin/env"),
-                vec!["-u".into(), "TERM_CWD".into(), "/opt/cosmix/bin/mix".into()],
+                vec!["-u".into(), "TERM_CWD".into(), MIX_BIN.into()],
                 &Some(dir),
                 Some(vec![("TERM".into(), settings.term.into())]),
                 80,
