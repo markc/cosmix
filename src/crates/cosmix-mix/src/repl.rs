@@ -114,12 +114,8 @@ fn exec_restart(
 pub fn run_repl() -> i32 {
     meta::init_start_time();
 
-    // Establish a sane interactive output baseline first thing — before the
-    // prelude, .mixrc, or a resume command can print/run, any of which would
-    // staircase on a raw inherited tty (see ensure_interactive_output_mode).
-    ensure_interactive_output_mode();
-
-    let rt = crate::build_runtime();
+    // Acquire foreground ownership before any terminal repair: a nested
+    // background shell must stop via SIGTTIN before touching parent termios.
     let mut job_table = match JobTable::interactive() {
         Ok(table) => table,
         Err(e) => {
@@ -127,6 +123,9 @@ pub fn run_repl() -> i32 {
             return 1;
         }
     };
+    // Still precedes prelude, rc, prompt and resume-command output.
+    ensure_interactive_output_mode();
+    let rt = crate::build_runtime();
 
     let history_path = dirs::home_dir()
         .map(|h| h.join(".mix_history"))

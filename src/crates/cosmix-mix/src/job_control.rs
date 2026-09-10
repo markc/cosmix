@@ -329,9 +329,8 @@ impl Controller {
         mut lease: Option<TerminalLease<'_>>,
     ) -> io::Result<Outcome> {
         if background {
-            let s = self.shared.state.lock().unwrap();
-            let job = &s.jobs[&id];
-            println!("[{}] {}", id, job.pgid);
+            let pgid = self.shared.state.lock().unwrap().jobs[&id].pgid;
+            println!("[{}] {}", id, pgid);
             return Ok(Outcome {
                 code: 0,
                 background: true,
@@ -386,7 +385,7 @@ impl Controller {
         drop(s);
         drop(lease); // cooked shell ownership before any prompt/notification
         if stopped {
-            println!("[{}] Stopped", id);
+            println!("[{}] Stopped (signal {})", id, code - 128);
         } else {
             self.shared.state.lock().unwrap().jobs.remove(&id);
         }
@@ -441,14 +440,19 @@ impl Controller {
     }
     pub fn notify_done(&self) {
         let mut s = self.shared.state.lock().unwrap();
+        let mut done = Vec::new();
         s.jobs.retain(|id, j| {
             if !j.foreground && j.state() == JobState::Done {
-                println!("[{}] Done {}", id, j.command);
+                done.push((*id, j.command.clone()));
                 false
             } else {
                 true
             }
         });
+        drop(s);
+        for (id, command) in done {
+            println!("[{id}] Done {command}");
+        }
     }
     pub fn abort_launch(&self, id: usize) {
         {
