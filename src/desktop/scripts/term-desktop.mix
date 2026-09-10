@@ -1,0 +1,102 @@
+-- term-desktop.mix — agentless desktop-workflow launcher for CosMix Term.
+--
+-- Drives CosMix Term over the Bus with NO AI agent in the loop: the desktop
+-- "open a terminal here", "focus the running one", and "lay a project out"
+-- workflows, done offline and model-independently through term.* verbs plus a
+-- detached launch. This is the sovereign control path — the same surface an
+-- agent reaches through MCP is reachable here from a plain script.
+--
+-- usage:
+--   mix term-desktop.mix open [DIR]           open Term with its shell in DIR (default: cwd)
+--   mix term-desktop.mix focus [DIR]          reuse a running Term (add a tab); else open in DIR
+--   mix term-desktop.mix layout NAME [DIR]    ensure Term runs, then build a named project layout
+--
+-- Layouts: "split" (split the active pane into two side-by-side panes);
+--          "dev" (three tabs for edit / build / run).
+--
+-- Visual window-raising for `focus` needs a compositor activate verb Comp does
+-- not expose yet (comp.window.activate); until it lands, `focus` reuses the
+-- running instance by adding a tab rather than spawning a second window — the
+-- desktop-legible "don't proliferate windows" half of focus-existing.
+
+fn term_running()
+  -- INFO is answered by any live Term; rc != 0 means no instance registered.
+  $probe = send "term" "INFO" body=""
+  return $rc == 0
+end
+
+fn usage()
+  raise("TERM_ARGS", "usage: open [DIR] | focus [DIR] | layout NAME [DIR]")
+end
+
+fn apply_layout($name)
+  if $name == "split" then
+    $r = send "term" "term.pane.split" dir="v"
+    print("layout split — " .. trim("" .. $r))
+  elif $name == "dev" then
+    -- One tab exists at launch; two more make the edit/build/run trio.
+    $r1 = send "term" "term.tab.new" body=""
+    $r2 = send "term" "term.tab.new" body=""
+    print("layout dev — three tabs (" .. trim("" .. $r1) .. "; " .. trim("" .. $r2) .. ")")
+  else
+    raise("TERM_LAYOUT", "unknown layout: " .. $name .. " (known: split, dev)")
+  end
+end
+
+$a = args()
+if len($a) < 1 then usage() end
+$cmd = $a[0]
+
+-- Resolve the target directory (open/focus: arg 1; layout: arg 2) and, for
+-- layout, the layout name (arg 1).
+$dir = cwd()
+$layout = ""
+if $cmd == "open" then
+  if len($a) >= 2 then $dir = $a[1] end
+elif $cmd == "focus" then
+  if len($a) >= 2 then $dir = $a[1] end
+elif $cmd == "layout" then
+  if len($a) < 2 then usage() end
+  $layout = $a[1]
+  if len($a) >= 3 then $dir = $a[2] end
+else
+  usage()
+end
+
+$running = term_running()
+
+-- open always launches; focus/layout launch only when nothing is running.
+$need_launch = false
+if $cmd == "open" then $need_launch = true end
+if ($cmd == "focus" or $cmd == "layout") and not $running then $need_launch = true end
+
+if $need_launch then
+  if not is_dir($dir) then raise("TERM_DIR", "not a directory: " .. $dir) end
+  if env("WAYLAND_DISPLAY") == "" then
+    raise("TERM_NODISPLAY", "WAYLAND_DISPLAY unset — run under a Wayland compositor")
+  end
+  -- TERM_CWD is inherited by the detached child (space-safe, no shell quoting);
+  -- `mix --gui` resolves the Term frontend and the child shell starts in $dir.
+  export TERM_CWD = $dir
+  $mix = "/proc/" .. to_string(pid()) .. "/exe"
+  $pid = spawn($mix .. " --gui", "/dev/null", "/dev/null")
+  print("launched Term (pid " .. to_string($pid) .. ") with its shell in " .. $dir)
+  -- Wait (bounded) for the new instance to register before driving it.
+  $i = 0
+  while $i < 40 and not term_running()
+    sleep(0.5)
+    $i = $i + 1
+  end
+  if not term_running() then raise("TERM_NOREG", "Term did not register on the Bus within 20s") end
+end
+
+if $cmd == "focus" then
+  if $running then
+    $r = send "term" "term.tab.new" body=""
+    print("reused running Term — opened a new tab (" .. trim("" .. $r) .. ")")
+  else
+    print("no running Term — opened a new one in " .. $dir)
+  end
+elif $cmd == "layout" then
+  apply_layout($layout)
+end

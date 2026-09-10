@@ -47,6 +47,18 @@ impl Drop for Removed {
     }
 }
 
+/// Identity of a pane whose shell child exited on its own — the payload of a
+/// "task complete" desktop notification. Captured by [`TabSet::reap_exited`]
+/// before the pane is closed, since [`Removed`] carries no identity. Only
+/// spontaneous exits produce one; a `term.pane.close`/`term.tab.close` reaches
+/// `close_pane`/`close` directly and never sets the `quit` flag this reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionNote {
+    pub pane_id: u64,
+    pub tab_title: String,
+    pub child_pid: i32,
+}
+
 pub struct Tab {
     pub id: u64,
     pub title: String,
@@ -430,24 +442,31 @@ impl TabSet {
             wake();
         }
     }
-    pub fn reap_exited(&mut self) -> Vec<Removed> {
-        let ids: Vec<_> = self
-            .tabs
-            .iter()
-            .flat_map(|tab| tab.tree.leaves(Geometry::default()))
-            .filter(|(pane, _)| {
-                pane.terminal
-                    .lock()
-                    .unwrap()
-                    .listener
-                    .quit
-                    .load(Ordering::Acquire)
-            })
-            .map(|(pane, _)| pane.id)
-            .collect();
-        ids.into_iter()
+    pub fn reap_exited(&mut self) -> (Vec<Removed>, Vec<CompletionNote>) {
+        // One pass captures the identity of every self-exited pane before any
+        // close mutates the tree; a second closes them. Notes are gathered
+        // here, not derived from `Removed` (which is identity-free), and only
+        // for panes whose child set `quit` — i.e. spontaneous shell exits.
+        let mut ids = Vec::new();
+        let mut notes = Vec::new();
+        for tab in &self.tabs {
+            for (pane, _) in tab.tree.leaves(Geometry::default()) {
+                let terminal = pane.terminal.lock().unwrap();
+                if terminal.listener.quit.load(Ordering::Acquire) {
+                    ids.push(pane.id);
+                    notes.push(CompletionNote {
+                        pane_id: pane.id,
+                        tab_title: tab.title.clone(),
+                        child_pid: terminal.pid,
+                    });
+                }
+            }
+        }
+        let removed = ids
+            .into_iter()
             .filter_map(|id| self.close_pane(id).1)
-            .collect()
+            .collect();
+        (removed, notes)
     }
 
     pub fn shutdown(&mut self) -> Vec<Removed> {
@@ -630,8 +649,11 @@ mod tests {
             .listener
             .quit
             .store(true, Ordering::Release);
-        let removed = tabs.reap_exited();
+        let (removed, notes) = tabs.reap_exited();
         assert_eq!(removed.len(), 1);
+        // The self-exited pane yields exactly one identity-bearing note.
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pane_id, pane);
         assert_eq!(tabs.active_tab().active_pane, original);
         assert!(matches!(tabs.active_tab().tree, PaneTree::Leaf(_)));
         drop(removed);

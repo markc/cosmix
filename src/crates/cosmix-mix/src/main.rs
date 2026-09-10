@@ -341,6 +341,15 @@ fn run_gui() -> i32 {
     let forwarded = env::args_os().skip_while(|arg| arg != "--gui").skip(1);
     let mut command = process::Command::new(&frontend);
     command.args(forwarded);
+    // "Open here": a terminal launched from a shell opens in that shell's
+    // directory. Stamp the invoking cwd as TERM_CWD so the frontend's child
+    // shell starts there, but never override an explicit TERM_CWD a caller
+    // (a desktop launcher targeting a project) already set.
+    if env::var_os("TERM_CWD").is_none() {
+        if let Ok(cwd) = env::current_dir() {
+            command.env("TERM_CWD", cwd);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

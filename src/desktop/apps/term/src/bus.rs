@@ -1,4 +1,4 @@
-use crate::tabs::{Cleanup, Outcome, TabSet};
+use crate::tabs::{Cleanup, CompletionNote, Outcome, TabSet};
 use cosmix_client::{BoundedIncomingEvent, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
@@ -6,16 +6,37 @@ use std::{
 };
 
 pub const HELP: &str = "term: tabbed Wayland Mix terminal\nDIAGNOSTIC surface — full ABP control (windows/tabs/panes/sessions per SPEC) is P3a, gated on authenticated per-instance identity (P0-I); this self-asserted `term` name is a placeholder, not the shipped multi-user identity.\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nThese tab verbs are DIAGNOSTIC too; real per-instance identity is P0-I.\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nThese pane verbs are DIAGNOSTIC too; real per-instance identity is P0-I.\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: DIAGNOSTIC ONLY; ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported. Not a product input API.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
-pub fn start(terminal: Arc<Mutex<TabSet>>, cleanup: Cleanup) -> std::thread::JoinHandle<()> {
+pub fn start(
+    terminal: Arc<Mutex<TabSet>>,
+    cleanup: Cleanup,
+    mut notify_rx: tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new().name("term-bus".into()).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("Bus runtime");
         runtime.block_on(async move {
             let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options("term", &cosmix_config::client_helpers::resolve_noded_url()).bounded_incoming(16).connect()).await;
             let client = match result { Ok(Ok(client)) => client, _ => { eprintln!("term Bus unavailable or connection timed out"); return; } };
             let Some(mut incoming) = client.incoming_bounded() else { return; };
+            // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
+            // or closes at shutdown. `recv()` on a closed channel returns `None`
+            // immediately and forever, which would spin the select; the
+            // precondition retires the branch on the first `None` so it is never
+            // re-polled, while the loop keeps serving Bus verbs until the TabSet
+            // empties.
+            let mut notify_open = true;
             while !terminal.lock().unwrap().is_empty() {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                    note = notify_rx.recv(), if notify_open => {
+                        // Fire-and-forget "task complete" notification. interactd
+                        // absent (unregistered `interact` service) is the common
+                        // desktop-less case and its error is ignored, not logged
+                        // per-exit.
+                        match note {
+                            Some(note) => notify_complete(&client, &note).await,
+                            None => notify_open = false,
+                        }
+                    },
                     event = incoming.recv() => {
                         let command = match event {
                             Some(BoundedIncomingEvent::Command(c)) => c,
@@ -33,6 +54,40 @@ pub fn start(terminal: Arc<Mutex<TabSet>>, cleanup: Cleanup) -> std::thread::Joi
             let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
         });
     }).expect("Bus thread")
+}
+
+/// Emit one `interact.notify` (notify.v1) for a self-exited pane. Best-effort:
+/// a 2s timeout bounds a wedged broker and every failure (interactd absent,
+/// transport error, timeout) is swallowed — a missing desktop notification must
+/// never disturb the terminal. `dedupe_key` is per-pane so a rapid re-exit
+/// coalesces rather than stacking.
+async fn notify_complete(client: &SupervisedClient, note: &CompletionNote) {
+    let body = serde_json::json!({
+        "summary": format!("Terminal shell exited — {}", note.tab_title),
+        "body": format!("pane {} (pid {}) finished", note.pane_id, note.child_pid),
+        "urgency": "normal",
+        "category": "transfer.complete",
+        "icon": { "lucide": "terminal" },
+        "dedupe_key": format!("term-pane-{}", note.pane_id),
+    });
+    // `send` is fire-and-forget: it returns once the frame is dispatched, never
+    // waiting on interactd, so a completion notify cannot stall the verb-serving
+    // select loop. One DIAGNOSTIC line makes the otherwise-invisible dispatch
+    // observable (an absent `interact` service surfaces here as a send error).
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        client.send("interact", "interact.notify", body),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            eprintln!("DIAGNOSTIC term completion-notify dispatched: pane {}", note.pane_id)
+        }
+        Ok(Err(error)) => {
+            eprintln!("DIAGNOSTIC term completion-notify not dispatched: {error}")
+        }
+        Err(_) => eprintln!("DIAGNOSTIC term completion-notify send timed out"),
+    }
 }
 
 fn handle(

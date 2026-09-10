@@ -81,6 +81,11 @@ fn control_letter(input: &KeyboardInput) -> Option<char> {
 
 #[derive(Resource)]
 struct Core(Arc<Mutex<TabSet>>, tabs::Cleanup);
+/// Sender for completion notes to the Bus task. `None` when TERM_NOTIFY=0
+/// disables notifications; sends are best-effort (a full/closed channel is
+/// ignored) so notification plumbing can never stall the render thread.
+#[derive(Resource)]
+struct NotifyTx(Option<tokio::sync::mpsc::UnboundedSender<tabs::CompletionNote>>);
 #[derive(Resource)]
 struct Painter(Mutex<raster::Raster>);
 #[derive(Resource)]
@@ -181,10 +186,17 @@ fn main() {
         },
     )));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
-    let bus = bus::start(terminal.clone(), cleanup.clone());
+    // Completion notifications: the reap system (render thread) hands
+    // self-exited pane identities to the Bus task, which emits interact.notify.
+    // TERM_NOTIFY=0 disables it — the sender is dropped, so notes are never
+    // queued and the Bus task retires its receive branch on the first close.
+    let notify_enabled = std::env::var("TERM_NOTIFY").map(|value| value != "0").unwrap_or(true);
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bus = bus::start(terminal.clone(), cleanup.clone(), notify_rx);
     App::new()
         .insert_resource(settings)
         .insert_resource(Core(terminal.clone(), cleanup.clone()))
+        .insert_resource(NotifyTx(notify_enabled.then_some(notify_tx)))
         .insert_resource(Painter(Mutex::new(painter)))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -838,6 +850,7 @@ fn pane_interior(computed: &ComputedNode) -> Vec2 {
 
 fn refresh(
     core: Res<Core>,
+    notify: Res<NotifyTx>,
     painter: Res<Painter>,
     settings: Res<config::Settings>,
     mut view: ResMut<View>,
@@ -845,8 +858,16 @@ fn refresh(
     mut nodes: Query<(&ComputedNode, &UiGlobalTransform, &mut Node)>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let removed = core.0.lock().unwrap().reap_exited();
+    let (removed, notes) = core.0.lock().unwrap().reap_exited();
     core.1.submit(removed);
+    // Hand each self-exited pane to the Bus task for an interact.notify. A
+    // dropped/closed channel is ignored — the notification is a courtesy, never
+    // a correctness dependency of the reap.
+    if let Some(tx) = &notify.0 {
+        for note in notes {
+            let _ = tx.send(note);
+        }
+    }
     let mut tabs = core.0.lock().unwrap();
     if tabs.is_empty() {
         exit.write(AppExit::Success);

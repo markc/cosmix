@@ -341,13 +341,23 @@ impl Terminal {
             0,
             settings.config.scrollback,
         )));
-        let home = std::env::var("HOME").map_err(|_| "HOME is required")?;
+        // "Open here": a valid TERM_CWD directory is the child shell's working
+        // directory (the desktop launcher / `mix --gui` stamps it from the
+        // invoking cwd). Absent or invalid, fall back to HOME so a bare
+        // desktop launch keeps its historical home-directory default. A
+        // non-directory TERM_CWD is ignored rather than trusted — the child
+        // must never start in a path that does not resolve.
+        let cwd = std::env::var("TERM_CWD")
+            .ok()
+            .filter(|dir| !dir.is_empty() && std::path::Path::new(dir).is_dir())
+            .or_else(|| std::env::var("HOME").ok())
+            .ok_or("HOME is required")?;
         // Explicit program + empty argv: native create_pty_with_spawn selects
         // setsid + TIOCSCTTY (Flatpak's non-controlling branch refused above).
         let pty = teletypewriter::create_pty_with_spawn(
             Some("/opt/cosmix/bin/mix"),
             vec![],
-            &Some(home),
+            &Some(cwd),
             Some(vec![("TERM".into(), settings.term.into())]),
             80,
             24,
