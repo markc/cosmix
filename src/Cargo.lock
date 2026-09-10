@@ -1327,13 +1327,15 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "cosmix-lib-bus",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -1922,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-webd"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1938,6 +1940,7 @@ dependencies = [
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-lib-daemon",
+ "cosmix-lib-files",
  "cosmix-lib-log",
  "cosmix-lib-log-props",
  "cosmix-lib-mix",

@@ -40,6 +40,7 @@ pub mod id;
 #[cfg(feature = "sqlite")]
 pub mod ingest;
 pub mod links;
+pub mod object_store;
 #[cfg(feature = "sqlite")]
 pub mod reconcile;
 pub mod schema;

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-files"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -31,6 +31,8 @@ sqlite = ["dep:rusqlite"]
 [dependencies]
 cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", default-features = false }
 blake3 = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

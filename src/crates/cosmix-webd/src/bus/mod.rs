@@ -33,6 +33,7 @@ pub mod props_publisher;
 pub mod routes;
 pub mod session_verbs;
 pub mod stats;
+mod storage;
 pub mod subscribe_granter;
 pub mod tls;
 pub mod vhost_verbs;
@@ -160,6 +161,20 @@ const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
 /// and immediately drops us therefore keeps growing the delay rather
 /// than driving a tight reconnect/log loop.
 pub async fn run(node: Arc<NodeState>) {
+    let public_roots: Vec<_> = node
+        .vhosts
+        .load()
+        .primaries
+        .iter()
+        .map(|p| p.state.www_dir.clone())
+        .collect();
+    let storage = match storage::Endpoint::load(&public_roots) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            tracing::error!(%error, "storage configuration rejected; storage verbs disabled");
+            None
+        }
+    };
     // Built ONCE so started_at is the true process start and survives the
     // reconnect loop (re-sent on every register). Version-discovery contract.
     let bi = cosmix_buildinfo::build_info!();
@@ -271,6 +286,13 @@ pub async fn run(node: Arc<NodeState>) {
             }
         };
         while let Some(cmd) = rx.recv().await {
+            if cmd.command.starts_with("webd.store.") {
+                match &storage {
+                    Some(endpoint) => endpoint.start(cmd, client_arc.clone()).await,
+                    None => storage::reply(&client_arc, &cmd, Err("storage_disabled".into())).await,
+                }
+                continue;
+            }
             let (rc, body) = if let Some(suffix) = cmd.command.strip_prefix("webd.props.") {
                 // SPEC-12 verb surface. PropsRouter::dispatch handles
                 // its own auth check + error projection — anything not

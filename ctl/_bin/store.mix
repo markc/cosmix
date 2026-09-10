@@ -1,0 +1,11 @@
+# Thin native storage client entry point; all remote data travels over ABP.
+$argv = ["cosmix-store"]
+for each $argument in args()
+  push($argv, $argument)
+end
+$result = run_argv($argv)
+print($result.stdout)
+if not $result.ok then
+  eprint($result.stderr)
+  exit(1)
+end
