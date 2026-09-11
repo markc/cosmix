@@ -873,21 +873,36 @@ async fn submit(
     // correlated checks are RPCs on the one shared connection, and an admission
     // that waits indefinitely on the broker is holding a reservation over a
     // human's prompt.
-    let still_ours = connection.client().is_connected()
-        && tokio::time::timeout(
+    // Each cause gets its OWN code. Collapsing them into one refusal told a
+    // caller nothing about what to do next: an identity loss is permanent, a
+    // moved generation means re-read it, and a continuation means wait.
+    let lost_identity = !connection.client().is_connected()
+        || !tokio::time::timeout(
             RECHECK,
             crate::session_status::admitted(connection, hello, actor, bound, Capability::Execute),
         )
         .await
-        .unwrap_or(false)
-        && session_state::view().is_some_and(|now| {
-            now.snapshot.source.as_ref() == Some(&request.target)
-                && now.snapshot.prompt_generation == request.prompt_generation
-                && !now.snapshot.continuation
-        });
-    if !still_ours {
+        .unwrap_or(false);
+    let recheck = if lost_identity {
+        Some("REFUSED")
+    } else {
+        match session_state::view() {
+            None => Some("REFUSED"),
+            Some(now) if now.snapshot.source.as_ref() != Some(&request.target) => {
+                Some("STALE_GENERATION")
+            }
+            // The commonest cause is a human who used the prompt while the
+            // reservation stood, which is exactly a stale generation.
+            Some(now) if now.snapshot.prompt_generation != request.prompt_generation => {
+                Some("STALE_GENERATION")
+            }
+            Some(now) if now.snapshot.continuation => Some("BUSY"),
+            Some(_) => None,
+        }
+    };
+    if let Some(code) = recheck {
         release(&control, editor).await;
-        return refusal("REFUSED");
+        return refusal(code);
     }
 
     // Step 5: mint the command identity and record the acceptance BEFORE the

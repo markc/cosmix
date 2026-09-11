@@ -1935,8 +1935,12 @@ fn stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact() {
             .await
             .expect("the submission must answer")
             .unwrap();
+        // STALE_GENERATION, pinned exactly. The human's line consumed the
+        // prompt the submission named, so "the generation you asked for is
+        // gone" is both true and actionable — re-read it and submit again.
+        // A generic refusal would have told the caller nothing.
         let error = outcome.expect_err("a human line must refuse the admission");
-        assert!(error.contains("BUSY"), "{error}");
+        assert_eq!(error, r#"{"error_code":"STALE_GENERATION"}"#, "{error}");
 
         // The human's line ran, and the agent's did not.
         let pane = f.child.until("HUMAN_WINS\r\n");
