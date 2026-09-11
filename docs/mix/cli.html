@@ -951,8 +951,10 @@ taken once, not per check. Every session RPC serialises on that one connection,
 so a renewal that loses its deadline to admission load is retried once with a
 fresh deadline before the attachment is given up. Stale targets return
 <code>STALE_GENERATION</code>. Recovery uses S3; it never resets shell sequence or prompt
-generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
+generation. Jobs, signals, foreground/resume,
 isolated tasks, input and event publication report <code>UNSUPPORTED</code>, never <code>BUSY</code>.
+Evaluation submit and inspect report what this build can actually do — see
+stage D below — and report <code>UNSUPPORTED</code> wherever it cannot.
 The resident runs at most four admission tasks alongside its receive/renew/restart
 loop, one of which is reserved for the pane's own Term: other same-UID callers
 share three, so a flood by them cannot starve the owner into uniform refusals.
@@ -967,6 +969,92 @@ receive owner, which writes that connection's <code>REFUSED</code>, and a droppe
 lifecycle notice raises a delivery gap the resident treats exactly as it treats
 the broker's own lifecycle gap. Other clients retain their existing receive
 configuration.</p>
+<h3 id="native-pane-shell-execution-stage-d">Native pane-shell execution (stage D)</h3>
+<p>The same enrolled attachment answers <code>shell.execute</code>, <code>shell.execute.result</code>
+and <code>shell.execute.cancel</code>. These are BROKER-023 <code>execute</code>, not <code>read_state</code>:
+holding the capability that answers questions about the shell does not reach
+them, and a caller without <code>execute</code> is refused before learning that the family
+exists.</p>
+<p><strong>Admission is empty-primary-prompt only.</strong> A submission is admitted when the
+shell is at <code>prompt-ready</code>, not a continuation, with an empty draft, no history
+search, no paste in progress and no partially-decoded key — and when the
+<code>prompt_generation</code> it names is the one actually at the prompt. Anything else
+is refused, and the refusal discards nothing: a half-typed line is still there,
+character for character, and finishing it runs the human's line.</p>
+<table><thead><tr><th>Situation</th><th>Answer</th></tr></thead><tbody>
+<tr><td>Empty primary prompt, generation matches</td><td>admitted</td></tr>
+<tr><td>Half-typed draft, history search, paste in progress</td><td><code>BUSY</code></td></tr>
+<tr><td>Continuation prompt</td><td><code>BUSY</code></td></tr>
+<tr><td>Evaluating, foreground child, starting, exiting</td><td><code>BUSY</code></td></tr>
+<tr><td>Custom <code>prompt()</code> still rendering</td><td><code>BUSY</code></td></tr>
+<tr><td>Wrong prompt generation, or a target that is not this shell</td><td><code>STALE_GENERATION</code></td></tr>
+<tr><td>No owned editor (the rustyline path)</td><td><code>UNSUPPORTED</code></td></tr>
+<tr><td>Retention table full</td><td><code>RESOURCE_LIMIT</code></td></tr>
+<tr><td>Same request id, different body</td><td><code>CONFLICT</code></td></tr>
+<tr><td>Unauthorised, or the attachment lost mid-admission</td><td><code>REFUSED</code></td></tr>
+</tbody></table>
+<p>Nothing queues behind a busy shell. There is no state in which a submission is
+accepted now and executed at some later prompt, because a caller cannot know
+what the shell will be doing then — and a snapshot is information, never an
+execution permit.</p>
+<p>The admitted line is <strong>visibly echoed before it runs</strong>, through the editor's own
+terminal, naming the principal and the command id:</p>
+<pre><code>mix: execute #7 admitted for Term ff86c6c7: print("hello")
+</code></pre>
+<p>The source in that line is escaped: control characters, escape sequences and
+newlines are rendered, never emitted. A submission is attacker-chosen bytes
+being drawn into a terminal a human is reading, and a raw echo would let it
+paint anything it liked, including a convincing forgery of a different
+announcement.</p>
+<p>Execution then follows the same path a typed line takes — the same classifier,
+aliases, job integration and history policy — adopting the command id that was
+minted, echoed and recorded before it started. Admission never opens a
+continuation: a submission that turns out to be an incomplete line is refused
+and the prompt is returned, because a remote execution may not leave a human
+holding half of someone else's line.</p>
+<p><code>shell.execute</code> answers immediately with <code>{"state":"running","operation_id":…}</code>;
+<code>shell.execute.result</code> returns that operation's state and, once it has one, its
+result. Retries are BROKER-018 idempotent for 15 minutes: an identical
+submission under the same request id replays the recorded answer rather than
+executing a second time.</p>
+<p>The result is serialised on the evaluator owner, so no interpreter value ever
+crosses to the Bus thread:</p>
+<pre><code class="language-json">{"state":"finished","result":{
+  "outcome":"completed",  "status":0,
+  "value":{"type":"string","version":1,"bytes":"11","truncated":false,"text":"hello world"},
+  "duration_ms":"3",
+  "cancellation":{"requested":false,"delivered":"none"}}}
+</code></pre>
+<p><code>outcome</code> is the execution's verdict and <code>value.truncated</code> is a property of how
+much of the answer fitted. They are independent: a command that succeeded and
+returned more than 16 KiB still succeeded.</p>
+<h4 id="cancellation-and-what-it-is-actually-worth">Cancellation, and what it is actually worth</h4>
+<p><code>shell.execute.cancel</code> resolves one immutable evaluation identity. A request for
+an evaluation that has already finished says so and signals nothing, so a
+cancellation can never reach a successor evaluation — the failure mode the
+single process-wide interrupt flag made inevitable. <code>SIGINT</code> is mapped the same
+way: the signal records which evaluation was running when it arrived, so a
+Ctrl-C at an idle prompt cannot trip the next line. A cancelled evaluation's
+intent is sticky, so a Mix <code>try</code>/<code>catch</code> around cancelled work cannot swallow it
+and run on.</p>
+<p>Delivery is cooperative, and the table says only what is true:</p>
+<table><thead><tr><th>Path</th><th>Guarantee</th></tr></thead><tbody>
+<tr><td>Ordinary statements</td><td>cooperative, at the evaluator's existing checkpoints</td></tr>
+<tr><td>Optimised native loops</td><td>cooperative, at the existing periodic check</td></tr>
+<tr><td>Captured runners (<code>run_argv</code>, <code>run_pipeline</code>)</td><td>existing polling and group escalation</td></tr>
+<tr><td>Managed interactive children</td><td>group signal via the job controller</td></tr>
+<tr><td><code>run_stream</code></td><td>not interruptible while blocked in the child wait</td></tr>
+<tr><td>Blocking HTTP, filesystem and device calls; uncooperative extensions</td><td><strong>no pre-emption</strong></td></tr>
+</tbody></table>
+<p>What cannot be promised is not promised: arbitrary builtin pre-emption,
+rolling back side effects, killing threads, or terminating descendants after
+they detach. Bounded termination of uncooperative work needs a separately
+supervised process, which by construction cannot inherit or mutate this shell's
+scope. <code>cancel</code> reports <code>requested</code>, <code>already_finished</code> or <code>unknown</code>, and a
+finished evaluation's report distinguishes <code>cancelled</code> from <code>completed_anyway</code>.</p>
+<p>Noninteractive shells, <code>--serve</code>, <code>mix -c</code> and any shell without an attachment
+are byte-identical and carry none of this: no surface is registered, no state is
+allocated, and <code>serve</code>'s process-wide shutdown semantics are untouched.</p>
 <ul>
 <li><code>mix</code> is intercepted by the shell, so it never sees <code>$</code>-sigil arguments — write <code>mix what round</code>, not <code>mix what $name</code>.</li>
 <li>The introspection family (<code>vars</code>/<code>aliases</code>/<code>functions</code>/<code>all</code>/<code>context</code>) is most useful <strong>inside a REPL</strong>, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.</li>

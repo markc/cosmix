@@ -139,7 +139,7 @@ pub(crate) struct Completion {
 }
 
 /// The honest cancellation story for one evaluation. `delivered` never claims
-/// more than the guarantee table in `docs/mix/shell-execute.md` allows.
+/// more than the guarantee table in `docs/mix/cli.md` allows.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CancellationReport {
     pub requested: bool,

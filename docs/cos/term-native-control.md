@@ -58,7 +58,9 @@ fallback for mutations.
 | `term.pane.split` | `manage_layout` | `dir`: `h`, `horizontal`, `v` or `vertical`; requires owner/owning Term authority |
 | `term.tab.select`, `term.pane.select` | `manage_layout` | Select the explicitly targeted pane and its tab |
 | `term.tab.close`, `term.pane.close` | `terminate`, plus affected layout authority | Close the explicit target |
-| `term.execute` | `execute` | Always `UNSUPPORTED`; no Stage-D execution API is enabled |
+| `term.execute` | `execute` | `source`, `prompt_generation`, mutation ID/epoch; forwarded to the pane shell's own admission surface |
+| `term.exec.result` | `execute` | `operation_id`: the forwarded execution's state and, once it has one, its result |
+| `term.exec.cancel` | `execute` | `operation_id`: cancel that execution; cooperative, and the reply says what actually happened |
 | `term.operation` | `read_state` | `operation_id`: retrieve the caller's retained operation outcome |
 
 Layout requests supply `affected`, an array of additional explicit targets,
@@ -67,6 +69,32 @@ than the primary target. The gate computes the affected set under the model
 lock and checks every member. Bound children cannot create panes outside their
 grant. Close requires termination authority for the panes being removed; layout
 authority does not substitute for termination authority.
+
+## Execution
+
+`term.execute` does not decide whether an execution may happen. The pane shell
+does, against its own prompt, its own editor state and its own prompt
+generation — none of which Term can observe. Term owns the same three things it
+owns for `term.type`: the actor and target rules, the BROKER-022 retry rules,
+and the guarantee that the request reaches the child this pane is bound to at
+exactly this generation. A pane whose child has not enrolled, has been replaced,
+or is at a different generation is refused before anything is forwarded.
+
+The shell's refusals are relayed rather than replaced, because `BUSY` and
+`STALE_GENERATION` tell a caller two different things to do next. `BUSY` means
+the human is using the prompt and nothing was discarded; `STALE_GENERATION`
+means the generation moved and the caller should re-read it. The full admission
+rules, the visible echo, the result shape and the honest cancellation guarantee
+table are in the Mix manual under "Native pane-shell execution (stage D)"
+(`mix man cli`).
+
+`term.execute` is a mutation: it spends a request ID and carries a request
+epoch, and its ID is retired before the submission is forwarded, so a lost reply
+can never become a second execution. `term.exec.result` and `term.exec.cancel`
+are not: both address one immutable evaluation identity and are idempotent by
+construction. A forwarded submission whose answer never arrives is reported as
+`UNKNOWN_OUTCOME`; `term.exec.result` on the operation, or a byte-identical
+retry, is how a caller finds out what happened.
 
 ## Live properties
 
