@@ -139,6 +139,8 @@ pub struct View {
     pub decoder_pending: bool,
     pub paste: bool,
     pub search: Option<String>,
+    /// Process-local count of incomplete bounded output cleanup attempts.
+    pub output_tears: usize,
 }
 
 enum Request {
@@ -324,18 +326,22 @@ pub struct OwnedEditor {
 }
 impl OwnedEditor {
     pub fn start(input: File, output: File) -> io::Result<Self> {
+        // Fail before installing signal hooks when an independent tty writer
+        // cannot be opened (the REPL can then safely fall back to rustyline).
+        let terminal = Terminal::new(input, output)?;
         let (wake_read, wake_write) = UnixStream::pair()?;
         wake_read.set_nonblocking(true)?;
         wake_write.set_nonblocking(true)?;
         let (signal_read, signal_write) = UnixStream::pair()?;
         signal_read.set_nonblocking(true)?;
+        // Presence covers the entire editor thread, including cooked phases;
+        // it is independent of the reducer's State::Editing.
         let registration = super::signals::Registration::new(signal_write.try_clone()?)?;
         let continued = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cont_flag = signal_hook::flag::register(libc::SIGCONT, continued.clone())?;
         let cont_wake =
             signal_hook::low_level::pipe::register(libc::SIGCONT, signal_write.try_clone()?)?;
         let resize = signal_hook::low_level::pipe::register(libc::SIGWINCH, signal_write)?;
-        let terminal = Terminal::new(input, output)?;
         let (sender, receiver) = mpsc::sync_channel(QUEUE);
         let control = Control {
             sender,
@@ -382,11 +388,11 @@ impl OwnedEditor {
                 }))
                 .unwrap_or_else(|_| Err(io::Error::other("editor worker panicked")));
                 let restored = owner.terminal.restore();
+                drop(registration);
                 owner.control.cleanup.finish(restored);
                 if let Err(error) = result {
                     let _ = line_tx.try_send(Err(error));
                 }
-                drop(registration);
                 signal_hook::low_level::unregister(resize);
                 signal_hook::low_level::unregister(cont_flag);
                 signal_hook::low_level::unregister(cont_wake);
@@ -475,6 +481,12 @@ struct Owner {
 fn protocol(error: super::ProtocolError) -> io::Error {
     io::Error::other(format!("editor protocol: {error:?}"))
 }
+struct CompletionRunning(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for CompletionRunning {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 impl Owner {
     fn effect(&mut self, effect: Effect) -> io::Result<Reply> {
         match effect {
@@ -484,6 +496,14 @@ impl Owner {
                     ModeAction::EnterEditing => self.terminal.enter(),
                     ModeAction::Restore => self.terminal.restore(),
                 };
+                if action == ModeAction::EnterEditing
+                    && result
+                        .as_ref()
+                        .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                {
+                    self.stopped = true;
+                    return self.editor.modes_waiting(token).map_err(protocol);
+                }
                 let reply = self
                     .editor
                     .modes_completed(token, result.is_ok())
@@ -491,6 +511,7 @@ impl Owner {
                 result?;
                 let mut reply = reply?;
                 if action == ModeAction::EnterEditing {
+                    self.stopped = false;
                     self.decoder.resume();
                     if let Some(result) = self.deferred.take() {
                         self.request(result)?;
@@ -645,6 +666,8 @@ impl Owner {
                 self.draft.clear();
                 self.cycle = None;
                 self.completing = false;
+                // A previous generation's worker must not clear this flag.
+                self.completion_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 self.deferred = None;
                 self.search_draft = None;
                 self.search_index = None;
@@ -688,6 +711,8 @@ impl Owner {
                     decoder_pending: self.decoder.pending(),
                     paste: self.decoder.pasting(),
                     search: self.editor.interaction().search.clone(),
+                    output_tears: super::terminal::OUTPUT_TEARS
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 }));
             }
             Request::HistoryRead => {
@@ -763,11 +788,11 @@ impl Owner {
         }
         // Only bypass the cooperative handler while cooked. The controller
         // still owns default-stop disposition and process-group behaviour.
-        super::signals::editing(false);
+        super::signals::cooperative(false);
         unsafe {
             libc::raise(libc::SIGTSTP);
         }
-        super::signals::editing(true);
+        super::signals::cooperative(true);
         self.resume_foreground()
     }
     fn resume_foreground(&mut self) -> io::Result<()> {
@@ -782,7 +807,7 @@ impl Owner {
                 })
                 .map_err(protocol)?;
             self.effect(effect)?;
-            self.stopped = false;
+            self.stopped = self.editor.state() != State::Editing;
         }
         Ok(())
     }
@@ -904,8 +929,12 @@ impl Owner {
                     let spawned = std::thread::Builder::new()
                         .name("mix-completion".into())
                         .spawn(move || {
-                            let (start, candidates) = snapshot.complete(&text, cursor);
-                            running.store(false, std::sync::atomic::Ordering::SeqCst);
+                            let _running = CompletionRunning(running);
+                            // Still deliver a result on panic so the owner's
+                            // completion interaction/Busy state also clears.
+                            let (start, candidates) =
+                                std::panic::catch_unwind(|| snapshot.complete(&text, cursor))
+                                    .unwrap_or_else(|_| (cursor, Vec::new()));
                             control.completed(Request::Completed {
                                 generation,
                                 revision,
@@ -1071,6 +1100,19 @@ fn restricted_command(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_running_clears_during_unwind() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_flag = flag.clone();
+        assert!(
+            std::panic::catch_unwind(move || {
+                let _running = super::CompletionRunning(worker_flag);
+                panic!("completion failure");
+            })
+            .is_err()
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
     #[test]
     fn completion_filters_before_applying_result_cap() {
         let mut commands: Vec<_> = (0..5000).map(|i| format!("aaa{i}")).collect();

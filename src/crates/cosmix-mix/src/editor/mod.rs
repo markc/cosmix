@@ -336,6 +336,23 @@ impl Editor {
             }
         }
     }
+    /// Foreground ownership was lost before raw entry. No modes changed and no
+    /// admission reservation is granted; a later foreground wake may Resume.
+    pub fn modes_waiting(&mut self, token: ModeToken) -> Result<Reply, ProtocolError> {
+        if self.pending != Some(token) {
+            return Err(ProtocolError::StaleModeCompletion);
+        }
+        if self.state != State::Activating {
+            return Err(ProtocolError::InvalidState);
+        }
+        self.pending = None;
+        self.reserved = false;
+        self.state = State::Suspended;
+        Ok(Reply::Suspended {
+            generation: token.generation,
+            edit_revision: self.revision,
+        })
+    }
     /// Called ONLY after the terminal owner has completed the named operation.
     /// Failure is fail-closed; shutdown can retry restoration afterwards.
     pub fn modes_completed(
@@ -436,6 +453,38 @@ mod tests {
         assert_eq!(e.state(), State::Activating);
         e.modes_completed(t, true).unwrap();
         e
+    }
+    #[test]
+    fn foreground_loss_during_activation_preserves_draft_and_can_resume() {
+        let mut e = editing(PromptProfile::Primary("test> ".into()));
+        e.edit(|b| b.insert("draft")).unwrap();
+        let revision = e.edit_revision();
+        let t = token(e.pause(G, revision).unwrap());
+        e.modes_completed(t, true).unwrap();
+        let t = token(
+            e.command(Command::Resume {
+                generation: G,
+                edit_revision: revision,
+            })
+            .unwrap(),
+        );
+        assert!(matches!(
+            e.modes_waiting(t).unwrap(),
+            Reply::Suspended { .. }
+        ));
+        assert_eq!(e.buffer().text(), "draft");
+        assert_eq!(e.edit_revision(), revision);
+        assert!(e.consume_reservation(G, revision).is_err());
+        let t = token(
+            e.command(Command::Resume {
+                generation: G,
+                edit_revision: revision,
+            })
+            .unwrap(),
+        );
+        e.modes_completed(t, true).unwrap();
+        assert_eq!(e.state(), State::Editing);
+        assert_eq!(e.buffer().text(), "draft");
     }
     fn suspend(e: &mut Editor) -> Effect {
         e.command(Command::SuspendRequested {

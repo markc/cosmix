@@ -48,6 +48,11 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     if !matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
         return;
     }
+    let _stop_handler = (signal == libc::SIGTSTP)
+        .then(crate::editor::signals::StopHandler::enter);
+    // One decision: a managed-job transition must not skip routing and then
+    // take the default branch on a second, different observation.
+    let managed = MANAGED_FOREGROUND.load(Ordering::Acquire);
     // SIGTTIN enters with SIG_DFL already installed. SIGTSTP retains its
     // handler while routing cooperatively, and installs SIG_DFL only for the
     // actual cooked-mode stop. Always reinstall the known action on return;
@@ -56,13 +61,13 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     // Every operation here is async-signal-safe; no locks or allocation.
     unsafe {
         if signal == libc::SIGTSTP
-            && !MANAGED_FOREGROUND.load(Ordering::Acquire)
+            && !managed
             && crate::editor::signals::request_stop()
         {
             libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
             return;
         }
-        if signal == libc::SIGTTIN || !MANAGED_FOREGROUND.load(Ordering::Acquire) {
+        if signal == libc::SIGTTIN || !managed {
             if signal == libc::SIGTSTP {
                 libc::signal(signal, libc::SIG_DFL);
             }
