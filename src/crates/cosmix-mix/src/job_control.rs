@@ -354,9 +354,12 @@ impl Controller {
         // Dropping Child does not reap; from here only the monitor waits.
         let members = children
             .into_iter()
-            .map(|c| Member {
-                pid: c.id() as i32,
-                state: MemberState::Running,
+            .map(|c| {
+                cosmix_mix::builtins::register_managed_pid(c.id() as i32);
+                Member {
+                    pid: c.id() as i32,
+                    state: MemberState::Running,
+                }
             })
             .collect();
         s.jobs.insert(
@@ -648,6 +651,7 @@ fn reap(shared: &Shared) {
                         continue;
                     }
                     member.state = MemberState::Lost;
+                    cosmix_mix::builtins::unregister_managed_pid(member.pid);
                     break;
                 }
                 member.state = if libc::WIFEXITED(status) {
@@ -660,6 +664,7 @@ fn reap(shared: &Shared) {
                     MemberState::Running
                 };
                 if member.state.terminal() {
+                    cosmix_mix::builtins::unregister_managed_pid(member.pid);
                     break;
                 }
             }

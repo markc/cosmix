@@ -490,7 +490,11 @@ remain registered for eventual reaping; an uninterruptible child cannot
 hold the prompt indefinitely.</p>
 <p>The process monitor is the sole consumer of registered child statuses,
 including stopped/continued states. SIGCHLD wakes it independently of REPL
-input or evaluator progress. It never waits for arbitrary child PIDs.</p></div></div>
+input or evaluator progress. It never waits for arbitrary child PIDs.
+<code>process_alive(pid)</code> requires a positive whole-number PID. It may reap an
+exited unmanaged child (including a legacy <code>spawn</code> child), but only probes
+controller-owned job PIDs with signal 0. A managed zombie can briefly report
+alive until the controller reaps it; the builtin never steals its status.</p></div></div>
     </div>
 
 </main>
