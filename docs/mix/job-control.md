@@ -25,9 +25,10 @@ live jobs and allows 500 ms for exit/reaping. Survivors are reported; there
 is no forced-kill escalation or guarantee about deliberately detached
 descendants. Foreground terminal modes are restored even if a child exits
 leaving raw mode enabled. Stopped jobs retain their own modes for `fg`.
-Normal exits retain cooked-mode changes (ICANON and ISIG still enabled), so
+Fresh jobs that exit normally retain cooked-mode changes (ICANON and ISIG still enabled), so
 commands such as `stty tostop` remain effective. Stops, signal exits and raw
-mode leakage restore the saved shell baseline. Mix cannot infer whether an
+mode leakage restore the saved shell baseline. A resumed stopped job also
+restores that baseline when it completes. Mix cannot infer whether an
 arbitrary cooked-mode change was deliberate; this is the explicit policy.
 
 The launch barrier runs in a private Mix trampoline **after** its first exec.

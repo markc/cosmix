@@ -466,6 +466,12 @@ impl Controller {
             if let Some(j) = s.jobs.get(&id) {
                 unsafe {
                     libc::kill(-j.pgid, libc::SIGKILL);
+                    // A released target may have moved itself out of the
+                    // original group before a later stage fails. Retain direct
+                    // child ownership and reap those members as well.
+                    for member in j.members.iter().filter(|m| !m.state.terminal()) {
+                        libc::kill(member.pid, libc::SIGKILL);
+                    }
                 }
             }
         }
@@ -584,13 +590,17 @@ fn close_jobs(shared: &Shared) {
             return;
         }
         if Instant::now() >= end {
-            for j in s.jobs.values().filter(|j| j.state() != JobState::Done) {
-                eprintln!(
-                    "mix: job {} (pgid {}) survived HUP/CONT grace",
-                    j.id, j.pgid
-                );
+            let survivors: Vec<_> = s
+                .jobs
+                .values()
+                .filter(|j| j.state() != JobState::Done)
+                .map(|j| (j.id, j.pgid))
+                .collect();
+            drop(s);
+            for (id, pgid) in survivors {
+                eprintln!("mix: job {} (pgid {}) survived HUP/CONT grace", id, pgid);
             }
-            s.closed = true;
+            shared.state.lock().unwrap().closed = true;
             shared.changed.notify_all();
             return;
         }
@@ -658,16 +668,8 @@ impl Stage {
             inherited: (gate_read, error_write),
         })
     }
-    pub fn spawn(&mut self, pgid: i32) -> io::Result<Child> {
-        let child = self.command.spawn()?;
-        let pid = child.id() as i32;
-        let group = if pgid == 0 { pid } else { pgid };
-        if unsafe { libc::setpgid(pid, group) } < 0 && unsafe { libc::getpgid(pid) } != group {
-            // Caller must still own/reap this child; group assignment in the
-            // trampoline pre_exec succeeded, so this is an invariant failure.
-            eprintln!("mix: child {pid} changed group during launch");
-        }
-        Ok(child)
+    pub fn spawn(&mut self) -> io::Result<Child> {
+        self.command.spawn()
     }
     pub fn release(mut self) -> io::Result<()> {
         drop(self.inherited);

@@ -1801,7 +1801,8 @@ fn execute_managed(
                 stage.command.stdout(Stdio::piped());
             }
             apply_output_redirects(&mut stage.command, &seg.redirects)?;
-            let mut child = stage.spawn(pgid)?;
+            let mut child = stage.spawn()?;
+            let pid = child.id() as i32;
             if pgid == 0 {
                 pgid = child.id() as i32;
             }
@@ -1810,6 +1811,13 @@ fn execute_managed(
             }
             children.push(child);
             stages.push(stage);
+            // Record ownership before checking the parent's half of setpgid:
+            // any failure below must flow through registered-child cleanup.
+            // EACCES is expected after the trampoline exec if its child-side
+            // assignment already established the correct group.
+            if unsafe { libc::setpgid(pid, pgid) } < 0 && unsafe { libc::getpgid(pid) } != pgid {
+                return Err(io::Error::other("child changed group during gated launch"));
+            }
         }
         Ok(())
     })();
