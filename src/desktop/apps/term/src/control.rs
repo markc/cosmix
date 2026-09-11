@@ -53,6 +53,13 @@ struct Request {
     property: Option<String>,
     #[serde(default)]
     value: Option<Value>,
+    /// Execute family. `source` is the line to run; `prompt_generation` is the
+    /// generation the caller believes is at the child's prompt, which is what
+    /// turns a stale snapshot into a refusal instead of an execution.
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    prompt_generation: Option<DecimalU64>,
 }
 
 #[derive(Clone)]
@@ -465,7 +472,9 @@ impl Control {
                 Capability::ManageLayout
             }
             "term.tab.close" | "term.pane.close" => Capability::Terminate,
-            "term.execute" => Capability::Execute,
+            // One capability for the whole execute family. Asking what an
+            // execution did is asking about an execution.
+            "term.execute" | "term.exec.result" | "term.exec.cancel" => Capability::Execute,
             _ => return Reply::error("UNSUPPORTED"),
         };
         if (request.request_id.is_some() || request.operation_id.is_some())
@@ -485,14 +494,6 @@ impl Control {
                 .is_some_and(|s| s.role == Role::PaneShell)
         {
             return Reply::error("FORBIDDEN");
-        }
-        // Deliberately after the capability decision, not before it: a caller
-        // without execute authority learns FORBIDDEN like any other refusal and
-        // is told nothing about what the verb would have done. Only a caller
-        // who would have been allowed sees that the verb is unimplemented,
-        // which is the documented stage-D state rather than a leak.
-        if capability == Capability::Execute {
-            return Reply::error("UNSUPPORTED");
         }
         // The recipient's own deadline comes from its renew cadence, never
         // from a check made here: `lease.check` answers only for a record this
@@ -602,6 +603,18 @@ impl Control {
                 }
             }
         }
+        // The execute family answers from the CHILD, over a round trip Term
+        // must not hold the terminal or tab lock across. It is handled here,
+        // after every identity, capability and lease check and before any of
+        // those locks are taken.
+        if matches!(
+            verb,
+            "term.execute" | "term.exec.result" | "term.exec.cancel"
+        ) {
+            return self
+                .forward_execute(connection, actor, verb, &request, &identity, digest)
+                .await;
+        }
         let target = request.target.clone();
         let live = native.pane_guard(target.pane_id.0, target.pane_generation.0);
         let permit = Arc::new(Permit {
@@ -681,62 +694,15 @@ impl Control {
                 Some(_) => {}
             }
         }
-        let mut state = self.state.lock().unwrap();
         if mutation {
             let Some(sequence) = request.request_id.map(|id| id.0).filter(|id| *id > 0) else {
                 return Reply::error("INVALID_ARGUMENT");
             };
-            for history in state.history.values_mut() {
-                while history
-                    .entries
-                    .front()
-                    .is_some_and(|e| e.at.elapsed() >= RETENTION)
-                {
-                    history.entries.pop_front();
-                }
+            if let Err(reply) = self.reserve_request_id(&identity, sequence, digest) {
+                return reply;
             }
-            let total = state
-                .history
-                .values()
-                .map(|h| h.entries.len())
-                .sum::<usize>();
-            // A key keeps its high-water mark even after every entry expires,
-            // so a late retry answers UNKNOWN_OUTCOME instead of re-executing;
-            // ageing alone therefore never drops one. The cap still has to
-            // evict rather than refuse. An ambient key names one connection and
-            // a connection id never returns, so a full table is overwhelmingly
-            // keys that can never be addressed again — refusing at the cap
-            // would brick every mutation on the instance permanently, which is
-            // strictly worse than losing the coldest actor's dedupe. Keys with
-            // no live entry go first, since losing one costs only a high-water
-            // mark; then the coldest overall. BROKER-023 allows earlier
-            // eviction at the instance cap, and TOTAL still bounds memory.
-            if !state.history.contains_key(&identity) && state.history.len() >= ACTORS {
-                let victim = state
-                    .history
-                    .iter()
-                    .min_by_key(|(_, history)| (!history.entries.is_empty(), history.last))
-                    .map(|(key, _)| key.clone());
-                if let Some(key) = victim {
-                    state.history.remove(&key);
-                }
-            }
-            let history = state.history.entry(identity.clone()).or_default();
-            if let Some(entry) = history.entries.iter().find(|e| e.sequence == sequence) {
-                return if entry.digest == digest {
-                    entry.reply.clone()
-                } else {
-                    Reply::refuse("CONFLICT", Some(mismatch()))
-                };
-            }
-            if sequence <= history.high_water {
-                return Reply::refuse("UNKNOWN_OUTCOME", Some(retired(history.high_water)));
-            }
-            if total >= TOTAL {
-                return Reply::error("RESOURCE_LIMIT");
-            }
-            history.high_water = sequence;
         }
+        let mut state = self.state.lock().unwrap();
         if !permit.valid() {
             return Reply::error("FORBIDDEN");
         }
@@ -861,6 +827,225 @@ impl Control {
         reply
     }
 
+    /// BROKER-022's commit-before-execute step, and the only copy of it. The
+    /// id is retired BEFORE the verb runs so a mutation whose result was lost
+    /// can never re-execute; `Err` carries the answer the caller gets instead.
+    fn reserve_request_id(
+        &self,
+        identity: &str,
+        sequence: u64,
+        digest: [u8; 32],
+    ) -> Result<(), Reply> {
+        let mut state = self.state.lock().unwrap();
+        for history in state.history.values_mut() {
+            while history
+                .entries
+                .front()
+                .is_some_and(|e| e.at.elapsed() >= RETENTION)
+            {
+                history.entries.pop_front();
+            }
+        }
+        let total = state
+            .history
+            .values()
+            .map(|h| h.entries.len())
+            .sum::<usize>();
+        // A key keeps its high-water mark even after every entry expires,
+        // so a late retry answers UNKNOWN_OUTCOME instead of re-executing;
+        // ageing alone therefore never drops one. The cap still has to
+        // evict rather than refuse. An ambient key names one connection and
+        // a connection id never returns, so a full table is overwhelmingly
+        // keys that can never be addressed again — refusing at the cap
+        // would brick every mutation on the instance permanently, which is
+        // strictly worse than losing the coldest actor's dedupe. Keys with
+        // no live entry go first, since losing one costs only a high-water
+        // mark; then the coldest overall. BROKER-023 allows earlier
+        // eviction at the instance cap, and TOTAL still bounds memory.
+        if !state.history.contains_key(identity) && state.history.len() >= ACTORS {
+            let victim = state
+                .history
+                .iter()
+                .min_by_key(|(_, history)| (!history.entries.is_empty(), history.last))
+                .map(|(key, _)| key.clone());
+            if let Some(key) = victim {
+                state.history.remove(&key);
+            }
+        }
+        let history = state.history.entry(identity.to_owned()).or_default();
+        if let Some(entry) = history.entries.iter().find(|e| e.sequence == sequence) {
+            return Err(if entry.digest == digest {
+                entry.reply.clone()
+            } else {
+                Reply::refuse("CONFLICT", Some(mismatch()))
+            });
+        }
+        if sequence <= history.high_water {
+            return Err(Reply::refuse("UNKNOWN_OUTCOME", Some(retired(history.high_water))));
+        }
+        if total >= TOTAL {
+            return Err(Reply::error("RESOURCE_LIMIT"));
+        }
+        history.high_water = sequence;
+        Ok(())
+    }
+
+    /// Retain a completed mutation's outcome so a retry replays it.
+    fn record_outcome(
+        &self,
+        identity: &str,
+        target: &Target,
+        sequence: u64,
+        digest: [u8; 32],
+        reply: &Reply,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let Some(history) = state.history.get_mut(identity) else {
+            return;
+        };
+        history.last = Instant::now();
+        history.entries.push_back(Entry {
+            target: target.clone(),
+            outcome: None,
+            sequence,
+            digest,
+            at: Instant::now(),
+            reply: reply.clone(),
+        });
+        if history.entries.len() > PER_ACTOR {
+            history.entries.pop_front();
+        }
+    }
+
+    /// BROKER-023 `execute`, forwarded to the pane shell's own surface.
+    ///
+    /// Term does not decide whether an execution may happen — the child does,
+    /// against ITS prompt, ITS editor state and ITS generation, none of which
+    /// Term can observe. What Term owns is the same thing it owns for
+    /// `term.type`: the actor/target/retry rules, and the guarantee that the
+    /// request reaches the child this pane is actually bound to at exactly this
+    /// generation. It holds no terminal or tab lock across the forward, because
+    /// the child's answer may take a full admission round trip.
+    async fn forward_execute(
+        &self,
+        connection: &VerifiedConnection,
+        actor: &BrokerPrincipal,
+        verb: &str,
+        request: &Request,
+        identity: &str,
+        digest: [u8; 32],
+    ) -> Reply {
+        let Some(child) = self.native.child_binding(
+            request.target.pane_id.0,
+            request.target.pane_generation.0,
+        ) else {
+            return Reply::error("FORBIDDEN");
+        };
+        // The child's own Source, not this pane's Target. They name the same
+        // pane through different identities, and the child will refuse anything
+        // that is not exactly its own.
+        let child_target = json!({
+            "broker_epoch": child.broker_epoch,
+            "record": child.reference(),
+            "instance_id": child.instance_id,
+            "pane_id": child.pane_id,
+            "pane_generation": child.pane_generation,
+        });
+        let (shell_verb, body, sequence) = match verb {
+            "term.execute" => {
+                let (Some(source), Some(generation)) =
+                    (request.source.as_deref(), request.prompt_generation)
+                else {
+                    return Reply::error("INVALID_ARGUMENT");
+                };
+                let Some(sequence) = request.request_id.map(|id| id.0).filter(|id| *id > 0) else {
+                    return Reply::error("INVALID_ARGUMENT");
+                };
+                // A submission is a mutation: it must carry the connection that
+                // is making it, so a reconnected caller cannot inherit an
+                // in-flight id.
+                match request.request_epoch {
+                    None => return Reply::error("INVALID_ARGUMENT"),
+                    Some(epoch) if epoch != actor.connection_id => {
+                        return Reply::error("UNKNOWN_OUTCOME");
+                    }
+                    Some(_) => {}
+                }
+                if let Err(reply) = self.reserve_request_id(identity, sequence, digest) {
+                    return reply;
+                }
+                (
+                    "shell.execute",
+                    json!({
+                        "version": 1,
+                        "target": child_target,
+                        "request_id": DecimalU64(sequence),
+                        "prompt_generation": generation,
+                        "source": source,
+                    }),
+                    Some(sequence),
+                )
+            }
+            // Reading a result and cancelling are idempotent against one
+            // immutable evaluation identity, so neither spends a request id.
+            _ => {
+                let Some(operation) = request.operation_id else {
+                    return Reply::error("INVALID_ARGUMENT");
+                };
+                let shell_verb = if verb == "term.exec.cancel" {
+                    "shell.execute.cancel"
+                } else {
+                    "shell.execute.result"
+                };
+                (
+                    shell_verb,
+                    json!({
+                        "version": 1,
+                        "target": child_target,
+                        "operation_id": operation,
+                    }),
+                    None,
+                )
+            }
+        };
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            connection.client().call(&child.name, shell_verb, body),
+        )
+        .await;
+        let mut reply = match answer {
+            Ok(Ok(value)) => {
+                let mut value = value;
+                value["target"] = json!(request.target);
+                if let Some(sequence) = sequence {
+                    value["operation_id_request"] = json!(DecimalU64(sequence));
+                }
+                Reply::ok(value)
+            }
+            // The child's refusal is ITS answer about ITS prompt. Term relays
+            // it rather than replacing it with a guess, because BUSY and
+            // STALE_GENERATION tell the caller two different things to do next.
+            Ok(Err(error)) => shell_refusal(&error.to_string(), sequence.is_some()),
+            // A submission whose answer never arrived may or may not have been
+            // admitted. `term.exec.result` on the id, or a byte-identical
+            // retry, is the only way to find out — and the retained entry below
+            // is what makes the retry answer rather than re-execute.
+            Err(_) if sequence.is_some() => Reply::error("UNKNOWN_OUTCOME"),
+            Err(_) => Reply::error("DISCONNECTED"),
+        };
+        if reply.body.len() > 256 * 1024 {
+            reply = Reply::error(if sequence.is_some() {
+                "UNKNOWN_OUTCOME"
+            } else {
+                "RESOURCE_LIMIT"
+            });
+        }
+        if let Some(sequence) = sequence {
+            self.record_outcome(identity, &request.target, sequence, digest, &reply);
+        }
+        reply
+    }
+
     fn layout(&self, tabs: &mut TabSet, verb: &str, request: &Request) -> Reply {
         let id = request.target.pane_id.0;
         let Some(tab) = tabs.control_tab(id) else {
@@ -918,6 +1103,33 @@ impl Control {
 /// different payloads. A retry MUST replay the body byte for byte, and the
 /// refusal says so rather than leaving a caller to guess why its "identical"
 /// retry conflicted.
+/// Translate the pane shell's refusal into Term's vocabulary. The child speaks
+/// almost the same one; the two that differ are spelled differently for the
+/// same meaning, and anything unrecognised is reported as an unknown outcome
+/// rather than being flattened into a denial that would read as a policy
+/// decision Term never made.
+fn shell_refusal(body: &str, mutation: bool) -> Reply {
+    #[derive(Deserialize)]
+    struct Refusal {
+        error_code: String,
+    }
+    let code = serde_json::from_str::<Refusal>(body)
+        .map(|refusal| refusal.error_code)
+        .unwrap_or_default();
+    match code.as_str() {
+        "BUSY" => Reply::error("BUSY"),
+        "STALE_GENERATION" => Reply::error("STALE_GENERATION"),
+        "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
+        "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
+        "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
+        "UNKNOWN_OUTCOME" => Reply::error("UNKNOWN_OUTCOME"),
+        "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
+        "REFUSED" => Reply::error("FORBIDDEN"),
+        _ if mutation => Reply::error("UNKNOWN_OUTCOME"),
+        _ => Reply::error("FORBIDDEN"),
+    }
+}
+
 fn mismatch() -> Value {
     json!({"reason":"request_mismatch","retry_requires":"byte_identical_body"})
 }

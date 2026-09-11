@@ -148,6 +148,11 @@ struct PaneState {
     live: AtomicBool,
     launched: AtomicBool,
     public_key: HexBytes<32>,
+    /// The child's own enrolled record, published by the actor once the
+    /// binding is Attached. A request that Term forwards TO the child has to
+    /// name the child's Bus name and its exact generation tuple, and neither
+    /// is derivable from the pane id.
+    binding: std::sync::Mutex<Option<SessionRecord>>,
 }
 
 pub struct PaneSession {
@@ -225,6 +230,26 @@ impl NativeSession {
         control
     }
 
+    /// The child's live enrolled record for `id` at exactly `generation`, or
+    /// `None`. Every liveness condition `pane_guard` enforces is enforced here
+    /// too: a forwarded request must not reach a child whose pane has been
+    /// closed, whose generation has moved on, or which has not enrolled yet.
+    pub fn child_binding(&self, id: u64, generation: u64) -> Option<SessionRecord> {
+        let shared = self.1.lock().unwrap();
+        let pane = shared.panes.get(&id)?.upgrade()?;
+        if !pane.live.load(Ordering::Acquire)
+            || !pane.control_ready.load(Ordering::Acquire)
+            || !pane.launched.load(Ordering::Acquire)
+            || pane.generation.load(Ordering::Acquire) != generation
+        {
+            return None;
+        }
+        let binding = pane.binding.lock().unwrap().clone()?;
+        (binding.state == BindingState::Attached
+            && binding.pane_generation == Some(DecimalU64(generation))
+            && binding.pane_id == Some(DecimalU64(id)))
+        .then_some(binding)
+    }
     pub fn pane_guard(&self, id: u64, generation: u64) -> Arc<dyn Fn() -> bool + Send + Sync> {
         let pane = self
             .1
@@ -255,6 +280,7 @@ impl NativeSession {
         let mut shared = self.1.lock().unwrap();
         if let Some(state) = shared.panes.remove(&id).and_then(|p| p.upgrade()) {
             state.live.store(false, Ordering::Release);
+            *state.binding.lock().unwrap() = None;
         }
         shared.status.remove(&id);
         drop(shared);
@@ -679,6 +705,7 @@ impl Actor {
                 launched: AtomicBool::new(false),
                 control_ready: AtomicBool::new(false),
                 public_key: ready.pane.public_key,
+                binding: std::sync::Mutex::new(None),
             });
             if let Some(child) = self.children.get_mut(&pane.id) {
                 child.pane = pane.clone();
@@ -750,6 +777,7 @@ impl Actor {
                 launched: AtomicBool::new(false),
                 control_ready: AtomicBool::new(false),
                 public_key: HexBytes(key.verifying_key().to_bytes()),
+                binding: std::sync::Mutex::new(None),
             });
             self.children.insert(
                 id,
@@ -1033,6 +1061,11 @@ impl Actor {
                     found.record.state == BindingState::Attached,
                     Ordering::Release,
                 );
+                // Publish only an ATTACHED binding. A pending or suspended
+                // record names a child that cannot answer, and forwarding to
+                // one would turn a known refusal into a timeout.
+                *child.pane.binding.lock().unwrap() =
+                    (found.record.state == BindingState::Attached).then(|| found.record.clone());
                 child.record = Some(found.record.clone());
                 return Ok(found);
             }
@@ -1135,6 +1168,9 @@ impl Actor {
         }
         child.pending.as_mut().unwrap().expires_ms = Some(result.grant.expires_ms);
         child.pane.control_ready.store(false, Ordering::Release);
+        // A fresh grant supersedes whatever was bound before it; the old name
+        // must stop being addressable the moment the generation moves.
+        *child.pane.binding.lock().unwrap() = None;
         child.record = Some(result.record.clone());
         Ok(result)
     }
@@ -1910,6 +1946,7 @@ pub(crate) mod tests {
                         launched: AtomicBool::new(true),
                         control_ready: AtomicBool::new(false),
                         public_key: HexBytes(key.verifying_key().to_bytes()),
+                        binding: std::sync::Mutex::new(None),
                     }),
                     record: None,
                     retry: Retry {
@@ -2417,6 +2454,7 @@ pub(crate) mod tests {
                         launched: AtomicBool::new(true),
                         control_ready: AtomicBool::new(false),
                         public_key: HexBytes(key.verifying_key().to_bytes()),
+                        binding: std::sync::Mutex::new(None),
                     }),
                     record: None,
                     retry: Retry {
