@@ -3,6 +3,11 @@
 //! GUI mutation and exit-notifier ordering remain covered in its own workspace.
 #![cfg(target_os = "linux")]
 
+// Term's embedded source uses these crate aliases; the Mix manifest explicitly
+// names the same dependencies cosmix_lib_bus / cosmix_lib_client.
+extern crate cosmix_lib_bus as cosmix_bus;
+extern crate cosmix_lib_client as cosmix_client;
+
 #[allow(dead_code)] // quarantine is Term-only; embedded tests exercise it too.
 #[path = "../../../desktop/apps/term/src/session_fd.rs"]
 mod session_fd;
@@ -16,6 +21,56 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 use term_native_test_broker::Broker;
+
+fn current_mix() -> &'static std::path::Path {
+    static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            // Cargo builds this target before running integration tests. Never
+            // search PATH, installed prefixes or guessed target directories.
+            let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_mix"));
+            assert!(
+                binary.is_absolute() && binary.is_file(),
+                "CURRENT Mix binary unavailable: {}",
+                binary.display()
+            );
+            let revision = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .expect("git is required to verify the fixture's source revision");
+            assert!(
+                revision.status.success(),
+                "cannot resolve CURRENT branch revision"
+            );
+            let expected = String::from_utf8(revision.stdout).unwrap();
+            let output = std::process::Command::new(&binary)
+                .args(["--version", "--json"])
+                .env_remove(session_fd::MARKER)
+                .env("MIX_STATS", "off")
+                .output()
+                .expect("cannot execute CURRENT Cargo-built Mix binary");
+            assert!(output.status.success(), "Mix provenance probe failed");
+            let provenance: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .expect("Mix binary must report structured build provenance");
+            assert_eq!(
+                provenance["git_sha_full"].as_str(),
+                Some(expected.trim()),
+                "STALE Mix binary: rebuild this branch; installed/stale binaries are forbidden"
+            );
+            assert_eq!(
+                provenance["git_dirty"], false,
+                "fixture requires a clean committed Mix build"
+            );
+            eprintln!(
+                "native-session fixture binary={} commit={}",
+                binary.display(),
+                expected.trim()
+            );
+            binary
+        })
+        .as_path()
+}
 
 async fn connect(broker: &Broker) -> VerifiedConnection {
     match NodedClient::connect_unix("", &broker.url, &broker.options(), None)
@@ -195,7 +250,7 @@ impl Child {
             ("TERM".into(), "xterm-256color".into()),
         ];
         let pty = teletypewriter::create_pty_with_spawn_fd(
-            Some(env!("CARGO_BIN_EXE_mix")),
+            Some(current_mix().to_str().unwrap()),
             vec![],
             &Some(home.path().display().to_string()),
             Some(env),
@@ -321,7 +376,7 @@ fn mix_child_bootstrap_proves_end_to_end() {
         .unwrap();
         child.send(&format!(
             "print(run_argv([{}, {}]).stdout)\n",
-            serde_json::to_string(env!("CARGO_BIN_EXE_mix")).unwrap(),
+            serde_json::to_string(current_mix()).unwrap(),
             serde_json::to_string(&helper).unwrap()
         ));
         child.until("DESCENDANT=[]\r\n");
@@ -495,7 +550,7 @@ fn bootstrap_has_no_evaluator_or_builtin_route() {
     let source = include_str!("../src/main.rs");
     let main = source.split("fn main() {").nth(1).unwrap();
     assert!(main.find("native_session::start()").unwrap() < main.find("spawn(real_main)").unwrap());
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mix"))
+    let output = std::process::Command::new(current_mix())
         .args(["builtins", "--json"])
         .env_remove(session_fd::MARKER)
         .env("MIX_STATS", "off")

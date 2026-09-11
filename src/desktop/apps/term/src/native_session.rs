@@ -2200,7 +2200,41 @@ pub(crate) mod tests {
         });
     }
 
-    // The completed mix_child_bootstrap_proves_end_to_end fixture lives in
-    // cosmix-mix/tests/native_session_pty.rs, where Cargo supplies the actual
-    // built Mix binary. It embeds this app's session_fd and real noded support.
+    #[test]
+    fn mix_child_bootstrap_proves_end_to_end() {
+        // Separate Cargo workspace: build and run its actual integration target
+        // instead of treating Term's standalone lifecycle tests as Mix evidence.
+        // Cargo builds the Mix binary; the fixture also checks its embedded SHA
+        // against HEAD. No environment override or installed-binary fallback.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .unwrap();
+        let output = std::process::Command::new("cargo")
+            .current_dir(&workspace)
+            // Never contend with the enclosing desktop Cargo test's target
+            // lock, including gates that export a shared CARGO_TARGET_DIR.
+            .env("CARGO_TARGET_DIR", workspace.join("target/term-native-e2e"))
+            .args([
+                "test",
+                "--locked",
+                "--manifest-path",
+                "Cargo.toml",
+                "-p",
+                "cosmix-mix",
+                "--test",
+                "native_session_pty",
+                "--",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .output()
+            .expect("cannot build CURRENT branch's Mix end-to-end target");
+        assert!(
+            output.status.success(),
+            "CURRENT Mix end-to-end build/test failed (no fallback):\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

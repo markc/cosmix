@@ -244,5 +244,13 @@ broker bounce, including child-first wake registration and pane generation
 UID/key/scope substitution, offset independence, stale lease non-use, marker
 scrubbing, stdio protection, missing-marker silence and the absence of any new
 builtin or evaluator route. No end-to-end seam remains ignored.
+The desktop suite now invokes this main-workspace integration target through
+Cargo in a separate target directory. Build or test failure fails the desktop
+test; it cannot substitute an installed binary or omit the Mix fixture. The
+fixture uses only `CARGO_BIN_EXE_mix` and checks `--version --json` for a clean
+build whose full source SHA equals the current checkout's HEAD before spawning
+the PTY. Run from a clean committed checkout; stale or unidentifiable binaries
+fail explicitly. Earlier desktop-only passes did not execute this cross-workspace
+fixture and were not evidence of Mix enrolment.
 Test and clippy results are supplied by the orchestrator; this document records
 implementation and test inventory only.

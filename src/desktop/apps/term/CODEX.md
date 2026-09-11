@@ -13,6 +13,12 @@ teletypewriter implementation. Handoff or support changes therefore require
 the Mix native-session tests as well as Term's gates; do not duplicate the
 memfd writer or replace the real broker with simulated replies.
 
+The desktop `mix_child_bootstrap_proves_end_to_end` test explicitly builds and
+runs that main-workspace target. It uses `src/target/term-native-e2e` to avoid
+the enclosing Cargo test's build lock. The fixture requires a clean committed
+build with embedded SHA matching HEAD; no installed/stale executable fallback
+is allowed. A desktop-only lifecycle pass is not Mix enrolment evidence.
+
 The fixture's pause control stalls the actual broker runtime and UDS sockets.
 It does not fabricate replies. Ordering probes at metadata removal and PTY
 cleanup must stay at those boundaries so reversing revoke/cleanup order fails.

@@ -7,9 +7,9 @@
 //! thread alone owns the Zeroizing seed; temporary SigningKeys zeroize on drop.
 //! Ordinary shells without the marker return before config, allocation or I/O.
 
-use cosmix_bus::native_session::*;
-use cosmix_client::session::{ChallengeResult, ExpectedScope, Hello, SessionFailure};
-use cosmix_client::{
+use cosmix_lib_bus::native_session::*;
+use cosmix_lib_client::session::{ChallengeResult, ExpectedScope, Hello, SessionFailure};
+use cosmix_lib_client::{
     BrokerAccount, ConnectError, NodedClient, UnixConnectOptions, UnixConnectOutcome,
     VerifiedConnection,
 };
