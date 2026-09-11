@@ -162,10 +162,21 @@ struct Entry {
     at: Instant,
     reply: Reply,
 }
-#[derive(Default)]
 struct History {
     high_water: u64,
     entries: VecDeque<Entry>,
+    /// Last accepted mutation. Only used to pick the coldest key to evict at
+    /// the actor cap; it never affects whether a retry is answered.
+    last: Instant,
+}
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            high_water: 0,
+            entries: VecDeque::new(),
+            last: Instant::now(),
+        }
+    }
 }
 #[derive(Default)]
 struct State {
@@ -253,6 +264,13 @@ impl Control {
             let Some(notice) = self.notice_rx.lock().unwrap().try_recv().ok() else {
                 break;
             };
+            // The lease ended; whether the write finished first is a separate
+            // question, answered by the byte count. The event and the retained
+            // outcome MUST agree on it — a caller that reads one and a caller
+            // that reads the other are asking the same thing.
+            let completed = notice.written >= notice.expected as u64;
+            let status = if completed { "completed" } else { "unknown" };
+            let outcome = if completed { "complete" } else { "partial_or_unknown" };
             {
                 let mut state = self.state.lock().unwrap();
                 if let Some(entry) = state.history.get_mut(&notice.actor).and_then(|h| {
@@ -262,7 +280,7 @@ impl Control {
                 }) {
                     entry.outcome = Some(Reply::ok(json!({
                         "operation_id":notice.request_id,
-                        "status":if notice.written >= notice.expected as u64 { "completed" } else { "unknown" },
+                        "status":status,
                         "boundary":"pty_write", "reason":"input_lease_ended",
                         "delivered_bytes_lower_bound":notice.written,
                     })));
@@ -274,7 +292,7 @@ impl Control {
                 .with_header("type", "event")
                 .with_header("command", "term.input.revoked")
                 .with_header("recipient_connection", &json!({"broker_epoch":notice.actor_epoch,"connection_id":notice.actor_connection}).to_string())
-                .with_body(&json!({"target":notice.target,"request_id":notice.request_id,"status":"revoked","outcome":"partial_or_unknown","delivered_bytes_lower_bound":notice.written}).to_string());
+                .with_body(&json!({"target":notice.target,"request_id":notice.request_id,"status":"revoked","outcome":outcome,"delivered_bytes_lower_bound":notice.written}).to_string());
             if tokio::time::timeout(
                 Duration::from_millis(100),
                 connection.client().send_raw(&message),
@@ -624,22 +642,41 @@ impl Control {
             let Some(sequence) = request.request_id.map(|id| id.0).filter(|id| *id > 0) else {
                 return Reply::error("INVALID_ARGUMENT");
             };
+            for history in state.history.values_mut() {
+                while history
+                    .entries
+                    .front()
+                    .is_some_and(|e| e.at.elapsed() >= RETENTION)
+                {
+                    history.entries.pop_front();
+                }
+            }
             let total = state
                 .history
                 .values()
                 .map(|h| h.entries.len())
                 .sum::<usize>();
+            // A key keeps its high-water mark even after every entry expires,
+            // so a late retry answers UNKNOWN_OUTCOME instead of re-executing.
+            // Ageing therefore never drops a key. But an ambient actor's key is
+            // per connection and reconnects mint new ones without end, so the
+            // cap evicts rather than refuses: the coldest key whose entries have
+            // all expired could only have served UNKNOWN_OUTCOME anyway. Refuse
+            // only under real pressure, where every key still holds a live
+            // result and the window clears it.
             if !state.history.contains_key(&identity) && state.history.len() >= ACTORS {
-                return Reply::error("RESOURCE_LIMIT");
+                let coldest = state
+                    .history
+                    .iter()
+                    .filter(|(_, history)| history.entries.is_empty())
+                    .min_by_key(|(_, history)| history.last)
+                    .map(|(key, _)| key.clone());
+                match coldest {
+                    Some(key) => state.history.remove(&key),
+                    None => return Reply::error("RESOURCE_LIMIT"),
+                };
             }
             let history = state.history.entry(identity.clone()).or_default();
-            while history
-                .entries
-                .front()
-                .is_some_and(|e| e.at.elapsed() >= RETENTION)
-            {
-                history.entries.pop_front();
-            }
             if let Some(entry) = history.entries.iter().find(|e| e.sequence == sequence) {
                 return if entry.digest == digest {
                     entry.reply.clone()
@@ -744,7 +781,16 @@ impl Control {
             _ => self.layout(&mut tabs, verb, &request),
         };
         if reply.body.len() > 256 * 1024 {
-            return Reply::error("RESOURCE_LIMIT");
+            if !mutation {
+                return Reply::error("RESOURCE_LIMIT");
+            }
+            // A mutation has already committed by here; only its reply is
+            // undeliverable, so reporting a plain limit failure would misstate
+            // what happened. The high-water mark set before execution already
+            // refuses re-execution, and recording this keeps a retry and
+            // term.operation answering the same unknown outcome rather than
+            // one of them finding no entry at all.
+            reply = Reply::error("UNKNOWN_OUTCOME");
         }
         if mutation {
             if reply.rc == 0 {
@@ -754,6 +800,7 @@ impl Control {
                 reply.body = result.to_string();
             }
             let history = state.history.get_mut(&identity).unwrap();
+            history.last = Instant::now();
             history.entries.push_back(Entry {
                 target: request.target.clone(),
                 outcome: None,
@@ -780,8 +827,9 @@ impl Control {
                 Err(_) => Reply::error("RESOURCE_LIMIT"),
             },
             "term.tab.select" | "term.pane.select" => {
-                tabs.select(tab);
-                tabs.focus(id);
+                if !tabs.select(tab) || !tabs.focus(id) {
+                    return Reply::error("FORBIDDEN");
+                }
                 Reply::ok(json!({"selected":request.target}))
             }
             "term.tab.close" => {
@@ -790,8 +838,13 @@ impl Control {
                 Reply::ok(json!({"closed":request.target}))
             }
             "term.pane.close" => {
-                tabs.select(tab);
-                tabs.focus(id);
+                // close_active and split_active act on whatever is focused, so a
+                // refused focus would silently retarget them at another pane.
+                // BROKER-023 refuses implicit active-pane selection; that has
+                // to be enforced, not left to the focus call happening to work.
+                if !tabs.select(tab) || !tabs.focus(id) {
+                    return Reply::error("FORBIDDEN");
+                }
                 let (_, removed) = tabs.close_active();
                 self.cleanup.submit(removed.into_iter().collect());
                 Reply::ok(json!({"closed":request.target}))
@@ -802,8 +855,9 @@ impl Control {
                     Some("v" | "vertical") => crate::panes::SplitDir::Vertical,
                     _ => return Reply::error("INVALID_ARGUMENT"),
                 };
-                tabs.select(tab);
-                tabs.focus(id);
+                if !tabs.select(tab) || !tabs.focus(id) {
+                    return Reply::error("FORBIDDEN");
+                }
                 match tabs.split_active(dir) {
                     Ok(id) => Reply::ok(json!({"pane_id":id})),
                     Err(_) => Reply::error("RESOURCE_LIMIT"),

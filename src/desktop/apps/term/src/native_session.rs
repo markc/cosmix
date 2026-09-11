@@ -552,6 +552,18 @@ impl Actor {
     fn control(&self) -> Option<Arc<crate::control::Control>> {
         self.shared.lock().unwrap().control.upgrade()
     }
+    /// Discard cached lifecycle authority and resynchronise. Reached from a
+    /// broker-signalled gap and from a local inbox overflow, which are the same
+    /// event: either way a lifecycle notice may have been missed, and nothing
+    /// may be resolved against the cached authority until it is re-earned.
+    async fn session_gap(&mut self) {
+        self.own_lease = None;
+        if let Some(control) = self.control() {
+            control.invalidate(None);
+        }
+        self.reconcile().await;
+        self.provision().await;
+    }
     /// Refresh this attachment and the conservative local deadline it
     /// establishes. Every renew site goes through here so the deadline the
     /// control lane reads can never be older than the lease that authorises
@@ -905,6 +917,11 @@ impl Actor {
                     }
                 }
                 self.reconcile().await;
+                // Re-earn the deadline now rather than at the next renew tick.
+                // Without this a reconnect denies every protected request for
+                // up to five seconds even though the attachment is already
+                // live; reconcile only renews when it had children to visit.
+                self.renew_parent().await;
             }
             Err(error) => {
                 eprintln!("term identity recovery: {error}");
@@ -1226,14 +1243,16 @@ impl Actor {
                 event = async { self.connection.as_mut().expect("guarded connection").recv().await }, if self.connection.is_some() => {
                     match event {
                         Some(event) => {
+                            // A dropped local delivery may have been a lifecycle
+                            // notice, so an overflowed inbox IS a gap and takes
+                            // the same path before anything resolves against
+                            // cached authority.
+                            if self.connection.as_ref().is_some_and(|c| c.take_gap()) {
+                                self.session_gap().await;
+                            }
                             let command = event.command();
                             if command.command == "noded.session.lifecycle.gap" {
-                                // A sticky gap invalidates cached lifecycle authority
-                                // before anything is resolved against it (PROP-025).
-                                self.own_lease = None;
-                                if let Some(control) = self.control() { control.invalidate(None); }
-                                self.reconcile().await;
-                                self.provision().await;
+                                self.session_gap().await;
                             } else if command.command == "noded.session.lifecycle" {
                                 self.notice(&command.body).await;
                             } else if let (Some(control), Some(connection), Some(parent), Some(own)) = (self.control(), &self.connection, &self.parent, &self.own_lease) {
