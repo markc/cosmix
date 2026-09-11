@@ -267,6 +267,10 @@ enum Request {
         revision: u64,
         token: OwnerToken,
     },
+    Release {
+        generation: Generation,
+        revision: u64,
+    },
     Inspect,
     HistoryLoad(String),
     HistoryAppend(String),
@@ -479,24 +483,22 @@ impl Control {
         }
     }
     /// Release a reservation without executing anything (step 4 refusal,
-    /// cancellation, identity loss). The editor returns to editing with the
-    /// same, untouched, empty draft.
+    /// cancellation, identity loss). The prompt was never taken away, so there
+    /// is nothing to give back — this only clears the promise.
     pub fn release(
         &self,
         generation: Generation,
         revision: u64,
         budget: std::time::Duration,
-    ) -> io::Result<Reply> {
-        match self.call_within(
-            Request::Protocol(Command::Resume {
+    ) -> io::Result<()> {
+        self.call_within(
+            Request::Release {
                 generation,
-                edit_revision: revision,
-            }),
+                revision,
+            },
             budget,
-        )? {
-            Response::Reply(reply) => Ok(reply),
-            _ => Err(io::Error::other("unexpected release reply")),
-        }
+        )
+        .map(|_| ())
     }
     /// Step 2-3: ask the editor to give up the terminal for an execution. A
     /// `Busy` reply is a refusal that changed nothing — the draft, the search
@@ -828,37 +830,19 @@ impl Owner {
     ) -> io::Result<()> {
         loop {
             let editing = self.editor.state() == State::Editing;
-            // §8's human-first rule has to hold through the RESERVATION too, not
-            // just while editing. The window is cooked mode with kernel echo and
-            // an unpolled tty: input landing there would be echoed into the
-            // announcement line and then handed to the admitted execution as
-            // stdin. Watching the descriptor is what lets the human refuse the
-            // admission instead of being eaten by it.
-            //
-            // LIMIT, stated because it is not obvious: the window is CANONICAL
-            // mode, so the line discipline holds a partial line and `poll` sees
-            // nothing until Enter. This therefore defends a completed line —
-            // the case where a whole human command would otherwise be consumed
-            // as somebody else's stdin — and not a half-typed one. Closing that
-            // needs the mode restore moved from reservation time to commit
-            // time, which is a change to the stage-C editor protocol.
-            let reserved = self.reserved_until.is_some();
             let ready = input::wait(
-                (editing || reserved).then(|| self.terminal.fd()),
+                editing.then(|| self.terminal.fd()),
                 wake.as_raw_fd(),
                 signals.as_raw_fd(),
                 self.terminal.output_fd(),
                 self.wait_timeout(editing),
             )?;
-            if ready[0] && reserved && !editing {
-                // Deliberately NOT read: the byte belongs to the editor, which
-                // is about to take the prompt back and will decode it normally.
-                // Resuming makes `admissible` false, so an Admit envelope
-                // already in flight aborts before it echoes anything.
-                self.expire_reservation()?;
-                continue;
-            }
-            // Human input observed in this poll wins before control admission.
+            // Human input observed in this poll wins before control admission —
+            // and now that a reservation leaves the editor EDITING and raw, that
+            // is the whole of the human-first rule for the reservation window
+            // too. A single byte is readable immediately, goes through the
+            // ordinary key path, and `activity` drops the reservation on its
+            // way. No separate watch, and no canonical-mode blind spot.
             if ready[0] && editing {
                 match input::read(self.terminal.fd()) {
                     Ok(Some(byte)) => {
@@ -953,31 +937,23 @@ impl Owner {
     }
     /// Derive the deadline from the editor's own state rather than keeping a
     /// second copy of it: whatever ended the reservation — consumption, a
-    /// release, a shutdown — has already been recorded there.
+    /// release, a keystroke — has already been recorded there.
     fn sync_reservation(&mut self) {
-        if self.editor.reserved() && self.editor.state() == State::Suspended {
+        if self.editor.reserved() {
             self.reserved_until
                 .get_or_insert_with(|| std::time::Instant::now() + RESERVATION);
         } else {
             self.reserved_until = None;
         }
     }
-    /// Take the prompt back from an admission owner that never came back. The
-    /// draft is empty by construction (only an empty primary prompt can be
-    /// reserved), so this restores exactly what the human was looking at.
+    /// Drop a reservation whose owner never came back. Nothing to restore and
+    /// nothing to redraw: a reservation never changed the terminal, so the
+    /// human's prompt has been sitting there live the whole time.
     fn expire_reservation(&mut self) -> io::Result<()> {
         self.reserved_until = None;
-        if self.editor.state() != State::Suspended || !self.editor.reserved() {
-            return Ok(());
-        }
-        let effect = self
+        let _ = self
             .editor
-            .command(Command::Resume {
-                generation: self.generation,
-                edit_revision: self.editor.edit_revision(),
-            })
-            .map_err(protocol)?;
-        self.effect(effect)?;
+            .release_reservation(self.generation, self.editor.edit_revision());
         Ok(())
     }
     fn request(&mut self, request: Request) -> io::Result<Response> {
@@ -1056,6 +1032,16 @@ impl Owner {
                     })
                     .map_err(protocol)?
             }
+            Request::Release {
+                generation,
+                revision,
+            } => {
+                self.editor
+                    .release_reservation(generation, revision)
+                    .map_err(protocol)?;
+                self.reserved_until = None;
+                return Ok(Response::Stopped);
+            }
             Request::Admit {
                 generation,
                 revision,
@@ -1086,6 +1072,17 @@ impl Owner {
                 if !token.claim() {
                     return Err(io::Error::other("admission abandoned by its owner"));
                 }
+                // §8 step 6, in order: stop reads and restore cooked mode,
+                // THEN announce, THEN execute. Everything up to this line
+                // happened with the terminal still raw and still being read,
+                // which is what let a human keystroke win.
+                self.terminal.finish(&super::render::layout(
+                    self.profile.text(),
+                    self.editor.buffer(),
+                    self.terminal.size().0,
+                )
+                .map_err(|e| io::Error::other(format!("editor layout: {e:?}")))?)?;
+                self.terminal.restore()?;
                 self.terminal.echo(&echo, drain)?;
                 if let Err(error) = self.editor.consume_reservation(generation, revision) {
                     // Unreachable given the check above, but a consumed prompt

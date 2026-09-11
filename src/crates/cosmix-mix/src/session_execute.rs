@@ -1059,7 +1059,7 @@ async fn reserve(control: &Control, expected: u64) -> Reserved {
         // grant a reservation over a prompt whose owner has already given up.
         let token = OwnerToken::new();
         match control.reserve(view.generation, view.revision, &token, EDITOR_BUDGET)? {
-            EditorReply::Suspended {
+            EditorReply::Reserved {
                 generation,
                 edit_revision,
             } => Ok(Reserved::Granted((generation, edit_revision))),

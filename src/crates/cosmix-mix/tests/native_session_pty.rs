@@ -1919,31 +1919,62 @@ fn stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact() {
                     .map_err(|e| e.to_string())
             }
         });
-        // Land the input inside the reservation window.
-        //
-        // A COMPLETE line, deliberately. The window is cooked mode, and a
-        // canonical line discipline does not make a partial line readable —
-        // `poll` cannot see it until Enter. So this is the boundary the fix
-        // actually defends: a human who finishes a line during the window has
-        // their line run, instead of it being swallowed as stdin by an
-        // execution they never asked for. The partial-keystroke case is
-        // documented as a residual, not asserted here as though it were
-        // covered.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        f.child.send("print(\"HUMAN_WINS\")\n");
+        // A SINGLE BYTE, mid-reservation — not a completed line. §8 puts the
+        // cooked-mode restore at the commit, so the window is still RAW: the
+        // byte is readable immediately, goes through the ordinary key path and
+        // ends the reservation on its way. Under the old placement this byte
+        // sat invisible in a canonical line discipline, was kernel-echoed into
+        // the announcement, and became the admitted execution's stdin.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.child.send("p");
         let outcome = tokio::time::timeout(Duration::from_secs(10), submitting)
             .await
             .expect("the submission must answer")
             .unwrap();
-        // STALE_GENERATION, pinned exactly. The human's line consumed the
-        // prompt the submission named, so "the generation you asked for is
-        // gone" is both true and actionable — re-read it and submit again.
-        // A generic refusal would have told the caller nothing.
-        let error = outcome.expect_err("a human line must refuse the admission");
-        assert_eq!(error, r#"{"error_code":"STALE_GENERATION"}"#, "{error}");
+        // BUSY, pinned exactly: the prompt is still the human's, still on the
+        // same generation, and they are mid-draft. Nothing was announced.
+        let error = outcome.expect_err("a keystroke must refuse the admission");
+        assert_eq!(error, r#"{"error_code":"BUSY"}"#, "{error}");
 
-        // The human's line ran, and the agent's did not.
+        // The draft is intact and still editable — the byte is the first
+        // character of the line the human goes on to finish.
+        f.child.send("rint(\"HUMAN_WINS\")\n");
         let pane = f.child.until("HUMAN_WINS\r\n");
+        assert!(!pane.contains("STOLEN"), "the agent's line ran: {pane}");
+        assert!(
+            !pane.contains("admitted for"),
+            "a refused admission announced itself: {pane}"
+        );
+
+        // And the completed-line case still refuses, with its own exact code:
+        // the human's line consumed the generation the caller named.
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let submitting = tokio::spawn({
+            let name = f.bound.name.clone();
+            let client = f.parent.connection.clone();
+            let body = execute_request(&f.bound, 2, generation, "print(\"STOLEN\")");
+            async move {
+                client
+                    .client()
+                    .call(&name, "shell.execute", body)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.child.send("print(\"HUMAN_AGAIN\")\n");
+        let error = tokio::time::timeout(Duration::from_secs(10), submitting)
+            .await
+            .expect("the submission must answer")
+            .unwrap()
+            .expect_err("a completed human line must refuse the admission");
+        assert!(
+            error == r#"{"error_code":"BUSY"}"#
+                || error == r#"{"error_code":"STALE_GENERATION"}"#,
+            "a completed line must refuse as BUSY (caught at the reservation) \
+             or STALE_GENERATION (caught at the recheck), not {error}"
+        );
+        let pane = f.child.until("HUMAN_AGAIN\r\n");
         assert!(!pane.contains("STOLEN"), "the agent's line ran: {pane}");
         teardown(f).await;
     });
