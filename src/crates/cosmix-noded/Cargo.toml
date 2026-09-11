@@ -58,6 +58,7 @@ arc-swap.workspace = true
 notify.workspace = true
 # SPEC 13 §9a D2 admission (2-c-1b): CSPRNG for the per-session challenge nonce.
 rand.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [build-dependencies]
 # Captures THIS repo's (cos) git sha + build time into COSMIX_* env vars.
@@ -67,7 +68,6 @@ cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-bui
 tracing-subscriber.workspace = true
 # SPEC 13 §9a D2 admission (2-c-1b): the round-trip transcript conformance test
 # generates a d2 keypair to sign a transcript the broker then reconstructs.
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 # Raw WebSocket client for verb-level integration tests where the
 # response carries custom headers (e.g. `noded.props.subscribe_grant`)
 # and we need to inspect them — `cosmix-lib-client`'s `call()` returns

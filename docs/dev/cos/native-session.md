@@ -1,5 +1,17 @@
 # Native session implementation staging
 
+## S2 allocation boundary
+
+The broker implements `hello`, allocation with a connection-bound Ed25519
+proof, attach-on-allocate, owner-UID `list`, and `renew`. Term names use the
+canonical UID encoding and 110 random bits; the epoch exclusion set is bounded
+to 65,536 names. Exhaustion refuses allocation. Each UID may hold 64 nonterminal
+Terms. Retained mutations use increasing decimal IDs and bounded cached results.
+Clients renew every five seconds; successful renewal refreshes the 15-second
+CLOCK_BOOTTIME lease, including repeated request IDs. Disconnect or expiry
+suspends the record for 30 seconds. Further S2 boundaries add child grants,
+resumption, notices and the typed client API.
+
 The S1 foundation implements the wire types in `cosmix-lib-bus` and shares
 noded's existing Axum WebSocket handler between transport identities. TCP
 registration, D2 admission and response-channel ownership remain unchanged.

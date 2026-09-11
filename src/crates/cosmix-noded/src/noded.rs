@@ -43,6 +43,8 @@ use crate::protection::TrafficClass;
 #[cfg(test)]
 #[path = "native_session_tests.rs"]
 mod native_session_tests;
+#[path = "session.rs"]
+mod session;
 use crate::subscription::{
     self, BrokerOrigin, JANITOR_INTERVAL, Notification, SubscriptionBroker, TopicInfo,
     stamp_broker_origin, strip_broker_origin,
@@ -343,6 +345,7 @@ impl PendingResponseTable {
 
 #[derive(Clone)]
 struct AppState {
+    sessions: Arc<tokio::sync::Mutex<session::Sessions>>,
     protected_responses: Arc<AtomicBool>,
     native_session_endpoint: Option<PathBuf>,
     broker_epoch: HexBytes<16>,
@@ -811,6 +814,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     let change_bus = crate::props::ChangeBus::new(broker.clone());
 
     let state = AppState {
+        sessions: Default::default(),
         protected_responses: Default::default(),
         broker_epoch: HexBytes(rand::random()),
         principal: None,
@@ -2000,6 +2004,15 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
     // teardown. The read loop `select!`s on it; the reload watcher calls
     // `notify_one()` to break the loop and drop a revoked member's session.
     let close_signal = Arc::new(tokio::sync::Notify::new());
+    if let Some(p) = &state.principal {
+        state.sessions.lock().await.connect(
+            p,
+            &tx,
+            close_signal.clone(),
+            state.protected_responses.clone(),
+        );
+    }
+    let mut session_tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     // SPEC 13 §9a (2-c-1b) — broker-speaks-first: when admission is enabled the
     // broker's FIRST frame is a D2 challenge. Non-blocking + additive — an
@@ -2042,6 +2055,11 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         let msg = tokio::select! {
             biased;
             _ = close_signal.notified() => break,
+            _ = session_tick.tick(), if state.principal.is_some() => {
+                let mut reg = state.registry.write().await;
+                state.sessions.lock().await.maintain(&mut reg, session::now_ms());
+                continue;
+            },
             next = ws_stream.next() => match next {
                 Some(Ok(m)) => m,
                 // Stream closed or errored — same as the old `while let` exit.
@@ -2109,8 +2127,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             let _ = tx.try_send(reply.to_wire());
             continue;
         }
-        // S1 supplies the wire profile, not S2's session state machine. Validate
-        // before returning an explicit unsupported result; never mutate identity.
+        // The strict raw parser remains ahead of all lifecycle mutation.
         if bus_msg
             .command_name()
             .is_some_and(|c| c.starts_with("noded.session."))
@@ -2122,28 +2139,38 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             }) else {
                 break;
             };
-            let error = cosmix_bus::native_session::SessionError {
-                error_code: if validation.is_ok() {
-                    cosmix_bus::native_session::ErrorCode::Unsupported
-                } else {
-                    cosmix_bus::native_session::ErrorCode::InvalidArgument
-                },
-                message: if validation.is_ok() {
-                    "session commands are not available"
-                } else {
-                    "invalid session request"
+            let result = match (&state.principal, validation) {
+                (Some(p), Ok(request)) => {
+                    let mut reg = state.registry.write().await;
+                    let mut sessions = state.sessions.lock().await;
+                    let result = sessions.execute(p, &request, &mut reg);
+                    if let Some(name) = sessions.name(p.connection_id) {
+                        service_name = Some(name);
+                    }
+                    result
                 }
-                .into(),
-                details: Default::default(),
+                (None, Ok(_)) => Err(cosmix_bus::native_session::SessionError::forbidden()),
+                (_, Err(_)) => Err(cosmix_bus::native_session::SessionError {
+                    error_code: cosmix_bus::native_session::ErrorCode::InvalidArgument,
+                    message: "invalid session request".into(),
+                    details: Default::default(),
+                }),
+            };
+            let (rc, body) = match result {
+                Ok(body) => (0, body),
+                Err(error) => (
+                    error.rc(),
+                    serde_json::to_value(error).expect("session error"),
+                ),
             };
             let reply = BusMessage::new()
                 .with_header("bus", "1")
                 .with_header("native-session", "1")
                 .with_header("type", "response")
-                .with_header("rc", "10")
+                .with_header("rc", &rc.to_string())
                 .with_header("id", id)
                 .with_header("command", bus_msg.command_name().unwrap_or("noded.session"))
-                .with_body(&serde_json::to_string(&error).expect("session error"));
+                .with_body(&body.to_string());
             canonicalize_connection_from(&mut bus_msg, service_name.as_deref());
             state.observe.observe(Observation::canonical(
                 ObserveDirection::Local,
@@ -2159,6 +2186,13 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 reply.get("id"),
             );
             continue;
+        }
+
+        if let Some(p) = &state.principal {
+            let mut reg = state.registry.write().await;
+            let mut sessions = state.sessions.lock().await;
+            sessions.maintain(&mut reg, session::now_ms());
+            state.principal = sessions.principal(p.connection_id, session::now_ms());
         }
 
         // SPEC 13 §9a (2-c-1b) — the D2 admission response. It carries
@@ -2771,6 +2805,15 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             tracing::debug!("enforce: closing refused inter-node session (§9a 2-c-2d)");
             break;
         }
+    }
+
+    if let Some(p) = &state.principal {
+        let mut reg = state.registry.write().await;
+        state
+            .sessions
+            .lock()
+            .await
+            .disconnect(p.connection_id, &mut reg);
     }
 
     // SPEC 13 §5.5 (2-c-2c) — drop this session from the live gated set. A
@@ -3485,6 +3528,16 @@ async fn handle_noded_command(
 
     match command {
         "noded.register" => {
+            if state
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.session.is_some())
+            {
+                let mut resp = respond("10");
+                resp.body = r#"{"error_code":"CONFLICT","message":"attached identity cannot be renamed","details":{}}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             let from = match msg.from_addr() {
                 Some(f) => f.to_string(),
                 None => {
@@ -3629,6 +3682,16 @@ async fn handle_noded_command(
         }
 
         "noded.deregister" => {
+            if state
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.session.is_some())
+            {
+                let mut resp = respond("10");
+                resp.body = r#"{"error_code":"CONFLICT","message":"attached identity requires session revoke","details":{}}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             // SPEC 18 §3.5 graceful shutdown: a citizen removes its own
             // registered name and awaits this response BEFORE exiting, so
             // the broker never routes a request to a dead name in the race
@@ -5164,6 +5227,7 @@ mod tests {
         let broker = Arc::new(SubscriptionBroker::new());
         let started = Instant::now();
         AppState {
+            sessions: Default::default(),
             protected_responses: Default::default(),
             broker_epoch: super::HexBytes([1; 16]),
             principal: None,

@@ -84,6 +84,94 @@ fn request(command: &str, to: &str, id: &str) -> BusMessage {
         .with_header("id", id)
 }
 
+async fn session_call<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut WebSocketStream<S>,
+    command: &str,
+    id: &str,
+    body: serde_json::Value,
+) -> BusMessage {
+    send(
+        socket,
+        &request(&format!("noded.session.{command}"), "noded", id)
+            .with_header("native-session", "1")
+            .with_body(&body.to_string()),
+    )
+    .await;
+    loop {
+        let reply = receive(socket).await;
+        if reply.message_type() == Some("response") && reply.get("id") == Some(id) {
+            return reply;
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_allocation_proof_connection_binding_retention_and_renew() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    let broker = Broker::start().await;
+    let mut socket = broker.unix().await;
+    let hello = session_call(&mut socket, "hello", "hello", serde_json::json!({})).await;
+    let context: serde_json::Value = serde_json::from_str(&hello.body).unwrap();
+    let key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(key.verifying_key().to_bytes());
+    let signature = HexBytes(
+        key.sign(&encode_allocate(
+            serde_json::from_value(context["broker_epoch"].clone()).unwrap(),
+            serde_json::from_value(context["connection_id"].clone()).unwrap(),
+            public_key,
+            Policy::Restricted,
+        ))
+        .to_bytes(),
+    );
+    let args =
+        serde_json::json!({"public_key":public_key, "signature":signature, "policy":"restricted"});
+    let mut thief = broker.unix().await;
+    assert_eq!(
+        session_call(&mut thief, "allocate", "1", args.clone())
+            .await
+            .get("rc"),
+        Some("10")
+    );
+    let allocated = session_call(&mut socket, "allocate", "1", args.clone()).await;
+    assert_eq!(allocated.get("rc"), Some("0"), "{}", allocated.body);
+    let result: serde_json::Value = serde_json::from_str(&allocated.body).unwrap();
+    let record: SessionRecord = serde_json::from_value(result["record"].clone()).unwrap();
+    assert!(reserved_session_name(&record.name));
+    assert_eq!(record.capabilities.len(), 6);
+    assert_eq!(record.binding_generation, DecimalU64(1));
+    assert_eq!(
+        session_call(&mut socket, "allocate", "1", args).await.body,
+        allocated.body
+    );
+    assert_eq!(
+        session_call(
+            &mut socket,
+            "revoke",
+            "1",
+            serde_json::json!({"target":record.reference()})
+        )
+        .await
+        .get("rc"),
+        Some("10")
+    );
+    for _ in 0..2 {
+        let reply = session_call(
+            &mut socket,
+            "renew",
+            "repeat",
+            serde_json::json!({"target":record.reference()}),
+        )
+        .await;
+        assert_eq!(reply.get("rc"), Some("0"));
+        let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body["record"]["lease_remaining_ms"], "15000");
+    }
+    let listed = session_call(&mut socket, "list", "list", serde_json::json!({})).await;
+    let body: serde_json::Value = serde_json::from_str(&listed.body).unwrap();
+    assert_eq!(body["records"].as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn reserved_session_namespace_matches_shape_not_canonical_uid() {
     let suffix = "abcdefghijklmnopqrstuvwxyz234567";
@@ -419,7 +507,7 @@ async fn protected_requests_responses_and_recipient_events_never_reach_tap_paylo
 }
 
 #[tokio::test]
-async fn unix_binary_frames_refused_and_bootstrap_is_strict_but_not_enabled_as_state_machine() {
+async fn unix_binary_frames_refused_and_bootstrap_is_strict() {
     let broker = Broker::start().await;
     let mut legacy = broker.tcp().await;
     for command in ["noded.session.lifecycle", "noded.session.lifecycle.gap"] {
@@ -439,11 +527,10 @@ async fn unix_binary_frames_refused_and_bootstrap_is_strict_but_not_enabled_as_s
     .await;
     let reply = receive(&mut socket).await;
     assert_eq!(reply.get("native-session"), Some("1"));
-    assert_eq!(reply.get("rc"), Some("10"));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&reply.body).unwrap()["error_code"],
-        "UNSUPPORTED"
-    );
+    assert_eq!(reply.get("rc"), Some("0"));
+    let hello: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(hello["broker_epoch"].as_str().unwrap().len(), 32);
+    assert_eq!(hello["connection_id"].as_str().unwrap().len(), 32);
     let malformed = request("noded.session.hello", "noded", "bad")
         .with_header("native-session", "1")
         .with_body(r#"{"x":1,"x":2}"#);
