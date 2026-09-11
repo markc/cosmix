@@ -16,15 +16,10 @@
 
 $shell_prefix = "p4_"
 $shell_fixtures = [
-  "p4_a_source_task_returns_a_typed_result_beside_its_streams",
-  "p4_a_task_environment_is_exactly_the_base_plus_its_overlay",
-  "p4_a_task_has_exactly_the_descriptors_it_was_given",
-  "p4_a_timeout_terminates_the_group_and_reports_itself_as_policy",
-  "p4_an_argv_task_reports_exit_status_and_no_structured_value",
-  "p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill",
-  "p4_oversized_streams_are_truncated_and_say_so",
-  "p4_refusals_leave_no_trace_and_deferrals_are_advertised",
-  "p4_the_two_surfaces_share_one_dedupe_space_and_cannot_read_each_other"
+  "p4_a_task_inherits_only_what_it_was_given",
+  "p4_both_modes_report_accurately_and_the_surfaces_stay_separate",
+  "p4_bounds_are_reported_and_refusals_leave_no_trace",
+  "p4_termination_is_hard_and_the_outcome_names_the_policy"
 ]
 $shell_expected = length($shell_fixtures)
 

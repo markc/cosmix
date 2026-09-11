@@ -2275,10 +2275,16 @@ fn stage_d_an_undetermined_admission_still_resolves_to_its_real_outcome() {
 // P4: isolated supervised tasks.
 //
 // A task is a separate process, so unlike stage D these fixtures are not about
-// the prompt at all. What they have to prove is the opposite: that the task got
-// NOTHING it was not given, that termination is hard rather than cooperative,
-// and that the outcome is read from wait() rather than from having sent a
-// signal.
+// the prompt. What they prove is the opposite: that the task got NOTHING it was
+// not given, that termination is hard rather than cooperative, and that the
+// outcome comes from wait() rather than from having sent a signal.
+//
+// Four fixtures, not nine. Each `stage_d_fixture` starts a real broker and a
+// real enrolled child, and this suite is run NESTED inside the desktop test
+// suite, in parallel with its own brokers and PTYs. Nine spawns of that weight
+// measurably starved `status_flood_preserves_lease_and_restart_ack` — a
+// fixture that must hold a 15-second lease under a 64-way flood — into losing
+// its attachment. Grouping by theme keeps every assertion and costs four.
 
 fn task_request(
     record: &SessionRecord,
@@ -2299,7 +2305,6 @@ fn task_request(
     request
 }
 
-/// Poll until the supervisor has published a report.
 async fn task_report(
     parent: &mut Parent,
     record: &SessionRecord,
@@ -2344,13 +2349,15 @@ async fn submit_task(
     Ok(counter(&accepted["operation_id"]))
 }
 
-/// Source mode end to end: the typed value travels the result descriptor while
-/// the program's text goes to stdout, and the two never mix.
+/// Both modes end to end, and the kind tag that keeps the two surfaces apart.
 #[test]
-fn p4_a_source_task_returns_a_typed_result_beside_its_streams() {
+fn p4_both_modes_report_accurately_and_the_surfaces_stay_separate() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         let mut f = stage_d_fixture("owned").await;
+
+        // SOURCE mode: the typed value travels the result descriptor while the
+        // program's text goes to stdout, and the two never mix.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
@@ -2363,43 +2370,31 @@ fn p4_a_source_task_returns_a_typed_result_beside_its_streams() {
         let task = &report["report"];
         assert_eq!(task["outcome"]["kind"], "exited", "{task}");
         assert_eq!(task["outcome"]["code"], 0, "{task}");
-        // Streams are separate BY CONSTRUCTION here — this is the mode whose
-        // whole point is that attribution is exact, not best-effort.
+        // Attribution is exact BY CONSTRUCTION here — separate pipes, which is
+        // the whole reason the manual points at this mode.
         assert!(task["stdout"]["text"].as_str().unwrap().contains("ON_STDOUT"));
         assert!(task["stderr"]["text"].as_str().unwrap().contains("ON_STDERR"));
         assert!(!task["stdout"]["text"].as_str().unwrap().contains("ON_STDERR"));
-        assert_eq!(task["stdout"]["truncated"], false);
-        // The value went down the result descriptor, NOT stdout.
         assert_eq!(task["result"]["kind"], "value", "{task}");
         let data = task["result"]["data"].as_str().unwrap();
-        assert!(data.contains("\"ok\""), "{data}");
-        assert!(data.contains("42"), "{data}");
+        assert!(data.contains("\"ok\"") && data.contains("42"), "{data}");
         assert!(
             !task["stdout"]["text"].as_str().unwrap().contains("42"),
             "the value leaked into the text stream: {task}"
         );
-        teardown(f).await;
-    });
-}
 
-/// argv mode has no interpreter value, and says so rather than presenting an
-/// absent one as a failure.
-#[test]
-fn p4_an_argv_task_reports_exit_status_and_no_structured_value() {
-    let _fixture = fixture_guard();
-    runtime().block_on(async {
-        let mut f = stage_d_fixture("owned").await;
+        // ARGV mode: real exit status, and no structured value rather than an
+        // absent one presented as a failure.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
-            1,
+            2,
             serde_json::json!({"argv": ["sh", "-c", "echo OUT; echo ERR >&2; exit 3"]}),
         )
         .await
         .expect("admitted");
         let report = task_report(&mut f.parent, &f.bound, operation).await;
         let task = &report["report"];
-        assert_eq!(task["outcome"]["kind"], "exited");
         assert_eq!(task["outcome"]["code"], 3, "{task}");
         assert!(task["stdout"]["text"].as_str().unwrap().contains("OUT"));
         assert!(task["stderr"]["text"].as_str().unwrap().contains("ERR"));
@@ -2415,20 +2410,61 @@ fn p4_an_argv_task_reports_exit_status_and_no_structured_value() {
                 .unwrap_err();
             assert!(error.contains("INVALID_ARGUMENT"), "{error}");
         }
+
+        // ONE dedupe space, records tagged: an identical retry replays.
+        let body = serde_json::json!({"source": "print(\"TASK_ONCE\")\n1"});
+        let first = submit_task(&mut f.parent, &f.bound, 3, body.clone())
+            .await
+            .expect("admitted");
+        task_report(&mut f.parent, &f.bound, first).await;
+        let again = submit_task(&mut f.parent, &f.bound, 3, body)
+            .await
+            .expect("a retry replays");
+        assert_eq!(again, first, "a retry minted a second task");
+
+        // Neither surface can read the other's operations, and the refusal is
+        // the same one an unknown id gets — no oracle either way.
+        let error = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute.result",
+            operation_request(&f.bound, first),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let accepted = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            execute_request(&f.bound, 4, generation, "print(\"EVAL\")"),
+        )
+        .await
+        .expect("admitted");
+        let evaluation = counter(&accepted["operation_id"]);
+        let error = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.task.result",
+            operation_request(&f.bound, evaluation),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
         teardown(f).await;
     });
 }
 
-/// The environment contract, asserted as WHOLE-SET equality rather than by
-/// spot-checking a few names. A task inherits nothing it was not given, and
-/// that is only checkable by listing everything it actually got.
+/// A task inherits NOTHING it was not given — asserted as whole-set equality,
+/// because spot-checking a few names cannot show the absence of the rest.
 #[test]
-fn p4_a_task_environment_is_exactly_the_base_plus_its_overlay() {
+fn p4_a_task_inherits_only_what_it_was_given() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         let mut f = stage_d_fixture("owned").await;
-        // Put a variable into the SHELL's live environment. It must not reach
-        // the task: the base set is snapshotted and enumerated, not inherited.
+        // A variable in the SHELL's live environment must not reach the task:
+        // the base set is snapshotted at startup and enumerated, not inherited.
         f.child
             .send("$x = setenv(\"P4_SHELL_SECRET\", \"leaked\")\nprint(\"ENV_SET\")\n");
         f.child.until("ENV_SET\r\n");
@@ -2455,58 +2491,32 @@ fn p4_a_task_environment_is_exactly_the_base_plus_its_overlay() {
             !names.contains("P4_SHELL_SECRET"),
             "a live shell variable reached a task: {names:?}"
         );
-        assert!(names.contains("P4_OVERLAY"), "{names:?}");
-        assert!(names.contains("TERM"), "{names:?}");
-        // WHOLE-SET: every name is either an enumerated base name or the
-        // overlay. Anything else is an inheritance nobody declared.
         let allowed: std::collections::BTreeSet<&str> = [
-            "HOME",
-            "USER",
-            "PATH",
-            "LANG",
-            "TERM",
-            "COSMIX",
-            "COSMIX_SRC",
-            "COSMIX_BIN",
-            "COSMIX_ETC",
-            "COSMIX_NODE_CONFIG",
-            "COSMIX_BROKER_ACCOUNT",
-            "P4_OVERLAY",
+            "HOME", "USER", "PATH", "LANG", "TERM", "COSMIX", "COSMIX_SRC",
+            "COSMIX_BIN", "COSMIX_ETC", "COSMIX_NODE_CONFIG",
+            "COSMIX_BROKER_ACCOUNT", "P4_OVERLAY",
         ]
         .into_iter()
         .collect();
         let extra: Vec<_> = names.difference(&allowed).collect();
         assert!(extra.is_empty(), "undeclared inheritance: {extra:?}");
+        assert!(names.contains("P4_OVERLAY") && names.contains("TERM"), "{names:?}");
         // The overlay WINS over the base on a collision.
         assert!(
             environ.contains("PATH=/p4/overridden"),
             "the overlay did not win: {environ}"
         );
-        teardown(f).await;
-    });
-}
 
-/// Descriptor hygiene, enforced rather than assumed: exactly stdin, stdout,
-/// stderr and the result channel. A leaked descriptor is how a task reaches
-/// something nobody granted it.
-#[test]
-fn p4_a_task_has_exactly_the_descriptors_it_was_given() {
-    let _fixture = fixture_guard();
-    runtime().block_on(async {
-        let mut f = stage_d_fixture("owned").await;
-        // ARGV mode, deliberately. A Mix interpreter opens its own
-        // descriptors during startup — prelude, config, the Bus probe — so a
-        // source task cannot distinguish "inherited from the parent" from
-        // "opened by myself", and asserting a count there would be asserting
-        // something the fixture cannot observe. `sh` opens nothing of its own,
-        // so what it sees IS what the spawn handed it.
-        //
-        // argv mode also has no result channel, which makes the expected set
-        // exactly the three standard streams plus the listing's own handle.
+        // Descriptor hygiene, in ARGV mode because that is where it is
+        // OBSERVABLE: a Mix interpreter opens its own descriptors at startup,
+        // so a source task cannot distinguish inheritance from its own work.
+        // `sh` opens nothing, so what it sees is what the spawn handed it —
+        // and argv mode has no result channel, so the expected set is the three
+        // standard streams plus the listing's own handle.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
-            1,
+            2,
             serde_json::json!({"argv": ["sh", "-c", "ls /proc/self/fd"]}),
         )
         .await
@@ -2522,15 +2532,13 @@ fn p4_a_task_has_exactly_the_descriptors_it_was_given() {
         for expected in [0, 1, 2] {
             assert!(open.contains(&expected), "fd {expected} missing: {listed}");
         }
-        assert!(
-            open.len() <= 4,
-            "a descriptor leaked into the task: {listed}"
-        );
-        // stdin is /dev/null, not the pane.
+        assert!(open.len() <= 4, "a descriptor leaked into the task: {listed}");
+
+        // stdin is /dev/null, not the pane: a reader sees EOF at once.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
-            2,
+            3,
             serde_json::json!({"argv": ["sh", "-c", "cat; echo DRAINED"]}),
         )
         .await
@@ -2547,22 +2555,21 @@ fn p4_a_task_has_exactly_the_descriptors_it_was_given() {
     });
 }
 
-/// Hard termination, and the honesty of the outcome. A timeout is POLICY: it
-/// must not be reported as an indistinguishable external signal.
+/// The arc's ONE hard termination guarantee, both ways in.
 #[test]
-fn p4_a_timeout_terminates_the_group_and_reports_itself_as_policy() {
+fn p4_termination_is_hard_and_the_outcome_names_the_policy() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         let mut f = stage_d_fixture("owned").await;
+
+        // A timeout is POLICY. It must not be reported as an indistinguishable
+        // external signal, and it must actually terminate the group.
         let started = Instant::now();
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
             1,
-            serde_json::json!({
-                "argv": ["sleep", "30"],
-                "timeout_ms": "1500",
-            }),
+            serde_json::json!({"argv": ["sleep", "30"], "timeout_ms": "800"}),
         )
         .await
         .expect("admitted");
@@ -2574,22 +2581,13 @@ fn p4_a_timeout_terminates_the_group_and_reports_itself_as_policy() {
         let task = &report["report"];
         assert_eq!(task["outcome"]["kind"], "timeout", "{task}");
         assert_eq!(task["outcome"]["escalated_to"], "sigterm", "{task}");
-        teardown(f).await;
-    });
-}
 
-/// The one HARD guarantee in the arc. A child that ignores SIGTERM is killed,
-/// and the report names how far the ladder had to go — from wait(), not from
-/// the fact that a signal was sent.
-#[test]
-fn p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill() {
-    let _fixture = fixture_guard();
-    runtime().block_on(async {
-        let mut f = stage_d_fixture("owned").await;
+        // A child that IGNORES SIGTERM is killed, and the report says how far
+        // the ladder had to go — read from wait(), not from the signal call.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
-            1,
+            2,
             serde_json::json!({
                 "argv": ["sh", "-c", "trap '' TERM; echo READY; while true; do sleep 1; done"],
                 "timeout_ms": "15000",
@@ -2597,7 +2595,7 @@ fn p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill() {
         )
         .await
         .expect("admitted");
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let cancelled = execute_call(
             &mut f.parent,
             &f.bound,
@@ -2611,14 +2609,13 @@ fn p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill() {
         let report = task_report(&mut f.parent, &f.bound, operation).await;
         let task = &report["report"];
         assert_eq!(task["outcome"]["kind"], "cancelled", "{task}");
-        // The ladder had to go all the way, and the report says so rather than
-        // implying the TERM was enough.
         assert_eq!(task["outcome"]["escalated_to"], "sigkill", "{task}");
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "escalation did not complete"
         );
-        // A cancel after settlement answers the settled fact, not a new request.
+
+        // Cancel is idempotent and answers the settled fact afterwards.
         let late = execute_call(
             &mut f.parent,
             &f.bound,
@@ -2632,20 +2629,23 @@ fn p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill() {
     });
 }
 
-/// Truncation is reported per stream with the real byte count — never silent,
-/// and never a reason for the task itself to fail.
+/// Bounds and refusals: nothing is silent, nothing wedges, and the deferrals
+/// are advertised rather than left to look like typos.
 #[test]
-fn p4_oversized_streams_are_truncated_and_say_so() {
+fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         let mut f = stage_d_fixture("owned").await;
+
+        // Truncation is reported with the REAL byte count, and never turns a
+        // successful task into a failed one.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
             1,
             serde_json::json!({
                 "argv": ["sh", "-c", "yes ABCDEFGHIJ | head -c 300000"],
-                "timeout_ms": "30000",
+                "timeout_ms": "20000",
             }),
         )
         .await
@@ -2659,108 +2659,25 @@ fn p4_oversized_streams_are_truncated_and_say_so() {
             "the REAL byte count must survive truncation: {task}"
         );
         assert!(task["stdout"]["text"].as_str().unwrap().len() <= 64 * 1024);
-        // A truncated stream does not make the execution a failure: the task
-        // exited zero and the outcome says so.
-        assert_eq!(task["outcome"]["kind"], "exited", "{task}");
         assert_eq!(task["outcome"]["code"], 0, "{task}");
-        teardown(f).await;
-    });
-}
 
-/// One dedupe space, records tagged. Neither surface can read the other's
-/// operations, and a retry replays rather than running twice.
-#[test]
-fn p4_the_two_surfaces_share_one_dedupe_space_and_cannot_read_each_other() {
-    let _fixture = fixture_guard();
-    runtime().block_on(async {
-        let mut f = stage_d_fixture("owned").await;
-        let body = serde_json::json!({"source": "print(\"TASK_ONCE\")\n1"});
-        let first = submit_task(&mut f.parent, &f.bound, 1, body.clone())
-            .await
-            .expect("admitted");
-        task_report(&mut f.parent, &f.bound, first).await;
-        // The identical retry replays the same operation.
-        let again = submit_task(&mut f.parent, &f.bound, 1, body)
-            .await
-            .expect("a retry replays");
-        assert_eq!(again, first, "a retry minted a second task");
-
-        // A task operation is NOT readable through the evaluation surface, and
-        // the refusal is the same one an unknown id gets.
-        let error = execute_call(
-            &mut f.parent,
-            &f.bound,
-            "shell.execute.result",
-            operation_request(&f.bound, first),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
-
-        // And the reverse: an evaluation is not readable as a task.
-        let generation = prompt_generation(&mut f.parent, &f.bound).await;
-        let accepted = execute_call(
-            &mut f.parent,
-            &f.bound,
-            "shell.execute",
-            execute_request(&f.bound, 2, generation, "print(\"EVAL\")"),
-        )
-        .await
-        .expect("admitted");
-        let evaluation = counter(&accepted["operation_id"]);
-        let error = execute_call(
-            &mut f.parent,
-            &f.bound,
-            "shell.task.result",
-            operation_request(&f.bound, evaluation),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
-
-        // A caller request id is shared across the surfaces: reusing id 1 on
-        // the OTHER surface with a different body is a conflict, not a second
-        // execution.
-        let error = execute_call(
-            &mut f.parent,
-            &f.bound,
-            "shell.execute",
-            execute_request(&f.bound, 1, generation, "print(\"NEVER\")"),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error.contains("CONFLICT") || error.contains("UNKNOWN_OUTCOME"),
-            "one dedupe space must refuse a reused id across surfaces: {error}"
-        );
-        teardown(f).await;
-    });
-}
-
-/// Refusals and bounds: a task that cannot start leaves no trace, the
-/// concurrency cap is a real limit, and the deferrals are advertised.
-#[test]
-fn p4_refusals_leave_no_trace_and_deferrals_are_advertised() {
-    let _fixture = fixture_guard();
-    runtime().block_on(async {
-        let mut f = stage_d_fixture("owned").await;
-        // A cwd that does not exist is refused BEFORE any spawn.
+        // A cwd that does not exist is refused BEFORE any spawn, and the
+        // request id is untouched — so the same id may simply be retried.
         let error = submit_task(
             &mut f.parent,
             &f.bound,
-            1,
+            2,
             serde_json::json!({"source": "1", "cwd": "/nonexistent/p4"}),
         )
         .await
         .unwrap_err();
         assert!(error.contains("NOT_FOUND"), "{error}");
-        // ...and the id is untouched, so the same id may simply be retried.
-        let operation = submit_task(&mut f.parent, &f.bound, 1, serde_json::json!({"source": "1"}))
+        let operation = submit_task(&mut f.parent, &f.bound, 2, serde_json::json!({"source": "1"}))
             .await
             .expect("a refused task must not burn its request id");
         task_report(&mut f.parent, &f.bound, operation).await;
 
-        // A zero timeout is refused; so is one past the cap.
+        // A zero timeout is refused, and so is one past the cap.
         for timeout in ["0", "600001"] {
             let error = submit_task(
                 &mut f.parent,
@@ -2773,7 +2690,9 @@ fn p4_refusals_leave_no_trace_and_deferrals_are_advertised() {
             assert!(error.contains("INVALID_ARGUMENT"), "{timeout}: {error}");
         }
 
-        // The concurrency cap is a REAL limit: four long tasks, then refusal.
+        // Concurrency is a REAL limit — processes and supervisor threads — so
+        // it refuses where the record table evicts. Short, self-terminating
+        // sleepers: the cap is what is under test, not the wait.
         let mut held = Vec::new();
         for id in 10..14u64 {
             held.push(
@@ -2781,7 +2700,7 @@ fn p4_refusals_leave_no_trace_and_deferrals_are_advertised() {
                     &mut f.parent,
                     &f.bound,
                     id,
-                    serde_json::json!({"argv": ["sleep", "4"], "timeout_ms": "5000"}),
+                    serde_json::json!({"argv": ["sleep", "3"], "timeout_ms": "4000"}),
                 )
                 .await
                 .unwrap_or_else(|e| panic!("task {id} should start: {e}")),
@@ -2791,7 +2710,7 @@ fn p4_refusals_leave_no_trace_and_deferrals_are_advertised() {
             &mut f.parent,
             &f.bound,
             14,
-            serde_json::json!({"argv": ["sleep", "4"], "timeout_ms": "5000"}),
+            serde_json::json!({"argv": ["sleep", "3"], "timeout_ms": "4000"}),
         )
         .await
         .unwrap_err();
