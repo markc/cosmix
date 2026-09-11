@@ -2488,6 +2488,56 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         // name), so a non-member/tombstoned peer can't keep an open socket to hit
         // un-authed builtins or route as anonymous.
         let mut close_after_refuse = false;
+        // Private native events address a verified connection, including an
+        // ambient owner with no registered name. The guard is a constraint,
+        // never a principal assertion; the session engine checks source role,
+        // live lease, target epoch/connection and same UID under its lock.
+        if let Some(value) = bus_msg.get("recipient_connection").map(str::to_owned) {
+            let result = if let (Some(principal), Ok(guard)) = (
+                &state.principal,
+                serde_json::from_str::<session::RecipientGuard>(&value),
+            ) {
+                let mut sessions = state.sessions.lock().await;
+                let _fence = state
+                    .delivery_fence
+                    .read()
+                    .expect("delivery fence poisoned");
+                canonicalize_routed_from_in_place(&mut bus_msg, service_name.as_deref());
+                stamp_broker_origin(&mut bus_msg, BrokerOrigin::Local);
+                sessions.private_event(principal, &guard, &mut bus_msg)
+            } else {
+                Err(cosmix_bus::native_session::SessionError::forbidden())
+            };
+            let observe = state.observe.for_class(TrafficClass::NativeSession);
+            if observe.is_active() {
+                observe.observe(
+                    Observation::from_message(
+                        ObserveDirection::Local,
+                        if result.is_ok() {
+                            ObserveOutcome::Delivered
+                        } else {
+                            ObserveOutcome::Rejected
+                        },
+                        &bus_msg,
+                        &bus_msg.to_wire(),
+                        None,
+                    )
+                    .with_class(TrafficClass::NativeSession),
+                );
+            }
+            if let Err(error) = result {
+                let reply = session_delivery_error(
+                    &error,
+                    state.principal.is_some(),
+                    None,
+                    bus_msg.command_name(),
+                );
+                deliver_observed_response(&observe, &tx, &reply, ObserveDirection::Local, None);
+            }
+            // Omit before enqueue to tap; never copy these private payloads
+            // into the general local/mesh/retention paths.
+            continue;
+        }
         match route {
             Route::LocalNoded => {
                 // SPEC 13 §9a (2-c-2b) — the register-time enforce gate. Per

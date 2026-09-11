@@ -1,0 +1,92 @@
+-- Hard gate: the S4 recipient-enforcement fixtures (BROKER-025 p0i-07/08/09/10)
+-- actually RUN. They are #[ignore]'d because each one spawns a real broker and
+-- a real Mix child over a PTY, which means a plain `cargo test` reports them as
+-- "ignored" and a green run says nothing about enforcement at all.
+--
+-- The count is the point. libtest exits 0 when its filter matches nothing, so a
+-- renamed module, a moved file or a mistyped filter would otherwise leave this
+-- gate passing while running zero enforcement tests. Requiring the exact
+-- expected "N passed" turns any of those into a failure.
+--
+-- Run from the repository src/ directory, like its sibling
+-- check-production-e2e.mix. That script owns p0i-01, so this one does not
+-- repeat it. The cross-UID fixture is NOT included either: it needs root plus a
+-- second UID, refuses to pass silently without them, and is documented in
+-- docs/cos/term-native-control.md.
+
+-- Every S4 fixture this gate is responsible for, by full test path, and nothing
+-- else. Full paths so a module rename cannot be absorbed by a prefix match.
+$fixtures = [
+  "native_session::enforcement_tests::p0i_07_actor_table_survives_reconnect_churn",
+  "native_session::enforcement_tests::p0i_07_affected_set_and_live_generation_authority",
+  "native_session::enforcement_tests::p0i_07_capability_separation_and_bound_termination",
+  "native_session::enforcement_tests::p0i_07_owner_mutations_and_retired_retries",
+  "native_session::enforcement_tests::p0i_07_real_recipient_both_policies",
+  "native_session::enforcement_tests::p0i_08_child_pane_term_and_broker_lifetime",
+  "native_session::enforcement_tests::p0i_08_lease_window_refresh_and_successor_binding_invalidation",
+  "native_session::enforcement_tests::p0i_08_queued_input_human_revoke_and_deadline",
+  "native_session::enforcement_tests::p0i_08_stale_cleanup_and_private_event_connection_guard",
+  "native_session::enforcement_tests::p0i_09_real_payload_tap_observe_and_logs",
+  "native_session::enforcement_tests::p0i_10_launch_failures_reach_real_recipient_denial",
+  "native_session::enforcement_tests::p0i_10_parent_bootstrap_outage_has_only_diagnostic_lane",
+  "native_session::enforcement_tests::p0i_10_real_tcp_fallback_is_control_free",
+  "native_session::enforcement_tests::p0i_10_unbound_pane_has_no_control"
+]
+$expected = length($fixtures)
+
+$root = cwd()
+if not exists($root + "/desktop/apps/term/src/control.rs") then
+  print("GATE BLOCKED: run from the repository src/ directory")
+  exit(2)
+end
+
+-- The fixtures refuse an installed or stale binary: they compare the Mix
+-- build's git sha against HEAD and require a clean checkout. Build it here so
+-- the gate cannot be satisfied by whatever happens to be lying in target/.
+print("building the current-HEAD Mix the fixtures require ...")
+-- RUSTC_WRAPPER disabled as in the sibling gate: a caching layer must never
+-- be able to decide whether this passes.
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 3000, env: {"RUSTC_WRAPPER": ""}})
+if $build["exit_code"] != 0 then
+  print($build["stderr"])
+  print("GATE BLOCKED: could not build cosmix-mix; an unbuilt binary is not a pass")
+  exit(2)
+end
+$binary = $root + "/target/release/mix"
+if not exists($binary) then
+  print("GATE BLOCKED: " + $binary + " missing after a successful build")
+  exit(2)
+end
+
+$argv = concat(
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  $fixtures
+)
+
+print("running " + $expected + " S4 enforcement fixtures ...")
+$run = run_argv($argv, {
+  timeout: 3000,
+  env: {COSMIX_E2E_MIX_BIN: $binary, "RUSTC_WRAPPER": ""}
+})
+print($run["stdout"])
+
+if $run["exit_code"] != 0 then
+  print($run["stderr"])
+  print("GATE FAIL: the S4 enforcement suite did not pass")
+  exit(1)
+end
+
+-- The count check. A filter that matched nothing also exits 0.
+$want = "test result: ok. " + $expected + " passed"
+if not contains($run["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  print("A zero-match filter, a renamed module or a moved fixture all exit 0;")
+  print("the count is what tells them apart from a real run.")
+  exit(1)
+end
+
+print("GATE PASS: " + $expected + " S4 enforcement fixtures ran and passed")
+print("NOT covered here: p0i-01 belongs to check-production-e2e.mix, and")
+print("p0i_07_other_uid_both_policies needs root plus a second UID. That one")
+print("refuses rather than passing silently; see the manual to run it.")
+exit(0)

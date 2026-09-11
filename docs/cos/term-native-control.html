@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/term-native-session</title>
+    <title>CosMix — cos/term-native-control</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,298 +441,196 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/term-native-session.md"><div class="prose"><h1 id="term-native-session-launch-handoff">Term native-session launch handoff</h1>
-<p>Term uses a separate verified Unix connection for the native-session profile.
-The diagnostic <code>term</code> service remains independent. The system broker account
-defaults to <code>cosmix-noded</code>; trusted launch configuration can select a different
-account with <code>COSMIX_BROKER_ACCOUNT</code>. The endpoint follows the client library's
-explicit/config/discovery/system order and always undergoes ownership and peer
-credential verification. Identity establishment runs on the actor. Before the
-first TabSet open, main waits once for at most 900ms for a ready bundle; healthy
-startup can therefore bind pane 1. An unavailable profile or failed grant leaves
-ordinary panes usable, including Ctrl+Shift+T.
-The allocated native route's <code>term.session</code> reports authorised pane binding
-status with an explicit target. The global diagnostic <code>term</code> route serves no
-protected controls. See <a href="/cos/term-native-control">native control</a> for the S4
-policy, input, properties and retry contracts. Status snapshots alone remain
-historical diagnostics, not evidence of live authority.</p>
-<p>The actor pre-provisions one keypair, grant and sealed LaunchFd for the next
-pane ID. Opening or splitting consumes a ready bundle without RPC, channel
-waiting or memfd construction on the GUI/Bus thread. If none is ready, the
-pane opens unbound (graphics-only), logs the reason and records it for
-<code>term.session</code>. The next bundle is provisioned in the background, including
-from the five-second renew tick. Its conservative local CLOCK_BOOTTIME expiry
-starts before grant creation, includes suspend and never extends on fetch.
-An unused bundle (or a missing bundle for the next slot) refreshes only while
-user presence is recent. Physical keyboard input, pointer/menu actions and
-window focus gain update a coarse atomic last-activity timestamp. Bus mutations
-do not manufacture presence. The presence window is five minutes, and each
-slot has a minimum 60-second interval between mints. Once idle, the actor holds
-the pool until activity returns. This policy applies to the unconsumed pool,
-not to live panes. No later pane open waits for RPC or startup readiness.
-Unbound running panes are not retroactively bootstrapped.
-The mint floor starts at the create acknowledgement (or uncertain timeout),
-so RPC latency cannot shorten the interval between issued names.</p>
-<p>A bundle needs at least twelve seconds remaining at consumption: five two-second
-connect/hello/challenge/list/prove budgets plus spawn slack. Short-window bundles
-take the unbound fallback and the pool subsequently refreshes under presence
-and its mint floor. Reconnection and reconciliation first withdraw shared
-readiness and invalidate the old consumption latches, before any await. The
-actor retains only the unused key and republishes a newly sealed descriptor
-and fresh latches under the reconciled scope. An old generation-2 descriptor
-cannot be consumed during replacement with a generation-1 broker incarnation.</p>
-<p>No-name failures clear the provisioning latch so the next tick can retry.
-Definitive create refusals release the provisional mint floor. A missing or
-malformed create ACK retains the floor and hold because a name may have been
-issued. Memfd delivery failure retains the known grant and key: the next tick
-retries delivery of that grant without spending another name.</p>
-<p>The 32-pane admission limit happens to equal noded's default per-parent pending
-grant quota. Look-ahead provisioning spends one slot too; configured lower
-quotas can refuse it. This reports “broker pending-grant quota exhausted” and
-opens an unbound pane rather than failing pane creation.</p>
-<p>Term retains its Ed25519 key for challenge-based resumption. A separate actor
-renews every five seconds. Replacement parent records, including after broker
-restart, receive fresh grants for live panes using their retained public keys.
-Re-grants advance the pane generation within the same parent instance. The child proves
-with its own retained private key; Term never receives that key back.</p>
-<p>A never-enrolled pane receives its initial grant and at most one new grant per
-external recovery event (successful reconnect, lifecycle gap or explicit pane
-restart). Expiry alone holds it with a visible diagnostic. For a previously
-enrolled pane, expiry schedules at most three automatic attempts with delays
-of 120, 240 and 480 seconds after successive expiries/failures. Reconnect/gap
-re-arms recovery but never resets the child's 60-second mint floor, including
-across broker epochs. An external re-grant blocked by that floor is deferred;
-it is a deliberate wait, not a recovery error. Attempts are charged before
-mutation, including uncertain
-ACKs and quota refusals. Existing grants are reconciled by key before minting;
-their own state, expiry identity and conservative local window are checked
-independently of record state. Consumed grants on attached/suspended records
-are retained attachments, not launchable pending grants. Broker-domain
-absolute timestamps are never compared with the client's time namespace.</p>
-<p>This bound is deliberate under BROKER-019's quota qualification: noded retains
-issued names for the whole epoch (65,536 node-wide). Unbounded 30-second
-re-grants for 32 idle panes would exhaust that budget in roughly 17 hours.
-For one continuously refreshed unused pool slot, the 60-second floor permits
-at most 1,440 issued names in a half-open 24-hour period, including the initial
-mint; idle periods issue none. Against 65,536 names per epoch, nonstop refresh
-alone could still use the shared budget in roughly 45 days. Parent allocations,
-explicit new-pane launches and live-child recovery also spend names. Each live
-child's reconnect/gap re-grants now obey the same floor, so event storms cannot
-mint repeatedly within a minute. The broker's quota remains the final bound.</p>
-<h2 id="sealed-memfd-version-1">Sealed memfd version 1</h2>
-<p>The nonsecret environment marker <code>COSMIX_SESSION_FD</code> is the decimal descriptor
-number. The anonymous memfd contains exactly these bytes:</p>
-<table><thead><tr><th>Offset</th><th>Encoding</th></tr></thead><tbody>
-<tr><td>0</td><td>Version byte <code>01</code></td></tr>
-<tr><td>1–4</td><td>Public JSON length N, unsigned 32-bit big-endian, at most 16384</td></tr>
-<tr><td>5–(4+N)</td><td>UTF-8 JSON object with <code>grant</code> and <code>record</code>, the typed <code>grant.create</code> result using BUS-016 encodings</td></tr>
-<tr><td>(5+N)–(36+N)</td><td>32 raw Ed25519 seed bytes, not the expanded 64-byte key</td></tr>
-<tr><td>37+N</td><td>Exact EOF; no trailing bytes</td></tr>
+        <div id="content-doc" data-prerendered="cos/term-native-control.md"><div class="prose"><h1 id="term-native-control">Term native control</h1>
+<p>The global TCP <code>term</code> diagnostic registration serves discovery (<code>INFO</code> and
+<code>HELP</code>) and sends completion notifications. It refuses all protected reads,
+mutations and property requests with <code>FORBIDDEN</code>, including when native-session
+bootstrap fails. It is not an alternative control route.</p>
+<p>Protected controls belong on the broker-allocated, verified Unix Term identity.
+BROKER-023 defines their policy; a diagnostic service name is never proof of
+authority.</p>
+<h2 id="recipient-gate">Recipient gate</h2>
+<p>The native identity actor receives protected requests on its own verified Unix
+connection. It uses the broker-stamped principal, its own current Term record,
+and the live pane model. It never takes identity or policy from request bodies,
+service names, PIDs or ordinary TCP headers.</p>
+<p><code>COSMIX_TERM_POLICY=restricted</code> selects the restricted policy at allocation;
+the default is <code>default-open</code>. An invalid value disables native bootstrap.
+The allocated record's policy remains authoritative on resumption.</p>
+<p>Under default-open, an independent verified same-UID owner connection has all
+six owner capabilities without confirmation. A bound pane-shell connection has
+only its recorded capabilities and pane scope, under either policy. Opening
+an independent connection is ambient owner access under default-open, including
+when the process happens to be a child. Restricted policy removes that ambient
+access. Other UIDs, TCP callers, names-only impostors and undelegated principals
+receive the same <code>FORBIDDEN</code> refusal without target-existence details.</p>
+<p>Every request names a <code>target</code> object:</p>
+<pre><code class="language-json">{
+  "target": {
+    "instance_id": "00000000000000000000000000000001",
+    "incarnation": "00000000000000000000000000000002",
+    "pane_id": "1",
+    "pane_generation": "1"
+  }
+}
+</code></pre>
+<p>IDs above are illustrative. Discover current records through the native session
+API. Instance/incarnation use BUS-016 hex encodings; generations, pane IDs and
+request IDs use decimal strings. A graphics-only pane has no protected control
+authority: delivering a launch descriptor alone is insufficient. The actor must
+first observe or reconcile a successful child attachment. There is no active-pane
+fallback for mutations.</p>
+<table><thead><tr><th>Verb</th><th>Required capability</th><th>Additional fields / result</th></tr></thead><tbody>
+<tr><td><code>term.session</code>, <code>term.list</code>, <code>term.tabs</code>, <code>term.panes</code></td><td><code>read_state</code></td><td>Scoped pane/tab metadata, binding diagnostic, input generation, retry epoch/high-water and limits</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>read_state</code></td><td>Metadata only by default</td></tr>
+<tr><td><code>term.snapshot</code> with <code>contents:true</code></td><td><code>read_contents</code></td><td>Snapshot text, bounded by the response limit</td></tr>
+<tr><td><code>term.type</code></td><td><code>input</code></td><td><code>text</code>, <code>foreground_generation</code>, mutation ID/epoch</td></tr>
+<tr><td><code>term.tab.new</code></td><td><code>manage_layout</code></td><td>Create a tab; requires owner/owning Term authority</td></tr>
+<tr><td><code>term.pane.split</code></td><td><code>manage_layout</code></td><td><code>dir</code>: <code>h</code>, <code>horizontal</code>, <code>v</code> or <code>vertical</code>; requires owner/owning Term authority</td></tr>
+<tr><td><code>term.tab.select</code>, <code>term.pane.select</code></td><td><code>manage_layout</code></td><td>Select the explicitly targeted pane and its tab</td></tr>
+<tr><td><code>term.tab.close</code>, <code>term.pane.close</code></td><td><code>terminate</code>, plus affected layout authority</td><td>Close the explicit target</td></tr>
+<tr><td><code>term.execute</code></td><td><code>execute</code></td><td>Always <code>UNSUPPORTED</code>; no Stage-D execution API is enabled</td></tr>
+<tr><td><code>term.operation</code></td><td><code>read_state</code></td><td><code>operation_id</code>: retrieve the caller's retained operation outcome</td></tr>
 </tbody></table>
-<p>The version byte is the sole extension point. Version 1 locks the exact public
-descriptor schema (<code>deny_unknown_fields</code> is deliberate); adding descriptor
-fields requires a new layout version. This differs from lifecycle notices,
-which are extensible hints under BROKER-021.</p>
-<p>Term writes the seed separately from the public JSON, seals shrink/grow/write,
-then seals the seal set. Both reserved source and target descriptors are
-CLOEXEC in Term. The pinned teletypewriter patch duplicates source onto target
-only after fork, closes source in the child, and leaves PTY stdio intact. Term
-closes both descriptors immediately after spawn. Temporary seed arrays and the
-child signing key use zeroize-on-drop. Seals protect integrity, not secrecy.
-Term also sets CLOEXEC on inherited bootstrap descriptors numbered at least 3,
-before its first spawn; malformed markers never change stdio.
-The memfd name <code>cosmix-session</code> identifies its purpose through
-procfs; this metadata disclosure is accepted. Anonymous memfd pages may be
-swapped: protection against privileged memory inspection or swap extraction is
-outside this threat model. Sealing is not encryption or memory locking.</p>
-<p>The child MUST seek to offset zero or use <code>pread</code>; inherited descriptors share
-an open-file offset, so it must not depend on Term's last offset. It SHOULD
-verify <code>F_GET_SEALS</code> contains SHRINK, GROW, WRITE and SEAL before parsing.
-<code>record.lease_remaining_ms</code> is stale by construction and informative only;
-it is never a live-authority deadline.</p>
-<p>Construct the typed client's <code>ExpectedScope</code> from the retained launch scope:</p>
-<table><thead><tr><th>Expected field</th><th>Source</th></tr></thead><tbody>
-<tr><td><code>unix_uid</code></td><td><code>record.owner_uid</code>, checked against the child's effective UID</td></tr>
-<tr><td><code>parent_key_hash</code></td><td><code>Some(grant.parent_key_hash)</code></td></tr>
-<tr><td><code>pane_id</code></td><td><code>record.pane_id</code></td></tr>
-<tr><td><code>pane_high_water</code></td><td><code>record.pane_generation</code>, retained and advanced within a parent incarnation</td></tr>
-<tr><td><code>role</code></td><td><code>record.role</code></td></tr>
-<tr><td><code>public_key_hash</code></td><td>SHA-256 of the raw retained child public key</td></tr>
-<tr><td><code>capabilities_hash</code></td><td>SHA-256 of <code>encode_capabilities(record.capabilities)</code></td></tr>
-<tr><td><code>broker_epoch</code></td><td>Fresh <code>session.hello</code> on the current verified connection</td></tr>
-<tr><td><code>purpose</code></td><td>Enrol for a pending child; resume for an existing attachment</td></tr>
-</tbody></table>
-<p>Do not construct expectations by copying a received challenge. The key
-selector's fixed wire tag is not a purpose claim: noded derives the returned
-purpose. <code>ChallengeResult::sign</code> checks it and the current broker epoch against
-the independent expectations before signing. A broker restart requires a fresh
-hello and parent-confirmed replacement scope, retaining the parent key hash.</p>
-<p>Mix consumes this layout at the first instruction of its application main,
-before the job-control stage entry, evaluator thread, startup hooks or user
-source. It removes the marker immediately, quarantines and owns valid fds &gt;=3,
-checks all four seals, anonymous regular-file status, exact bounded length,
-version and descriptor/key scope, then closes the fd on success or failure.
-Public JSON and the seed are read with separate <code>pread</code> calls. The inherited
-offset and stale lease field never affect validation. Invalid stdio markers
-are removed without touching the corresponding descriptor.
-On bootstrap failure Mix scans <code>/proc/self/fd</code> and closes descriptors &gt;=3
-linking to <code>memfd:cosmix-session*</code>, even when the marker named the wrong fd.
-Successful consumption also closes duplicate launch fds before starting threads.
-If <code>/proc/self/fd</code> is unavailable, the sweep cannot discover mislabelled or
-duplicate fds. The known valid-marker descriptor is still closed; the extra
-sweep is defence in depth and requires procfs.</p>
-<p>The binary-only <code>cosmix-mix/src/native_session.rs</code> module keeps the 32-byte seed
-in private <code>Zeroizing&lt;[u8; 32]&gt;</code> storage. It moves into a dedicated resident
-thread with its own Tokio runtime; temporary Ed25519 signing keys zeroize on
-drop. The evaluator library cannot import the executable, and no builtin,
-variable, property, context object or Bus handler receives the seed, bootstrap
-object or an attachment-owner handle. Mix adds no language surface for binding.
-The existing diagnostic Bus runtime is independent. A later child receives
-neither the launch descriptor nor its marker.</p>
-<p>Only environment strings are captured before the evaluator starts. The resident
-resolves account NSS, discovers paths and reads configuration from those owned
-strings, so name-service or filesystem latency cannot delay the prompt. It never
-reads the process environment concurrently with evaluator <code>setenv</code>.</p>
-<p>The resident task performs verified Unix connect, hello, key-selected challenge,
-owner-UID <code>session.self {record_id}</code> discovery and prove, then renews every five seconds. Immutable
-expectations come from the launch descriptor. Fresh authenticated discovery
-determines enrol versus resume and the parent incarnation, independently of the
-challenge; hello supplies the epoch. Signing still checks the retained parent
-key hash, UID, pane, role and capability hashes. Pane high-water advances within
-one parent domain and resets only on authenticated parent/epoch replacement,
-with parent-key continuity checked before committing the reset. Same-record
-resumption increments binding generation; a new broker epoch creates a new
-record whose initial attachment generation is 1, not the old generation plus 1.
-The challenge supplies a record selector only; its scope is checked against the
-retained launch expectation and the independent authenticated read. Enrolment
-and resumption never depend on the diagnostic <code>session.list</code> snapshot cap.</p>
-<p>Expired or consumed proof challenges receive at most three fresh-challenge
-retries per connection, separated by at least five seconds. Other refusals hold
-for external hints; transport failures use reconnect backoff. Successful proof
-resets the retry budget. Lifecycle notices and gaps tolerate additional fields;
-malformed hints use the once-only diagnostic reporter.</p>
-<p>Before either REPL exec-restart path replaces Mix, it signals the private owner
-to revoke its record and waits at most 16 seconds. The owner confirms revocation
-through an independent targeted read because self-revoke can close the socket
-before its ACK arrives. During reconnect backoff it retains the last record,
-opens an independent connection and re-proves its retained key to regain
-self-revoke authority. The restart transaction has a ten-second total budget,
-with the same two-second per-RPC limit. A confirmed result means the same record
-was observed revoked, not that this particular RPC caused revocation (Term or
-expiry may have done so). One diagnostic reports the result; an unavailable broker
-leaves cleanup to lease/window expiry. The replacement shell runs normally but
-stays unbound until pane restart: v1 deliberately does not retain the seed over
-exec. A surviving PID alone must not leave a phantom attachment.</p>
-<p>No marker means an immediate silent return, with no configuration lookup,
-thread, runtime or broker connection. A present invalid bootstrap produces one
-stage-labelled diagnostic and ordinary shell execution continues. Binding RPCs
-never block the evaluator. Transport recovery makes at most six attempts with
-delays of 5, 10, 20, 40 and 40 seconds; verification/profile failures stop
-immediately without downgrade. On a live connection, absent/refused key lookup
-retains broker wake interest and waits for a lifecycle notice or gap, not a
-polling timer. Recovery events coalesce behind a five-second attempt floor;
-same-generation attached notices cannot produce a self-resume loop. A wake
-quota refusal is reported and permits only one delayed retry after 60 seconds.
-If that fails to obtain either a challenge or interest, the owner stops.
-Repeated failures are suppressed after the first diagnostic. A later wake-quota
-failure has its own once-only diagnostic, as BROKER-019 explicitly requires;
-neither its fallback retry nor subsequent reconnects repeat it.
-Exiting Mix never joins this task:
-the process closes its connection and Term's child-exit handler owns revocation.</p>
-<p>Pane close invalidates local session state before removing metadata or queuing
-cleanup. The cleanup worker waits up to three seconds for a revoke attempt.
-That is best effort, not guaranteed acknowledgement: three RPCs can take six
-seconds, plus queued work. Child
-exit also queues revocation directly from the PTY event. Shutdown attempts
-child revocations followed by parent revocation; connection detection and
-broker lease/resumption deadlines bound lost notifications. Transport close is
-bounded by the two-second RPC budget; actor shutdown has a three-second child
-batch, two-second parent revoke and two-second close. Supervisor teardown waits
-at most eight seconds and never joins an unfinished worker. Timeout diagnostics
-name abandoned revokes or transport close and the remaining 15-second lease /
-30-second window expiry. Stopping during connection establishment also reports
-the skipped parent revoke. Failed child closes
-retain public-key tombstones for retry; a 128-entry backlog stops provisioning
-new grants (panes still open), rather than accumulating dead entries forever.
-An epoch replacement drops obsolete dead entries. Unknown lifecycle fields
-remain rejected and dropped-notice parse errors are logged. This slice does
-not install protected command handlers; their authorisation gate is S4.</p>
-<h2 id="verification-inventory">Verification inventory</h2>
-<p>Source tests cover memfd layout round-trip and all four seals; a real PTY
-helper checks that the mapped memfd appears exactly once and is absent from a
-second child while Term's descriptors remain open. Real in-process noded tests
-cover pane and Term revocation, an actual OS child exit through the PTY event
-path, and metadata/PTY ordering probes under a paused real broker. They also
-cover same-epoch resumption, lost create-ACK reconciliation, broker bounce with
-the retained public key and parent-key hash, no-regrant expiry hold while renews
-keep the parent alive, immediate ready/missing-bundle consumption, broker-down
-Ctrl+Shift+T, lowered-quota diagnostics and saturated-UDS close/exit deadlines.
-The expiry test uses the broker's real clock and takes at least 31 seconds.
-A separate simulated-cycle test verifies noded's actual minted 30-second expiry
-and counts real grant.create calls across the exhaustion horizon. Synthetic
-expiry uses the real broker's revoke transition and the production notice/retry
-paths; it does not simulate broker RPC replies. The memfd helper also verifies
-Term's startup quarantine prevents a further child's inheritance. Typed-client
-integration tests reject wrong proof purpose and broker epoch before signing.</p>
-<p>The tests-only support crate embeds production noded modules by path. Startup
-tests exercise first-open startup through main's Supervisor/TabSet path
-with a healthy and an absent broker, without test-manufactured readiness. New
-regressions cover short-window rejection; generation-2 descriptor withdrawal
-before delayed reconnect and republication at generation 1; free retry after
-quota/fetch/memfd failures versus uncertain create ACKs; gap-storm mint floors;
-and a full simulated day of active-presence pool mints followed by an idle day.
-The wall-clock broker-bounce test allows the deliberate 60-second mint floor.
-The PTY ordering probe signals entry before its broker RPC, and stdio markers
-are rejected before any quarantine syscall.</p>
-<p>Each fixture owns a separate runtime so a bounce drops accepted sockets and all
-background tasks, not just listeners. It neither changes noded's production
-API nor simulates its command engine. The completed
-<code>cosmix-mix/tests/native_session_pty.rs::mix_child_bootstrap_proves_end_to_end</code>
-test uses Term's actual LaunchFd through the test-support library and a libc
-<code>openpty</code> fixture with <code>setsid</code>/<code>TIOCSCTTY</code> and child-only fd mapping. It spawns
-Cargo's built Mix binary and asserts initial attachment generation 1, renewals
-beyond 15 seconds on that original attachment (resumption cannot substitute),
-scrubbed rc/context/descendant state and post-exit revocation.
-Its parent fixture drives Term's typed allocate/renew/re-grant/revoke duties;
-the GUI and exit-notifier ordering remain covered by the Term workspace tests.
-The desktop test <code>p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes</code>
-also runs the production NativeSession prepare → LaunchFd → teletypewriter
-mapping → real Mix proof path, requiring attachment generation 1 and revocation
-on actual child exit. It requires a clean current-HEAD release binary supplied
-through <code>COSMIX_E2E_MIX_BIN</code> and checks live Git status and embedded SHA. It is
-ignored by default; explicit <code>--ignored</code> runs fail if the variable is absent.
-See Term's <code>tests/README.md</code> for the exact build and gate invocation. This covers
-p0i-01's binding portion, not S4 protected mutation admission.</p>
-<p>Term's teletypewriter PTY tests remain desktop-only; that dependency is not
-part of the main workspace.
-A second real-PTY test keeps the same child alive across parent resumption and
-broker bounce, including child-first wake registration and pane generation
-2 to 1 under a replacement parent. Mix unit/process tests cover seals, layout,
-UID/key/scope substitution, offset independence, stale lease non-use, marker
-scrubbing (including mislabelled-marker fd cleanup), stdio protection and
-missing-marker silence. A source-boundary/builtin-inventory test prominently
-checks that the owner does not import the evaluator library; it is a static
-boundary check, not a general reachability proof. A real-broker unit test delays
-one proof beyond challenge expiry and requires recovery without a lifecycle
-notice. A real-PTY test exercises the resume-flag exec-restart path and asserts
-revocation, the same PID, one diagnostic and a usable unbound replacement.
-The production Term→Mix test requires an explicit gate run. Native-session, job-control and owned-editor
-PTY tests each take a process-wide fixture mutex; serialisation no longer
-depends on the runner's thread-count flag.
-The desktop suite now invokes this main-workspace integration target through
-Cargo in a separate target directory. Build or test failure fails the desktop
-test; it cannot substitute an installed binary or omit the Mix fixture. The
-fixture uses only <code>CARGO_BIN_EXE_mix</code> and checks <code>--version --json</code> for a clean
-build whose full source SHA equals the current checkout's HEAD before spawning
-the PTY. It also runs <code>git status --porcelain</code> against the live checkout rather
-than trusting a potentially stale embedded dirty flag after dependency edits.
-Both provenance checks use <code>-uno</code>: tracked changes fail; untracked scratch
-files do not invalidate the build.
-Run from a clean committed checkout; stale or unidentifiable binaries
-fail explicitly. Earlier desktop-only passes did not execute this cross-workspace
-fixture and were not evidence of Mix enrolment.
-Test and clippy results are supplied by the orchestrator; this document records
-implementation and test inventory only.</p></div></div>
+<p>Layout requests supply <code>affected</code>, an array of additional explicit targets,
+when source/destination tabs, sibling geometry or replacement focus affect more
+than the primary target. The gate computes the affected set under the model
+lock and checks every member. Bound children cannot create panes outside their
+grant. Close requires termination authority for the panes being removed; layout
+authority does not substitute for termination authority.</p>
+<h2 id="live-properties">Live properties</h2>
+<p><code>term.props.get</code> supports <code>property:"state"</code> and <code>property:"contents"</code> with the
+same explicit target and separate read capabilities. <code>term.props.set</code> supports
+<code>property:"selected", value:true</code> and <code>property:"input", value:"..."</code>; selection
+uses layout authority and input uses input authority. Mutating properties carry
+the same generations, affected set, request ID and epoch as their corresponding
+verbs. Input properties also need <code>foreground_generation</code>.</p>
+<p>These are live pane properties, not a second persisted copy of terminal state.
+The adapter constructs <code>PeerIdentity</code> only from verified context and resolves
+the props-store <code>AuthPolicy</code>/capability set with the same Term-owned evaluator.
+Fresh lease checks complete before synchronous resolution; commitment rechecks
+scope and local lifetime under the model lock. Legacy property identities retain
+an absent optional native context. Broad property-write strings cannot bypass
+the pane gate. Private watches, audit subscriptions and retained screen replay
+are not installed by this adapter; unsupported property operations are refused.</p>
+<h2 id="input-and-revocation">Input and revocation</h2>
+<p>Each accepted input request claims a two-second, one-writer lease for the pane.
+Another actor receives <code>BUSY</code> while that lease is live. Input requires the current
+foreground generation; human keys, focus/layout changes and observed PTY foreground
+process-group changes invalidate old generations. The first human key revokes
+agent ownership before its own admission. It never waits for lease expiry.</p>
+<p>The existing ASCII key encoder supports ordinary ASCII, newline/Enter, tab,
+backspace and Ctrl+C/D. This is bounded keyboard input, not the future paste or
+execution pump. Unsupported characters are rejected before queue admission.
+The request envelope is limited to 8,192 bytes; responses to 256 KiB. Queue
+admission is atomic and actual nonblocking PTY writes recheck the permit. Expired
+or revoked, unwritten agent bytes are discarded without counting them as PTY
+writes. Already written bytes cannot be recalled.</p>
+<p>Term establishes conservative <code>Deadline</code>s outside the model/property locks, from
+two different sources because <code>lease.check</code> answers only for a record the asking
+connection holds a delivery dependency on. A bound caller's request registers
+exactly that dependency, so its lease is a real <code>lease.check</code>, reused within one
+five-second lease window and dropped by the lifecycle notices and gaps that drop
+the permits it authorised. Term's own attachment never has such a dependency, so
+its deadline comes from the renewal it must issue every five seconds anyway:
+renew refuses unless the record is attached on that very connection, and returns
+the refreshed remainder. A failed renew, a reconnect, a gap or a notice about
+Term's own attachment leaves no deadline at all rather than a stale one. Queued
+permits retain those deadlines and a read-only connection-liveness probe.
+Lifecycle revocation/suspension, successor binding generations, gaps, connection
+loss, pane close and child exit invalidate permits. No missed notice can extend
+a deadline. The verified client inbox is bounded at
+256 deliveries; a full inbox drops that delivery without disconnecting, because
+a gapped recipient must still resynchronise on the same connection
+(BROKER-022). Only receiver closure or transport loss retires the reader and
+invalidates connection liveness; broker-side lifecycle queue/gap behaviour is
+unchanged. A drop is not a delivery, though: it raises a sticky gap flag the
+consumer reads, and Term treats that flag as identical to a broker-signalled
+gap, discarding cached lifecycle authority and resynchronising. The flag is
+only read when the next delivery is handled, so a dropped notice can leave
+cached authority live until then, bounded by the five-second lease window.</p>
+<p><code>term.input.revoked</code> is a private event carrying target, request ID, a
+delivered-byte lower bound and an outcome derived from it: <code>complete</code> when every
+byte reached the PTY before the lease ended, <code>partial_or_unknown</code> otherwise. The
+retained operation result reports that same distinction, so the event and the
+query never disagree about what happened. Its
+<code>recipient_connection</code> routing constraint contains the original verified broker
+epoch and connection ID. Noded accepts this direct event only from a currently
+attached same-UID Term, checks the exact destination connection under its session
+lock, and stamps its source. This also serves unnamed ambient owners without
+inventing service names. Old names or successor attachments cannot collect an
+old connection's event. Event queues are bounded and best-effort; retained
+operation queries remain available within the retry window. Delivering one of
+these events also takes a recipient dependency slot on the destination
+connection, and those slots are capped: at the cap the notice is simply not
+delivered. That is within BROKER-022's best-effort contract and is why the
+retained operation result, not the event, is the answer of record — a client
+that needs the outcome asks for it rather than waiting to be told. A completed input
+outcome means bytes reached the PTY, never that a shell command completed.</p>
+<p>Protected requests, replies, refusal bodies, property contents and private input
+events are omitted before tap enqueue. Observe receives only BROKER-024 metadata;
+general application diagnostics do not log payloads. Unsupported VT-event logs
+record only the event discriminant, not clipboard/title/text fields.</p>
+<h2 id="retries-and-errors">Retries and errors</h2>
+<p>Mutations require a nonzero, monotonically increasing <code>request_id</code> and
+<code>request_epoch</code> equal to the authenticated connection's ID, available from
+<code>session.hello</code> or <code>term.session</code>. Preserve the exact epoch and JSON payload when
+retrying. The epoch constrains the ID; it never supplies the authenticated actor.
+<code>term.session</code> reports the current actor's request high-water mark.</p>
+<p>Entries bind the authenticated actor, target incarnation/generation, verb and
+payload hash. That hash covers the request bytes AS SENT: Term does not
+canonicalise, so two encodings of the same object are two different payloads and
+a retry MUST replay the body byte for byte, not re-serialise it. Repeated
+accepted requests return the same operation ID and submission result;
+conflicting arguments produce <code>CONFLICT</code> with
+<code>details:{"reason":"request_mismatch","retry_requires":"byte_identical_body"}</code>. <code>term.operation</code>
+can report a later PTY-write outcome. Successful close retries resolve before
+live-pane lookup, so removal does not cause a duplicate action.</p>
+<p>Retention is 15 minutes or the last 1,024 accepted mutations per actor, with an
+instance cap of 4,096 retained entries and 256 actor histories. Actor high-water
+marks remain until Term exits. Ageing alone never drops an actor's key, because
+its high-water mark is what keeps a late retry from re-executing; at the actor
+cap the coldest key is evicted instead, preferring one whose entries have all
+expired. Exhausting the entry cap returns <code>RESOURCE_LIMIT</code>. Retired IDs, stale
+instance incarnations and old connection epochs produce <code>UNKNOWN_OUTCOME</code>, never
+automatic re-execution. The mark advances BEFORE the verb runs, so an ID can be
+retired without its outcome ever being recorded — deliberate, so a committed
+mutation cannot re-execute when its result was lost. Because an actor holding
+only <code>input</code> or <code>terminate</code> cannot read the mark back through <code>term.session</code>,
+<code>UNKNOWN_OUTCOME</code> carries
+<code>details:{"reason":"retired_request_id","request_high_water":"&lt;n&gt;"}</code> so it can
+resynchronise without a read capability. A bound actor
+can recover retained results after authenticated resumption. There is no
+exactly-once guarantee across crashes or a new authenticated actor.</p>
+<p>Success uses ABP RC 0; typed application refusals use RC 10. The error vocabulary
+includes <code>INVALID_ARGUMENT</code>, <code>NOT_FOUND</code>, <code>STALE_GENERATION</code>, <code>CONFLICT</code>, <code>BUSY</code>,
+<code>FORBIDDEN</code>, <code>UNSUPPORTED</code>, <code>RESOURCE_LIMIT</code>, <code>DISCONNECTED</code>, <code>EXPIRED</code>, <code>CANCELLED</code>
+and <code>UNKNOWN_OUTCOME</code>. Authority failures remain uniform <code>FORBIDDEN</code>; a stale
+foreground generation is <code>STALE_GENERATION</code>. Transport failure and caller-side
+timeout remain client transport outcomes, separate from an application reply.</p>
+<p>The S4 fixture inventory and explicit gate prerequisites are in
+<code>src/desktop/apps/term/tests/README.md</code>. Test/clippy acceptance is supplied by the
+orchestrator; this page describes implementation, not a claim of passing gates.</p>
+<p>The enforcement fixtures are <code>#[ignore]</code>d because each spawns a real broker and a
+real Mix child over a PTY, so a plain <code>cargo test</code> reports them as ignored and
+says nothing about enforcement. Run them mechanically from <code>src/</code>:</p>
+<pre><code class="language-sh">mix desktop/apps/term/check-s4-gates.mix     # the 14 S4 enforcement fixtures
+mix desktop/apps/term/check-production-e2e.mix   # p0i-01, the production child-proof
+</code></pre>
+<p>It builds the current-HEAD Mix the fixtures demand — they refuse a stale or
+installed binary — runs them by exact test path, and requires the precise
+expected pass count, because libtest exits 0 when its filter matches nothing and
+a renamed module would otherwise leave the gate green while running none of them.</p>
+<p>One fixture is deliberately outside both scripts. <code>p0i_07_other_uid_both_policies</code>
+needs root and a second UID, and refuses rather than passing silently without
+them. Run it explicitly:</p>
+<pre><code class="language-sh">cd src/desktop
+BIN=$(ls -t target/debug/deps/term-* | grep -v \.d | head -1)
+sudo env COSMIX_SESSION_TEST_UID=&lt;a non-root uid&gt; \
+     COSMIX_E2E_MIX_BIN=&lt;abs path to src/target/release/mix&gt; HOME=/root \
+     ./$BIN --exact \
+     native_session::enforcement_tests::p0i_07_other_uid_both_policies --ignored
+</code></pre></div></div>
     </div>
 
 </main>

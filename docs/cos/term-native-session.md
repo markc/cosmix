@@ -9,8 +9,11 @@ credential verification. Identity establishment runs on the actor. Before the
 first TabSet open, main waits once for at most 900ms for a ready bundle; healthy
 startup can therefore bind pane 1. An unavailable profile or failed grant leaves
 ordinary panes usable, including Ctrl+Shift+T.
-`term.session {}` reports per-pane binding status and the latest provisioning
-diagnostic; these are diagnostic snapshots, not evidence of live authority.
+The allocated native route's `term.session` reports authorised pane binding
+status with an explicit target. The global diagnostic `term` route serves no
+protected controls. See [native control](term-native-control.md) for the S4
+policy, input, properties and retry contracts. Status snapshots alone remain
+historical diagnostics, not evidence of live authority.
 
 The actor pre-provisions one keypair, grant and sealed LaunchFd for the next
 pane ID. Opening or splitting consumes a ready bundle without RPC, channel

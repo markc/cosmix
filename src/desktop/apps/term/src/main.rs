@@ -2,6 +2,7 @@ mod bus;
 mod config;
 #[cfg(test)]
 mod config_precedence_tests;
+mod control;
 #[cfg(test)]
 mod input_tests;
 #[cfg(test)]
@@ -12,10 +13,10 @@ mod panes;
 mod raster;
 mod session_fd;
 mod tabs;
-mod terminal;
 #[cfg(test)]
 #[path = "../../../vendor/teletypewriter/patch_guard.rs"]
 mod teletypewriter_patch_guard;
+mod terminal;
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -151,8 +152,7 @@ fn main() {
     assert!(identity.validate().is_ok());
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "{}\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--print-config: print resolved startup settings and exit",
-            bus::HELP
+            "CosMix Term: tabbed Wayland Mix terminal\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--print-config: print resolved startup settings and exit\nBus: the global `term` name is diagnostic discovery only; protected controls use the allocated native-session route"
         );
         return;
     }
@@ -197,6 +197,9 @@ fn main() {
         }),
     ));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
+    let _control = native
+        .as_ref()
+        .map(|s| s.handle.install_control(terminal.clone(), cleanup.clone()));
     // Completion notifications: the reap system (render thread) hands
     // self-exited pane identities to the Bus task, which emits interact.notify.
     // TERM_NOTIFY=0 disables it — the sender is dropped, so notes are never

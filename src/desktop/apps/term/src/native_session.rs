@@ -1,7 +1,8 @@
-//! Term-owned identity actor. No diagnostic verbs are installed on this lane.
+//! Term-owned identity actor and verified recipient lane. Protected controls
+//! share its attachment, ordered lifecycle stream and reconnect lifetime.
 use crate::session_fd::{LaunchFd, fresh_key};
 use cosmix_bus::native_session::*;
-use cosmix_client::session::{ExpectedScope, GrantResult, SessionFailure};
+use cosmix_client::session::{Deadline, ExpectedScope, GrantResult, Hello, SessionFailure};
 use cosmix_client::{
     BrokerAccount, NodedClient, UnixConnectOptions, UnixConnectOutcome, VerifiedConnection,
 };
@@ -18,6 +19,25 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const RPC_BUDGET: Duration = Duration::from_secs(2);
 const RENEW: Duration = Duration::from_secs(5);
+/// Verified deliveries the broker may hold for this recipient before the reader
+/// starts refusing them. Bounded so stamped authority never accumulates
+/// unserved.
+const VERIFIED_LANE: usize = 256;
+/// Protected requests waiting on the server task. Bounded so a flood sheds with
+/// a uniform refusal instead of growing a backlog of stamped authority.
+const DISPATCH_QUEUE: usize = 64;
+
+/// One protected request, with the authority that was current when it arrived.
+/// A reconnect between arrival and service leaves this connection disconnected,
+/// which dispatch refuses on its first check, so a stale job cannot be served
+/// against a newer attachment.
+struct Dispatch {
+    control: Arc<crate::control::Control>,
+    connection: Arc<VerifiedConnection>,
+    parent: SessionRecord,
+    own: (Hello, Deadline),
+    event: cosmix_client::VerifiedCommand,
+}
 const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const RETRY_FLOOR: Duration = Duration::from_secs(120);
 const RETRY_CAP: u32 = 3;
@@ -71,6 +91,9 @@ pub struct NativeSession(
 );
 
 struct Shared {
+    policy: Policy,
+    child_capabilities: Vec<Capability>,
+    control: std::sync::Weak<crate::control::Control>,
     next_id: u64,
     ready: Option<Ready>,
     panes: HashMap<u64, std::sync::Weak<PaneState>>,
@@ -81,6 +104,9 @@ struct Shared {
 impl Default for Shared {
     fn default() -> Self {
         Self {
+            policy: Policy::DefaultOpen,
+            child_capabilities: capabilities(),
+            control: std::sync::Weak::new(),
             next_id: 1,
             ready: None,
             panes: HashMap::new(),
@@ -116,6 +142,7 @@ pub struct Supervisor {
 }
 
 struct PaneState {
+    control_ready: AtomicBool,
     id: u64,
     generation: AtomicU64,
     live: AtomicBool,
@@ -178,6 +205,44 @@ enum Request {
 }
 
 impl NativeSession {
+    pub fn pane_generation(&self, id: u64) -> Option<u64> {
+        self.1
+            .lock()
+            .unwrap()
+            .panes
+            .get(&id)?
+            .upgrade()
+            .filter(|p| p.control_ready.load(Ordering::Acquire) && p.live.load(Ordering::Acquire))
+            .map(|p| p.generation.load(Ordering::Acquire))
+    }
+    pub fn install_control(
+        &self,
+        tabs: Arc<std::sync::Mutex<crate::tabs::TabSet>>,
+        cleanup: crate::tabs::Cleanup,
+    ) -> Arc<crate::control::Control> {
+        let control = Arc::new(crate::control::Control::new(tabs, cleanup, self.clone()));
+        self.1.lock().unwrap().control = Arc::downgrade(&control);
+        control
+    }
+
+    pub fn pane_guard(&self, id: u64, generation: u64) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let pane = self
+            .1
+            .lock()
+            .unwrap()
+            .panes
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        Arc::new(move || {
+            pane.upgrade().is_some_and(|p| {
+                p.live.load(Ordering::Acquire)
+                    && p.control_ready.load(Ordering::Acquire)
+                    && p.launched.load(Ordering::Acquire)
+                    && p.generation.load(Ordering::Acquire) == generation
+            })
+        })
+    }
     /// Only physical keyboard/pointer focus paths call this, not Bus mutations.
     pub fn activity(&self) {
         if let Some(now) = clock_ms() {
@@ -286,13 +351,48 @@ impl Supervisor {
         })
         .map_err(|e| e.to_string())?;
         options.require_native_session = true;
-        Self::with_options(options, cosmix_config::client_helpers::resolve_noded_url())
+        // Opt in to the bounded verified lane. An unbounded one would let a
+        // flood of stamped requests accumulate faster than they can be served,
+        // which is authority held in memory that nothing has decided on yet.
+        // Bounded, the reader refuses the overflow and reports dropped id-less
+        // notices as a gap, both of which the actor settles above.
+        options.incoming_capacity = Some(VERIFIED_LANE);
+        let policy = match std::env::var("COSMIX_TERM_POLICY").as_deref() {
+            Ok("restricted") => Policy::Restricted,
+            Ok("default-open") | Err(_) => Policy::DefaultOpen,
+            _ => return Err("invalid Term policy".into()),
+        };
+        let url = cosmix_config::client_helpers::resolve_noded_url();
+        if policy == Policy::DefaultOpen {
+            Self::with_options(options, url)
+        } else {
+            Self::with_policy(options, url, policy)
+        }
     }
 
     pub fn with_options(options: UnixConnectOptions, url: String) -> Result<Self, String> {
+        Self::with_policy(options, url, Policy::DefaultOpen)
+    }
+
+    pub fn with_policy(
+        options: UnixConnectOptions,
+        url: String,
+        policy: Policy,
+    ) -> Result<Self, String> {
+        Self::with_capabilities(options, url, policy, capabilities())
+    }
+
+    fn with_capabilities(
+        options: UnixConnectOptions,
+        url: String,
+        policy: Policy,
+        child_capabilities: Vec<Capability>,
+    ) -> Result<Self, String> {
         let key = fresh_key().map_err(|e| e.to_string())?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(std::sync::Mutex::new(Shared::default()));
+        shared.lock().unwrap().policy = policy;
+        shared.lock().unwrap().child_capabilities = child_capabilities;
         let actor_shared = shared.clone();
         let activity = Arc::new(AtomicU64::new(clock_ms().unwrap_or(0)));
         let actor_activity = activity.clone();
@@ -313,6 +413,7 @@ impl Supervisor {
                         key,
                         connection: None,
                         parent: None,
+                        own_lease: None,
                         children: HashMap::new(),
                         shared: actor_shared,
                         provisioned: None,
@@ -437,8 +538,12 @@ struct Actor {
     options: UnixConnectOptions,
     url: String,
     key: SigningKey,
-    connection: Option<VerifiedConnection>,
+    connection: Option<Arc<VerifiedConnection>>,
     parent: Option<SessionRecord>,
+    /// The recipient's own conservative deadline and the context it is bound
+    /// to, refreshed by the renew cadence so no protected request ever
+    /// establishes it inside its own resolution (PROP-024).
+    own_lease: Option<(Hello, Deadline)>,
     children: HashMap<u64, Child>,
     shared: Arc<std::sync::Mutex<Shared>>,
     provisioned: Option<u64>,
@@ -469,6 +574,67 @@ fn forbidden(error: &SessionFailure) -> bool {
 }
 
 impl Actor {
+    fn control(&self) -> Option<Arc<crate::control::Control>> {
+        self.shared.lock().unwrap().control.upgrade()
+    }
+    /// The one place a protected request is refused without being served.
+    /// Reached from three saturation points — the lane dropped it, Term's own
+    /// queue is full, or there is no attachment to serve it against — and they
+    /// share this so the refusals cannot drift apart. Detached so a saturated
+    /// or slow peer never blocks the identity loop, which is the whole reason
+    /// serving moved off it.
+    fn refuse(&self, event: cosmix_client::VerifiedCommand, code: &'static str) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let reply = crate::control::Reply::error(code);
+            let _ = tokio::time::timeout(
+                RPC_BUDGET,
+                connection
+                    .client()
+                    .respond(event.command(), reply.rc, &reply.body),
+            )
+            .await;
+        });
+    }
+
+    /// Discard cached lifecycle authority and resynchronise. Reached from a
+    /// broker-signalled gap and from a local inbox overflow, which are the same
+    /// event: either way a lifecycle notice may have been missed, and nothing
+    /// may be resolved against the cached authority until it is re-earned.
+    async fn session_gap(&mut self) {
+        self.own_lease = None;
+        if let Some(control) = self.control() {
+            control.invalidate(None);
+        }
+        self.reconcile().await;
+        self.provision().await;
+    }
+    /// Refresh this attachment and the conservative local deadline it
+    /// establishes. Every renew site goes through here so the deadline the
+    /// control lane reads can never be older than the lease that authorises
+    /// it; a failed renew drops it rather than leaving stale authority behind.
+    async fn renew_parent(&mut self) -> bool {
+        let refreshed = if let (Some(connection), Some(parent)) = (&self.connection, &self.parent) {
+            bounded(connection.session_renew_lease(parent.reference()))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        match refreshed {
+            Some((result, hello, deadline)) => {
+                self.parent = Some(result.record);
+                self.own_lease = Some((hello, deadline));
+                true
+            }
+            None => {
+                self.own_lease = None;
+                false
+            }
+        }
+    }
     fn launch_fd(&mut self, grant: &GrantResult) -> std::io::Result<LaunchFd> {
         #[cfg(test)]
         if std::mem::take(&mut self.faults.memfd) {
@@ -511,6 +677,7 @@ impl Actor {
                 generation: AtomicU64::new(ready.pane.generation.load(Ordering::Acquire)),
                 live: AtomicBool::new(true),
                 launched: AtomicBool::new(false),
+                control_ready: AtomicBool::new(false),
                 public_key: ready.pane.public_key,
             });
             if let Some(child) = self.children.get_mut(&pane.id) {
@@ -581,6 +748,7 @@ impl Actor {
                 generation: AtomicU64::new(1),
                 live: AtomicBool::new(true),
                 launched: AtomicBool::new(false),
+                control_ready: AtomicBool::new(false),
                 public_key: HexBytes(key.verifying_key().to_bytes()),
             });
             self.children.insert(
@@ -705,6 +873,14 @@ impl Actor {
     }
 
     async fn connect(&mut self) {
+        // No deadline survives a reconnect: it is bound to the old connection.
+        self.own_lease = None;
+        for child in self.children.values() {
+            child.pane.control_ready.store(false, Ordering::Release);
+        }
+        if let Some(control) = self.control() {
+            control.invalidate(None);
+        }
         self.withdraw_ready();
         if let Some(old) = self.connection.take() {
             close_connection(&old).await;
@@ -758,7 +934,8 @@ impl Actor {
                 }
             }
             Err(error) if forbidden(&error) => {
-                bounded(connection.session_allocate(&self.key, Policy::DefaultOpen)).await
+                let policy = self.shared.lock().unwrap().policy;
+                bounded(connection.session_allocate(&self.key, policy)).await
             }
             Err(error) => Err(error),
         };
@@ -769,7 +946,7 @@ impl Actor {
                         || old.broker_epoch != result.record.broker_epoch
                 });
                 self.parent = Some(result.record);
-                self.connection = Some(connection);
+                self.connection = Some(Arc::new(connection));
                 if replacement {
                     if self.pool_key.as_ref().is_some_and(|(id, _)| {
                         self.children
@@ -787,6 +964,11 @@ impl Actor {
                     }
                 }
                 self.reconcile().await;
+                // Re-earn the deadline now rather than at the next renew tick.
+                // Without this a reconnect denies every protected request for
+                // up to five seconds even though the attachment is already
+                // live; reconcile only renews when it had children to visit.
+                self.renew_parent().await;
             }
             Err(error) => {
                 eprintln!("term identity recovery: {error}");
@@ -845,6 +1027,10 @@ impl Actor {
                         .pane_generation
                         .ok_or(SessionFailure::InvalidResponse)?
                         .0,
+                    Ordering::Release,
+                );
+                child.pane.control_ready.store(
+                    found.record.state == BindingState::Attached,
                     Ordering::Release,
                 );
                 child.record = Some(found.record.clone());
@@ -907,7 +1093,7 @@ impl Actor {
             pane_generation: DecimalU64(child.pane.generation.load(Ordering::Acquire)),
             public_key: child.pane.public_key,
             role: Role::PaneShell,
-            capabilities: capabilities(),
+            capabilities: self.shared.lock().unwrap().child_capabilities.clone(),
         };
         let previous_pending = child.pending.take();
         child.pending = Some(PendingGrant {
@@ -948,6 +1134,7 @@ impl Actor {
             return Err(SessionFailure::InvalidResponse);
         }
         child.pending.as_mut().unwrap().expires_ms = Some(result.grant.expires_ms);
+        child.pane.control_ready.store(false, Ordering::Release);
         child.record = Some(result.record.clone());
         Ok(result)
     }
@@ -977,11 +1164,7 @@ impl Actor {
                 }
             }
             // A slow reconciliation batch cannot starve the parent's lease.
-            if let (Some(connection), Some(parent)) = (&self.connection, &self.parent)
-                && let Ok(result) = bounded(connection.session_renew(parent.reference())).await
-            {
-                self.parent = Some(result.record);
-            }
+            self.renew_parent().await;
         }
     }
 
@@ -990,23 +1173,25 @@ impl Actor {
             return;
         };
         child.pane.live.store(false, Ordering::Release);
-        let Some(connection) = self.connection.as_ref() else {
-            return;
-        };
         // A forbidden fetch can also mean a suspended parent. Confirm this
         // attachment is live before treating absence as successful cleanup.
         // This also keeps large close batches from starving the parent lease.
-        let Some(parent) = self.parent.as_ref() else {
+        if !self.renew_parent().await {
+            return;
+        }
+        let (Some(connection), Some(child)) =
+            (self.connection.as_ref(), self.children.get_mut(&id))
+        else {
             return;
         };
-        match bounded(connection.session_renew(parent.reference())).await {
-            Ok(result) => self.parent = Some(result.record),
-            Err(_) => return,
-        }
         // Attachment generation may have advanced since the initial grant.
         // Fetch the current owned key's reference before parent-initiated revoke.
         match bounded(connection.session_grant_fetch(child.pane.public_key)).await {
             Ok(found) => {
+                child.pane.control_ready.store(
+                    found.record.state == BindingState::Attached,
+                    Ordering::Release,
+                );
                 child.record = Some(found.record.clone());
                 if bounded(connection.session_revoke(found.record.reference()))
                     .await
@@ -1058,33 +1243,64 @@ impl Actor {
                 }
             }
             // As in reconciliation, a slow batch must not starve the parent.
-            if let (Some(connection), Some(parent)) = (&self.connection, &self.parent)
-                && let Ok(result) = bounded(connection.session_renew(parent.reference())).await
-            {
-                self.parent = Some(result.record);
-            }
+            self.renew_parent().await;
         }
     }
 
     async fn run(&mut self, mut requests: UnboundedReceiver<Request>) {
+        // Protected requests are served by a sibling task, not on this loop.
+        // A bound caller's request can cost a lease-check round trip plus a
+        // reply, and this loop is the one that renews the attachment and drains
+        // revocation notices; serving inline let one slow caller push renew past
+        // its cadence and leave revocations undelivered. The queue is bounded so
+        // a flood sheds instead of growing, and serving is serial because
+        // dispatch already serialises on the model and policy locks.
+        let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel::<Dispatch>(DISPATCH_QUEUE);
+        let server = tokio::spawn(async move {
+            while let Some(job) = dispatch_rx.recv().await {
+                let reply = job
+                    .control
+                    .dispatch(&job.connection, &job.parent, &job.own, &job.event)
+                    .await;
+                let _ = tokio::time::timeout(
+                    RPC_BUDGET,
+                    job.connection
+                        .client()
+                        .respond(job.event.command(), reply.rc, &reply.body),
+                )
+                .await;
+            }
+        });
         let mut renew = tokio::time::interval(RENEW);
         renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Revocation wakes this lane; it is never woken by a clock. The wake
+        // appears once the render thread installs the control surface, so it
+        // is picked up lazily rather than required at actor startup.
+        let mut control_wake: Option<Arc<tokio::sync::Notify>> = None;
         loop {
+            if control_wake.is_none() {
+                control_wake = self.control().map(|control| control.wake());
+            }
             tokio::select! {
                 biased;
                 _ = renew.tick() => {
-                    let healthy = if let (Some(connection), Some(parent)) = (&self.connection, &self.parent) {
-                        match bounded(connection.session_renew(parent.reference())).await {
-                            Ok(result) => { self.parent = Some(result.record); true }
-                            Err(_) => false,
-                        }
-                    } else { false };
-                    if !healthy { self.connect().await; }
+                    if !self.renew_parent().await { self.connect().await; }
                     // Notices schedule retries; this tick does not poll grants.
                     self.retry_due(Instant::now()).await;
                     let closing: Vec<_> = self.children.iter().filter(|(_, c)| !c.pane.live.load(Ordering::Acquire)).map(|(id, _)| *id).collect();
                     for id in closing { self.close_child(id).await; }
                     self.provision().await;
+                    // Backstop only, on a cadence BROKER-020 already requires:
+                    // a permit that merely aged out queues its notice here
+                    // rather than waiting for the next revocation to wake us.
+                    if let (Some(control), Some(connection)) = (self.control(), &self.connection) {
+                        control.flush_notices(connection).await;
+                    }
+                }
+                _ = async { match &control_wake { Some(wake) => wake.notified().await, None => std::future::pending().await } } => {
+                    if let (Some(control), Some(connection)) = (self.control(), &self.connection) {
+                        control.flush_notices(connection).await;
+                    }
                 }
                 request = requests.recv() => match request {
                     Some(Request::Provision) => self.provision().await,
@@ -1094,15 +1310,51 @@ impl Actor {
                     }
                     None => break,
                 },
-                event = async { self.connection.as_mut().expect("guarded connection").recv().await }, if self.connection.is_some() => {
+                event = async { self.connection.as_ref().expect("guarded connection").recv_shared().await }, if self.connection.is_some() => {
                     match event {
                         Some(event) => {
+                            // The lane says what this delivery is before the verb
+                            // does. A Gap is the absence of a delivery — the
+                            // dropped envelope may have been a lifecycle notice,
+                            // so it takes the identical path to a broker-signalled
+                            // gap. A Refuse carries correlation and nothing
+                            // admissible; the OWNER answers it, because the reader
+                            // task must never write.
+                            if event.delivery() == cosmix_client::Delivery::Gap {
+                                self.session_gap().await;
+                                continue;
+                            }
+                            if event.delivery() == cosmix_client::Delivery::Refuse {
+                                self.refuse(event, "RESOURCE_LIMIT");
+                                continue;
+                            }
                             let command = event.command();
                             if command.command == "noded.session.lifecycle.gap" {
-                                self.reconcile().await;
-                                self.provision().await;
+                                self.session_gap().await;
                             } else if command.command == "noded.session.lifecycle" {
                                 self.notice(&command.body).await;
+                            } else if let (Some(control), Some(connection), Some(parent), Some(own)) = (self.control(), &self.connection, &self.parent, &self.own_lease) {
+                                // Hand the request to the server task and go
+                                // straight back to the select. Serving it here
+                                // would hold this loop for a lease check plus a
+                                // reply, and this loop is what renews the lease
+                                // and drains revocation notices.
+                                let job = Dispatch {
+                                    control,
+                                    connection: connection.clone(),
+                                    parent: parent.clone(),
+                                    own: own.clone(),
+                                    event,
+                                };
+                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(job)) = dispatch_tx.try_send(job) {
+                                    // Term's own queue is full. Same shape as the
+                                    // lane's refusal above and written the same
+                                    // way, so there is one refusal mechanism
+                                    // rather than two that could drift apart.
+                                    self.refuse(job.event, "RESOURCE_LIMIT");
+                                }
+                            } else {
+                                self.refuse(event, "FORBIDDEN");
                             }
                         }
                         None => { self.connect().await; }
@@ -1110,9 +1362,16 @@ impl Actor {
                 }
             }
         }
+        // Nothing queued may be served after the identity loop stops: shutdown
+        // is about to revoke the records those jobs would be answered against.
+        server.abort();
     }
 
     async fn shutdown(&mut self) {
+        self.own_lease = None;
+        if let Some(control) = self.control() {
+            control.invalidate(None);
+        }
         // No unconsumed launch key or descriptor survives shutdown.
         self.shared.lock().unwrap().ready = None;
         self.pool_key = None;
@@ -1174,6 +1433,24 @@ impl Actor {
         {
             return;
         }
+        if let Some(control) = self.control() {
+            let mut target = notice.target.clone();
+            if notice.state == BindingState::Attached {
+                target.binding_generation.0 = target.binding_generation.0.saturating_sub(1);
+            }
+            control.invalidate(Some(&target));
+        }
+        // A notice about this attachment retires the deadline the control lane
+        // reads, rather than leaving it live until the next renew would have
+        // noticed. Nothing protected resolves again until a renew re-earns it.
+        if self
+            .parent
+            .as_ref()
+            .is_some_and(|p| p.record_id == notice.target.record_id)
+            && notice.state != BindingState::Attached
+        {
+            self.own_lease = None;
+        }
         let id = self.children.iter().find_map(|(id, child)| {
             child
                 .record
@@ -1201,6 +1478,10 @@ impl Actor {
             }
             let child = self.children.get_mut(&id).unwrap();
             child.retry.enrolled |= notice.state == BindingState::Attached;
+            child
+                .pane
+                .control_ready
+                .store(notice.state == BindingState::Attached, Ordering::Release);
             if let Some(record) = &mut child.record {
                 record.binding_generation = notice.target.binding_generation;
                 record.state = notice.state;
@@ -1229,6 +1510,10 @@ impl Actor {
 #[cfg(test)]
 #[path = "native_session_e2e.rs"]
 mod production_e2e;
+
+#[cfg(test)]
+#[path = "control_tests.rs"]
+mod enforcement_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1281,6 +1566,7 @@ pub(crate) mod tests {
             key: fresh_key().unwrap(),
             connection: None,
             parent: None,
+            own_lease: None,
             children: HashMap::new(),
             shared: Arc::new(std::sync::Mutex::new(Shared::default())),
             provisioned: None,
@@ -1622,6 +1908,7 @@ pub(crate) mod tests {
                         generation: AtomicU64::new(1),
                         live: AtomicBool::new(true),
                         launched: AtomicBool::new(true),
+                        control_ready: AtomicBool::new(false),
                         public_key: HexBytes(key.verifying_key().to_bytes()),
                     }),
                     record: None,
@@ -2109,6 +2396,7 @@ pub(crate) mod tests {
                 key: fresh_key().unwrap(),
                 connection: None,
                 parent: None,
+                own_lease: None,
                 children: HashMap::new(),
                 shared: Arc::new(std::sync::Mutex::new(Shared::default())),
                 provisioned: None,
@@ -2127,6 +2415,7 @@ pub(crate) mod tests {
                         generation: AtomicU64::new(1),
                         live: AtomicBool::new(true),
                         launched: AtomicBool::new(true),
+                        control_ready: AtomicBool::new(false),
                         public_key: HexBytes(key.verifying_key().to_bytes()),
                     }),
                     record: None,

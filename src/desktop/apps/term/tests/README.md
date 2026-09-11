@@ -22,4 +22,48 @@ The real broker, NativeSession prepare, sealed LaunchFd, production Terminal
 spawn implementation, patched teletypewriter FD mapping and rio Machine all
 participate. The test requires attachment generation 1, submits `exit` to the
 real Mix prompt and observes revocation while retaining Terminal itself.
-This realises p0i-01's binding hop; protected mutation admission remains S4.
+This realises p0i-01's binding hop.
+
+## Recipient enforcement (S4)
+
+The `native_session::enforcement_tests` module uses the same clean-HEAD Mix
+provenance requirement. Each fixture starts a real isolated broker and the
+production NativeSession actor, TabSet and PTY implementation. Requests enter
+the real verified service and property adapters. Child fixtures first require
+the production Mix attachment, then deliberately resume that child's key on
+a verified fixture connection. No caller-provided principal bypasses the broker.
+
+After building current-HEAD Mix, the unprivileged acceptance inventory is:
+
+```mix
+print(run_argv_must(["env", "RUSTC_WRAPPER=", "COSMIX_E2E_MIX_BIN=" .. env("COSMIX") .. "/src/target/release/mix", "cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "native_session::enforcement_tests::", "--", "--ignored", "--nocapture", "--skip", "p0i_07_other_uid_both_policies"], {cwd: env("COSMIX") .. "/src"}))
+```
+
+| Fixture | Real enforcement exercised |
+| --- | --- |
+| p0i-07 both policies | Ambient owner, pane-bound child, sibling scope, TCP and body spoof denial; verb/property reads, input, selection and unsupported execute |
+| p0i-07 owner mutations | Every layout/input mutation, identical retries, operation lookup and expired retention |
+| p0i-07 capability separation | Real child granted only read_state in both policies; denied contents/input/layout/terminate/execute; full-grant child close |
+| p0i-07 other UID | Verified socket from a different OS UID, both policies, real and nonexistent targets |
+| p0i-08 queued input | Actual PTY write boundary blocked; one-writer exclusion, human revocation, two-second deadline during broker pause, local pane revocation |
+| p0i-08 lifetime | Child exit, pane close, Term exit and broker restart during queued input; old incarnation cannot regain rights |
+| p0i-08 stale cleanup | Authentic child resumption, stale connection cleanup and connection-specific private event delivery |
+| p0i-09 payload | Actual protected input and contents, allowlisted observe metadata, legacy tap omission and captured application diagnostics |
+| p0i-10 unbound pane | Live graphical fallback pane has no protected verb/property access |
+| p0i-10 TCP fallback | Real diagnostic service permits discovery only |
+| p0i-10 launch failures | Missing/cancelled handoff, locally expired handoff window, broken sealed FD, wrong grant scope and quota exhaustion; real fallback prompt and denied controls |
+| p0i-10 parent outage | Failed native bootstrap leaves diagnostic discovery only and no native control registration |
+
+The cross-UID test is separately ignored and **requires root plus an explicit
+`COSMIX_SESSION_TEST_UID` naming a non-root local test account**, in addition to
+`COSMIX_E2E_MIX_BIN`. Run its exact test name with `--ignored --exact` under
+those conditions. Missing prerequisites fail loudly; ordinary ignored output
+is not acceptance evidence. The application-log fixture excludes dependency
+raw-wire tracing and asserts that protected payloads do not enter application
+diagnostic output.
+
+The queued-write and retention hooks only hold the real write boundary or
+age retained records; policy, transport and broker stamps are not mocked.
+Existing S0–S3 and legacy handler tests remain part of the regression inventory.
+Run both workspace test/clippy gates separately; this inventory does not claim
+they passed.

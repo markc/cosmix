@@ -214,6 +214,15 @@ struct Connection {
     binding: Option<Id>,
 }
 
+/// Optional routing constraint for private recipient events. This narrows a
+/// name route to the exact verified connection that authorised the delivery.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecipientGuard {
+    pub broker_epoch: HexBytes<16>,
+    pub connection_id: HexBytes<16>,
+}
+
 struct Outbox {
     tx: mpsc::Sender<String>,
     wake: Arc<tokio::sync::Notify>,
@@ -245,6 +254,58 @@ impl Default for Sessions {
 }
 
 impl Sessions {
+    pub(crate) fn private_event(
+        &mut self,
+        source: &BrokerPrincipal,
+        guard: &RecipientGuard,
+        message: &mut BusMessage,
+    ) -> Result<(), SessionError> {
+        if message.message_type() != Some("event")
+            || message.command_name() != Some("term.input.revoked")
+            || message.get("id").is_some()
+            || message.body.len() > 8192
+        {
+            return Err(SessionError::forbidden());
+        }
+        if self
+            .publisher_now(source)?
+            .as_ref()
+            .is_none_or(|p| p.session.as_ref().is_none_or(|s| s.role != Role::Term))
+        {
+            return Err(SessionError::forbidden());
+        }
+        let target = self
+            .connections
+            .get(&guard.connection_id)
+            .filter(|c| {
+                c.principal.broker_epoch == guard.broker_epoch
+                    && c.principal.unix_uid == source.unix_uid
+            })
+            .ok_or_else(SessionError::forbidden)?
+            .tx
+            .clone();
+        let principal = self
+            .delivery_now(source, &target)?
+            .ok_or_else(SessionError::forbidden)?;
+        let identity = principal
+            .session
+            .as_ref()
+            .filter(|s| s.role == Role::Term)
+            .ok_or_else(SessionError::forbidden)?;
+        let name = self
+            .records
+            .get(&identity.record_id)
+            .ok_or_else(SessionError::forbidden)?
+            .view
+            .name
+            .clone();
+        message.set("from", &name);
+        message.headers.remove("recipient_connection");
+        stamp_principal(message, Some(&principal)).map_err(|_| SessionError::forbidden())?;
+        target
+            .try_send(message.to_wire())
+            .map_err(|_| error(ErrorCode::ResourceLimit, "private_event_queue_full"))
+    }
     pub(super) fn with_grant_limit(pending_grants_per_parent: usize) -> Self {
         Self {
             pending_grants_per_parent,

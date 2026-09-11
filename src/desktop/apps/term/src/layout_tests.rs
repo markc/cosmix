@@ -273,7 +273,8 @@ fn scheduled_refresh_survives_bus_mutations_between_update_and_post_update() {
                 .world()
                 .get::<bevy::feathers::theme::ThemeBorderColor>(pane.container)
                 .unwrap()
-                .0.clone();
+                .0
+                .clone();
             assert_eq!(
                 token,
                 if pane.active {

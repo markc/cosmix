@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-props-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "bevy",
  "cosmix-app-identity",
@@ -8528,6 +8528,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

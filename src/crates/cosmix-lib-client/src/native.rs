@@ -507,8 +507,9 @@ impl NodedClient {
         })
     }
 
-    /// Read the current service name.
-    fn name(&self) -> String {
+    /// Read the current service name. Diagnostic and outbound-envelope use
+    /// only; a name is never authority (BROKER-023).
+    pub fn name(&self) -> String {
         self.service_name.read().unwrap().clone()
     }
 
@@ -994,6 +995,12 @@ impl NodedClient {
     /// Check if the broker connection is alive.
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+    /// Read-only lifetime probe for queued recipient work. It never reconnects
+    /// or establishes authority and cannot be used to set connection state.
+    pub fn connection_liveness(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let connected = self.connected.clone();
+        move || connected.load(Ordering::Acquire)
     }
 
     /// Inspect an error returned by a connect/register operation without

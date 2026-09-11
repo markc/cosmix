@@ -137,6 +137,7 @@ mod tests {
             wg_peer: None,
             signed_ident: signed.map(str::to_owned),
             service_name: None,
+            ..Default::default()
         }
     }
 
