@@ -7,6 +7,10 @@ key interests and affected recipients. Notice storage is bounded to 256 entries
 per connection and 4,096 globally. Overflow sets a separate coalesced gap bit;
 global pressure sheds from a largest backlog. The writer sends gaps before queued
 notices. Slow readers are never disconnected because of notice overflow.
+Replacement attachment offers the new generation to the closing channel as well
+as the successor. A channel that has held a binding cannot allocate or prove a
+different record while its close is pending; queued bootstrap work preserves
+the original binding scope.
 
 Bound routed deliveries register a connection/reference dependency before enqueue,
 under the same lock as revocation. Dependency caps are 256 per recipient and 8,192

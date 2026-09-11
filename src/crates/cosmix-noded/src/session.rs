@@ -59,6 +59,99 @@ mod queue_tests {
     }
 
     #[test]
+    fn replacement_notifies_closing_channel_and_preserves_its_scope() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let (mut s, mut reg, p, id) = allocated();
+        let key = SigningKey::from_bytes(&rand::random());
+        let public_key = HexBytes(key.verifying_key().to_bytes());
+        s.records.get_mut(&id).unwrap().key = public_key;
+        let old_tx = s.connections[&p.connection_id].tx.clone();
+        s.open_outbox(p.connection_id, &old_tx, Default::default());
+        let mut successor = p.clone();
+        successor.connection_id = HexBytes([3; 16]);
+        let (tx, _rx) = mpsc::channel(1);
+        s.connect(&successor, &tx, Default::default(), Default::default());
+        let selector = ChallengeArgs::Key(KeyChallenge {
+            public_key,
+            purpose: Purpose::Enrol,
+        });
+        let proof: ProofTranscript =
+            serde_json::from_value(s.challenge(&successor, &selector, 1001).unwrap()).unwrap();
+        s.prove(
+            &successor,
+            &ProveArgs {
+                challenge_id: proof.challenge_id,
+                signature: HexBytes(key.sign(&encode_proof(&proof).unwrap()).to_bytes()),
+            },
+            &mut reg,
+            1002,
+        )
+        .unwrap();
+        let (_, wire) = s.next_notice(p.connection_id, p.broker_epoch).unwrap();
+        let notice = bus::parse(&wire).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&notice.body).unwrap();
+        assert_eq!(body["target"]["binding_generation"], "2");
+        assert_eq!(body["state"], "attached");
+        assert_eq!(s.attached(p.connection_id), None);
+        assert_eq!(s.attached(successor.connection_id), Some(id));
+
+        // The old read loop has not observed its close notification yet.
+        let other_key = SigningKey::from_bytes(&rand::random());
+        let other_public = HexBytes(other_key.verifying_key().to_bytes());
+        let allocation = SessionCommand::Allocate(AllocateArgs {
+            public_key: other_public,
+            signature: HexBytes(
+                other_key
+                    .sign(&encode_allocate(
+                        p.broker_epoch,
+                        p.connection_id,
+                        other_public,
+                        Policy::Restricted,
+                    ))
+                    .to_bytes(),
+            ),
+            policy: Policy::Restricted,
+        });
+        assert_eq!(
+            s.dispatch(&p, &allocation, &mut reg, 1003)
+                .unwrap_err()
+                .details["reason"],
+            "already_bound"
+        );
+        // An otherwise valid proof must not rename the retiring channel either.
+        let (other, _, _, other_id) = allocated();
+        let mut other_record = other.records.into_values().next().unwrap();
+        other_record.key = other_public;
+        other_record.connection = None;
+        other_record.view.state = BindingState::Suspended;
+        s.records.insert(other_id, other_record);
+        let proof: ProofTranscript = serde_json::from_value(
+            s.challenge(
+                &p,
+                &ChallengeArgs::Key(KeyChallenge {
+                    public_key: other_public,
+                    purpose: Purpose::Enrol,
+                }),
+                1003,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let refused = s
+            .prove(
+                &p,
+                &ProveArgs {
+                    challenge_id: proof.challenge_id,
+                    signature: HexBytes(other_key.sign(&encode_proof(&proof).unwrap()).to_bytes()),
+                },
+                &mut reg,
+                1004,
+            )
+            .unwrap_err();
+        assert_eq!(refused.details["reason"], "already_bound");
+    }
+
+    #[test]
     fn lease_check_refreshes_recipient_notice_dependency() {
         let (mut s, mut reg, p, id) = allocated();
         let mut recipient = p.clone();
@@ -867,7 +960,7 @@ impl Sessions {
                 serde_json::json!({"broker_epoch": p.broker_epoch, "connection_id": p.connection_id}),
             ),
             SessionCommand::Allocate(a) => {
-                if self.attached(p.connection_id).is_some() {
+                if self.connections[&p.connection_id].binding.is_some() {
                     return Err(error(ErrorCode::Conflict, "already_bound"));
                 }
                 verify(
@@ -1302,8 +1395,8 @@ impl Sessions {
         if r.view.state == BindingState::Revoked || !self.parent_live(r, now) {
             return Err(error(ErrorCode::Expired, ""));
         }
-        if self
-            .attached(p.connection_id)
+        if self.connections[&p.connection_id]
+            .binding
             .is_some_and(|id| id != proof.record_id)
         {
             return Err(error(ErrorCode::Conflict, "already_bound"));
@@ -1327,6 +1420,7 @@ impl Sessions {
             g.state = GrantState::Consumed;
         }
         let r = self.records.get_mut(&proof.record_id).expect("record");
+        let closing = r.connection;
         if let Some(old) = r.connection
             && old != p.connection_id
             && let Some(c) = self.connections.get(&old)
@@ -1343,7 +1437,7 @@ impl Sessions {
             .get_mut(&p.connection_id)
             .expect("connection")
             .binding = Some(proof.record_id);
-        self.notice(proof.record_id, None);
+        self.notice(proof.record_id, closing);
         for child in self.children(proof.record_id) {
             if self.records[&child].view.state != BindingState::Revoked {
                 self.notice(child, None);
