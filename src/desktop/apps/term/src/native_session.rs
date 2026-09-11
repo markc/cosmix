@@ -237,15 +237,6 @@ impl NativeSession {
     pub fn child_binding(&self, id: u64, generation: u64) -> Option<SessionRecord> {
         let shared = self.1.lock().unwrap();
         let pane = shared.panes.get(&id)?.upgrade()?;
-        #[cfg(test)]
-        eprintln!(
-            "child_binding({id},{generation}) live={} ready={} launched={} gen={} bound={:?}",
-            pane.live.load(Ordering::Acquire),
-            pane.control_ready.load(Ordering::Acquire),
-            pane.launched.load(Ordering::Acquire),
-            pane.generation.load(Ordering::Acquire),
-            pane.binding.lock().unwrap().as_ref().map(|r| (r.state, r.pane_id, r.pane_generation))
-        );
         if !pane.live.load(Ordering::Acquire)
             || !pane.control_ready.load(Ordering::Acquire)
             || !pane.launched.load(Ordering::Acquire)
@@ -509,6 +500,26 @@ struct Child {
     record: Option<SessionRecord>,
     retry: Retry,
     pending: Option<PendingGrant>,
+}
+
+impl Child {
+    /// The pane's published binding is exactly "the current record, while it is
+    /// Attached" — the one thing a forwarded request needs and the one thing
+    /// `pane_generation` cannot answer, since a name and a generation tuple are
+    /// not derivable from a pane id.
+    ///
+    /// Both the grant fetch and the lifecycle notice change that record, and
+    /// BOTH must republish. The notice is the fast path to Attached; publishing
+    /// only from the fetch left the binding empty for the whole life of a child
+    /// whose fetch never ran again, which reads at the far end as "this pane
+    /// has no shell".
+    fn publish_binding(&self) {
+        *self.pane.binding.lock().unwrap() = self
+            .record
+            .as_ref()
+            .filter(|record| record.state == BindingState::Attached)
+            .cloned();
+    }
 }
 
 #[derive(Default)]
@@ -1070,12 +1081,11 @@ impl Actor {
                     found.record.state == BindingState::Attached,
                     Ordering::Release,
                 );
-                // Publish only an ATTACHED binding. A pending or suspended
-                // record names a child that cannot answer, and forwarding to
-                // one would turn a known refusal into a timeout.
-                *child.pane.binding.lock().unwrap() =
-                    (found.record.state == BindingState::Attached).then(|| found.record.clone());
                 child.record = Some(found.record.clone());
+                // Only an ATTACHED record is published. A pending or suspended
+                // one names a child that cannot answer, and forwarding to it
+                // would turn a known refusal into a timeout.
+                child.publish_binding();
                 return Ok(found);
             }
             Ok(found) => {
@@ -1531,6 +1541,9 @@ impl Actor {
                 record.binding_generation = notice.target.binding_generation;
                 record.state = notice.state;
             }
+            // Republished from the record the two lines above just corrected:
+            // this is the path a child normally reaches Attached by.
+            child.publish_binding();
             if notice.state == BindingState::Revoked && child.pane.live.load(Ordering::Acquire) {
                 if !child.pane.launched.load(Ordering::Acquire) {
                     self.diagnostic(Some(id), "unconsumed bundle expired; refresh waits for user presence and the mint floor");
