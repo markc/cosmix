@@ -1088,16 +1088,6 @@ fn p0i_07_affected_set_and_live_generation_authority() {
             0,
             "the generation gate must be the only thing refusing those"
         );
-        forbidden(
-            call(
-                owner.client(),
-                &parent.name,
-                "term.type",
-                json!({"target":ahead,"request_id":"1","foreground_generation":"1","text":"NO"}),
-            )
-            .await,
-        );
-
         // Selecting the first pane while the second tab is active moves focus
         // in both tabs, so the request must carry authority over the whole
         // affected set. This ambient owner WOULD be allowed that sibling on its
@@ -1135,6 +1125,22 @@ fn p0i_07_affected_set_and_live_generation_authority() {
             0
         );
 
+        // Input is refused on the same stale generation, against the same live
+        // pane. This comes after a valid mutation deliberately: the harness
+        // caches one request epoch per (connection, service) from a term.session
+        // probe using whatever target the first request-ID call carries, so
+        // leading with a bad target would poison every later mutation with a
+        // zero epoch and mask what is actually being tested.
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.type",
+                json!({"target":ahead,"request_id":"5","foreground_generation":"1","text":"NO"}),
+            )
+            .await,
+        );
+
         // Closing the now-active first tab promotes the second one, so the
         // replacement's panes join the affected set even though the request
         // never names that tab.
@@ -1143,7 +1149,7 @@ fn p0i_07_affected_set_and_live_generation_authority() {
                 owner.client(),
                 &parent.name,
                 "term.tab.close",
-                json!({"target":first,"request_id":"5"}),
+                json!({"target":first,"request_id":"6"}),
             )
             .await,
         );
@@ -1152,7 +1158,7 @@ fn p0i_07_affected_set_and_live_generation_authority() {
                 owner.client(),
                 &parent.name,
                 "term.tab.close",
-                json!({"target":first,"affected":[second],"request_id":"6"})
+                json!({"target":first,"affected":[second],"request_id":"7"})
             )
             .await
             .0,
