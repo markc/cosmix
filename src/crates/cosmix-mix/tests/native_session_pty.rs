@@ -2560,7 +2560,7 @@ fn p4_a_timeout_terminates_the_group_and_reports_itself_as_policy() {
             &f.bound,
             1,
             serde_json::json!({
-                "argv": ["sleep", "300"],
+                "argv": ["sleep", "30"],
                 "timeout_ms": "1500",
             }),
         )
@@ -2592,7 +2592,7 @@ fn p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill() {
             1,
             serde_json::json!({
                 "argv": ["sh", "-c", "trap '' TERM; echo READY; while true; do sleep 1; done"],
-                "timeout_ms": "60000",
+                "timeout_ms": "15000",
             }),
         )
         .await
@@ -2781,7 +2781,7 @@ fn p4_refusals_leave_no_trace_and_deferrals_are_advertised() {
                     &mut f.parent,
                     &f.bound,
                     id,
-                    serde_json::json!({"argv": ["sleep", "20"], "timeout_ms": "30000"}),
+                    serde_json::json!({"argv": ["sleep", "4"], "timeout_ms": "5000"}),
                 )
                 .await
                 .unwrap_or_else(|e| panic!("task {id} should start: {e}")),
@@ -2791,7 +2791,7 @@ fn p4_refusals_leave_no_trace_and_deferrals_are_advertised() {
             &mut f.parent,
             &f.bound,
             14,
-            serde_json::json!({"argv": ["sleep", "20"], "timeout_ms": "30000"}),
+            serde_json::json!({"argv": ["sleep", "4"], "timeout_ms": "5000"}),
         )
         .await
         .unwrap_err();
