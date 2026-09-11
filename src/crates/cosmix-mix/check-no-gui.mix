@@ -1,0 +1,26 @@
+-- Hard gate: the canonical `mix` binary links NO GUI/terminal-emulator
+-- crates. The shell runs as root's login shell fleet-wide; it must stay
+-- small and boring. The graphical terminal is the SEPARATE `cosmix-term`
+-- binary in the desktop workspace — `mix --gui` exec-replaces into it.
+-- The single shared thing is the bus contract, never the ELF.
+-- (Standing decision, reaffirmed 2026-09-11 after an e2e briefly dragged
+-- teletypewriter/corcovado into the main lockfile; this gate makes the
+-- convention mechanical. Run alongside the workspace test/clippy battery.)
+-- Run from the repository src/ directory. `-e normal` restricts to deps
+-- that actually link into shipped binaries (dev-deps excluded — the PTY
+-- test fixtures use plain libc).
+$tree = run_argv(["cargo", "tree", "--locked", "-p", "cosmix-mix", "-e", "normal"], {timeout: 600})
+if $tree["exit_code"] != 0 then
+  print($tree["stderr"])
+  print("GATE BLOCKED: cargo tree failed; an empty filter is not a pass")
+  exit(1)
+end
+$filter = run_argv(["grep", "-iE", "bevy|wgpu|winit|sugarloaf|swash|rio-vt|rio-backend|rio-window|teletypewriter|corcovado|softbuffer|smithay|x11|xcb|copypasta|crossterm"], {stdin: $tree["stdout"]})
+print($filter["stdout"])
+if $filter["exit_code"] == 1 then
+  print("GATE PASS: cargo tree rc=0; forbidden GUI-crate filter rc=1")
+  exit(0)
+end
+print("GATE FAIL: a GUI/terminal-emulator crate reached the canonical mix binary")
+print($filter["stderr"])
+exit(1)
