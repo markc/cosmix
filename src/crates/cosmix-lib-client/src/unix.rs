@@ -115,6 +115,8 @@ pub struct VerifiedConnection {
     client: NodedClient,
     incoming: tokio::sync::Mutex<VerifiedIncoming>,
     pub(crate) session_lock: tokio::sync::Mutex<()>,
+    /// One hello per connection: see [`VerifiedConnection::session_context`].
+    pub(crate) session_context: tokio::sync::OnceCell<crate::session::Hello>,
 }
 impl VerifiedConnection {
     /// Requests/replies use the existing ABP client API. Its raw receive lane
@@ -131,14 +133,50 @@ impl VerifiedConnection {
     pub async fn recv_shared(&self) -> Option<VerifiedCommand> {
         match &mut *self.incoming.lock().await {
             VerifiedIncoming::Unbounded(receiver) => receiver.recv().await,
-            VerifiedIncoming::Bounded(receiver) => receiver.recv().await,
+            VerifiedIncoming::Bounded {
+                commands,
+                refusals,
+                gap,
+            } => {
+                if gap.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    return Some(VerifiedCommand::gap());
+                }
+                // Refusals first: a request the lane dropped is already waiting
+                // on its caller's deadline, and answering it frees that caller.
+                tokio::select! {
+                    biased;
+                    refused = refusals.recv() => match refused {
+                        Some(refused) => Some(refused),
+                        None => commands.recv().await,
+                    },
+                    command = commands.recv() => command,
+                }
+            }
         }
     }
 }
 
 pub(crate) enum VerifiedIncoming {
     Unbounded(mpsc::UnboundedReceiver<VerifiedCommand>),
-    Bounded(mpsc::Receiver<VerifiedCommand>),
+    Bounded {
+        commands: mpsc::Receiver<VerifiedCommand>,
+        refusals: mpsc::Receiver<VerifiedCommand>,
+        gap: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+/// What the receive owner owes this delivery. The reader task never writes to
+/// the shared sink and never waits on a full lane, so both of the non-ordinary
+/// outcomes it can reach are reported here and settled by the owner instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// An ordinary broker delivery to act on.
+    Command,
+    /// The bounded lane was full; the owner owes this request one refusal.
+    Refuse,
+    /// One or more id-less broker notices were dropped. Indistinguishable from
+    /// a missed lifecycle change: treat it exactly as a broker lifecycle gap.
+    Gap,
 }
 
 /// Immutable delivery paired with context parsed on its verified transport.
@@ -159,10 +197,44 @@ pub(crate) enum VerifiedIncoming {
 pub struct VerifiedCommand {
     command: IncomingCommand,
     principal: Option<BrokerPrincipal>,
+    delivery: Delivery,
 }
 impl VerifiedCommand {
     pub(crate) fn new(command: IncomingCommand, principal: Option<BrokerPrincipal>) -> Self {
-        Self { command, principal }
+        Self {
+            command,
+            principal,
+            delivery: Delivery::Command,
+        }
+    }
+    /// Keeps the correlation the reply needs and nothing that could be mistaken
+    /// for an admitted request: the delivery itself says it must be refused.
+    pub(crate) fn refusal(self) -> Self {
+        Self {
+            delivery: Delivery::Refuse,
+            ..self
+        }
+    }
+    /// Carries no broker content and no principal: a gap is the absence of a
+    /// delivery, never a delivery to act on.
+    pub(crate) fn gap() -> Self {
+        Self {
+            command: IncomingCommand {
+                from: String::new(),
+                command: String::new(),
+                id: None,
+                args: serde_json::Value::Null,
+                body: String::new(),
+                headers: Default::default(),
+            },
+            principal: None,
+            delivery: Delivery::Gap,
+        }
+    }
+    /// What the receive owner owes this delivery. Check this before the verb:
+    /// a refusal or a gap carries no admissible request.
+    pub fn delivery(&self) -> Delivery {
+        self.delivery
     }
     pub fn command(&self) -> &IncomingCommand {
         &self.command
@@ -260,6 +332,7 @@ async fn connect_verified(
         client,
         incoming: tokio::sync::Mutex::new(incoming),
         session_lock: tokio::sync::Mutex::new(()),
+        session_context: tokio::sync::OnceCell::new(),
     })
 }
 

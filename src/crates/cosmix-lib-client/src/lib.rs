@@ -50,7 +50,7 @@ pub mod session;
 mod unix;
 #[cfg(unix)]
 pub use unix::{
-    BrokerAccount, ConnectError, UnixConnectOptions, UnixConnectOutcome, VerifiedCommand,
+    BrokerAccount, ConnectError, Delivery, UnixConnectOptions, UnixConnectOutcome, VerifiedCommand,
     VerifiedConnection,
 };
 

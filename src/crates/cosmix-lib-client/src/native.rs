@@ -51,10 +51,11 @@ enum NativeIncomingSender {
     #[cfg(unix)]
     Verified(mpsc::UnboundedSender<crate::unix::VerifiedCommand>),
     #[cfg(unix)]
-    VerifiedBounded(
-        mpsc::Sender<crate::unix::VerifiedCommand>,
-        Arc<Mutex<WsSink>>,
-    ),
+    VerifiedBounded {
+        commands: mpsc::Sender<crate::unix::VerifiedCommand>,
+        refusals: mpsc::Sender<crate::unix::VerifiedCommand>,
+        gap: Arc<AtomicBool>,
+    },
     Unbounded(mpsc::UnboundedSender<IncomingCommand>),
     Bounded(BoundedIncomingSender),
 }
@@ -70,46 +71,57 @@ impl NativeIncomingSender {
             Self::Verified(tx) => tx
                 .send(crate::unix::VerifiedCommand::new(command, _principal))
                 .is_ok(),
+            // This arm runs on the reader task, which owns response delivery
+            // for every in-flight RPC on this connection. It therefore never
+            // writes to the shared sink and never waits for lane capacity:
+            // both would gate every pending reply on an unrelated consumer.
             #[cfg(unix)]
-            Self::VerifiedBounded(tx, sink) => {
+            Self::VerifiedBounded {
+                commands,
+                refusals,
+                gap,
+            } => {
                 let bytes = command
                     .headers
                     .iter()
                     .fold(command.body.len(), |n, (k, v)| {
                         n.saturating_add(k.len()).saturating_add(v.len())
                     });
-                // Broker notices are id-less and must not be lost on overflow.
+                // Broker notices are id-less, so there is nothing to refuse and
+                // no reply a caller is waiting for. A dropped one is reported as
+                // a sticky gap instead: the receive owner re-reads its state
+                // exactly as it would for a broker lifecycle gap.
                 if command.id.is_none() {
-                    return bytes <= 65536
-                        && tx
-                            .send(crate::unix::VerifiedCommand::new(command, _principal))
-                            .await
-                            .is_ok();
+                    if bytes > 65536 {
+                        gap.store(true, Ordering::Release);
+                        return true;
+                    }
+                    return match commands
+                        .try_send(crate::unix::VerifiedCommand::new(command, _principal))
+                    {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            gap.store(true, Ordering::Release);
+                            true
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    };
                 }
                 let event = crate::unix::VerifiedCommand::new(command, _principal);
                 let refused = if bytes > 65536 {
                     event
                 } else {
-                    match tx.try_send(event) {
+                    match commands.try_send(event) {
                         Ok(()) => return true,
                         Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         Err(mpsc::error::TrySendError::Full(event)) => event,
                     }
                 };
-                let command = refused.command();
-                let mut reply = BusMessage::new()
-                    .with_header("type", "response")
-                    .with_header("from", "")
-                    .with_header("to", &command.from)
-                    .with_header("command", &command.command)
-                    .with_header("id", command.id.as_deref().unwrap_or(""))
-                    .with_header("rc", "10");
-                reply.body = r#"{"error_code":"REFUSED"}"#.into();
-                sink.lock()
-                    .await
-                    .send(Message::Text(reply.to_wire().into()))
-                    .await
-                    .is_ok()
+                // A full refusal queue means the owner has not drained the ones
+                // already handed over, so writing more cannot help; the caller
+                // still has its own deadline.
+                let _ = refusals.try_send(refused.refusal());
+                true
             }
             Self::Unbounded(sender) => sender.send(command).is_ok(),
             Self::Bounded(sender) => sender.try_send(command),
@@ -308,10 +320,23 @@ impl NodedClient {
         let connected = Arc::new(AtomicBool::new(true));
         let (tx, rx) = match incoming_capacity {
             Some(capacity @ 1..=1024) => {
-                let (tx, rx) = mpsc::channel(capacity);
+                let (tx, commands) = mpsc::channel(capacity);
+                // Refusals are correlation only; the owner drains them ahead of
+                // ordinary work, so a short queue is enough to keep the reader
+                // from ever having to wait.
+                let (refusal_tx, refusals) = mpsc::channel(capacity.min(8));
+                let gap = Arc::new(AtomicBool::new(false));
                 (
-                    NativeIncomingSender::VerifiedBounded(tx, sink.clone()),
-                    crate::unix::VerifiedIncoming::Bounded(rx),
+                    NativeIncomingSender::VerifiedBounded {
+                        commands: tx,
+                        refusals: refusal_tx,
+                        gap: gap.clone(),
+                    },
+                    crate::unix::VerifiedIncoming::Bounded {
+                        commands,
+                        refusals,
+                        gap,
+                    },
                 )
             }
             Some(_) => anyhow::bail!("invalid verified incoming capacity"),
@@ -1097,7 +1122,7 @@ impl NodedClient {
         #[cfg(unix)]
         let verified = matches!(
             &incoming_tx,
-            NativeIncomingSender::Verified(_) | NativeIncomingSender::VerifiedBounded(..)
+            NativeIncomingSender::Verified(_) | NativeIncomingSender::VerifiedBounded { .. }
         );
         #[cfg(not(unix))]
         let verified = false;
@@ -1203,14 +1228,15 @@ mod verified_bound_tests {
     use super::*;
 
     #[tokio::test]
-    async fn overflow_refuses_without_disconnecting_and_preserves_notices() {
-        let (wire_tx, mut wire_rx) = mpsc::unbounded_channel();
-        let sink: WsSink = Box::pin(futures_util::sink::unfold(wire_tx, |tx, message| async {
-            tx.send(message).unwrap();
-            Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
-        }));
-        let (tx, mut rx) = mpsc::channel(1);
-        let sender = NativeIncomingSender::VerifiedBounded(tx, Arc::new(Mutex::new(sink)));
+    async fn overflow_hands_off_refusals_and_reports_dropped_notices_as_a_gap() {
+        let (tx, mut commands) = mpsc::channel(1);
+        let (refusal_tx, mut refusals) = mpsc::channel(4);
+        let gap = Arc::new(AtomicBool::new(false));
+        let sender = NativeIncomingSender::VerifiedBounded {
+            commands: tx,
+            refusals: refusal_tx,
+            gap: gap.clone(),
+        };
         let command = |id| IncomingCommand {
             from: "caller".into(),
             command: "shell.status".into(),
@@ -1221,18 +1247,24 @@ mod verified_bound_tests {
         };
         assert!(sender.send(command(Some("1".into())), None).await);
         assert!(sender.send(command(Some("2".into())), None).await);
-        let response = wire_rx.recv().await.unwrap();
-        let response = bus::parse(response.to_text().unwrap()).unwrap();
-        assert_eq!(response.get("id"), Some("2"));
-        assert_eq!(response.get("rc"), Some("10"));
-        assert_eq!(response.body, r#"{"error_code":"REFUSED"}"#);
-        assert_eq!(rx.recv().await.unwrap().command().id.as_deref(), Some("1"));
+        // The reader hands the overflowed request to the receive owner instead
+        // of writing to the sink it does not own.
+        let refused = refusals.recv().await.unwrap();
+        assert_eq!(refused.delivery(), crate::unix::Delivery::Refuse);
+        assert_eq!(refused.command().id.as_deref(), Some("2"));
+        assert!(!gap.load(Ordering::Acquire));
+        // A dropped id-less notice is a delivery gap, not a refusal: nothing is
+        // queued for reply and the reader still does not block on a full lane.
         assert!(sender.send(command(None), None).await);
-        assert!(rx.recv().await.unwrap().command().id.is_none());
-        assert!(
-            wire_rx.try_recv().is_err(),
-            "notices must not receive replies"
+        assert!(gap.swap(false, Ordering::AcqRel));
+        assert!(refusals.try_recv().is_err(), "notices are never refused");
+        assert_eq!(
+            commands.recv().await.unwrap().command().id.as_deref(),
+            Some("1")
         );
+        assert!(sender.send(command(None), None).await);
+        assert!(commands.recv().await.unwrap().command().id.is_none());
+        assert!(!gap.load(Ordering::Acquire));
     }
 }
 
