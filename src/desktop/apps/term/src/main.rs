@@ -13,6 +13,9 @@ mod raster;
 mod session_fd;
 mod tabs;
 mod terminal;
+#[cfg(test)]
+#[path = "../../../vendor/teletypewriter/patch_guard.rs"]
+mod teletypewriter_patch_guard;
 
 use bevy::{
     asset::RenderAssetUsages,
