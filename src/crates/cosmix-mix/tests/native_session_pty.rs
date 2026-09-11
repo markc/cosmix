@@ -874,14 +874,22 @@ fn status_pump_scenarios(editor: &str) {
             "jobs",
             "job_signal",
             "foreground",
-            "evaluation_submit",
-            "evaluation_inspect",
             "input",
             "isolated_task",
             "events",
         ] {
             assert_eq!(idle["capabilities"][feature], "UNSUPPORTED");
         }
+        // Stage D turned the two evaluation families on, and only where the
+        // terminal can be released without a keypress. The report is derived
+        // from what this build can do, so the two editors must disagree here.
+        let (submit, inspect) = if editor == "owned" {
+            ("idle-prompt-admission", "result-and-cancel")
+        } else {
+            ("UNSUPPORTED", "UNSUPPORTED")
+        };
+        assert_eq!(idle["capabilities"]["evaluation_submit"], submit);
+        assert_eq!(idle["capabilities"]["evaluation_inspect"], inspect);
 
         child.send("while true; 1 + 1; done\n");
         let evaluating = phase(&mut parent, &bound, "evaluating").await;
