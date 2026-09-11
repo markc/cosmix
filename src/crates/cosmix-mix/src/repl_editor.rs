@@ -9,12 +9,25 @@ use std::os::fd::FromRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
+const MAX_HISTORY_FILE_BYTES: u64 = 16 * 1024 * 1024;
+fn read_complete_history(path: &Path) -> io::Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_HISTORY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_HISTORY_FILE_BYTES {
+        return Err(io::Error::other("history exceeds 16 MiB ingestion limit"));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 pub enum ReplEditor {
     Legacy(Box<rustyline::Editor<MixHelper, rustyline::history::DefaultHistory>>),
     Owned {
         editor: OwnedEditor,
         helper: Option<MixHelper>,
         generation: u64,
+        history_writable: bool,
     },
 }
 impl ReplEditor {
@@ -37,6 +50,7 @@ impl ReplEditor {
             editor: OwnedEditor::start(duplicate(0)?, duplicate(1)?)?,
             helper: None,
             generation: 0,
+            history_writable: true,
         })
     }
     pub fn control(&self) -> Option<Control> {
@@ -58,6 +72,7 @@ impl ReplEditor {
                 editor,
                 helper,
                 generation,
+                ..
             } => {
                 *generation = generation
                     .checked_add(1)
@@ -87,13 +102,27 @@ impl ReplEditor {
     pub fn load_history(&mut self, path: &Path) -> rustyline::Result<()> {
         match self {
             Self::Legacy(editor) => editor.load_history(path),
-            Self::Owned { editor, .. } => {
-                let file = File::open(path)?;
-                let mut text = String::new();
-                // Existing codecs retain 100 entries; also bound file ingestion.
-                file.take(16 * 1024 * 1024).read_to_string(&mut text)?;
-                editor.control.load_history(text)?;
-                Ok(())
+            Self::Owned {
+                editor,
+                history_writable,
+                ..
+            } => {
+                *history_writable = false;
+                match read_complete_history(path).and_then(|text| editor.control.load_history(text))
+                {
+                    Ok(()) => {
+                        *history_writable = true;
+                        Ok(())
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        *history_writable = true;
+                        Err(e.into())
+                    }
+                    Err(e) => {
+                        eprintln!("mix: incomplete history load; history saving disabled: {e}");
+                        Err(e.into())
+                    }
+                }
             }
         }
     }
@@ -101,7 +130,16 @@ impl ReplEditor {
         let path = path.as_ref();
         match self {
             Self::Legacy(editor) => editor.save_history(path),
-            Self::Owned { editor, .. } => {
+            Self::Owned {
+                editor,
+                history_writable,
+                ..
+            } => {
+                if !*history_writable {
+                    return Err(
+                        io::Error::other("history saving disabled after incomplete load").into(),
+                    );
+                }
                 let text = editor.control.encode_history()?;
                 let mut file = OpenOptions::new()
                     .create(true)

@@ -44,10 +44,12 @@ snapshots, prompt text and render layouts have explicit limits.
 
 History continues to use `.mix_history` and rustyline's `#V2` multiline encoding,
 with the last 100 entries and consecutive duplicate suppression. History files
-are loaded with a 16 MiB limit. Completion uses the same variables, aliases,
+are loaded with a 16 MiB limit; incomplete/oversized loads warn and disable saving
+so the original file cannot be overwritten by a loaded prefix. Completion uses the same variables, aliases,
 command names and subcommand sources as the legacy path, plus the captured cwd
-and home for paths. At most 4096 candidates are retained. A large directory scan
-is capped, so this preview may omit candidates from unusually large directories.
+and home for paths. Prefix filtering precedes the 4096-result/1 MiB result cap,
+including directory enumeration. Command names share a cached owned snapshot
+using the legacy PATH-scan lifetime, invalidated when aliases change.
 
 Prompt SGR colour is retained; cursor-control and terminal-protocol escapes are
 stripped. Resize reflows the logical buffer; buffers taller than the terminal

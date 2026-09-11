@@ -17,6 +17,21 @@ use std::time::{Duration, Instant};
 const LIMIT: Duration = Duration::from_secs(15);
 const PROMPT: &str = "OWNED> ";
 
+#[test]
+fn oversized_history_is_warned_and_never_rewritten() {
+    let mut original = b"#V2\n".to_vec();
+    original.extend("valid_record\n".repeat(1_400_000).as_bytes());
+    let mut p = Pty::with_history(None, true, PROMPT, Some(&original));
+    p.until("history saving disabled");
+    p.prompt();
+    p.command("print(101)");
+    p.exit();
+    assert_eq!(
+        fs::read(p.home.path().join(".mix_history")).unwrap(),
+        original
+    );
+}
+
 fn modes(fd: i32) -> libc::termios {
     let mut t = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
@@ -71,7 +86,7 @@ fn fixture_editor() {
             },
             CompletionSnapshot {
                 variables: vec!["cycle_a".into(), "cycle_b".into()],
-                commands: vec!["secret_command".into()],
+                commands: std::sync::Arc::new(vec!["secret_command".into()]),
                 ..Default::default()
             },
             vec!["print(616)".into()],
@@ -350,12 +365,23 @@ impl Pty {
         Self::configured(fixture, owned, PROMPT)
     }
     fn configured(fixture: Option<&str>, owned: bool, prompt: &str) -> Self {
+        Self::with_history(fixture, owned, prompt, None)
+    }
+    fn with_history(
+        fixture: Option<&str>,
+        owned: bool,
+        prompt: &str,
+        history: Option<&[u8]>,
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         fs::write(
             home.path().join(".mixrc"),
             format!("fn prompt()\nreturn \"{prompt}\"\nend\n"),
         )
         .unwrap();
+        if let Some(history) = history {
+            fs::write(home.path().join(".mix_history"), history).unwrap();
+        }
         let mut m = -1;
         let mut s = -1;
         let size = libc::winsize {

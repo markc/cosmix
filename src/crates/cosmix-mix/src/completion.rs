@@ -18,35 +18,47 @@ pub struct CompletionState {
     pub _function_names: Vec<String>,
 }
 
+type OwnedCommandCache = (Vec<String>, std::sync::Arc<Vec<String>>);
+
 pub struct MixHelper {
     path_commands: Vec<String>,
     pub state: Rc<RefCell<CompletionState>>,
+    owned_commands: RefCell<Option<OwnedCommandCache>>,
 }
 
 impl MixHelper {
     /// Called on the evaluator owner; only owned names and paths cross threads.
     pub fn snapshot(&self) -> crate::editor::runtime::CompletionSnapshot {
-        let history = rustyline::history::DefaultHistory::new();
-        let context = Context::new(&history);
-        let commands = self
-            .complete("", 0, &context)
-            .unwrap_or_default()
-            .1
-            .into_iter()
-            .map(|p| p.replacement)
-            .collect();
+        let aliases = self.state.borrow().alias_names.clone();
+        let mut cache = self.owned_commands.borrow_mut();
+        // Reuse the same PATH scan lifetime as rustyline. Alias changes are the
+        // only changing input to command-name completion; cwd is captured below
+        // for path completion and does not require cloning thousands of names.
+        if cache.as_ref().is_none_or(|(key, _)| key != &aliases) {
+            let history = rustyline::history::DefaultHistory::new();
+            let context = Context::new(&history);
+            let commands = self
+                .complete("", 0, &context)
+                .unwrap_or_default()
+                .1
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect();
+            *cache = Some((aliases, std::sync::Arc::new(commands)));
+        }
+        let commands = cache.as_ref().unwrap().1.clone();
         crate::editor::runtime::CompletionSnapshot {
             variables: self.state.borrow().variable_names.clone(),
             commands,
             cwd: env::current_dir().unwrap_or_default(),
             home: dirs::home_dir().unwrap_or_default(),
         }
-        .bounded()
     }
     pub fn new() -> Self {
         let path_commands = scan_path_commands();
         MixHelper {
             path_commands,
+            owned_commands: RefCell::new(None),
             state: Rc::new(RefCell::new(CompletionState {
                 variable_names: Vec::new(),
                 alias_names: Vec::new(),

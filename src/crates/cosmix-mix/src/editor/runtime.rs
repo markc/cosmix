@@ -15,7 +15,8 @@ use super::{Command, Editor, Effect, Generation, ModeAction, PromptProfile, Repl
 
 const QUEUE: usize = 16;
 const MAX_CANDIDATES: usize = 4096;
-const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const MAX_COMPLETION_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_HISTORY_ENTRY_BYTES: usize = 1024 * 1024;
 
 pub const MIX_SUBCOMMANDS: &[&str] = &[
     "vars",
@@ -43,27 +44,11 @@ pub const MIX_SUBCOMMANDS: &[&str] = &[
 #[derive(Clone, Debug, Default)]
 pub struct CompletionSnapshot {
     pub variables: Vec<String>,
-    pub commands: Vec<String>,
+    pub commands: Arc<Vec<String>>,
     pub cwd: PathBuf,
     pub home: PathBuf,
 }
 impl CompletionSnapshot {
-    /// Bound snapshots on the producing owner as well as candidate results.
-    pub fn bounded(mut self) -> Self {
-        let mut budget = MAX_SNAPSHOT_BYTES;
-        for entries in [&mut self.variables, &mut self.commands] {
-            entries.truncate(MAX_CANDIDATES);
-            entries.retain(|entry| {
-                if entry.len() > budget {
-                    false
-                } else {
-                    budget -= entry.len();
-                    true
-                }
-            });
-        }
-        self
-    }
     fn complete(&self, text: &str, cursor: usize) -> (usize, Vec<String>) {
         let before = &text[..cursor];
         let start = before
@@ -78,6 +63,7 @@ impl CompletionSnapshot {
                 self.variables
                     .iter()
                     .filter(|v| v.starts_with(prefix))
+                    .take(MAX_CANDIDATES)
                     .map(|v| format!("${v}")),
             );
         } else if before[..start].trim().is_empty() {
@@ -85,6 +71,7 @@ impl CompletionSnapshot {
                 self.commands
                     .iter()
                     .filter(|v| v.starts_with(word))
+                    .take(MAX_CANDIDATES)
                     .cloned(),
             );
         } else if before[..start].trim() == "mix" {
@@ -102,10 +89,10 @@ impl CompletionSnapshot {
             } else {
                 self.cwd.join(dir)
             };
-            let mut budget = MAX_SNAPSHOT_BYTES;
+            let mut budget = MAX_COMPLETION_RESULT_BYTES;
             if let Ok(entries) = std::fs::read_dir(path) {
                 // Directory enumeration and metadata never block the tty owner.
-                for entry in entries.take(MAX_CANDIDATES).flatten() {
+                for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
                     if name.starts_with(prefix) {
                         let suffix = if entry.path().is_dir() { "/" } else { "" };
@@ -115,11 +102,23 @@ impl CompletionSnapshot {
                         }
                         budget -= candidate.len();
                         candidates.push(candidate);
+                        if candidates.len() == MAX_CANDIDATES {
+                            break;
+                        }
                     }
                 }
             }
             candidates.sort();
         }
+        let mut budget = MAX_COMPLETION_RESULT_BYTES;
+        candidates.retain(|candidate| {
+            if candidate.len() > budget {
+                false
+            } else {
+                budget -= candidate.len();
+                true
+            }
+        });
         (start, candidates)
     }
 }
@@ -217,7 +216,7 @@ impl Control {
         self.call(Request::HistoryLoad(text)).map(|_| ())
     }
     pub fn append_history(&self, text: &str) -> io::Result<bool> {
-        if text.len() > MAX_SNAPSHOT_BYTES {
+        if text.len() > MAX_HISTORY_ENTRY_BYTES {
             return Err(io::Error::other("history entry limit"));
         }
         match self.call(Request::HistoryAppend(text.into()))? {
@@ -364,6 +363,7 @@ impl OwnedEditor {
                     draft: String::new(),
                     cycle: None,
                     completing: false,
+                    completion_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     deferred: None,
                     search_draft: None,
                     search_index: None,
@@ -410,14 +410,14 @@ impl OwnedEditor {
     ) -> io::Result<Reply> {
         if profile.text().len() > 64 * 1024
             || history.len() > 100
-            || history.iter().any(|s| s.len() > MAX_SNAPSHOT_BYTES)
+            || history.iter().any(|s| s.len() > MAX_HISTORY_ENTRY_BYTES)
         {
             return Err(io::Error::other("editor prompt/history limit"));
         }
         match self.control.call(Request::Begin {
             generation,
             profile,
-            completion: completion.bounded(),
+            completion,
             history,
         })? {
             Response::Reply(reply) => Ok(reply),
@@ -460,6 +460,7 @@ struct Owner {
     draft: String,
     cycle: Option<Cycle>,
     completing: bool,
+    completion_running: Arc<std::sync::atomic::AtomicBool>,
     deferred: Option<Request>,
     search_draft: Option<Buffer>,
     search_index: Option<usize>,
@@ -636,6 +637,8 @@ impl Owner {
                 self.history_index = self.history.len();
                 self.draft.clear();
                 self.cycle = None;
+                self.completing = false;
+                self.deferred = None;
                 self.search_draft = None;
                 self.search_index = None;
                 self.decoder = Decoder::default();
@@ -704,6 +707,11 @@ impl Owner {
                 start,
                 candidates,
             } => {
+                // A previous prompt's worker must not clear a new prompt's busy
+                // state or install a deferred result after Begin reset it.
+                if generation != self.generation {
+                    return Ok(Response::Stopped);
+                }
                 if self.editor.state() == State::Suspended {
                     self.deferred = Some(Request::Completed {
                         generation,
@@ -863,7 +871,11 @@ impl Owner {
             Key::Control(9) if self.profile.allows_completion() => {
                 if self.cycle.is_some() {
                     self.cycle()?;
-                } else if !self.completing {
+                } else if !self.completing
+                    && !self
+                        .completion_running
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
                     let mut interaction = self.editor.interaction().clone();
                     interaction.completion = true;
                     self.editor.set_interaction(interaction).map_err(protocol)?;
@@ -873,18 +885,29 @@ impl Owner {
                     let text = self.editor.buffer().text().to_owned();
                     let cursor = self.editor.buffer().cursor();
                     let control = self.control.clone();
-                    std::thread::Builder::new()
+                    let running = self.completion_running.clone();
+                    let spawned = std::thread::Builder::new()
                         .name("mix-completion".into())
                         .spawn(move || {
                             let (start, candidates) = snapshot.complete(&text, cursor);
+                            running.store(false, std::sync::atomic::Ordering::SeqCst);
                             control.completed(Request::Completed {
                                 generation,
                                 revision,
                                 start,
                                 candidates,
                             });
-                        })?;
-                    self.completing = true;
+                        });
+                    if spawned.is_ok() {
+                        self.completing = true;
+                    } else {
+                        self.completion_running
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        let mut interaction = self.editor.interaction().clone();
+                        interaction.completion = false;
+                        self.editor.set_interaction(interaction).map_err(protocol)?;
+                        self.terminal.bell()?;
+                    }
                 }
             }
             Key::Up | Key::Down | Key::Control(16 | 14) => {
@@ -1001,6 +1024,17 @@ fn restricted_command(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_filters_before_applying_result_cap() {
+        let mut commands: Vec<_> = (0..5000).map(|i| format!("aaa{i}")).collect();
+        commands.push("ssh".into());
+        let snapshot = super::CompletionSnapshot {
+            commands: std::sync::Arc::new(commands),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.complete("ss", 2).1, ["ssh"]);
+        assert_eq!(snapshot.complete("a", 1).1.len(), super::MAX_CANDIDATES);
+    }
     use super::*;
     #[test]
     fn completion_spans_stay_utf8_boundaries_after_unicode_space() {
