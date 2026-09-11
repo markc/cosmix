@@ -236,7 +236,9 @@ impl Controller {
         while unsafe { libc::tcgetpgrp(fd) } != unsafe { libc::getpgrp() } {
             // Orphaned groups discard SIGTTIN. Never spin forever there.
             if admission_attempts == 8 {
-                return Err(io::Error::other("foreground admission did not stop or acquire terminal"));
+                return Err(io::Error::other(
+                    "foreground admission did not stop or acquire terminal",
+                ));
             }
             admission_attempts += 1;
             // A nested background shell asks its parent for foregrounding.
@@ -522,26 +524,63 @@ impl Controller {
         }
     }
     pub fn abort_launch(&self, id: usize) {
-        {
-            let s = self.shared.state.lock().unwrap();
-            if let Some(j) = s.jobs.get(&id) {
-                unsafe {
-                    libc::kill(-j.pgid, libc::SIGKILL);
-                    // A released target may have moved itself out of the
-                    // original group before a later stage fails. Retain direct
-                    // child ownership and reap those members as well.
-                    for member in j.members.iter().filter(|m| !m.state.terminal()) {
-                        libc::kill(member.pid, libc::SIGKILL);
+        // Bound both grace periods; a D-state member cannot be synchronously
+        // reaped even after SIGKILL. Keep survivors registered with the monitor.
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            {
+                let s = self.shared.state.lock().unwrap();
+                if let Some(j) = s.jobs.get(&id) {
+                    unsafe {
+                        libc::kill(-j.pgid, signal);
+                        libc::kill(-j.pgid, libc::SIGCONT);
+                        // A released target may have moved itself out of the
+                        // original group before a later stage fails. Retain direct
+                        // child ownership and reap those members as well.
+                        for member in j.members.iter().filter(|m| !m.state.terminal()) {
+                            libc::kill(member.pid, signal);
+                            libc::kill(member.pid, libc::SIGCONT);
+                        }
                     }
                 }
             }
+            self.wake();
+            let mut s = self.shared.state.lock().unwrap();
+            let end = Instant::now() + CLOSE_GRACE;
+            while s.jobs.get(&id).is_some_and(|j| j.state() != JobState::Done) {
+                let Some(remaining) = end.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                s = self.shared.changed.wait_timeout(s, remaining).unwrap().0;
+            }
+            if s.jobs.get(&id).is_none_or(|j| j.state() == JobState::Done) {
+                s.jobs.remove(&id);
+                return;
+            }
         }
-        self.wake();
         let mut s = self.shared.state.lock().unwrap();
-        while s.jobs.get(&id).is_some_and(|j| j.state() != JobState::Done) {
-            s = self.shared.changed.wait(s).unwrap();
+        if let Some(job) = s.jobs.get_mut(&id) {
+            job.foreground = false;
+            let survivors: Vec<_> = job
+                .members
+                .iter()
+                .filter(|m| !m.state.terminal())
+                .map(|m| m.pid)
+                .collect();
+            eprintln!("mix: failed job {id} survived TERM/KILL grace: {survivors:?}");
         }
-        s.jobs.remove(&id);
+    }
+    fn launch_stopped(&self, id: usize) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .is_some_and(|j| {
+                j.members
+                    .iter()
+                    .any(|m| matches!(m.state, MemberState::Stopped(_)))
+            })
     }
     pub fn shutdown(&self) {
         let mut state = self.shared.state.lock().unwrap();
@@ -736,18 +775,61 @@ impl Stage {
     pub fn spawn(&mut self) -> io::Result<Child> {
         self.command.spawn()
     }
-    pub fn release(mut self) -> io::Result<()> {
+    pub fn release(self, controller: &Controller, id: usize) -> io::Result<()> {
+        self.release_with_stop(|| controller.launch_stopped(id))
+    }
+    fn release_with_stop(mut self, stopped: impl Fn() -> bool) -> io::Result<()> {
         drop(self.inherited);
         self.gate.write_all(&[1])?;
         drop(self.gate);
         let mut errno = Vec::new();
-        Read::by_ref(&mut self.error)
-            .take(4)
-            .read_to_end(&mut errno)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if stopped() {
+                return Err(io::Error::other("job stopped before exec acknowledgement"));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stage exec acknowledgement timed out",
+                ));
+            }
+            let mut fd = libc::pollfd {
+                fd: self.error.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut fd, 1, 20) };
+            if rc < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if rc == 0 {
+                continue;
+            }
+            let mut bytes = [0; 4];
+            match self.error.read(&mut bytes[..4 - errno.len()]) {
+                Ok(0) => break,
+                Ok(n) => errno.extend_from_slice(&bytes[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+            if errno.len() == 4 {
+                break;
+            }
+        }
         if errno.is_empty() {
             Ok(())
-        } else if let Ok(bytes) = <[u8; 4]>::try_from(errno) {
+        } else if let Ok(bytes) = <[u8; 4]>::try_from(errno.as_slice()) {
             Err(io::Error::from_raw_os_error(i32::from_ne_bytes(bytes)))
+        } else if errno.len() == 1 {
+            Err(io::Error::other(format!(
+                "stage trampoline failure (reason {})",
+                errno[0]
+            )))
         } else {
             Err(io::Error::other("incomplete stage exec acknowledgement"))
         }
@@ -766,8 +848,16 @@ pub fn stage_entry() {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|fd| *fd > 2)
     };
-    let (Some(g), Some(e), Some(program)) = (parse(2), parse(3), args.get(4)) else {
+    let fail = |reason: u8| -> ! {
+        if let Some(e) = parse(3) {
+            unsafe {
+                libc::write(e, (&reason as *const u8).cast(), 1);
+            }
+        }
         std::process::exit(126);
+    };
+    let (Some(g), Some(e), Some(program)) = (parse(2), parse(3), args.get(4)) else {
+        fail(1);
     };
     // The hidden entry is not an authority boundary, but malformed argv must
     // never construct File from an invalid or multiply-owned descriptor.
@@ -775,16 +865,16 @@ pub fn stage_entry() {
         || unsafe { libc::fcntl(g, libc::F_GETFD) } < 0
         || unsafe { libc::fcntl(e, libc::F_GETFD) } < 0
     {
-        std::process::exit(126);
+        fail(2);
     }
     let mut gate = unsafe { File::from_raw_fd(g) };
     let mut error = unsafe { File::from_raw_fd(e) };
-    unsafe {
-        libc::fcntl(e, libc::F_SETFD, libc::FD_CLOEXEC);
+    if unsafe { libc::fcntl(e, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        fail(3);
     }
     let mut byte = [0];
     if gate.read_exact(&mut byte).is_err() || byte[0] != 1 {
-        std::process::exit(126);
+        fail(4);
     }
     drop(gate);
     let err = Command::new(program).args(&args[5..]).exec();

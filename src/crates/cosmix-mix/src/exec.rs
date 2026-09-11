@@ -1854,7 +1854,8 @@ fn execute_managed(
         }
     };
     for stage in stages {
-        if let Err(e) = stage.release() {
+        if let Err(e) = stage.release(controller, id) {
+            drop(lease); // reclaim the terminal before bounded abort cleanup
             controller.abort_launch(id);
             return Err(e);
         }

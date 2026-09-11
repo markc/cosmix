@@ -44,8 +44,12 @@ an installation replaces or unlinks their original executable.
 This lets Rust's spawn acknowledgement complete before the barrier waits.
 Only after all children share their job group and the foreground terminal
 has transferred does Mix release target execution. A second close-on-exec
-pipe reports target-exec failures; failed launches kill the job group and
-reap every registered direct child.
+pipe reports target-exec failures and one-byte trampoline failure reasons.
+Acknowledgement waits observe member stops and have a five-second deadline.
+Failed launches reclaim the terminal first, send TERM/CONT, allow 500 ms,
+then send KILL/CONT and allow another 500 ms. Survivors are reported and
+remain registered for eventual reaping; an uninterruptible child cannot
+hold the prompt indefinitely.
 
 The process monitor is the sole consumer of registered child statuses,
 including stopped/continued states. SIGCHLD wakes it independently of REPL
