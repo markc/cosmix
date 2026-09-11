@@ -11,7 +11,7 @@
 use cosmix_lib_bus::native_session::*;
 use cosmix_lib_client::session::{ChallengeResult, ExpectedScope, Hello, SessionFailure};
 use cosmix_lib_client::{
-    BrokerAccount, ConnectError, NodedClient, UnixConnectOptions, UnixConnectOutcome,
+    BrokerAccount, ConnectError, Delivery, NodedClient, UnixConnectOptions, UnixConnectOutcome,
     VerifiedConnection,
 };
 use ed25519_dalek::SigningKey;
@@ -604,9 +604,12 @@ async fn own(
             }
         };
         let connection = std::sync::Arc::new(connection);
+        // One hello for this connection's whole life. Every later user of the
+        // context — lease checks on the admission path above all — reads the
+        // cache instead of queuing another RPC behind the renew.
         let hello = match rpc(
             "hello: broker context unavailable",
-            connection.session_hello(),
+            connection.session_context(),
         )
         .await
         {
@@ -670,9 +673,9 @@ async fn own(
                             }
                         }
                     } else if let Some(bound) = &record {
-                        match rpc("renew: attachment lost", connection.session_renew(bound.reference())).await {
-                            Ok(result) if result.record.reference() == bound.reference() && result.record.state == BindingState::Attached => record = Some(result.record),
-                            _ => { reporter.report("renew: attachment lost; bounded reconnect"); break true; }
+                        match renew(&connection, bound).await {
+                            Some(renewed) => record = Some(renewed),
+                            None => { reporter.report("renew: attachment lost; bounded reconnect"); break true; }
                         }
                     }
                 }
@@ -682,11 +685,21 @@ async fn own(
                     let Some(event) = event else { break true };
                     if !connection.client().is_connected() { break true; }
                     let command = event.command();
-                    if command.command == "noded.session.lifecycle.gap" || command.command == "noded.session.lifecycle" {
+                    if event.delivery() == Delivery::Refuse {
+                        // The reader never writes: an overflowed request is
+                        // refused here, on the one arm that owns the sink.
+                        let connection = connection.clone();
+                        refusal = Some(Box::pin(async move {
+                            crate::session_status::refuse(&connection, &event).await;
+                        }));
+                    } else if event.delivery() == Delivery::Gap || command.command == "noded.session.lifecycle.gap" || command.command == "noded.session.lifecycle" {
                         // Authenticated notices are hints, never scope or authority.
                         // Coalesce them behind the floor. Attached notices at our
                         // own generation must not trigger a self-resume feedback loop.
-                        let relevant = match relevant_notice(&command.command, &command.body, &hello, record.as_ref()) {
+                        // A lane gap carries no notice to decode and no choice:
+                        // something was dropped, so nothing about the current
+                        // attachment can still be assumed.
+                        let relevant = event.delivery() == Delivery::Gap || match relevant_notice(&command.command, &command.body, &hello, record.as_ref()) {
                             Ok(relevant) => relevant,
                             Err(_) => { reporter.report("notice decode: malformed lifecycle hint dropped"); false }
                         };
@@ -697,8 +710,13 @@ async fn own(
                         }
                     } else if command.id.is_some() {
                         let connection = connection.clone();
-                        if requests.len() < 4 && let Some(bound) = record.as_ref() {
-                            let bound = bound.clone();
+                        // The last slot belongs to this pane's own Term; other
+                        // same-UID callers share the rest.
+                        let admitted = record
+                            .as_ref()
+                            .filter(|bound| requests.len() < crate::session_status::dispatch_slots(&event, bound))
+                            .cloned();
+                        if let Some(bound) = admitted {
                             let hello = hello.clone();
                             requests.spawn(async move {
                                 crate::session_status::dispatch(&connection, &hello, &bound, &event).await;
@@ -725,6 +743,35 @@ async fn own(
         reporter.report("transport: attachment disconnected; bounded reconnects");
         failures = failures.max(1);
     }
+}
+
+/// One bounded retry with a fresh timeout before the attachment is given up.
+/// Every session RPC serialises on this connection, so a burst of admissions
+/// can push one renewal past its 2s timeout; a 5s cadence against a 15s lease
+/// leaves room for the extra attempt. Transient contention must delay a
+/// renewal, not drop the attachment and force a full reconnect.
+async fn renew(connection: &VerifiedConnection, bound: &SessionRecord) -> Option<SessionRecord> {
+    for attempt in 0..2 {
+        match rpc(
+            "renew: attachment lost",
+            connection.session_renew(bound.reference()),
+        )
+        .await
+        {
+            Ok(result)
+                if result.record.reference() == bound.reference()
+                    && result.record.state == BindingState::Attached =>
+            {
+                return Some(result.record);
+            }
+            // Only transport loss or an elapsed deadline is contention. A
+            // refusal, or a record that came back changed, is an answer about
+            // this attachment: retrying it would only delay the reconnect.
+            Err(failure) if attempt == 0 && matches!(failure.recovery, Recovery::Reconnect) => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 async fn reconnect_backoff(
@@ -783,7 +830,8 @@ async fn revoke_for_restart_inner(
             else {
                 return false;
             };
-            let Ok(Ok(hello)) = tokio::time::timeout(RPC, connection.session_hello()).await else {
+            let Ok(Ok(hello)) = tokio::time::timeout(RPC, connection.session_context()).await
+            else {
                 close(&connection).await;
                 return false;
             };

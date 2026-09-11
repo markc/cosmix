@@ -10,6 +10,35 @@ use std::time::Duration;
 const MAX_REQUEST: usize = 2048;
 const ADMISSION: Duration = Duration::from_secs(2);
 pub(crate) const VERB: &str = "shell.status";
+/// Concurrent status dispatches the resident will carry at once, and the share
+/// of them any caller other than this pane's own Term may hold.
+const DISPATCH_SLOTS: usize = 4;
+const SHARED_SLOTS: usize = DISPATCH_SLOTS - 1;
+
+/// Scheduling class only, never authority: `admitted` still re-runs the whole
+/// policy on the reserved slot. Without the reservation any same-UID process
+/// can hold every slot and starve the owning Term into uniform refusals.
+fn owning_term(event: &VerifiedCommand, bound: &SessionRecord) -> bool {
+    event.trusted_context().is_some_and(|principal| {
+        principal.broker_epoch == bound.broker_epoch
+            && principal.unix_uid == bound.owner_uid
+            && principal.owner_node == bound.owner_node
+            && principal.session.as_ref().is_some_and(|caller| {
+                caller.role == Role::Term
+                    && Some(caller.instance_id) == bound.parent_instance
+                    && Some(caller.incarnation) == bound.parent_incarnation
+            })
+    })
+}
+
+/// How many of the resident's dispatch slots this caller may occupy.
+pub(crate) fn dispatch_slots(event: &VerifiedCommand, bound: &SessionRecord) -> usize {
+    if owning_term(event, bound) {
+        DISPATCH_SLOTS
+    } else {
+        SHARED_SLOTS
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,7 +194,12 @@ pub(crate) async fn dispatch(
                     refuse(connection, event).await;
                     return;
                 };
+                // A snapshot observed after the transport dropped is not
+                // deliverable, but the refusal is still attempted: every
+                // admitted request gets one uniform answer or a failed write,
+                // never a silent drop that a caller cannot distinguish.
                 if !connection.client().is_connected() {
+                    refuse(connection, event).await;
                     return;
                 }
                 // Source changes atomically with the reducer's sequence. Never
