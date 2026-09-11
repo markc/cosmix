@@ -1610,6 +1610,55 @@ fn p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges() {
             forbidden(call(&tcp, &parent.name, verb, json!({"target":target})).await);
         }
 
+        // The announcement names the ORIGINATING agent, not Term. On the real
+        // agent path Term is always the shell's direct caller, so an
+        // announcement built from the direct caller would say "Term" for every
+        // submission and tell the human nothing about who is driving the pane.
+        assert!(
+            snapshot.1["text"]
+                .as_str()
+                .unwrap()
+                .contains(" via Term "),
+            "the announcement did not name the originator and its relay: {}",
+            snapshot.1["text"]
+        );
+
+        // Term namespaces what it forwards. Two DIFFERENT actors using the same
+        // caller request id must not collide at the child — before this, the
+        // second one replayed the first one's operation.
+        let sibling = verified(&fixture.broker).await;
+        let generation = idle_generation(owner.client(), &child).await;
+        let other = call(
+            sibling.client(),
+            &parent.name,
+            "term.execute",
+            json!({"target":target,"request_id":"2","prompt_generation":generation,
+                   "source":"print(\"SECOND_ACTOR\")"}),
+        )
+        .await;
+        assert_eq!(other.0, 0, "{other:?}");
+        assert_ne!(
+            other.1["operation_id"], accepted.1["operation_id"],
+            "two actors sharing a caller request id collapsed onto one operation"
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let reply = call(
+                sibling.client(),
+                &parent.name,
+                "term.exec.result",
+                json!({"target":target,"operation_id":other.1["operation_id"]}),
+            )
+            .await;
+            if reply.1["state"] == "finished" {
+                assert_eq!(reply.1["result"]["outcome"], "completed", "{reply:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "never finished: {reply:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        sibling.client().close().await;
+
         // A pane generation that is not this child's is not this child. Term
         // must not forward to whatever happens to be bound now.
         let mut wrong = target;
