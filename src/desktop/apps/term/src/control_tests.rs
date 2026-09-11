@@ -66,6 +66,12 @@ async fn call(client: &NodedClient, name: &str, verb: &str, mut body: Value) -> 
         serde_json::from_str(&body).expect("structured Term response"),
     )
 }
+/// libtest exits 0 when its filter matches nothing, so a renamed module or a
+/// mistyped --exact path would leave a self-exec fixture passing while asserting
+/// nothing at all. Require the child to report that it ran the one test.
+fn ran_one_test(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).contains("test result: ok. 1 passed")
+}
 fn forbidden(reply: (u8, Value)) {
     assert_eq!(reply, (10, json!({"error_code":"FORBIDDEN"})));
 }
@@ -648,6 +654,16 @@ fn p0i_09_real_payload_tap_observe_and_logs() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            ran_one_test(&output.stdout),
+            "observation worker never ran its assertions: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Scanning an empty stream for the sentinel would pass for free. The
+        // worker enables broker/client tracing precisely so there is real
+        // diagnostic output here to scan.
+        assert!(!output.stderr.is_empty(), "no captured diagnostic output to scan");
         for stream in [&output.stdout, &output.stderr] {
             assert!(
                 !String::from_utf8_lossy(stream).contains("PRIVATE_S4_SENTINEL"),
@@ -735,13 +751,22 @@ fn p0i_07_other_uid_both_policies() {
             let configuration = json!({"broker_uid":unsafe { libc::geteuid() },"broker_gid":unsafe { libc::getegid() },"endpoint":fixture.broker.endpoint,"url":fixture.broker.url,"name":parent.name,"target":target(&parent,&child)});
             let mut process = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "native_session::enforcement_tests::p0i_07_other_uid_both_policies", "--ignored", "--nocapture"])
-                .uid(uid).gid(uid).env("COSMIX_S4_OTHER_UID_WORKER", configuration.to_string()).spawn().unwrap();
-            tokio::time::timeout(Duration::from_secs(30), async {
+                .uid(uid).gid(uid).env("COSMIX_S4_OTHER_UID_WORKER", configuration.to_string())
+                .stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    if let Some(status) = process.try_wait().unwrap() { assert!(status.success()); break; }
+                    if let Some(status) = process.try_wait().unwrap() { return status; }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }).await.expect("other-UID real recipient fixture deadline");
+            assert!(status.success());
+            let mut stdout = Vec::new();
+            std::io::Read::read_to_end(&mut process.stdout.take().unwrap(), &mut stdout).unwrap();
+            assert!(
+                ran_one_test(&stdout),
+                "other-UID worker never ran its denial assertions: {}",
+                String::from_utf8_lossy(&stdout)
+            );
         });
     }
 }
@@ -1009,4 +1034,129 @@ fn p0i_07_capability_separation_and_bound_termination() {
             assert!(fixture.tabs.lock().unwrap().is_empty());
         });
     }
+}
+
+#[test]
+#[ignore = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit S4 gate only"]
+fn p0i_07_affected_set_and_live_generation_authority() {
+    eprintln!("{REQUIRE_MIX}");
+    let fixture = Fixture::new(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let owner = verified(&fixture.broker).await;
+        let (parent, first) = fixture.records(&owner, 1).await;
+        let first = target(&parent, &first);
+        fixture.open_second();
+        let (_, second) = fixture.records(&owner, 2).await;
+        let second = target(&parent, &second);
+        assert_ne!(first.pane_id, second.pane_id);
+
+        // A LIVE pane is still not addressable by a generation it is not on.
+        // This is the permit's pane guard rather than the pure policy decision,
+        // so it only means anything against a pane that really is alive: the
+        // same request with the current generation succeeds immediately after.
+        let mut ahead = first.clone();
+        ahead.pane_generation.0 += 1;
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.snapshot",
+                json!({"target":ahead,"contents":true}),
+            )
+            .await,
+        );
+        let mut zero = first.clone();
+        zero.pane_generation.0 = 0;
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.snapshot",
+                json!({"target":zero,"contents":true}),
+            )
+            .await,
+        );
+        assert_eq!(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.snapshot",
+                json!({"target":first,"contents":true})
+            )
+            .await
+            .0,
+            0,
+            "the generation gate must be the only thing refusing those"
+        );
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.type",
+                json!({"target":ahead,"request_id":"1","foreground_generation":"1","text":"NO"}),
+            )
+            .await,
+        );
+
+        // Selecting the first pane while the second tab is active moves focus
+        // in both tabs, so the request must carry authority over the whole
+        // affected set. This ambient owner WOULD be allowed that sibling on its
+        // own, which is what makes this the affected-set gate rather than a
+        // policy one: omitting the sibling is refused anyway.
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.pane.select",
+                json!({"target":first,"request_id":"2"}),
+            )
+            .await,
+        );
+        let mut stale = second.clone();
+        stale.pane_generation.0 += 1;
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.pane.select",
+                json!({"target":first,"affected":[stale],"request_id":"3"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.pane.select",
+                json!({"target":first,"affected":[second],"request_id":"4"})
+            )
+            .await
+            .0,
+            0
+        );
+
+        // Closing the now-active first tab promotes the second one, so the
+        // replacement's panes join the affected set even though the request
+        // never names that tab.
+        forbidden(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.tab.close",
+                json!({"target":first,"request_id":"5"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.tab.close",
+                json!({"target":first,"affected":[second],"request_id":"6"})
+            )
+            .await
+            .0,
+            0
+        );
+    });
 }
