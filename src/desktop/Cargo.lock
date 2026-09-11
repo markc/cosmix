@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.84.0"
+version = "0.84.2"
 dependencies = [
  "futures-util",
  "indexmap",
