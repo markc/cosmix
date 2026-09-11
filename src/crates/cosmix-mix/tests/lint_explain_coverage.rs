@@ -13,10 +13,7 @@ fn codes_in(src: &str) -> Vec<String> {
         let start = i + pos;
         i = start + 4;
         let c = &bytes[start..];
-        if c.len() >= 9
-            && c[4].is_ascii_uppercase()
-            && c[5..9].iter().all(u8::is_ascii_digit)
-        {
+        if c.len() >= 9 && c[4].is_ascii_uppercase() && c[5..9].iter().all(u8::is_ascii_digit) {
             out.push(String::from_utf8_lossy(&c[..9]).into_owned());
         }
     }

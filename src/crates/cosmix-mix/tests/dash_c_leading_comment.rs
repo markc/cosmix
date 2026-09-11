@@ -32,7 +32,10 @@ fn run(code: &str) -> (String, i32) {
 #[test]
 fn leading_comment_does_not_discard_the_program() {
     let (stdout, code) = run("-- set up\nprint(\"RAN\")");
-    assert_eq!(stdout, "RAN", "a program whose first line is a comment must run");
+    assert_eq!(
+        stdout, "RAN",
+        "a program whose first line is a comment must run"
+    );
     assert_eq!(code, 0);
 }
 
@@ -52,9 +55,18 @@ fn comment_then_blank_then_code_runs() {
 
 #[test]
 fn wholly_comment_input_is_still_a_clean_noop() {
-    for code_str in ["-- just a comment", "# hash only", "-- one\n-- two", "", "   "] {
+    for code_str in [
+        "-- just a comment",
+        "# hash only",
+        "-- one\n-- two",
+        "",
+        "   ",
+    ] {
         let (stdout, code) = run(code_str);
-        assert_eq!(stdout, "", "all-comment input must produce no output: {code_str:?}");
+        assert_eq!(
+            stdout, "",
+            "all-comment input must produce no output: {code_str:?}"
+        );
         assert_eq!(code, 0, "all-comment input must exit 0: {code_str:?}");
     }
 }

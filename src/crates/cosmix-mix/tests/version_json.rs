@@ -19,7 +19,13 @@ fn version_json_shape_and_full_sha() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["build_time", "git_dirty", "git_sha", "git_sha_full", "version"]
+        [
+            "build_time",
+            "git_dirty",
+            "git_sha",
+            "git_sha_full",
+            "version"
+        ]
     );
     assert!(v["git_dirty"].is_boolean());
     let full = v["git_sha_full"].as_str().unwrap();

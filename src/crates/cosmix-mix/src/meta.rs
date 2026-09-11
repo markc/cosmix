@@ -821,12 +821,17 @@ fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
     // 1. Version + build provenance.
     let bi = cosmix_buildinfo::build_info!();
     let dirty = if bi.git_dirty { " (dirty tree)" } else { "" };
-    println!("  ✓ version    {} · git {}{} · built {}", bi.version, bi.git_sha, dirty, bi.build_time);
+    println!(
+        "  ✓ version    {} · git {}{} · built {}",
+        bi.version, bi.git_sha, dirty, bi.build_time
+    );
 
     // 2. Compiled feature set — the honest "what can this binary do".
     let feats = cosmix_mix::builtins::compiled_features();
     if feats.is_empty() {
-        println!("  ⚠ features   none — a bare interpreter; network/crypto/data builtins will refuse. Rebuild with the feature set (setup.mix enables all).");
+        println!(
+            "  ⚠ features   none — a bare interpreter; network/crypto/data builtins will refuse. Rebuild with the feature set (setup.mix enables all)."
+        );
     } else {
         println!("  ✓ features   {}", feats.join(" "));
     }
@@ -838,7 +843,9 @@ fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
         let n = eval.scope().function_names().len();
         println!("  ✓ prelude    loaded ({n} functions in scope)");
     } else {
-        println!("  ⚠ prelude    not loaded (this session ran with --no-prelude; the prelude is fine)");
+        println!(
+            "  ⚠ prelude    not loaded (this session ran with --no-prelude; the prelude is fine)"
+        );
     }
 
     // 4. Manual — count readable pages across the checkout docs dir and the
@@ -857,7 +864,9 @@ fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
         }
     }
     if man_topics.is_empty() {
-        println!("  ⚠ manual     no pages found locally — `mix man TOPIC` fetches + caches on first use (needs network once).");
+        println!(
+            "  ⚠ manual     no pages found locally — `mix man TOPIC` fetches + caches on first use (needs network once)."
+        );
     } else {
         println!("  ✓ manual     {} page(s) readable", man_topics.len());
     }
@@ -867,11 +876,16 @@ fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
         Some(dir) => match probe_writable_dir(&dir) {
             Ok(()) => println!("  ✓ stats      writable at {}", dir.display()),
             Err(e) => {
-                println!("  ✗ stats      {} not writable: {e} — fix its ownership/permissions or set XDG_DATA_HOME", dir.display());
+                println!(
+                    "  ✗ stats      {} not writable: {e} — fix its ownership/permissions or set XDG_DATA_HOME",
+                    dir.display()
+                );
                 fails += 1;
             }
         },
-        None => println!("  ⚠ stats      no data dir resolvable (no HOME/XDG_DATA_HOME) — usage tracking is off"),
+        None => println!(
+            "  ⚠ stats      no data dir resolvable (no HOME/XDG_DATA_HOME) — usage tracking is off"
+        ),
     }
 
     // 6. Bus — only if a noded endpoint is configured/derivable. Bounded probe,
@@ -891,7 +905,9 @@ fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
         }
         BusProbe::Reachable => println!("  ✓ bus        reachable at {noded}"),
         BusProbe::Unreachable(why) => {
-            println!("  ⚠ bus        {noded} unreachable ({why}) — start noded, or ignore if standalone");
+            println!(
+                "  ⚠ bus        {noded} unreachable ({why}) — start noded, or ignore if standalone"
+            );
         }
     }
 
@@ -957,9 +973,10 @@ fn probe_bus_blocking(url: &str) -> BusProbe {
     // resolved addresses still fits under the overall ceiling.
     let timeout = Duration::from_millis(200);
     // Unix socket: `unix:/path` or a bare path.
-    if let Some(path) = url.strip_prefix("unix:").or_else(|| {
-        (url.starts_with('/') || url.starts_with("./")).then_some(url)
-    }) {
+    if let Some(path) = url
+        .strip_prefix("unix:")
+        .or_else(|| (url.starts_with('/') || url.starts_with("./")).then_some(url))
+    {
         if !Path::new(path).exists() {
             return BusProbe::Unreachable("socket path does not exist".into());
         }
@@ -1530,7 +1547,9 @@ fn cmd_help_overview() {
     println!("  mix FILE [ARGS]  Run a script in a clean child process");
     println!("  mix --version    Print the version line (also: mix -V)");
     println!("  mix status       Detailed status (uptime, memory, scope depth, trace)");
-    println!("  mix doctor       Health self-check (version, features, prelude, manual, stats, bus)");
+    println!(
+        "  mix doctor       Health self-check (version, features, prelude, manual, stats, bus)"
+    );
     println!("  mix vars         List all variables");
     println!("  mix aliases      List all aliases");
     println!("  mix functions    List all user-defined functions");
@@ -1562,7 +1581,9 @@ fn cmd_help_overview() {
     println!("  mix builtins [X] Full builtin list; X = a name, category, --json, or --names");
     println!("  mix what NAME    One-line description of a builtin or keyword");
     println!("  mix apropos TERM Search builtins, keywords + manual by name/description");
-    println!("  mix explain CODE Full rationale for a lint code (MIX-XXXX); a builtin name uses AI");
+    println!(
+        "  mix explain CODE Full rationale for a lint code (MIX-XXXX); a builtin name uses AI"
+    );
     println!("  mix diff LANG    Translation cheatsheet (e.g. mix diff bash)");
     println!("  mix syntax       Shortcut for: mix man variables");
     println!("  mix operators    Shortcut for: mix man operators");

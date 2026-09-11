@@ -36,7 +36,10 @@ fn file_error_shows_the_offending_line() {
     let out = mix().arg(f.path()).output().expect("spawn mix");
     let err = stderr_of(out);
     assert!(err.contains("sqrt() expects a number"), "{err}");
-    assert!(err.contains("\n  3 | sqrt(\"nope\")"), "no footer in:\n{err}");
+    assert!(
+        err.contains("\n  3 | sqrt(\"nope\")"),
+        "no footer in:\n{err}"
+    );
 }
 
 #[test]

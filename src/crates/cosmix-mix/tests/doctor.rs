@@ -38,6 +38,10 @@ fn doctor_exit_status_reflects_health() {
     } else {
         // If something genuinely failed (✗), the exit must be non-zero — the
         // whole point of a gateable doctor.
-        assert_ne!(out.status.code(), Some(0), "a failed check must exit non-zero:\n{s}");
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "a failed check must exit non-zero:\n{s}"
+        );
     }
 }

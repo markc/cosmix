@@ -100,7 +100,10 @@ fn explicit_nil_cap_means_no_cap() {
     assert_eq!(out.stdout, BINARY_INPUT, "nil must read the whole stream");
 
     // A cap of 0 is a real cap, not "absent".
-    let zero = run_filter("write_stdout(\"n=\", bytes_len(read_stdin_bytes(0)))", BINARY_INPUT);
+    let zero = run_filter(
+        "write_stdout(\"n=\", bytes_len(read_stdin_bytes(0)))",
+        BINARY_INPUT,
+    );
     assert!(zero.status.success(), "status={:?}", zero.status);
     assert_eq!(zero.stdout, b"n=0");
 }
@@ -135,7 +138,8 @@ fn broken_pipe_raises_and_the_documented_idiom_exits_quietly() {
 
     // Default: a failed write RAISES rather than being swallowed, so a
     // filter cannot report success having written nothing.
-    let loud = "$i = 0\nwhile $i < 200000\n  write_stdout(\"line \", $i, \"\\n\")\n  $i = $i + 1\nend\n";
+    let loud =
+        "$i = 0\nwhile $i < 200000\n  write_stdout(\"line \", $i, \"\\n\")\n  $i = $i + 1\nend\n";
     let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
         .args(["-c", loud])
         .env("MIX_STATS", "off")
@@ -148,7 +152,10 @@ fn broken_pipe_raises_and_the_documented_idiom_exits_quietly() {
     stdout.read_exact(&mut first).expect("read first byte");
     drop(stdout); // the `| head -1` moment
     let out = child.wait_with_output().expect("wait");
-    assert!(!out.status.success(), "a dropped write must not report success");
+    assert!(
+        !out.status.success(),
+        "a dropped write must not report success"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Broken pipe"), "stderr: {stderr}");
 

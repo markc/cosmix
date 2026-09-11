@@ -82,17 +82,26 @@ pub fn locate_root(env_root: Option<PathBuf>, exe: Option<&Path>) -> Option<Path
     if let Some(root) = env_root {
         return Some(root);
     }
-    exe?.ancestors().skip(1).take(6).find(|d| is_root(d)).map(Path::to_path_buf)
+    exe?.ancestors()
+        .skip(1)
+        .take(6)
+        .find(|d| is_root(d))
+        .map(Path::to_path_buf)
 }
 
 fn resolve_all() -> ResolvedPaths {
     let user_mode = current_uid() != 0;
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
     let exe = std::env::current_exe().ok();
-    let root = locate_root(std::env::var_os("COSMIX").map(PathBuf::from), exe.as_deref());
+    let root = locate_root(
+        std::env::var_os("COSMIX").map(PathBuf::from),
+        exe.as_deref(),
+    );
 
     let src = env_or("COSMIX_SRC", || {
-        root.clone().unwrap_or_else(|| default_root(&home)).join("src")
+        root.clone()
+            .unwrap_or_else(|| default_root(&home))
+            .join("src")
     });
 
     let etc = env_or("COSMIX_ETC", || match &root {
@@ -109,7 +118,12 @@ fn resolve_all() -> ResolvedPaths {
         None => PathBuf::from("/usr/local/bin"),
     });
 
-    ResolvedPaths { root, src, etc, bin }
+    ResolvedPaths {
+        root,
+        src,
+        etc,
+        bin,
+    }
 }
 
 fn env_or(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
@@ -211,7 +225,10 @@ mod tests {
 
     #[test]
     fn env_root_wins_over_self_location() {
-        let root = locate_root(Some(PathBuf::from("/srv/cosmix")), Some(Path::new("/nowhere/bin/mix")));
+        let root = locate_root(
+            Some(PathBuf::from("/srv/cosmix")),
+            Some(Path::new("/nowhere/bin/mix")),
+        );
         assert_eq!(root, Some(PathBuf::from("/srv/cosmix")));
     }
 
@@ -224,13 +241,19 @@ mod tests {
         std::fs::create_dir_all(root.join("src/target/release")).unwrap();
         std::fs::write(root.join("bootstrap"), "").unwrap();
         std::fs::write(root.join("src/Cargo.toml"), "").unwrap();
-        assert_eq!(locate_root(None, Some(&root.join("bin/mix"))), Some(root.clone()));
+        assert_eq!(
+            locate_root(None, Some(&root.join("bin/mix"))),
+            Some(root.clone())
+        );
         assert_eq!(
             locate_root(None, Some(&root.join("src/target/release/mix"))),
             Some(root.clone())
         );
         // a system install has no checkout above it
-        assert_eq!(locate_root(None, Some(Path::new("/opt/cosmix/bin/mix"))), None);
+        assert_eq!(
+            locate_root(None, Some(Path::new("/opt/cosmix/bin/mix"))),
+            None
+        );
     }
 
     #[test]
