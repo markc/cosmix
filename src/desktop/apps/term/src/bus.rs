@@ -1,14 +1,17 @@
-use crate::tabs::{Cleanup, CompletionNote, Outcome, TabSet};
+use crate::tabs::{Cleanup, CompletionNote, TabSet};
+#[cfg(test)]
+use crate::tabs::Outcome;
 use cosmix_client::{BoundedIncomingEvent, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+#[cfg(test)]
 pub const HELP: &str = "term: tabbed Wayland Mix terminal\nDIAGNOSTIC surface — full ABP control (windows/tabs/panes/sessions per SPEC) is P3a, gated on authenticated per-instance identity (P0-I); this self-asserted `term` name is a placeholder, not the shipped multi-user identity.\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nThese tab verbs are DIAGNOSTIC too; real per-instance identity is P0-I.\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nThese pane verbs are DIAGNOSTIC too; real per-instance identity is P0-I.\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: DIAGNOSTIC ONLY; ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported. Not a product input API.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 pub fn start(
     terminal: Arc<Mutex<TabSet>>,
-    cleanup: Cleanup,
+    _cleanup: Cleanup,
     mut notify_rx: tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new().name("term-bus".into()).spawn(move || {
@@ -47,7 +50,7 @@ pub fn start(
                             None => break,
                         };
                         let result = if command.body.len() > 8192 { Err("request exceeds 8192 bytes".into()) } else {
-                            handle(&terminal, &cleanup, &command.command, &command.body)
+                            diagnostic(&command.command)
                         };
                         let (rc,body) = match result { Ok(body) => (0,body), Err(error) => (10,error) };
                         let _ = tokio::time::timeout(Duration::from_secs(2),client.respond(&command,rc,&body)).await;
@@ -128,6 +131,19 @@ async fn notify_complete(client: &SupervisedClient, note: &CompletionNote) {
     }
 }
 
+/// The global, self-asserted TCP name is never an authority boundary.
+/// Keep discovery/notification compatibility, but fail closed for all data and
+/// controls, including when native bootstrap is unavailable.
+fn diagnostic(verb: &str) -> Result<String, String> {
+    match verb {
+        "INFO" | "HELP" | "info" | "help" => Ok(
+            "term: diagnostic discovery only; protected controls require the allocated native-session route".into(),
+        ),
+        _ => Err("{\"error_code\":\"FORBIDDEN\"}".into()),
+    }
+}
+
+#[cfg(test)]
 fn handle(
     set: &Mutex<TabSet>,
     cleanup: &Cleanup,
@@ -263,6 +279,7 @@ fn handle(
     }
 }
 
+#[cfg(test)]
 fn parse_dir(body: &str) -> Result<crate::panes::SplitDir, String> {
     match body {
         "h" | "horizontal" => Ok(crate::panes::SplitDir::Horizontal),
@@ -271,6 +288,7 @@ fn parse_dir(body: &str) -> Result<crate::panes::SplitDir, String> {
     }
 }
 
+#[cfg(test)]
 fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     if body.len() > 8192 {
         return Err("request exceeds 8192 bytes".into());
@@ -319,6 +337,16 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_lane_has_no_protected_controls() {
+        for verb in ["term.session", "term.tabs", "term.panes", "term.snapshot",
+            "term.type", "term.tab.new", "term.tab.select", "term.tab.close",
+            "term.pane.split", "term.pane.select", "term.pane.close", "term.execute",
+            "props.get", "props.set", "props.watch"] {
+            assert_eq!(diagnostic(verb).unwrap_err(), "{\"error_code\":\"FORBIDDEN\"}");
+        }
+        assert!(diagnostic("HELP").is_ok());
+    }
     #[test]
     fn notification_drain_keeps_final_reap_and_bounds_blocked_sends() {
         tokio::runtime::Builder::new_current_thread()
