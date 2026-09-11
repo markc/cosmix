@@ -152,8 +152,7 @@ fn main() {
     assert!(identity.validate().is_ok());
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "{}\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--print-config: print resolved startup settings and exit",
-            bus::HELP
+            "CosMix Term: tabbed Wayland Mix terminal\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--print-config: print resolved startup settings and exit\nBus: the global `term` name is diagnostic discovery only; protected controls use the allocated native-session route"
         );
         return;
     }

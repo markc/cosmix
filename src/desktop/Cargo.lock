@@ -3206,6 +3206,7 @@ dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
+ "cosmix-lib-props-store",
  "ctk",
  "ed25519-dalek",
  "libc",
@@ -8528,6 +8529,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

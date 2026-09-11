@@ -107,8 +107,11 @@ the model/property locks. Queued permits retain those deadlines and a read-only
 connection-liveness probe. Lifecycle revocation/suspension, successor binding
 generations, gaps, connection loss, pane close and child exit invalidate permits.
 No missed notice can extend a deadline. The verified client inbox is bounded at
-256 deliveries and retires its reader on local overflow, invalidating connection
-liveness; broker-side lifecycle queue/gap behaviour is unchanged.
+256 deliveries; a full inbox drops that delivery without disconnecting, because
+a gapped recipient must still resynchronise on the same connection
+(BROKER-022). Only receiver closure or transport loss retires the reader and
+invalidates connection liveness; broker-side lifecycle queue/gap behaviour is
+unchanged.
 
 `term.input.revoked` is a private event carrying target, request ID and a
 `partial_or_unknown` outcome with a delivered-byte lower bound. Its
