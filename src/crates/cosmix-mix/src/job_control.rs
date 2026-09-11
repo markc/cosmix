@@ -673,7 +673,9 @@ impl Stage {
         let (error, error_write) = pipe()?;
         let g = gate_read.as_raw_fd();
         let e = error_write.as_raw_fd();
-        let mut command = Command::new(std::env::current_exe()?);
+        // The proc link remains executable after an installer unlinks us;
+        // current_exe() would return an unusable path ending in " (deleted)".
+        let mut command = Command::new("/proc/self/exe");
         command
             .args([STAGE_ARG, &g.to_string(), &e.to_string(), program])
             .args(args);

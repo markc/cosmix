@@ -179,7 +179,9 @@ impl Pty {
             libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mix"));
+        let executable = home.path().join("mix");
+        fs::copy(env!("CARGO_BIN_EXE_mix"), &executable).unwrap();
+        let mut cmd = Command::new(executable);
         cmd.args(args)
             .env("HOME", home.path())
             .env("TERM", "xterm-256color")
@@ -332,6 +334,16 @@ fn foreground_barrier_and_fast_exit_pipeline() {
         );
         assert!(!alive(x[0]) && !alive(y[0]), "every member reaped");
     }
+}
+
+#[test]
+fn external_command_survives_unlinked_shell_executable() {
+    let mut p = Pty::interactive();
+    fs::remove_file(p.home.path().join("mix")).unwrap();
+    p.command(&p.fixture("identity", "after-unlink"));
+    let child = p.report("after-unlink");
+    assert_eq!(child[1], child[2]);
+    assert!(!alive(child[0]));
 }
 
 #[test]

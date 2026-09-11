@@ -35,6 +35,8 @@ restores that baseline when it completes. Mix cannot infer whether an
 arbitrary cooked-mode change was deliberate; this is the explicit policy.
 
 The launch barrier runs in a private Mix trampoline **after** its first exec.
+It executes `/proc/self/exe`, so open shells keep launching commands after
+an installation replaces or unlinks their original executable.
 This lets Rust's spawn acknowledgement complete before the barrier waits.
 Only after all children share their job group and the foreground terminal
 has transferred does Mix release target execution. A second close-on-exec

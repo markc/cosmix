@@ -473,6 +473,8 @@ mode leakage restore the saved shell baseline. A resumed stopped job also
 restores that baseline when it completes. Mix cannot infer whether an
 arbitrary cooked-mode change was deliberate; this is the explicit policy.</p>
 <p>The launch barrier runs in a private Mix trampoline <strong>after</strong> its first exec.
+It executes <code>/proc/self/exe</code>, so open shells keep launching commands after
+an installation replaces or unlinks their original executable.
 This lets Rust's spawn acknowledgement complete before the barrier waits.
 Only after all children share their job group and the foreground terminal
 has transferred does Mix release target execution. A second close-on-exec
