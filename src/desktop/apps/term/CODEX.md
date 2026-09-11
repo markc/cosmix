@@ -8,8 +8,9 @@ the typed client API. Keep the embedding tests-only; it is not a supported
 noded library API, and daemon test-only modules are not included.
 
 Mix's `tests/native_session_pty.rs` also depends on this support crate and
-embeds Term's production `src/session_fd.rs` by path, using the same pinned
-teletypewriter implementation. Handoff or support changes therefore require
+uses Term's production `src/session_fd.rs` through the support library, without
+compiling its desktop-only teletypewriter tests. Mix uses libc `openpty`, as its
+job-control fixtures do. Handoff or support changes therefore require
 the Mix native-session tests as well as Term's gates; do not duplicate the
 memfd writer or replace the real broker with simulated replies.
 

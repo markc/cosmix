@@ -72,7 +72,6 @@ proptest = "1"
 tempfile = "3"
 term-native-test-broker = { path = "../../desktop/apps/term/tests/support" }
 # The S3 fixture uses Term's actual sealed-fd implementation and pinned PTY hook.
-teletypewriter = { path = "../../desktop/vendor/teletypewriter" }
 
 [build-dependencies]
 # Captures mix HEAD sha + build time for serve-citizen provenance.

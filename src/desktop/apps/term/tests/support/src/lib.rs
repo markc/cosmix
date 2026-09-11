@@ -2,6 +2,11 @@
 //! Keep module paths pointed at production sources: no simulated session RPCs.
 #![allow(dead_code)]
 
+// Compile the real handoff as library code, without pulling Term's desktop
+// teletypewriter tests into the main workspace's Mix integration target.
+#[path = "../../../src/session_fd.rs"]
+pub mod session_fd;
+
 #[path = "../../../../../../crates/cosmix-noded/src/admission.rs"]
 mod admission;
 #[path = "../../../../../../crates/cosmix-noded/src/authority.rs"]

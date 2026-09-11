@@ -32,3 +32,4 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+zeroize = "1"

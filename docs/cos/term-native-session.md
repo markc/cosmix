@@ -233,11 +233,14 @@ Each fixture owns a separate runtime so a bounce drops accepted sockets and all
 background tasks, not just listeners. It neither changes noded's production
 API nor simulates its command engine. The completed
 `cosmix-mix/tests/native_session_pty.rs::mix_child_bootstrap_proves_end_to_end`
-test embeds Term's actual LaunchFd implementation and pinned PTY hook, spawns
+test uses Term's actual LaunchFd through the test-support library and a libc
+`openpty` fixture with `setsid`/`TIOCSCTTY` and child-only fd mapping. It spawns
 Cargo's built Mix binary and asserts initial attachment generation 1, renewals
 beyond 15 seconds, scrubbed rc/context/descendant state and post-exit revocation.
 Its parent fixture drives Term's typed allocate/renew/re-grant/revoke duties;
 the GUI and exit-notifier ordering remain covered by the Term workspace tests.
+Term's teletypewriter PTY tests remain desktop-only; that dependency is not
+part of the main workspace.
 A second real-PTY test keeps the same child alive across parent resumption and
 broker bounce, including child-first wake registration and pane generation
 2 to 1 under a replacement parent. Mix unit/process tests cover seals, layout,

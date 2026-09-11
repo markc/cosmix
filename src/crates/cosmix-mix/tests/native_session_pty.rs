@@ -1,26 +1,24 @@
 //! S3: real noded + Term's real LaunchFd/PTY mapping + the built Mix binary.
 //! The fixture owns the Term-side record/renew/re-grant/revoke duties. Term's
 //! GUI mutation and exit-notifier ordering remain covered in its own workspace.
+//! Run with --test-threads=1, like job_control_pty: openpty cannot set CLOEXEC
+//! atomically, so sibling fixture forks must not overlap its descriptor setup.
 #![cfg(target_os = "linux")]
 
-// Term's embedded source uses these crate aliases; the Mix manifest explicitly
-// names the same dependencies cosmix_lib_bus / cosmix_lib_client.
-extern crate cosmix_lib_bus as cosmix_bus;
-extern crate cosmix_lib_client as cosmix_client;
-
-#[allow(dead_code)] // quarantine is Term-only; embedded tests exercise it too.
-#[path = "../../../desktop/apps/term/src/session_fd.rs"]
-mod session_fd;
-
-use cosmix_bus::native_session::*;
-use cosmix_client::session::{ExpectedScope, GrantResult};
-use cosmix_client::{NodedClient, UnixConnectOutcome, VerifiedConnection};
+use cosmix_lib_bus::native_session::*;
+use cosmix_lib_client::session::{ExpectedScope, GrantResult};
+use cosmix_lib_client::{NodedClient, UnixConnectOutcome, VerifiedConnection};
 use ed25519_dalek::SigningKey;
 use session_fd::{LaunchFd, fresh_key};
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use term_native_test_broker::Broker;
+use term_native_test_broker::session_fd;
 
 fn current_mix() -> &'static std::path::Path {
     static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -212,7 +210,8 @@ impl Parent {
 }
 
 struct Child {
-    pty: teletypewriter::Pty,
+    pty: File,
+    process: std::process::Child,
     home: tempfile::TempDir,
     reaped: bool,
 }
@@ -266,26 +265,72 @@ impl Child {
             ("MIX_EDITOR".into(), "owned".into()),
             ("TERM".into(), "xterm-256color".into()),
         ];
-        let pty = teletypewriter::create_pty_with_spawn_fd(
-            Some(current_mix().to_str().unwrap()),
-            vec![],
-            &Some(home.path().display().to_string()),
-            Some(env),
-            100,
-            30,
-            1000,
-            600,
-            Some(launch.mapping()),
-        )
-        .unwrap();
+        // Same libc PTY pattern as job_control_pty, with the real LaunchFd's
+        // reserved mapping duplicated only in this child's pre_exec hook.
+        let (mut master_fd, mut slave_fd) = (-1, -1);
+        let size = libc::winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 1000,
+            ws_ypixel: 600,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &size,
+                )
+            },
+            0
+        );
+        for fd in [&mut master_fd, &mut slave_fd] {
+            let retained = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(retained >= 0);
+            unsafe {
+                libc::close(*fd);
+            }
+            *fd = retained;
+        }
+        let pty = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut command = Command::new(current_mix());
+        command
+            .current_dir(home.path())
+            .envs(env)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        let (source, target) = launch.mapping();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(source, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let process = command.spawn().unwrap();
         Self {
             pty,
+            process,
             home,
             reaped: false,
         }
     }
     fn pid(&self) -> i32 {
-        *self.pty.child.pid
+        self.process.id() as i32
     }
     fn send(&mut self, line: &str) {
         self.pty.write_all(line.as_bytes()).unwrap();
