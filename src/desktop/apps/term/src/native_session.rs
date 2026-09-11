@@ -19,6 +19,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const RPC_BUDGET: Duration = Duration::from_secs(2);
 const RENEW: Duration = Duration::from_secs(5);
+/// Verified deliveries the broker may hold for this recipient before the reader
+/// starts refusing them. Bounded so stamped authority never accumulates
+/// unserved.
+const VERIFIED_LANE: usize = 256;
 /// Protected requests waiting on the server task. Bounded so a flood sheds with
 /// a uniform refusal instead of growing a backlog of stamped authority.
 const DISPATCH_QUEUE: usize = 64;
@@ -347,6 +351,12 @@ impl Supervisor {
         })
         .map_err(|e| e.to_string())?;
         options.require_native_session = true;
+        // Opt in to the bounded verified lane. An unbounded one would let a
+        // flood of stamped requests accumulate faster than they can be served,
+        // which is authority held in memory that nothing has decided on yet.
+        // Bounded, the reader refuses the overflow and reports dropped id-less
+        // notices as a gap, both of which the actor settles above.
+        options.incoming_capacity = Some(VERIFIED_LANE);
         let policy = match std::env::var("COSMIX_TERM_POLICY").as_deref() {
             Ok("restricted") => Policy::Restricted,
             Ok("default-open") | Err(_) => Policy::DefaultOpen,
@@ -567,6 +577,28 @@ impl Actor {
     fn control(&self) -> Option<Arc<crate::control::Control>> {
         self.shared.lock().unwrap().control.upgrade()
     }
+    /// The one place a protected request is refused without being served.
+    /// Reached from three saturation points — the lane dropped it, Term's own
+    /// queue is full, or there is no attachment to serve it against — and they
+    /// share this so the refusals cannot drift apart. Detached so a saturated
+    /// or slow peer never blocks the identity loop, which is the whole reason
+    /// serving moved off it.
+    fn refuse(&self, event: cosmix_client::VerifiedCommand, code: &'static str) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let reply = crate::control::Reply::error(code);
+            let _ = tokio::time::timeout(
+                RPC_BUDGET,
+                connection
+                    .client()
+                    .respond(event.command(), reply.rc, &reply.body),
+            )
+            .await;
+        });
+    }
+
     /// Discard cached lifecycle authority and resynchronise. Reached from a
     /// broker-signalled gap and from a local inbox overflow, which are the same
     /// event: either way a lifecycle notice may have been missed, and nothing
@@ -1278,15 +1310,23 @@ impl Actor {
                     }
                     None => break,
                 },
-                event = async { self.connection.as_ref().expect("guarded connection").recv().await }, if self.connection.is_some() => {
+                event = async { self.connection.as_ref().expect("guarded connection").recv_shared().await }, if self.connection.is_some() => {
                     match event {
                         Some(event) => {
-                            // A dropped local delivery may have been a lifecycle
-                            // notice, so an overflowed inbox IS a gap and takes
-                            // the same path before anything resolves against
-                            // cached authority.
-                            if self.connection.as_ref().is_some_and(|c| c.take_gap()) {
+                            // The lane says what this delivery is before the verb
+                            // does. A Gap is the absence of a delivery — the
+                            // dropped envelope may have been a lifecycle notice,
+                            // so it takes the identical path to a broker-signalled
+                            // gap. A Refuse carries correlation and nothing
+                            // admissible; the OWNER answers it, because the reader
+                            // task must never write.
+                            if event.delivery() == cosmix_client::Delivery::Gap {
                                 self.session_gap().await;
+                                continue;
+                            }
+                            if event.delivery() == cosmix_client::Delivery::Refuse {
+                                self.refuse(event, "RESOURCE_LIMIT");
+                                continue;
                             }
                             let command = event.command();
                             if command.command == "noded.session.lifecycle.gap" {
@@ -1307,21 +1347,14 @@ impl Actor {
                                     event,
                                 };
                                 if let Err(tokio::sync::mpsc::error::TrySendError::Full(job)) = dispatch_tx.try_send(job) {
-                                    // Shed uniformly rather than queue without
-                                    // limit or drop silently. The refusal is
-                                    // sent from a detached task so a saturated
-                                    // recipient still never blocks this loop.
-                                    tokio::spawn(async move {
-                                        let reply = crate::control::Reply::error("RESOURCE_LIMIT");
-                                        let _ = tokio::time::timeout(RPC_BUDGET, job.connection.client().respond(job.event.command(), reply.rc, &reply.body)).await;
-                                    });
+                                    // Term's own queue is full. Same shape as the
+                                    // lane's refusal above and written the same
+                                    // way, so there is one refusal mechanism
+                                    // rather than two that could drift apart.
+                                    self.refuse(job.event, "RESOURCE_LIMIT");
                                 }
-                            } else if let Some(connection) = &self.connection {
-                                let connection = connection.clone();
-                                tokio::spawn(async move {
-                                    let reply = crate::control::Reply::error("FORBIDDEN");
-                                    let _ = tokio::time::timeout(RPC_BUDGET, connection.client().respond(event.command(), reply.rc, &reply.body)).await;
-                                });
+                            } else {
+                                self.refuse(event, "FORBIDDEN");
                             }
                         }
                         None => { self.connect().await; }

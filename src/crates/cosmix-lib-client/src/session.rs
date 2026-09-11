@@ -313,7 +313,10 @@ impl VerifiedConnection {
         &self,
         target: RecordRef,
     ) -> SessionResult<(RecordResult, Hello, Deadline)> {
-        let context = self.session_hello().await?;
+        // The connection-scoped hello, not a fresh one: every session RPC takes
+        // session_lock, so a per-renew hello would serialise ahead of this very
+        // renew and of any admission check waiting behind it.
+        let context = self.session_context().await?;
         let start = boottime_ms()?;
         let result: RecordResult = self
             .session_rpc(

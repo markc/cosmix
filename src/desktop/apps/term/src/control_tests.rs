@@ -464,7 +464,7 @@ fn p0i_08_queued_input_human_revoke_and_deadline() {
         listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
         let event = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let event = owner.recv().await.expect("owner connection remains live");
+                let event = owner.recv_shared().await.expect("owner connection remains live");
                 if event.command().command == "term.input.revoked" { break event; }
             }
         }).await.expect("private revocation event reaches unnamed verified owner");
@@ -1031,7 +1031,7 @@ fn p0i_08_stale_cleanup_and_private_event_connection_guard() {
         listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
         let crossed = tokio::time::timeout(Duration::from_millis(350), async {
             loop {
-                let event = successor.recv().await.unwrap();
+                let event = successor.recv_shared().await.unwrap();
                 if event.command().command == "term.input.revoked" { break event; }
             }
         }).await;
@@ -1046,7 +1046,7 @@ fn p0i_08_stale_cleanup_and_private_event_connection_guard() {
         listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
         let delivered = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let event = successor.recv().await.unwrap();
+                let event = successor.recv_shared().await.unwrap();
                 if event.command().command == "term.input.revoked" { break event; }
             }
         }).await.expect("the successor must receive its OWN revocation");
