@@ -48,20 +48,24 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     if !matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
         return;
     }
-    // SA_RESETHAND already installed SIG_DFL. Never save/restore a previous
-    // disposition: concurrent entries could otherwise save that temporary
-    // default and permanently lose the handler. Reinstall the known action
-    // after resume (or immediately when suppressing a managed-job SIGTSTP).
+    // SIGTTIN enters with SIG_DFL already installed. SIGTSTP retains its
+    // handler while routing cooperatively, and installs SIG_DFL only for the
+    // actual cooked-mode stop. Always reinstall the known action on return;
+    // never save a concurrent handler's temporary default disposition.
     // SIGTTIN always stops: retrying a background terminal read would spin.
     // Every operation here is async-signal-safe; no locks or allocation.
     unsafe {
-        if signal == libc::SIGTSTP && !MANAGED_FOREGROUND.load(Ordering::Acquire)
-            && crate::editor::signals::request_stop() {
+        if signal == libc::SIGTSTP
+            && !MANAGED_FOREGROUND.load(Ordering::Acquire)
+            && crate::editor::signals::request_stop()
+        {
             libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
             return;
         }
         if signal == libc::SIGTTIN || !MANAGED_FOREGROUND.load(Ordering::Acquire) {
-            if signal == libc::SIGTSTP { libc::signal(signal, libc::SIG_DFL); }
+            if signal == libc::SIGTSTP {
+                libc::signal(signal, libc::SIG_DFL);
+            }
             libc::raise(signal);
         }
         libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
@@ -720,20 +724,22 @@ impl Drop for TerminalLease<'_> {
         *self.controller.shared.shell_modes.lock().unwrap() = self.saved;
         // The managed operation is over even if reclaiming the tty fails.
         // Retaining this bit would permanently suppress subsequent shell stops.
-        match release_foreground(&MANAGED_FOREGROUND, || foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid)) {
-            Ok(()) => {
-                if let Err(e) = set_modes(self.controller.tty.as_raw_fd(), &self.saved) {
-                    eprintln!("mix: terminal restore: {e}");
-                }
-            }
-            Err(e) => eprintln!("mix: terminal restore: {e}"),
+        if let Err(e) = release_foreground(&MANAGED_FOREGROUND, || {
+            foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid)?;
+            set_modes(self.controller.tty.as_raw_fd(), &self.saved)
+        }) {
+            eprintln!("mix: terminal restore: {e}");
         }
     }
 }
 
-fn release_foreground(managed: &AtomicBool, reclaim: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+fn release_foreground(
+    managed: &AtomicBool,
+    reclaim: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let result = reclaim();
     managed.store(false, Ordering::Release);
-    reclaim()
+    result
 }
 
 fn reap(shared: &Shared) {
@@ -1001,7 +1007,7 @@ mod tests {
     fn failed_foreground_reclaim_does_not_suppress_later_stops() {
         let managed = super::AtomicBool::new(true);
         let result = super::release_foreground(&managed, || {
-            assert!(!managed.load(super::Ordering::Acquire));
+            assert!(managed.load(super::Ordering::Acquire));
             Err(std::io::Error::from_raw_os_error(libc::ENOTTY))
         });
         assert!(result.is_err());

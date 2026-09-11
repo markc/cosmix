@@ -84,6 +84,7 @@ impl ReplEditor {
                 };
                 editor.begin(
                     Generation {
+                        // Real attachment/session identity is deferred to stage D.
                         session: 1,
                         prompt: *generation,
                     },

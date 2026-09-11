@@ -13,6 +13,9 @@ pub enum Key {
     Text(String),
     Paste(String),
     PasteStart,
+    PasteOverflow,
+    Redo,
+    YankPop,
     Escape,
     Left,
     Right,
@@ -38,6 +41,8 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn pending(&self) -> bool {
+        // A trailing partial UTF-8 scalar keeps admission Busy until completed;
+        // this is the deliberate cost of having only an escape timer.
         !self.pending.is_empty()
     }
     pub fn pasting(&self) -> bool {
@@ -85,7 +90,7 @@ impl Decoder {
                 self.paste_tail.clear();
                 let bytes = self.paste.take().unwrap();
                 return Some(if std::mem::take(&mut self.overflow) {
-                    Key::Invalid
+                    Key::PasteOverflow
                 } else {
                     Key::Paste(
                         String::from_utf8_lossy(&bytes)
@@ -128,6 +133,8 @@ impl Decoder {
                 b"\x1b[3~" => Key::Delete,
                 b"\x1bb" | b"\x1b[1;5D" => Key::WordLeft,
                 b"\x1bf" | b"\x1b[1;5C" => Key::WordRight,
+                b"\x1br" | b"\x1b_" => Key::Redo,
+                b"\x1by" => Key::YankPop,
                 b"\x1b[200~" => {
                     self.paste = Some(Vec::new());
                     Key::PasteStart
@@ -228,7 +235,7 @@ mod tests {
         let mut d = Decoder::default();
         decode(&mut d, b"\x1b[200~");
         decode(&mut d, &vec![b'x'; MAX_PASTE + 1]);
-        assert_eq!(decode(&mut d, PASTE_END), vec![Key::Invalid]);
+        assert_eq!(decode(&mut d, PASTE_END), vec![Key::PasteOverflow]);
         d.feed(27);
         d.escape_since = Some(Instant::now() - ESC_DELAY);
         assert_eq!(d.expire(), Some(Key::Escape));

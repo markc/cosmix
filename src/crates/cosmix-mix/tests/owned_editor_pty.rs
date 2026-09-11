@@ -18,6 +18,43 @@ const LIMIT: Duration = Duration::from_secs(15);
 const PROMPT: &str = "OWNED> ";
 
 #[test]
+fn overflow_notice_redo_and_yank_pop_preserve_editing() {
+    let mut p = Pty::new(None, true);
+    p.prompt();
+    p.send(b"print(818)\x1b[200~");
+    p.send(&vec![b'x'; 64 * 1024 + 1]);
+    p.send(b"\x1b[201~");
+    p.until("paste rejected, draft preserved");
+    p.send(b"\n");
+    assert!(p.prompt().contains("\r\n818\r\n"));
+    p.send(b"\x1b[200~print(303)\x1b[201~\x1f\x1br\n");
+    assert!(p.prompt().contains("\r\n303\r\n"));
+    p.send(b"print(111)\x15print(222)\x15\x19\x1by\n");
+    assert!(p.prompt().contains("\r\n111\r\n"));
+    p.exit();
+}
+
+#[test]
+fn repeated_empty_search_and_forward_relaxation_keep_position() {
+    let mut p = Pty::new(None, true);
+    p.prompt();
+    for command in ["print(101)", "print(202)", "print(303)"] {
+        p.command(command);
+    }
+    p.send(b"\x12\x12");
+    p.until("print(303)");
+    p.send(b"\x12");
+    p.until("print(202)");
+    p.send(b"\x13");
+    p.until("print(303)");
+    p.send(b"\x07\x13print(1");
+    p.until("print(101)");
+    p.send(b"\x7f\n\n");
+    assert!(p.prompt().contains("\r\n101\r\n"));
+    p.exit();
+}
+
+#[test]
 fn oversized_history_is_warned_and_never_rewritten() {
     let mut original = b"#V2\n".to_vec();
     original.extend("valid_record\n".repeat(1_400_000).as_bytes());
@@ -402,12 +439,18 @@ impl Pty {
             },
             0
         );
+        // Atomically mark the retained descriptors CLOEXEC and immediately
+        // close openpty's originals, before any concurrent fixture can exec.
+        for fd in [&mut m, &mut s] {
+            let retained = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(retained >= 0);
+            unsafe {
+                libc::close(*fd);
+            }
+            *fd = retained;
+        }
         let master = unsafe { File::from_raw_fd(m) };
         let slave = unsafe { File::from_raw_fd(s) };
-        unsafe {
-            libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
         let original = modes(s);
         let mut command = Command::new(if fixture.is_some() {
             std::env::current_exe().unwrap()

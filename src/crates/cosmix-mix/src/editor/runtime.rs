@@ -245,6 +245,8 @@ impl Control {
         }
     }
     fn send(&self, request: Request) -> io::Result<mpsc::Receiver<io::Result<Response>>> {
+        // Full queue is an immediate resource-limit error, not deferred work;
+        // disconnection is failure, never evidence of terminal restoration.
         let (tx, rx) = mpsc::sync_channel(1);
         self.sender
             .try_send(Envelope { request, reply: tx })
@@ -347,6 +349,7 @@ impl OwnedEditor {
             .spawn(move || {
                 let mut owner = Owner {
                     editor: Editor::new(1),
+                    // Attachment/session generation is intentionally stage-D work.
                     generation: Generation {
                         session: 1,
                         prompt: 0,
@@ -367,6 +370,7 @@ impl OwnedEditor {
                     deferred: None,
                     search_draft: None,
                     search_index: None,
+                    search_forward: false,
                     line_tx: line_tx.clone(),
                     control: worker_control,
                 };
@@ -464,6 +468,7 @@ struct Owner {
     deferred: Option<Request>,
     search_draft: Option<Buffer>,
     search_index: Option<usize>,
+    search_forward: bool,
     line_tx: mpsc::SyncSender<io::Result<Line>>,
     control: Control,
 }
@@ -501,6 +506,8 @@ impl Owner {
         }
     }
     fn draw(&mut self) -> io::Result<()> {
+        // Bounded O(buffer) reflow per keystroke is accepted for this preview;
+        // incremental layout/render optimisation is deferred to parity work.
         let layout = super::render::layout(
             self.profile.text(),
             self.editor.buffer(),
@@ -641,6 +648,7 @@ impl Owner {
                 self.deferred = None;
                 self.search_draft = None;
                 self.search_index = None;
+                self.search_forward = false;
                 self.decoder = Decoder::default();
                 effect
             }
@@ -808,15 +816,20 @@ impl Owner {
                         term.push_str(&text);
                     }
                     self.editor.set_interaction(interaction).map_err(protocol)?;
-                    self.search_index = None;
                     self.search(false)?;
                 }
-                Key::Control(18) => self.search(true)?,
+                Key::Control(18) => {
+                    self.search_forward = false;
+                    self.search(true)?;
+                }
+                Key::Control(19) => {
+                    self.search_forward = true;
+                    self.search(true)?;
+                }
                 Key::Control(8 | 127) => {
                     let mut interaction = self.editor.interaction().clone();
                     interaction.search.as_mut().unwrap().pop();
                     self.editor.set_interaction(interaction).map_err(protocol)?;
-                    self.search_index = None;
                     self.search(false)?;
                 }
                 Key::Escape | Key::Control(7) => {
@@ -831,6 +844,7 @@ impl Owner {
                     self.end_search()?;
                 }
                 Key::Control(13 | 10) => {
+                    // Deliberate promotion-gate divergence: select, don't submit.
                     self.end_search()?;
                 }
                 Key::Control(3) => {
@@ -845,9 +859,10 @@ impl Owner {
             return self.draw();
         }
         match key {
-            Key::Control(18) => {
+            Key::Control(18 | 19) => {
                 self.search_draft = Some(self.editor.buffer().clone());
                 self.search_index = None;
+                self.search_forward = key == Key::Control(19);
                 let mut interaction = self.editor.interaction().clone();
                 interaction.search = Some(String::new());
                 self.editor.set_interaction(interaction).map_err(protocol)?;
@@ -929,6 +944,18 @@ impl Owner {
             }
             Key::Text(text) => self.edit(|b| b.insert(&text))?,
             Key::Paste(text) => self.edit(|b| b.paste(&text))?,
+            Key::PasteOverflow => {
+                let layout = super::render::layout(
+                    self.profile.text(),
+                    self.editor.buffer(),
+                    self.terminal.size().0,
+                )
+                .map_err(|e| io::Error::other(format!("editor layout: {e:?}")))?;
+                self.terminal.notice(
+                    &layout,
+                    "mix: paste exceeds 64 KiB; paste rejected, draft preserved",
+                )?;
+            }
             Key::Left | Key::Control(2) => self.edit(Buffer::left)?,
             Key::Right | Key::Control(6) => self.edit(Buffer::right)?,
             Key::WordLeft => self.edit(Buffer::word_left)?,
@@ -946,6 +973,8 @@ impl Owner {
             })?,
             Key::Control(25) => self.edit(Buffer::yank)?,
             Key::Control(31) => self.edit(Buffer::undo)?,
+            Key::Redo => self.edit(Buffer::redo)?,
+            Key::YankPop => self.edit(Buffer::yank_pop)?,
             Key::Invalid => self.terminal.bell()?,
             _ => {}
         }
@@ -971,22 +1000,40 @@ impl Owner {
     }
     fn search(&mut self, previous: bool) -> io::Result<()> {
         let term = self.editor.interaction().search.as_deref().unwrap_or("");
-        let start = if previous {
-            self.search_index.and_then(|i| i.checked_sub(1))
+        let initial = if self.search_forward {
+            (!self.history.is_empty()).then_some(0)
         } else {
             self.history.len().checked_sub(1)
         };
-        if let Some(start) = start
-            && let Some(found) = super::history::search(
-                &self.history,
-                term,
-                start,
-                super::history::Direction::Reverse,
-                super::history::SearchKind::FullText,
-            )
-        {
-            let text = self.history[found.index].clone();
-            self.search_index = Some(found.index);
+        let start = match (previous, self.search_index) {
+            (true, Some(index)) if self.search_forward => {
+                index.checked_add(1).filter(|i| *i < self.history.len())
+            }
+            (true, Some(index)) => index.checked_sub(1),
+            (_, index) => index.or(initial),
+        };
+        let direction = if self.search_forward {
+            super::history::Direction::Forward
+        } else {
+            super::history::Direction::Reverse
+        };
+        let found = start.and_then(|start| {
+            if term.is_empty() {
+                Some(start)
+            } else {
+                super::history::search(
+                    &self.history,
+                    term,
+                    start,
+                    direction,
+                    super::history::SearchKind::FullText,
+                )
+                .map(|found| found.index)
+            }
+        });
+        if let Some(index) = found {
+            let text = self.history[index].clone();
+            self.search_index = Some(index);
             self.edit(|b| b.replace(0..b.text().len(), &text))?;
         }
         Ok(())

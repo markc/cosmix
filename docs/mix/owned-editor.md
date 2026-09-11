@@ -11,7 +11,7 @@ state and raw modes. Its `poll()` includes a control socket and a signal wake
 socket. Only escape disambiguation uses a timer. Completion filesystem work runs
 off the input thread, with bounded candidates and generation/revision checks.
 
-Enter restores terminal modes and disables bracketed paste before returning the
+Enter restores terminal modes and attempts to disable bracketed paste before returning the
 line for evaluation. No next prompt starts speculatively. The job controller
 continues to own process groups and foreground-terminal transfer. Ctrl+Z at an
 editor prompt restores modes before invoking the controller's existing shell
@@ -36,10 +36,13 @@ evaluation or provide the parked-evaluator host.
 
 Implemented keys include grapheme-aware left/right/delete/backspace, Home/End,
 Ctrl+A/E/B/F, Alt+B/F, history Up/Down and Ctrl+P/N, Ctrl+R reverse search,
-Ctrl+K/U/W kill, Ctrl+Y yank, Ctrl+_ undo, Tab completion/cycling, Ctrl+C and
+Ctrl+K/U/W kill, Ctrl+Y yank, Alt+Y yank-pop, Ctrl+_ undo, Alt+R/Alt+_ redo,
+Ctrl+S forward search, Tab completion/cycling, Ctrl+C and
 Ctrl+D. Enter leaves search with its selected match; Escape or Ctrl+G restores
 the previous draft. Bracketed paste is a single undoable edit; paste payloads
-over 64 KiB are rejected after consuming their closing marker. Input buffers,
+over 64 KiB are rejected after consuming their closing marker, with a one-line
+diagnostic on a fresh line and the draft preserved. Prompt bytes are reserved in
+the buffer budget so paste cannot exceed the renderer's combined input limit. Input buffers,
 snapshots, prompt text and render layouts have explicit limits.
 
 History continues to use `.mix_history` and rustyline's `#V2` multiline encoding,
@@ -56,6 +59,11 @@ stripped. Resize reflows the logical buffer; buffers taller than the terminal
 use a viewport containing the cursor. Full editing/search/completion UI parity,
 terminal-emulator visual acceptance and real SSH coverage remain promotion gates
 before changing the default or removing rustyline.
+
+Per-keystroke O(buffer) reflow is accepted and bounded; optimisation is deferred.
+Search Enter selects without submitting; its parity divergence remains deliberate.
+Trailing partial UTF-8 keeps admission Busy until completed under the one-timer rule.
+Attachment-backed session generations are deferred to stage D; the current local session tag is 1.
 
 The `owned_editor_pty` integration family covers actual PTY input and handoff,
 Unicode editing, multiline history, completion, silent resize, EOF/HUP and nested

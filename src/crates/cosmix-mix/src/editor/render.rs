@@ -11,7 +11,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const MAX_LAYOUT_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_LAYOUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Position {

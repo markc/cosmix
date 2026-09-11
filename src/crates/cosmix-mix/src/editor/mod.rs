@@ -277,9 +277,17 @@ impl Editor {
                 if self.serial == u64::MAX {
                     return Err(ProtocolError::Exhausted);
                 }
+                let bytes = render::MAX_LAYOUT_BYTES
+                    .checked_sub(profile.text().len())
+                    .ok_or(ProtocolError::Edit(EditError::Limit))?;
                 self.generation = Some(generation);
                 self.profile = Some(profile);
-                self.buffer = Buffer::default();
+                // Reserve prompt bytes up front so a successful edit can never
+                // exceed the renderer's combined input bound later.
+                self.buffer = Buffer::new(buffer::Limits {
+                    bytes,
+                    ..Default::default()
+                });
                 self.interaction = Interaction::default();
                 self.modes(State::Activating, ModeAction::EnterEditing)
             }
@@ -392,6 +400,19 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paste_cannot_exceed_combined_prompt_render_budget() {
+        let mut e = editing(super::PromptProfile::Primary("p".repeat(2048)));
+        let draft = "x".repeat(super::render::MAX_LAYOUT_BYTES - 2048 - 8);
+        e.edit(|b| b.insert(&draft)).unwrap();
+        let before = e.buffer().clone();
+        assert_eq!(
+            e.edit(|b| b.paste("0123456789012345")),
+            Err(super::ProtocolError::Edit(super::buffer::EditError::Limit))
+        );
+        assert_eq!(e.buffer(), &before);
+        assert_eq!(e.state(), super::State::Editing);
+    }
     use super::*;
     const G: Generation = Generation {
         session: 7,

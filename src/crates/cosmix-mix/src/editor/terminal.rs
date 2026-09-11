@@ -6,6 +6,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 pub struct Terminal {
+    // The controller separately records job modes. The ordering contract is
+    // editor restore before line return, controller foreground before re-entry.
     input: File,
     output: File,
     saved: Option<libc::termios>,
@@ -146,6 +148,11 @@ impl Terminal {
     }
     pub fn bell(&mut self) -> io::Result<()> {
         self.queue(b"\x07")
+    }
+    pub fn notice(&mut self, layout: &Layout, message: &str) -> io::Result<()> {
+        self.finish(layout)?;
+        self.queue(message.as_bytes())?;
+        self.fresh_line()
     }
     pub fn finish(&mut self, layout: &Layout) -> io::Result<()> {
         let mut bytes = String::from("\r");
