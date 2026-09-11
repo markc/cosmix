@@ -3553,7 +3553,7 @@ async fn route_local(
                 LocalRouteResult {
                     traffic_class,
                     target_tx: None,
-                    forwarded_wire: Some(wire),
+                    forwarded_wire: None,
                     outcome: ObserveOutcome::Rejected,
                 }
             }
