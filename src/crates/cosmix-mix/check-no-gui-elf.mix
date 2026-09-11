@@ -1,0 +1,38 @@
+-- Hard gate, ELF layer: the BUILT mix binary links no GUI/display
+-- libraries and stays within a size ceiling. Companion to check-no-gui.mix
+-- (which checks the Cargo graph): this one catches whatever reaches the
+-- artifact regardless of how it got in — feature unification, links=,
+-- build scripts. Run from the repository src/ directory AFTER
+-- `cargo build --release`.
+$bin = "target/release/mix"
+if not is_file($bin) then
+  print("GATE BLOCKED: " .. $bin .. " missing — build release first")
+  exit(1)
+end
+$dyn = run_argv(["readelf", "-d", $bin], {timeout: 60})
+if $dyn["exit_code"] != 0 then
+  print($dyn["stderr"])
+  print("GATE BLOCKED: readelf failed; an empty filter is not a pass")
+  exit(1)
+end
+$needed = run_argv(["grep", "NEEDED"], {stdin: $dyn["stdout"]})
+if $needed["exit_code"] != 0 then
+  print("GATE BLOCKED: no NEEDED entries parsed — static binary or readelf drift; verify by hand")
+  exit(1)
+end
+print($needed["stdout"])
+$hit = run_argv(["grep", "-iE", "wayland|xkbcommon|vulkan|EGL|libX11|libxcb|libGL|libdrm|gbm"], {stdin: $needed["stdout"]})
+if $hit["exit_code"] == 0 then
+  print("GATE FAIL: GUI/display library linked into the canonical mix binary:")
+  print($hit["stdout"])
+  exit(1)
+end
+-- Size ceiling: release mix is ~tens of MB; a GUI stack would multiply it.
+-- Ceiling 64 MiB gives honest headroom while catching a Bevy-class leak.
+$sz = size($bin)
+if $sz > 67108864 then
+  print("GATE FAIL: mix release binary is " .. to_string($sz) .. " bytes (> 64 MiB ceiling)")
+  exit(1)
+end
+print("GATE PASS: no forbidden NEEDED libraries; size " .. to_string($sz) .. " bytes within ceiling")
+exit(0)
