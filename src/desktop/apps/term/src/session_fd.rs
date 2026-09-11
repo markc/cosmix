@@ -8,6 +8,25 @@ use zeroize::Zeroizing;
 
 pub const MARKER: &str = "COSMIX_SESSION_FD";
 
+/// Run before any threads or child spawns. Term might itself be launched by a
+/// native parent; its inherited handoff must never leak into a pane's exec.
+pub fn quarantine_inherited() {
+    if let Ok(value) = std::env::var(MARKER) {
+        match value.parse::<RawFd>() {
+            Ok(fd) if fd >= 0 => {
+                // SAFETY: fcntl changes flags only; ownership is not assumed.
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                    eprintln!(
+                        "term inherited session descriptor unavailable: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+            _ => eprintln!("term inherited session descriptor marker is invalid"),
+        }
+    }
+}
+
 pub fn fresh_key() -> io::Result<SigningKey> {
     let mut seed = Zeroizing::new([0u8; 32]);
     let mut offset = 0;
@@ -192,6 +211,28 @@ mod tests {
                 unsafe { libc::fcntl(fds[0], libc::F_GETFD) } & libc::FD_CLOEXEC,
                 0
             );
+            // This process models Term itself inheriting a bootstrap fd.
+            // Its first child must not inherit it, even without Mix support.
+            quarantine_inherited();
+            assert_ne!(
+                unsafe { libc::fcntl(fds[0], libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session_fd::tests::fd_child_reports_open_descriptors",
+                    "--nocapture",
+                ])
+                .env("COSMIX_FD_TEST_COUNT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(String::from_utf8_lossy(&child.stdout).contains("FD_DISCIPLINE_OK"));
         }
         println!("FD_DISCIPLINE_OK");
     }

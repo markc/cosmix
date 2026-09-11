@@ -140,6 +140,7 @@ fn resolve_config(
 }
 
 fn main() {
+    session_fd::quarantine_inherited();
     let identity = AppIdentity {
         slug: "term",
         display_name: "CosMix Term",

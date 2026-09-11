@@ -34,6 +34,37 @@ CLOEXEC in Term. The pinned teletypewriter patch duplicates source onto target
 only after fork, closes source in the child, and leaves PTY stdio intact. Term
 closes both descriptors immediately after spawn. Temporary seed arrays and the
 child signing key use zeroize-on-drop. Seals protect integrity, not secrecy.
+Term also sets CLOEXEC on any bootstrap descriptor it inherited, before its
+first spawn. The memfd name `cosmix-session` identifies its purpose through
+procfs; this metadata disclosure is accepted. Anonymous memfd pages may be
+swapped: protection against privileged memory inspection or swap extraction is
+outside this threat model. Sealing is not encryption or memory locking.
+
+The child MUST seek to offset zero or use `pread`; inherited descriptors share
+an open-file offset, so it must not depend on Term's last offset. It SHOULD
+verify `F_GET_SEALS` contains SHRINK, GROW, WRITE and SEAL before parsing.
+`record.lease_remaining_ms` is stale by construction and informative only;
+it is never a live-authority deadline.
+
+Construct the typed client's `ExpectedScope` from the retained launch scope:
+
+| Expected field | Source |
+|---|---|
+| `unix_uid` | `record.owner_uid`, checked against the child's effective UID |
+| `parent_key_hash` | `Some(grant.parent_key_hash)` |
+| `pane_id` | `record.pane_id` |
+| `pane_high_water` | `record.pane_generation`, retained and advanced within a parent incarnation |
+| `role` | `record.role` |
+| `public_key_hash` | SHA-256 of the raw retained child public key |
+| `capabilities_hash` | SHA-256 of `encode_capabilities(record.capabilities)` |
+| `broker_epoch` | Fresh `session.hello` on the current verified connection |
+| `purpose` | Enrol for a pending child; resume for an existing attachment |
+
+Do not construct expectations by copying a received challenge. The key
+selector's fixed wire tag is not a purpose claim: noded derives the returned
+purpose. `ChallengeResult::sign` checks it and the current broker epoch against
+the independent expectations before signing. A broker restart requires a fresh
+hello and parent-confirmed replacement scope, retaining the parent key hash.
 
 The next Mix slice must read and validate this layout before hooks or user
 source, close the descriptor, remove the marker, retain the signing key outside

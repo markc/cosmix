@@ -270,6 +270,11 @@ impl Actor {
                     eprintln!("term session wake registration unavailable");
                 }
                 let expected = ExpectedScope {
+                    broker_epoch: match bounded(connection.session_hello()).await {
+                        Ok(hello) => hello.broker_epoch,
+                        Err(_) => return,
+                    },
+                    purpose: Purpose::Resume,
                     unix_uid: unsafe { libc::geteuid() },
                     parent_key_hash: None,
                     pane_id: None,

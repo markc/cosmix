@@ -470,7 +470,34 @@ then seals the seal set. Both reserved source and target descriptors are
 CLOEXEC in Term. The pinned teletypewriter patch duplicates source onto target
 only after fork, closes source in the child, and leaves PTY stdio intact. Term
 closes both descriptors immediately after spawn. Temporary seed arrays and the
-child signing key use zeroize-on-drop. Seals protect integrity, not secrecy.</p>
+child signing key use zeroize-on-drop. Seals protect integrity, not secrecy.
+Term also sets CLOEXEC on any bootstrap descriptor it inherited, before its
+first spawn. The memfd name <code>cosmix-session</code> identifies its purpose through
+procfs; this metadata disclosure is accepted. Anonymous memfd pages may be
+swapped: protection against privileged memory inspection or swap extraction is
+outside this threat model. Sealing is not encryption or memory locking.</p>
+<p>The child MUST seek to offset zero or use <code>pread</code>; inherited descriptors share
+an open-file offset, so it must not depend on Term's last offset. It SHOULD
+verify <code>F_GET_SEALS</code> contains SHRINK, GROW, WRITE and SEAL before parsing.
+<code>record.lease_remaining_ms</code> is stale by construction and informative only;
+it is never a live-authority deadline.</p>
+<p>Construct the typed client's <code>ExpectedScope</code> from the retained launch scope:</p>
+<table><thead><tr><th>Expected field</th><th>Source</th></tr></thead><tbody>
+<tr><td><code>unix_uid</code></td><td><code>record.owner_uid</code>, checked against the child's effective UID</td></tr>
+<tr><td><code>parent_key_hash</code></td><td><code>Some(grant.parent_key_hash)</code></td></tr>
+<tr><td><code>pane_id</code></td><td><code>record.pane_id</code></td></tr>
+<tr><td><code>pane_high_water</code></td><td><code>record.pane_generation</code>, retained and advanced within a parent incarnation</td></tr>
+<tr><td><code>role</code></td><td><code>record.role</code></td></tr>
+<tr><td><code>public_key_hash</code></td><td>SHA-256 of the raw retained child public key</td></tr>
+<tr><td><code>capabilities_hash</code></td><td>SHA-256 of <code>encode_capabilities(record.capabilities)</code></td></tr>
+<tr><td><code>broker_epoch</code></td><td>Fresh <code>session.hello</code> on the current verified connection</td></tr>
+<tr><td><code>purpose</code></td><td>Enrol for a pending child; resume for an existing attachment</td></tr>
+</tbody></table>
+<p>Do not construct expectations by copying a received challenge. The key
+selector's fixed wire tag is not a purpose claim: noded derives the returned
+purpose. <code>ChallengeResult::sign</code> checks it and the current broker epoch against
+the independent expectations before signing. A broker restart requires a fresh
+hello and parent-confirmed replacement scope, retaining the parent key hash.</p>
 <p>The next Mix slice must read and validate this layout before hooks or user
 source, close the descriptor, remove the marker, retain the signing key outside
 the language surface, and use authenticated key-selected challenges for recovery.

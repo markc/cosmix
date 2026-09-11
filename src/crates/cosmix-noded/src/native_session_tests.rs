@@ -433,6 +433,8 @@ async fn parent_revocation_is_ordered_against_inflight_child_prove() {
             .await
             .unwrap();
         let scope = cosmix_client::session::ExpectedScope {
+            broker_epoch: child.session_hello().await.unwrap().broker_epoch,
+            purpose: Purpose::Enrol,
             unix_uid: record.owner_uid,
             parent_key_hash: Some(grant.grant.parent_key_hash),
             pane_id: Some(DecimalU64(1)),
@@ -1755,7 +1757,9 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
         public_key,
         purpose: Purpose::Enrol,
     });
-    let scope = cosmix_client::session::ExpectedScope {
+    let mut scope = cosmix_client::session::ExpectedScope {
+        broker_epoch: child.session_hello().await.unwrap().broker_epoch,
+        purpose: Purpose::Enrol,
         unix_uid: parent_record.owner_uid,
         parent_key_hash: Some(HexBytes(
             Sha256::digest(parent_key.verifying_key().to_bytes()).into(),
@@ -1769,6 +1773,18 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
         ),
     };
     let challenge = child.session_challenge(&selector).await.unwrap();
+    let mut wrong_context = scope.clone();
+    wrong_context.purpose = Purpose::Resume;
+    assert!(matches!(
+        challenge.sign(&key, &wrong_context),
+        Err(cosmix_client::session::SessionFailure::ScopeMismatch)
+    ));
+    wrong_context = scope.clone();
+    wrong_context.broker_epoch.0[0] ^= 1;
+    assert!(matches!(
+        challenge.sign(&key, &wrong_context),
+        Err(cosmix_client::session::SessionFailure::ScopeMismatch)
+    ));
     let mut higher_scope = scope.clone();
     higher_scope.pane_high_water = Some(DecimalU64(
         challenge.transcript.pane_generation.unwrap().0 + 1,
@@ -1781,6 +1797,7 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
     assert!(challenge.sign(&key, &higher_scope).is_ok());
     let proof = challenge.sign(&key, &scope).unwrap();
     let record = child.session_prove(&proof).await.unwrap().record;
+    scope.purpose = Purpose::Resume;
     child.session_renew(record.reference()).await.unwrap();
     let mut legacy = broker.tcp().await;
     send(&mut legacy, &request("noded.list", "noded", "list")).await;
@@ -1844,6 +1861,8 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
         .await
         .unwrap();
     let parent_scope = cosmix_client::session::ExpectedScope {
+        broker_epoch: replacement.session_hello().await.unwrap().broker_epoch,
+        purpose: Purpose::Resume,
         unix_uid: parent_record.owner_uid,
         parent_key_hash: None,
         pane_id: None,
@@ -1912,7 +1931,9 @@ async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_
         if let Some(proof) = &captured {
             assert!(child.session_prove(proof).await.is_err());
         }
-        let scope = cosmix_client::session::ExpectedScope {
+        let mut scope = cosmix_client::session::ExpectedScope {
+            broker_epoch: child.session_hello().await.unwrap().broker_epoch,
+            purpose: Purpose::Enrol,
             unix_uid: record.owner_uid,
             parent_key_hash: Some(granted.grant.parent_key_hash),
             pane_id: Some(DecimalU64(9)),
@@ -1932,6 +1953,7 @@ async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_
             .unwrap();
         let proof = challenge.sign(&child_key, &scope).unwrap();
         let attached = child.session_prove(&proof).await.unwrap();
+        scope.purpose = Purpose::Resume;
         assert_eq!(attached.record.binding_generation, DecimalU64(1));
         assert!(child.session_prove(&proof).await.is_err());
         child.client().close().await;
