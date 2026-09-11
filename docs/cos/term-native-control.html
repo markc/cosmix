@@ -492,6 +492,9 @@ fallback for mutations.</p>
 <tr><td><code>term.execute</code></td><td><code>execute</code></td><td><code>source</code>, <code>prompt_generation</code>, mutation ID/epoch; forwarded to the pane shell's own admission surface</td></tr>
 <tr><td><code>term.exec.result</code></td><td><code>execute</code></td><td><code>operation_id</code>: the forwarded execution's state and, once it has one, its result</td></tr>
 <tr><td><code>term.exec.cancel</code></td><td><code>execute</code></td><td><code>operation_id</code>: cancel that execution; cooperative, and the reply says what actually happened</td></tr>
+<tr><td><code>term.task.submit</code></td><td><code>execute</code></td><td><code>source</code> XOR <code>argv</code>, <code>cwd</code>, <code>env</code>, <code>timeout_ms</code>, mutation ID/epoch; forwarded to the pane shell's isolated-task surface</td></tr>
+<tr><td><code>term.task.result</code></td><td><code>execute</code></td><td><code>operation_id</code>: the task's state (<code>running</code>, <code>cancelling</code>, <code>settled</code>) and, once settled, its outcome, streams and structured result</td></tr>
+<tr><td><code>term.task.cancel</code></td><td><code>execute</code></td><td><code>operation_id</code>: SIGTERM to the task group, 2s grace, then SIGKILL — the one HARD termination in the surface</td></tr>
 <tr><td><code>term.operation</code></td><td><code>read_state</code></td><td><code>operation_id</code>: retrieve the caller's retained operation outcome</td></tr>
 </tbody></table>
 <p>Layout requests supply <code>affected</code>, an array of additional explicit targets,
@@ -540,6 +543,26 @@ supplied field, which would let one agent announce itself as another — and the
 child renders it through the same allowlist escape as the source, as
 <code>&lt;originator&gt; via Term …</code>. The "via" is load-bearing: the child authenticated
 Term, not the name Term relayed.</p>
+<h2 id="isolated-tasks">Isolated tasks</h2>
+<p><code>term.task.*</code> mirrors <code>term.exec.*</code> mechanically — same capability, same epoch
+rule, same forwarded-id mapping, same retry discipline, same non-retention of
+local placeholders — and forwards to the child, which owns every decision about
+whether a task may run. Term adds no task state machinery of its own.</p>
+<p>Two differences are deliberate. The forwarded-id map stays keyed
+<code>(identity, sequence)</code> and is NOT split by family: splitting it would let one
+caller request ID mint a fresh forwarded ID on each surface and BOTH execute.
+Family scoping applies to ADDRESSING only, so <code>term.exec.result</code> cannot read a
+task operation and <code>term.task.result</code> cannot read an evaluation — each refuses
+a foreign ID exactly as it refuses an unknown one.</p>
+<p>And a task submission carries no principal label. A task never renders into the
+pane, so there is no announcement for one to appear in; the visible-echo rule
+is about interactive submissions in an attached human pane, and an isolated task
+is neither.</p>
+<p>Term relays the <code>source</code>/<code>argv</code> union exactly as sent and never picks a side, so
+both-or-neither reaches the child's own refusal rather than being resolved at
+the hop. The full task contract — the enumerated environment, the termination
+ladder, the caps and the advertised deferrals — is in the Mix manual under
+"Isolated supervised tasks" (<code>mix man cli</code>).</p>
 <h2 id="live-properties">Live properties</h2>
 <p><code>term.props.get</code> supports <code>property:"state"</code> and <code>property:"contents"</code> with the
 same explicit target and separate read capabilities. <code>term.props.set</code> supports

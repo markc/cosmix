@@ -1,0 +1,82 @@
+-- Hard gate: the P4 isolated-task fixtures actually RUN.
+--
+-- Sibling of check-stage-d-gates.mix, and pinned the same two ways. libtest
+-- exits 0 when its filter matches nothing, so a renamed module, a moved file or
+-- a mistyped filter would otherwise leave this passing while running zero
+-- fixtures; the COUNT catches that. And a prefix filter would happily run some
+-- other set of the same size, so every NAME is pinned too.
+--
+-- What these fixtures are for, in one line each: a task must inherit nothing it
+-- was not given, its termination must be hard rather than cooperative, and its
+-- outcome must come from wait() rather than from having sent a signal. The
+-- environment and descriptor fixtures are the first; the timeout and SIGKILL
+-- escalation fixtures are the second and third.
+--
+-- Run from the repository src/ directory, like its siblings.
+
+$shell_prefix = "p4_"
+$shell_fixtures = [
+  "p4_a_source_task_returns_a_typed_result_beside_its_streams",
+  "p4_a_task_environment_is_exactly_the_base_plus_its_overlay",
+  "p4_a_task_has_exactly_the_descriptors_it_was_given",
+  "p4_a_timeout_terminates_the_group_and_reports_itself_as_policy",
+  "p4_an_argv_task_reports_exit_status_and_no_structured_value",
+  "p4_cancelling_a_sigterm_ignoring_task_escalates_to_sigkill",
+  "p4_oversized_streams_are_truncated_and_say_so",
+  "p4_refusals_leave_no_trace_and_deferrals_are_advertised",
+  "p4_the_two_surfaces_share_one_dedupe_space_and_cannot_read_each_other"
+]
+$shell_expected = length($shell_fixtures)
+
+$root = cwd()
+if not exists($root + "/desktop/apps/term/src/control.rs") then
+  print("GATE BLOCKED: run from the repository src/ directory")
+  exit(2)
+end
+
+-- The PTY fixtures refuse an installed or stale binary: they compare the Mix
+-- build's git sha against HEAD and require a clean checkout. Build it here so
+-- the gate cannot be satisfied by whatever happens to be lying in target/.
+-- RUSTC_WRAPPER disabled as in every sibling gate: a caching layer must never
+-- be able to decide whether a gate runs at all.
+print("building the current-HEAD Mix the fixtures require ...")
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 3000, env: {"RUSTC_WRAPPER": ""}})
+if $build["exit_code"] != 0 then
+  print($build["stderr"])
+  print("GATE BLOCKED: could not build cosmix-mix; an unbuilt binary is not a pass")
+  exit(2)
+end
+
+print("running " + $shell_expected + " P4 task fixtures ...")
+$run = run_argv(
+  ["cargo", "test", "-p", "cosmix-mix", "--test", "native_session_pty", $shell_prefix, "--", "--test-threads=1"],
+  {timeout: 3000, env: {"RUSTC_WRAPPER": ""}}
+)
+print($run["stdout"])
+if $run["exit_code"] != 0 then
+  print($run["stderr"])
+  print("GATE FAIL: the P4 task suite did not pass")
+  exit(1)
+end
+
+$want = "test result: ok. " + $shell_expected + " passed"
+if not contains($run["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  print("A zero-match filter, a renamed module or a deleted fixture all exit 0;")
+  print("the count is what tells them apart from a real run.")
+  exit(1)
+end
+
+-- The count alone would accept nine fixtures that are not these nine.
+for $fixture in $shell_fixtures
+  if not contains($run["stdout"], $fixture) then
+    print("GATE FAIL: " + $fixture + " did not run")
+    exit(1)
+  end
+end
+
+print("GATE PASS: " + $shell_expected + " P4 task fixtures ran and passed")
+print("NOT covered here: the Term term.task.* forward rides the stage-D")
+print("forwarding discipline and is covered by check-stage-d-gates.mix's Term")
+print("fixture plus the capability mirror; the S4 identity suite is its own gate.")
+exit(0)
