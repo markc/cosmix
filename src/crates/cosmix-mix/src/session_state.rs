@@ -51,6 +51,7 @@ pub(crate) enum Transition {
     PromptPreparing,
     PromptReady { continuation: bool },
     LineAccepted,
+    LineAbandoned,
     EvaluationAccepted,
     EvaluationStarted,
     EvaluationFinished,
@@ -136,14 +137,22 @@ impl Reducer {
         }
     }
     fn prepare_prompt(&mut self, continuation: bool) -> Option<Generation> {
-        let generation = Generation {
-            session: self
-                .snapshot
-                .source
-                .as_ref()
-                .map_or(0, |s| s.record.binding_generation.0),
-            prompt: self.snapshot.prompt_generation.0.checked_add(1)?,
+        let session = self
+            .snapshot
+            .source
+            .as_ref()
+            .map_or(0, |s| s.record.binding_generation.0);
+        // A reserved ticket the editor took but never activated is re-presented,
+        // not re-minted. This counter only advances on activation, so a mint
+        // would repeat the number anyway; stating the re-presentation makes the
+        // pairing with the editor's unspent-generation rule explicit rather than
+        // an accident of two counters happening to agree. An attachment change
+        // is a genuinely new prompt and does mint.
+        let prompt = match self.pending_prompt {
+            Some((pending, _, _)) if pending.session == session => pending.prompt,
+            _ => self.snapshot.prompt_generation.0.checked_add(1)?,
         };
+        let generation = Generation { session, prompt };
         self.pending_prompt = Some((generation, continuation, self.snapshot.source.clone()));
         Some(generation)
     }
@@ -186,13 +195,33 @@ impl Reducer {
                 s.continuation = *continuation;
                 s.phase = Phase::PromptReady;
             }
-            Transition::LineAccepted => s.phase = Phase::Idle,
-            Transition::EvaluationAccepted => {
+            // A line is the shell's, not the prompt's: the window in which it is
+            // classified and alias-expanded must never read `idle`, the one
+            // phase an execution admission would accept. The id belongs to the
+            // reducer, so it is minted here and the window reports
+            // evaluating-with-id rather than an unidentified evaluation.
+            Transition::LineAccepted => {
                 let Some(id) = self.next_command.checked_add(1) else {
                     return;
                 };
                 self.next_command = id;
                 s.command_id = Some(DecimalU64(id));
+                s.phase = Phase::Evaluating;
+            }
+            // The line turned out to run nothing (empty, incomplete or a parse
+            // error). Close its window truthfully instead of leaving a phantom
+            // evaluation standing until the next prompt.
+            Transition::LineAbandoned => s.phase = Phase::Idle,
+            Transition::EvaluationAccepted => {
+                // LineAccepted already minted this line's id; adopt it so one
+                // accepted line is one command, not two.
+                if s.command_id.is_none() {
+                    let Some(id) = self.next_command.checked_add(1) else {
+                        return;
+                    };
+                    self.next_command = id;
+                    s.command_id = Some(DecimalU64(id));
+                }
             }
             Transition::EvaluationStarted => {
                 self.evaluation_started_ms = Some(now);
@@ -256,9 +285,11 @@ impl Reducer {
             diagnostic,
             transition,
         });
+        // Both events name the command they closed; only the snapshot that
+        // follows them reports no command in flight.
         if matches!(
             self.replay.back().map(|e| &e.transition),
-            Some(Transition::EvaluationFinished)
+            Some(Transition::EvaluationFinished | Transition::LineAbandoned)
         ) {
             s.command_id = None;
         }
@@ -328,6 +359,10 @@ pub(crate) fn evaluation(executing: bool) -> Evaluation {
     if active {
         commit(Transition::EvaluationAccepted);
         commit(Transition::EvaluationStarted);
+    } else if enabled() {
+        // Classified as running nothing: the window LineAccepted opened has to
+        // close here, or a line that never executed keeps reporting evaluating.
+        commit(Transition::LineAbandoned);
     }
     Evaluation(active)
 }
@@ -371,8 +406,16 @@ mod tests {
         let sequence = state.snapshot.sequence;
         state.activate_prompt(ticket); // redraw/resume, not a new prompt
         assert_eq!(state.snapshot.sequence, sequence);
+        // An accepted line is never idle: classification and alias expansion
+        // run inside an identified evaluation, not in the one phase an
+        // execution admission would accept.
         state.commit(Transition::LineAccepted);
+        assert_eq!(state.snapshot.phase, Phase::Evaluating);
+        let accepted = state.snapshot.command_id.unwrap();
+        state.commit(Transition::LineAbandoned);
         assert_eq!(state.snapshot.phase, Phase::Idle);
+        assert_eq!(state.replay.back().unwrap().command_id, Some(accepted));
+        assert_eq!(state.snapshot.command_id, None);
         let continuation = state.prepare_prompt(true).unwrap();
         assert_eq!(state.snapshot.phase, Phase::Idle);
         state.activate_prompt(continuation);
@@ -456,6 +499,49 @@ mod tests {
         assert_eq!(state.snapshot.command_id, None);
         state.commit(Transition::EvaluationAccepted);
         assert!(state.snapshot.command_id.unwrap().0 > id.unwrap().0);
+    }
+
+    #[test]
+    fn an_unactivated_ticket_is_represented_not_reminted() {
+        let mut state = Reducer::new();
+        let ticket = state.prepare_prompt(false).unwrap();
+        // The editor has taken this prompt number; a Begin that never reached
+        // Editing leaves it taken. Offering a different number would present
+        // one the editor refuses, so the reserved ticket is offered again.
+        assert!(state.prepare_prompt(true).unwrap() == ticket);
+        assert_eq!(state.snapshot.prompt_generation, DecimalU64(0));
+        state.activate_prompt(ticket);
+        assert_eq!(state.snapshot.prompt_generation.0, ticket.prompt);
+        assert!(state.snapshot.continuation);
+        let sequence = state.snapshot.sequence;
+        state.activate_prompt(ticket);
+        assert_eq!(
+            state.snapshot.sequence, sequence,
+            "one activation, one commit"
+        );
+        // Taken up: the next prompt is genuinely a new one.
+        assert_eq!(
+            state.prepare_prompt(false).unwrap().prompt,
+            ticket.prompt + 1
+        );
+    }
+
+    #[test]
+    fn an_accepted_line_keeps_one_command_identity_through_evaluation() {
+        let mut state = Reducer::new();
+        state.commit(Transition::LineAccepted);
+        let id = state.snapshot.command_id.unwrap();
+        // The reducer mints at LineAccepted; the evaluation adopts that id
+        // rather than opening a second command for the same line.
+        state.commit(Transition::EvaluationAccepted);
+        assert_eq!(state.snapshot.command_id, Some(id));
+        state.commit(Transition::EvaluationStarted);
+        assert_eq!(state.snapshot.phase, Phase::Evaluating);
+        state.commit(Transition::EvaluationFinished);
+        assert_eq!(state.snapshot.phase, Phase::Idle);
+        assert_eq!(state.snapshot.command_id, None);
+        state.commit(Transition::LineAccepted);
+        assert!(state.snapshot.command_id.unwrap().0 > id.0);
     }
 
     #[test]

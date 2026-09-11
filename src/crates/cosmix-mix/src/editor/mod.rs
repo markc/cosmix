@@ -160,6 +160,8 @@ pub struct Editor {
     serial: u64,
     pending: Option<ModeToken>,
     reserved: bool,
+    /// Whether the current generation's Begin ever reached Editing.
+    activated: bool,
 }
 
 impl Editor {
@@ -201,7 +203,18 @@ impl Editor {
             serial: 0,
             pending: None,
             reserved: false,
+            // The zero sentinel is not a prompt anyone may present.
+            activated: true,
         }
+    }
+    /// A prompt number is spent once its Begin reached Editing. Until then the
+    /// owner may present it again: the reducer reserved that number and the
+    /// editor took it, so any other number it could offer would be refused.
+    fn spent(&self, generation: Generation) -> bool {
+        self.generation.is_some_and(|current| {
+            generation.prompt < current.prompt
+                || (generation.prompt == current.prompt && self.activated)
+        })
     }
     pub fn state(&self) -> State {
         self.state
@@ -260,6 +273,10 @@ impl Editor {
     }
     /// Only the local Begin path may move to a new attachment between prompts.
     /// All in-flight control commands still require an exact generation match.
+    /// A Begin that took a prompt number without reaching Editing leaves the
+    /// owner free to present that same number again; anything spent is stale.
+    /// In-flight control commands are unaffected: `check` still demands an
+    /// exact match.
     pub(crate) fn bind_prompt_session(
         &mut self,
         generation: Generation,
@@ -267,10 +284,7 @@ impl Editor {
         if self.state != State::Idle {
             return Err(ProtocolError::InvalidState);
         }
-        if self
-            .generation
-            .is_some_and(|g| generation.prompt <= g.prompt)
-        {
+        if self.spent(generation) {
             return Err(ProtocolError::StaleGeneration);
         }
         self.session = generation.session;
@@ -282,11 +296,7 @@ impl Editor {
                 generation,
                 profile,
             } => {
-                if generation.session != self.session
-                    || self
-                        .generation
-                        .is_some_and(|g| generation.prompt <= g.prompt)
-                {
+                if generation.session != self.session || self.spent(generation) {
                     return Err(ProtocolError::StaleGeneration);
                 }
                 if self.state != State::Idle {
@@ -299,6 +309,7 @@ impl Editor {
                     .checked_sub(profile.text().len())
                     .ok_or(ProtocolError::Edit(EditError::Limit))?;
                 self.generation = Some(generation);
+                self.activated = false;
                 self.profile = Some(profile);
                 // Reserve prompt bytes up front so a successful edit can never
                 // exceed the renderer's combined input bound later.
@@ -391,6 +402,8 @@ impl Editor {
         let reply = match self.state {
             State::Activating => {
                 self.state = State::Editing;
+                // Reaching Editing is what spends the prompt number.
+                self.activated = true;
                 Reply::Editing {
                     generation,
                     edit_revision,
@@ -472,6 +485,51 @@ mod tests {
         e.modes_completed(t, true).unwrap();
         e
     }
+    #[test]
+    fn a_prompt_number_is_spent_only_by_reaching_editing() {
+        let mut e = Editor::new(7);
+        e.bind_prompt_session(G).unwrap();
+        let t = token(
+            e.command(Command::BeginPrompt {
+                generation: G,
+                profile: PromptProfile::Primary("> ".into()),
+            })
+            .unwrap(),
+        );
+        // Foreground was lost before raw entry: the number is taken, but
+        // nothing was reserved and no activation was published, so the reducer
+        // may still present that same reserved ticket.
+        assert!(matches!(
+            e.modes_waiting(t).unwrap(),
+            Reply::Suspended { .. }
+        ));
+        assert!(!e.spent(G));
+        assert_eq!(e.bind_prompt_session(G), Err(ProtocolError::InvalidState));
+        let revision = e.edit_revision();
+        let t = token(
+            e.command(Command::Resume {
+                generation: G,
+                edit_revision: revision,
+            })
+            .unwrap(),
+        );
+        // The foreground wake activates that same generation, once.
+        assert_eq!(
+            e.modes_completed(t, true),
+            Ok(Reply::Editing {
+                generation: G,
+                edit_revision: revision
+            })
+        );
+        e.finish_line().unwrap();
+        assert!(e.spent(G));
+        assert_eq!(
+            e.bind_prompt_session(G),
+            Err(ProtocolError::StaleGeneration)
+        );
+        assert_eq!(e.bind_prompt_session(Generation { prompt: 2, ..G }), Ok(()));
+    }
+
     #[test]
     fn foreground_loss_during_activation_preserves_draft_and_can_resume() {
         let mut e = editing(PromptProfile::Primary("test> ".into()));

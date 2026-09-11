@@ -304,6 +304,7 @@ pub fn run_repl() -> i32 {
             Ok(line) => {
                 crate::session_state::commit(crate::session_state::Transition::LineAccepted);
                 if line_buf.is_empty() && line.trim().is_empty() {
+                    crate::session_state::commit(crate::session_state::Transition::LineAbandoned);
                     continue;
                 }
 
@@ -323,6 +324,9 @@ pub fn run_repl() -> i32 {
                     Some("") => {
                         eprintln!("mix: time: usage: time <command | mix expression>");
                         line_buf.clear();
+                        crate::session_state::commit(
+                            crate::session_state::Transition::LineAbandoned,
+                        );
                         continue;
                     }
                     Some(rest) => (true, rest.to_string()),
