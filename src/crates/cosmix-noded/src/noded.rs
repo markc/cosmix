@@ -2667,6 +2667,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 let origin = broker_origin_for_delivery(source_ip, &state.bind);
                 stamp_broker_origin(&mut bus_msg, origin);
                 let canonical_text = bus_msg.to_wire();
+                let canonical_message = observing.then(|| bus_msg.clone());
                 // `route_local` mutates `bus_msg`'s `id` to the broker-local
                 // rewrite. Use the wire bytes it returns (id-rewritten) for
                 // the tap so observers see exactly what the target service
@@ -2699,7 +2700,10 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                         Observation::from_message(
                             ObserveDirection::Local,
                             route_result.outcome,
-                            &bus_msg,
+                            canonical_message
+                                .as_ref()
+                                .filter(|_| route_result.forwarded_wire.is_none())
+                                .unwrap_or(&bus_msg),
                             observed_wire,
                             correlation_id.as_deref(),
                         )
@@ -3354,6 +3358,15 @@ async fn route_local(
             )
             .await;
         let reg = registry.read().await;
+        // An entry may become protected on the same channel while pending
+        // registration waits. Preserve old protection and include its new class.
+        let traffic_class = traffic_class.merge(
+            reg.get(service)
+                .map(|e| e.traffic_class)
+                .unwrap_or_default(),
+        );
+        let scoped_observe = state.observe.for_class(traffic_class);
+        let observe = &scoped_observe;
         let mut sessions = if state.principal.is_some() || traffic_class.protected() {
             Some(state.sessions.lock().await)
         } else {
@@ -3398,7 +3411,13 @@ async fn route_local(
                 reg.get(service)
                     .is_some_and(|e| e.traffic_class.protected())
             });
-            stamp_principal(msg, principal).expect("principal validated at upgrade");
+            stamp_principal(msg, principal).map_err(|_| {
+                cosmix_bus::native_session::SessionError {
+                    error_code: cosmix_bus::native_session::ErrorCode::Unavailable,
+                    message: "broker principal cannot be encoded".into(),
+                    details: Default::default(),
+                }
+            })?;
             let wire = msg.to_wire();
             // Mark before enqueue: a fast recipient may respond immediately.
             // Failed enqueue may conservatively protect this connection too.
@@ -6721,6 +6740,113 @@ mod tests {
         let canonical = super::canonicalize_routed_from(&mut msg, None, &original);
         assert_eq!(canonical, original, "short-circuit returns original text");
         assert_eq!(msg.get("from"), None);
+    }
+
+    #[tokio::test]
+    async fn oversized_principal_refuses_without_poisoning_delivery_fence() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let (mut sessions, _, mut principal, _) =
+            super::session::queue_tests::allocated_at(super::session::now_ms().unwrap());
+        let (caller, mut replies) = mpsc::channel(8);
+        principal.owner_node = "x".repeat(5000);
+        sessions.connect(&principal, &caller, Default::default(), Default::default());
+        state.principal = Some(principal);
+        state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
+        let (target, mut received) = mpsc::channel(8);
+        state.registry.write().await.insert(
+            "recipient".into(),
+            super::ServiceEntry {
+                tx: target,
+                traffic_class: super::TrafficClass::NativeSession,
+                protected_responses: Default::default(),
+                info: Default::default(),
+            },
+        );
+        let mut request = BusMessage::new().with_header("id", "oversized");
+        let admission = super::SessionAdmission::default();
+        let result = super::route_local(
+            &state,
+            "recipient",
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, super::ObserveOutcome::Rejected);
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            bus_mod::parse(&replies.try_recv().unwrap())
+                .unwrap()
+                .get("rc"),
+            Some("20")
+        );
+        assert!(!state.delivery_fence.is_poisoned());
+        assert!(state.pending_responses.map.read().await.is_empty());
+        state.principal = None;
+        let result = super::route_local(
+            &state,
+            "recipient",
+            &mut BusMessage::new(),
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, super::ObserveOutcome::Delivered);
+    }
+
+    #[tokio::test]
+    async fn pending_wait_reclassifies_a_newly_protected_expired_target() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let (sessions, mut registry, _, _) = super::session::queue_tests::allocated_at(
+            super::session::now_ms().unwrap().saturating_sub(15_000),
+        );
+        let name = registry.keys().next().unwrap().clone();
+        let (target, mut received) = mpsc::channel(8);
+        let entry = registry.get_mut(&name).unwrap();
+        entry.tx = target;
+        entry.traffic_class = super::TrafficClass::Legacy;
+        *state.registry.write().await = registry;
+        state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
+        let (caller, mut replies) = mpsc::channel(8);
+        let mut request = BusMessage::new().with_header("id", "reclassify");
+        let admission = super::SessionAdmission::default();
+        let pending = state.pending_responses.map.write().await;
+        let route = super::route_local(
+            &state,
+            &name,
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        );
+        tokio::pin!(route);
+        assert!(futures_util::poll!(&mut route).is_pending());
+        state
+            .registry
+            .write()
+            .await
+            .get_mut(&name)
+            .unwrap()
+            .traffic_class = super::TrafficClass::NativeSession;
+        drop(pending);
+        let result = route.await;
+        assert_eq!(result.outcome, super::ObserveOutcome::Rejected);
+        assert!(result.traffic_class.protected());
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            bus_mod::parse(&replies.try_recv().unwrap())
+                .unwrap()
+                .get("error"),
+            Some("EXPIRED")
+        );
     }
 
     #[tokio::test]

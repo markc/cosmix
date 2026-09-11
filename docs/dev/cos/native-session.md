@@ -30,6 +30,10 @@ rechecks channel ownership and recomputes the lease after that await, immediatel
 before enqueue. Refusal removes the pending entry and restores caller correlation.
 Routing lookup uses a registry read guard; only actual mutations take write.
 It also refuses an expired native target while its route awaits scheduler removal.
+Post-await classification includes any newly protected destination. Principal
+encoding failure returns a refusal without panicking under the delivery fence.
+Refusal observations use the pre-mutation envelope, never headers from an
+unshipped delivery attempt.
 Delivery errors carry native response headers for verified recipients and the
 legacy error header/body for legacy recipients, including correlated responses.
 `lease.check` requires an existing unexpired dependency, atomically refreshes
