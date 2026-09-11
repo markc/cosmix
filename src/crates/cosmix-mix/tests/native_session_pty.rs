@@ -2494,33 +2494,36 @@ fn p4_a_task_has_exactly_the_descriptors_it_was_given() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         let mut f = stage_d_fixture("owned").await;
+        // ARGV mode, deliberately. A Mix interpreter opens its own
+        // descriptors during startup — prelude, config, the Bus probe — so a
+        // source task cannot distinguish "inherited from the parent" from
+        // "opened by myself", and asserting a count there would be asserting
+        // something the fixture cannot observe. `sh` opens nothing of its own,
+        // so what it sees IS what the spawn handed it.
+        //
+        // argv mode also has no result channel, which makes the expected set
+        // exactly the three standard streams plus the listing's own handle.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
             1,
-            serde_json::json!({
-                "source": "print(join(sort(glob(\"/proc/self/fd/*\")), \",\"))",
-            }),
+            serde_json::json!({"argv": ["sh", "-c", "ls /proc/self/fd"]}),
         )
         .await
         .expect("admitted");
         let report = task_report(&mut f.parent, &f.bound, operation).await;
         let listed = report["report"]["stdout"]["text"].as_str().unwrap().trim();
         let mut open: Vec<i32> = listed
-            .split(',')
-            // glob returns whole paths; the descriptor is the final component.
-            .filter_map(|entry| entry.trim().rsplit('/').next())
+            .split_whitespace()
             .filter_map(|entry| entry.parse().ok())
-            // The read of /proc/self/fd itself holds a descriptor; it is the
-            // reader's own and not an inheritance.
             .collect();
         open.sort_unstable();
         open.dedup();
-        for expected in [0, 1, 2, 3] {
+        for expected in [0, 1, 2] {
             assert!(open.contains(&expected), "fd {expected} missing: {listed}");
         }
         assert!(
-            open.iter().all(|fd| *fd <= 4),
+            open.len() <= 4,
             "a descriptor leaked into the task: {listed}"
         );
         // stdin is /dev/null, not the pane.
