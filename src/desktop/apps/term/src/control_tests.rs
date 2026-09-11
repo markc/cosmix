@@ -1278,3 +1278,22 @@ fn p0i_08_lease_window_refresh_and_successor_binding_invalidation() {
         listener.block_control_writes(false);
     });
 }
+
+/// The plan requires a revoked paste to finish any bracketed-paste terminator
+/// before discarding the remainder. This encoder never opens one — it emits
+/// per-key sequences only — so that obligation is inapplicable here rather than
+/// quietly skipped. If bracketed paste is ever added to the control input path
+/// this fails, and the terminator handling has to be written alongside it.
+#[test]
+fn control_input_never_opens_a_bracketed_paste() {
+    const OPEN: &str = "\u{1b}[200~";
+    const CLOSE: &str = "\u{1b}[201~";
+    let encoded = crate::terminal::encode_text("plain text\nwith\ttabs\u{3}").unwrap();
+    let encoded = String::from_utf8_lossy(&encoded).into_owned();
+    assert!(!encoded.contains(OPEN), "bracketed paste opened: {encoded:?}");
+    assert!(!encoded.contains(CLOSE), "bracketed paste closed: {encoded:?}");
+    // The needles have to be able to match something, or the two assertions
+    // above would hold for any encoder at all.
+    assert!(format!("x{OPEN}y{CLOSE}z").contains(OPEN));
+    assert!(format!("x{OPEN}y{CLOSE}z").contains(CLOSE));
+}

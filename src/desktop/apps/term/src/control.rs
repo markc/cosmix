@@ -421,6 +421,11 @@ impl Control {
         {
             return Reply::error("FORBIDDEN");
         }
+        // Deliberately after the capability decision, not before it: a caller
+        // without execute authority learns FORBIDDEN like any other refusal and
+        // is told nothing about what the verb would have done. Only a caller
+        // who would have been allowed sees that the verb is unimplemented,
+        // which is the documented stage-D state rather than a leak.
         if capability == Capability::Execute {
             return Reply::error("UNSUPPORTED");
         }
