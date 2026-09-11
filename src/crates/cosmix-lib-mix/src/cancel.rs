@@ -303,6 +303,12 @@ pub fn cancel(id: u64) -> Outcome {
     }
 }
 
+/// The evaluation currently running, or 0. Lets a caller ask whether the
+/// operation it just cancelled is the one that would receive a group signal.
+pub fn active() -> u64 {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Report a known evaluation's cancellation state without changing it:
 /// (intent recorded, what asked for it, whether the interrupt was consumed).
 pub fn state(id: u64) -> Option<(bool, Option<Source>, bool)> {
@@ -428,6 +434,71 @@ mod tests {
         assert!(guard.evaluation().cancel_requested());
         assert!(flag.load(Ordering::SeqCst));
         drop(guard);
+    }
+
+    /// The admission window: an id exists from the moment it is minted, so a
+    /// cancel arriving before the evaluation starts addresses it rather than
+    /// being told the id is unknown — which used to contradict the result
+    /// surface, already reporting the same operation as running.
+    #[test]
+    fn a_cancel_during_admission_is_adopted_when_the_evaluation_begins() {
+        let _lock = crate::interrupt::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let flag = flag();
+        reset_for_test();
+        publish(21);
+        assert_eq!(cancel(21), Outcome::Requested);
+        // Nothing is running yet, so nothing is signalled yet.
+        assert!(!flag.load(Ordering::SeqCst));
+        let guard = begin(21);
+        assert!(
+            guard.evaluation().cancel_requested(),
+            "intent recorded before the start was lost in the handover"
+        );
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "an adopted cancellation must fire at the FIRST checkpoint"
+        );
+        drop(guard);
+    }
+
+    /// `requested` is intent; `delivered` is what actually happened. Reporting
+    /// the first as though it were the second tells a caller work stopped when
+    /// it ran to completion.
+    #[test]
+    fn delivery_is_recorded_at_the_consumption_point_not_inferred() {
+        let _lock = crate::interrupt::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let flag = flag();
+        reset_for_test();
+        let guard = begin(31);
+        assert_eq!(cancel(31), Outcome::Requested);
+        assert_eq!(state(31), Some((true, Some(Source::Request), false)));
+        // The evaluation ran to completion despite the cancellation.
+        drop(guard);
+        assert_eq!(
+            state(31).map(|s| s.2),
+            Some(false),
+            "an evaluation that completed anyway must not report delivery"
+        );
+
+        reset_for_test();
+        let guard = begin(32);
+        cancel(32);
+        // Now something actually consumes the interrupt.
+        assert!(flag.swap(false, Ordering::SeqCst));
+        note_delivery();
+        drop(guard);
+        assert_eq!(state(32).map(|s| s.2), Some(true));
+    }
+
+    /// Delivery is only ever attributed to an evaluation that ASKED for it.
+    #[test]
+    fn an_ordinary_interrupt_is_not_recorded_as_a_delivered_cancellation() {
+        let _lock = crate::interrupt::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let guard = begin(41);
+        note_delivery();
+        drop(guard);
+        assert_eq!(state(41), Some((false, None, false)));
     }
 
     #[test]

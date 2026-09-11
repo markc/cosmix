@@ -719,11 +719,30 @@ terminal, naming the principal and the command id:
 mix: execute #7 admitted for Term ff86c6c7: print("hello")
 ```
 
-The source in that line is escaped: control characters, escape sequences and
-newlines are rendered, never emitted. A submission is attacker-chosen bytes
-being drawn into a terminal a human is reading, and a raw echo would let it
-paint anything it liked, including a convincing forgery of a different
-announcement.
+The source in that line is escaped by a printable **allowlist**, not a blocklist:
+anything outside ordinary printable text is rendered rather than emitted. That
+covers the characters `is_control` does not report — bidi overrides and
+isolates, zero-width joiners, the BOM, a soft hyphen, `U+2028`/`U+2029` — each
+of which can reorder or hide what a reader sees without being a control code. A
+submission is attacker-chosen bytes drawn into a terminal a human is reading,
+and the allowlist means a new trick is escaped by default rather than passed
+through by omission.
+
+A source too long for one line is truncated with its tail NAMED:
+
+```
+mix: execute #7 admitted for PaneShell 9c1f via Term ff86c6c7: <head> …[+812 bytes, sha256:3ab19f04]
+```
+
+Nothing executes with an unannounced tail, and two submissions sharing a head
+are still distinguishable. When a forwarder relays somebody else's submission
+the announcement reads `<originator> via <forwarder>`: the shell authenticated
+the forwarder, not the name it relayed, and the wording says so rather than
+implying the shell verified it.
+
+If the whole line cannot be put on the glass, the pane says
+`announcement abandoned; nothing executed` instead — an announcement is
+zero-or-whole, because a partial one reads exactly like a real admission.
 
 Execution then follows the same path a typed line takes — the same classifier,
 aliases, job integration and history policy — adopting the command id that was
@@ -734,9 +753,30 @@ holding half of someone else's line.
 
 `shell.execute` answers immediately with `{"state":"running","operation_id":…}`;
 `shell.execute.result` returns that operation's state and, once it has one, its
-result. Retries are BROKER-018 idempotent for 15 minutes: an identical
-submission under the same request id replays the recorded answer rather than
-executing a second time.
+result. Both it and `shell.execute.cancel` are scoped to the actor that
+submitted — holding `execute` authorises driving the shell, not reading back
+what somebody else drove it to do — and an operation belonging to another actor
+is refused exactly like one that does not exist.
+
+Retries are BROKER-018 idempotent: an identical submission under the same
+request id replays the recorded answer rather than executing a second time.
+**Fifteen minutes is the ceiling, not a promise.** The store holds 256
+operations, and a busy shell reaches that long before it reaches the clock; the
+oldest COMPLETED record is then evicted (a running one never is). What survives
+eviction is a per-actor high-water mark, so a retry whose record is gone answers
+`UNKNOWN_OUTCOME` rather than executing a second time — the id stays spent even
+when its result no longer exists.
+
+Three refusals are worth telling apart, because they are different facts:
+
+* `BUSY` — nothing was announced and nothing ran. The request id is untouched
+  and the same submission may simply be retried.
+* `UNKNOWN_OUTCOME` with `reason: admission_abandoned_before_execution` — proven
+  that nothing ran, but the id is spent and its outcome recorded. Retrying it
+  replays that; use a new id to try again.
+* `UNKNOWN_OUTCOME` with `reason: admission_claimed_without_report` — the shell
+  cannot say whether the line ran. The named `operation_id` stays resolvable, so
+  `shell.execute.result` on it is how the caller finds out.
 
 The result is serialised on the evaluator owner, so no interpreter value ever
 crosses to the Bus thread:
@@ -770,10 +810,18 @@ Delivery is cooperative, and the table says only what is true:
 |---|---|
 | Ordinary statements | cooperative, at the evaluator's existing checkpoints |
 | Optimised native loops | cooperative, at the existing periodic check |
-| Captured runners (`run_argv`, `run_pipeline`) | existing polling and group escalation |
-| Managed interactive children | group signal via the job controller |
+| Captured runners (`run_argv`, `run_pipeline`) | existing polling; the runner abandons its child |
+| Managed interactive foreground job | **SIGINT to the process group**, via the job controller — the one path that does not depend on the target polling anything |
 | `run_stream` | not interruptible while blocked in the child wait |
+| `serve()` | **not covered**: its interrupt is a process-wide shutdown request, consumed by the pump's own exit rather than reported as a delivered cancellation |
 | Blocking HTTP, filesystem and device calls; uncooperative extensions | **no pre-emption** |
+
+The group signal is SIGINT and stops there. Escalating to `SIGTERM` and then
+`SIGKILL` would need a grace period this shell does not run a clock for, and a
+shell that escalated on its own would destroy work a human could still have
+recovered with `fg`. The `cancel` reply reports `signalled_pgid` when a real
+group signal went out, so a caller can tell the two strengths apart rather than
+having to assume.
 
 What cannot be promised is not promised: arbitrary builtin pre-emption,
 rolling back side effects, killing threads, or terminating descendants after
@@ -783,8 +831,14 @@ scope. `cancel` reports `requested`, `already_finished` or `unknown`, and a
 finished evaluation's report distinguishes `cancelled` from `completed_anyway`.
 
 Noninteractive shells, `--serve`, `mix -c` and any shell without an attachment
-are byte-identical and carry none of this: no surface is registered, no state is
-allocated, and `serve`'s process-wide shutdown semantics are untouched.
+carry none of this: no surface is registered, no admission state is allocated,
+no result store exists, and `serve`'s process-wide shutdown semantics are
+untouched. One thing is NOT unchanged, and it applies to every Mix process: the
+SIGINT handler now also records which evaluation a signal was aimed at, so
+`interrupt::init` registers one additional chained handler. Two relaxed atomic
+stores, no allocation, no behaviour change to what the signal does — but it is a
+difference, and "byte-identical" would have been a claim this page could not
+back.
 
 - `mix` is intercepted by the shell, so it never sees `$`-sigil arguments — write `mix what round`, not `mix what $name`.
 - The introspection family (`vars`/`aliases`/`functions`/`all`/`context`) is most useful **inside a REPL**, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.

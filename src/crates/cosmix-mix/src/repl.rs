@@ -241,13 +241,25 @@ pub fn run_repl() -> i32 {
         // without a keypress, and only where there is an enrolled attachment to
         // authorise against. Anywhere else the surface stays unregistered and
         // answers UNSUPPORTED rather than a BUSY that could never clear.
-        if crate::session_state::enabled() {
-            crate::session_execute::register(control.clone());
-        }
         if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } =
             job_table.policy()
         {
+            if crate::session_state::enabled() {
+                // The controller is what makes the guarantee table's managed-
+                // children row real: a cancelled foreground job is signalled by
+                // group, not merely asked to notice a flag.
+                let signaller = controller.clone();
+                crate::session_execute::register(
+                    control.clone(),
+                    std::sync::Arc::new(move || signaller.interrupt_foreground()),
+                );
+            }
             controller.set_terminal_shutdown(std::sync::Arc::new(move || control.shutdown()));
+        } else if crate::session_state::enabled() {
+            // No job controller: the shell is not managing process groups, so
+            // there is nothing to signal and the surface says so by having no
+            // stronger path than the cooperative one.
+            crate::session_execute::register(control.clone(), std::sync::Arc::new(|| None));
         }
     }
 

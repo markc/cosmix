@@ -379,6 +379,10 @@ pub(crate) fn finished(operation: u64, completion: Completion) {
 
 struct Surface {
     control: Control,
+    /// Delivers a cancellation to the managed foreground job group. The one
+    /// non-cooperative path in the guarantee table, and the reason a cancelled
+    /// `sleep` stops rather than being merely asked to.
+    interrupt_foreground: std::sync::Arc<dyn Fn() -> Option<i32> + Send + Sync>,
 }
 fn surface() -> &'static Mutex<Option<Surface>> {
     static SURFACE: OnceLock<Mutex<Option<Surface>>> = OnceLock::new();
@@ -388,8 +392,14 @@ fn surface() -> &'static Mutex<Option<Surface>> {
 /// The owned editor registers here at REPL startup. Nothing else can: the
 /// rustyline path has no way to release the terminal without a keypress, so it
 /// leaves the surface unregistered and every submission answers UNSUPPORTED.
-pub(crate) fn register(control: Control) {
-    *surface().lock().unwrap_or_else(|e| e.into_inner()) = Some(Surface { control });
+pub(crate) fn register(
+    control: Control,
+    interrupt_foreground: std::sync::Arc<dyn Fn() -> Option<i32> + Send + Sync>,
+) {
+    *surface().lock().unwrap_or_else(|e| e.into_inner()) = Some(Surface {
+        control,
+        interrupt_foreground,
+    });
 }
 pub(crate) fn withdraw() {
     *surface().lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -659,6 +669,21 @@ fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, St
     } else {
         cosmix_mix::cancel::cancel(operation)
     };
+    // The cooperative flag only reaches code that polls it. A managed
+    // foreground child does not poll anything, so while THIS operation is the
+    // running one the job controller delivers to its process group as well.
+    let signalled = if outcome == cosmix_mix::cancel::Outcome::Requested
+        && cosmix_mix::cancel::active() == operation
+    {
+        let hook = surface()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.interrupt_foreground.clone());
+        hook.and_then(|hook| hook())
+    } else {
+        None
+    };
     (
         0,
         serde_json::json!({
@@ -671,8 +696,15 @@ fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, St
             },
             // Said plainly rather than implied: recording intent is not
             // stopping anything. What it is worth per code path is in the
-            // guarantee table, and nothing here promises more.
-            "delivery": "cooperative; no pre-emption of blocking builtins",
+            // guarantee table, and nothing here promises more. The one
+            // exception is reported, not implied — a caller can see from
+            // `signalled_pgid` that a real group signal went out.
+            "delivery": if signalled.is_some() {
+                "cooperative, plus SIGINT delivered to the managed foreground job group"
+            } else {
+                "cooperative; no pre-emption of blocking builtins"
+            },
+            "signalled_pgid": signalled,
         })
         .to_string(),
     )
@@ -1020,10 +1052,84 @@ mod tests {
         assert!(!echoed.contains('\r'));
         assert!(!echoed.contains('\n'));
         assert!(echoed.starts_with("print(1)\\x1b[2J"));
-        // Long submissions are bounded, and the bound is visible.
-        let long = sanitise(&"a".repeat(MAX_ECHO_SOURCE * 2));
-        assert!(long.ends_with('…'));
-        assert!(long.len() <= MAX_ECHO_SOURCE + 4);
+    }
+
+    /// The characters that reorder or hide text without being control codes.
+    /// `is_control` reports none of these, which is exactly why the escape is
+    /// an allowlist and not a list of known-bad characters.
+    #[test]
+    fn the_echo_escapes_the_characters_is_control_does_not_report() {
+        for (name, hostile) in [
+            ("RLO", "print(1)\u{202e})1(tnirp"),
+            ("LRI", "print(1)\u{2066}hidden\u{2069}"),
+            ("ZWJ", "pri\u{200d}nt(1)"),
+            ("ZWSP", "pri\u{200b}nt(1)"),
+            ("BOM", "\u{feff}print(1)"),
+            ("soft hyphen", "pri\u{ad}nt(1)"),
+            ("line separator", "print(1)\u{2028}print(2)"),
+            ("paragraph separator", "print(1)\u{2029}print(2)"),
+            ("word joiner", "pri\u{2060}nt(1)"),
+        ] {
+            let echoed = sanitise(hostile);
+            for character in hostile.chars().filter(|c| !c.is_ascii()) {
+                assert!(
+                    !echoed.contains(character),
+                    "{name}: {character:?} survived into the announcement: {echoed}"
+                );
+            }
+            // Sub-256 code points render as \xNN and the rest as \u{NNNN};
+            // which form is used is presentation, escaped-at-all is the rule.
+            assert!(
+                echoed.contains("\\u{") || echoed.contains("\\x"),
+                "{name} was not escaped: {echoed}"
+            );
+        }
+        // Ordinary non-ASCII text is NOT mangled — an allowlist that escaped
+        // every accent would make the announcement unreadable for most people.
+        assert_eq!(sanitise("print(\"héllo wörld\")"), "print(\"héllo wörld\")");
+        assert_eq!(sanitise("print(\"日本語\")"), "print(\"日本語\")");
+    }
+
+    #[test]
+    fn a_truncated_announcement_names_its_hidden_tail() {
+        let long = "a".repeat(MAX_ECHO_SOURCE * 2);
+        let echoed = sanitise(&long);
+        assert!(echoed.contains("…[+"), "{echoed}");
+        assert!(echoed.contains("sha256:"), "{echoed}");
+        // Two submissions sharing a head are still distinguishable.
+        let other = format!("{}b", "a".repeat(MAX_ECHO_SOURCE * 2 - 1));
+        assert_ne!(sanitise(&other), echoed);
+    }
+
+    /// The cap bounds what is WRITTEN. Checking after the push let a multi-byte
+    /// character carry the line past it.
+    #[test]
+    fn the_echo_cap_is_never_overshot_by_a_multibyte_character() {
+        for pad in 0..8 {
+            // Land a 4-byte character exactly on the boundary from each offset.
+            let source = format!("{}{}", "a".repeat(MAX_ECHO_SOURCE - pad), "𝄞".repeat(4));
+            let echoed = sanitise(&source);
+            let head = echoed.split(" …[").next().unwrap();
+            assert!(
+                head.len() <= MAX_ECHO_SOURCE,
+                "pad {pad}: head is {} bytes",
+                head.len()
+            );
+            assert!(echoed.is_char_boundary(head.len()));
+        }
+        // An escape that would straddle the cap is dropped whole, never split.
+        let source = format!("{}\u{202e}", "a".repeat(MAX_ECHO_SOURCE - 2));
+        let echoed = sanitise(&source);
+        assert!(!echoed.contains("\\u{20"), "a split escape leaked: {echoed}");
+    }
+
+    #[test]
+    fn a_relayed_principal_is_escaped_and_bounded_like_any_other_input() {
+        let hostile = "Term\u{202e}\x1b[2J evil".to_owned() + &"x".repeat(500);
+        let label = sanitise_label(&hostile);
+        assert!(!label.contains('\u{202e}'));
+        assert!(!label.contains('\x1b'));
+        assert!(label.len() <= MAX_ECHO_PRINCIPAL + 4, "{}", label.len());
     }
 
     #[test]
@@ -1054,33 +1160,94 @@ mod tests {
         assert_eq!(json["value"]["type"], "string");
     }
 
-    #[test]
-    fn retention_never_drops_a_running_evaluation() {
-        let mut store = Store::default();
-        for operation in 0..(RECORDS as u64 + 16) {
-            store.records.push(Record {
-                actor: "a".into(),
-                request_id: operation + 1,
-                digest: [0; 32],
-                operation,
-                at: Instant::now() - RETENTION * 2,
-                completion: (operation != 5).then_some(Completion {
-                    outcome: "completed",
-                    status: None,
-                    value: None,
-                    error: None,
-                    duration_ms: DecimalU64(0),
-                    cancellation: CancellationReport {
-                        requested: false,
-                        source: None,
-                        delivered: "none",
-                    },
-                }),
-            });
+    fn completed() -> Completion {
+        Completion {
+            outcome: "completed",
+            status: None,
+            value: None,
+            error: None,
+            duration_ms: DecimalU64(0),
+            cancellation: CancellationReport {
+                requested: false,
+                source: None,
+                delivered: "none",
+            },
         }
-        store.sweep();
-        assert!(store.records.iter().any(|r| r.operation == 5));
+    }
+    fn record(operation: u64, finished: bool) -> Record {
+        Record {
+            actor: "a".into(),
+            request_id: operation + 1,
+            digest: [0; 32],
+            operation,
+            at: Instant::now(),
+            completion: finished.then(completed),
+        }
+    }
+
+    /// A bounded table that only ever fills is the S4-M1 failure: it wedges the
+    /// surface permanently for everyone. It must evict — and evicting must not
+    /// resurrect a spent request id, or the retry that follows executes twice.
+    #[test]
+    fn a_full_store_evicts_instead_of_wedging_and_keeps_ids_spent() {
+        let mut store = Store::default();
+        for operation in 0..(RECORDS as u64 + 64) {
+            assert!(store.admit(record(operation, true)), "wedged at {operation}");
+        }
         assert!(store.records.len() <= RECORDS);
+        // The earliest ids were evicted, and every one of them is still spent.
+        assert!(store.records.iter().all(|r| r.operation >= 64));
+        assert!(store.retired("a", 1));
+        assert!(store.retired("a", RECORDS as u64));
+        assert!(!store.retired("a", RECORDS as u64 + 999));
+        // Another actor's ids are its own.
+        assert!(!store.retired("b", 1));
+    }
+
+    #[test]
+    fn a_running_evaluation_is_never_evicted_and_a_full_table_of_them_refuses() {
+        let mut store = Store::default();
+        store.admit(record(0, false));
+        for operation in 1..(RECORDS as u64 + 8) {
+            assert!(store.admit(record(operation, true)));
+        }
+        assert!(
+            store.records.iter().any(|r| r.operation == 0),
+            "a result that still has to be publishable was dropped"
+        );
+        // Now fill it entirely with running records: eviction has nothing to
+        // take, and refusing is the honest answer rather than dropping a
+        // result somebody is waiting for.
+        let mut store = Store::default();
+        for operation in 0..RECORDS as u64 {
+            assert!(store.admit(record(operation, false)));
+        }
+        assert!(!store.admit(record(9_999, false)));
+    }
+
+    #[test]
+    fn operations_are_addressable_only_by_the_actor_that_submitted_them() {
+        let mut store = Store::default();
+        store.admit(record(7, true));
+        assert!(store.owned("a", 7).is_some());
+        assert!(
+            store.owned("b", 7).is_none(),
+            "another actor reached an operation it did not submit"
+        );
+    }
+
+    #[test]
+    fn an_expired_record_leaves_its_id_spent() {
+        let mut store = Store::default();
+        let mut aged = record(1, true);
+        aged.at = Instant::now() - RETENTION * 2;
+        store.admit(aged);
+        store.sweep();
+        assert!(store.records.is_empty(), "the record should have aged out");
+        assert!(
+            store.retired("a", 2),
+            "ageing a record out must not make its id executable again"
+        );
     }
 
     #[test]

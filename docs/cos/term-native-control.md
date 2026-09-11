@@ -92,9 +92,30 @@ table are in the Mix manual under "Native pane-shell execution (stage D)"
 epoch, and its ID is retired before the submission is forwarded, so a lost reply
 can never become a second execution. `term.exec.result` and `term.exec.cancel`
 are not: both address one immutable evaluation identity and are idempotent by
-construction. A forwarded submission whose answer never arrives is reported as
-`UNKNOWN_OUTCOME`; `term.exec.result` on the operation, or a byte-identical
-retry, is how a caller finds out what happened.
+construction.
+
+**Request IDs are namespaced at the hop.** Term forwards on its own connection,
+so at the child every caller's IDs would otherwise land in one `(actor, id)`
+space keyed to Term — one agent's ID 1 would replay another's operation, and two
+agents using the same ID with different bodies would conflict with each other
+forever. Term mints its own monotonic sequence per caller request and remembers
+the mapping, so the child sees one ID per `(Term, forwarded-seq)`. The mapping is
+what makes a retry safe: it forwards the SAME child ID, reaching the child's own
+dedupe rather than submitting again.
+
+A forwarded submission whose answer never arrives is reported as
+`UNKNOWN_OUTCOME`, and that placeholder is deliberately **not retained**. A
+retained local timeout would make every byte-identical retry replay the
+placeholder forever; not retaining it lets the retry re-forward to the child,
+which is the only party that can say what actually happened. The same applies to
+a reply too large to deliver.
+
+**The announcement names the originating agent, not Term.** Term supplies the
+principal from its own broker-stamped actor context — never from a caller-
+supplied field, which would let one agent announce itself as another — and the
+child renders it through the same allowlist escape as the source, as
+`<originator> via Term …`. The "via" is load-bearing: the child authenticated
+Term, not the name Term relayed.
 
 ## Live properties
 

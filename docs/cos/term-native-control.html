@@ -519,9 +519,27 @@ table are in the Mix manual under "Native pane-shell execution (stage D)"
 epoch, and its ID is retired before the submission is forwarded, so a lost reply
 can never become a second execution. <code>term.exec.result</code> and <code>term.exec.cancel</code>
 are not: both address one immutable evaluation identity and are idempotent by
-construction. A forwarded submission whose answer never arrives is reported as
-<code>UNKNOWN_OUTCOME</code>; <code>term.exec.result</code> on the operation, or a byte-identical
-retry, is how a caller finds out what happened.</p>
+construction.</p>
+<p><strong>Request IDs are namespaced at the hop.</strong> Term forwards on its own connection,
+so at the child every caller's IDs would otherwise land in one <code>(actor, id)</code>
+space keyed to Term — one agent's ID 1 would replay another's operation, and two
+agents using the same ID with different bodies would conflict with each other
+forever. Term mints its own monotonic sequence per caller request and remembers
+the mapping, so the child sees one ID per <code>(Term, forwarded-seq)</code>. The mapping is
+what makes a retry safe: it forwards the SAME child ID, reaching the child's own
+dedupe rather than submitting again.</p>
+<p>A forwarded submission whose answer never arrives is reported as
+<code>UNKNOWN_OUTCOME</code>, and that placeholder is deliberately <strong>not retained</strong>. A
+retained local timeout would make every byte-identical retry replay the
+placeholder forever; not retaining it lets the retry re-forward to the child,
+which is the only party that can say what actually happened. The same applies to
+a reply too large to deliver.</p>
+<p><strong>The announcement names the originating agent, not Term.</strong> Term supplies the
+principal from its own broker-stamped actor context — never from a caller-
+supplied field, which would let one agent announce itself as another — and the
+child renders it through the same allowlist escape as the source, as
+<code>&lt;originator&gt; via Term …</code>. The "via" is load-bearing: the child authenticated
+Term, not the name Term relayed.</p>
 <h2 id="live-properties">Live properties</h2>
 <p><code>term.props.get</code> supports <code>property:"state"</code> and <code>property:"contents"</code> with the
 same explicit target and separate read capabilities. <code>term.props.set</code> supports

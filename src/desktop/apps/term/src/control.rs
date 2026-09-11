@@ -215,6 +215,27 @@ struct State {
     /// map: `RecordRef` is a wire type without `Hash`, and this holds at most
     /// one entry per live bound child.
     leases: Vec<(RecordRef, Instant, Deadline)>,
+    /// Request ids Term mints for what it forwards, and the caller request each
+    /// one stands for.
+    ///
+    /// Term forwards on its OWN connection, so at the child every agent's
+    /// request ids land in one (actor, id) space keyed to Term. Relaying the
+    /// caller's id therefore collapsed them together: agent B's id 1 replayed
+    /// agent A's operation, and two agents that both used id 1 with different
+    /// bodies conflicted with each other forever. Term mints its own
+    /// monotonic sequence instead, so the child sees one id per
+    /// (Term, forwarded-seq) and nothing collides.
+    forwarded: HashMap<String, (u64, [u8; 32])>,
+    next_forward: u64,
+}
+
+/// What Term already knows about a caller request it is being asked to forward.
+enum Forward {
+    Fresh(u64),
+    /// Already forwarded under this id. Re-forwarding reaches the child's own
+    /// dedupe, which is the only place that can say what actually happened.
+    Retry(u64),
+    Conflict,
 }
 
 struct InputNotice {
@@ -475,7 +496,12 @@ impl Control {
             // One capability for the whole execute family. Asking what an
             // execution did is asking about an execution.
             "term.execute" | "term.exec.result" | "term.exec.cancel" => Capability::Execute,
-            _ => return Reply::error("UNSUPPORTED"),
+            // An unknown verb is resolved against the WEAKEST capability rather
+            // than answered here. Answering early would tell an unauthorised
+            // caller which verbs exist — a known one comes back FORBIDDEN and
+            // an unknown one UNSUPPORTED, which is a probe of the verb table.
+            // The UNSUPPORTED fall-through is below, after `allows`.
+            _ => Capability::ReadState,
         };
         if (request.request_id.is_some() || request.operation_id.is_some())
             && actor.session.is_none()
@@ -486,6 +512,29 @@ impl Control {
         }
         if !allows(parent, actor, &request.target, capability) {
             return Reply::error("FORBIDDEN");
+        }
+        // Only now, to a caller that WOULD have been allowed. An unauthorised
+        // one was refused above and learns nothing about the verb table.
+        if !matches!(
+            verb,
+            "term.session"
+                | "term.list"
+                | "term.tabs"
+                | "term.panes"
+                | "term.operation"
+                | "term.snapshot"
+                | "term.type"
+                | "term.tab.new"
+                | "term.tab.select"
+                | "term.pane.split"
+                | "term.pane.select"
+                | "term.tab.close"
+                | "term.pane.close"
+                | "term.execute"
+                | "term.exec.result"
+                | "term.exec.cancel"
+        ) {
+            return Reply::error("UNSUPPORTED");
         }
         if matches!(verb, "term.tab.new" | "term.pane.split")
             && actor
@@ -890,6 +939,30 @@ impl Control {
         Ok(())
     }
 
+    /// The id Term forwards for one caller request, minted once and remembered
+    /// so a byte-identical retry forwards the SAME id and reaches the child's
+    /// own dedupe rather than becoming a second submission.
+    fn forwarded_id(&self, identity: &str, sequence: u64, digest: [u8; 32]) -> Forward {
+        let mut state = self.state.lock().unwrap();
+        let key = format!("{identity}\0{sequence}");
+        if let Some((existing, recorded)) = state.forwarded.get(&key) {
+            return if *recorded == digest {
+                Forward::Retry(*existing)
+            } else {
+                Forward::Conflict
+            };
+        }
+        state.next_forward += 1;
+        let minted = state.next_forward;
+        // Bounded alongside the history it belongs to: the mapping is only
+        // useful while the entry that produced it can still be retried.
+        if state.forwarded.len() >= TOTAL {
+            state.forwarded.clear();
+        }
+        state.forwarded.insert(key, (minted, digest));
+        Forward::Fresh(minted)
+    }
+
     /// Retain a completed mutation's outcome so a retry replays it.
     fn record_outcome(
         &self,
@@ -971,17 +1044,34 @@ impl Control {
                     }
                     Some(_) => {}
                 }
-                if let Err(reply) = self.reserve_request_id(identity, sequence, digest) {
-                    return reply;
-                }
+                // Order matters. A caller request Term has ALREADY forwarded
+                // maps to a stable child id, so re-forwarding it cannot execute
+                // twice — the child's dedupe owns that decision. Consulting the
+                // mapping first is what lets a retry get past Term's own
+                // high-water mark, which is otherwise the thing that turns
+                // "your answer was lost" into "unknown, forever".
+                let forwarded = match self.forwarded_id(identity, sequence, digest) {
+                    Forward::Conflict => return Reply::refuse("CONFLICT", Some(mismatch())),
+                    Forward::Retry(id) => id,
+                    Forward::Fresh(id) => {
+                        if let Err(reply) = self.reserve_request_id(identity, sequence, digest) {
+                            return reply;
+                        }
+                        id
+                    }
+                };
                 (
                     "shell.execute",
                     json!({
                         "version": 1,
                         "target": child_target,
-                        "request_id": DecimalU64(sequence),
+                        "request_id": DecimalU64(forwarded),
                         "prompt_generation": generation,
                         "source": source,
+                        // The shell authenticated Term, not this actor, so the
+                        // shell renders it as relayed. Taken from Term's own
+                        // trusted context — a caller cannot put a name here.
+                        "on_behalf_of": principal_label(actor),
                     }),
                     Some(sequence),
                 )
@@ -1013,25 +1103,32 @@ impl Control {
             connection.client().call(&child.name, shell_verb, body),
         )
         .await;
-        let mut reply = match answer {
+        // `retain` is the load-bearing distinction. A reply that came FROM the
+        // child is that request's settled outcome and is retained so a retry
+        // replays it. A local placeholder — Term's own timeout, or a reply too
+        // large to deliver — is not an outcome at all: retaining it would make
+        // every byte-identical retry replay the placeholder forever, when
+        // re-forwarding would reach the child's own dedupe and get the real
+        // answer. So placeholders are returned and NOT recorded.
+        let (mut reply, mut retain) = match answer {
             Ok(Ok(value)) => {
                 let mut value = value;
                 value["target"] = json!(request.target);
                 if let Some(sequence) = sequence {
                     value["operation_id_request"] = json!(DecimalU64(sequence));
                 }
-                Reply::ok(value)
+                (Reply::ok(value), true)
             }
             // The child's refusal is ITS answer about ITS prompt. Term relays
             // it rather than replacing it with a guess, because BUSY and
             // STALE_GENERATION tell the caller two different things to do next.
-            Ok(Err(error)) => shell_refusal(&error.to_string(), sequence.is_some()),
+            Ok(Err(error)) => (shell_refusal(&error.to_string(), sequence.is_some()), true),
             // A submission whose answer never arrived may or may not have been
-            // admitted. `term.exec.result` on the id, or a byte-identical
-            // retry, is the only way to find out — and the retained entry below
-            // is what makes the retry answer rather than re-execute.
-            Err(_) if sequence.is_some() => Reply::error("UNKNOWN_OUTCOME"),
-            Err(_) => Reply::error("DISCONNECTED"),
+            // admitted. The caller's route forward is `term.exec.result`, or a
+            // byte-identical retry that re-forwards to the child's dedupe —
+            // which is only possible because this is not recorded.
+            Err(_) if sequence.is_some() => (Reply::error("UNKNOWN_OUTCOME"), false),
+            Err(_) => (Reply::error("DISCONNECTED"), false),
         };
         if reply.body.len() > 256 * 1024 {
             reply = Reply::error(if sequence.is_some() {
@@ -1039,8 +1136,11 @@ impl Control {
             } else {
                 "RESOURCE_LIMIT"
             });
+            retain = false;
         }
-        if let Some(sequence) = sequence {
+        if let Some(sequence) = sequence
+            && retain
+        {
             self.record_outcome(identity, &request.target, sequence, digest, &reply);
         }
         reply
@@ -1124,9 +1224,15 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
         "UNKNOWN_OUTCOME" => Reply::error("UNKNOWN_OUTCOME"),
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
+        // A settled denial: the child looked at the request and said no.
         "REFUSED" => Reply::error("FORBIDDEN"),
+        // Everything else is a shape Term does not recognise. Flattening those
+        // to FORBIDDEN was wrong in both directions: it reads as a policy
+        // decision Term never made, and for a transient it tells the caller to
+        // stop when it should retry. An unrecognised answer to a mutation is an
+        // unknown outcome; to a read, a transport-shaped failure.
         _ if mutation => Reply::error("UNKNOWN_OUTCOME"),
-        _ => Reply::error("FORBIDDEN"),
+        _ => Reply::error("DISCONNECTED"),
     }
 }
 
@@ -1157,6 +1263,26 @@ fn actor_key(actor: &BrokerPrincipal) -> String {
         ),
     }
 }
+/// The name the PANE announces for a forwarded submission. Built from Term's
+/// own broker-stamped actor context and nothing else: a caller has no field
+/// through which to supply a name, because a name a caller chose would let one
+/// agent announce itself as another.
+fn principal_label(actor: &BrokerPrincipal) -> String {
+    match &actor.session {
+        Some(s) => {
+            let record: String = s
+                .record_id
+                .0
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{:?} {}", s.role, record)
+        }
+        None => format!("uid {} pid {}", actor.unix_uid, actor.peer_pid),
+    }
+}
+
 fn principal_allowed(parent: &SessionRecord, actor: &BrokerPrincipal) -> bool {
     actor.validate().is_ok()
         && actor.unix_uid == parent.owner_uid
