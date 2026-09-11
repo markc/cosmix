@@ -880,16 +880,16 @@ fn status_pump_scenarios(editor: &str) {
             counter(&still_idle["status"]["transition_age_ms"])
                 > counter(&idle["status"]["transition_age_ms"])
         );
-        for feature in [
-            "jobs",
-            "job_signal",
-            "foreground",
-            "input",
-            "isolated_task",
-            "events",
-        ] {
+        for feature in ["jobs", "job_signal", "foreground", "input", "events"] {
             assert_eq!(idle["capabilities"][feature], "UNSUPPORTED");
         }
+        // P4 turned isolated tasks on, and unlike evaluation submit they do
+        // NOT depend on the editor: a task is a separate process that never
+        // touches the prompt, so both editors report it the same way.
+        assert_eq!(
+            idle["capabilities"]["isolated_task"],
+            "supervised-process; poll-only (no watch/list)"
+        );
         // Stage D turned the two evaluation families on, and only where the
         // terminal can be released without a keypress. The report is derived
         // from what this build can do, so the two editors must disagree here.

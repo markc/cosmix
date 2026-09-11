@@ -37,6 +37,7 @@ mod repl;
 mod repl_editor;
 mod serve_runtime;
 mod result_fd;
+mod session_task;
 mod session_execute;
 mod session_state;
 mod session_status;

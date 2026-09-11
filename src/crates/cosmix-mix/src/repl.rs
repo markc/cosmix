@@ -211,6 +211,11 @@ pub fn run_repl() -> i32 {
         crate::session_state::observe_directory();
     }
     meta::init_start_time();
+    // Snapshot the task base environment BEFORE the prelude, .mixrc or any
+    // user code can mutate environ. A task must inherit only what it was
+    // given, and that is only checkable if the base was captured before
+    // anything could add to it.
+    crate::session_task::capture_base_env();
 
     // Acquire foreground ownership before any terminal repair: a nested
     // background shell must stop via SIGTTIN before touching parent termios.

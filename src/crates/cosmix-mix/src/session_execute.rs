@@ -48,6 +48,14 @@ use std::time::{Duration, Instant};
 pub(crate) const SUBMIT: &str = "shell.execute";
 pub(crate) const RESULT: &str = "shell.execute.result";
 pub(crate) const CANCEL: &str = "shell.execute.cancel";
+pub(crate) const TASK_SUBMIT: &str = "shell.task.submit";
+pub(crate) const TASK_RESULT: &str = "shell.task.result";
+pub(crate) const TASK_CANCEL: &str = "shell.task.cancel";
+/// Named so they can be REFUSED explicitly rather than falling into the
+/// unknown-verb arm. A deferral that answers the same as a typo is not a
+/// deferral a caller can act on.
+pub(crate) const TASK_WATCH: &str = "shell.task.watch";
+pub(crate) const TASK_LIST: &str = "shell.task.list";
 
 /// Bodies are bounded well under Term's own 8 KiB request limit, so a
 /// submission that Term will forward cannot be one this surface would refuse.
@@ -68,6 +76,10 @@ const RECORDS: usize = 256;
 /// connection id that never returns, so an unbounded map grows by one key per
 /// connection that ever submitted, for the life of the shell.
 const ACTORS: usize = 64;
+/// Settled TASK records retained. Far tighter than RECORDS because a task
+/// record carries two stream captures and a result: eight is already ~1.5 MiB
+/// where an evaluation record is a few hundred bytes.
+pub(crate) const TASK_RECORDS: usize = 8;
 /// The short editor round trips: inspect, reserve, release. None of them writes
 /// to the terminal.
 const EDITOR_BUDGET: Duration = Duration::from_millis(400);
@@ -315,14 +327,35 @@ fn not_started(operation: u64) -> (u8, String) {
 
 // --------------------------------------------------------------------- store
 
-struct Record {
+/// Which surface an operation belongs to.
+///
+/// ONE dedupe space, records tagged — not two stores. Splitting the
+/// (actor, request_id) space by kind would let one caller request id mint a
+/// fresh operation on each surface and BOTH execute, which is the same
+/// double-execution bug the shared space exists to prevent. The tag is used
+/// only for ADDRESSING: `shell.execute.result` cannot read a task operation and
+/// `shell.task.result` cannot read an evaluation, so neither surface can be
+/// used to read the other's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Execute,
+    Task,
+}
+
+pub(crate) struct Record {
     actor: String,
     request_id: u64,
     digest: [u8; 32],
     operation: u64,
+    kind: Kind,
     at: Instant,
-    /// Present once the evaluator owner has published the outcome.
+    /// Present once the owner has published the outcome. For an evaluation that
+    /// is the evaluator thread; for a task, its supervisor.
     completion: Option<Completion>,
+    /// A settled task's full report. Kept beside `completion` rather than
+    /// inside it because the two surfaces answer different shapes and flattening
+    /// them would put stream captures on every evaluation result.
+    task: Option<crate::session_task::TaskReport>,
 }
 
 #[derive(Default)]
@@ -414,10 +447,48 @@ impl Store {
     /// Operations are addressed only by the actor that submitted them. A
     /// mismatch answers exactly like an unknown id, so the surface cannot be
     /// used as an oracle for which operation numbers exist.
-    fn owned(&self, actor: &str, operation: u64) -> Option<&Record> {
+    fn owned(&self, actor: &str, operation: u64, kind: Kind) -> Option<&Record> {
         self.records
             .iter()
-            .find(|r| r.operation == operation && r.actor == actor)
+            .find(|r| r.operation == operation && r.actor == actor && r.kind == kind)
+    }
+    /// The supervisor publishes by operation alone: it is the owner of that
+    /// task by construction and has no actor context to check against.
+    fn task_record(&mut self, operation: u64) -> Option<&mut Record> {
+        self.records
+            .iter_mut()
+            .find(|r| r.operation == operation && r.kind == Kind::Task)
+    }
+    /// Settled TASK records get their own, much tighter cap: a task carries two
+    /// stream captures and a result, so eight of them is already ~1.5 MiB,
+    /// where an evaluation record is a few hundred bytes. Running tasks are
+    /// never evicted — they are bounded separately by TASKS, and their reports
+    /// are still owed to somebody.
+    fn trim_tasks(&mut self) {
+        loop {
+            let settled = self
+                .records
+                .iter()
+                .filter(|r| r.kind == Kind::Task && r.completion.is_some())
+                .count();
+            if settled <= TASK_RECORDS {
+                return;
+            }
+            let Some(index) = self
+                .records
+                .iter()
+                .position(|r| r.kind == Kind::Task && r.completion.is_some())
+            else {
+                return;
+            };
+            self.records.remove(index);
+        }
+    }
+    fn running_tasks(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|r| r.kind == Kind::Task && r.completion.is_none())
+            .count()
     }
 }
 
@@ -695,6 +766,14 @@ pub(crate) async fn dispatch(
         SUBMIT => submit(connection, hello, bound, event, actor).await,
         RESULT => retrieve(bound, actor, &command.body),
         CANCEL => cancel(bound, actor, &command.body),
+        TASK_SUBMIT => task_submit(bound, actor, &command.body),
+        TASK_RESULT => task_retrieve(bound, actor, &command.body),
+        TASK_CANCEL => task_cancel(bound, actor, &command.body),
+        // Advertised, not stubbed. The §6 rule is that an absent operation says
+        // so: a caller polling `shell.task.result` is doing the supported thing,
+        // and would otherwise have to discover by silence that watching is not
+        // implemented.
+        TASK_WATCH | TASK_LIST => refusal("UNSUPPORTED"),
         _ => refusal("UNSUPPORTED"),
     }
 }
@@ -715,7 +794,7 @@ fn retrieve(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, 
     // Scoped to the submitting actor. An execution's result names what ran in
     // this shell and what it returned; holding `execute` authorises driving the
     // shell, not reading back what somebody else drove it to do.
-    let Some(record) = store.owned(&identity, request.operation_id.0) else {
+    let Some(record) = store.owned(&identity, request.operation_id.0, Kind::Execute) else {
         return refusal("UNKNOWN_OUTCOME");
     };
     (
@@ -756,7 +835,7 @@ fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, St
     // below is adopted when the evaluation begins rather than lost.
     let finished = {
         let store = store().lock().unwrap_or_else(|e| e.into_inner());
-        match store.owned(&identity, operation) {
+        match store.owned(&identity, operation, Kind::Execute) {
             None => return refusal("UNKNOWN_OUTCOME"),
             Some(record) => record.completion.is_some(),
         }
@@ -818,6 +897,321 @@ fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, St
                 "cooperative; no pre-emption of blocking builtins"
             },
             "signalled_pgid": signalled,
+        })
+        .to_string(),
+    )
+}
+
+// ---------------------------------------------------------------- task verbs
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskSubmit {
+    version: u8,
+    target: Source,
+    request_id: DecimalU64,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    cwd: String,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    timeout_ms: DecimalU64,
+}
+
+#[derive(Serialize)]
+struct TaskAccepted {
+    version: u8,
+    operation_id: DecimalU64,
+    state: &'static str,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct TaskRetrieved {
+    version: u8,
+    operation_id: DecimalU64,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<DecimalU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<crate::session_task::TaskReport>,
+}
+
+/// Live supervisors, so a cancel can reach one. Separate from the Store because
+/// the Store holds RESULTS and this holds the means to affect a process; a
+/// settled task keeps its record and loses its handle.
+fn handles() -> &'static Mutex<std::collections::HashMap<u64, crate::session_task::Handle>> {
+    static HANDLES: OnceLock<Mutex<std::collections::HashMap<u64, crate::session_task::Handle>>> =
+        OnceLock::new();
+    HANDLES.get_or_init(Mutex::default)
+}
+
+/// NO idle-prompt admission, deliberately. A task is a separate process; the
+/// shell being busy has nothing to do with whether one can start, and refusing
+/// BUSY here would destroy the independence that is the mode's entire purpose.
+fn task_submit(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, String) {
+    let Ok(request) = serde_json::from_str::<TaskSubmit>(body) else {
+        return refusal("INVALID_REQUEST");
+    };
+    if request.version != 1 || request.request_id.0 == 0 {
+        return refusal("INVALID_REQUEST");
+    }
+    if request.target != Source::from(bound) {
+        return refusal("STALE_GENERATION");
+    }
+    let identity = actor_key(actor);
+    let digest: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    // ONE dedupe space with the evaluation surface, records tagged. Splitting
+    // it would let the same caller request id mint an operation on each surface
+    // and both execute.
+    enum Known {
+        Replay { operation: u64, settled: bool },
+        Conflict,
+        Retired,
+        Fresh,
+    }
+    let known = {
+        let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+        store.sweep();
+        match store
+            .records
+            .iter()
+            .find(|r| r.actor == identity && r.request_id == request.request_id.0)
+        {
+            None if store.retired(&identity, request.request_id.0) => Known::Retired,
+            Some(record) if record.digest != digest => Known::Conflict,
+            Some(record) => Known::Replay {
+                operation: record.operation,
+                settled: record.completion.is_some(),
+            },
+            None => Known::Fresh,
+        }
+    };
+    match known {
+        Known::Conflict => return refusal("CONFLICT"),
+        Known::Retired => return refusal("UNKNOWN_OUTCOME"),
+        Known::Replay { operation, settled } => {
+            return (
+                0,
+                serde_json::to_string(&TaskAccepted {
+                    version: 1,
+                    operation_id: DecimalU64(operation),
+                    state: if settled { "settled" } else { "running" },
+                    status: "accepted",
+                })
+                .expect("bounded acceptance serialises"),
+            );
+        }
+        Known::Fresh => {}
+    }
+    let spec = match crate::session_task::Spec::validate(
+        request.source,
+        request.argv,
+        request.cwd,
+        request.env,
+        request.timeout_ms.0,
+    ) {
+        Ok(spec) => spec,
+        Err(code) => return refusal(code),
+    };
+    let Some(operation) = session_state::mint_command() else {
+        return refusal("RESOURCE_LIMIT");
+    };
+    // Concurrency is a REAL limit here — processes and supervisor threads —
+    // so refusing is correct where the record table evicts.
+    {
+        let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+        if store.running_tasks() >= crate::session_task::TASKS {
+            return refusal("RESOURCE_LIMIT");
+        }
+        if !store.admit(Record {
+            actor: identity,
+            request_id: request.request_id.0,
+            digest,
+            operation,
+            kind: Kind::Task,
+            at: Instant::now(),
+            completion: None,
+            task: None,
+        }) {
+            return refusal("RESOURCE_LIMIT");
+        }
+    }
+    // Registry VOCABULARY only. A task's cancellation is killpg with
+    // escalation; ACTIVE, the shared interrupt flag and the SIGINT latch are
+    // evaluation machinery and are not touched here.
+    cosmix_mix::cancel::publish(operation);
+    match crate::session_task::spawn(spec, move |report| {
+        task_settled(operation, report);
+    }) {
+        Ok(handle) => {
+            handles()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(operation, handle);
+            store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .settle(operation);
+            (
+                0,
+                serde_json::to_string(&TaskAccepted {
+                    version: 1,
+                    operation_id: DecimalU64(operation),
+                    state: "running",
+                    status: "accepted",
+                })
+                .expect("bounded acceptance serialises"),
+            )
+        }
+        Err(error) => {
+            // Nothing started, so the id stays free — the same discipline the
+            // admission path uses for a pre-claim refusal.
+            let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+            store.forget(operation);
+            drop(store);
+            cosmix_mix::cancel::forget(operation);
+            (
+                10,
+                serde_json::json!({
+                    "error_code": "INVALID_ARGUMENT",
+                    "reason": "spawn_failed",
+                    "detail": error,
+                })
+                .to_string(),
+            )
+        }
+    }
+}
+
+/// Published by the supervisor thread once `wait()` has spoken.
+fn task_settled(operation: u64, report: crate::session_task::TaskReport) {
+    {
+        let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = store.task_record(operation) {
+            // A task's Completion is a marker that it settled; the report
+            // carries the detail. Keeping them separate is what stops stream
+            // captures appearing on every evaluation result.
+            record.completion = Some(Completion {
+                outcome: "settled",
+                status: None,
+                value: None,
+                error: None,
+                duration_ms: report.duration_ms,
+                cancellation: CancellationReport {
+                    requested: false,
+                    source: None,
+                    delivered: "none",
+                },
+            });
+            record.task = Some(report);
+            record.at = Instant::now();
+        }
+        store.trim_tasks();
+    }
+    handles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&operation);
+}
+
+fn task_retrieve(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, String) {
+    let Ok(request) = serde_json::from_str::<Operation>(body) else {
+        return refusal("INVALID_REQUEST");
+    };
+    if request.version != 1 {
+        return refusal("INVALID_REQUEST");
+    }
+    if request.target != Source::from(bound) {
+        return refusal("STALE_GENERATION");
+    }
+    let identity = actor_key(actor);
+    let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+    store.sweep();
+    let Some(record) = store.owned(&identity, request.operation_id.0, Kind::Task) else {
+        return refusal("UNKNOWN_OUTCOME");
+    };
+    let report = record.task.clone();
+    let settled = record.completion.is_some();
+    drop(store);
+    // "cancelling" is a real reported state, not a gap between two others: a
+    // caller that asked for cancellation and reads "running" cannot tell
+    // whether its request arrived.
+    let cancelling = handles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&request.operation_id.0)
+        .is_some_and(|handle| {
+            handle
+                .cancelling
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+    let elapsed = (!settled)
+        .then(|| {
+            handles()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&request.operation_id.0)
+                .map(|handle| DecimalU64(handle.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64))
+        })
+        .flatten();
+    (
+        0,
+        serde_json::to_string(&TaskRetrieved {
+            version: 1,
+            operation_id: request.operation_id,
+            state: match (settled, cancelling) {
+                (true, _) => "settled",
+                (false, true) => "cancelling",
+                (false, false) => "running",
+            },
+            elapsed_ms: elapsed,
+            report,
+        })
+        .expect("bounded task report serialises"),
+    )
+}
+
+fn task_cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, String) {
+    let Ok(request) = serde_json::from_str::<Operation>(body) else {
+        return refusal("INVALID_REQUEST");
+    };
+    if request.version != 1 {
+        return refusal("INVALID_REQUEST");
+    }
+    if request.target != Source::from(bound) {
+        return refusal("STALE_GENERATION");
+    }
+    let identity = actor_key(actor);
+    let operation = request.operation_id.0;
+    let settled = {
+        let store = store().lock().unwrap_or_else(|e| e.into_inner());
+        match store.owned(&identity, operation, Kind::Task) {
+            None => return refusal("UNKNOWN_OUTCOME"),
+            Some(record) => record.completion.is_some(),
+        }
+    };
+    if !settled
+        && let Some(handle) = handles()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&operation)
+    {
+        handle.cancel();
+    }
+    (
+        0,
+        serde_json::json!({
+            "version": 1,
+            "operation_id": request.operation_id,
+            "outcome": if settled { "already_settled" } else { "requested" },
+            // The one HARD guarantee in the arc, and it is still not a claim
+            // that the process has stopped YET — only that it will be made to.
+            // The proof is the wait status in the report, never this reply.
+            "delivery": "SIGTERM to the task group, 2s grace, then SIGKILL; \
+                         the outcome is read from wait(), not from this request",
         })
         .to_string(),
     )
@@ -1013,8 +1407,10 @@ async fn submit(
             request_id: request.request_id.0,
             digest,
             operation,
+            kind: Kind::Execute,
             at: Instant::now(),
             completion: None,
+            task: None,
         });
     if !admitted_to_store {
         release(&control, editor).await;
@@ -1359,8 +1755,10 @@ mod tests {
             request_id: operation + 1,
             digest: [0; 32],
             operation,
+            kind: Kind::Execute,
             at: Instant::now(),
             completion: finished.then(completed),
+            task: None,
         }
     }
 
@@ -1411,9 +1809,9 @@ mod tests {
     fn operations_are_addressable_only_by_the_actor_that_submitted_them() {
         let mut store = Store::default();
         store.admit(record(7, true));
-        assert!(store.owned("a", 7).is_some());
+        assert!(store.owned("a", 7, Kind::Execute).is_some());
         assert!(
-            store.owned("b", 7).is_none(),
+            store.owned("b", 7, Kind::Execute).is_none(),
             "another actor reached an operation it did not submit"
         );
     }
