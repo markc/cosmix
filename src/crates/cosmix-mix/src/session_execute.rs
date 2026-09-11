@@ -308,9 +308,17 @@ fn actor_key(actor: &BrokerPrincipal) -> String {
 fn principal_label(actor: &BrokerPrincipal) -> String {
     match &actor.session {
         Some(s) => {
-            let record = format!("{:?}", s.record_id);
-            let short: String = record.chars().take(8).collect();
-            format!("{:?} {}", s.role, short)
+            // HexBytes renders as lowercase hex through Serialize, not Debug —
+            // Debug would put the type name on the glass where the identity
+            // should be. The first bytes are enough to tell two callers apart.
+            let record: String = s
+                .record_id
+                .0
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{:?} {}", s.role, record)
         }
         None => format!("uid {} pid {}", actor.unix_uid, actor.peer_pid),
     }

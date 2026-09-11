@@ -1353,9 +1353,17 @@ fn stage_d_admits_at_an_idle_prompt_echoes_and_reports_a_structured_result() {
             echoed < printed,
             "the echo must precede the execution it announces: {output}"
         );
+        let announcement = &output[echoed..printed];
         assert!(
-            output[echoed..printed].contains("print(\\\"ADMITTED_OK\\\")"),
+            announcement.contains("print(\"ADMITTED_OK\")"),
             "the echo must name the submitted source: {output}"
+        );
+        // The announcement names a real caller, not a type name and not an
+        // empty slot: a human reading the pane has to be able to tell two
+        // agents apart.
+        assert!(
+            announcement.contains("Term ") && !announcement.contains("HexBytes"),
+            "the echo must name the principal: {announcement}"
         );
 
         let result = result_of(&mut f.parent, &f.bound, operation).await;
