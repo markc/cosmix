@@ -1,7 +1,6 @@
 //! Disposable real controlling-PTY tests. Fixtures execute in isolated libtest
 //! processes so signal handlers never interfere with the parent test runner.
-//! REQUIRED: run with --test-threads=1. openpty has no atomic CLOEXEC option;
-//! serial execution excludes sibling fixture forks during openpty/dup/close.
+//! A process-wide fixture lock excludes sibling forks during openpty/dup/close.
 #![cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[path = "../src/editor/mod.rs"]
@@ -17,10 +16,15 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(15);
+static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    FIXTURE_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
 const PROMPT: &str = "OWNED> ";
 
 #[test]
 fn overflow_notice_redo_and_yank_pop_preserve_editing() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     p.send(b"print(818)\x1b[200~");
@@ -38,6 +42,7 @@ fn overflow_notice_redo_and_yank_pop_preserve_editing() {
 
 #[test]
 fn repeated_empty_search_and_forward_relaxation_keep_position() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     for command in ["print(101)", "print(202)", "print(303)"] {
@@ -58,6 +63,7 @@ fn repeated_empty_search_and_forward_relaxation_keep_position() {
 
 #[test]
 fn oversized_history_is_warned_and_never_rewritten() {
+    let _fixture = fixture_guard();
     let mut original = b"#V2\n".to_vec();
     original.extend("valid_record\n".repeat(1_400_000).as_bytes());
     let mut p = Pty::with_history(None, true, PROMPT, Some(&original));
@@ -93,6 +99,7 @@ fn same_modes(a: libc::termios, b: libc::termios) {
 
 #[test]
 fn fixture_editor() {
+    let _fixture = fixture_guard();
     let Ok(scenario) = std::env::var("OWNED_FIXTURE") else {
         return;
     };
@@ -353,6 +360,7 @@ fn stop_supervisor(original: libc::termios) {
 
 #[test]
 fn external_stop_is_cooked_and_bg_waits_for_foreground_before_resuming_draft() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("external-stop"), true);
     p.prompt();
     p.send(b"print(731");
@@ -378,6 +386,7 @@ fn external_stop_is_cooked_and_bg_waits_for_foreground_before_resuming_draft() {
 
 #[test]
 fn undrained_master_does_not_block_suspend_or_shutdown() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("backpressure"), true);
     p.prompt();
     p.send(&[b'a'; 2000]);
@@ -392,6 +401,7 @@ fn undrained_master_does_not_block_suspend_or_shutdown() {
 
 #[test]
 fn bounded_drain_completes_partial_escape_output_and_finish_before_cleanup() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("bounded-drain"), true);
     // Wait without draining until the child proves a partial write is pending.
     wait(|| p.home.path().join("drain-ready").exists());
@@ -409,6 +419,7 @@ fn bounded_drain_completes_partial_escape_output_and_finish_before_cleanup() {
 
 #[test]
 fn input_failure_shutdown_waits_for_terminal_cleanup() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("input-error"), true);
     p.prompt();
     p.send(b"x");
@@ -420,6 +431,7 @@ fn input_failure_shutdown_waits_for_terminal_cleanup() {
 
 #[test]
 fn wrapped_submission_moves_below_tail_from_home() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     let text = format!("print(\"{}\")", "a".repeat(100));
@@ -437,6 +449,7 @@ fn wrapped_submission_moves_below_tail_from_home() {
 
 #[test]
 fn taller_than_viewport_submission_only_moves_below_visible_tail() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     let text = format!("print(\"{}\")", "a".repeat(15_000));
@@ -461,6 +474,7 @@ fn taller_than_viewport_submission_only_moves_below_visible_tail() {
 
 #[test]
 fn invalid_utf8_history_is_warned_and_never_rewritten() {
+    let _fixture = fixture_guard();
     let original = b"#V2\nvalid\n\xff";
     let mut p = Pty::with_history(None, true, PROMPT, Some(original));
     p.until("history saving disabled");
@@ -523,7 +537,7 @@ impl Pty {
             },
             0
         );
-        // Serial execution (required above) excludes concurrent fixture forks
+        // The fixture lock excludes concurrent fixture forks
         // until openpty's originals are closed and retained fds are CLOEXEC.
         for fd in [&mut m, &mut s] {
             let retained = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
@@ -642,6 +656,7 @@ impl Drop for Pty {
 
 #[test]
 fn type_echo_execute_unicode_history_multiline_and_eof() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     assert_eq!(modes(p.slave.as_raw_fd()).c_lflag & libc::ICANON, 0);
@@ -673,6 +688,7 @@ fn type_echo_execute_unicode_history_multiline_and_eof() {
 
 #[test]
 fn control_pause_preserves_draft_and_split_decoder_without_child_leak() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("draft"), true);
     p.prompt();
     p.send("draft界".as_bytes());
@@ -690,6 +706,7 @@ fn control_pause_preserves_draft_and_split_decoder_without_child_leak() {
 
 #[test]
 fn control_pause_preserves_paste_and_admission_wakes_without_input() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("paste"), true);
     p.prompt();
     p.send(b"\x1b[200~abc");
@@ -710,6 +727,7 @@ fn control_pause_preserves_paste_and_admission_wakes_without_input() {
 
 #[test]
 fn silent_resize_redraw_and_hup_restores_modes_and_protocols() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     p.send(b"long_draft_for_resize");
@@ -737,6 +755,7 @@ fn silent_resize_redraw_and_hup_restores_modes_and_protocols() {
 
 #[test]
 fn foreground_job_ctrl_z_fg_and_nested_editor_stop_preserve_draft() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     p.send(b"/bin/sleep 300\n");
@@ -772,6 +791,7 @@ fn foreground_job_ctrl_z_fg_and_nested_editor_stop_preserve_draft() {
 
 #[test]
 fn completion_snapshot_variables_paths_and_cycle() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, true);
     p.prompt();
     p.command("$owned_unique = 919");
@@ -791,6 +811,7 @@ fn completion_snapshot_variables_paths_and_cycle() {
 
 #[test]
 fn unselected_editor_uses_legacy_path() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(None, false);
     p.prompt();
     assert!(p.command("print(818)").contains("\r\n818\r\n"));
@@ -799,6 +820,7 @@ fn unselected_editor_uses_legacy_path() {
 
 #[test]
 fn search_state_survives_control_suspend_and_resume() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("search"), true);
     p.prompt();
     p.send(b"\x12616");
@@ -814,6 +836,7 @@ fn search_state_survives_control_suspend_and_resume() {
 
 #[test]
 fn completion_cycles_and_restricted_profile_cannot_read_ordinary_snapshots() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(Some("completion"), true);
     p.prompt();
     p.send(b"$cycle_\t");
@@ -839,6 +862,7 @@ fn completion_cycles_and_restricted_profile_cannot_read_ordinary_snapshots() {
 
 #[test]
 fn coloured_prompt_and_paste_undo_yank_through_real_editor() {
+    let _fixture = fixture_guard();
     let mut p = Pty::configured(None, true, "\x1b[32mOWNED> \x1b[0m");
     p.until("\x1b[?2004h");
     p.until("\x1b[32m");

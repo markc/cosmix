@@ -1,8 +1,7 @@
 //! S3: real noded + Term's real LaunchFd/PTY mapping + the built Mix binary.
 //! The fixture owns the Term-side record/renew/re-grant/revoke duties. Term's
 //! GUI mutation and exit-notifier ordering remain covered in its own workspace.
-//! Run with --test-threads=1, like job_control_pty: openpty cannot set CLOEXEC
-//! atomically, so sibling fixture forks must not overlap its descriptor setup.
+//! A process-wide fixture lock excludes sibling forks across openpty/dup/spawn.
 #![cfg(target_os = "linux")]
 
 use cosmix_lib_bus::native_session::*;
@@ -19,6 +18,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use term_native_test_broker::Broker;
 use term_native_test_broker::session_fd;
+
+static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 fn current_mix() -> &'static std::path::Path {
     static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -42,6 +48,16 @@ fn current_mix() -> &'static std::path::Path {
                 "cannot resolve CURRENT branch revision"
             );
             let expected = String::from_utf8(revision.stdout).unwrap();
+            // Build-script git_dirty can be stale after dependency-only edits.
+            let status = Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=normal"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .expect("git status is required for fixture provenance");
+            assert!(
+                status.status.success() && status.stdout.is_empty(),
+                "fixture requires a clean CURRENT checkout, including dependency edits"
+            );
             let output = std::process::Command::new(&binary)
                 .args(["--version", "--json"])
                 .env_remove(session_fd::MARKER)
@@ -259,6 +275,10 @@ impl Child {
             launch.marker(),
             ("HOME".into(), home.path().display().to_string()),
             ("COSMIX_SRC".into(), home.path().display().to_string()),
+            (
+                "COSMIX_BIN".into(),
+                current_mix().parent().unwrap().display().to_string(),
+            ),
             ("COSMIX_NODE_CONFIG".into(), config.display().to_string()),
             ("COSMIX_BROKER_ACCOUNT".into(), account),
             ("MIX_STATS".into(), "off".into()),
@@ -397,6 +417,7 @@ fn runtime() -> tokio::runtime::Runtime {
 
 #[test]
 fn mix_child_bootstrap_proves_end_to_end() {
+    let _fixture = fixture_guard();
     let broker = Broker::start();
     runtime().block_on(async {
         let mut parent = Parent::new(&broker).await;
@@ -452,9 +473,14 @@ fn mix_child_bootstrap_proves_end_to_end() {
             parent.renew().await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        parent
+        let still_bound = parent
             .wait(bound.record_id, BindingState::Attached, 1)
             .await;
+        assert_eq!(
+            still_bound.reference(),
+            bound.reference(),
+            "renew must preserve the ORIGINAL attachment; resumption cannot substitute"
+        );
         child.exit();
         let latest = parent
             .connection
@@ -475,6 +501,7 @@ fn mix_child_bootstrap_proves_end_to_end() {
 
 #[test]
 fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
+    let _fixture = fixture_guard();
     let mut broker = Broker::start();
     runtime().block_on(async {
         let mut parent = Parent::new(&broker).await;
@@ -533,6 +560,7 @@ fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
 
 #[test]
 fn valid_handoff_with_broker_down_does_not_delay_first_source() {
+    let _fixture = fixture_guard();
     let mut broker = Broker::start();
     runtime().block_on(async {
         let parent = Parent::new(&broker).await;
@@ -560,6 +588,7 @@ fn valid_handoff_with_broker_down_does_not_delay_first_source() {
 
 #[test]
 fn substituted_parent_scope_is_rejected_without_failing_shell() {
+    let _fixture = fixture_guard();
     let broker = Broker::start();
     runtime().block_on(async {
         let mut parent = Parent::new(&broker).await;
@@ -588,10 +617,62 @@ fn substituted_parent_scope_is_rejected_without_failing_shell() {
 }
 
 #[test]
-fn bootstrap_has_no_evaluator_or_builtin_route() {
+fn enrolled_exec_restart_revokes_and_replacement_stays_unbound() {
+    let _fixture = fixture_guard();
+    let broker = Broker::start();
+    runtime().block_on(async {
+        let mut parent = Parent::new(&broker).await;
+        let key = fresh_key().unwrap();
+        let grant = parent
+            .grant(HexBytes(key.verifying_key().to_bytes()), 1)
+            .await;
+        let launch = LaunchFd::new(&grant, &key).unwrap();
+        let mut child = Child::spawn(&broker, &launch);
+        drop(launch);
+        drop(key);
+        child.until("RC_MARKER=[]\r\n");
+        let bound = parent
+            .wait(grant.record.record_id, BindingState::Attached, 1)
+            .await;
+        let pid = child.pid();
+        // Exercise the real repl.rs exec_restart path, with the existing
+        // self-update resume flag. Empty contents suppress a resumed command.
+        std::fs::write(child.home.path().join(".claude-resume"), "").unwrap();
+        child.send("/usr/bin/true\n");
+        let output = child.until("RC_MARKER=[]\r\n");
+        assert_eq!(
+            output
+                .matches("exec restart leaves this pane unbound")
+                .count(),
+            1,
+            "{output}"
+        );
+        assert!(output.contains("record revoked"), "{output}");
+        assert_eq!(child.pid(), pid);
+        parent.wait(bound.record_id, BindingState::Revoked, 1).await;
+        child.send("print(\"REPLACEMENT_WORKS\")\n");
+        let output = child.until("REPLACEMENT_WORKS\r\n");
+        assert!(
+            !output.contains("native-session"),
+            "replacement must stay silently unbound"
+        );
+        assert!(
+            !serde_json::to_string(&child.context())
+                .unwrap()
+                .contains("COSMIX_SESSION_FD")
+        );
+        child.exit();
+        parent.revoke_and_verify(&broker).await;
+    });
+}
+
+#[test]
+fn bootstrap_source_boundary_and_builtin_inventory_exclude_seed_state() {
+    let _fixture = fixture_guard();
     let owner = include_str!("../src/native_session.rs");
+    // Load-bearing boundary: the secret owner never imports the evaluator lib.
+    assert!(!owner.contains("cosmix_mix::"));
     for forbidden in [
-        "cosmix_mix::",
         "Evaluator",
         "pub struct Bootstrap",
         "pub fn seed",

@@ -17,7 +17,7 @@ memfd writer or replace the real broker with simulated replies.
 The desktop `mix_child_bootstrap_proves_end_to_end` test explicitly builds and
 runs that main-workspace target. It uses `src/target/term-native-e2e` to avoid
 the enclosing Cargo test's build lock. The fixture requires a clean committed
-build with embedded SHA matching HEAD; no installed/stale executable fallback
+build with embedded SHA matching HEAD and live Git status clean; no installed/stale executable fallback
 is allowed. A desktop-only lifecycle pass is not Mix enrolment evidence.
 
 The fixture's pause control stalls the actual broker runtime and UDS sockets.

@@ -265,7 +265,8 @@ API nor simulates its command engine. The completed
 test uses Term's actual LaunchFd through the test-support library and a libc
 `openpty` fixture with `setsid`/`TIOCSCTTY` and child-only fd mapping. It spawns
 Cargo's built Mix binary and asserts initial attachment generation 1, renewals
-beyond 15 seconds, scrubbed rc/context/descendant state and post-exit revocation.
+beyond 15 seconds on that original attachment (resumption cannot substitute),
+scrubbed rc/context/descendant state and post-exit revocation.
 Its parent fixture drives Term's typed allocate/renew/re-grant/revoke duties;
 the GUI and exit-notifier ordering remain covered by the Term workspace tests.
 Term's teletypewriter PTY tests remain desktop-only; that dependency is not
@@ -274,14 +275,24 @@ A second real-PTY test keeps the same child alive across parent resumption and
 broker bounce, including child-first wake registration and pane generation
 2 to 1 under a replacement parent. Mix unit/process tests cover seals, layout,
 UID/key/scope substitution, offset independence, stale lease non-use, marker
-scrubbing, stdio protection, missing-marker silence and the absence of any new
-builtin or evaluator route. No end-to-end seam remains ignored.
+scrubbing (including mislabelled-marker fd cleanup), stdio protection and
+missing-marker silence. A source-boundary/builtin-inventory test prominently
+checks that the owner does not import the evaluator library; it is a static
+boundary check, not a general reachability proof. A real-broker unit test delays
+one proof beyond challenge expiry and requires recovery without a lifecycle
+notice. A real-PTY test exercises the resume-flag exec-restart path and asserts
+revocation, the same PID, one diagnostic and a usable unbound replacement.
+No end-to-end seam remains ignored. Native-session, job-control and owned-editor
+PTY tests each take a process-wide fixture mutex; serialisation no longer
+depends on the runner's thread-count flag.
 The desktop suite now invokes this main-workspace integration target through
 Cargo in a separate target directory. Build or test failure fails the desktop
 test; it cannot substitute an installed binary or omit the Mix fixture. The
 fixture uses only `CARGO_BIN_EXE_mix` and checks `--version --json` for a clean
 build whose full source SHA equals the current checkout's HEAD before spawning
-the PTY. Run from a clean committed checkout; stale or unidentifiable binaries
+the PTY. It also runs `git status --porcelain` against the live checkout rather
+than trusting a potentially stale embedded dirty flag after dependency edits.
+Run from a clean committed checkout; stale or unidentifiable binaries
 fail explicitly. Earlier desktop-only passes did not execute this cross-workspace
 fixture and were not evidence of Mix enrolment.
 Test and clippy results are supplied by the orchestrator; this document records
