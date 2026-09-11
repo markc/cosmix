@@ -111,9 +111,14 @@ fn exec_restart(eval: &mut Evaluator, rl: &mut Editor, history_path: &std::path:
 pub fn run_repl() -> i32 {
     let _session_lifetime = crate::session_state::ShellLifetime;
     if crate::session_state::enabled() {
-        cosmix_mix::shell_observation::set_directory_observer(|cwd| {
-            crate::session_state::commit(crate::session_state::Transition::DirectoryChanged {
-                cwd,
+        cosmix_mix::shell_observation::set_observer(|observation| {
+            use crate::session_state::Transition;
+            use cosmix_mix::shell_observation::Observation;
+            crate::session_state::commit(match observation {
+                Observation::DirectoryChanged { cwd } => Transition::DirectoryChanged { cwd },
+                Observation::ForegroundChanged { active } => {
+                    Transition::ForegroundChanged { active }
+                }
             });
         });
         crate::session_state::observe_directory();
@@ -132,6 +137,16 @@ pub fn run_repl() -> i32 {
         }
     };
     // Still precedes prelude, rc, prompt and resume-command output.
+    if crate::session_state::enabled()
+        && let crate::job_control::ExecutionPolicy::Interactive { controller, .. } =
+            job_table.policy()
+    {
+        controller.observe_foreground(|active| {
+            crate::session_state::commit(crate::session_state::Transition::ForegroundChanged {
+                active,
+            });
+        });
+    }
     ensure_interactive_output_mode();
     let rt = crate::build_runtime();
 

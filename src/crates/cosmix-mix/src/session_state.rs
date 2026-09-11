@@ -10,6 +10,7 @@ const MAX_CWD: usize = 4096;
 static STATE: OnceLock<Mutex<Reducer>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Source {
     pub broker_epoch: HexBytes<16>,
     pub record: RecordRef,
@@ -63,6 +64,9 @@ pub(crate) struct Event {
     pub sequence: DecimalU64,
     pub command_id: Option<DecimalU64>,
     pub timestamp_ms: DecimalU64,
+    pub duration_ms: Option<DecimalU64>,
+    /// Fixed diagnostics only; command source, output and errors are not retained.
+    pub diagnostic: Option<&'static str>,
     pub transition: Transition,
 }
 
@@ -98,6 +102,7 @@ pub(crate) struct Reducer {
     replay: VecDeque<Event>,
     next_command: u64,
     foreground_return: Phase,
+    evaluation_started_ms: Option<u64>,
 }
 impl Reducer {
     fn new() -> Self {
@@ -119,6 +124,7 @@ impl Reducer {
             replay: VecDeque::with_capacity(REPLAY),
             next_command: 0,
             foreground_return: Phase::Starting,
+            evaluation_started_ms: None,
         }
     }
     fn now(&self) -> u64 {
@@ -127,6 +133,8 @@ impl Reducer {
     fn commit(&mut self, mut transition: Transition) {
         let now = self.now();
         let s = &mut self.snapshot;
+        let mut duration_ms = None;
+        let mut diagnostic = None;
         // Exhaustion is terminal, never wrap a generation into apparent freshness.
         let Some(sequence) = s.sequence.0.checked_add(1) else {
             return;
@@ -150,8 +158,17 @@ impl Reducer {
                 self.next_command = id;
                 s.command_id = Some(DecimalU64(id));
             }
-            Transition::EvaluationStarted => s.phase = Phase::Evaluating,
-            Transition::EvaluationFinished => s.phase = Phase::Starting,
+            Transition::EvaluationStarted => {
+                self.evaluation_started_ms = Some(now);
+                s.phase = Phase::Evaluating;
+            }
+            Transition::EvaluationFinished => {
+                duration_ms = self
+                    .evaluation_started_ms
+                    .take()
+                    .map(|start| DecimalU64(now.saturating_sub(start)));
+                s.phase = Phase::Starting;
+            }
             Transition::ForegroundChanged { active } => {
                 if *active {
                     self.foreground_return = s.phase;
@@ -162,6 +179,12 @@ impl Reducer {
             }
             Transition::DirectoryChanged { cwd } => {
                 s.cwd_truncated = cwd.as_ref().is_some_and(|v| v.len() > MAX_CWD);
+                if s.cwd_truncated {
+                    diagnostic = Some("cwd truncated");
+                }
+                if cwd.is_none() {
+                    diagnostic = Some("cwd unavailable");
+                }
                 if let Some(value) = cwd {
                     let mut end = value.len().min(MAX_CWD);
                     while !value.is_char_boundary(end) {
@@ -185,6 +208,8 @@ impl Reducer {
             sequence: s.sequence,
             command_id: s.command_id,
             timestamp_ms: s.transition_ms,
+            duration_ms,
+            diagnostic,
             transition,
         });
         if matches!(
@@ -304,5 +329,39 @@ mod tests {
         assert_eq!(state.snapshot.command_id, None);
         state.commit(Transition::EvaluationAccepted);
         assert!(state.snapshot.command_id.unwrap().0 > id.unwrap().0);
+    }
+
+    #[test]
+    fn attachment_recovery_keeps_sequence_and_historical_provenance() {
+        let mut state = Reducer::new();
+        let mut source = Source {
+            broker_epoch: HexBytes([1; 16]),
+            record: RecordRef {
+                record_id: HexBytes([2; 16]),
+                incarnation: HexBytes([3; 16]),
+                binding_generation: DecimalU64(1),
+            },
+            instance_id: HexBytes([4; 16]),
+            pane_id: Some(DecimalU64(1)),
+            pane_generation: Some(DecimalU64(1)),
+        };
+        state.commit(Transition::AttachmentChanged {
+            source: Some(source.clone()),
+        });
+        state.commit(Transition::PromptReady {
+            continuation: false,
+        });
+        let original = state.snapshot.clone();
+        state.commit(Transition::AttachmentChanged { source: None });
+        source.record.binding_generation = DecimalU64(2);
+        source.pane_generation = Some(DecimalU64(2));
+        state.commit(Transition::AttachmentChanged {
+            source: Some(source.clone()),
+        });
+        assert!(state.snapshot.sequence.0 > original.sequence.0);
+        assert_eq!(state.snapshot.prompt_generation, original.prompt_generation);
+        assert_eq!(state.replay[1].source, original.source);
+        assert_eq!(state.snapshot.source, Some(source));
+        assert!(!state.view(Some(original.sequence)).gap);
     }
 }

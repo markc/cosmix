@@ -598,8 +598,10 @@ metadata. Snapshot phases are `starting`, `prompt-ready`, `evaluating`,
 primary or continuation prompt; `continuation` distinguishes them. Custom prompt
 evaluation is `evaluating` without a command ID. Accepted evaluations allocate
 monotonic command IDs, retained through foreground waits and cleared on finish.
-The foreground phase follows the job kernel's terminal lease, including
-`run_stream`, foreground pipelines and `fg`; it does not enumerate jobs.
+The foreground phase follows the job kernel's terminal lease for foreground
+pipelines and `fg`, and brackets the existing synchronous `run_stream` spawn/wait.
+This observation does not change `run_stream` job or signal semantics and does
+not enumerate jobs.
 
 The owned editor acknowledges activation before prompt-ready is recorded.
 Legacy readline reports its entry boundary because it has no activation
@@ -628,6 +630,10 @@ detached residents do not dispatch requests. Stale targets return
 `STALE_GENERATION`. Recovery uses S3; it never resets shell sequence or prompt
 generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
 isolated tasks, input and event publication report `UNSUPPORTED`, never `BUSY`.
+The resident opts into a 64-command verified receive queue, with a 64 KiB
+envelope/body limit per retained command. Overflow closes that connection and
+uses S3 recovery; lifecycle notices are never silently dropped. Other clients
+retain their existing receive configuration.
 
 - `mix` is intercepted by the shell, so it never sees `$`-sigil arguments — write `mix what round`, not `mix what $name`.
 - The introspection family (`vars`/`aliases`/`functions`/`all`/`context`) is most useful **inside a REPL**, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.

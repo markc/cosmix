@@ -4,7 +4,7 @@ use cosmix_lib_bus::native_session::*;
 use cosmix_lib_client::session::Hello;
 use cosmix_lib_client::{VerifiedCommand, VerifiedConnection};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_REQUEST: usize = 2048;
 const ADMISSION: Duration = Duration::from_secs(2);
@@ -96,7 +96,7 @@ async fn admitted(
     if !permitted(principal, bound) {
         return false;
     }
-    // Fresh correlated checks also register lifecycle dependencies. No cached
+    // Fresh correlated checks refresh the delivered caller's dependency. No cached
     // discovery snapshot or lease_remaining_ms from the request is authority.
     let caller_lease = if let Some(caller) = &principal.session {
         match connection
@@ -113,10 +113,20 @@ async fn admitted(
     } else {
         None
     };
-    let Ok(target_lease) = connection.session_lease_check(bound.reference()).await else {
+    // lease.check is recipient-only: broker delivery creates a dependency on
+    // the CALLER, not on ourselves. Re-read our own attachment by record ID,
+    // retaining request-start time so latency cannot extend its reported lease.
+    let started = Instant::now();
+    let Ok(current) = connection.session_self(bound.record_id).await else {
         return false;
     };
-    target_lease.is_live(hello).unwrap_or(false)
+    current.record.state == BindingState::Attached
+        && Source::from(&current.record) == Source::from(bound)
+        && current.record.policy == bound.policy
+        && current
+            .record
+            .lease_remaining_ms
+            .is_some_and(|remaining| started.elapsed() < Duration::from_millis(remaining.0))
         && caller_lease.is_none_or(|lease| lease.is_live(hello).unwrap_or(false))
 }
 
@@ -149,6 +159,9 @@ pub(crate) async fn dispatch(
                 let Some(status) = session_state::view(request.after_sequence) else {
                     return;
                 };
+                if !connection.client().is_connected() {
+                    return;
+                }
                 // Source changes atomically with the reducer's sequence. Never
                 // relabel an old-generation snapshot with a new attachment.
                 if status.snapshot.source.as_ref() != Some(&request.target) {
@@ -178,4 +191,102 @@ pub(crate) async fn dispatch(
             .respond(command, response.0, &response.1),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn target() -> SessionRecord {
+        SessionRecord {
+            name: "test-pane".into(),
+            record_assurance: RecordAssurance::SessionBound,
+            owner_node: "alpha".into(),
+            owner_uid: 1000,
+            broker_epoch: HexBytes([1; 16]),
+            record_id: HexBytes([2; 16]),
+            instance_id: HexBytes([3; 16]),
+            incarnation: HexBytes([4; 16]),
+            role: Role::PaneShell,
+            parent_instance: Some(HexBytes([5; 16])),
+            parent_incarnation: Some(HexBytes([6; 16])),
+            pane_id: Some(DecimalU64(1)),
+            pane_generation: Some(DecimalU64(2)),
+            binding_generation: DecimalU64(3),
+            state: BindingState::Attached,
+            capabilities: vec![Capability::ReadState],
+            policy: Policy::Restricted,
+            lease_remaining_ms: Some(DecimalU64(1000)),
+        }
+    }
+    fn ambient() -> BrokerPrincipal {
+        BrokerPrincipal {
+            version: PrincipalVersion::V1,
+            assurance: Assurance::LocalUnix,
+            owner_node: "alpha".into(),
+            unix_uid: 1000,
+            unix_gid: 1000,
+            peer_pid: 1,
+            broker_epoch: HexBytes([1; 16]),
+            connection_id: HexBytes([7; 16]),
+            session: None,
+        }
+    }
+    #[test]
+    fn policy_cross_uid_epoch_and_bound_scope_never_fall_back() {
+        let mut target = target();
+        let mut caller = ambient();
+        assert!(!permitted(&caller, &target));
+        target.policy = Policy::DefaultOpen;
+        assert!(permitted(&caller, &target));
+        caller.unix_uid += 1;
+        assert!(!permitted(&caller, &target));
+        caller.unix_uid -= 1;
+        caller.broker_epoch = HexBytes([9; 16]);
+        assert!(!permitted(&caller, &target));
+        caller.broker_epoch = target.broker_epoch;
+        caller.assurance = Assurance::SessionBound;
+        caller.session = Some(SessionIdentity {
+            record_id: target.record_id,
+            instance_id: target.instance_id,
+            incarnation: target.incarnation,
+            role: Role::PaneShell,
+            parent_instance: target.parent_instance,
+            parent_incarnation: target.parent_incarnation,
+            pane_id: target.pane_id,
+            pane_generation: target.pane_generation,
+            binding_generation: target.binding_generation,
+            capabilities: vec![Capability::ReadState],
+            lease_remaining_ms: DecimalU64(1000),
+        });
+        assert!(permitted(&caller, &target));
+        target.policy = Policy::Restricted;
+        assert!(permitted(&caller, &target));
+        caller.session.as_mut().unwrap().capabilities.clear();
+        assert!(!permitted(&caller, &target));
+        target.policy = Policy::DefaultOpen;
+        assert!(!permitted(&caller, &target));
+        caller
+            .session
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(Capability::ReadState);
+        caller.session.as_mut().unwrap().pane_id = Some(DecimalU64(99));
+        assert!(!permitted(&caller, &target));
+        caller.session.as_mut().unwrap().pane_id = target.pane_id;
+        caller.session.as_mut().unwrap().binding_generation = DecimalU64(1);
+        assert!(!permitted(&caller, &target));
+    }
+
+    #[test]
+    fn bounded_typed_request_rejects_unknown_fields_and_bad_counters() {
+        let target = Source::from(&target());
+        let mut value = serde_json::json!({"version":1,"target":target,"after_sequence":"12"});
+        assert!(serde_json::from_value::<Request>(value.clone()).is_ok());
+        value["after_sequence"] = serde_json::json!(12);
+        assert!(serde_json::from_value::<Request>(value.clone()).is_err());
+        value["after_sequence"] = serde_json::json!("12");
+        value["command"] = serde_json::json!("execute");
+        assert!(serde_json::from_value::<Request>(value).is_err());
+    }
 }

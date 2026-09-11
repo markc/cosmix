@@ -50,6 +50,8 @@ impl NativeIncomingReceiver {
 enum NativeIncomingSender {
     #[cfg(unix)]
     Verified(mpsc::UnboundedSender<crate::unix::VerifiedCommand>),
+    #[cfg(unix)]
+    VerifiedBounded(mpsc::Sender<crate::unix::VerifiedCommand>),
     Unbounded(mpsc::UnboundedSender<IncomingCommand>),
     Bounded(BoundedIncomingSender),
 }
@@ -65,6 +67,19 @@ impl NativeIncomingSender {
             Self::Verified(tx) => tx
                 .send(crate::unix::VerifiedCommand::new(command, _principal))
                 .is_ok(),
+            #[cfg(unix)]
+            Self::VerifiedBounded(tx) => {
+                let bytes = command
+                    .headers
+                    .iter()
+                    .fold(command.body.len(), |n, (k, v)| {
+                        n.saturating_add(k.len()).saturating_add(v.len())
+                    });
+                bytes <= 65536
+                    && tx
+                        .try_send(crate::unix::VerifiedCommand::new(command, _principal))
+                        .is_ok()
+            }
             Self::Unbounded(sender) => sender.send(command).is_ok(),
             Self::Bounded(sender) => sender.try_send(command),
         }
@@ -254,15 +269,32 @@ impl NodedClient {
         socket: WebSocketStream<tokio::net::UnixStream>,
         service_name: &str,
         provenance: Option<cosmix_bus::RegisterProvenance>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<crate::unix::VerifiedCommand>)> {
+        incoming_capacity: Option<usize>,
+    ) -> Result<(Self, crate::unix::VerifiedIncoming)> {
         let (sink, stream) = socket.split();
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = match incoming_capacity {
+            Some(capacity @ 1..=1024) => {
+                let (tx, rx) = mpsc::channel(capacity);
+                (
+                    NativeIncomingSender::VerifiedBounded(tx),
+                    crate::unix::VerifiedIncoming::Bounded(rx),
+                )
+            }
+            Some(_) => anyhow::bail!("invalid verified incoming capacity"),
+            None => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (
+                    NativeIncomingSender::Verified(tx),
+                    crate::unix::VerifiedIncoming::Unbounded(rx),
+                )
+            }
+        };
         let reader = tokio::spawn(Self::reader_loop(
             stream,
             pending.clone(),
-            NativeIncomingSender::Verified(tx),
+            tx,
             connected.clone(),
             service_name.into(),
         ));
@@ -1031,7 +1063,10 @@ impl NodedClient {
         service_name: String,
     ) {
         #[cfg(unix)]
-        let verified = matches!(&incoming_tx, NativeIncomingSender::Verified(_));
+        let verified = matches!(
+            &incoming_tx,
+            NativeIncomingSender::Verified(_) | NativeIncomingSender::VerifiedBounded(_)
+        );
         #[cfg(not(unix))]
         let verified = false;
         while let Some(result) = stream.next().await {
@@ -1128,6 +1163,33 @@ impl NodedClient {
 
         // Resolve all pending requests with an error
         pending.lock().expect("pending mutex poisoned").clear();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod verified_bound_tests {
+    use super::*;
+    fn command(body: String) -> IncomingCommand {
+        IncomingCommand {
+            from: "caller".into(),
+            command: "shell.status".into(),
+            id: Some("1".into()),
+            args: serde_json::Value::Null,
+            body,
+            headers: Default::default(),
+        }
+    }
+    #[tokio::test]
+    async fn full_verified_lane_fails_closed_without_waiting() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sender = NativeIncomingSender::VerifiedBounded(sender);
+        assert!(sender.send(command("first".into()), None));
+        // false tells the real reader loop to disconnect and invalidate pending
+        // authority; this lane must never silently drop a lifecycle notice.
+        assert!(!sender.send(command("second".into()), None));
+        assert_eq!(receiver.recv().await.unwrap().command().body, "first");
+        assert!(!sender.send(command("x".repeat(65537)), None));
+        assert!(receiver.try_recv().is_err());
     }
 }
 

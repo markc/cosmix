@@ -894,8 +894,10 @@ metadata. Snapshot phases are <code>starting</code>, <code>prompt-ready</code>, 
 primary or continuation prompt; <code>continuation</code> distinguishes them. Custom prompt
 evaluation is <code>evaluating</code> without a command ID. Accepted evaluations allocate
 monotonic command IDs, retained through foreground waits and cleared on finish.
-The foreground phase follows the job kernel's terminal lease, including
-<code>run_stream</code>, foreground pipelines and <code>fg</code>; it does not enumerate jobs.</p>
+The foreground phase follows the job kernel's terminal lease for foreground
+pipelines and <code>fg</code>, and brackets the existing synchronous <code>run_stream</code> spawn/wait.
+This observation does not change <code>run_stream</code> job or signal semantics and does
+not enumerate jobs.</p>
 <p>The owned editor acknowledges activation before prompt-ready is recorded.
 Legacy readline reports its entry boundary because it has no activation
 acknowledgement. <code>cwd</code> is the last observed directory, captured at shell startup
@@ -920,7 +922,11 @@ Correlated lease checks revalidate both caller and target at admission, and
 detached residents do not dispatch requests. Stale targets return
 <code>STALE_GENERATION</code>. Recovery uses S3; it never resets shell sequence or prompt
 generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
-isolated tasks, input and event publication report <code>UNSUPPORTED</code>, never <code>BUSY</code>.</p>
+isolated tasks, input and event publication report <code>UNSUPPORTED</code>, never <code>BUSY</code>.
+The resident opts into a 64-command verified receive queue, with a 64 KiB
+envelope/body limit per retained command. Overflow closes that connection and
+uses S3 recovery; lifecycle notices are never silently dropped. Other clients
+retain their existing receive configuration.</p>
 <ul>
 <li><code>mix</code> is intercepted by the shell, so it never sees <code>$</code>-sigil arguments — write <code>mix what round</code>, not <code>mix what $name</code>.</li>
 <li>The introspection family (<code>vars</code>/<code>aliases</code>/<code>functions</code>/<code>all</code>/<code>context</code>) is most useful <strong>inside a REPL</strong>, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.</li>

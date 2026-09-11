@@ -231,6 +231,7 @@ pub struct Controller {
     worker: Mutex<Option<JoinHandle<()>>>,
     old_signals: Vec<(i32, libc::sigaction)>,
     fallback_executable: PathBuf,
+    foreground_observer: std::sync::OnceLock<fn(bool)>,
 }
 
 fn modes(fd: i32) -> io::Result<libc::termios> {
@@ -404,12 +405,19 @@ impl Controller {
             worker: Mutex::new(Some(worker)),
             old_signals,
             fallback_executable,
+            foreground_observer: std::sync::OnceLock::new(),
         })))
     }
 
     /// Install the input owner's protocol/mode shutdown, separate from PGIDs.
     pub fn set_terminal_shutdown(&self, shutdown: TerminalShutdown) {
         *self.shared.terminal_shutdown.lock().unwrap() = Some(shutdown);
+    }
+
+    /// Observation only. Called outside controller locks after terminal
+    /// transitions; the subscriber accepts owned data and must not wait.
+    pub fn observe_foreground(&self, observer: fn(bool)) {
+        let _ = self.foreground_observer.set(observer);
     }
 
     /// Owned snapshots are the attachment point for stage A; no publication
@@ -485,9 +493,9 @@ impl Controller {
         *self.shared.shell_modes.lock().unwrap() = saved;
         foreground(self.tty.as_raw_fd(), pgid)?;
         MANAGED_FOREGROUND.store(true, Ordering::Release);
-        crate::session_state::commit(crate::session_state::Transition::ForegroundChanged {
-            active: true,
-        });
+        if let Some(observer) = self.foreground_observer.get() {
+            observer(true);
+        }
         Ok(TerminalLease {
             controller: self,
             saved,
@@ -734,9 +742,9 @@ impl Drop for TerminalLease<'_> {
         }) {
             eprintln!("mix: terminal restore: {e}");
         }
-        crate::session_state::commit(crate::session_state::Transition::ForegroundChanged {
-            active: false,
-        });
+        if let Some(observer) = self.controller.foreground_observer.get() {
+            observer(false);
+        }
     }
 }
 

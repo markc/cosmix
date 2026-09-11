@@ -232,8 +232,8 @@ pub(super) fn start() {
     // Also remove duplicate launch descriptors before threads start. This
     // makes later runtime/worker failures incapable of leaving inherited fds.
     quarantine_failed_bootstrap();
-    // Snapshot every env-derived input while main is still single-threaded.
     crate::session_state::enable();
+    // Snapshot every env-derived input while main is still single-threaded.
     // The evaluator may later mutate environ; the resident must never read it.
     let account = std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
     let environment = crate::node_config::NativeEnvironment::capture();
@@ -310,6 +310,7 @@ fn options(
     });
     options.configured_endpoint = endpoint;
     options.require_native_session = true;
+    options.incoming_capacity = Some(64);
     Ok(options)
 }
 
@@ -671,6 +672,7 @@ async fn own(
                 }
                 event = connection.recv() => {
                     let Some(event) = event else { break true };
+                    if !connection.client().is_connected() { break true; }
                     let command = event.command();
                     if command.command == "noded.session.lifecycle.gap" || command.command == "noded.session.lifecycle" {
                         // Authenticated notices are hints, never scope or authority.

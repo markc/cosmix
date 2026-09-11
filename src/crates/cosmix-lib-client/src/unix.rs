@@ -31,6 +31,10 @@ pub struct UnixConnectOptions {
     /// Explicitly allow a fresh TCP connection after Unix setup fails. It
     /// never carries trusted context, even if TCP advertises native-session.
     pub allow_unverified_tcp_fallback: bool,
+    /// Opt-in bounded verified command lane (1..=1024). A full lane closes
+    /// the connection rather than losing lifecycle notices or blocking I/O.
+    /// Individual retained commands are limited to 64 KiB of envelope/body.
+    pub incoming_capacity: Option<usize>,
 }
 
 impl UnixConnectOptions {
@@ -41,6 +45,7 @@ impl UnixConnectOptions {
             configured_endpoint: None,
             require_native_session: false,
             allow_unverified_tcp_fallback: false,
+            incoming_capacity: None,
         }
     }
 
@@ -107,7 +112,7 @@ pub enum UnixConnectOutcome {
 /// Only endpoint verification plus profile negotiation can construct this.
 pub struct VerifiedConnection {
     client: NodedClient,
-    incoming: mpsc::UnboundedReceiver<VerifiedCommand>,
+    incoming: VerifiedIncoming,
     pub(crate) session_lock: tokio::sync::Mutex<()>,
 }
 impl VerifiedConnection {
@@ -118,8 +123,16 @@ impl VerifiedConnection {
     }
 
     pub async fn recv(&mut self) -> Option<VerifiedCommand> {
-        self.incoming.recv().await
+        match &mut self.incoming {
+            VerifiedIncoming::Unbounded(receiver) => receiver.recv().await,
+            VerifiedIncoming::Bounded(receiver) => receiver.recv().await,
+        }
     }
+}
+
+pub(crate) enum VerifiedIncoming {
+    Unbounded(mpsc::UnboundedReceiver<VerifiedCommand>),
+    Bounded(mpsc::Receiver<VerifiedCommand>),
 }
 
 /// Immutable delivery paired with context parsed on its verified transport.
@@ -230,12 +243,13 @@ async fn connect_verified(
     let (ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", socket)
         .await
         .map_err(|error| ConnectError::Protocol(error.into()))?;
-    let (client, incoming) = NodedClient::from_verified_unix(ws, service_name, provenance)
-        .await
-        .map_err(|error| match error.downcast::<ConnectError>() {
-            Ok(error) => error,
-            Err(error) => ConnectError::Protocol(error),
-        })?;
+    let (client, incoming) =
+        NodedClient::from_verified_unix(ws, service_name, provenance, options.incoming_capacity)
+            .await
+            .map_err(|error| match error.downcast::<ConnectError>() {
+                Ok(error) => error,
+                Err(error) => ConnectError::Protocol(error),
+            })?;
     Ok(VerifiedConnection {
         client,
         incoming,
