@@ -32,8 +32,10 @@ refuse startup before listener activation; the global 1,024-grant and per-UID
 The native noded tests use real Unix WebSockets and kernel peer credentials.
 They include separate-process reserved-name competition, altered-scope and
 captured-proof refusal after connection loss and against a new challenge,
-fresh resumption, restart/re-enrolment, parent-resume wake, lease dependency
-registration, observation/log omission, grant/Term/challenge/interest exhaustion,
+fresh resumption, restart/re-enrolment, competing-proof refusal, lease dependency
+registration, wake retention after a suspended-parent
+proof refusal, configurable per-parent grant isolation and cancellation,
+observation/log omission, grant/Term/challenge/interest exhaustion,
 retention high-water and deterministic notice-queue overflow. A test-only probe
 fills the real broker's notice queue under its lock, then checks gap delivery and
 key-selected resynchronisation over the real Unix connection. Clock-boundary

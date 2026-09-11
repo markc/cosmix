@@ -1808,6 +1808,21 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
             break;
         }
     }
+    // A refused resume consumes the proof slot but must preserve the child's
+    // key interest, so the later parent resume can wake it without re-granting.
+    let suspended_challenge = waiting.session_challenge(&selector).await.unwrap();
+    assert!(matches!(
+        waiting
+            .session_prove(&suspended_challenge.sign(&key, &scope).unwrap())
+            .await,
+        Err(cosmix_client::session::SessionFailure::Refused {
+            error: SessionError {
+                error_code: ErrorCode::Expired,
+                ..
+            },
+            ..
+        })
+    ));
     let replacement = verified(&broker).await;
     let challenge = replacement
         .session_challenge(&ChallengeArgs::Key(KeyChallenge {
@@ -1922,11 +1937,35 @@ async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_
                 .is_err()
         );
         let fresh = resumed.session_challenge(&selector).await.unwrap();
+        let rival = verified(&broker).await;
+        let competing = rival.session_challenge(&selector).await.unwrap();
+        assert_eq!(
+            competing.transcript.binding_generation,
+            fresh.transcript.binding_generation
+        );
         let attached = resumed
             .session_prove(&fresh.sign(&child_key, &scope).unwrap())
             .await
             .unwrap();
         assert_eq!(attached.record.binding_generation, DecimalU64(2));
+        assert!(matches!(
+            rival
+                .session_prove(&competing.sign(&child_key, &scope).unwrap())
+                .await,
+            Err(cosmix_client::session::SessionFailure::Refused {
+                error: SessionError {
+                    error_code: ErrorCode::StaleGeneration,
+                    ..
+                },
+                ..
+            })
+        ));
+        // Losing proofs and delayed cleanup cannot remove the winning channel.
+        resumed
+            .session_renew(attached.record.reference())
+            .await
+            .unwrap();
+        rival.client().close().await;
         assert!(
             parent
                 .session_revoke(attached.record.reference())
