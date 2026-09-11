@@ -238,6 +238,8 @@ pub(crate) struct Sessions {
 
 impl Default for Sessions {
     fn default() -> Self {
+        // This default coincides with Term's MAX_TABS, not an admission promise:
+        // its look-ahead grant also spends a slot and operators may lower it.
         Self::with_grant_limit(32)
     }
 }

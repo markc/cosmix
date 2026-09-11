@@ -299,6 +299,8 @@ pub struct Screen {
     pub updated: Instant,
 }
 pub struct Terminal {
+    #[cfg(test)]
+    pub before_pty_cleanup: Option<Box<dyn FnMut() + Send>>,
     session: Option<crate::native_session::PaneSession>,
     pub listener: Listener,
     pub stats: Stats,
@@ -405,19 +407,13 @@ impl Terminal {
         }
         // Explicit program + argv: native create_pty_with_spawn selects
         // setsid + TIOCSCTTY (Flatpak's non-controlling branch refused above).
-        let launch = native
-            .map(|native| native.prepare(pane_id))
-            .transpose()?
-            .flatten();
+        let launch = native.and_then(|native| native.prepare(pane_id));
         let (session, fd) = match launch {
             Some((session, fd)) => (Some(session), Some(fd)),
             None => (None, None),
         };
         let spawn = |dir: String| {
-            let mut env = vec![("TERM".into(), settings.term.into())];
-            if let Some(fd) = &fd {
-                env.push(fd.marker());
-            }
+            let env = vec![("TERM".into(), settings.term.into())];
             let mut args = vec!["-u".into(), "TERM_CWD".into()];
             // Never propagate a marker inherited by Term itself. The one
             // current launch marker is supplied explicitly after env's unsets.
@@ -480,6 +476,8 @@ impl Terminal {
             };
         listener.dirty();
         Ok(Self {
+            #[cfg(test)]
+            before_pty_cleanup: None,
             session,
             listener,
             stats,
@@ -606,6 +604,10 @@ impl Terminal {
         let Some(thread) = self.thread.take() else {
             return;
         };
+        #[cfg(test)]
+        if let Some(mut probe) = self.before_pty_cleanup.take() {
+            probe();
+        }
         self.listener.quit.store(true, Ordering::Release);
         if let Some(sender) = self.listener.writes.lock().unwrap().sender.take() {
             let _ = sender.send(Msg::Shutdown);
