@@ -12,300 +12,6 @@ const MAX_ISSUED: usize = 65_536;
 type Id = HexBytes<16>;
 type Reply = Result<serde_json::Value, SessionError>;
 
-#[cfg(test)]
-mod queue_tests {
-    use super::*;
-    fn allocated() -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
-        use ed25519_dalek::{Signer, SigningKey};
-        let mut s = Sessions::default();
-        let mut reg = HashMap::new();
-        let p = BrokerPrincipal {
-            version: PrincipalVersion::V1,
-            assurance: Assurance::LocalUnix,
-            owner_node: "alpha".into(),
-            unix_uid: 123,
-            unix_gid: 123,
-            peer_pid: 1,
-            broker_epoch: HexBytes([1; 16]),
-            connection_id: HexBytes([2; 16]),
-            session: None,
-        };
-        let (tx, _rx) = mpsc::channel(1);
-        s.connect(
-            &p,
-            &tx,
-            Arc::new(tokio::sync::Notify::new()),
-            Default::default(),
-        );
-        let key = SigningKey::from_bytes(&rand::random());
-        let public_key = HexBytes(key.verifying_key().to_bytes());
-        let signature = HexBytes(
-            key.sign(&encode_allocate(
-                p.broker_epoch,
-                p.connection_id,
-                public_key,
-                Policy::Restricted,
-            ))
-            .to_bytes(),
-        );
-        let command = SessionCommand::Allocate(AllocateArgs {
-            public_key,
-            signature,
-            policy: Policy::Restricted,
-        });
-        s.dispatch(&p, &command, &mut reg, 1000).unwrap();
-        let id = s.attached(p.connection_id).unwrap();
-        (s, reg, p, id)
-    }
-
-    #[test]
-    fn replacement_notifies_closing_channel_and_preserves_its_scope() {
-        use ed25519_dalek::{Signer, SigningKey};
-        let (mut s, mut reg, p, id) = allocated();
-        let key = SigningKey::from_bytes(&rand::random());
-        let public_key = HexBytes(key.verifying_key().to_bytes());
-        s.records.get_mut(&id).unwrap().key = public_key;
-        let old_tx = s.connections[&p.connection_id].tx.clone();
-        s.open_outbox(p.connection_id, &old_tx, Default::default());
-        let mut successor = p.clone();
-        successor.connection_id = HexBytes([3; 16]);
-        let (tx, _rx) = mpsc::channel(1);
-        s.connect(&successor, &tx, Default::default(), Default::default());
-        let selector = ChallengeArgs::Key(KeyChallenge {
-            public_key,
-            purpose: Purpose::Enrol,
-        });
-        let proof: ProofTranscript =
-            serde_json::from_value(s.challenge(&successor, &selector, 1001).unwrap()).unwrap();
-        s.prove(
-            &successor,
-            &ProveArgs {
-                challenge_id: proof.challenge_id,
-                signature: HexBytes(key.sign(&encode_proof(&proof).unwrap()).to_bytes()),
-            },
-            &mut reg,
-            1002,
-        )
-        .unwrap();
-        let (_, wire) = s.next_notice(p.connection_id, p.broker_epoch).unwrap();
-        let notice = bus::parse(&wire).unwrap();
-        let body: serde_json::Value = serde_json::from_str(&notice.body).unwrap();
-        assert_eq!(body["target"]["binding_generation"], "2");
-        assert_eq!(body["state"], "attached");
-        assert_eq!(s.attached(p.connection_id), None);
-        assert_eq!(s.attached(successor.connection_id), Some(id));
-
-        // The old read loop has not observed its close notification yet.
-        let other_key = SigningKey::from_bytes(&rand::random());
-        let other_public = HexBytes(other_key.verifying_key().to_bytes());
-        let allocation = SessionCommand::Allocate(AllocateArgs {
-            public_key: other_public,
-            signature: HexBytes(
-                other_key
-                    .sign(&encode_allocate(
-                        p.broker_epoch,
-                        p.connection_id,
-                        other_public,
-                        Policy::Restricted,
-                    ))
-                    .to_bytes(),
-            ),
-            policy: Policy::Restricted,
-        });
-        assert_eq!(
-            s.dispatch(&p, &allocation, &mut reg, 1003)
-                .unwrap_err()
-                .details["reason"],
-            "already_bound"
-        );
-        // An otherwise valid proof must not rename the retiring channel either.
-        let (other, _, _, other_id) = allocated();
-        let mut other_record = other.records.into_values().next().unwrap();
-        other_record.key = other_public;
-        other_record.connection = None;
-        other_record.view.state = BindingState::Suspended;
-        s.records.insert(other_id, other_record);
-        let proof: ProofTranscript = serde_json::from_value(
-            s.challenge(
-                &p,
-                &ChallengeArgs::Key(KeyChallenge {
-                    public_key: other_public,
-                    purpose: Purpose::Enrol,
-                }),
-                1003,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let refused = s
-            .prove(
-                &p,
-                &ProveArgs {
-                    challenge_id: proof.challenge_id,
-                    signature: HexBytes(other_key.sign(&encode_proof(&proof).unwrap()).to_bytes()),
-                },
-                &mut reg,
-                1004,
-            )
-            .unwrap_err();
-        assert_eq!(refused.details["reason"], "already_bound");
-    }
-
-    #[test]
-    fn delivery_releases_expired_dependencies_without_a_maintenance_tick() {
-        let (mut s, _, p, id) = allocated();
-        let recipient = HexBytes([3; 16]);
-        let (tx, _rx) = mpsc::channel(1);
-        s.open_outbox(recipient, &tx, Default::default());
-        let reference = s.records[&id].view.reference();
-        for generation in 2..=257 {
-            let mut target = reference.clone();
-            target.binding_generation = DecimalU64(generation);
-            s.outboxes
-                .get_mut(&recipient)
-                .unwrap()
-                .dependencies
-                .push((target, 1001));
-        }
-        assert_eq!(
-            s.delivery(&p, &tx, 1000).unwrap_err().details["reason"],
-            "recipient_dependency_limit"
-        );
-        s.delivery(&p, &tx, 1001).unwrap();
-        assert_eq!(
-            s.outboxes[&recipient].dependencies,
-            vec![(reference, 16_000)]
-        );
-    }
-
-    #[test]
-    fn lease_check_refreshes_recipient_notice_dependency() {
-        let (mut s, mut reg, p, id) = allocated();
-        let mut recipient = p.clone();
-        recipient.connection_id = HexBytes([3; 16]);
-        let (tx, _rx) = mpsc::channel(1);
-        s.connect(
-            &recipient,
-            &tx,
-            Arc::new(tokio::sync::Notify::new()),
-            Default::default(),
-        );
-        s.open_outbox(
-            recipient.connection_id,
-            &tx,
-            Arc::new(tokio::sync::Notify::new()),
-        );
-        s.delivery(&p, &tx, 1000).unwrap();
-        let target = s.records[&id].view.reference();
-        s.dispatch(
-            &p,
-            &SessionCommand::Renew(TargetArgs {
-                target: target.clone(),
-            }),
-            &mut reg,
-            6000,
-        )
-        .unwrap();
-        let checked = s
-            .dispatch(
-                &recipient,
-                &SessionCommand::LeaseCheck(TargetArgs { target }),
-                &mut reg,
-                7000,
-            )
-            .unwrap();
-        assert_eq!(checked["lease_remaining_ms"], "14000");
-        assert_eq!(
-            s.outboxes[&recipient.connection_id].dependencies[0].1,
-            21_000
-        );
-        s.maintain(&mut reg, 16_000);
-        s.suspend(id, &mut reg, 16_000);
-        assert!(
-            s.next_notice(recipient.connection_id, p.broker_epoch)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn lease_boundary_and_delayed_sweep_do_not_extend_resumption() {
-        let (mut s, mut reg, p, id) = allocated();
-        let reference = s.records[&id].view.reference();
-        s.maintain(&mut reg, 15_999);
-        assert_eq!(s.records[&id].view.state, BindingState::Attached);
-        s.maintain(&mut reg, 16_000);
-        assert_eq!(s.records[&id].view.state, BindingState::Suspended);
-        assert_eq!(s.records[&id].deadline, 46_000);
-        assert!(
-            s.dispatch(
-                &p,
-                &SessionCommand::Renew(TargetArgs { target: reference }),
-                &mut reg,
-                16_000
-            )
-            .is_err()
-        );
-        s.suspend(id, &mut reg, 20_000);
-        assert_eq!(s.records[&id].deadline, 46_000);
-        s.maintain(&mut reg, 46_000);
-        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
-        let (mut s, mut reg, _, id) = allocated();
-        s.maintain(&mut reg, 50_000);
-        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
-    }
-
-    #[test]
-    fn retained_expiry_keeps_unknown_outcome_high_water() {
-        let (mut s, mut reg, p, id) = allocated();
-        let args = TargetArgs {
-            target: s.records[&id].view.reference(),
-        };
-        let message = BusMessage::new().with_header("id", "7");
-        let request = BootstrapRequest {
-            message,
-            command: SessionCommand::Revoke(args),
-        };
-        let first = s.execute(&p, &request, &mut reg);
-        assert!(first.is_ok());
-        assert_eq!(s.execute(&p, &request, &mut reg), first);
-        for result in &mut s.results {
-            result.expires = 0;
-        }
-        assert_eq!(
-            s.execute(&p, &request, &mut reg).unwrap_err().details["reason"],
-            "unknown_outcome"
-        );
-    }
-    #[test]
-    fn notice_overflow_coalesces_and_global_shedding_marks_victim() {
-        let mut s = Sessions::default();
-        let (tx, _rx) = mpsc::channel(1);
-        let epoch = HexBytes([1; 16]);
-        for n in 0..17 {
-            let id = HexBytes([n; 16]);
-            s.open_outbox(id, &tx, Arc::new(tokio::sync::Notify::new()));
-        }
-        let first = HexBytes([0; 16]);
-        for _ in 0..257 {
-            s.queue_notice(first, "notice".into());
-        }
-        assert_eq!(s.outboxes[&first].notices.len(), 256);
-        assert!(s.next_notice(first, epoch).unwrap().0);
-        assert!(!s.next_notice(first, epoch).unwrap().0);
-        for n in 1..17 {
-            for _ in 0..256 {
-                s.queue_notice(HexBytes([n; 16]), "notice".into());
-            }
-        }
-        assert_eq!(
-            s.outboxes.values().map(|o| o.notices.len()).sum::<usize>(),
-            4096
-        );
-        assert!(s.outboxes.values().any(|o| o.gap));
-        s.restore_gap(first);
-        assert!(s.next_notice(first, epoch).unwrap().0);
-    }
-}
 
 pub(crate) fn now_ms() -> u64 {
     let mut ts = libc::timespec {
@@ -1499,5 +1205,300 @@ impl Sessions {
             }
         }
         Ok(serde_json::json!({"record":self.snapshot(&self.records[&proof.record_id],now)}))
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    fn allocated() -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut s = Sessions::default();
+        let mut reg = HashMap::new();
+        let p = BrokerPrincipal {
+            version: PrincipalVersion::V1,
+            assurance: Assurance::LocalUnix,
+            owner_node: "alpha".into(),
+            unix_uid: 123,
+            unix_gid: 123,
+            peer_pid: 1,
+            broker_epoch: HexBytes([1; 16]),
+            connection_id: HexBytes([2; 16]),
+            session: None,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        s.connect(
+            &p,
+            &tx,
+            Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
+        let key = SigningKey::from_bytes(&rand::random());
+        let public_key = HexBytes(key.verifying_key().to_bytes());
+        let signature = HexBytes(
+            key.sign(&encode_allocate(
+                p.broker_epoch,
+                p.connection_id,
+                public_key,
+                Policy::Restricted,
+            ))
+            .to_bytes(),
+        );
+        let command = SessionCommand::Allocate(AllocateArgs {
+            public_key,
+            signature,
+            policy: Policy::Restricted,
+        });
+        s.dispatch(&p, &command, &mut reg, 1000).unwrap();
+        let id = s.attached(p.connection_id).unwrap();
+        (s, reg, p, id)
+    }
+
+    #[test]
+    fn replacement_notifies_closing_channel_and_preserves_its_scope() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let (mut s, mut reg, p, id) = allocated();
+        let key = SigningKey::from_bytes(&rand::random());
+        let public_key = HexBytes(key.verifying_key().to_bytes());
+        s.records.get_mut(&id).unwrap().key = public_key;
+        let old_tx = s.connections[&p.connection_id].tx.clone();
+        s.open_outbox(p.connection_id, &old_tx, Default::default());
+        let mut successor = p.clone();
+        successor.connection_id = HexBytes([3; 16]);
+        let (tx, _rx) = mpsc::channel(1);
+        s.connect(&successor, &tx, Default::default(), Default::default());
+        let selector = ChallengeArgs::Key(KeyChallenge {
+            public_key,
+            purpose: Purpose::Enrol,
+        });
+        let proof: ProofTranscript =
+            serde_json::from_value(s.challenge(&successor, &selector, 1001).unwrap()).unwrap();
+        s.prove(
+            &successor,
+            &ProveArgs {
+                challenge_id: proof.challenge_id,
+                signature: HexBytes(key.sign(&encode_proof(&proof).unwrap()).to_bytes()),
+            },
+            &mut reg,
+            1002,
+        )
+        .unwrap();
+        let (_, wire) = s.next_notice(p.connection_id, p.broker_epoch).unwrap();
+        let notice = bus::parse(&wire).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&notice.body).unwrap();
+        assert_eq!(body["target"]["binding_generation"], "2");
+        assert_eq!(body["state"], "attached");
+        assert_eq!(s.attached(p.connection_id), None);
+        assert_eq!(s.attached(successor.connection_id), Some(id));
+
+        // The old read loop has not observed its close notification yet.
+        let other_key = SigningKey::from_bytes(&rand::random());
+        let other_public = HexBytes(other_key.verifying_key().to_bytes());
+        let allocation = SessionCommand::Allocate(AllocateArgs {
+            public_key: other_public,
+            signature: HexBytes(
+                other_key
+                    .sign(&encode_allocate(
+                        p.broker_epoch,
+                        p.connection_id,
+                        other_public,
+                        Policy::Restricted,
+                    ))
+                    .to_bytes(),
+            ),
+            policy: Policy::Restricted,
+        });
+        assert_eq!(
+            s.dispatch(&p, &allocation, &mut reg, 1003)
+                .unwrap_err()
+                .details["reason"],
+            "already_bound"
+        );
+        // An otherwise valid proof must not rename the retiring channel either.
+        let (other, _, _, other_id) = allocated();
+        let mut other_record = other.records.into_values().next().unwrap();
+        other_record.key = other_public;
+        other_record.connection = None;
+        other_record.view.state = BindingState::Suspended;
+        s.records.insert(other_id, other_record);
+        let proof: ProofTranscript = serde_json::from_value(
+            s.challenge(
+                &p,
+                &ChallengeArgs::Key(KeyChallenge {
+                    public_key: other_public,
+                    purpose: Purpose::Enrol,
+                }),
+                1003,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let refused = s
+            .prove(
+                &p,
+                &ProveArgs {
+                    challenge_id: proof.challenge_id,
+                    signature: HexBytes(other_key.sign(&encode_proof(&proof).unwrap()).to_bytes()),
+                },
+                &mut reg,
+                1004,
+            )
+            .unwrap_err();
+        assert_eq!(refused.details["reason"], "already_bound");
+    }
+
+    #[test]
+    fn delivery_releases_expired_dependencies_without_a_maintenance_tick() {
+        let (mut s, _, p, id) = allocated();
+        let recipient = HexBytes([3; 16]);
+        let (tx, _rx) = mpsc::channel(1);
+        s.open_outbox(recipient, &tx, Default::default());
+        let reference = s.records[&id].view.reference();
+        for generation in 2..=257 {
+            let mut target = reference.clone();
+            target.binding_generation = DecimalU64(generation);
+            s.outboxes
+                .get_mut(&recipient)
+                .unwrap()
+                .dependencies
+                .push((target, 1001));
+        }
+        assert_eq!(
+            s.delivery(&p, &tx, 1000).unwrap_err().details["reason"],
+            "recipient_dependency_limit"
+        );
+        s.delivery(&p, &tx, 1001).unwrap();
+        assert_eq!(
+            s.outboxes[&recipient].dependencies,
+            vec![(reference, 16_000)]
+        );
+    }
+
+    #[test]
+    fn lease_check_refreshes_recipient_notice_dependency() {
+        let (mut s, mut reg, p, id) = allocated();
+        let mut recipient = p.clone();
+        recipient.connection_id = HexBytes([3; 16]);
+        let (tx, _rx) = mpsc::channel(1);
+        s.connect(
+            &recipient,
+            &tx,
+            Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
+        s.open_outbox(
+            recipient.connection_id,
+            &tx,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        s.delivery(&p, &tx, 1000).unwrap();
+        let target = s.records[&id].view.reference();
+        s.dispatch(
+            &p,
+            &SessionCommand::Renew(TargetArgs {
+                target: target.clone(),
+            }),
+            &mut reg,
+            6000,
+        )
+        .unwrap();
+        let checked = s
+            .dispatch(
+                &recipient,
+                &SessionCommand::LeaseCheck(TargetArgs { target }),
+                &mut reg,
+                7000,
+            )
+            .unwrap();
+        assert_eq!(checked["lease_remaining_ms"], "14000");
+        assert_eq!(
+            s.outboxes[&recipient.connection_id].dependencies[0].1,
+            21_000
+        );
+        s.maintain(&mut reg, 16_000);
+        s.suspend(id, &mut reg, 16_000);
+        assert!(
+            s.next_notice(recipient.connection_id, p.broker_epoch)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn lease_boundary_and_delayed_sweep_do_not_extend_resumption() {
+        let (mut s, mut reg, p, id) = allocated();
+        let reference = s.records[&id].view.reference();
+        s.maintain(&mut reg, 15_999);
+        assert_eq!(s.records[&id].view.state, BindingState::Attached);
+        s.maintain(&mut reg, 16_000);
+        assert_eq!(s.records[&id].view.state, BindingState::Suspended);
+        assert_eq!(s.records[&id].deadline, 46_000);
+        assert!(
+            s.dispatch(
+                &p,
+                &SessionCommand::Renew(TargetArgs { target: reference }),
+                &mut reg,
+                16_000
+            )
+            .is_err()
+        );
+        s.suspend(id, &mut reg, 20_000);
+        assert_eq!(s.records[&id].deadline, 46_000);
+        s.maintain(&mut reg, 46_000);
+        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
+        let (mut s, mut reg, _, id) = allocated();
+        s.maintain(&mut reg, 50_000);
+        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
+    }
+
+    #[test]
+    fn retained_expiry_keeps_unknown_outcome_high_water() {
+        let (mut s, mut reg, p, id) = allocated();
+        let args = TargetArgs {
+            target: s.records[&id].view.reference(),
+        };
+        let message = BusMessage::new().with_header("id", "7");
+        let request = BootstrapRequest {
+            message,
+            command: SessionCommand::Revoke(args),
+        };
+        let first = s.execute(&p, &request, &mut reg);
+        assert!(first.is_ok());
+        assert_eq!(s.execute(&p, &request, &mut reg), first);
+        for result in &mut s.results {
+            result.expires = 0;
+        }
+        assert_eq!(
+            s.execute(&p, &request, &mut reg).unwrap_err().details["reason"],
+            "unknown_outcome"
+        );
+    }
+    #[test]
+    fn notice_overflow_coalesces_and_global_shedding_marks_victim() {
+        let mut s = Sessions::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let epoch = HexBytes([1; 16]);
+        for n in 0..17 {
+            let id = HexBytes([n; 16]);
+            s.open_outbox(id, &tx, Arc::new(tokio::sync::Notify::new()));
+        }
+        let first = HexBytes([0; 16]);
+        for _ in 0..257 {
+            s.queue_notice(first, "notice".into());
+        }
+        assert_eq!(s.outboxes[&first].notices.len(), 256);
+        assert!(s.next_notice(first, epoch).unwrap().0);
+        assert!(!s.next_notice(first, epoch).unwrap().0);
+        for n in 1..17 {
+            for _ in 0..256 {
+                s.queue_notice(HexBytes([n; 16]), "notice".into());
+            }
+        }
+        assert_eq!(
+            s.outboxes.values().map(|o| o.notices.len()).sum::<usize>(),
+            4096
+        );
+        assert!(s.outboxes.values().any(|o| o.gap));
+        s.restore_gap(first);
+        assert!(s.next_notice(first, epoch).unwrap().0);
     }
 }
