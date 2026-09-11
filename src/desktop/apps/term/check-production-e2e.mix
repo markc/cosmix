@@ -1,0 +1,36 @@
+-- Hard gate: the p0i-01 production child-proof actually RUNS.
+-- The e2e is #[ignore]d so ordinary test runs stay hermetic, which means a
+-- green suite alone carries no evidence the production spawn path was ever
+-- exercised. This script is the mechanical invocation: build the
+-- current-HEAD mix, point the e2e at it, run it BY NAME with --ignored,
+-- and require the literal "1 passed" — a renamed test filtering to zero
+-- matches must fail this gate, not pass it.
+-- Run from the repository src/ directory (build worker or dev checkout).
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 900})
+if $build["exit_code"] != 0 then
+  print($build["stderr"])
+  print("GATE BLOCKED: mix release build failed")
+  exit(1)
+end
+$bin = cwd() .. "/target/release/mix"
+if not is_file($bin) then
+  print("GATE BLOCKED: " .. $bin .. " missing after build")
+  exit(1)
+end
+$test = run_argv(["cargo", "test", "--manifest-path", "desktop/Cargo.toml",
+  "-p", "cosmix-term",
+  "p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes",
+  "--", "--ignored", "--test-threads=1"],
+  {timeout: 900, env: {"COSMIX_E2E_MIX_BIN": $bin}})
+print($test["stdout"])
+if $test["exit_code"] != 0 then
+  print($test["stderr"])
+  print("GATE FAIL: production e2e failed")
+  exit(1)
+end
+if not contains($test["stdout"], "test result: ok. 1 passed") then
+  print("GATE FAIL: e2e did not report exactly '1 passed' — a zero-match filter is not evidence")
+  exit(1)
+end
+print("GATE PASS: p0i-01 production child-proof executed and passed against the current build")
+exit(0)
