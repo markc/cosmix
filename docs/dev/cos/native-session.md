@@ -11,7 +11,8 @@ notices. Slow readers are never disconnected because of notice overflow.
 Bound routed deliveries register a connection/reference dependency before enqueue,
 under the same lock as revocation. Dependency caps are 256 per recipient and 8,192
 globally; exhaustion refuses the delivery. `lease.check` requires an existing
-unexpired dependency and returns the minimum remaining ancestor lease. Recipients
+unexpired dependency, atomically refreshes its notice lifetime through the returned
+lease, and returns the minimum remaining ancestor lease. Recipients
 use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
 
 The same fence covers correlated responses and fresh topic fan-out. Retained

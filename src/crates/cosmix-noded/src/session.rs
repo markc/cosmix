@@ -59,6 +59,50 @@ mod queue_tests {
     }
 
     #[test]
+    fn lease_check_refreshes_recipient_notice_dependency() {
+        let (mut s, mut reg, p, id) = allocated();
+        let mut recipient = p.clone();
+        recipient.connection_id = HexBytes([3; 16]);
+        let (tx, _rx) = mpsc::channel(1);
+        s.connect(
+            &recipient,
+            &tx,
+            Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
+        s.delivery(&p, &tx, 1000).unwrap();
+        let target = s.records[&id].view.reference();
+        s.dispatch(
+            &p,
+            &SessionCommand::Renew(TargetArgs {
+                target: target.clone(),
+            }),
+            &mut reg,
+            6000,
+        )
+        .unwrap();
+        let checked = s
+            .dispatch(
+                &recipient,
+                &SessionCommand::LeaseCheck(TargetArgs { target }),
+                &mut reg,
+                7000,
+            )
+            .unwrap();
+        assert_eq!(checked["lease_remaining_ms"], "14000");
+        assert_eq!(
+            s.outboxes[&recipient.connection_id].dependencies[0].1,
+            21_000
+        );
+        s.maintain(&mut reg, 16_000);
+        s.suspend(id, &mut reg, 16_000);
+        assert!(
+            s.next_notice(recipient.connection_id, p.broker_epoch)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn lease_boundary_and_delayed_sweep_do_not_extend_resumption() {
         let (mut s, mut reg, p, id) = allocated();
         let reference = s.records[&id].view.reference();
@@ -788,15 +832,16 @@ impl Sessions {
                 }
                 let out = self
                     .outboxes
-                    .get(&p.connection_id)
+                    .get_mut(&p.connection_id)
                     .ok_or_else(SessionError::forbidden)?;
-                if !out
+                let Some((_, expires)) = out
                     .dependencies
-                    .iter()
-                    .any(|(target, expires)| *target == a.target && *expires > now)
-                {
+                    .iter_mut()
+                    .find(|(target, expires)| *target == a.target && *expires > now)
+                else {
                     return Err(error(ErrorCode::Conflict, "dependency_missing"));
-                }
+                };
+                *expires = now + remaining;
                 Ok(serde_json::json!({"lease_remaining_ms":DecimalU64(remaining)}))
             }
             SessionCommand::Revoke(a) => {
