@@ -327,7 +327,7 @@ fn reap_child(pid: i32, timeout: Duration) {
     }
 }
 /// The canonical system Mix — the only shell Term spawns (mandate: Mix is the
-/// shell). Probed for executability before spawn; see `Terminal::start`.
+/// shell). Probed for executability before spawn; see `Terminal::start_session`.
 const MIX_BIN: &str = "/opt/cosmix/bin/mix";
 
 fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<String, String> {
@@ -349,11 +349,6 @@ fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<St
 }
 
 impl Terminal {
-    #[cfg(test)]
-    pub fn start(settings: crate::config::Settings) -> Result<Self, String> {
-        Self::start_session(settings, None, 0)
-    }
-
     pub fn start_session(
         settings: crate::config::Settings,
         native: Option<&crate::native_session::NativeSession>,
