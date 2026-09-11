@@ -13,18 +13,18 @@ pub(super) const MAX_ISSUED: usize = 65_536;
 type Id = HexBytes<16>;
 type Reply = Result<serde_json::Value, SessionError>;
 
-
-pub(crate) fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> Result<u64, SessionError> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: ts is a valid writable timespec. Failure must not mint authority.
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) },
-        0
-    );
-    (ts.tv_sec as u64).saturating_mul(1000) + ts.tv_nsec as u64 / 1_000_000
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return Err(error(ErrorCode::Unavailable, "clock_unavailable"));
+    }
+    Ok((ts.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000_000))
 }
 
 fn error(code: ErrorCode, reason: &str) -> SessionError {
@@ -37,6 +37,134 @@ fn error(code: ErrorCode, reason: &str) -> SessionError {
         message: "session request refused".into(),
         details,
     }
+}
+
+/// Owned by the broker serve future, so aborting a broker also stops its timer.
+pub(super) struct MaintenanceTask(tokio::task::JoinHandle<()>);
+
+impl Drop for MaintenanceTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn deadline_timer() -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: timerfd_create returns a new owned descriptor on success.
+    let fd = unsafe {
+        libc::timerfd_create(libc::CLOCK_BOOTTIME, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: this is the sole owner of the newly created descriptor.
+    tokio::io::unix::AsyncFd::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Sleep until an absolute BOOTTIME deadline, including time spent suspended.
+/// Tokio's ordinary Instant timer uses CLOCK_MONOTONIC on Linux instead.
+async fn sleep_until(
+    timer: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    deadline: u64,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let deadline = deadline.max(1); // zero would disarm timerfd
+    let spec = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: (deadline / 1000) as libc::time_t,
+            tv_nsec: ((deadline % 1000) * 1_000_000) as libc::c_long,
+        },
+    };
+    // SAFETY: valid timer descriptor and input timespec; no old-value output.
+    if unsafe {
+        libc::timerfd_settime(
+            timer.get_ref().as_raw_fd(),
+            libc::TFD_TIMER_ABSTIME,
+            &spec,
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    loop {
+        let mut ready = timer.readable().await?;
+        match ready.try_io(|fd| {
+            let mut expirations = 0u64;
+            // SAFETY: valid descriptor and writable buffer of exactly 8 bytes.
+            let count = unsafe {
+                libc::read(
+                    fd.get_ref().as_raw_fd(),
+                    (&mut expirations as *mut u64).cast(),
+                    8,
+                )
+            };
+            if count < 0 {
+                Err(std::io::Error::last_os_error())
+            } else if count == 8 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("short timer read"))
+            }
+        }) {
+            Ok(result) => return result,
+            Err(_) => continue, // readiness raced with re-arming; await the FD
+        }
+    }
+}
+
+pub(super) fn spawn_maintenance(
+    registry: Arc<RwLock<HashMap<String, ServiceEntry>>>,
+    sessions: Arc<tokio::sync::Mutex<Sessions>>,
+) -> MaintenanceTask {
+    MaintenanceTask(tokio::spawn(async move {
+        let timer = match deadline_timer() {
+            Ok(timer) => timer,
+            Err(_) => {
+                let mut reg = registry.write().await;
+                sessions.lock().await.fail_clock(&mut reg);
+                tracing::error!("Native session expiry timer unavailable");
+                return;
+            }
+        };
+        let wake = sessions.lock().await.deadline_wake.clone();
+        loop {
+            let (failed, deadline) = {
+                let sessions = sessions.lock().await;
+                (sessions.clock_failed, sessions.next_deadline())
+            };
+            if failed {
+                let mut reg = registry.write().await;
+                sessions.lock().await.fail_clock(&mut reg);
+                return;
+            }
+            let expiry = async {
+                match deadline {
+                    Some(deadline) => sleep_until(&timer, deadline).await,
+                    None => std::future::pending::<std::io::Result<()>>().await,
+                }
+            };
+            tokio::select! {
+                _ = wake.notified() => continue,
+                result = expiry => {
+                    let mut reg = registry.write().await;
+                    let mut sessions = sessions.lock().await;
+                    match result.and_then(|()| sessions.checked_now().map_err(|_| std::io::Error::other("clock unavailable"))) {
+                        Ok(now) => sessions.maintain(&mut reg, now),
+                        Err(_) => {
+                            sessions.fail_clock(&mut reg);
+                            tracing::error!("Native session expiry clock unavailable");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }))
 }
 
 fn verify(key: HexBytes<32>, signature: HexBytes<64>, bytes: &[u8]) -> Result<(), SessionError> {
@@ -112,6 +240,8 @@ pub(crate) struct Sessions {
     pane_high_water: HashMap<(Id, u64), u64>,
     outboxes: HashMap<Id, Outbox>,
     last_maintained: Option<u64>,
+    deadline_wake: Arc<tokio::sync::Notify>,
+    clock_failed: bool,
 }
 
 impl Default for Sessions {
@@ -132,6 +262,8 @@ impl Sessions {
             pane_high_water: Default::default(),
             outboxes: Default::default(),
             last_maintained: None,
+            deadline_wake: Default::default(),
+            clock_failed: false,
         }
     }
 
@@ -167,6 +299,7 @@ impl Sessions {
 
     pub(super) fn close_outbox(&mut self, id: Id) {
         self.outboxes.remove(&id);
+        self.deadline_wake.notify_one();
     }
 
     pub(super) fn next_notice(&mut self, id: Id, epoch: Id) -> Option<(bool, String)> {
@@ -249,12 +382,39 @@ impl Sessions {
         }
     }
 
+    pub(crate) fn delivery_now(
+        &mut self,
+        p: &BrokerPrincipal,
+        target: &mpsc::Sender<String>,
+    ) -> Result<Option<BrokerPrincipal>, SessionError> {
+        let now = self.checked_now()?;
+        self.delivery(p, target, now)
+    }
+
+    /// A read-only route lookup must still refuse an expired native target
+    /// while the scheduler is waiting to acquire the registry write lock.
+    pub(super) fn validate_route(&mut self, name: &str) -> Result<(), SessionError> {
+        let now = self.checked_now()?;
+        if self
+            .records
+            .values()
+            .find(|r| r.view.name == name)
+            .is_some_and(|r| self.remaining(r, now) == 0)
+        {
+            return Err(error(ErrorCode::Expired, ""));
+        }
+        Ok(())
+    }
+
     pub(crate) fn delivery(
         &mut self,
         p: &BrokerPrincipal,
         target: &mpsc::Sender<String>,
         now: u64,
     ) -> Result<Option<BrokerPrincipal>, SessionError> {
+        if self.clock_failed {
+            return Err(error(ErrorCode::Unavailable, "clock_unavailable"));
+        }
         let principal = self.principal(p.connection_id, now);
         let Some(id) = self.attached(p.connection_id) else {
             // A stale cached bound principal cannot fall back to ambient authority.
@@ -270,7 +430,7 @@ impl Sessions {
         }
         let reference = r.view.reference();
         // Topic fan-out reaches this admission path without a registry sweep.
-        // Expired dependencies must not occupy either quota until the next tick.
+        // Expired dependencies must not occupy either quota until an expiry wake.
         for out in self.outboxes.values_mut() {
             out.dependencies.retain(|(_, expires)| *expires > now);
         }
@@ -295,6 +455,7 @@ impl Sessions {
             }
             out.dependencies.push((reference, now + remaining));
         }
+        self.deadline_wake.notify_one();
         Ok(principal)
     }
     pub(super) fn connect(
@@ -476,6 +637,73 @@ impl Sessions {
         self.notice(id, closing);
     }
 
+    fn checked_now(&mut self) -> Result<u64, SessionError> {
+        if self.clock_failed {
+            return Err(error(ErrorCode::Unavailable, "clock_unavailable"));
+        }
+        now_ms().inspect_err(|_| {
+            self.clock_failed = true;
+            self.deadline_wake.notify_one();
+        })
+    }
+
+    fn fail_clock(&mut self, reg: &mut HashMap<String, ServiceEntry>) {
+        self.clock_failed = true;
+        for id in self.records.keys().copied().collect::<Vec<_>>() {
+            self.revoke(id, reg);
+        }
+        for c in self.connections.values() {
+            c.close.notify_one();
+        }
+    }
+
+    pub(super) fn maintain_now(
+        &mut self,
+        reg: &mut HashMap<String, ServiceEntry>,
+    ) -> Result<u64, SessionError> {
+        let now = match self.checked_now() {
+            Ok(now) => now,
+            Err(error) => {
+                self.fail_clock(reg);
+                return Err(error);
+            }
+        };
+        self.maintain(reg, now);
+        self.deadline_wake.notify_one();
+        Ok(now)
+    }
+
+    /// One absolute BOOTTIME deadline for pure-expiry work; no periodic sweep.
+    fn next_deadline(&self) -> Option<u64> {
+        self.records
+            .values()
+            .filter(|r| {
+                matches!(
+                    r.view.state,
+                    BindingState::Attached | BindingState::Suspended
+                )
+            })
+            .map(|r| r.deadline)
+            .chain(
+                self.grants
+                    .values()
+                    .filter(|g| g.state == GrantState::Pending)
+                    .map(|g| g.expires_ms.0),
+            )
+            .chain(
+                self.connections
+                    .values()
+                    .filter_map(|c| c.challenge.as_ref().map(|(_, p)| p.challenge_expires_ms.0)),
+            )
+            .chain(self.results.iter().map(|r| r.expires))
+            .chain(
+                self.outboxes
+                    .values()
+                    .flat_map(|o| o.dependencies.iter().map(|(_, expires)| *expires)),
+            )
+            .min()
+    }
+
     pub(super) fn maintain(&mut self, reg: &mut HashMap<String, ServiceEntry>, now: u64) {
         self.last_maintained = Some(now);
         let mut expired: Vec<_> = self
@@ -528,9 +756,10 @@ impl Sessions {
     }
 
     pub(super) fn disconnect(&mut self, id: Id, reg: &mut HashMap<String, ServiceEntry>) {
-        self.maintain(reg, now_ms());
-        if let Some(record) = self.attached(id) {
-            self.suspend(record, reg, now_ms());
+        if let Ok(now) = self.maintain_now(reg)
+            && let Some(record) = self.attached(id)
+        {
+            self.suspend(record, reg, now);
         }
         self.connections.remove(&id);
         self.results.retain(|r| r.connection != id);
@@ -596,8 +825,7 @@ impl Sessions {
         request: &BootstrapRequest,
         reg: &mut HashMap<String, ServiceEntry>,
     ) -> Reply {
-        let now = now_ms();
-        self.maintain(reg, now);
+        let now = self.maintain_now(reg)?;
         let cid = p.connection_id;
         let id = request
             .message
@@ -637,8 +865,15 @@ impl Sessions {
                     .expect("cached");
                 self.results.remove(index);
             }
-            while !self.results.is_empty() && (self.results.len() >= 8192
-                || self.results.iter().map(|r| r.bytes).sum::<usize>().saturating_add(bytes) > 16 * 1024 * 1024)
+            while !self.results.is_empty()
+                && (self.results.len() >= 8192
+                    || self
+                        .results
+                        .iter()
+                        .map(|r| r.bytes)
+                        .sum::<usize>()
+                        .saturating_add(bytes)
+                        > 16 * 1024 * 1024)
             {
                 self.results.pop_front();
             }
@@ -666,6 +901,10 @@ impl Sessions {
         reg: &mut HashMap<String, ServiceEntry>,
         now: u64,
     ) -> Reply {
+        self.deadline_wake.notify_one();
+        if self.clock_failed {
+            return Err(error(ErrorCode::Unavailable, "clock_unavailable"));
+        }
         if self.last_maintained != Some(now) {
             self.maintain(reg, now);
         }
@@ -999,7 +1238,12 @@ impl Sessions {
             let mut e = error(ErrorCode::Conflict, "challenge_outstanding");
             e.details.insert(
                 "retry_after_ms".into(),
-                proof.challenge_expires_ms.0.saturating_sub(now).to_string().into(),
+                proof
+                    .challenge_expires_ms
+                    .0
+                    .saturating_sub(now)
+                    .to_string()
+                    .into(),
             );
             return Err(e);
         }
@@ -1116,6 +1360,7 @@ impl Sessions {
     }
 
     pub(super) fn consume_malformed(&mut self, cid: Id) {
+        self.deadline_wake.notify_one();
         if let Some(c) = self.connections.get_mut(&cid)
             && let Some((_, p)) = c.challenge.take()
         {
@@ -1227,7 +1472,9 @@ pub(super) mod queue_tests {
         allocated_at(1000)
     }
 
-    pub(crate) fn allocated_at(now: u64) -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
+    pub(crate) fn allocated_at(
+        now: u64,
+    ) -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
         use ed25519_dalek::{Signer, SigningKey};
         let mut s = Sessions::default();
         let mut reg = HashMap::new();
@@ -1286,9 +1533,62 @@ pub(super) mod queue_tests {
     }
 
     #[tokio::test]
+    async fn one_scheduler_rearms_for_an_earlier_deadline_without_traffic() {
+        let now = now_ms().unwrap();
+        let (s, reg, p, id) = allocated_at(now);
+        let close = s.connections[&p.connection_id].close.clone();
+        let sessions = Arc::new(tokio::sync::Mutex::new(s));
+        let registry = Arc::new(RwLock::new(reg));
+        let _scheduler = spawn_maintenance(registry.clone(), sessions.clone());
+        // Re-arm while the scheduler may already be sleeping on the old lease.
+        let deadline = now_ms().unwrap() + 30;
+        {
+            let mut s = sessions.lock().await;
+            s.records.get_mut(&id).unwrap().deadline = deadline;
+            s.deadline_wake.notify_one();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), close.notified())
+            .await
+            .unwrap();
+        let reg = registry.read().await;
+        let s = sessions.lock().await;
+        assert!(reg.is_empty());
+        assert_eq!(s.records[&id].view.state, BindingState::Suspended);
+        assert_eq!(s.next_deadline(), Some(deadline + RESUME_MS));
+    }
+
+    #[test]
+    fn routing_refuses_expired_target_before_scheduler_removes_route() {
+        let (mut s, reg, _, id) = allocated_at(now_ms().unwrap().saturating_sub(LEASE_MS));
+        let name = s.records[&id].view.name.clone();
+        assert!(reg.contains_key(&name));
+        assert_eq!(
+            s.validate_route(&name).unwrap_err().error_code,
+            ErrorCode::Expired
+        );
+    }
+
+    #[test]
+    fn clock_failure_revokes_and_cannot_mint_new_authority() {
+        let (mut s, mut reg, p, id) = allocated();
+        s.fail_clock(&mut reg);
+        assert!(reg.is_empty());
+        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
+        assert_eq!(
+            s.maintain_now(&mut reg).unwrap_err().error_code,
+            ErrorCode::Unavailable
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        assert_eq!(
+            s.delivery_now(&p, &tx).unwrap_err().error_code,
+            ErrorCode::Unavailable
+        );
+    }
+
+    #[tokio::test]
     async fn fanout_refuses_only_the_recipient_at_dependency_capacity() {
         let (mut s, _, p, id) = allocated();
-        let now = now_ms();
+        let now = now_ms().unwrap();
         s.records.get_mut(&id).unwrap().deadline = now + LEASE_MS;
         let p = s.principal(p.connection_id, now).unwrap();
         let broker = subscription::SubscriptionBroker::new();
@@ -1303,18 +1603,38 @@ pub(super) mod queue_tests {
                     incarnation: HexBytes([99; 16]),
                     binding_generation: DecimalU64(1),
                 };
-                s.outboxes.get_mut(&cid).unwrap().dependencies = vec![(reference, now + LEASE_MS); 256];
+                s.outboxes.get_mut(&cid).unwrap().dependencies =
+                    vec![(reference, now + LEASE_MS); 256];
             }
-            broker.subscribe_topic_verified("session.test", &format!("recipient{index}"), tx, None, true).await;
+            broker
+                .subscribe_topic_verified(
+                    "session.test",
+                    &format!("recipient{index}"),
+                    tx,
+                    None,
+                    true,
+                )
+                .await;
             receivers.push(rx);
         }
         broker.set_native_sessions(Arc::new(tokio::sync::Mutex::new(s)));
         let (publisher, _rx) = mpsc::channel(8);
-        let wire = BusMessage::new().with_header("type", "event").with_header("command", "snapshot").to_wire();
-        let (_, delivered, refused, _) = broker.publish_with_principal(
-            "session.test", &wire, "publisher", publisher,
-            subscription::BrokerOrigin::Local, false, Some(&p)
-        ).await.unwrap();
+        let wire = BusMessage::new()
+            .with_header("type", "event")
+            .with_header("command", "snapshot")
+            .to_wire();
+        let (_, delivered, refused, _) = broker
+            .publish_with_principal(
+                "session.test",
+                &wire,
+                "publisher",
+                publisher,
+                subscription::BrokerOrigin::Local,
+                false,
+                Some(&p),
+            )
+            .await
+            .unwrap();
         assert_eq!((delivered, refused), (2, 1));
         assert!(receivers[0].try_recv().is_ok());
         assert!(receivers[1].try_recv().is_err());
@@ -1324,7 +1644,8 @@ pub(super) mod queue_tests {
     #[test]
     fn dispatch_expires_without_caller_maintenance() {
         let (mut s, mut reg, p, id) = allocated();
-        s.dispatch(&p, &SessionCommand::Hello, &mut reg, 50_000).unwrap();
+        s.dispatch(&p, &SessionCommand::Hello, &mut reg, 50_000)
+            .unwrap();
         assert_eq!(s.records[&id].view.state, BindingState::Revoked);
         assert!(reg.is_empty());
     }

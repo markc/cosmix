@@ -859,6 +859,8 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         live_sessions: Arc::new(RwLock::new(HashMap::new())),
     };
     broker.set_native_sessions(state.sessions.clone());
+    let _session_maintenance =
+        session::spawn_maintenance(state.registry.clone(), state.sessions.clone());
     #[cfg(test)]
     if let Some(probe) = session_probe {
         let _ = probe.send(state.sessions.clone());
@@ -2005,24 +2007,19 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
     let writer_epoch = state.broker_epoch;
     let send_task = tokio::spawn(async move {
         loop {
-            loop {
-                let notice = writer_sessions
-                    .lock()
-                    .await
-                    .next_notice(channel_id, writer_epoch);
-                let Some((gap, notice)) = notice else {
-                    break;
-                };
-                if ws_sink.send(Message::Text(notice.into())).await.is_err() {
-                    if gap {
-                        writer_sessions.lock().await.restore_gap(channel_id);
-                    }
-                    return;
-                }
-            }
             let msg = tokio::select! {
                 biased;
-                _ = notice_wake.notified() => continue,
+                _ = notice_wake.notified() => {
+                    loop {
+                        let notice = writer_sessions.lock().await.next_notice(channel_id, writer_epoch);
+                        let Some((gap, notice)) = notice else { break; };
+                        if ws_sink.send(Message::Text(notice.into())).await.is_err() {
+                            if gap { writer_sessions.lock().await.restore_gap(channel_id); }
+                            return;
+                        }
+                    }
+                    continue;
+                },
                 msg = rx.recv() => match msg { Some(msg) => msg, None => break },
             };
             if ws_sink.send(Message::Text(msg.into())).await.is_err() {
@@ -2061,7 +2058,6 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             state.protected_responses.clone(),
         );
     }
-    let mut session_tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     // SPEC 13 §9a (2-c-1b) — broker-speaks-first: when admission is enabled the
     // broker's FIRST frame is a D2 challenge. Non-blocking + additive — an
@@ -2104,11 +2100,6 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         let msg = tokio::select! {
             biased;
             _ = close_signal.notified() => break,
-            _ = session_tick.tick(), if state.principal.is_some() => {
-                let mut reg = state.registry.write().await;
-                state.sessions.lock().await.maintain(&mut reg, session::now_ms());
-                continue;
-            },
             next = ws_stream.next() => match next {
                 Some(Ok(m)) => m,
                 // Stream closed or errored — same as the old `while let` exit.
@@ -2192,7 +2183,11 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 && bus_msg.command_name() == Some("noded.session.prove")
                 && let Some(p) = &state.principal
             {
-                state.sessions.lock().await.consume_malformed(p.connection_id);
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .consume_malformed(p.connection_id);
             }
             let result = match (&state.principal, validation) {
                 (Some(p), Ok(request)) => {
@@ -2234,7 +2229,11 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             canonicalize_connection_from(&mut bus_msg, service_name.as_deref());
             state.observe.observe(Observation::canonical(
                 ObserveDirection::Local,
-                if rc == 0 { ObserveOutcome::BrokerHandled } else { ObserveOutcome::Rejected },
+                if rc == 0 {
+                    ObserveOutcome::BrokerHandled
+                } else {
+                    ObserveOutcome::Rejected
+                },
                 &bus_msg,
                 bus_msg.get("id"),
             ));
@@ -2251,8 +2250,10 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
         if let Some(p) = &state.principal {
             let mut reg = state.registry.write().await;
             let mut sessions = state.sessions.lock().await;
-            sessions.maintain(&mut reg, session::now_ms());
-            let Some(principal) = sessions.principal(p.connection_id, session::now_ms()) else {
+            let Ok(now) = sessions.maintain_now(&mut reg) else {
+                break;
+            };
+            let Some(principal) = sessions.principal(p.connection_id, now) else {
                 break;
             };
             state.principal = Some(principal);
@@ -2314,12 +2315,14 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                     let _reg = state.registry.read().await;
                     let mut sessions = state.sessions.lock().await;
                     let principal = if let Some(p) = &state.principal {
-                        match sessions.delivery(p, &pending.caller_tx, session::now_ms()) {
+                        match sessions.delivery_now(p, &pending.caller_tx) {
                             Ok(p) => p,
                             Err(error) => {
                                 let reply = session_delivery_error(
-                                    &error, pending.caller_verified,
-                                    Some(&pending.caller_id), bus_msg.command_name()
+                                    &error,
+                                    pending.caller_verified,
+                                    Some(&pending.caller_id),
+                                    bus_msg.command_name(),
                                 );
                                 let _ = pending.caller_tx.try_send(reply.to_wire());
                                 continue;
@@ -3285,8 +3288,12 @@ fn session_delivery_error(
     } else {
         body["error"] = code.into();
     }
-    if let Some(id) = id { reply.set("id", id); }
-    if let Some(command) = command { reply.set("command", command); }
+    if let Some(id) = id {
+        reply.set("id", id);
+    }
+    if let Some(command) = command {
+        reply.set("command", command);
+    }
     reply.body = body.to_string();
     reply
 }
@@ -3332,7 +3339,7 @@ async fn route_local(
             )
             .await;
         let reg = registry.read().await;
-        let mut sessions = if state.principal.is_some() {
+        let mut sessions = if state.principal.is_some() || traffic_class.protected() {
             Some(state.sessions.lock().await)
         } else {
             None
@@ -3342,7 +3349,10 @@ async fn route_local(
                 .delivery_fence
                 .read()
                 .expect("delivery fence poisoned");
-            if !reg.get(service).is_some_and(|entry| entry.same_channel(&target_tx)) {
+            if !reg
+                .get(service)
+                .is_some_and(|entry| entry.same_channel(&target_tx))
+            {
                 return Err(cosmix_bus::native_session::SessionError {
                     error_code: cosmix_bus::native_session::ErrorCode::Unavailable,
                     message: "recipient changed before delivery".into(),
@@ -3362,12 +3372,16 @@ async fn route_local(
             }
             // Recompute immediately before serialisation/enqueue, after every
             // awaited lock and the delivery fence. Revocation shares this lock.
+            if let Some(sessions) = sessions.as_mut() {
+                sessions.validate_route(service)?;
+            }
             let fresh_principal = match (&state.principal, sessions.as_mut()) {
-                (Some(p), Some(sessions)) => sessions.delivery(p, &target_tx, session::now_ms())?,
+                (Some(p), Some(sessions)) => sessions.delivery_now(p, &target_tx)?,
                 _ => None,
             };
             let principal = fresh_principal.as_ref().filter(|_| {
-                reg.get(service).is_some_and(|e| e.traffic_class.protected())
+                reg.get(service)
+                    .is_some_and(|e| e.traffic_class.protected())
             });
             stamp_principal(msg, principal).expect("principal validated at upgrade");
             let wire = msg.to_wire();
@@ -3391,10 +3405,23 @@ async fn route_local(
                     Some(ref bid) => pending_responses.take(bid).await.map(|p| p.caller_id),
                     None => None,
                 };
-                let reply = session_delivery_error(&error, state.principal.is_some(), caller_id.as_deref(), msg.command_name());
-                deliver_observed_response(observe, caller_tx, &reply, ObserveDirection::Local, reply.get("id"));
+                let reply = session_delivery_error(
+                    &error,
+                    state.principal.is_some(),
+                    caller_id.as_deref(),
+                    msg.command_name(),
+                );
+                deliver_observed_response(
+                    observe,
+                    caller_tx,
+                    &reply,
+                    ObserveDirection::Local,
+                    reply.get("id"),
+                );
                 return LocalRouteResult {
-                    traffic_class, target_tx: Some(target_tx), forwarded_wire: None,
+                    traffic_class,
+                    target_tx: Some(target_tx),
+                    forwarded_wire: None,
                     outcome: ObserveOutcome::Rejected,
                 };
             }
@@ -3906,8 +3933,19 @@ async fn handle_noded_command(
             let services: Vec<serde_json::Value> = {
                 let mut reg = state.registry.write().await;
                 let mut sessions = state.sessions.lock().await;
-                let now = session::now_ms();
-                sessions.maintain(&mut reg, now);
+                let now = match sessions.maintain_now(&mut reg) {
+                    Ok(now) => now,
+                    Err(error) => {
+                        let reply = session_delivery_error(
+                            &error,
+                            state.principal.is_some(),
+                            msg.get("id"),
+                            msg.command_name(),
+                        );
+                        let _ = tx.try_send(reply.to_wire());
+                        return;
+                    }
+                };
                 let mut entries: Vec<_> = reg
                     .keys()
                     .map(String::as_str)
@@ -4202,7 +4240,8 @@ async fn handle_noded_command(
                     resp.body = serde_json::json!({
                         "seq": seq, "delivered": delivered, "refused": refused,
                         "partial": refused != 0
-                    }).to_string();
+                    })
+                    .to_string();
                     let _ = tx.try_send(resp.to_wire());
                     dispatch_notifications(state, &notices).await;
                 }
@@ -6672,28 +6711,48 @@ mod tests {
     #[tokio::test]
     async fn pending_contention_releases_authority_locks_and_rechecks_delivery() {
         let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
-        let now = super::session::now_ms();
+        let now = super::session::now_ms().unwrap();
         let (sessions, registry, principal, _) = super::session::queue_tests::allocated_at(now);
         state.principal = sessions.principal(principal.connection_id, now);
         state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
         *state.registry.write().await = registry;
         let (target, mut received) = mpsc::channel(8);
-        state.registry.write().await.insert("recipient".into(), super::ServiceEntry {
-            protected_responses: Default::default(),
-            traffic_class: super::TrafficClass::NativeSession,
-            tx: target,
-            info: Default::default(),
-        });
+        state.registry.write().await.insert(
+            "recipient".into(),
+            super::ServiceEntry {
+                protected_responses: Default::default(),
+                traffic_class: super::TrafficClass::NativeSession,
+                tx: target,
+                info: Default::default(),
+            },
+        );
         let (caller, mut replies) = mpsc::channel(8);
-        let mut request = BusMessage::new().with_header("id", "original").with_header("command", "probe.echo");
+        let mut request = BusMessage::new()
+            .with_header("id", "original")
+            .with_header("command", "probe.echo");
         let pending_guard = state.pending_responses.map.write().await;
         let admission = super::SessionAdmission::default();
-        let route = super::route_local(&state, "recipient", &mut request, &caller, None,
-            "127.0.0.1".parse().unwrap(), &admission, None);
+        let route = super::route_local(
+            &state,
+            "recipient",
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        );
         tokio::pin!(route);
         assert!(futures_util::poll!(&mut route).is_pending());
-        let mut registry = tokio::time::timeout(std::time::Duration::from_secs(1), state.registry.write()).await.unwrap();
-        state.sessions.lock().await.maintain(&mut registry, now + 15_000);
+        let mut registry =
+            tokio::time::timeout(std::time::Duration::from_secs(1), state.registry.write())
+                .await
+                .unwrap();
+        state
+            .sessions
+            .lock()
+            .await
+            .maintain(&mut registry, now + 15_000);
         drop(registry);
         drop(pending_guard);
         assert_eq!(route.await.outcome, super::ObserveOutcome::Rejected);

@@ -24,11 +24,12 @@ the original binding scope.
 Bound routed deliveries register a connection/reference dependency before enqueue,
 under the same lock as revocation. Dependency caps are 256 per recipient and 8,192
 globally; exhaustion refuses the delivery. Delivery admission releases expired
-dependency slots, including during topic fan-out between maintenance ticks.
+dependency slots, including during topic fan-out between expiry wakes.
 Routing releases registry and session guards before pending registration, then
 rechecks channel ownership and recomputes the lease after that await, immediately
 before enqueue. Refusal removes the pending entry and restores caller correlation.
 Routing lookup uses a registry read guard; only actual mutations take write.
+It also refuses an expired native target while its route awaits scheduler removal.
 Delivery errors carry native response headers for verified recipients and the
 legacy error header/body for legacy recipients, including correlated responses.
 `lease.check` requires an existing unexpired dependency, atomically refreshes
@@ -44,6 +45,15 @@ closed subscriptions are still pruned. A successful `topic.publish` result adds
 remain visible when another recipient refuses. Refusal diagnostics contain only
 aggregate counts, without recipient identity or message contents.
 Ping publishes the effective bounds in `native_session_limits` (decimal strings).
+One broker-owned scheduler sleeps until the earliest record lease/resumption,
+pending grant, challenge, retained result or recipient dependency deadline. State
+changes notify it to recompute; idle connections have no maintenance interval.
+Its single absolute CLOCK_BOOTTIME timerfd includes suspend time and is cancelled
+with the broker. Expiry alone takes the registry write lock; rescheduling only
+reads session deadlines. Writers drain notices only after a notice wake, with
+gap-before-notice priority, so ordinary outbound messages take no session lock.
+Clock/timer failure returns `UNAVAILABLE`, revokes native authority and closes
+native connections; it cannot panic or silently mint a fresh lease.
 `noded.pending_grants_per_parent` configures the per-Term pending-grant cap
 (integer, default 32, range 0–32). Zero disables new grants. Values above 32
 refuse startup before listener activation; the global 1,024-grant and per-UID

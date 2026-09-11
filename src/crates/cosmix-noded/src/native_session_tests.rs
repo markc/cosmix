@@ -1770,8 +1770,13 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
     };
     let challenge = child.session_challenge(&selector).await.unwrap();
     let mut higher_scope = scope.clone();
-    higher_scope.pane_high_water = Some(DecimalU64(challenge.transcript.pane_generation.unwrap().0 + 1));
-    assert!(matches!(challenge.sign(&key, &higher_scope), Err(cosmix_client::session::SessionFailure::ScopeMismatch)));
+    higher_scope.pane_high_water = Some(DecimalU64(
+        challenge.transcript.pane_generation.unwrap().0 + 1,
+    ));
+    assert!(matches!(
+        challenge.sign(&key, &higher_scope),
+        Err(cosmix_client::session::SessionFailure::ScopeMismatch)
+    ));
     higher_scope.pane_high_water = challenge.transcript.pane_generation;
     assert!(challenge.sign(&key, &higher_scope).is_ok());
     let proof = challenge.sign(&key, &scope).unwrap();

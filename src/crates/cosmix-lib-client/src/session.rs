@@ -79,15 +79,24 @@ impl Deadline {
 fn boottime_ms() -> SessionResult<u64> {
     #[cfg(target_os = "linux")]
     {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         // SAFETY: ts is a valid writable timespec.
         if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
-            return Err(SessionFailure::Transport(std::io::Error::last_os_error().into()));
+            return Err(SessionFailure::Transport(
+                std::io::Error::last_os_error().into(),
+            ));
         }
-        Ok((ts.tv_sec as u64).saturating_mul(1000).saturating_add(ts.tv_nsec as u64 / 1_000_000))
+        Ok((ts.tv_sec as u64)
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec as u64 / 1_000_000))
     }
     #[cfg(not(target_os = "linux"))]
-    Err(SessionFailure::Transport(anyhow::anyhow!("CLOCK_BOOTTIME is unavailable")))
+    Err(SessionFailure::Transport(anyhow::anyhow!(
+        "CLOCK_BOOTTIME is unavailable"
+    )))
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +131,8 @@ impl ChallengeResult {
             || p.parent_key_hash != expected.parent_key_hash
             || p.pane_id != expected.pane_id
             || expected.pane_high_water.is_some_and(|high| {
-                p.pane_generation.is_none_or(|generation| generation.0 < high.0)
+                p.pane_generation
+                    .is_none_or(|generation| generation.0 < high.0)
             })
             || p.role != expected.role
             || p.public_key_hash != expected.public_key_hash
@@ -240,7 +250,14 @@ impl VerifiedConnection {
     /// Captures request-start CLOCK_BOOTTIME internally. Gaps invalidate results.
     pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
         let start = boottime_ms()?;
-        let result: LeaseResult = self.session_rpc("lease.check", TargetArgs { target: target.clone() }).await?;
+        let result: LeaseResult = self
+            .session_rpc(
+                "lease.check",
+                TargetArgs {
+                    target: target.clone(),
+                },
+            )
+            .await?;
         let deadline = Deadline {
             target,
             expires_ms: start.saturating_add(result.lease_remaining_ms.0),

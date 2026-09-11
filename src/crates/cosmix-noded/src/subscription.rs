@@ -475,7 +475,7 @@ impl SubscriptionBroker {
             {
                 let mut sessions = sessions.lock().await;
                 let fresh = sessions
-                    .delivery(&p, tx, crate::noded::session::now_ms())
+                    .delivery_now(&p, tx)
                     .map_err(PublishError::Session)?;
                 cosmix_bus::native_session::stamp_principal(&mut message, fresh.as_ref())
                     .map_err(|_| PublishError::MalformedPayload)?;
@@ -806,7 +806,11 @@ impl SubscriptionBroker {
         };
 
         if refused != 0 {
-            tracing::debug!(delivered, refused, "Topic fan-out completed with recipient refusals");
+            tracing::debug!(
+                delivered,
+                refused,
+                "Topic fan-out completed with recipient refusals"
+            );
         }
         Ok((seq, delivered, refused, notifications))
     }
