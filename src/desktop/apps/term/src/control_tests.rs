@@ -497,8 +497,12 @@ fn p0i_08_queued_input_human_revoke_and_deadline() {
         })
         .await
         .expect("Term re-establishes its own attachment after the broker pause");
+        // Empty text on purpose. The one-writer check runs before anything is
+        // queued, so this still discriminates BUSY from admitted, while adding
+        // no bytes whose flush would race the revocation below and make the
+        // byte-count assertion nondeterministic.
         assert_eq!(
-            call(expiry.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","request_epoch":epoch,"foreground_generation":listener.foreground_generation().to_string(),"text":"AFTER_EXPIRY"})).await.0,
+            call(expiry.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","request_epoch":epoch,"foreground_generation":listener.foreground_generation().to_string(),"text":""})).await.0,
             0,
             "an expired permit must not still hold the one-writer lease"
         );
