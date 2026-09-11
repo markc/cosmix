@@ -830,10 +830,18 @@ impl Owner {
             let editing = self.editor.state() == State::Editing;
             // §8's human-first rule has to hold through the RESERVATION too, not
             // just while editing. The window is cooked mode with kernel echo and
-            // an unpolled tty: a keystroke that lands there would be echoed into
-            // the announcement line and then handed to the admitted execution as
-            // stdin. Watching the descriptor is what lets the human's byte
-            // refuse the admission instead of being eaten by it.
+            // an unpolled tty: input landing there would be echoed into the
+            // announcement line and then handed to the admitted execution as
+            // stdin. Watching the descriptor is what lets the human refuse the
+            // admission instead of being eaten by it.
+            //
+            // LIMIT, stated because it is not obvious: the window is CANONICAL
+            // mode, so the line discipline holds a partial line and `poll` sees
+            // nothing until Enter. This therefore defends a completed line —
+            // the case where a whole human command would otherwise be consumed
+            // as somebody else's stdin — and not a half-typed one. Closing that
+            // needs the mode restore moved from reservation time to commit
+            // time, which is a change to the stage-C editor protocol.
             let reserved = self.reserved_until.is_some();
             let ready = input::wait(
                 (editing || reserved).then(|| self.terminal.fd()),

@@ -1919,19 +1919,26 @@ fn stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact() {
                     .map_err(|e| e.to_string())
             }
         });
-        // Land the keystroke inside the reservation window.
+        // Land the input inside the reservation window.
+        //
+        // A COMPLETE line, deliberately. The window is cooked mode, and a
+        // canonical line discipline does not make a partial line readable —
+        // `poll` cannot see it until Enter. So this is the boundary the fix
+        // actually defends: a human who finishes a line during the window has
+        // their line run, instead of it being swallowed as stdin by an
+        // execution they never asked for. The partial-keystroke case is
+        // documented as a residual, not asserted here as though it were
+        // covered.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        f.child.send("print(\"HUMAN");
+        f.child.send("print(\"HUMAN_WINS\")\n");
         let outcome = tokio::time::timeout(Duration::from_secs(10), submitting)
             .await
             .expect("the submission must answer")
             .unwrap();
-        let error = outcome.expect_err("a human keystroke must refuse the admission");
+        let error = outcome.expect_err("a human line must refuse the admission");
         assert!(error.contains("BUSY"), "{error}");
 
-        // The human's bytes are intact and still editable: finishing the line
-        // runs exactly what they typed, and nothing else.
-        f.child.send("_WINS\")\n");
+        // The human's line ran, and the agent's did not.
         let pane = f.child.until("HUMAN_WINS\r\n");
         assert!(!pane.contains("STOLEN"), "the agent's line ran: {pane}");
         teardown(f).await;
