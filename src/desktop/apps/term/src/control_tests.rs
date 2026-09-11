@@ -403,7 +403,13 @@ fn p0i_07_real_recipient_both_policies() {
                 body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
                 assert_eq!(call(bound.client(), &parent.name, verb, body).await.0, 0, "{policy:?} {verb}");
             }
-            assert_eq!(call(bound.client(), &parent.name, "term.execute", json!({"target":target})).await, (10,json!({"error_code":"UNSUPPORTED"})));
+            // Stage D made `execute` real, so an authorised caller no longer
+            // gets the "unimplemented" answer — it gets the schema refusal for
+            // a submission that names no source and no generation. What has NOT
+            // changed is that an unauthorised caller is refused above, before
+            // any of this is visible. The full forwarding path is
+            // p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges.
+            assert_eq!(call(bound.client(), &parent.name, "term.execute", json!({"target":target})).await, (10,json!({"error_code":"INVALID_ARGUMENT"})));
             let state = call(bound.client(), &parent.name, "term.session", json!({"target":target})).await.1;
             let request = json!({"target":target,"request_id":"3","foreground_generation":state["foreground_generation"].as_u64().unwrap().to_string(),"text":"S4_INPUT"});
             let first = call(bound.client(), &parent.name, "term.type", request.clone()).await;
@@ -1448,4 +1454,171 @@ fn default_child_capabilities_cover_every_dispatchable_verb() {
     // And the reverse: a capability nobody routes to is dead weight in every
     // grant, so the two tables have to stay the same size.
     assert_eq!(granted.len(), 6, "granted capabilities: {granted:?}");
+}
+
+// ---------------------------------------------------------------------------
+// P0-J stage D: BROKER-023 `execute`, end to end through the real Term.
+
+/// Ask the CHILD directly. Term forwards executions; it does not observe the
+/// child's prompt, and a test that read the generation from Term would be
+/// asserting against a number nobody publishes.
+async fn shell_status(client: &NodedClient, child: &SessionRecord) -> Value {
+    let body = json!({"version":1,"target":{
+        "broker_epoch":child.broker_epoch,
+        "record":child.reference(),
+        "instance_id":child.instance_id,
+        "pane_id":child.pane_id,
+        "pane_generation":child.pane_generation,
+    }});
+    raw(client, &child.name, "shell.status", &body).await.1
+}
+
+async fn idle_generation(client: &NodedClient, child: &SessionRecord) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = shell_status(client, child).await;
+        if status["status"]["snapshot"]["phase"] == "prompt-ready"
+            && status["status"]["snapshot"]["continuation"] == false
+        {
+            return status["status"]["snapshot"]["prompt_generation"]
+                .as_str()
+                .expect("decimal-string generation")
+                .to_owned();
+        }
+        assert!(Instant::now() < deadline, "child never idled: {status}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[test]
+#[ignore = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit stage-D gate only"]
+fn p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges() {
+    eprintln!("{REQUIRE_MIX}");
+    let fixture = Fixture::new(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let owner = verified(&fixture.broker).await;
+        let (parent, child) = fixture.records(&owner, 1).await;
+        let target = target(&parent, &child);
+        let generation = idle_generation(owner.client(), &child).await;
+
+        // A submission that names no source cannot be a submission. This is the
+        // schema refusal, and it happens before anything is forwarded.
+        assert_eq!(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.execute",
+                json!({"target":target,"request_id":"1","prompt_generation":generation})
+            )
+            .await,
+            (10, json!({"error_code":"INVALID_ARGUMENT"}))
+        );
+
+        // The real thing: Term forwards, the child admits, and the answer that
+        // comes back is the CHILD's, carrying the operation id the child minted.
+        let submission = json!({
+            "target": target, "request_id": "2",
+            "prompt_generation": generation,
+            "source": "print(\"TERM_EXEC_OK\")",
+        });
+        let accepted = call(owner.client(), &parent.name, "term.execute", submission.clone()).await;
+        assert_eq!(accepted.0, 0, "{accepted:?}");
+        assert_eq!(accepted.1["status"], "accepted");
+        let operation = accepted.1["operation_id"].clone();
+        assert!(operation.is_string(), "{accepted:?}");
+        // Term stamps the caller's own target back on, so a reply is
+        // recognisable as belonging to the request that was sent to Term.
+        assert_eq!(accepted.1["target"], json!(target));
+
+        // The result family resolves the same operation through Term.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let result = loop {
+            let reply = call(
+                owner.client(),
+                &parent.name,
+                "term.exec.result",
+                json!({"target":target,"operation_id":operation}),
+            )
+            .await;
+            assert_eq!(reply.0, 0, "{reply:?}");
+            if reply.1["state"] == "finished" {
+                break reply.1;
+            }
+            assert!(Instant::now() < deadline, "never finished: {reply:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(result["result"]["outcome"], "completed", "{result}");
+
+        // BROKER-018 across BOTH hops: the identical retry answers from Term's
+        // own record and never reaches the child a second time.
+        let replay = call(owner.client(), &parent.name, "term.execute", submission).await;
+        assert_eq!(replay, accepted, "a retry must replay, not re-execute");
+        let snapshot = call(
+            owner.client(),
+            &parent.name,
+            "term.snapshot",
+            json!({"target":target,"contents":true}),
+        )
+        .await;
+        assert_eq!(
+            snapshot.1["text"].as_str().unwrap().matches("TERM_EXEC_OK").count(),
+            // Once as the admission echo, once as the output. A third would be
+            // a second execution.
+            2,
+            "exactly one execution reached the pane: {}",
+            snapshot.1["text"]
+        );
+
+        // The child's refusals are RELAYED, not replaced: BUSY and
+        // STALE_GENERATION tell a caller two different things to do next.
+        let stale = call(
+            owner.client(),
+            &parent.name,
+            "term.execute",
+            json!({"target":target,"request_id":"3","prompt_generation":generation,
+                   "source":"print(\"NEVER\")"}),
+        )
+        .await;
+        assert_eq!(stale.1["error_code"], "STALE_GENERATION", "{stale:?}");
+
+        // Cancellation resolves through the same family, and an id this shell
+        // never admitted addresses nothing.
+        let unknown = call(
+            owner.client(),
+            &parent.name,
+            "term.exec.cancel",
+            json!({"target":target,"operation_id":"9999"}),
+        )
+        .await;
+        assert_eq!(unknown.1["error_code"], "UNKNOWN_OUTCOME", "{unknown:?}");
+        let finished = call(
+            owner.client(),
+            &parent.name,
+            "term.exec.cancel",
+            json!({"target":target,"operation_id":operation}),
+        )
+        .await;
+        assert_eq!(finished.0, 0, "{finished:?}");
+        assert_eq!(finished.1["outcome"], "already_finished");
+
+        // An unverified peer never reaches any of it.
+        let tcp = NodedClient::connect_anonymous(&fixture.broker.url).await.unwrap();
+        for verb in ["term.execute", "term.exec.result", "term.exec.cancel"] {
+            forbidden(call(&tcp, &parent.name, verb, json!({"target":target})).await);
+        }
+
+        // A pane generation that is not this child's is not this child. Term
+        // must not forward to whatever happens to be bound now.
+        let mut wrong = target;
+        wrong.pane_generation = DecimalU64(wrong.pane_generation.0 + 1);
+        let reply = call(
+            owner.client(),
+            &parent.name,
+            "term.execute",
+            json!({"target":wrong,"request_id":"4","prompt_generation":generation,
+                   "source":"print(\"NEVER\")"}),
+        )
+        .await;
+        assert_eq!(reply, (10, json!({"error_code":"FORBIDDEN"})), "{reply:?}");
+    });
 }
