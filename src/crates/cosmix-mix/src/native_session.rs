@@ -42,6 +42,7 @@ static RESTART: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<RestartAc
 /// The shell's two exec-restart paths call this before replacing the process.
 /// This is intentionally not a builtin: it can only stop the private owner.
 pub(super) fn before_exec_restart() {
+    crate::session_state::commit(crate::session_state::Transition::ShellReplacement);
     let Some(sender) = RESTART.get() else {
         return;
     };
@@ -232,6 +233,7 @@ pub(super) fn start() {
     // makes later runtime/worker failures incapable of leaving inherited fds.
     quarantine_failed_bootstrap();
     // Snapshot every env-derived input while main is still single-threaded.
+    crate::session_state::enable();
     // The evaluator may later mutate environ; the resident must never read it.
     let account = std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
     let environment = crate::node_config::NativeEnvironment::capture();
@@ -633,9 +635,13 @@ async fn own(
                         pending = None;
                         next_attempt = Instant::now() + NOTICE_COALESCING_FLOOR;
                         match bootstrap.attach(&connection, &hello, reporter).await {
-                            Ok(bound) => { last_record = Some(bound.clone()); record = Some(bound); failures = 0; proof_retries = ProofRetries::default(); }
+                            Ok(bound) => {
+                                crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: Some((&bound).into()) });
+                                last_record = Some(bound.clone()); record = Some(bound); failures = 0; proof_retries = ProofRetries::default();
+                            }
                             Err(error) => {
                                 record = None;
+                                crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: None });
                                 if error.wake { reporter.wake(); } else { reporter.report(error.stage); }
                                 match error.recovery {
                                     Recovery::Reconnect => break true,
@@ -676,12 +682,18 @@ async fn own(
                         };
                         if relevant {
                             record = None;
+                            crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: None });
                             pending.get_or_insert(next_attempt);
                         }
+                    } else if let Some(bound) = &record {
+                        crate::session_status::dispatch(&connection, &hello, bound, &event).await;
                     }
                 }
             }
         };
+        crate::session_state::commit(crate::session_state::Transition::AttachmentChanged {
+            source: None,
+        });
         close(&connection).await;
         if !reconnect {
             return;

@@ -48,8 +48,7 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     if !matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
         return;
     }
-    let _stop_handler = (signal == libc::SIGTSTP)
-        .then(crate::editor::signals::StopHandler::enter);
+    let _stop_handler = (signal == libc::SIGTSTP).then(crate::editor::signals::StopHandler::enter);
     // One decision: a managed-job transition must not skip routing and then
     // take the default branch on a second, different observation.
     let managed = MANAGED_FOREGROUND.load(Ordering::Acquire);
@@ -60,10 +59,7 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     // SIGTTIN always stops: retrying a background terminal read would spin.
     // Every operation here is async-signal-safe; no locks or allocation.
     unsafe {
-        if signal == libc::SIGTSTP
-            && !managed
-            && crate::editor::signals::request_stop()
-        {
+        if signal == libc::SIGTSTP && !managed && crate::editor::signals::request_stop() {
             libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
             return;
         }
@@ -489,6 +485,9 @@ impl Controller {
         *self.shared.shell_modes.lock().unwrap() = saved;
         foreground(self.tty.as_raw_fd(), pgid)?;
         MANAGED_FOREGROUND.store(true, Ordering::Release);
+        crate::session_state::commit(crate::session_state::Transition::ForegroundChanged {
+            active: true,
+        });
         Ok(TerminalLease {
             controller: self,
             saved,
@@ -735,6 +734,9 @@ impl Drop for TerminalLease<'_> {
         }) {
             eprintln!("mix: terminal restore: {e}");
         }
+        crate::session_state::commit(crate::session_state::Transition::ForegroundChanged {
+            active: false,
+        });
     }
 }
 

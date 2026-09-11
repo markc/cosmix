@@ -352,6 +352,7 @@ pub fn builtin_cd(args: &[String]) -> i32 {
         eprintln!("cd: {}: {}", target, e);
         return 1;
     }
+    crate::session_state::observe_directory();
 
     // SAFETY: Mix is single-threaded.
     unsafe {

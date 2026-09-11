@@ -114,7 +114,14 @@ impl ReplEditor {
     }
     pub fn readline(&mut self, prompt: &str, continuation: bool) -> rustyline::Result<String> {
         match self {
-            Self::Legacy(editor) => editor.readline(prompt),
+            Self::Legacy(editor) => {
+                // Legacy has no activation acknowledgement; this is the last
+                // observed readline boundary, never an admission permit.
+                crate::session_state::commit(crate::session_state::Transition::PromptReady {
+                    continuation,
+                });
+                editor.readline(prompt)
+            }
             Self::Owned {
                 editor,
                 helper,
@@ -139,6 +146,9 @@ impl ReplEditor {
                     helper.as_ref().map(MixHelper::snapshot).unwrap_or_default(),
                     Vec::new(),
                 )?;
+                crate::session_state::commit(crate::session_state::Transition::PromptReady {
+                    continuation,
+                });
                 match editor.readline()? {
                     Line::Submitted(line) => Ok(line),
                     Line::Interrupted => Err(ReadlineError::Interrupted),
