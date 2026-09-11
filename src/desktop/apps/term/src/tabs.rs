@@ -307,6 +307,9 @@ impl TabSet {
     pub fn active_tab(&self) -> &Tab {
         &self.tabs[self.active]
     }
+    /// Implicit active-pane selection. BROKER-023 refuses it for protected
+    /// control, so only the cfg(test) legacy handler and fixtures may use it.
+    #[cfg(test)]
     pub fn active_pane_terminal(&self) -> Arc<Mutex<Terminal>> {
         let tab = self.active_tab();
         tab.tree
@@ -337,7 +340,7 @@ impl TabSet {
         self.invalidate_tab_control(self.active_id());
     }
     fn invalidate_tab_control(&self, tab: u64) {
-        for (id, pane) in &self.metadata {
+        for (id, pane) in self.metadata.iter() {
             if self.control_tab(*id) == Some(tab) {
                 pane.control.revoke_control();
             }
