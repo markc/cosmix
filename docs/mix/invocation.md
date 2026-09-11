@@ -60,6 +60,13 @@ as `interactive`, `script`, `c`, `stdin`, or `serve`. Set `MIX_STATS=off` (also
 `0` or `false`) to skip collection and all stats I/O. See [usage
 statistics](stats.md).
 
+When Term supplies a native-session launch fd, Mix consumes and closes it and
+scrubs `COSMIX_SESSION_FD` before startup hooks or user source. Binding and renews
+run on a private resident thread; the seed has no Mix language or `mix context`
+representation. Invalid bootstrap input reports the failed stage and leaves the
+shell usable. Without the marker, all entry modes keep their ordinary silent
+startup path. See the [Term launch contract](../cos/term-native-session.md).
+
 ## Running a script file
 
 The first non-flag argument is the script path; everything after it is passed to

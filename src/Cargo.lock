@@ -1002,6 +1002,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "corcovado"
+version = "0.5.27"
+source = "git+https://github.com/raphamorim/rio?rev=932c1a7d9e07b4db5924f7a0dd689e823c3a1442#932c1a7d9e07b4db5924f7a0dd689e823c3a1442"
+dependencies = [
+ "libc",
+ "miow 0.5.0",
+ "tracing",
+ "windows-sys 0.42.0",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1462,7 +1473,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "signal-hook",
+ "signal-hook 0.3.18",
  "tokio",
  "toml",
  "tracing",
@@ -1753,6 +1764,7 @@ dependencies = [
  "cosmix-lib-mix",
  "cosmix-lib-props-core",
  "dirs",
+ "ed25519-dalek",
  "glob",
  "indexmap",
  "libc",
@@ -1761,14 +1773,18 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
- "signal-hook",
+ "sha2",
+ "signal-hook 0.3.18",
+ "teletypewriter",
  "tempfile",
+ "term-native-test-broker",
  "tokio",
  "tokio-util",
  "tracing",
  "unicode-segmentation",
  "unicode-width",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -4501,6 +4517,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "miow"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ffbca2f655e33c08be35d87278e5b18b89550a37dbd598c20db92f6a471123"
+dependencies = [
+ "windows-sys 0.42.0",
+]
+
+[[package]]
+name = "miow"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "mix-bench"
 version = "0.1.0"
 dependencies = [
@@ -6556,6 +6590,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6830,6 +6874,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teletypewriter"
+version = "0.5.27"
+dependencies = [
+ "corcovado",
+ "dirs",
+ "libc",
+ "miow 0.6.1",
+ "parking_lot",
+ "signal-hook 0.4.4",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6840,6 +6898,35 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "term-native-test-broker"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "chrono",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-mesh",
+ "cosmix-lib-mesh-trust",
+ "cosmix-lib-props-store",
+ "ed25519-dalek",
+ "futures-util",
+ "libc",
+ "notify",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8006,6 +8093,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
 dependencies = [
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a3e1820f08b8513f676f7ab6c1f99ff312fb97b553d30ff4dd86f9f15728aa7"
+dependencies = [
+ "windows_aarch64_gnullvm 0.42.2",
+ "windows_aarch64_msvc 0.42.2",
+ "windows_i686_gnu 0.42.2",
+ "windows_i686_msvc 0.42.2",
+ "windows_x86_64_gnu 0.42.2",
+ "windows_x86_64_gnullvm 0.42.2",
+ "windows_x86_64_msvc 0.42.2",
 ]
 
 [[package]]

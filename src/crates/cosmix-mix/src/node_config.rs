@@ -96,6 +96,39 @@ pub fn resolve_noded_url() -> String {
         .unwrap_or_else(|| FALLBACK_URL.to_string())
 }
 
+/// Required native-session connections must not fall through a broken explicit
+/// configuration. Keep the ordinary lazy TCP resolver's behaviour unchanged.
+pub fn native_endpoint() -> Result<Option<PathBuf>, &'static str> {
+    for path in search_paths() {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                return parse_native_endpoint(&contents);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("unreadable node configuration"),
+        }
+    }
+    Ok(None)
+}
+
+fn parse_native_endpoint(contents: &str) -> Result<Option<PathBuf>, &'static str> {
+    // Keep this schema separate: malformed native-only settings must not
+    // change the legacy TCP resolver when no launch descriptor is present.
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct NativeConfig {
+        noded: NativeNoded,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct NativeNoded {
+        unix_socket: Option<PathBuf>,
+    }
+    let config: NativeConfig =
+        cosmix_mix::from_conf_mix_str(contents).map_err(|_| "invalid node configuration")?;
+    Ok(config.noded.unix_socket)
+}
+
 /// Walk `search_paths()` until the first **existing** file. Return the
 /// parse result for that one file — success → Some, parse error → None
 /// (caller falls back to loopback). **Does NOT continue searching past
@@ -154,6 +187,23 @@ fn load_from(path: &Path) -> Option<MixNodeConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_endpoint_is_typed_without_changing_legacy_url_parsing() {
+        let valid = "noded: { unix_socket: \"/run/cosmix/noded/bus.sock\" }";
+        assert_eq!(
+            parse_native_endpoint(valid).unwrap(),
+            Some(PathBuf::from("/run/cosmix/noded/bus.sock"))
+        );
+        let invalid = "wg_ip: \"192.0.2.5\"\nnoded: { port: 4300, unix_socket: 7 }";
+        assert!(parse_native_endpoint(invalid).is_err());
+        let legacy: MixNodeConfig = cosmix_mix::from_conf_mix_str(invalid).unwrap();
+        assert_eq!(legacy.broker_url(), "ws://192.0.2.5:4300/ws");
+        assert_eq!(
+            parse_native_endpoint("noded: { port: 4300 }").unwrap(),
+            None
+        );
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let d =

@@ -25,8 +25,8 @@ const STOP_BUDGET: Duration = Duration::from_secs(8);
 const STARTUP_BUDGET: Duration = Duration::from_millis(900);
 const PRESENCE_MS: u64 = 5 * 60 * 1000;
 const MINT_FLOOR: Duration = Duration::from_secs(60);
-// Four two-second RPC budgets (connect/hello/challenge/prove), plus spawn slack.
-const LAUNCH_MARGIN_MS: u64 = 10_000;
+// Five two-second budgets (connect/hello/challenge/list/prove), plus spawn slack.
+const LAUNCH_MARGIN_MS: u64 = 12_000;
 
 fn clock_ms() -> Option<u64> {
     let mut time = libc::timespec {
@@ -2200,9 +2200,7 @@ pub(crate) mod tests {
         });
     }
 
-    #[test]
-    #[ignore = "S3 Mix slice: consume memfd before hooks and prove over real PTY"]
-    fn mix_child_bootstrap_proves_end_to_end() {
-        panic!("Implement with the child-side bootstrap slice; never count this seam as passing");
-    }
+    // The completed mix_child_bootstrap_proves_end_to_end fixture lives in
+    // cosmix-mix/tests/native_session_pty.rs, where Cargo supplies the actual
+    // built Mix binary. It embeds this app's session_fd and real noded support.
 }

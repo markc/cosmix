@@ -30,8 +30,8 @@ Unbound running panes are not retroactively bootstrapped.
 The mint floor starts at the create acknowledgement (or uncertain timeout),
 so RPC latency cannot shorten the interval between issued names.
 
-A bundle needs at least ten seconds remaining at consumption: four two-second
-connect/hello/challenge/prove budgets plus spawn slack. Short-window bundles
+A bundle needs at least twelve seconds remaining at consumption: five two-second
+connect/hello/challenge/list/prove budgets plus spawn slack. Short-window bundles
 take the unbound fallback and the pool subsequently refreshes under presence
 and its mint floor. Reconnection and reconciliation first withdraw shared
 readiness and invalidate the old consumption latches, before any await. The
@@ -134,11 +134,51 @@ purpose. `ChallengeResult::sign` checks it and the current broker epoch against
 the independent expectations before signing. A broker restart requires a fresh
 hello and parent-confirmed replacement scope, retaining the parent key hash.
 
-The next Mix slice must read and validate this layout before hooks or user
-source, close the descriptor, remove the marker, retain the signing key outside
-the language surface, and use authenticated key-selected challenges for recovery.
-The full child-proves-over-real-PTY acceptance seam is
-`mix_child_bootstrap_proves_end_to_end`.
+Mix consumes this layout at the first instruction of its application main,
+before the job-control stage entry, evaluator thread, startup hooks or user
+source. It removes the marker immediately, quarantines and owns valid fds >=3,
+checks all four seals, anonymous regular-file status, exact bounded length,
+version and descriptor/key scope, then closes the fd on success or failure.
+Public JSON and the seed are read with separate `pread` calls. The inherited
+offset and stale lease field never affect validation. Invalid stdio markers
+are removed without touching the corresponding descriptor.
+
+The binary-only `cosmix-mix/src/native_session.rs` module keeps the 32-byte seed
+in private `Zeroizing<[u8; 32]>` storage. It moves into a dedicated resident
+thread with its own Tokio runtime; temporary Ed25519 signing keys zeroize on
+drop. The evaluator library cannot import the executable, and no builtin,
+variable, property, context object or Bus handler receives the seed, bootstrap
+object or an attachment-owner handle. Mix adds no language surface for binding.
+The existing diagnostic Bus runtime is independent. A later child receives
+neither the launch descriptor nor its marker.
+
+The resident task performs verified Unix connect, hello, key-selected challenge,
+owner-UID session discovery and prove, then renews every five seconds. Immutable
+expectations come from the launch descriptor. Fresh authenticated discovery
+determines enrol versus resume and the parent incarnation, independently of the
+challenge; hello supplies the epoch. Signing still checks the retained parent
+key hash, UID, pane, role and capability hashes. Pane high-water advances within
+one parent domain and resets only on authenticated parent/epoch replacement,
+with parent-key continuity checked before committing the reset. Same-record
+resumption increments binding generation; a new broker epoch creates a new
+record whose initial attachment generation is 1, not the old generation plus 1.
+
+No marker means an immediate silent return, with no configuration lookup,
+thread, runtime or broker connection. A present invalid bootstrap produces one
+stage-labelled diagnostic and ordinary shell execution continues. Binding RPCs
+never block the evaluator. Transport recovery makes at most six attempts with
+delays of 5, 10, 20, 40 and 40 seconds; verification/profile failures stop
+immediately without downgrade. On a live connection, absent/refused key lookup
+retains broker wake interest and waits for a lifecycle notice or gap, not a
+polling timer. Recovery events coalesce behind a five-second attempt floor;
+same-generation attached notices cannot produce a self-resume loop. A wake
+quota refusal is reported and permits only one delayed retry after 60 seconds.
+If that fails to obtain either a challenge or interest, the owner stops.
+Repeated failures are suppressed after the first diagnostic. A later wake-quota
+failure has its own once-only diagnostic, as BROKER-019 explicitly requires;
+neither its fallback retry nor subsequent reconnects repeat it.
+Exiting Mix never joins this task:
+the process closes its connection and Term's child-exit handler owns revocation.
 
 Pane close invalidates local session state before removing metadata or queuing
 cleanup. The cleanup worker waits up to three seconds for a revoke attempt.
@@ -191,6 +231,18 @@ are rejected before any quarantine syscall.
 
 Each fixture owns a separate runtime so a bounce drops accepted sockets and all
 background tasks, not just listeners. It neither changes noded's production
-API nor simulates its command engine. The Mix end-to-end seam is explicitly
-ignored pending the child slice. Test and clippy results are supplied by the
-orchestrator; this document records implementation and test inventory only.
+API nor simulates its command engine. The completed
+`cosmix-mix/tests/native_session_pty.rs::mix_child_bootstrap_proves_end_to_end`
+test embeds Term's actual LaunchFd implementation and pinned PTY hook, spawns
+Cargo's built Mix binary and asserts initial attachment generation 1, renewals
+beyond 15 seconds, scrubbed rc/context/descendant state and post-exit revocation.
+Its parent fixture drives Term's typed allocate/renew/re-grant/revoke duties;
+the GUI and exit-notifier ordering remain covered by the Term workspace tests.
+A second real-PTY test keeps the same child alive across parent resumption and
+broker bounce, including child-first wake registration and pane generation
+2 to 1 under a replacement parent. Mix unit/process tests cover seals, layout,
+UID/key/scope substitution, offset independence, stale lease non-use, marker
+scrubbing, stdio protection, missing-marker silence and the absence of any new
+builtin or evaluator route. No end-to-end seam remains ignored.
+Test and clippy results are supplied by the orchestrator; this document records
+implementation and test inventory only.

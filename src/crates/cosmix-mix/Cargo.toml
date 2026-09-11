@@ -62,6 +62,9 @@ ureq = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rusqlite.workspace = true
 blake3 = "1"
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+zeroize = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Property-based testing for the shell-dispatch tokenizer (P0 of the mix
@@ -69,6 +72,9 @@ blake3 = "1"
 # in the cosmix hub). Test-only; never linked into the shipped binary.
 proptest = "1"
 tempfile = "3"
+term-native-test-broker = { path = "../../desktop/apps/term/tests/support" }
+# The S3 fixture uses Term's actual sealed-fd implementation and pinned PTY hook.
+teletypewriter = { path = "../../desktop/vendor/teletypewriter" }
 
 [build-dependencies]
 # Captures mix HEAD sha + build time for serve-citizen provenance.
