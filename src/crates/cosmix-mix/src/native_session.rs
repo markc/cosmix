@@ -697,8 +697,8 @@ async fn own(
                         }
                     } else if command.id.is_some() {
                         let connection = connection.clone();
-                        if requests.len() < 4 && record.is_some() {
-                            let bound = record.as_ref().unwrap().clone();
+                        if requests.len() < 4 && let Some(bound) = record.as_ref() {
+                            let bound = bound.clone();
                             let hello = hello.clone();
                             requests.spawn(async move {
                                 crate::session_status::dispatch(&connection, &hello, &bound, &event).await;
