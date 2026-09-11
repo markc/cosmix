@@ -1,10 +1,11 @@
 //! Private BROKER-019 bootstrap and BROKER-020 attachment owner.
 //!
-//! This binary-only module has one entry point, called before any threads,
+//! This binary-only module has a startup entry point, called before any threads,
 //! startup hooks, evaluator or user source. The evaluator library cannot import
 //! the binary. No Value, Environment, builtin, property, bus handler or context
 //! object ever receives Bootstrap, its seed, or an owner handle. The resident
 //! thread alone owns the Zeroizing seed; temporary SigningKeys zeroize on drop.
+//! A separate exec-restart signal can only stop the owner; it exposes no state.
 //! Ordinary shells without the marker return before config, allocation or I/O.
 
 use cosmix_lib_bus::native_session::*;
@@ -24,9 +25,40 @@ use zeroize::Zeroizing;
 const MARKER: &str = "COSMIX_SESSION_FD";
 const SEALS: i32 = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
 const RPC: Duration = Duration::from_secs(2);
-const FLOOR: Duration = Duration::from_secs(5);
+// BROKER-020: renew every 5s, lease expires 15s after the last renewal.
+const RENEW_CADENCE: Duration = Duration::from_secs(5);
+const _: () = assert!(RENEW_CADENCE.as_secs() * 3 <= 15);
+const CONNECT_BACKOFF_BASE: Duration = Duration::from_secs(5);
+const PROOF_RETRY_FLOOR: Duration = Duration::from_secs(5);
+const NOTICE_COALESCING_FLOOR: Duration = Duration::from_secs(5);
+const PROOF_RETRY_CAP: u32 = 3;
 const WAKE_RETRY: Duration = Duration::from_secs(60);
 const CONNECT_CAP: u32 = 6;
+type RestartAck = std::sync::mpsc::SyncSender<bool>;
+// Control only: no key, descriptor, scope, record or evaluator value is shared.
+static RESTART: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<RestartAck>> =
+    std::sync::OnceLock::new();
+
+/// The shell's two exec-restart paths call this before replacing the process.
+/// This is intentionally not a builtin: it can only stop the private owner.
+pub(super) fn before_exec_restart() {
+    let Some(sender) = RESTART.get() else {
+        return;
+    };
+    let (ack, receiver) = std::sync::mpsc::sync_channel(1);
+    let revoked = sender.send(ack).is_ok()
+        && receiver
+            .recv_timeout(Duration::from_secs(16))
+            .unwrap_or(false);
+    eprintln!(
+        "mix native-session: exec restart leaves this pane unbound until pane restart; {}",
+        if revoked {
+            "record revoked"
+        } else {
+            "revocation unconfirmed; remaining records expire by lease/window"
+        }
+    );
+}
 
 // Deliberately no Debug, Clone, Serialize, accessor or shared/static storage.
 struct Bootstrap {
@@ -34,6 +66,10 @@ struct Bootstrap {
     scope: ExpectedScope,
     parent: (HexBytes<16>, HexBytes<16>),
     public_key: HexBytes<32>,
+    #[cfg(test)]
+    proof_delay_once: Duration,
+    #[cfg(test)]
+    proof_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn marker_fd(value: &std::ffi::OsStr) -> Result<RawFd, &'static str> {
@@ -47,6 +83,40 @@ fn marker_fd(value: &std::ffi::OsStr) -> Result<RawFd, &'static str> {
 /// Sole caller is main, before starting any threads. Removing the marker here
 /// also scrubs malformed input; no later exec or environment import sees it.
 fn consume() -> Result<Option<Bootstrap>, &'static str> {
+    let result = consume_inner();
+    if result.is_err() {
+        quarantine_failed_bootstrap();
+    }
+    result
+}
+
+// Startup only, before any other threads or descriptor-owning application
+// objects exist. A malformed marker may name the wrong fd: close every named
+// launch memfd, including duplicates. Never touch stdio or unrelated memfds.
+fn quarantine_failed_bootstrap() {
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        let descriptors: Vec<_> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let fd = entry.file_name().to_str()?.parse::<RawFd>().ok()?;
+                let target = std::fs::read_link(entry.path()).ok()?;
+                (fd >= 3
+                    && target
+                        .to_string_lossy()
+                        .trim_start_matches('/')
+                        .starts_with("memfd:cosmix-session"))
+                .then_some(fd)
+            })
+            .collect();
+        for fd in descriptors {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+fn consume_inner() -> Result<Option<Bootstrap>, &'static str> {
     let Some(value) = std::env::var_os(MARKER) else {
         return Ok(None);
     };
@@ -128,6 +198,10 @@ fn parse(file: &File) -> Result<Bootstrap, &'static str> {
         seed,
         parent,
         public_key,
+        #[cfg(test)]
+        proof_delay_once: Duration::ZERO,
+        #[cfg(test)]
+        proof_attempts: Default::default(),
         scope: ExpectedScope {
             broker_epoch: record.broker_epoch,
             purpose: Purpose::Enrol,
@@ -152,17 +226,28 @@ pub(super) fn start() {
             return;
         }
     };
+    // Also remove duplicate launch descriptors before threads start. This
+    // makes later runtime/worker failures incapable of leaving inherited fds.
+    quarantine_failed_bootstrap();
+    // Snapshot every env-derived input while main is still single-threaded.
+    // The evaluator may later mutate environ; the resident must never read it.
+    let account = std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
+    let endpoint = crate::node_config::native_endpoint();
+    let url = crate::node_config::resolve_noded_url();
+    let options = match options(account, endpoint) {
+        Ok(options) => options,
+        Err(stage) => {
+            quarantine_failed_bootstrap();
+            loud(stage);
+            return;
+        }
+    };
+    let (sender, restart) = tokio::sync::mpsc::unbounded_channel();
+    let _ = RESTART.set(sender);
     if std::thread::Builder::new()
         .name("mix-native-session".into())
         .spawn(move || {
             let mut reporter = Reporter::default();
-            let options = match options() {
-                Ok(options) => options,
-                Err(stage) => {
-                    reporter.report(stage);
-                    return;
-                }
-            };
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -173,7 +258,7 @@ pub(super) fn start() {
                     return;
                 }
             };
-            runtime.block_on(own(bootstrap, options, &mut reporter));
+            runtime.block_on(own(bootstrap, options, url, &mut reporter, restart));
             runtime.shutdown_timeout(Duration::from_millis(100));
         })
         .is_err()
@@ -184,11 +269,12 @@ pub(super) fn start() {
     // Term's real child-exit path owns revocation; abrupt exit also closes UDS.
 }
 
-fn options() -> Result<UnixConnectOptions, &'static str> {
-    let name = std::ffi::CString::new(
-        std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into()),
-    )
-    .map_err(|_| "configuration: invalid broker account")?;
+fn options(
+    account: String,
+    endpoint: Result<Option<std::path::PathBuf>, &'static str>,
+) -> Result<UnixConnectOptions, &'static str> {
+    let name =
+        std::ffi::CString::new(account).map_err(|_| "configuration: invalid broker account")?;
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0u8; 65536];
@@ -211,8 +297,8 @@ fn options() -> Result<UnixConnectOptions, &'static str> {
         uid: entry.pw_uid,
         gid: entry.pw_gid,
     });
-    options.configured_endpoint = crate::node_config::native_endpoint()
-        .map_err(|_| "configuration: invalid native-session endpoint configuration")?;
+    options.configured_endpoint =
+        endpoint.map_err(|_| "configuration: invalid native-session endpoint configuration")?;
     options.require_native_session = true;
     Ok(options)
 }
@@ -246,6 +332,7 @@ impl Reporter {
 
 enum Recovery {
     Reconnect,
+    FreshChallenge,
     Wait,
     Stop,
 }
@@ -258,7 +345,7 @@ impl Failure {
     fn scope() -> Self {
         Self {
             stage: "scope: broker scope does not match retained launch",
-            recovery: Recovery::Stop,
+            recovery: Recovery::Wait,
             wake: false,
         }
     }
@@ -269,9 +356,9 @@ async fn rpc<T>(
 ) -> Result<T, Failure> {
     match tokio::time::timeout(RPC, future).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(SessionFailure::Refused { wake_error, .. })) => Err(Failure {
+        Ok(Err(SessionFailure::Refused { error, wake_error })) => Err(Failure {
             stage,
-            recovery: Recovery::Wait,
+            recovery: refusal_recovery(stage, &error),
             wake: wake_error.is_some(),
         }),
         Ok(Err(SessionFailure::Transport(_))) | Err(_) => Err(Failure {
@@ -284,6 +371,36 @@ async fn rpc<T>(
             recovery: Recovery::Stop,
             wake: false,
         }),
+    }
+}
+
+fn refusal_recovery(stage: &str, error: &SessionError) -> Recovery {
+    let reason = error
+        .details
+        .get("reason")
+        .and_then(serde_json::Value::as_str);
+    if stage.starts_with("prove:")
+        && matches!(
+            (error.error_code, reason),
+            (ErrorCode::Expired, Some("challenge_expired"))
+                | (ErrorCode::Conflict, Some("challenge_consumed"))
+        )
+    {
+        Recovery::FreshChallenge
+    } else {
+        Recovery::Wait
+    }
+}
+
+#[derive(Default)]
+struct ProofRetries(u32);
+impl ProofRetries {
+    fn next(&mut self, now: Instant) -> Option<Instant> {
+        if self.0 >= PROOF_RETRY_CAP {
+            return None;
+        }
+        self.0 += 1;
+        Some(now + PROOF_RETRY_FLOOR)
     }
 }
 
@@ -335,6 +452,9 @@ impl Bootstrap {
         hello: &Hello,
         reporter: &mut Reporter,
     ) -> Result<SessionRecord, Failure> {
+        #[cfg(test)]
+        self.proof_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let challenge = rpc(
             "challenge: key lookup refused or unavailable",
             connection.session_challenge_key(self.public_key),
@@ -344,6 +464,8 @@ impl Bootstrap {
             reporter.wake();
         }
         let wake_failed = challenge.wake_error.is_some();
+        #[cfg(test)]
+        tokio::time::sleep(std::mem::take(&mut self.proof_delay_once)).await;
         let result = rpc(
             "discovery: record lookup failed",
             connection.session_self(challenge.transcript.record_id),
@@ -419,15 +541,24 @@ impl Bootstrap {
     }
 }
 
-async fn own(mut bootstrap: Bootstrap, options: UnixConnectOptions, reporter: &mut Reporter) {
-    let url = crate::node_config::resolve_noded_url();
+async fn own(
+    mut bootstrap: Bootstrap,
+    options: UnixConnectOptions,
+    url: String,
+    reporter: &mut Reporter,
+    mut restart: tokio::sync::mpsc::UnboundedReceiver<RestartAck>,
+) {
     let mut failures = 0;
     loop {
         if failures >= CONNECT_CAP {
             return;
         }
         if failures > 0 {
-            tokio::time::sleep(FLOOR * (1 << (failures - 1).min(3))).await;
+            tokio::select! {
+                biased;
+                Some(ack) = restart.recv() => { let _ = ack.send(false); return; }
+                _ = tokio::time::sleep(CONNECT_BACKOFF_BASE * (1 << (failures - 1).min(3))) => {}
+            }
         }
         failures += 1;
         let result =
@@ -467,26 +598,36 @@ async fn own(mut bootstrap: Bootstrap, options: UnixConnectOptions, reporter: &m
             }
         };
         let mut record: Option<SessionRecord> = None;
+        let mut last_record: Option<SessionRecord> = None;
         let mut pending = Some(Instant::now());
         let mut next_attempt = Instant::now();
         let mut wake_retry_used = false;
-        let mut tick = tokio::time::interval(FLOOR);
+        let mut proof_retries = ProofRetries::default();
+        let mut tick = tokio::time::interval(RENEW_CADENCE);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let reconnect = loop {
             tokio::select! {
                 biased;
+                Some(ack) = restart.recv() => {
+                    let revoked = revoke_for_restart(&connection, record.as_ref().or(last_record.as_ref()), &url, &options).await;
+                    let _ = ack.send(revoked);
+                    break false;
+                }
                 _ = tick.tick() => {
                     if pending.is_some_and(|due| Instant::now() >= due) {
                         pending = None;
-                        next_attempt = Instant::now() + FLOOR;
+                        next_attempt = Instant::now() + NOTICE_COALESCING_FLOOR;
                         match bootstrap.attach(&connection, &hello, reporter).await {
-                            Ok(bound) => { record = Some(bound); failures = 0; }
+                            Ok(bound) => { last_record = Some(bound.clone()); record = Some(bound); failures = 0; proof_retries = ProofRetries::default(); }
                             Err(error) => {
                                 record = None;
                                 if error.wake { reporter.wake(); } else { reporter.report(error.stage); }
                                 match error.recovery {
                                     Recovery::Reconnect => break true,
                                     Recovery::Stop => break false,
+                                    Recovery::FreshChallenge => {
+                                        pending = proof_retries.next(Instant::now());
+                                    }
                                     Recovery::Wait => {
                                         if error.wake && !wake_retry_used {
                                             wake_retry_used = true;
@@ -514,7 +655,11 @@ async fn own(mut bootstrap: Bootstrap, options: UnixConnectOptions, reporter: &m
                         // Authenticated notices are hints, never scope or authority.
                         // Coalesce them behind the floor. Attached notices at our
                         // own generation must not trigger a self-resume feedback loop.
-                        if relevant_notice(&command.command, &command.body, &hello, record.as_ref()) {
+                        let relevant = match relevant_notice(&command.command, &command.body, &hello, record.as_ref()) {
+                            Ok(relevant) => relevant,
+                            Err(_) => { reporter.report("notice decode: malformed lifecycle hint dropped"); false }
+                        };
+                        if relevant {
                             record = None;
                             pending.get_or_insert(next_attempt);
                         }
@@ -531,29 +676,49 @@ async fn own(mut bootstrap: Bootstrap, options: UnixConnectOptions, reporter: &m
     }
 }
 
+async fn revoke_for_restart(
+    connection: &VerifiedConnection,
+    record: Option<&SessionRecord>,
+    url: &str,
+    options: &UnixConnectOptions,
+) -> bool {
+    let Some(record) = record else {
+        return false;
+    };
+    let _ = tokio::time::timeout(RPC, connection.session_revoke(record.reference())).await;
+    // Self-revoke closes its transport before the ACK is guaranteed. Confirm
+    // committed state through an independent authenticated, targeted read.
+    let Ok(Ok(UnixConnectOutcome::VerifiedUnix(observer))) =
+        tokio::time::timeout(RPC, NodedClient::connect_unix("", url, options, None)).await
+    else {
+        return false;
+    };
+    let revoked = matches!(tokio::time::timeout(RPC, observer.session_self(record.record_id)).await,
+        Ok(Ok(result)) if result.record.state == BindingState::Revoked);
+    close(&observer).await;
+    revoked
+}
+
 fn relevant_notice(
     command: &str,
     body: &str,
     hello: &Hello,
     current: Option<&SessionRecord>,
-) -> bool {
+) -> Result<bool, serde_json::Error> {
     #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Notice {
         broker_epoch: HexBytes<16>,
         target: RecordRef,
         state: BindingState,
     }
     #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Gap {
         broker_epoch: HexBytes<16>,
     }
     if command == "noded.session.lifecycle.gap" {
-        return serde_json::from_str::<Gap>(body)
-            .is_ok_and(|gap| gap.broker_epoch == hello.broker_epoch);
+        return serde_json::from_str::<Gap>(body).map(|gap| gap.broker_epoch == hello.broker_epoch);
     }
-    serde_json::from_str::<Notice>(body).is_ok_and(|notice| {
+    serde_json::from_str::<Notice>(body).map(|notice| {
         notice.broker_epoch == hello.broker_epoch
             && current.is_none_or(|current| {
                 notice.target.record_id != current.record_id

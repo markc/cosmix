@@ -95,6 +95,11 @@ number. The anonymous memfd contains exactly these bytes:
 | (5+N)–(36+N) | 32 raw Ed25519 seed bytes, not the expanded 64-byte key |
 | 37+N | Exact EOF; no trailing bytes |
 
+The version byte is the sole extension point. Version 1 locks the exact public
+descriptor schema (`deny_unknown_fields` is deliberate); adding descriptor
+fields requires a new layout version. This differs from lifecycle notices,
+which are extensible hints under BROKER-021.
+
 Term writes the seed separately from the public JSON, seals shrink/grow/write,
 then seals the seal set. Both reserved source and target descriptors are
 CLOEXEC in Term. The pinned teletypewriter patch duplicates source onto target
@@ -142,6 +147,9 @@ version and descriptor/key scope, then closes the fd on success or failure.
 Public JSON and the seed are read with separate `pread` calls. The inherited
 offset and stale lease field never affect validation. Invalid stdio markers
 are removed without touching the corresponding descriptor.
+On bootstrap failure Mix scans `/proc/self/fd` and closes descriptors >=3
+linking to `memfd:cosmix-session*`, even when the marker named the wrong fd.
+Successful consumption also closes duplicate launch fds before starting threads.
 
 The binary-only `cosmix-mix/src/native_session.rs` module keeps the 32-byte seed
 in private `Zeroizing<[u8; 32]>` storage. It moves into a dedicated resident
@@ -152,8 +160,12 @@ object or an attachment-owner handle. Mix adds no language surface for binding.
 The existing diagnostic Bus runtime is independent. A later child receives
 neither the launch descriptor nor its marker.
 
+All environment-derived account, endpoint and URL inputs are captured before
+the evaluator starts. The resident receives owned configuration and never reads
+the process environment concurrently with evaluator `setenv`.
+
 The resident task performs verified Unix connect, hello, key-selected challenge,
-owner-UID session discovery and prove, then renews every five seconds. Immutable
+owner-UID `session.self {record_id}` discovery and prove, then renews every five seconds. Immutable
 expectations come from the launch descriptor. Fresh authenticated discovery
 determines enrol versus resume and the parent incarnation, independently of the
 challenge; hello supplies the epoch. Signing still checks the retained parent
@@ -162,6 +174,23 @@ one parent domain and resets only on authenticated parent/epoch replacement,
 with parent-key continuity checked before committing the reset. Same-record
 resumption increments binding generation; a new broker epoch creates a new
 record whose initial attachment generation is 1, not the old generation plus 1.
+The challenge supplies a record selector only; its scope is checked against the
+retained launch expectation and the independent authenticated read. Enrolment
+and resumption never depend on the diagnostic `session.list` snapshot cap.
+
+Expired or consumed proof challenges receive at most three fresh-challenge
+retries per connection, separated by at least five seconds. Other refusals hold
+for external hints; transport failures use reconnect backoff. Successful proof
+resets the retry budget. Lifecycle notices and gaps tolerate additional fields;
+malformed hints use the once-only diagnostic reporter.
+
+Before either REPL exec-restart path replaces Mix, it signals the private owner
+to revoke its record and waits at most 16 seconds. The owner confirms revocation
+through an independent targeted read because self-revoke can close the socket
+before its ACK arrives. One diagnostic reports the result; an unavailable broker
+leaves cleanup to lease/window expiry. The replacement shell runs normally but
+stays unbound until pane restart: v1 deliberately does not retain the seed over
+exec. A surviving PID alone must not leave a phantom attachment.
 
 No marker means an immediate silent return, with no configuration lookup,
 thread, runtime or broker connection. A present invalid bootstrap produces one

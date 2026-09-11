@@ -283,6 +283,12 @@ derived from authenticated state, never caller assertions.
 | `self` | `{record_id}` | `{record}`; one owner-UID record, including terminal state; absent and foreign-UID IDs both return `FORBIDDEN` |
 | `lease.check` | `{target:ref}` | `{lease_remaining_ms}`; authorised recipient obtains a fresh remaining-lease delta and lifecycle interest |
 
+`self` is an additive bounded discovery read for enrolment and resumption. It
+does not grant authority or register lifecycle interest. It uses `list`'s owner
+UID visibility rules but returns one record regardless of retained history or
+the diagnostic snapshot cap. Callers derive immutable proof expectations from
+the retained launch descriptor, not from either discovery or challenge fields.
+
 `allocate` requires an unbound kernel-verified local owner connection; its key
 is registered for later resumption. Allocation cannot require a pre-existing
 session grant; at most 64 nonterminal Term records per verified UID are allowed,
@@ -378,7 +384,12 @@ result retention. Every successful renew, including a repeated ID, MUST refresh
 the current live lease deadline; it MUST NOT revive a suspended/terminal record.
 Challenges/proofs use their one-use state instead: any repeated consumed proof
 returns `CONFLICT`, reason `challenge_consumed`; pruned/unknown challenge IDs
-return uniform `FORBIDDEN`. `list` MUST return `RESOURCE_LIMIT` rather than a
+return uniform `FORBIDDEN`. An expired outstanding challenge returns `EXPIRED`,
+reason `challenge_expired`; maintenance that removes it retains its ID in the
+same bounded consumed-ID set, so a late proof can instead return
+`CONFLICT/challenge_consumed`. Neither case emits a lifecycle notice. Clients
+may retry a fresh challenge with a bounded attempt budget and delay floor.
+`list` MUST return `RESOURCE_LIMIT` rather than a
 silently partial snapshot. An already revoked owned target returns
 `{revoked:false}`; stale references return `STALE_GENERATION` and MUST NOT affect
 a successor. Missing/unowned targets return uniform `FORBIDDEN`.

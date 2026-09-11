@@ -21,7 +21,7 @@ fn descriptor() -> serde_json::Value {
 fn memfd(descriptor: serde_json::Value, version: u8, seals: i32, extra: bool) -> File {
     let raw = unsafe {
         libc::memfd_create(
-            c"mix-bootstrap-test".as_ptr(),
+            c"cosmix-session-test".as_ptr(),
             libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
         )
     };
@@ -76,6 +76,9 @@ fn rejects_unsealed_partial_seals_layout_and_scope_substitution() {
     }
     assert!(parse(&memfd(descriptor(), 2, SEALS, false)).is_err());
     assert!(parse(&memfd(descriptor(), 1, SEALS, true)).is_err());
+    let mut extended = descriptor();
+    extended["future_field"] = serde_json::json!(true);
+    assert!(parse(&memfd(extended, 1, SEALS, false)).is_err());
     for (field, value) in [
         ("role", serde_json::json!("term")),
         ("pane_id", serde_json::Value::Null),
@@ -111,11 +114,20 @@ fn consume_scrub_helper() {
     assert_eq!(result.is_ok(), expected == "ok");
     assert!(std::env::var_os(MARKER).is_none());
     assert_eq!(unsafe { libc::fcntl(64, libc::F_GETFD) }, -1);
+    for fd in 0..3 {
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+    }
 }
 
 #[test]
 fn consume_closes_fd_and_scrubs_marker_on_success_and_failure() {
-    for valid in [true, false] {
+    for (valid, marker) in [
+        (true, "64"),
+        (false, "64"),
+        (true, "65"),
+        (true, "bogus"),
+        (true, "0"),
+    ] {
         let file = memfd(descriptor(), 1, if valid { SEALS } else { 0 }, false);
         let raw = file.as_raw_fd();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -125,10 +137,14 @@ fn consume_closes_fd_and_scrubs_marker_on_success_and_failure() {
                 "native_session::tests::consume_scrub_helper",
                 "--nocapture",
             ])
-            .env(MARKER, "64")
+            .env(MARKER, marker)
             .env(
                 "MIX_BOOTSTRAP_SCRUB_TEST",
-                if valid { "ok" } else { "error" },
+                if valid && marker == "64" {
+                    "ok"
+                } else {
+                    "error"
+                },
             );
         unsafe {
             command.pre_exec(move || {
@@ -190,30 +206,182 @@ fn attached_notice_does_not_create_a_self_resume_loop() {
         connection_id: HexBytes([9; 16]),
     };
     let mut notice = serde_json::json!({"broker_epoch":hello.broker_epoch, "target":record.reference(), "state":"attached"});
-    assert!(!relevant_notice(
-        "noded.session.lifecycle",
-        &notice.to_string(),
-        &hello,
-        Some(&record)
-    ));
+    assert!(
+        !relevant_notice(
+            "noded.session.lifecycle",
+            &notice.to_string(),
+            &hello,
+            Some(&record)
+        )
+        .unwrap()
+    );
     notice["state"] = serde_json::json!("suspended");
-    assert!(relevant_notice(
-        "noded.session.lifecycle",
-        &notice.to_string(),
-        &hello,
-        Some(&record)
-    ));
+    notice["future_broker_field"] = serde_json::json!({"ignored": true});
+    assert!(
+        relevant_notice(
+            "noded.session.lifecycle",
+            &notice.to_string(),
+            &hello,
+            Some(&record)
+        )
+        .unwrap()
+    );
     notice["target"]["binding_generation"] = serde_json::json!("0");
-    assert!(!relevant_notice(
-        "noded.session.lifecycle",
-        &notice.to_string(),
-        &hello,
-        Some(&record)
-    ));
-    assert!(relevant_notice(
-        "noded.session.lifecycle.gap",
-        &serde_json::json!({"broker_epoch":hello.broker_epoch}).to_string(),
-        &hello,
-        Some(&record)
-    ));
+    assert!(
+        !relevant_notice(
+            "noded.session.lifecycle",
+            &notice.to_string(),
+            &hello,
+            Some(&record)
+        )
+        .unwrap()
+    );
+    assert!(
+        relevant_notice(
+            "noded.session.lifecycle.gap",
+            &serde_json::json!({"broker_epoch":hello.broker_epoch, "future_broker_field":42})
+                .to_string(),
+            &hello,
+            Some(&record)
+        )
+        .unwrap()
+    );
+    assert!(relevant_notice("noded.session.lifecycle", "{", &hello, Some(&record)).is_err());
+}
+
+#[test]
+fn fresh_proof_retry_classification_and_budget_are_bounded() {
+    for (code, reason, retry) in [
+        (ErrorCode::Expired, "challenge_expired", true),
+        (ErrorCode::Conflict, "challenge_consumed", true),
+        (ErrorCode::Forbidden, "", false),
+        (ErrorCode::Expired, "grant_expired", false),
+        (ErrorCode::Conflict, "other", false),
+    ] {
+        let error = SessionError {
+            error_code: code,
+            message: String::new(),
+            details: serde_json::from_value(serde_json::json!({"reason":reason})).unwrap(),
+        };
+        assert_eq!(
+            matches!(
+                refusal_recovery("prove: refused", &error),
+                Recovery::FreshChallenge
+            ),
+            retry
+        );
+        assert!(matches!(
+            refusal_recovery("challenge: refused", &error),
+            Recovery::Wait
+        ));
+    }
+    let mut budget = ProofRetries::default();
+    let now = Instant::now();
+    for _ in 0..PROOF_RETRY_CAP {
+        assert!(budget.next(now).unwrap() >= now + PROOF_RETRY_FLOOR);
+    }
+    for _ in 0..100 {
+        assert!(budget.next(now).is_none());
+    }
+}
+
+#[test]
+fn resident_uses_configuration_captured_before_thread_start() {
+    let source = include_str!("native_session.rs");
+    let start = source.split("pub(super) fn start()").nth(1).unwrap();
+    assert!(start.find("resolve_noded_url()").unwrap() < start.find(".spawn(move ||").unwrap());
+    let worker = source.split("async fn own(").nth(1).unwrap();
+    for forbidden in ["std::env::", "resolve_noded_url()", "native_endpoint()"] {
+        assert!(
+            !worker.contains(forbidden),
+            "resident must not read mutable environ"
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_broker_challenge_expiry_recovers_without_a_lifecycle_notice() {
+    use term_native_test_broker::{Broker, session_fd::LaunchFd};
+    let broker = Broker::start();
+    let options = broker.options();
+    let UnixConnectOutcome::VerifiedUnix(parent) =
+        NodedClient::connect_unix("", &broker.url, &options, None)
+            .await
+            .unwrap()
+    else {
+        panic!("verified parent required")
+    };
+    let parent_key = SigningKey::from_bytes(&[19; 32]);
+    let mut parent_record = parent
+        .session_allocate(&parent_key, Policy::DefaultOpen)
+        .await
+        .unwrap()
+        .record;
+    let child_key = SigningKey::from_bytes(&[42; 32]);
+    let grant = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: parent_record.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key: HexBytes(child_key.verifying_key().to_bytes()),
+            role: Role::PaneShell,
+            capabilities: vec![Capability::ReadState],
+        })
+        .await
+        .unwrap();
+    let launch = LaunchFd::new(&grant, &child_key).unwrap();
+    let raw = unsafe { libc::fcntl(launch.mapping().0, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(raw >= 3);
+    let file = unsafe { File::from_raw_fd(raw) };
+    let mut bootstrap = parse(&file).ok().unwrap();
+    drop(file);
+    drop(launch);
+    // Delay only the first proof beyond the broker's actual 5s challenge life.
+    // No broker bounce, gap or parent mutation can rescue a Wait-only owner.
+    bootstrap.proof_delay_once = Duration::from_secs(6);
+    let attempts = bootstrap.proof_attempts.clone();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let url = broker.url.clone();
+    let task = tokio::spawn(async move {
+        let mut reporter = Reporter::default();
+        own(bootstrap, options, url, &mut reporter, receiver).await;
+        reporter.reported
+    });
+    let started = Instant::now();
+    let mut renewed = Instant::now();
+    loop {
+        if renewed.elapsed() >= Duration::from_secs(3) {
+            parent_record = parent
+                .session_renew(parent_record.reference())
+                .await
+                .unwrap()
+                .record;
+            renewed = Instant::now();
+        }
+        let record = parent
+            .session_self(grant.record.record_id)
+            .await
+            .unwrap()
+            .record;
+        if record.state == BindingState::Attached {
+            assert_eq!(record.binding_generation, DecimalU64(1));
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "expired proof stranded child"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert!(started.elapsed() >= Duration::from_secs(6) + PROOF_RETRY_FLOOR);
+    let (ack, received) = std::sync::mpsc::sync_channel(1);
+    sender.send(ack).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert!(received.try_recv().unwrap());
 }

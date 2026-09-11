@@ -674,6 +674,11 @@ derived from authenticated state, never caller assertions.</p>
 <tr><td><code>self</code></td><td><code>{record_id}</code></td><td><code>{record}</code>; one owner-UID record, including terminal state; absent and foreign-UID IDs both return <code>FORBIDDEN</code></td></tr>
 <tr><td><code>lease.check</code></td><td><code>{target:ref}</code></td><td><code>{lease_remaining_ms}</code>; authorised recipient obtains a fresh remaining-lease delta and lifecycle interest</td></tr>
 </tbody></table>
+<p><code>self</code> is an additive bounded discovery read for enrolment and resumption. It
+does not grant authority or register lifecycle interest. It uses <code>list</code>'s owner
+UID visibility rules but returns one record regardless of retained history or
+the diagnostic snapshot cap. Callers derive immutable proof expectations from
+the retained launch descriptor, not from either discovery or challenge fields.</p>
 <p><code>allocate</code> requires an unbound kernel-verified local owner connection; its key
 is registered for later resumption. Allocation cannot require a pre-existing
 session grant; at most 64 nonterminal Term records per verified UID are allowed,
@@ -762,7 +767,12 @@ result retention. Every successful renew, including a repeated ID, MUST refresh
 the current live lease deadline; it MUST NOT revive a suspended/terminal record.
 Challenges/proofs use their one-use state instead: any repeated consumed proof
 returns <code>CONFLICT</code>, reason <code>challenge_consumed</code>; pruned/unknown challenge IDs
-return uniform <code>FORBIDDEN</code>. <code>list</code> MUST return <code>RESOURCE_LIMIT</code> rather than a
+return uniform <code>FORBIDDEN</code>. An expired outstanding challenge returns <code>EXPIRED</code>,
+reason <code>challenge_expired</code>; maintenance that removes it retains its ID in the
+same bounded consumed-ID set, so a late proof can instead return
+<code>CONFLICT/challenge_consumed</code>. Neither case emits a lifecycle notice. Clients
+may retry a fresh challenge with a bounded attempt budget and delay floor.
+<code>list</code> MUST return <code>RESOURCE_LIMIT</code> rather than a
 silently partial snapshot. An already revoked owned target returns
 <code>{revoked:false}</code>; stale references return <code>STALE_GENERATION</code> and MUST NOT affect
 a successor. Missing/unowned targets return uniform <code>FORBIDDEN</code>.</p>

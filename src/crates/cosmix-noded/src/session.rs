@@ -761,8 +761,9 @@ impl Sessions {
             if c.challenge
                 .as_ref()
                 .is_some_and(|(_, p)| p.challenge_expires_ms.0 <= now)
+                && let Some((_, proof)) = c.challenge.take()
             {
-                c.challenge = None;
+                Self::remember_consumed(c, proof.challenge_id);
             }
         }
     }
@@ -1423,7 +1424,7 @@ impl Sessions {
             .filter(|(_, proof)| proof.challenge_id == a.challenge_id)
             .ok_or_else(SessionError::forbidden)?;
         if proof.challenge_expires_ms.0 <= now {
-            return Err(error(ErrorCode::Expired, ""));
+            return Err(error(ErrorCode::Expired, "challenge_expired"));
         }
         let r = self
             .records
