@@ -6,7 +6,44 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+// Coincides with noded's default pending_grants_per_parent, not a guarantee:
+// operators can lower that quota, and look-ahead provisioning spends one slot.
+// A quota refusal opens a graphics-only pane; term.session explains why.
 const MAX_TABS: usize = 32;
+
+#[cfg(not(test))]
+type PaneMetadata = HashMap<u64, PaneInfo>;
+
+// Wrap the actual remove operation in tests. A separate callback line beside
+// it would miss a mutation that moved only metadata.remove before revoke.
+#[cfg(test)]
+#[derive(Default)]
+struct PaneMetadata {
+    entries: HashMap<u64, PaneInfo>,
+    before_remove: Option<Box<dyn FnMut(u64) + Send>>,
+}
+#[cfg(test)]
+impl std::ops::Deref for PaneMetadata {
+    type Target = HashMap<u64, PaneInfo>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for PaneMetadata {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+#[cfg(test)]
+impl PaneMetadata {
+    fn remove(&mut self, id: &u64) -> Option<PaneInfo> {
+        if let Some(probe) = &mut self.before_remove {
+            probe(*id);
+        }
+        self.entries.remove(id)
+    }
+}
 
 #[derive(Clone)]
 pub struct Cleanup(std::sync::mpsc::SyncSender<Vec<Removed>>);
@@ -68,13 +105,14 @@ pub struct Tab {
 }
 
 pub struct TabSet {
+    native: Option<crate::native_session::NativeSession>,
     settings: crate::config::Settings,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
     next_pane_id: u64,
     pub revision: u64,
-    metadata: HashMap<u64, PaneInfo>,
+    metadata: PaneMetadata,
     wake: Option<Wake>,
     closing: bool,
     pending: Arc<AtomicUsize>,
@@ -107,6 +145,34 @@ pub struct TabInfo {
 }
 
 impl TabSet {
+    pub fn user_activity(&self) {
+        if let Some(native) = &self.native {
+            native.activity();
+        }
+    }
+
+    /// Main and startup tests share this exact bounded first-open path.
+    pub fn with_supervisor(
+        settings: crate::config::Settings,
+        native: Option<&mut crate::native_session::Supervisor>,
+    ) -> Result<Self, String> {
+        if let Some(native) = native {
+            native.wait_startup();
+            Self::with_session(settings, Some(native.handle.clone()))
+        } else {
+            Self::with_session(settings, None)
+        }
+    }
+    #[cfg(test)]
+    pub fn probe_metadata_removal(&mut self, probe: Box<dyn FnMut(u64) + Send>) {
+        self.metadata.before_remove = Some(probe);
+    }
+    pub fn session_status(&self) -> serde_json::Value {
+        self.native.as_ref().map_or_else(
+            || serde_json::json!({"diagnostic": "native identity unavailable; panes are graphics-only"}),
+            |native| native.status(),
+        )
+    }
     #[cfg(test)]
     pub fn new() -> Result<Self, String> {
         Self::with_settings(crate::config::Settings {
@@ -115,15 +181,24 @@ impl TabSet {
         })
     }
 
+    #[cfg(test)]
     pub fn with_settings(settings: crate::config::Settings) -> Result<Self, String> {
+        Self::with_session(settings, None)
+    }
+
+    pub fn with_session(
+        settings: crate::config::Settings,
+        native: Option<crate::native_session::NativeSession>,
+    ) -> Result<Self, String> {
         let mut set = Self {
+            native,
             settings,
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
             next_pane_id: 1,
             revision: 0,
-            metadata: HashMap::new(),
+            metadata: PaneMetadata::default(),
             wake: None,
             closing: false,
             pending: Arc::new(AtomicUsize::new(0)),
@@ -134,7 +209,9 @@ impl TabSet {
 
     pub fn open(&mut self) -> Result<u64, String> {
         let settings = self.settings;
-        self.open_with(move || Terminal::start(settings))
+        let native = self.native.clone();
+        let id = self.next_pane_id;
+        self.open_with(move || Terminal::start_session(settings, native.as_ref(), id))
     }
 
     fn open_with(
@@ -175,13 +252,28 @@ impl TabSet {
         if self.metadata.len() + self.pending.load(Ordering::Acquire) >= MAX_TABS {
             return Err("tab limit (32) reached".into());
         }
-        let terminal = std::panic::catch_unwind(start)
-            .map_err(|_| "terminal startup panicked".to_string())??;
+        // Consume the pane ID even on failed spawn: a delayed revoke for an
+        // uncertain grant must never select a subsequent launch by reused ID.
+        let id = self.next_pane_id;
+        self.next_pane_id = self
+            .next_pane_id
+            .checked_add(1)
+            .ok_or("pane ID exhausted")?;
+        let terminal = match std::panic::catch_unwind(start)
+            .map_err(|_| "terminal startup panicked".to_string())
+            .and_then(|result| result)
+        {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                if let Some(native) = &self.native {
+                    native.revoke_pane(id);
+                }
+                return Err(error);
+            }
+        };
         if let Some(wake) = &self.wake {
             terminal.set_wake(wake.clone());
         }
-        let id = self.next_pane_id;
-        self.next_pane_id += 1;
         self.metadata.insert(
             id,
             PaneInfo {
@@ -242,7 +334,10 @@ impl TabSet {
     }
     pub fn split_active(&mut self, dir: SplitDir) -> Result<u64, String> {
         let settings = self.settings;
-        let pane = self.start_pane(move || Terminal::start(settings))?;
+        let native = self.native.clone();
+        let pane_id = self.next_pane_id;
+        let pane =
+            self.start_pane(move || Terminal::start_session(settings, native.as_ref(), pane_id))?;
         let id = pane.id;
         let tab = &mut self.tabs[self.active];
         tab.tree.split(tab.active_pane, dir, pane);
@@ -311,6 +406,9 @@ impl TabSet {
         };
         let tab = &mut self.tabs[index];
         let terminal = tab.tree.pane_by_id(id).unwrap().terminal.clone();
+        if let Some(native) = &self.native {
+            native.revoke_pane(id);
+        }
         let sibling = tab.tree.sibling_focus(id);
         let Some(tree) = tab.tree.clone().without(id) else {
             return self.close(self.tabs[index].id);
@@ -351,6 +449,9 @@ impl TabSet {
             .map(|id| tab.tree.pane_by_id(*id).unwrap().terminal.clone())
             .collect();
         for id in &ids {
+            if let Some(native) = &self.native {
+                native.revoke_pane(*id);
+            }
             self.metadata.remove(id);
         }
         self.pending.fetch_add(ids.len(), Ordering::AcqRel);

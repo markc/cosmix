@@ -138,7 +138,10 @@ fn handle(
     let args = parse_args(verb, body)?;
     let mut tabs = set.lock().unwrap();
     match verb {
-        "INFO" | "HELP" | "info" | "help" => Ok(HELP.into()),
+        "INFO" | "HELP" | "info" | "help" => Ok(format!(
+            "{HELP}\nterm.session {{}}: native identity and per-pane binding diagnostics (not live authority)"
+        )),
+        "term.session" => Ok(tabs.session_status().to_string()),
         "term.tabs" => Ok(tabs
             .list()
             .iter()
@@ -276,7 +279,8 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
         return Ok(serde_json::json!({}));
     }
     let field = match verb {
-        "term.snapshot" | "term.tabs" | "term.tab.new" | "term.panes" | "term.pane.close" => None,
+        "term.snapshot" | "term.tabs" | "term.tab.new" | "term.panes" | "term.pane.close"
+        | "term.session" => None,
         "term.type" => Some("text"),
         "term.tab.select" | "term.tab.close" | "term.pane.select" => Some("id"),
         "term.pane.split" => Some("dir"),
@@ -461,6 +465,7 @@ mod tests {
     #[test]
     fn json_contracts() {
         for verb in [
+            "term.session",
             "term.snapshot",
             "term.tabs",
             "term.tab.new",

@@ -104,6 +104,7 @@ fn exec_restart(
         .to_string_lossy()
         .into_owned();
     eprintln!("Restarting Mix...");
+    crate::native_session::before_exec_restart();
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(&mix_bin).exec();
     eprintln!("Failed to restart: {}", err);
@@ -727,6 +728,7 @@ pub fn run_repl() -> i32 {
                                             }
                                             let _ = rl.save_history(&history_path);
                                             job_table.shutdown();
+                                            crate::native_session::before_exec_restart();
                                             use std::os::unix::process::CommandExt;
                                             let err = std::process::Command::new(&exec_path).exec();
                                             eprintln!("Failed to restart: {}", err);

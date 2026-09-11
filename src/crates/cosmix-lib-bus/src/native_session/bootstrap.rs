@@ -119,6 +119,12 @@ pub struct TargetArgs {
     pub target: RecordRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfArgs {
+    pub record_id: HexBytes<16>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
@@ -136,6 +142,7 @@ pub enum SessionCommand {
     Renew(TargetArgs),
     Revoke(TargetArgs),
     List,
+    SelfRecord(SelfArgs),
     LeaseCheck(TargetArgs),
 }
 
@@ -240,6 +247,7 @@ pub fn parse_bootstrap(input: &[u8]) -> Result<BootstrapRequest, WireError> {
             args::<EmptyArgs>(body)?;
             SessionCommand::List
         }
+        Some("noded.session.self") => SessionCommand::SelfRecord(args(body)?),
         Some("noded.session.allocate") => SessionCommand::Allocate(args(body)?),
         Some("noded.session.grant.create") => {
             let g: GrantCreateArgs = args(body)?;

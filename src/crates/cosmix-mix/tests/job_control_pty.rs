@@ -1,6 +1,9 @@
 //! Real PTYs and a re-executed Rust fixture (no shell/interpreter helpers).
-//! REQUIRED: run with --test-threads=1. openpty has no atomic CLOEXEC option;
-//! serial execution excludes sibling fixture forks during openpty/dup/close.
+//! A process-wide fixture lock serialises tests: openpty has no atomic CLOEXEC
+//! option, so sibling fixture forks must not overlap openpty/dup/close.
+//! It spans each whole fixture: same-process runs include lock wait in latency.
+//! Nextest uses separate test processes (no shared mutex); its timeout budget
+//! still needs to allow setup plus the real job-control fixture durations.
 #![cfg(target_os = "linux")]
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -12,6 +15,10 @@ use std::time::{Duration, Instant};
 
 const PROMPT: &str = "P0J> ";
 const LIMIT: Duration = Duration::from_secs(10);
+static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    FIXTURE_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
 static RESIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 extern "C" fn resized(_: i32) {
     RESIZED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -41,6 +48,7 @@ fn tty_modes(fd: i32) -> libc::termios {
 // not in the Mix executable and cannot bypass the normal launch protocol.
 #[test]
 fn fixture_process() {
+    let _fixture = fixture_guard();
     let Ok(mode) = std::env::var("P0J_MODE") else {
         return;
     };
@@ -417,6 +425,7 @@ impl Drop for Pty {
 
 #[test]
 fn foreground_barrier_and_fast_exit_pipeline() {
+    let _fixture = fixture_guard();
     // Repetition increases the likelihood of exposing a missing barrier;
     // scheduling observations are not proof of its absence or correctness.
     let mut p = Pty::interactive();
@@ -445,6 +454,7 @@ fn foreground_barrier_and_fast_exit_pipeline() {
 
 #[test]
 fn external_command_survives_unlinked_shell_executable() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     fs::remove_file(p.home.path().join("mix")).unwrap();
     p.command(&p.fixture("identity", "after-unlink"));
@@ -455,6 +465,7 @@ fn external_command_survives_unlinked_shell_executable() {
 
 #[test]
 fn unmanaged_stream_stop_is_visible_to_outer_parent_and_resumes() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.send(&format!("{}\n", p.fixture("outer-shell", "outer")));
     p.report("outer");
@@ -482,6 +493,7 @@ fn unmanaged_stream_stop_is_visible_to_outer_parent_and_resumes() {
 
 #[test]
 fn idle_prompt_ctrl_z_keeps_readline_usable() {
+    let _fixture = fixture_guard();
     // This session-leader group is orphaned: default SIGTSTP is discarded.
     // The interrupted editor read must retry rather than terminate the REPL.
     let mut p = Pty::interactive();
@@ -497,6 +509,7 @@ fn idle_prompt_ctrl_z_keeps_readline_usable() {
 
 #[test]
 fn background_pipeline_is_immediate_and_sigint_is_foreground_only() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.command(&format!(
         "{} | {} &",
@@ -521,6 +534,7 @@ fn background_pipeline_is_immediate_and_sigint_is_foreground_only() {
 
 #[test]
 fn stop_bg_fg_and_terminal_modes() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.send(&format!("{}\n", p.fixture("hold", "job")));
     let j = p.report("job");
@@ -554,6 +568,7 @@ fn stop_bg_fg_and_terminal_modes() {
 
 #[test]
 fn monitor_reaps_without_a_prompt_iteration() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.command(&format!("{} &", p.fixture("hold", "background")));
     let bg = p.report("background");
@@ -572,6 +587,7 @@ fn monitor_reaps_without_a_prompt_iteration() {
 
 #[test]
 fn close_reports_hup_ignoring_survivor_without_kill_escalation() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.command(&format!("{} &", p.fixture("ignore-hup", "survivor")));
     let j = p.report("survivor");
@@ -591,6 +607,7 @@ fn close_reports_hup_ignoring_survivor_without_kill_escalation() {
 
 #[test]
 fn background_read_gets_sigttin_and_tostop_write_stops() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.command(&format!("{} &", p.fixture("read", "reader")));
     let r = p.report("reader");
@@ -613,6 +630,7 @@ fn background_read_gets_sigttin_and_tostop_write_stops() {
 
 #[test]
 fn failed_later_exec_kills_and_reaps_pipeline() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     let line = format!(
         "{} | /nonexistent-p0j-executable",
@@ -652,6 +670,7 @@ fn failed_later_exec_kills_and_reaps_pipeline() {
 
 #[test]
 fn nested_shell_foreground_and_parent_restoration() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.send(&format!("{}\n", env!("CARGO_BIN_EXE_mix")));
     p.until(PROMPT);
@@ -671,6 +690,7 @@ fn nested_shell_foreground_and_parent_restoration() {
 
 #[test]
 fn background_nested_shell_waits_for_foreground_admission() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.command(&format!("{} &", env!("CARGO_BIN_EXE_mix")));
     wait_for(|| p.command("jobs").contains("Stopped"));
@@ -692,6 +712,7 @@ fn background_nested_shell_waits_for_foreground_admission() {
 
 #[test]
 fn noninteractive_ssh_style_command_never_takes_terminal_or_group() {
+    let _fixture = fixture_guard();
     // PTY allocated, controlling terminal present, yet explicit -c policy.
     let source = "print(pid()); run_stream([\"/bin/true\"])";
     let mut p = Pty::new(&["-c", source], false, true);
@@ -711,6 +732,7 @@ fn noninteractive_ssh_style_command_never_takes_terminal_or_group() {
 
 #[test]
 fn captured_runners_keep_their_wait_owner_inside_an_interactive_session() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.command(&format!("{} &", p.fixture("hold", "background")));
     let background = p.report("background");
@@ -759,6 +781,7 @@ fn captured_runners_keep_their_wait_owner_inside_an_interactive_session() {
 
 #[test]
 fn redirected_stdin_and_no_controlling_terminal_do_not_initialise_jobs() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(&[], true, true);
     wait_for(|| p.shell.try_wait().unwrap().is_some());
     assert!(p.shell.wait().unwrap().success());
@@ -770,6 +793,7 @@ fn redirected_stdin_and_no_controlling_terminal_do_not_initialise_jobs() {
 
 #[test]
 fn source_shares_background_controller_and_hup_reaps_owned_jobs() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     let script = p.home.path().join("jobs.mix");
     fs::write(&script, format!("{} &\n", p.fixture("hold", "sourced"))).unwrap();
@@ -787,6 +811,7 @@ fn source_shares_background_controller_and_hup_reaps_owned_jobs() {
 
 #[test]
 fn hup_restores_retained_slave_after_foreground_raw_leak() {
+    let _fixture = fixture_guard();
     let mut p = Pty::new(&[], false, true);
     let original = p.initial_modes;
     p.until(PROMPT);
@@ -811,6 +836,7 @@ fn hup_restores_retained_slave_after_foreground_raw_leak() {
 
 #[test]
 fn cold_start_hup_keeps_repaired_modes_before_any_launch() {
+    let _fixture = fixture_guard();
     let mut p = Pty::spawn_config(&[], false, true, false, false, true);
     p.until("COLD-READY");
     unsafe {
@@ -828,6 +854,7 @@ fn cold_start_hup_keeps_repaired_modes_before_any_launch() {
 
 #[test]
 fn resize_reaches_silent_foreground_job() {
+    let _fixture = fixture_guard();
     let mut p = Pty::interactive();
     p.send(&format!("{}\n", p.fixture("resize-silent", "resize")));
     p.report("resize");
@@ -851,6 +878,7 @@ fn resize_reaches_silent_foreground_job() {
 
 #[test]
 fn managed_target_resets_inherited_quit_disposition_and_mask() {
+    let _fixture = fixture_guard();
     let mut p = Pty::spawn_with_signals(&[], false, true, false, true);
     p.until(PROMPT);
     p.command(&p.fixture("signals", "managed-signals"));
@@ -861,6 +889,7 @@ fn managed_target_resets_inherited_quit_disposition_and_mask() {
 
 #[test]
 fn fixture_path_has_no_shell_metacharacters() {
+    let _fixture = fixture_guard();
     // The generated fixture argv is intentionally plain shell-classifier input.
     assert!(
         std::env::current_exe()
@@ -876,6 +905,7 @@ fn fixture_path_has_no_shell_metacharacters() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn stop_between_terminal_transfer_and_stage_release_aborts_launch() {
+    let _fixture = fixture_guard();
     if run_bounded_ptrace_case("stop_between_terminal_transfer_and_stage_release_aborts_launch") {
         return;
     }
@@ -981,6 +1011,7 @@ fn stop_between_terminal_transfer_and_stage_release_aborts_launch() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn ssh_dash_c_has_zero_shell_group_or_terminal_handoff_syscalls() {
+    let _fixture = fixture_guard();
     if run_bounded_ptrace_case("ssh_dash_c_has_zero_shell_group_or_terminal_handoff_syscalls") {
         return;
     }

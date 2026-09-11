@@ -31,6 +31,7 @@ mod job_control;
 mod jobs;
 mod lint;
 mod meta;
+mod native_session;
 mod node_config;
 mod repl;
 mod repl_editor;
@@ -1494,6 +1495,7 @@ fn check_syntax(source: &str, filename: &str) -> i32 {
 const MAIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 fn main() {
+    native_session::start();
     job_control::stage_entry();
     let handle = std::thread::Builder::new()
         .name("mix-eval".into())

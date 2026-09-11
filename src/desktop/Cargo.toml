@@ -49,6 +49,10 @@ smithay = { path = "vendor/smithay" }
 wgpu = { path = "vendor/wgpu" }
 wgpu-core = { path = "vendor/wgpu-core" }
 
+# FD handoff patch, drift guard and upstream-PR exit: README.teletypewriter-patch.md.
+[patch."https://github.com/raphamorim/rio"]
+teletypewriter = { path = "vendor/teletypewriter" }
+
 [profile.release]
 strip = true
 lto = "thin"

@@ -238,6 +238,8 @@ pub(crate) struct Sessions {
 
 impl Default for Sessions {
     fn default() -> Self {
+        // This default coincides with Term's MAX_TABS, not an admission promise:
+        // its look-ahead grant also spends a slot and operators may lower it.
         Self::with_grant_limit(32)
     }
 }
@@ -759,8 +761,9 @@ impl Sessions {
             if c.challenge
                 .as_ref()
                 .is_some_and(|(_, p)| p.challenge_expires_ms.0 <= now)
+                && let Some((_, proof)) = c.challenge.take()
             {
-                c.challenge = None;
+                Self::remember_consumed(c, proof.challenge_id);
             }
         }
     }
@@ -1080,6 +1083,14 @@ impl Sessions {
                 r.deadline = now + LEASE_MS;
                 let view = self.snapshot(&self.records[&a.target.record_id], now);
                 Ok(serde_json::json!({"record": view}))
+            }
+            SessionCommand::SelfRecord(a) => {
+                let record = self
+                    .records
+                    .get(&a.record_id)
+                    .filter(|record| record.view.owner_uid == p.unix_uid)
+                    .ok_or_else(SessionError::forbidden)?;
+                Ok(serde_json::json!({"record": self.snapshot(record, now)}))
             }
             SessionCommand::List => {
                 let mut records: Vec<_> = self
@@ -1413,7 +1424,7 @@ impl Sessions {
             .filter(|(_, proof)| proof.challenge_id == a.challenge_id)
             .ok_or_else(SessionError::forbidden)?;
         if proof.challenge_expires_ms.0 <= now {
-            return Err(error(ErrorCode::Expired, ""));
+            return Err(error(ErrorCode::Expired, "challenge_expired"));
         }
         let r = self
             .records
@@ -1525,6 +1536,63 @@ pub(super) mod queue_tests {
         s.dispatch(&p, &command, &mut reg, now).unwrap();
         let id = s.attached(p.connection_id).unwrap();
         (s, reg, p, id)
+    }
+
+    #[test]
+    fn targeted_owner_read_survives_oversized_history_and_hides_foreign_ids() {
+        let (mut s, mut reg, p, id) = allocated();
+        // Retained terminal history, each entry a normal bounded record shape.
+        for index in 100u128..2100 {
+            let original = &s.records[&id];
+            let mut view = original.view.clone();
+            let key = original.key;
+            view.record_id = HexBytes(index.to_be_bytes());
+            view.name = format!("retained-{index}");
+            view.state = BindingState::Revoked;
+            s.records.insert(
+                view.record_id,
+                Record {
+                    sequence: index as usize,
+                    parent_id: None,
+                    grant_id: None,
+                    view,
+                    key,
+                    connection: None,
+                    deadline: 0,
+                },
+            );
+        }
+        assert_eq!(
+            s.dispatch(&p, &SessionCommand::List, &mut reg, 1001)
+                .unwrap_err()
+                .details["reason"],
+            "snapshot_limit"
+        );
+        let command = SessionCommand::SelfRecord(SelfArgs { record_id: id });
+        let result = s.dispatch(&p, &command, &mut reg, 1001).unwrap();
+        assert_eq!(
+            result["record"]["record_id"],
+            serde_json::to_value(id).unwrap()
+        );
+        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+        let mut foreign = p.clone();
+        foreign.unix_uid += 1;
+        assert_eq!(
+            s.dispatch(&foreign, &command, &mut reg, 1001).unwrap_err(),
+            SessionError::forbidden()
+        );
+        assert_eq!(
+            s.dispatch(
+                &p,
+                &SessionCommand::SelfRecord(SelfArgs {
+                    record_id: HexBytes([255; 16])
+                }),
+                &mut reg,
+                1001
+            )
+            .unwrap_err(),
+            SessionError::forbidden()
+        );
     }
 
     #[test]

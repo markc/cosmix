@@ -493,6 +493,12 @@ per-line classification, no <code>~/.mixrc</code>.</p>
 as <code>interactive</code>, <code>script</code>, <code>c</code>, <code>stdin</code>, or <code>serve</code>. Set <code>MIX_STATS=off</code> (also
 <code>0</code> or <code>false</code>) to skip collection and all stats I/O. See <a href="/mix/stats">usage
 statistics</a>.</p>
+<p>When Term supplies a native-session launch fd, Mix consumes and closes it and
+scrubs <code>COSMIX_SESSION_FD</code> before startup hooks or user source. Binding and renews
+run on a private resident thread; the seed has no Mix language or <code>mix context</code>
+representation. Invalid bootstrap input reports the failed stage and leaves the
+shell usable. Without the marker, all entry modes keep their ordinary silent
+startup path. See the <a href="/cos/term-native-session">Term launch contract</a>.</p>
 <h2 id="running-a-script-file">Running a script file</h2>
 <p>The first non-flag argument is the script path; everything after it is passed to
 the script.</p>

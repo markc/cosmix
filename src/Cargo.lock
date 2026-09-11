@@ -1229,7 +1229,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-lib-bus"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "libc",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.84.0"
+version = "0.84.1"
 dependencies = [
  "blake3",
  "chrono",
@@ -1753,6 +1753,7 @@ dependencies = [
  "cosmix-lib-mix",
  "cosmix-lib-props-core",
  "dirs",
+ "ed25519-dalek",
  "glob",
  "indexmap",
  "libc",
@@ -1761,14 +1762,17 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
+ "term-native-test-broker",
  "tokio",
  "tokio-util",
  "tracing",
  "unicode-segmentation",
  "unicode-width",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -1835,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-noded"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6840,6 +6844,36 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "term-native-test-broker"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "chrono",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-mesh",
+ "cosmix-lib-mesh-trust",
+ "cosmix-lib-props-store",
+ "ed25519-dalek",
+ "futures-util",
+ "libc",
+ "notify",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

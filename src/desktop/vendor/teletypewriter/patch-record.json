@@ -1,0 +1,6 @@
+{
+  "upstream_rev": "932c1a7d9e07b4db5924f7a0dd689e823c3a1442",
+  "src/unix/mod.rs": "feb2e6aeea0a284d90a20aa80f66f5555a9a2706d4d64bd3bf5302bf69fb2f4b",
+  "launch_api_hunk": "328c9c3fa6f4facef34a1bddce38a69ca47d7fbb2863f0faf54fa61363179968",
+  "child_mapping_hunk": "56bc874d27bcfabfb9f033aec13f9cb79ff7c1f751f2166b19252bba612baf7e"
+}

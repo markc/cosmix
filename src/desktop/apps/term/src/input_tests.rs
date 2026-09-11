@@ -4,6 +4,10 @@ use bevy::input_focus::{InputDispatchPlugin, InputFocusPlugin, InputFocusSystems
 use bevy::window::PrimaryWindow;
 
 fn fixture() -> Option<(App, Entity)> {
+    fixture_with_native(None)
+}
+
+fn fixture_with_native(native: Option<native_session::NativeSession>) -> Option<(App, Entity)> {
     if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
         eprintln!("SKIP input PTY test: Mix unavailable");
         return None;
@@ -43,7 +47,14 @@ fn fixture() -> Option<(App, Entity)> {
         .id();
     let entry = app.world_mut().spawn_empty().id();
     let (cleanup, _) = tabs::Cleanup::start().unwrap();
-    app.insert_resource(Core(Arc::new(Mutex::new(TabSet::new().unwrap())), cleanup));
+    let settings = config::Settings {
+        config: config::Config::default(),
+        term: "xterm-256color",
+    };
+    app.insert_resource(Core(
+        Arc::new(Mutex::new(TabSet::with_session(settings, native).unwrap())),
+        cleanup,
+    ));
     app.insert_resource(View {
         pane_views: vec![],
         pane_root: None,
@@ -100,6 +111,32 @@ fn chord(app: &mut App, window: Entity, code: KeyCode) {
     press(app, window, KeyCode::ControlLeft);
     press(app, window, KeyCode::ShiftLeft);
     press(app, window, code);
+}
+
+#[test]
+fn broker_down_ctrl_shift_t_still_opens_unbound_pane() {
+    let mut broker = term_native_test_broker::Broker::start();
+    let options = broker.options();
+    let url = broker.url.clone();
+    broker.stop();
+    let supervisor = native_session::Supervisor::with_options(options, url).unwrap();
+    let (mut app, window) = fixture_with_native(Some(supervisor.handle.clone())).unwrap();
+    chord(&mut app, window, KeyCode::KeyT);
+    app.update();
+    assert_eq!(count(&app), 2);
+    let status = app
+        .world()
+        .resource::<Core>()
+        .0
+        .lock()
+        .unwrap()
+        .session_status();
+    assert!(
+        status["panes"]["2"]
+            .as_str()
+            .unwrap()
+            .contains("graphics-only")
+    );
 }
 
 #[test]

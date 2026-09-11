@@ -7,10 +7,15 @@ mod input_tests;
 #[cfg(test)]
 mod layout_tests;
 mod metrics;
+mod native_session;
 mod panes;
 mod raster;
+mod session_fd;
 mod tabs;
 mod terminal;
+#[cfg(test)]
+#[path = "../../../vendor/teletypewriter/patch_guard.rs"]
+mod teletypewriter_patch_guard;
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -138,6 +143,7 @@ fn resolve_config(
 }
 
 fn main() {
+    session_fd::quarantine_inherited();
     let identity = AppIdentity {
         slug: "term",
         display_name: "CosMix Term",
@@ -179,18 +185,25 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1)
         });
-    let terminal = Arc::new(Mutex::new(TabSet::with_settings(settings).unwrap_or_else(
-        |e| {
+    let mut native = native_session::Supervisor::start()
+        .map_err(|error| {
+            eprintln!("term native-session disabled: {error}");
+        })
+        .ok();
+    let terminal = Arc::new(Mutex::new(
+        TabSet::with_supervisor(settings, native.as_mut()).unwrap_or_else(|e| {
             eprintln!("PTY startup: {e}");
             std::process::exit(1)
-        },
-    )));
+        }),
+    ));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
     // Completion notifications: the reap system (render thread) hands
     // self-exited pane identities to the Bus task, which emits interact.notify.
     // TERM_NOTIFY=0 disables it — the sender is dropped, so notes are never
     // queued and the Bus task retires its receive branch on the first close.
-    let notify_enabled = std::env::var("TERM_NOTIFY").map(|value| value != "0").unwrap_or(true);
+    let notify_enabled = std::env::var("TERM_NOTIFY")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
     let bus = bus::start(terminal.clone(), cleanup.clone(), notify_rx);
     App::new()
@@ -232,6 +245,7 @@ fn main() {
         )
         .add_observer(keyboard)
         .add_observer(on_menu)
+        .add_systems(Update, record_focus_activity)
         .add_systems(Update, (menu_focus, sync_tabs, sync_panes).chain())
         .add_systems(PostUpdate, refresh.after(bevy::ui::UiSystems::Layout))
         .run();
@@ -241,6 +255,7 @@ fn main() {
     let _ = bus.join();
     drop(cleanup);
     let _ = reaper.join();
+    drop(native);
 }
 fn setup(
     mut commands: Commands,
@@ -352,7 +367,9 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
                   core: Res<Core>,
                   view: Res<View>,
                   mut focus: ResMut<InputFocus>| {
-                core.0.lock().unwrap().select(id);
+                let mut tabs = core.0.lock().unwrap();
+                tabs.user_activity();
+                tabs.select(id);
                 focus.set(view.terminal, FocusCause::Pressed);
             },
         );
@@ -365,6 +382,7 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
          core: Res<Core>,
          view: Res<View>,
          mut focus: ResMut<InputFocus>| {
+            core.0.lock().unwrap().user_activity();
             menu_action("tab.new", &core);
             focus.set(view.terminal, FocusCause::Pressed);
         },
@@ -432,7 +450,13 @@ fn menu_focus(mut view: ResMut<View>, nodes: Query<&Node>, mut focus: ResMut<Inp
 fn on_menu(event: On<MenuActivated>, core: Res<Core>) {
     menu_action(event.id, &core);
 }
+fn record_focus_activity(mut events: MessageReader<bevy::window::WindowFocused>, core: Res<Core>) {
+    if events.read().any(|event| event.focused) {
+        core.0.lock().unwrap().user_activity();
+    }
+}
 fn menu_action(id: &str, core: &Core) {
+    core.0.lock().unwrap().user_activity();
     match id {
         "help.about" => println!(
             "CosMix Term · component=term · version={}",
@@ -472,6 +496,7 @@ fn keyboard(
     if event.input.state != ButtonState::Pressed {
         return;
     }
+    core.0.lock().unwrap().user_activity();
     let ctrl = modifiers.ctrl();
     let shift = modifiers.shift();
     let open = view
@@ -702,7 +727,9 @@ fn spawn_pane_tree(
                           core: Res<Core>,
                           mut view: ResMut<View>,
                           mut focus: ResMut<InputFocus>| {
-                        if core.0.lock().unwrap().focus(id) {
+                        let mut tabs = core.0.lock().unwrap();
+                        tabs.user_activity();
+                        if tabs.focus(id) {
                             view.terminal = entity;
                             focus.set(entity, FocusCause::Pressed);
                         }

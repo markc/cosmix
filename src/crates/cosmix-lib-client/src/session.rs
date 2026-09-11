@@ -118,6 +118,10 @@ pub struct ChallengeResult {
 /// do not anchor continuity: the allocation-proven parent key hash does.
 #[derive(Debug, Clone)]
 pub struct ExpectedScope {
+    /// From hello on the current verified connection, never the challenge.
+    pub broker_epoch: HexBytes<16>,
+    /// Enrol for a pending child, resume for an existing attachment.
+    pub purpose: Purpose,
     pub unix_uid: u32,
     pub parent_key_hash: Option<HexBytes<32>>,
     pub pane_id: Option<DecimalU64>,
@@ -134,7 +138,9 @@ impl ChallengeResult {
     /// parent random IDs may change during broker recovery.
     pub fn sign(&self, key: &SigningKey, expected: &ExpectedScope) -> SessionResult<ProveArgs> {
         let p = &self.transcript;
-        if p.unix_uid != expected.unix_uid
+        if p.broker_epoch != expected.broker_epoch
+            || p.purpose != expected.purpose
+            || p.unix_uid != expected.unix_uid
             || p.parent_key_hash != expected.parent_key_hash
             || p.pane_id != expected.pane_id
             || expected.pane_high_water.is_some_and(|high| {
@@ -242,6 +248,19 @@ impl VerifiedConnection {
             wake_error,
         })
     }
+    /// The BUS-016 key selector carries the fixed `enrol` tag on the wire.
+    /// This is not a claim about the returned proof purpose: noded derives that
+    /// from the record. Callers must independently expect enrol or resume in sign().
+    pub async fn session_challenge_key(
+        &self,
+        public_key: HexBytes<32>,
+    ) -> SessionResult<ChallengeResult> {
+        self.session_challenge(&ChallengeArgs::Key(KeyChallenge {
+            public_key,
+            purpose: Purpose::Enrol,
+        }))
+        .await
+    }
     pub async fn session_prove(&self, args: &ProveArgs) -> SessionResult<RecordResult> {
         self.session_rpc("prove", args).await
     }
@@ -253,6 +272,10 @@ impl VerifiedConnection {
     }
     pub async fn session_list(&self) -> SessionResult<ListResult> {
         self.session_rpc("list", serde_json::json!({})).await
+    }
+    /// Owner-UID scoped single-record read, independent of diagnostic list caps.
+    pub async fn session_self(&self, record_id: HexBytes<16>) -> SessionResult<RecordResult> {
+        self.session_rpc("self", SelfArgs { record_id }).await
     }
     /// Captures request-start CLOCK_BOOTTIME internally. Gaps invalidate results.
     pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
