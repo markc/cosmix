@@ -580,7 +580,7 @@ async fn notice_overflow_delivers_gap_before_notices_and_key_resync_succeeds() {
         })
         .await
         .unwrap();
-    let waiting = verified(&broker).await;
+    let mut waiting = verified(&broker).await;
     let selector = ChallengeArgs::Key(KeyChallenge {
         public_key,
         purpose: Purpose::Enrol,
@@ -1813,7 +1813,7 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
             .as_ref()
             .is_some_and(|r| r.record_id == record.record_id)
     }));
-    let waiting = verified(&broker).await;
+    let mut waiting = verified(&broker).await;
     // Register interest before parent loss; this first challenge is consumed
     // by an invalid proof so it cannot mask the post-resume fresh transcript.
     let wake_challenge = waiting.session_challenge(&selector).await.unwrap();
@@ -2033,7 +2033,7 @@ async fn p0i_06_client_verified_delivery_and_tcp_has_no_trusted_context() {
     use cosmix_client::{NodedClient, UnixConnectOutcome};
     let broker = Broker::start().await;
     let options = client_options(&broker);
-    let UnixConnectOutcome::VerifiedUnix(service) =
+    let UnixConnectOutcome::VerifiedUnix(mut service) =
         NodedClient::connect_unix("verified-service", &broker.url, &options, None)
             .await
             .unwrap()
