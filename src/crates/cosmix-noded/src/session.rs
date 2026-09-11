@@ -152,6 +152,33 @@ mod queue_tests {
     }
 
     #[test]
+    fn delivery_releases_expired_dependencies_without_a_maintenance_tick() {
+        let (mut s, _, p, id) = allocated();
+        let recipient = HexBytes([3; 16]);
+        let (tx, _rx) = mpsc::channel(1);
+        s.open_outbox(recipient, &tx, Default::default());
+        let reference = s.records[&id].view.reference();
+        for generation in 2..=257 {
+            let mut target = reference.clone();
+            target.binding_generation = DecimalU64(generation);
+            s.outboxes
+                .get_mut(&recipient)
+                .unwrap()
+                .dependencies
+                .push((target, 1001));
+        }
+        assert_eq!(
+            s.delivery(&p, &tx, 1000).unwrap_err().details["reason"],
+            "recipient_dependency_limit"
+        );
+        s.delivery(&p, &tx, 1001).unwrap();
+        assert_eq!(
+            s.outboxes[&recipient].dependencies,
+            vec![(reference, 16_000)]
+        );
+    }
+
+    #[test]
     fn lease_check_refreshes_recipient_notice_dependency() {
         let (mut s, mut reg, p, id) = allocated();
         let mut recipient = p.clone();
@@ -533,6 +560,11 @@ impl Sessions {
             return Err(error(ErrorCode::Expired, ""));
         }
         let reference = r.view.reference();
+        // Topic fan-out reaches this admission path without a registry sweep.
+        // Expired dependencies must not occupy either quota until the next tick.
+        for out in self.outboxes.values_mut() {
+            out.dependencies.retain(|(_, expires)| *expires > now);
+        }
         let global = self
             .outboxes
             .values()

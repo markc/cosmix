@@ -14,8 +14,10 @@ the original binding scope.
 
 Bound routed deliveries register a connection/reference dependency before enqueue,
 under the same lock as revocation. Dependency caps are 256 per recipient and 8,192
-globally; exhaustion refuses the delivery. `lease.check` requires an existing
-unexpired dependency, atomically refreshes its notice lifetime through the returned
+globally; exhaustion refuses the delivery. Delivery admission releases expired
+dependency slots, including during topic fan-out between maintenance ticks.
+`lease.check` requires an existing unexpired dependency, atomically refreshes
+its notice lifetime through the returned
 lease, and returns the minimum remaining ancestor lease. Recipients
 use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
 
