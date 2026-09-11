@@ -3,6 +3,7 @@ pub mod ast;
 pub mod builtin_info;
 pub mod builtins;
 pub mod builtins_hof;
+pub mod cancel;
 pub mod continuation;
 pub mod error;
 pub mod evaluator;

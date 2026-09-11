@@ -101,6 +101,17 @@ pub fn init(flag: Arc<AtomicBool>) -> bool {
     // the REPL's tokio task, and the pre-existing "blocking builtin
     // cannot be interrupted" behaviour is what we'd fall back to.
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag);
+    // Second, chained handler: records WHICH evaluation the signal was aimed
+    // at, so `cancel` can refuse to let an idle-prompt Ctrl-C land on the next
+    // evaluation. The flag registration above still delivers the interrupt
+    // itself; this only supplies the mapping.
+    //
+    // SAFETY: `cancel::signal_arrived` performs two relaxed atomic stores and
+    // nothing else — no allocation, no locking, no reentrant libc — which is
+    // async-signal-safe.
+    let _ = unsafe {
+        signal_hook::low_level::register(signal_hook::consts::SIGINT, crate::cancel::signal_arrived)
+    };
     true
 }
 

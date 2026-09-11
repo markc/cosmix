@@ -5751,6 +5751,11 @@ impl Evaluator {
                     if g.interrupted.load(Ordering::Relaxed) {
                         g.interrupted.store(false, Ordering::Relaxed);
                         drop(g);
+                        // Converting the flag into an error clears it. If this
+                        // evaluation is under a standing cancellation the intent
+                        // outlives the error, so a `catch` around cancelled work
+                        // cannot resume it.
+                        crate::cancel::reassert();
                         return Err(self.runtime_err("interrupted"));
                     }
                 }
@@ -12031,6 +12036,7 @@ impl Evaluator {
             }
         };
         if interrupted {
+            crate::cancel::reassert();
             return Err(self.runtime_err("interrupted"));
         }
         if let Some(lim) = self.ctx.time_limit {
