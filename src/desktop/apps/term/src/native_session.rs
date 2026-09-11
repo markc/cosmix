@@ -19,6 +19,21 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const RPC_BUDGET: Duration = Duration::from_secs(2);
 const RENEW: Duration = Duration::from_secs(5);
+/// Protected requests waiting on the server task. Bounded so a flood sheds with
+/// a uniform refusal instead of growing a backlog of stamped authority.
+const DISPATCH_QUEUE: usize = 64;
+
+/// One protected request, with the authority that was current when it arrived.
+/// A reconnect between arrival and service leaves this connection disconnected,
+/// which dispatch refuses on its first check, so a stale job cannot be served
+/// against a newer attachment.
+struct Dispatch {
+    control: Arc<crate::control::Control>,
+    connection: Arc<VerifiedConnection>,
+    parent: SessionRecord,
+    own: (Hello, Deadline),
+    event: cosmix_client::VerifiedCommand,
+}
 const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const RETRY_FLOOR: Duration = Duration::from_secs(120);
 const RETRY_CAP: u32 = 3;
@@ -513,7 +528,7 @@ struct Actor {
     options: UnixConnectOptions,
     url: String,
     key: SigningKey,
-    connection: Option<VerifiedConnection>,
+    connection: Option<Arc<VerifiedConnection>>,
     parent: Option<SessionRecord>,
     /// The recipient's own conservative deadline and the context it is bound
     /// to, refreshed by the renew cadence so no protected request ever
@@ -899,7 +914,7 @@ impl Actor {
                         || old.broker_epoch != result.record.broker_epoch
                 });
                 self.parent = Some(result.record);
-                self.connection = Some(connection);
+                self.connection = Some(Arc::new(connection));
                 if replacement {
                     if self.pool_key.as_ref().is_some_and(|(id, _)| {
                         self.children
@@ -1201,6 +1216,29 @@ impl Actor {
     }
 
     async fn run(&mut self, mut requests: UnboundedReceiver<Request>) {
+        // Protected requests are served by a sibling task, not on this loop.
+        // A bound caller's request can cost a lease-check round trip plus a
+        // reply, and this loop is the one that renews the attachment and drains
+        // revocation notices; serving inline let one slow caller push renew past
+        // its cadence and leave revocations undelivered. The queue is bounded so
+        // a flood sheds instead of growing, and serving is serial because
+        // dispatch already serialises on the model and policy locks.
+        let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel::<Dispatch>(DISPATCH_QUEUE);
+        let server = tokio::spawn(async move {
+            while let Some(job) = dispatch_rx.recv().await {
+                let reply = job
+                    .control
+                    .dispatch(&job.connection, &job.parent, &job.own, &job.event)
+                    .await;
+                let _ = tokio::time::timeout(
+                    RPC_BUDGET,
+                    job.connection
+                        .client()
+                        .respond(job.event.command(), reply.rc, &reply.body),
+                )
+                .await;
+            }
+        });
         let mut renew = tokio::time::interval(RENEW);
         renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Revocation wakes this lane; it is never woken by a clock. The wake
@@ -1240,7 +1278,7 @@ impl Actor {
                     }
                     None => break,
                 },
-                event = async { self.connection.as_mut().expect("guarded connection").recv().await }, if self.connection.is_some() => {
+                event = async { self.connection.as_ref().expect("guarded connection").recv().await }, if self.connection.is_some() => {
                     match event {
                         Some(event) => {
                             // A dropped local delivery may have been a lifecycle
@@ -1256,11 +1294,34 @@ impl Actor {
                             } else if command.command == "noded.session.lifecycle" {
                                 self.notice(&command.body).await;
                             } else if let (Some(control), Some(connection), Some(parent), Some(own)) = (self.control(), &self.connection, &self.parent, &self.own_lease) {
-                                let reply = control.dispatch(connection, parent, own, &event).await;
-                                let _ = tokio::time::timeout(RPC_BUDGET, connection.client().respond(event.command(), reply.rc, &reply.body)).await;
+                                // Hand the request to the server task and go
+                                // straight back to the select. Serving it here
+                                // would hold this loop for a lease check plus a
+                                // reply, and this loop is what renews the lease
+                                // and drains revocation notices.
+                                let job = Dispatch {
+                                    control,
+                                    connection: connection.clone(),
+                                    parent: parent.clone(),
+                                    own: own.clone(),
+                                    event,
+                                };
+                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(job)) = dispatch_tx.try_send(job) {
+                                    // Shed uniformly rather than queue without
+                                    // limit or drop silently. The refusal is
+                                    // sent from a detached task so a saturated
+                                    // recipient still never blocks this loop.
+                                    tokio::spawn(async move {
+                                        let reply = crate::control::Reply::error("RESOURCE_LIMIT");
+                                        let _ = tokio::time::timeout(RPC_BUDGET, job.connection.client().respond(job.event.command(), reply.rc, &reply.body)).await;
+                                    });
+                                }
                             } else if let Some(connection) = &self.connection {
-                                let reply = crate::control::Reply::error("FORBIDDEN");
-                                let _ = tokio::time::timeout(RPC_BUDGET, connection.client().respond(event.command(), reply.rc, &reply.body)).await;
+                                let connection = connection.clone();
+                                tokio::spawn(async move {
+                                    let reply = crate::control::Reply::error("FORBIDDEN");
+                                    let _ = tokio::time::timeout(RPC_BUDGET, connection.client().respond(event.command(), reply.rc, &reply.body)).await;
+                                });
                             }
                         }
                         None => { self.connect().await; }
@@ -1268,6 +1329,9 @@ impl Actor {
                 }
             }
         }
+        // Nothing queued may be served after the identity loop stops: shutdown
+        // is about to revoke the records those jobs would be answered against.
+        server.abort();
     }
 
     async fn shutdown(&mut self) {

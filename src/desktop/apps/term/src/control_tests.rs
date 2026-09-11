@@ -32,8 +32,15 @@ async fn call(client: &NodedClient, name: &str, verb: &str, mut body: Value) -> 
         static EPOCHS: std::cell::RefCell<std::collections::HashMap<(usize, String), Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
     }
     if body.get("request_id").is_some() && body.get("request_epoch").is_none() {
+        // Keyed on the client ADDRESS, which is only unique while every
+        // connection is held: a loop that builds one in the same stack slot
+        // each iteration aliases the first entry. Rather than make callers
+        // remember that, a cached epoch that turns out to be wrong is detected
+        // and healed below, because the recipient refuses a mismatched epoch
+        // before it executes anything.
         let key = (std::ptr::from_ref(client) as usize, name.to_string());
         let cached = EPOCHS.with(|epochs| epochs.borrow().get(&key).cloned());
+        let from_cache = cached.is_some();
         let epoch = if let Some(epoch) = cached {
             epoch
         } else {
@@ -49,11 +56,27 @@ async fn call(client: &NodedClient, name: &str, verb: &str, mut body: Value) -> 
                 }
                 _ => json!(HexBytes([0u8; 16])),
             };
-            EPOCHS.with(|epochs| epochs.borrow_mut().insert(key, epoch.clone()));
+            EPOCHS.with(|epochs| epochs.borrow_mut().insert(key.clone(), epoch.clone()));
             epoch
         };
         body["request_epoch"] = epoch;
+        if from_cache {
+            // A stale cached epoch is refused BEFORE the recipient executes
+            // anything, so re-probing and retrying once cannot double-apply.
+            // A genuine unknown outcome answers the same way the second time.
+            let first = raw(client, name, verb, &body).await;
+            if first.1["error_code"] != "UNKNOWN_OUTCOME" {
+                return first;
+            }
+            EPOCHS.with(|epochs| epochs.borrow_mut().remove(&key));
+            let mut retry = body.clone();
+            retry.as_object_mut().unwrap().remove("request_epoch");
+            return Box::pin(call(client, name, verb, retry)).await;
+        }
     }
+    raw(client, name, verb, &body).await
+}
+async fn raw(client: &NodedClient, name: &str, verb: &str, body: &Value) -> (u8, Value) {
     let (rc, body, _) = tokio::time::timeout(
         Duration::from_secs(6),
         client.call_with_headers_raw(name, verb, &Default::default(), &body.to_string()),
@@ -424,7 +447,7 @@ fn p0i_07_real_recipient_both_policies() {
 fn p0i_08_queued_input_human_revoke_and_deadline() {
     let fixture = Fixture::new(Policy::DefaultOpen);
     runtime().block_on(async {
-        let mut owner = verified(&fixture.broker).await;
+        let owner = verified(&fixture.broker).await;
         let (parent, child) = fixture.records(&owner, 1).await;
         let target = target(&parent, &child);
         let pane = fixture.tabs.lock().unwrap().pane_by_id(1).unwrap();
@@ -993,7 +1016,7 @@ fn p0i_08_stale_cleanup_and_private_event_connection_guard() {
         let listener = fixture.tabs.lock().unwrap().pane_by_id(1).unwrap().lock().unwrap().listener.clone();
         listener.block_control_writes(true);
         assert_eq!(call(first.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","foreground_generation":listener.foreground_generation().to_string(),"text":"OLD_ATTACHMENT"})).await.0, 0);
-        let mut successor = verified(&fixture.broker).await;
+        let successor = verified(&fixture.broker).await;
         fixture.rebind(&successor, false).await;
         first.client().close().await;
         assert_eq!(call(successor.client(), &parent.name, "term.props.get", json!({"target":target,"property":"state"})).await.0, 0);

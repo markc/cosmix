@@ -260,7 +260,13 @@ impl Control {
         // Bound work per actor turn as well as retained queue memory. Name
         // reuse cannot redirect these private events: noded atomically checks
         // the original epoch/connection at the actual delivery boundary.
+        // A total budget, not just a per-send one: this still runs on the
+        // identity loop, which must get back to renewing the attachment.
+        let budget = Instant::now() + Duration::from_millis(200);
         for _ in 0..16 {
+            if Instant::now() >= budget {
+                break;
+            }
             let Some(notice) = self.notice_rx.lock().unwrap().try_recv().ok() else {
                 break;
             };
@@ -292,7 +298,7 @@ impl Control {
                 .with_header("type", "event")
                 .with_header("command", "term.input.revoked")
                 .with_header("recipient_connection", &json!({"broker_epoch":notice.actor_epoch,"connection_id":notice.actor_connection}).to_string())
-                .with_body(&json!({"target":notice.target,"request_id":notice.request_id,"status":"revoked","outcome":outcome,"delivered_bytes_lower_bound":notice.written}).to_string());
+                .with_body(&json!({"target":&notice.target,"request_id":notice.request_id,"status":"revoked","outcome":outcome,"delivered_bytes_lower_bound":notice.written}).to_string());
             if tokio::time::timeout(
                 Duration::from_millis(100),
                 connection.client().send_raw(&message),
@@ -300,6 +306,10 @@ impl Control {
             .await
             .is_err()
             {
+                // Put it back rather than lose it on the floor. It was already
+                // dequeued, and the retained outcome recorded above is
+                // idempotent, so a later wake can try the send again.
+                let _ = self.notice_tx.try_send(notice);
                 break;
             }
         }
