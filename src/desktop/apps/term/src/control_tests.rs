@@ -1297,3 +1297,47 @@ fn control_input_never_opens_a_bracketed_paste() {
     assert!(format!("x{OPEN}y{CLOSE}z").contains(OPEN));
     assert!(format!("x{OPEN}y{CLOSE}z").contains(CLOSE));
 }
+
+#[test]
+#[ignore = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit S4 gate only"]
+fn p0i_07_actor_table_survives_reconnect_churn() {
+    eprintln!("{REQUIRE_MIX}");
+    let fixture = Fixture::new(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let owner = verified(&fixture.broker).await;
+        let (parent, child) = fixture.records(&owner, 1).await;
+        let target = target(&parent, &child);
+        // One ambient actor key is minted per connection, so a client that
+        // reconnects mints them without end. Well past the 256-key cap the
+        // instance must still accept mutations: refusing at the cap would have
+        // bricked every mutation on this Term for the rest of its life, and no
+        // amount of waiting would have cleared it. The connections are kept
+        // alive so the table really is full of live keys, which is the case
+        // that has no expired entry to reclaim.
+        let mut actors = Vec::new();
+        for cycle in 0..320u32 {
+            let actor = verified(&fixture.broker).await;
+            let reply = call(
+                actor.client(),
+                &parent.name,
+                "term.pane.select",
+                json!({"target":target,"request_id":"1"}),
+            )
+            .await;
+            assert_eq!(reply.0, 0, "cycle {cycle} refused: {reply:?}");
+            actors.push(actor);
+        }
+        // The original owner is unaffected by the churn.
+        assert_eq!(
+            call(
+                owner.client(),
+                &parent.name,
+                "term.session",
+                json!({"target":target})
+            )
+            .await
+            .0,
+            0
+        );
+    });
+}

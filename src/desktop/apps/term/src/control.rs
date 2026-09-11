@@ -662,24 +662,25 @@ impl Control {
                 .map(|h| h.entries.len())
                 .sum::<usize>();
             // A key keeps its high-water mark even after every entry expires,
-            // so a late retry answers UNKNOWN_OUTCOME instead of re-executing.
-            // Ageing therefore never drops a key. But an ambient actor's key is
-            // per connection and reconnects mint new ones without end, so the
-            // cap evicts rather than refuses: the coldest key whose entries have
-            // all expired could only have served UNKNOWN_OUTCOME anyway. Refuse
-            // only under real pressure, where every key still holds a live
-            // result and the window clears it.
+            // so a late retry answers UNKNOWN_OUTCOME instead of re-executing;
+            // ageing alone therefore never drops one. The cap still has to
+            // evict rather than refuse. An ambient key names one connection and
+            // a connection id never returns, so a full table is overwhelmingly
+            // keys that can never be addressed again — refusing at the cap
+            // would brick every mutation on the instance permanently, which is
+            // strictly worse than losing the coldest actor's dedupe. Keys with
+            // no live entry go first, since losing one costs only a high-water
+            // mark; then the coldest overall. BROKER-023 allows earlier
+            // eviction at the instance cap, and TOTAL still bounds memory.
             if !state.history.contains_key(&identity) && state.history.len() >= ACTORS {
-                let coldest = state
+                let victim = state
                     .history
                     .iter()
-                    .filter(|(_, history)| history.entries.is_empty())
-                    .min_by_key(|(_, history)| history.last)
+                    .min_by_key(|(_, history)| (!history.entries.is_empty(), history.last))
                     .map(|(key, _)| key.clone());
-                match coldest {
-                    Some(key) => state.history.remove(&key),
-                    None => return Reply::error("RESOURCE_LIMIT"),
-                };
+                if let Some(key) = victim {
+                    state.history.remove(&key);
+                }
             }
             let history = state.history.entry(identity.clone()).or_default();
             if let Some(entry) = history.entries.iter().find(|e| e.sequence == sequence) {
