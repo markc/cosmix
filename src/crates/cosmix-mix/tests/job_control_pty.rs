@@ -513,6 +513,48 @@ fn noninteractive_ssh_style_command_never_takes_terminal_or_group() {
 }
 
 #[test]
+fn captured_runners_keep_their_wait_owner_inside_an_interactive_session() {
+    let mut p = Pty::interactive();
+    p.command(&format!("{} &", p.fixture("hold", "background")));
+    let background = p.report("background");
+    for _ in 0..8 {
+        for (runner, expected) in [
+            (
+                r#"run_argv(["/bin/printf", "CAPTURE-VALUE"])"#,
+                "CAPTURE-VALUE",
+            ),
+            (
+                r#"run_pipeline([["/bin/printf", "PIPE-VALUE"], ["/bin/cat"]])"#,
+                "PIPE-VALUE",
+            ),
+        ] {
+            let output = p.command(&format!(
+                "$r = {runner}; print($r.ok); print($r.exit_code); print($r.stdout)"
+            ));
+            assert!(output.contains("\r\ntrue\r\n0\r\n"), "{output:?}");
+            assert!(
+                output.contains(&format!("\r\n{expected}\r\n")),
+                "{output:?}"
+            );
+            assert_eq!(
+                unsafe { libc::tcgetpgrp(p.master.as_raw_fd()) },
+                p.shell.id() as i32
+            );
+        }
+    }
+    assert!(alive(background[0]));
+    let jobs = p.command("jobs");
+    assert!(
+        jobs.contains(&format!("pgid={}", background[1])),
+        "{jobs:?}"
+    );
+    assert!(
+        !jobs.contains("[2]"),
+        "captured process became a job: {jobs:?}"
+    );
+}
+
+#[test]
 fn redirected_stdin_and_no_controlling_terminal_do_not_initialise_jobs() {
     let mut p = Pty::new(&[], true, true);
     wait_for(|| p.shell.try_wait().unwrap().is_some());
