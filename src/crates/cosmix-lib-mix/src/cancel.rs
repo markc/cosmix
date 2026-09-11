@@ -240,6 +240,7 @@ pub fn state(id: u64) -> Option<(bool, Option<Source>, bool)> {
 /// a resumed script.
 pub fn reassert() {
     let id = ACTIVE.load(Ordering::Relaxed);
+    if std::env::var_os("MIX_CANCEL_DEBUG").is_some() { eprintln!("REASSERT id={id} latch={} target={}", SIGNAL_LATCH.load(Ordering::Relaxed), SIGNAL_TARGET.load(Ordering::Relaxed)); }
     if id == 0 {
         return;
     }
