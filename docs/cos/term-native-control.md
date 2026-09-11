@@ -198,10 +198,11 @@ orchestrator; this page describes implementation, not a claim of passing gates.
 
 The enforcement fixtures are `#[ignore]`d because each spawns a real broker and a
 real Mix child over a PTY, so a plain `cargo test` reports them as ignored and
-says nothing about enforcement. Run them mechanically from the repository root:
+says nothing about enforcement. Run them mechanically from `src/`:
 
 ```sh
-mix src/desktop/apps/term/check-s4-gates.mix
+mix desktop/apps/term/check-s4-gates.mix     # the 14 S4 enforcement fixtures
+mix desktop/apps/term/check-production-e2e.mix   # p0i-01, the production child-proof
 ```
 
 It builds the current-HEAD Mix the fixtures demand — they refuse a stale or
@@ -209,7 +210,7 @@ installed binary — runs them by exact test path, and requires the precise
 expected pass count, because libtest exits 0 when its filter matches nothing and
 a renamed module would otherwise leave the gate green while running none of them.
 
-One fixture is deliberately outside that script. `p0i_07_other_uid_both_policies`
+One fixture is deliberately outside both scripts. `p0i_07_other_uid_both_policies`
 needs root and a second UID, and refuses rather than passing silently without
 them. Run it explicitly:
 
