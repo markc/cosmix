@@ -51,6 +51,13 @@ pub(crate) enum Transition {
     PromptPreparing,
     PromptReady { continuation: bool },
     LineAccepted,
+    /// A line the shell never typed, carrying the identity the admission owner
+    /// already minted, echoed and recorded. Adopting it rather than minting a
+    /// second one is what keeps one admitted submission one command in the
+    /// reducer, in the visible echo and in the result store alike.
+    LineAdmitted {
+        command_id: DecimalU64,
+    },
     LineAbandoned,
     EvaluationAccepted,
     EvaluationStarted,
@@ -170,6 +177,15 @@ impl Reducer {
         self.commit(Transition::PromptReady { continuation });
         debug_assert_eq!(self.snapshot.prompt_generation.0, generation.prompt);
     }
+    /// Reserve the next command identity without publishing a transition. The
+    /// admission owner needs the id before the line exists — it goes into the
+    /// visible echo and into the result record, both of which are committed
+    /// before anything executes.
+    fn mint_command(&mut self) -> Option<u64> {
+        let id = self.next_command.checked_add(1)?;
+        self.next_command = id;
+        Some(id)
+    }
     fn now(&self) -> u64 {
         boottime_ms()
             .unwrap_or(u64::MAX)
@@ -206,6 +222,10 @@ impl Reducer {
                 };
                 self.next_command = id;
                 s.command_id = Some(DecimalU64(id));
+                s.phase = Phase::Evaluating;
+            }
+            Transition::LineAdmitted { command_id } => {
+                s.command_id = Some(*command_id);
                 s.phase = Phase::Evaluating;
             }
             // The line turned out to run nothing (empty, incomplete or a parse
@@ -334,6 +354,16 @@ pub(crate) fn prepare_prompt(continuation: bool) -> Option<Generation> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .prepare_prompt(continuation)
+    })
+}
+/// Reserve a command identity for an admission. `None` means the counter is
+/// exhausted, which is terminal — never a wrap into an apparently fresh id.
+pub(crate) fn mint_command() -> Option<u64> {
+    STATE.get().and_then(|state| {
+        state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mint_command()
     })
 }
 pub(crate) fn prompt_activated(generation: Generation) {

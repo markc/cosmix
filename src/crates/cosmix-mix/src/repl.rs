@@ -10,7 +10,9 @@ use crate::completion::MixHelper;
 use crate::exec::{self, PipelineResult};
 use crate::jobs::JobTable;
 use crate::meta;
-use crate::repl_editor::ReplEditor as Editor;
+use crate::repl_editor::{ReplEditor as Editor, ReplInput};
+use crate::session_execute::{CancellationReport, Completion, Structured};
+use cosmix_lib_bus::native_session::DecimalU64;
 use crate::shell::{self, InputKind};
 use crate::stats_io;
 
@@ -107,6 +109,91 @@ fn exec_restart(eval: &mut Evaluator, rl: &mut Editor, history_path: &std::path:
     std::process::exit(1);
 }
 
+/// Publishes an admitted evaluation's outcome however its REPL arm leaves —
+/// `continue`, `break 'repl`, or falling through. The arms below are full of
+/// early exits; an operation whose result was never published would leave its
+/// caller reading a `running` state that can never change, which is worse than
+/// any wrong answer because nothing ever corrects it.
+struct Report {
+    operation: u64,
+    started: std::time::Instant,
+    outcome: &'static str,
+    status: Option<i64>,
+    value: Option<Structured>,
+    error: Option<String>,
+}
+impl Report {
+    fn new(operation: u64) -> Self {
+        Self {
+            operation,
+            started: std::time::Instant::now(),
+            outcome: "completed",
+            status: None,
+            value: None,
+            error: None,
+        }
+    }
+    /// Bound every diagnostic that leaves the evaluator. An error message can
+    /// carry arbitrary user data.
+    fn fail(&mut self, message: String) {
+        self.outcome = "failed";
+        let mut message = message;
+        if message.len() > crate::session_execute::MAX_ERROR {
+            let mut end = crate::session_execute::MAX_ERROR;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        self.error = Some(message);
+    }
+}
+impl Drop for Report {
+    fn drop(&mut self) {
+        let cancellation = CancellationReport::for_evaluation(self.operation);
+        // Delivered is not the same as died. A cancellation that reached a
+        // child which ignores SIGINT, and which then ran to completion and
+        // exited zero, did not cancel anything — overwriting that to
+        // "cancelled" would report work as stopped when its own result says it
+        // finished. The outcome comes from what was RECORDED about the
+        // evaluation; the cancellation block reports the delivery separately,
+        // so a caller sees both facts and neither is inferred from the other.
+        let completed_anyway =
+            self.outcome == "completed" && self.status.is_none_or(|status| status == 0);
+        if cancellation.delivered == "cooperative" && !completed_anyway {
+            self.outcome = "cancelled";
+        }
+        crate::session_execute::finished(
+            self.operation,
+            Completion {
+                outcome: self.outcome,
+                status: self.status,
+                value: self.value.take(),
+                error: self.error.take(),
+                duration_ms: DecimalU64(
+                    self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                ),
+                cancellation,
+            },
+        );
+    }
+}
+
+/// A shell-builtin arm returns to the prompt without touching the pipeline
+/// result, so a status the shell already computed reaches the report only if it
+/// is put there. The whole family needs this, not just the first one found:
+/// `cd`, `pushd` and `popd` all report a real failure, and an admitted
+/// `pushd /nonexistent` that answered "completed" would be a lie the caller has
+/// no other way to detect.
+fn record_builtin(report: &mut Option<Report>, code: i32, what: &str) {
+    if let Some(report) = report.as_mut() {
+        report.status = Some(i64::from(code));
+        if code != 0 {
+            report.fail(format!("{what}: exit status {code}"));
+        }
+    }
+}
+
 /// Run the interactive REPL.
 pub fn run_repl() -> i32 {
     let _session_lifetime = crate::session_state::ShellLifetime;
@@ -170,11 +257,33 @@ pub fn run_repl() -> i32 {
 
     let _ = rl.load_history(&history_path);
 
-    if let Some(control) = rl.control()
-        && let crate::job_control::ExecutionPolicy::Interactive { controller, .. } =
+    if let Some(control) = rl.control() {
+        // Execution admission exists only where the terminal can be released
+        // without a keypress, and only where there is an enrolled attachment to
+        // authorise against. Anywhere else the surface stays unregistered and
+        // answers UNSUPPORTED rather than a BUSY that could never clear.
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } =
             job_table.policy()
-    {
-        controller.set_terminal_shutdown(std::sync::Arc::new(move || control.shutdown()));
+        {
+            if crate::session_state::enabled() {
+                // The controller is what makes the guarantee table's managed-
+                // children row real: a cancelled foreground job is signalled by
+                // group, not merely asked to notice a flag.
+                let signaller = controller.clone();
+                crate::session_execute::register(
+                    control.clone(),
+                    std::sync::Arc::new(move |evaluation| {
+                        signaller.interrupt_foreground(evaluation)
+                    }),
+                );
+            }
+            controller.set_terminal_shutdown(std::sync::Arc::new(move || control.shutdown()));
+        } else if crate::session_state::enabled() {
+            // No job controller: the shell is not managing process groups, so
+            // there is nothing to signal and the surface says so by having no
+            // stronger path than the cooperative one.
+            crate::session_execute::register(control.clone(), std::sync::Arc::new(|_| None));
+        }
     }
 
     let mut eval = Evaluator::new();
@@ -301,8 +410,36 @@ pub fn run_repl() -> i32 {
         ensure_interactive_output_mode();
 
         match rl.readline(&prompt, !line_buf.is_empty()) {
-            Ok(line) => {
-                crate::session_state::commit(crate::session_state::Transition::LineAccepted);
+            Ok(input) => {
+                // An admitted submission arrives with its identity already
+                // minted, echoed to the pane and recorded in the result store.
+                // The reducer adopts that identity instead of opening a second
+                // command for the same execution.
+                let (line, admitted) = match input {
+                    ReplInput::Human(line) => (line, None),
+                    ReplInput::Admitted(admitted) => (admitted.source, Some(admitted.operation)),
+                };
+                match admitted {
+                    Some(command_id) => crate::session_state::commit(
+                        crate::session_state::Transition::LineAdmitted {
+                            command_id: DecimalU64(command_id),
+                        },
+                    ),
+                    None => crate::session_state::commit(
+                        crate::session_state::Transition::LineAccepted,
+                    ),
+                }
+                let mut report = admitted.map(Report::new);
+                // One evaluation, one cancellation identity. A cancel request
+                // or a SIGINT resolves to THIS id and cannot reach whatever
+                // runs after it. Human lines get one too: the signal mapping is
+                // what stops a Ctrl-C at an idle prompt tripping the next line.
+                let evaluation_id = admitted.or_else(|| {
+                    crate::session_state::view()
+                        .and_then(|view| view.snapshot.command_id)
+                        .map(|id| id.0)
+                });
+                let _cancellation = evaluation_id.map(cosmix_mix::cancel::begin);
                 if line_buf.is_empty() && line.trim().is_empty() {
                     crate::session_state::commit(crate::session_state::Transition::LineAbandoned);
                     continue;
@@ -323,6 +460,9 @@ pub fn run_repl() -> i32 {
                 let (timed, work) = match shell::strip_time_prefix(&line_buf) {
                     Some("") => {
                         eprintln!("mix: time: usage: time <command | mix expression>");
+                        if let Some(report) = report.as_mut() {
+                            report.fail("time: usage: time <command | mix expression>".into());
+                        }
                         line_buf.clear();
                         crate::session_state::commit(
                             crate::session_state::Transition::LineAbandoned,
@@ -371,6 +511,31 @@ pub fn run_repl() -> i32 {
                 let _evaluation = crate::session_state::evaluation(executing);
                 match kind {
                     InputKind::Incomplete => {
+                        // An admitted submission may not open a continuation:
+                        // §3 refuses a continuation prompt as BUSY, so leaving
+                        // one standing would put the shell in a state remote
+                        // execution is not allowed to create — and the human
+                        // would be holding half of someone else's line.
+                        if let Some(report) = report.as_mut() {
+                            eprintln!(
+                                "mix: execute: refused incomplete submission; a remote execution may not open a continuation"
+                            );
+                            report.fail(
+                                "incomplete submission: a remote execution must be a complete line"
+                                    .into(),
+                            );
+                            line_buf.clear();
+                            // LineAdmitted opened an `evaluating` window that
+                            // nothing will close: the human arms of this match
+                            // reach LineAbandoned through the classifier, and
+                            // this arm returns to the prompt directly. Without
+                            // this the snapshot reports a command in flight for
+                            // the rest of the session.
+                            crate::session_state::commit(
+                                crate::session_state::Transition::LineAbandoned,
+                            );
+                            continue;
+                        }
                         // Don't clear line_buf — wait for more input
                         continue;
                     }
@@ -385,6 +550,9 @@ pub fn run_repl() -> i32 {
                             s.track_error(&msg);
                         }
                         eprintln!("{}", msg);
+                        if let Some(report) = report.as_mut() {
+                            report.fail(msg);
+                        }
                         line_buf.clear();
                         continue;
                     }
@@ -401,10 +569,22 @@ pub fn run_repl() -> i32 {
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
                                 }
+                                if let Some(report) = report.as_mut() {
+                                    report.value = Some(Structured::new("nil", String::new()));
+                                }
                             }
                             Ok(val) => {
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
+                                }
+                                // The structured result is serialised HERE, on
+                                // the evaluator owner. No Value, Scope or Rc
+                                // ever crosses to the Bus thread.
+                                if let Some(report) = report.as_mut() {
+                                    report.value = Some(Structured::new(
+                                        val.type_name(),
+                                        val.to_mix_string(),
+                                    ));
                                 }
                                 let trimmed = input.trim();
                                 if !trimmed.starts_with("print") && !trimmed.starts_with("eprint") {
@@ -412,6 +592,9 @@ pub fn run_repl() -> i32 {
                                 }
                             }
                             Err(MixError::ExitRequest { code }) => {
+                                if let Some(report) = report.as_mut() {
+                                    report.status = Some(i64::from(code));
+                                }
                                 let _ = rl.save_history(&history_path);
                                 exit_code = code;
                                 break 'repl;
@@ -419,6 +602,9 @@ pub fn run_repl() -> i32 {
                             Err(e) => {
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.track_error(&format!("{}", e));
+                                }
+                                if let Some(report) = report.as_mut() {
+                                    report.fail(format!("{}", e));
                                 }
                                 eprintln!("{}", e);
 
@@ -459,14 +645,26 @@ pub fn run_repl() -> i32 {
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
                                 }
+                                if let Some(report) = report.as_mut() {
+                                    report.value = Some(Structured::new("nil", String::new()));
+                                }
                             }
                             Ok(val) => {
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
                                 }
+                                if let Some(report) = report.as_mut() {
+                                    report.value = Some(Structured::new(
+                                        val.type_name(),
+                                        val.to_mix_string(),
+                                    ));
+                                }
                                 println!("{}", val.to_mix_string());
                             }
                             Err(MixError::ExitRequest { code }) => {
+                                if let Some(report) = report.as_mut() {
+                                    report.status = Some(i64::from(code));
+                                }
                                 let _ = rl.save_history(&history_path);
                                 exit_code = code;
                                 break 'repl;
@@ -474,6 +672,9 @@ pub fn run_repl() -> i32 {
                             Err(e) => {
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.track_error(&format!("{}", e));
+                                }
+                                if let Some(report) = report.as_mut() {
+                                    report.fail(format!("{}", e));
                                 }
                                 eprintln!("{}", e);
                             }
@@ -594,26 +795,36 @@ pub fn run_repl() -> i32 {
                                 break 'repl;
                             }
                             "cd" => {
-                                handle_cd(&pipeline.segments[0].args, &mut eval);
+                                // The shell-builtin arms return to the prompt
+                                // without touching the pipeline result, so an
+                                // admitted `cd /nonexistent` reported success.
+                                // A status the shell already computed must
+                                // reach the report.
+                                let code = handle_cd(&pipeline.segments[0].args, &mut eval);
+                                record_builtin(&mut report, code, "cd");
                                 continue;
                             }
                             "pushd" => {
-                                if !pipeline.segments[0].args.is_empty() {
+                                let code = if !pipeline.segments[0].args.is_empty() {
                                     if let Ok(cwd) = env::current_dir() {
                                         dir_stack.push(cwd.to_string_lossy().to_string());
                                     }
-                                    handle_cd(&pipeline.segments[0].args, &mut eval);
+                                    handle_cd(&pipeline.segments[0].args, &mut eval)
                                 } else {
                                     eprintln!("pushd: no directory specified");
-                                }
+                                    2
+                                };
+                                record_builtin(&mut report, code, "pushd");
                                 continue;
                             }
                             "popd" => {
-                                if let Some(dir) = dir_stack.pop() {
-                                    handle_cd(&[dir], &mut eval);
+                                let code = if let Some(dir) = dir_stack.pop() {
+                                    handle_cd(&[dir], &mut eval)
                                 } else {
                                     eprintln!("popd: directory stack empty");
-                                }
+                                    2
+                                };
+                                record_builtin(&mut report, code, "popd");
                                 continue;
                             }
                             "history" => {
@@ -623,20 +834,28 @@ pub fn run_repl() -> i32 {
                                 continue;
                             }
                             "which" | "type" => {
+                                let mut code = 0;
                                 for arg in &pipeline.segments[0].args {
                                     match which_command(arg) {
                                         Some(path) => println!("{}", path),
-                                        None => eprintln!("{}: not found", arg),
+                                        None => {
+                                            eprintln!("{}: not found", arg);
+                                            code = 1;
+                                        }
                                     }
                                 }
+                                record_builtin(&mut report, code, "which");
                                 continue;
                             }
                             "unalias" => {
+                                let mut code = 0;
                                 for arg in &pipeline.segments[0].args {
                                     if !eval.remove_alias(arg) {
                                         eprintln!("unalias: {}: not found", arg);
+                                        code = 1;
                                     }
                                 }
+                                record_builtin(&mut report, code, "unalias");
                                 continue;
                             }
                             "jobs" => {
@@ -857,6 +1076,9 @@ pub fn run_repl() -> i32 {
 
                         match exec::execute_pipeline_with_policy(&pipeline, &job_table.policy()) {
                             Ok(PipelineResult::Managed(outcome)) => {
+                                if let Some(report) = report.as_mut() {
+                                    report.status = Some(i64::from(outcome.code));
+                                }
                                 eval.set_global("status", Value::Number(outcome.code as f64));
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
@@ -867,6 +1089,9 @@ pub fn run_repl() -> i32 {
                             }
                             Ok(PipelineResult::Done(status)) => {
                                 let code = exec::exit_code(status);
+                                if let Some(report) = report.as_mut() {
+                                    report.status = Some(i64::from(code));
+                                }
                                 eval.set_global("status", Value::Number(code as f64));
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
@@ -888,6 +1113,10 @@ pub fn run_repl() -> i32 {
                             }
                             Err(e) => {
                                 eprintln!("{}: {}", pipeline.segments[0].program, e);
+                                if let Some(report) = report.as_mut() {
+                                    report.status = Some(127);
+                                    report.fail(format!("{}: {}", pipeline.segments[0].program, e));
+                                }
                                 eval.set_global("status", Value::Number(127.0));
                             }
                         }
@@ -925,6 +1154,10 @@ pub fn run_repl() -> i32 {
             }
         }
     }
+
+    // The editor is about to go away; an admission that reserved a prompt on a
+    // shell that is leaving must find no surface rather than a dead control.
+    crate::session_execute::withdraw();
 
     // Save usage stats before exit
     if let Some(stats) = eval.take_stats() {
@@ -981,10 +1214,11 @@ fn build_prompt(eval: &mut Evaluator, rt: &tokio::runtime::Runtime) -> Result<St
 /// as `$?`. Delegating fixed two REPL-only divergences: `cd -` with OLDPWD
 /// unset is now an error (was a silent no-op chdir to cwd), and `~user/...`
 /// stays literal → ENOENT (was mangled to `$HOMEuser/...`).
-fn handle_cd(args: &[impl AsRef<str>], eval: &mut Evaluator) {
+fn handle_cd(args: &[impl AsRef<str>], eval: &mut Evaluator) -> i32 {
     let args: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
     let code = exec::builtin_cd(&args);
     eval.set_global("?", Value::Number(code as f64));
+    code
 }
 
 /// Source ~/.mixrc into `eval` within an existing async context (no

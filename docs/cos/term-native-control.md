@@ -58,7 +58,9 @@ fallback for mutations.
 | `term.pane.split` | `manage_layout` | `dir`: `h`, `horizontal`, `v` or `vertical`; requires owner/owning Term authority |
 | `term.tab.select`, `term.pane.select` | `manage_layout` | Select the explicitly targeted pane and its tab |
 | `term.tab.close`, `term.pane.close` | `terminate`, plus affected layout authority | Close the explicit target |
-| `term.execute` | `execute` | Always `UNSUPPORTED`; no Stage-D execution API is enabled |
+| `term.execute` | `execute` | `source`, `prompt_generation`, mutation ID/epoch; forwarded to the pane shell's own admission surface |
+| `term.exec.result` | `execute` | `operation_id`: the forwarded execution's state and, once it has one, its result |
+| `term.exec.cancel` | `execute` | `operation_id`: cancel that execution; cooperative, and the reply says what actually happened |
 | `term.operation` | `read_state` | `operation_id`: retrieve the caller's retained operation outcome |
 
 Layout requests supply `affected`, an array of additional explicit targets,
@@ -67,6 +69,53 @@ than the primary target. The gate computes the affected set under the model
 lock and checks every member. Bound children cannot create panes outside their
 grant. Close requires termination authority for the panes being removed; layout
 authority does not substitute for termination authority.
+
+## Execution
+
+`term.execute` does not decide whether an execution may happen. The pane shell
+does, against its own prompt, its own editor state and its own prompt
+generation — none of which Term can observe. Term owns the same three things it
+owns for `term.type`: the actor and target rules, the BROKER-022 retry rules,
+and the guarantee that the request reaches the child this pane is bound to at
+exactly this generation. A pane whose child has not enrolled, has been replaced,
+or is at a different generation is refused before anything is forwarded.
+
+The shell's refusals are relayed rather than replaced, because `BUSY` and
+`STALE_GENERATION` tell a caller two different things to do next. `BUSY` means
+the human is using the prompt and nothing was discarded; `STALE_GENERATION`
+means the generation moved and the caller should re-read it. The full admission
+rules, the visible echo, the result shape and the honest cancellation guarantee
+table are in the Mix manual under "Native pane-shell execution (stage D)"
+(`mix man cli`).
+
+`term.execute` is a mutation: it spends a request ID and carries a request
+epoch, and its ID is retired before the submission is forwarded, so a lost reply
+can never become a second execution. `term.exec.result` and `term.exec.cancel`
+are not: both address one immutable evaluation identity and are idempotent by
+construction.
+
+**Request IDs are namespaced at the hop.** Term forwards on its own connection,
+so at the child every caller's IDs would otherwise land in one `(actor, id)`
+space keyed to Term — one agent's ID 1 would replay another's operation, and two
+agents using the same ID with different bodies would conflict with each other
+forever. Term mints its own monotonic sequence per caller request and remembers
+the mapping, so the child sees one ID per `(Term, forwarded-seq)`. The mapping is
+what makes a retry safe: it forwards the SAME child ID, reaching the child's own
+dedupe rather than submitting again.
+
+A forwarded submission whose answer never arrives is reported as
+`UNKNOWN_OUTCOME`, and that placeholder is deliberately **not retained**. A
+retained local timeout would make every byte-identical retry replay the
+placeholder forever; not retaining it lets the retry re-forward to the child,
+which is the only party that can say what actually happened. The same applies to
+a reply too large to deliver.
+
+**The announcement names the originating agent, not Term.** Term supplies the
+principal from its own broker-stamped actor context — never from a caller-
+supplied field, which would let one agent announce itself as another — and the
+child renders it through the same allowlist escape as the source, as
+`<originator> via Term …`. The "via" is load-bearing: the child authenticated
+Term, not the name Term relayed.
 
 ## Live properties
 

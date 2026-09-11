@@ -1,0 +1,128 @@
+-- Hard gate: the P0-J stage-D fixtures — idle-prompt execution admission and
+-- per-evaluation cancellation — actually RUN, on both sides of the path.
+--
+-- Two suites, because stage D is two halves that fail differently. The SHELL
+-- half lives in cosmix-mix and drives a real broker, a real grant and a real
+-- Mix child on a real PTY; it is where the load-bearing claims are asserted
+-- (the admission echo reaches the glass before the output it announces, a
+-- refused submission leaves a human draft byte-intact, a cancelled loop never
+-- prints its completion marker). The TERM half is an #[ignore]'d S4-family
+-- fixture that proves the forward: Term reaches the child this pane is bound
+-- to, at exactly this generation, and relays the child's own refusal rather
+-- than replacing it.
+--
+-- The counts are the point, and for two different reasons. libtest exits 0 when
+-- its filter matches nothing, so a renamed module, a moved file or a mistyped
+-- filter would otherwise leave this gate passing while running zero fixtures.
+-- And the shell suite is a PREFIX filter: pinning its count is what stops a
+-- fixture being quietly deleted or renamed out of the set.
+--
+-- Run from the repository src/ directory, like its siblings check-s4-gates.mix
+-- and check-production-e2e.mix.
+
+-- The shell half, by prefix, with the exact set pinned below it.
+$shell_prefix = "stage_d"
+$shell_fixtures = [
+  "stage_d_a_cancelled_captured_runner_reports_cancelled_not_completed",
+  "stage_d_a_refused_submission_may_be_retried_under_the_same_id",
+  "stage_d_an_undetermined_admission_still_resolves_to_its_real_outcome",
+  "stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact",
+  "stage_d_a_signal_during_an_admitted_execution_does_not_reach_the_next_one",
+  "stage_d_admits_at_an_idle_prompt_echoes_and_reports_a_structured_result",
+  "stage_d_an_abandoned_admission_never_executes_and_its_retry_does_not_re_run",
+  "stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human",
+  "stage_d_cancellation_resolves_the_exact_operation",
+  "stage_d_cancelling_a_managed_foreground_job_signals_its_process_group",
+  "stage_d_is_unsupported_rather_than_busy_without_the_owned_editor",
+  "stage_d_paste_and_search_drafts_are_preserved_with_exact_refusals",
+  "stage_d_refuses_every_ineligible_prompt_state_without_discarding_anything",
+  "stage_d_reports_its_own_capability_and_refuses_unauthorised_callers"
+]
+$shell_expected = length($shell_fixtures)
+
+-- The Term half. Full path so a module rename cannot be absorbed by a prefix.
+$term_fixtures = [
+  "native_session::enforcement_tests::p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges"
+]
+$term_expected = length($term_fixtures)
+
+$root = cwd()
+if not exists($root + "/desktop/apps/term/src/control.rs") then
+  print("GATE BLOCKED: run from the repository src/ directory")
+  exit(2)
+end
+
+-- The PTY fixtures refuse an installed or stale binary: they compare the Mix
+-- build's git sha against HEAD and require a clean checkout. Build it here so
+-- the gate cannot be satisfied by whatever happens to be lying in target/.
+-- RUSTC_WRAPPER disabled as in the sibling gates: a caching layer must never be
+-- able to decide whether this passes.
+print("building the current-HEAD Mix the fixtures require ...")
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 3000, env: {"RUSTC_WRAPPER": ""}})
+if $build["exit_code"] != 0 then
+  print($build["stderr"])
+  print("GATE BLOCKED: could not build cosmix-mix; an unbuilt binary is not a pass")
+  exit(2)
+end
+$binary = $root + "/target/release/mix"
+if not exists($binary) then
+  print("GATE BLOCKED: " + $binary + " missing after a successful build")
+  exit(2)
+end
+
+-- Half one: the shell's own admission surface, against a real PTY child.
+print("running " + $shell_expected + " stage-D shell fixtures ...")
+$shell = run_argv(
+  ["cargo", "test", "-p", "cosmix-mix", "--test", "native_session_pty", $shell_prefix, "--", "--test-threads=1"],
+  {timeout: 3000, env: {"RUSTC_WRAPPER": ""}}
+)
+print($shell["stdout"])
+if $shell["exit_code"] != 0 then
+  print($shell["stderr"])
+  print("GATE FAIL: the stage-D shell suite did not pass")
+  exit(1)
+end
+$want = "test result: ok. " + $shell_expected + " passed"
+if not contains($shell["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  print("A zero-match filter, a renamed module or a deleted fixture all exit 0;")
+  print("the count is what tells them apart from a real run.")
+  exit(1)
+end
+-- Every pinned name must have actually appeared in the run. The count alone
+-- would accept six fixtures that are not these six.
+for $fixture in $shell_fixtures
+  if not contains($shell["stdout"], $fixture) then
+    print("GATE FAIL: " + $fixture + " did not run")
+    exit(1)
+  end
+end
+
+-- Half two: the Term forward, which is #[ignore]'d and needs the built binary.
+print("running " + $term_expected + " stage-D Term fixture ...")
+$argv = concat(
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  $term_fixtures
+)
+$term = run_argv($argv, {
+  timeout: 3000,
+  env: {COSMIX_E2E_MIX_BIN: $binary, "RUSTC_WRAPPER": ""}
+})
+print($term["stdout"])
+if $term["exit_code"] != 0 then
+  print($term["stderr"])
+  print("GATE FAIL: the stage-D Term fixture did not pass")
+  exit(1)
+end
+$want = "test result: ok. " + $term_expected + " passed"
+if not contains($term["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  exit(1)
+end
+
+print("GATE PASS: " + $shell_expected + " shell fixtures and " + $term_expected + " Term fixture ran and passed")
+print("NOT covered here: the S4 recipient-enforcement suite is check-s4-gates.mix,")
+print("and p0i-01 belongs to check-production-e2e.mix. Stage D adds no new")
+print("enforcement surface — it makes an existing capability real, and the")
+print("authority behind it is still gated by those two.")
+exit(0)

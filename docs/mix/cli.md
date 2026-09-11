@@ -660,8 +660,10 @@ taken once, not per check. Every session RPC serialises on that one connection,
 so a renewal that loses its deadline to admission load is retried once with a
 fresh deadline before the attachment is given up. Stale targets return
 `STALE_GENERATION`. Recovery uses S3; it never resets shell sequence or prompt
-generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
+generation. Jobs, signals, foreground/resume,
 isolated tasks, input and event publication report `UNSUPPORTED`, never `BUSY`.
+Evaluation submit and inspect report what this build can actually do — see
+stage D below — and report `UNSUPPORTED` wherever it cannot.
 The resident runs at most four admission tasks alongside its receive/renew/restart
 loop, one of which is reserved for the pane's own Term: other same-UID callers
 share three, so a flood by them cannot starve the owner into uniform refusals.
@@ -676,6 +678,184 @@ receive owner, which writes that connection's `REFUSED`, and a dropped id-less
 lifecycle notice raises a delivery gap the resident treats exactly as it treats
 the broker's own lifecycle gap. Other clients retain their existing receive
 configuration.
+
+### Native pane-shell execution (stage D)
+
+The same enrolled attachment answers `shell.execute`, `shell.execute.result`
+and `shell.execute.cancel`. These are BROKER-023 `execute`, not `read_state`:
+holding the capability that answers questions about the shell does not reach
+them, and a caller without `execute` is refused before learning that the family
+exists.
+
+**Admission is empty-primary-prompt only.** A submission is admitted when the
+shell is at `prompt-ready`, not a continuation, with an empty draft, no history
+search, no paste in progress and no partially-decoded key — and when the
+`prompt_generation` it names is the one actually at the prompt. Anything else
+is refused, and the refusal discards nothing: a half-typed line is still there,
+character for character, and finishing it runs the human's line.
+
+| Situation | Answer |
+|---|---|
+| Empty primary prompt, generation matches | admitted |
+| Half-typed draft, history search, paste in progress | `BUSY` |
+| Continuation prompt | `BUSY` |
+| Evaluating, foreground child, starting, exiting | `BUSY` |
+| Custom `prompt()` still rendering | `BUSY` |
+| Wrong prompt generation, or a target that is not this shell | `STALE_GENERATION` |
+| No owned editor (the rustyline path) | `UNSUPPORTED` |
+| Retention table full | `RESOURCE_LIMIT` |
+| Same request id, different body | `CONFLICT` |
+| Unauthorised, or the attachment lost mid-admission | `REFUSED` |
+
+Nothing queues behind a busy shell. There is no state in which a submission is
+accepted now and executed at some later prompt, because a caller cannot know
+what the shell will be doing then — and a snapshot is information, never an
+execution permit.
+
+The admitted line is **visibly echoed before it runs**, through the editor's own
+terminal, naming the principal and the command id:
+
+```
+mix: execute #7 admitted for Term ff86c6c7: print("hello")
+```
+
+The source in that line is escaped by a printable **allowlist**, not a blocklist:
+anything outside ordinary printable text is rendered rather than emitted. That
+covers the characters `is_control` does not report — bidi overrides and
+isolates, zero-width joiners, the BOM, a soft hyphen, `U+2028`/`U+2029` — each
+of which can reorder or hide what a reader sees without being a control code. A
+submission is attacker-chosen bytes drawn into a terminal a human is reading,
+and the allowlist means a new trick is escaped by default rather than passed
+through by omission.
+
+A source too long for one line is truncated with its tail NAMED:
+
+```
+mix: execute #7 admitted for PaneShell 9c1f via Term ff86c6c7: <head> …[+812 bytes, sha256:3ab19f04]
+```
+
+Nothing executes with an unannounced tail, and two submissions sharing a head
+are still distinguishable. When a forwarder relays somebody else's submission
+the announcement reads `<originator> via <forwarder>`: the shell authenticated
+the forwarder, not the name it relayed, and the wording says so rather than
+implying the shell verified it.
+
+If the whole line cannot be put on the glass, the pane says
+`announcement abandoned; nothing executed` instead — an announcement is
+zero-or-whole, because a partial one reads exactly like a real admission.
+
+**A reservation takes nothing away.** Between the moment the shell agrees to run
+a submission and the moment it commits, the prompt is still live: still in raw
+mode, still being read a byte at a time, still the human's. Any input at all
+during that window — a single character, even one that edits nothing — ends the
+reservation, and the submission is refused having announced nothing. The
+terminal only changes hands at the commit itself, which is one atomic step:
+reads stopped, cooked mode restored, announcement written, line executed. That
+ordering is why a keystroke can never be painted into the announcement by kernel
+echo, and can never arrive as the admitted execution's standard input.
+
+Execution then follows the same path a typed line takes — the same classifier,
+aliases, job integration and history policy — adopting the command id that was
+minted, echoed and recorded before it started. Admission never opens a
+continuation: a submission that turns out to be an incomplete line is refused
+and the prompt is returned, because a remote execution may not leave a human
+holding half of someone else's line.
+
+`shell.execute` answers immediately with `{"state":"running","operation_id":…}`;
+`shell.execute.result` returns that operation's state and, once it has one, its
+result. Both it and `shell.execute.cancel` are scoped to the actor that
+submitted — holding `execute` authorises driving the shell, not reading back
+what somebody else drove it to do — and an operation belonging to another actor
+is refused exactly like one that does not exist.
+
+Retries are BROKER-018 idempotent: an identical submission under the same
+request id replays the recorded answer rather than executing a second time.
+**Request ids must be monotonic per caller.** A spent id stays spent even after
+its record is gone (see the cap below), so reusing a lower id answers
+`UNKNOWN_OUTCOME` rather than executing; callers going through Term get this
+for free, because Term mints its own sequence, but a direct caller has to keep
+its own counter.
+**Fifteen minutes is the ceiling, not a promise.** The store holds 256
+operations, and a busy shell reaches that long before it reaches the clock; the
+oldest COMPLETED record is then evicted (a running one never is). What survives
+eviction is a per-actor high-water mark, so a retry whose record is gone answers
+`UNKNOWN_OUTCOME` rather than executing a second time — the id stays spent even
+when its result no longer exists.
+
+Three refusals are worth telling apart, because they are different facts:
+
+* `BUSY` — nothing was announced and nothing ran. The request id is untouched
+  and the same submission may simply be retried. This is the commonest refusal
+  by design: a reservation is given up the instant the human touches the
+  keyboard, so a busy pane produces it routinely.
+* `UNKNOWN_OUTCOME` with `reason: admission_abandoned_before_execution` — proven
+  that nothing ran, but the id is spent and its outcome recorded. Retrying it
+  replays that; use a new id to try again.
+* `UNKNOWN_OUTCOME` with `reason: admission_claimed_without_report` — the shell
+  cannot say whether the line ran. The named `operation_id` stays resolvable, so
+  `shell.execute.result` on it is how the caller finds out.
+
+The result is serialised on the evaluator owner, so no interpreter value ever
+crosses to the Bus thread:
+
+```json
+{"state":"finished","result":{
+  "outcome":"completed",  "status":0,
+  "value":{"type":"string","version":1,"bytes":"11","truncated":false,"text":"hello world"},
+  "duration_ms":"3",
+  "cancellation":{"requested":false,"delivered":"none"}}}
+```
+
+`outcome` is the execution's verdict and `value.truncated` is a property of how
+much of the answer fitted. They are independent: a command that succeeded and
+returned more than 16 KiB still succeeded.
+
+#### Cancellation, and what it is actually worth
+
+`shell.execute.cancel` resolves one immutable evaluation identity. A request for
+an evaluation that has already finished says so and signals nothing, so a
+cancellation can never reach a successor evaluation — the failure mode the
+single process-wide interrupt flag made inevitable. `SIGINT` is mapped the same
+way: the signal records which evaluation was running when it arrived, so a
+Ctrl-C at an idle prompt cannot trip the next line. A cancelled evaluation's
+intent is sticky, so a Mix `try`/`catch` around cancelled work cannot swallow it
+and run on.
+
+Delivery is cooperative, and the table says only what is true:
+
+| Path | Guarantee |
+|---|---|
+| Ordinary statements | cooperative, at the evaluator's existing checkpoints |
+| Optimised native loops | cooperative, at the existing periodic check |
+| Captured runners (`run_argv`, `run_pipeline`) | existing polling; the runner abandons its child |
+| Managed interactive foreground job | **SIGINT to the process group**, via the job controller — the one path that does not depend on the target polling anything |
+| `run_stream` | not interruptible while blocked in the child wait |
+| `serve()` | **not covered**: its interrupt is a process-wide shutdown request, consumed by the pump's own exit rather than reported as a delivered cancellation |
+| Blocking HTTP, filesystem and device calls; uncooperative extensions | **no pre-emption** |
+
+The group signal is SIGINT and stops there. Escalating to `SIGTERM` and then
+`SIGKILL` would need a grace period this shell does not run a clock for, and a
+shell that escalated on its own would destroy work a human could still have
+recovered with `fg`. The `cancel` reply reports `signalled_pgid` when a real
+group signal went out, so a caller can tell the two strengths apart rather than
+having to assume.
+
+What cannot be promised is not promised: arbitrary builtin pre-emption,
+rolling back side effects, killing threads, or terminating descendants after
+they detach. Bounded termination of uncooperative work needs a separately
+supervised process, which by construction cannot inherit or mutate this shell's
+scope. `cancel` reports `requested`, `already_finished` or `unknown`, and a
+finished evaluation's report distinguishes `cancelled` from `completed_anyway`.
+
+Noninteractive shells, `--serve`, `mix -c` and any shell without an attachment
+carry none of this: no surface is registered, no admission state is allocated,
+no result store exists, and `serve`'s process-wide shutdown semantics are
+untouched. One thing is NOT unchanged, and it applies to every Mix process: the
+SIGINT handler now also records which evaluation a signal was aimed at, so
+`interrupt::init` registers one additional chained handler. Two relaxed atomic
+stores, no allocation, no behaviour change to what the signal does — but it is a
+difference, and "byte-identical" would have been a claim this page could not
+back.
 
 - `mix` is intercepted by the shell, so it never sees `$`-sigil arguments — write `mix what round`, not `mix what $name`.
 - The introspection family (`vars`/`aliases`/`functions`/`all`/`context`) is most useful **inside a REPL**, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.

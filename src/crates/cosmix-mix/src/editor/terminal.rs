@@ -210,6 +210,73 @@ impl Terminal {
     pub fn bell(&mut self) -> io::Result<()> {
         self.queue(b"\x07")
     }
+    /// Write one line and DRAIN it before returning, unlike every other writer
+    /// here. The admission echo has to be on the glass before the evaluation it
+    /// announces produces any output of its own, and the evaluator writes
+    /// straight to the shared stdout — it does not go through this buffer. A
+    /// queued echo would race that output and could surface after it.
+    ///
+    /// Called only from the admission path, with modes already restored and the
+    /// editor idle, so the bounded wait below is for tty flow control alone.
+    ///
+    /// `drain` is supplied by the caller and must fit INSIDE the budget that
+    /// caller is itself being held to. A fixed deadline longer than the
+    /// admission budget is what let a timed-out admission keep writing to the
+    /// pane after its caller had been answered.
+    pub fn echo(&mut self, text: &str, drain: Duration) -> io::Result<()> {
+        // ONE queue call, so a failure part-way cannot leave the announcement
+        // split across two writes with only the first on screen.
+        let mut line = String::with_capacity(text.len() + 2);
+        line.push_str(text);
+        line.push_str("\r\n");
+        self.queue(line.as_bytes())?;
+        self.cursor_row = 0;
+        let deadline = Instant::now() + drain;
+        while self.written < self.pending.len() {
+            let failure = if !self.foreground() {
+                // Writing would raise SIGTTOU against a shell that no longer
+                // owns the terminal. Refusing is correct: the caller turns this
+                // into a refusal and nothing executes unannounced.
+                Some("editor lost the terminal before the echo")
+            } else if Instant::now() >= deadline {
+                OUTPUT_TEARS.fetch_add(1, Ordering::Relaxed);
+                Some("echo could not be flushed")
+            } else {
+                None
+            };
+            if let Some(failure) = failure {
+                // An announcement is zero-or-whole. A partial one reads exactly
+                // like a real admission, so if the whole line could not be put
+                // on the glass, say on the glass that it was abandoned — and
+                // never let the absence of the rest be mistaken for silence.
+                self.abort_echo();
+                return Err(io::Error::other(failure));
+            }
+            self.flush_ready()?;
+            if self.written < self.pending.len() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        // flush_ready consumed the dirty bit above; the caller is not drawing.
+        self.dirty = false;
+        Ok(())
+    }
+    /// Best effort by construction: the write that failed is the reason this is
+    /// needed, so it may fail too. Dropping whatever is still queued first is
+    /// what stops the abandoned announcement from arriving later anyway.
+    fn abort_echo(&mut self) {
+        // Never write off the foreground. A background write with TOSTOP set
+        // raises SIGTTOU and STOPS the shell — recovering from a failed
+        // announcement must not be able to suspend the process it is
+        // recovering. The same guard the rest of this file writes behind.
+        if self.foreground() {
+            let notice = b"\r\nmix: execute: announcement abandoned; nothing executed\r\n";
+            let _ = self.output.write(notice);
+        }
+        self.pending.clear();
+        self.written = 0;
+        self.cursor_row = 0;
+    }
     pub fn notice(&mut self, layout: &Layout, message: &str) -> io::Result<()> {
         self.finish(layout)?;
         self.queue(message.as_bytes())?;

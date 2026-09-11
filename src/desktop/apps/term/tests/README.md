@@ -67,3 +67,27 @@ age retained records; policy, transport and broker stamps are not mocked.
 Existing S0–S3 and legacy handler tests remain part of the regression inventory.
 Run both workspace test/clippy gates separately; this inventory does not claim
 they passed.
+
+## Stage-D test hooks
+
+Two environment variables exist ONLY to make P0-J stage-D interleavings
+deterministic. Both are read **once** — at editor start and at first use
+respectively — so nothing later in the process, including evaluated Mix, can
+turn them on; both are absent and therefore zero in every ordinary run, costing
+one comparison against a captured field.
+
+| Variable | Read by | Widens |
+|---|---|---|
+| `MIX_ADMIT_DELAY_MS` | the editor thread, before an admission claims its owner token | the queued-envelope window, so a fixture can make the admission owner give up while the envelope is still queued |
+| `MIX_RESERVE_HOLD_MS` | the admission owner, between reserve and commit | the reservation window, so a fixture can type into it |
+| `MIX_CLAIM_DELAY_MS` | the editor thread, AFTER an admission claims its token | the committed window, the only way to reach the branch where the owner's abandon loses and the outcome is genuinely undetermined |
+
+They are not `#[cfg(test)]` because the PTY fixtures drive the real release
+binary, which is built without test cfg by construction — a hook compiled out of
+that binary could not be reached by the tests that need it. Neither changes any
+decision the shell makes: they only stretch an interval that is otherwise
+sub-millisecond, and every assertion around them is about behaviour that holds
+at any interval length.
+
+`check-stage-d-gates.mix` sets neither; the fixtures that need them set them per
+child.

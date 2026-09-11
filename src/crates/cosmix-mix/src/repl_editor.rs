@@ -1,6 +1,6 @@
 //! Opt-in adapter. The legacy editor receives the same calls when unselected.
 use crate::completion::MixHelper;
-use crate::editor::runtime::{Control, Line, OwnedEditor};
+use crate::editor::runtime::{Admitted, Control, Line, OwnedEditor};
 use crate::editor::{Generation, PromptProfile};
 use rustyline::error::ReadlineError;
 use std::collections::HashSet;
@@ -59,6 +59,14 @@ fn read_complete_history(path: &Path) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// What the prompt produced. An admitted line is not a human line with a tag
+/// on it: it carries an identity that was minted, echoed and recorded before it
+/// arrived, and the REPL adopts that identity rather than opening its own.
+pub enum ReplInput {
+    Human(String),
+    Admitted(Admitted),
+}
+
 pub enum ReplEditor {
     Legacy(Box<rustyline::Editor<MixHelper, rustyline::history::DefaultHistory>>),
     Owned {
@@ -87,10 +95,14 @@ impl ReplEditor {
         let editor = match duplicate(0).and_then(|input| {
             duplicate(1).and_then(|output| {
                 if crate::session_state::enabled() {
-                    OwnedEditor::start_with_activation(
+                    OwnedEditor::start_with_hooks(
                         input,
                         output,
                         Some(crate::session_state::prompt_activated),
+                        // The editor is the only party that can observe an
+                        // admission failing after it claimed the work; the
+                        // owner has already been answered by then.
+                        Some(crate::session_execute::admission_failed),
                     )
                 } else {
                     OwnedEditor::start(input, output)
@@ -122,7 +134,7 @@ impl ReplEditor {
             Self::Owned { helper: target, .. } => *target = helper,
         }
     }
-    pub fn readline(&mut self, prompt: &str, continuation: bool) -> rustyline::Result<String> {
+    pub fn readline(&mut self, prompt: &str, continuation: bool) -> rustyline::Result<ReplInput> {
         match self {
             Self::Legacy(editor) => {
                 // Legacy has no activation acknowledgement; this is the last
@@ -130,7 +142,7 @@ impl ReplEditor {
                 if let Some(generation) = crate::session_state::prepare_prompt(continuation) {
                     crate::session_state::prompt_activated(generation);
                 }
-                editor.readline(prompt)
+                editor.readline(prompt).map(ReplInput::Human)
             }
             Self::Owned {
                 editor,
@@ -165,7 +177,8 @@ impl ReplEditor {
                 // The editor owner publishes only an actual Editing acknowledgement,
                 // including deferred foreground activation. Suspended/Err publish nothing.
                 match editor.readline()? {
-                    Line::Submitted(line) => Ok(line),
+                    Line::Submitted(line) => Ok(ReplInput::Human(line)),
+                    Line::Admitted(admitted) => Ok(ReplInput::Admitted(admitted)),
                     Line::Interrupted => Err(ReadlineError::Interrupted),
                     Line::Eof => Err(ReadlineError::Eof),
                 }

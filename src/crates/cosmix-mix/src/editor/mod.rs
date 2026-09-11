@@ -123,6 +123,13 @@ pub enum Reply {
         generation: Generation,
         edit_revision: u64,
     },
+    /// An execution reservation stands. The editor is STILL editing, still in
+    /// raw mode and still reading: this is a promise not to accept a second
+    /// admission, not a surrender of the terminal.
+    Reserved {
+        generation: Generation,
+        edit_revision: u64,
+    },
     RestoredAndStopped {
         generation: Generation,
     },
@@ -219,6 +226,22 @@ impl Editor {
     pub fn state(&self) -> State {
         self.state
     }
+    /// Whether a granted execution reservation is standing. A local lifecycle
+    /// `pause` never sets this, so suspension alone is not a permit.
+    pub fn reserved(&self) -> bool {
+        self.reserved
+    }
+    /// Would [`Self::consume_reservation`] succeed right now? The admission
+    /// owner writes its visible echo between this question and the consume;
+    /// both run on the thread that owns every field read here, so a true answer
+    /// stays true across that write and the announcement can never be separated
+    /// from the execution it announces.
+    pub fn admissible(&self, generation: Generation, revision: u64) -> bool {
+        self.generation == Some(generation)
+            && revision == self.revision
+            && self.state == State::Editing
+            && self.reserved
+    }
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -239,6 +262,13 @@ impl Editor {
             .revision
             .checked_add(1)
             .ok_or(ProtocolError::Exhausted)?;
+        // Human-first, enforced at the one place every observed human action
+        // passes through. A byte — even one that is only part of an escape
+        // sequence, even one that edits nothing — ends any standing
+        // reservation. The admission owner then finds nothing to consume and
+        // is refused, which is the whole of the rule: the person at the
+        // keyboard wins ties.
+        self.reserved = false;
         Ok(())
     }
     pub fn edit(
@@ -320,6 +350,15 @@ impl Editor {
                 self.interaction = Interaction::default();
                 self.modes(State::Activating, ModeAction::EnterEditing)
             }
+            // A reservation changes NO terminal state. §8 puts the cooked-mode
+            // restore at step 6, the commit — and that placement is what makes
+            // human-first hold: while the reservation stands the editor is
+            // still in raw mode reading byte by byte, so a half-typed character
+            // is seen immediately, lands in the draft as ordinary typing, and
+            // clears the reservation. Restoring here instead handed the window
+            // to the canonical line discipline, where kernel echo painted the
+            // keystroke into the announcement and the bytes then became the
+            // admitted execution's stdin.
             Command::SuspendRequested {
                 generation,
                 edit_revision,
@@ -338,9 +377,11 @@ impl Editor {
                         edit_revision: self.revision,
                     }));
                 }
-                let effect = self.modes(State::RestoringForSuspend, ModeAction::Restore)?;
                 self.reserved = true;
-                Ok(effect)
+                Ok(Effect::Reply(Reply::Reserved {
+                    generation,
+                    edit_revision: self.revision,
+                }))
             }
             Command::Resume {
                 generation,
@@ -353,6 +394,10 @@ impl Editor {
                 if self.state != State::Suspended {
                     return Err(ProtocolError::InvalidState);
                 }
+                // Returning the prompt to the human ends any reservation over
+                // it. An admission owner that comes back after a release —
+                // late, cancelled, or timed out — finds nothing to consume.
+                self.reserved = false;
                 self.modes(State::Activating, ModeAction::EnterEditing)
             }
             Command::Shutdown { generation } => {
@@ -424,10 +469,12 @@ impl Editor {
         };
         Ok(reply)
     }
-    /// Admission owner consumes a suspended reservation after its final
-    /// identity/deadline/revision checks. No speculative next prompt.
-    /// Only a suspended reservation may be consumed here; human-line return
-    /// requires a separate terminal-restored completion seam in the input lane.
+    /// Step 5: the admission owner consumes the reservation after its final
+    /// identity/deadline/revision checks, and the prompt ends here.
+    ///
+    /// The caller has already restored the terminal at this point, exactly as
+    /// the human-line path does in `finish_line`. Both routes off a prompt
+    /// therefore look the same to the editor: modes restored, then Idle.
     pub fn consume_reservation(
         &mut self,
         generation: Generation,
@@ -437,10 +484,25 @@ impl Editor {
         if revision != self.revision {
             return Err(ProtocolError::StaleRevision);
         }
-        if self.state != State::Suspended || !self.reserved {
+        if self.state != State::Editing || !self.reserved {
             return Err(ProtocolError::InvalidState);
         }
         self.state = State::Idle;
+        self.reserved = false;
+        Ok(())
+    }
+    /// Drop a reservation without executing anything, leaving the prompt and
+    /// its draft exactly as they were. Nothing to undo: a reservation never
+    /// changed the terminal in the first place.
+    pub fn release_reservation(
+        &mut self,
+        generation: Generation,
+        revision: u64,
+    ) -> Result<(), ProtocolError> {
+        self.check(generation)?;
+        if revision != self.revision {
+            return Err(ProtocolError::StaleRevision);
+        }
         self.reserved = false;
         Ok(())
     }
@@ -569,35 +631,78 @@ mod tests {
         })
         .unwrap()
     }
+    /// §8 step 6 puts the cooked-mode restore at the COMMIT. A reservation
+    /// therefore changes nothing at all: the editor keeps editing, keeps its
+    /// raw mode and keeps reading, which is what leaves the human able to
+    /// out-race it with a single keystroke.
     #[test]
-    fn restore_before_ack_and_preserve_undo() {
+    fn a_reservation_changes_no_terminal_state_and_keeps_editing() {
         let mut e = editing(PromptProfile::Primary("> ".into()));
-        e.edit(|b| b.insert("draft")).unwrap();
-        e.edit(|b| b.kill(0..5, false)).unwrap();
-        let before = e.buffer().clone();
-        let rev = e.edit_revision();
-        let t = token(suspend(&mut e));
-        assert_eq!(e.state(), State::RestoringForSuspend);
-        assert_eq!(e.edit(|b| b.insert("x")), Err(ProtocolError::InvalidState));
+        let revision = e.edit_revision();
+        let before = e.clone();
+        let reply = suspend(&mut e);
         assert_eq!(
-            e.modes_completed(t, true),
-            Ok(Reply::Suspended {
+            reply,
+            Effect::Reply(Reply::Reserved {
                 generation: G,
-                edit_revision: rev
-            })
+                edit_revision: revision
+            }),
+            "a reservation must not produce a mode operation"
         );
-        assert_eq!(e.buffer(), &before);
-        let t = token(
-            e.command(Command::Resume {
-                generation: G,
-                edit_revision: rev,
-            })
-            .unwrap(),
-        );
-        e.modes_completed(t, true).unwrap();
-        assert_eq!(e.buffer(), &before);
-        e.edit(Buffer::undo).unwrap();
-        assert_eq!(e.buffer().text(), "draft");
+        assert_eq!(e.state(), State::Editing, "the editor stopped editing");
+        assert!(e.reserved());
+        // Everything except the promise itself is untouched.
+        assert_eq!(e.buffer(), before.buffer());
+        assert_eq!(e.edit_revision(), revision);
+        // And it can still be typed into, because it was never taken away.
+        assert!(e.edit(|b| b.insert("x")).is_ok());
+    }
+
+    /// Human-first, at the one place every observed human action passes
+    /// through. A byte that edits nothing still ends the reservation.
+    #[test]
+    fn any_human_activity_ends_a_standing_reservation() {
+        type Act = fn(&mut Editor) -> Result<(), ProtocolError>;
+        for (name, act) in [
+            ("insert", (|e| e.edit(|b| b.insert("x")).map(|_| ())) as Act),
+            // A no-op edit: backspace at position zero changes no text.
+            ("no-op edit", |e| e.edit(Buffer::backspace).map(|_| ())),
+            // A partial escape sequence, which reaches the buffer as nothing
+            // at all but is unmistakably a person at the keyboard.
+            ("partial key", |e| {
+                e.set_interaction(Interaction {
+                    decoder_pending: true,
+                    ..Default::default()
+                })
+            }),
+        ] {
+            let mut e = editing(PromptProfile::Primary("> ".into()));
+            let revision = e.edit_revision();
+            assert!(matches!(
+                suspend(&mut e),
+                Effect::Reply(Reply::Reserved { .. })
+            ));
+            assert!(e.reserved(), "{name}");
+            act(&mut e).unwrap();
+            assert!(!e.reserved(), "{name}: the reservation survived a keystroke");
+            assert!(
+                !e.admissible(G, revision),
+                "{name}: an admission could still commit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_released_reservation_leaves_the_prompt_exactly_as_it_was() {
+        let mut e = editing(PromptProfile::Primary("> ".into()));
+        let revision = e.edit_revision();
+        suspend(&mut e);
+        let reserved = e.clone();
+        e.release_reservation(G, revision).unwrap();
+        assert!(!e.reserved());
+        assert_eq!(e.state(), State::Editing);
+        assert_eq!(e.buffer(), reserved.buffer());
+        assert_eq!(e.edit_revision(), revision);
     }
     #[test]
     fn admission_blockers() {
@@ -653,8 +758,7 @@ mod tests {
                 Err(ProtocolError::StaleGeneration)
             );
         }
-        let t = token(suspend(&mut e));
-        e.modes_completed(t, true).unwrap();
+        suspend(&mut e);
         e.consume_reservation(G, 1).unwrap();
         assert_eq!(
             e.command(Command::BeginPrompt {
@@ -674,7 +778,9 @@ mod tests {
     #[test]
     fn failure_and_shutdown_supersede_pending_operations() {
         let mut e = editing(PromptProfile::Primary(String::new()));
-        let old = token(suspend(&mut e));
+        // The lifecycle pause is the mode-moving operation now; a reservation
+        // deliberately has no modes to fail.
+        let old = token(e.pause(G, e.edit_revision()).unwrap());
         assert_eq!(
             e.modes_completed(old, false),
             Err(ProtocolError::ModeFailure)
@@ -716,7 +822,7 @@ mod tests {
                 e.modes_completed(begin, true).unwrap();
             }
             if phase > 1 {
-                let t = token(suspend(&mut e));
+                let t = token(e.pause(G, e.edit_revision()).unwrap());
                 if phase > 2 {
                     e.modes_completed(t, true).unwrap();
                 }
@@ -829,8 +935,10 @@ mod tests {
             }
             let mut e = base.clone();
             let effect = suspend(&mut e);
+            // A reservation is granted only while EDITING, and it is never a
+            // mode operation — it changes nothing but the promise.
             assert_eq!(
-                matches!(effect, Effect::Modes { .. }),
+                matches!(effect, Effect::Reply(Reply::Reserved { .. })),
                 state == State::Editing
             );
             if state != State::Editing {
@@ -842,16 +950,12 @@ mod tests {
                 state != State::Stopped
             );
         }
+        // Serial exhaustion belongs to the mode-moving operations now; a
+        // reservation allocates no mode token, so it cannot exhaust one.
         let mut e = editing(PromptProfile::Primary(String::new()));
         e.serial = u64::MAX;
         let before = e.clone();
-        assert_eq!(
-            e.command(Command::SuspendRequested {
-                generation: G,
-                edit_revision: 0
-            }),
-            Err(ProtocolError::Exhausted)
-        );
+        assert_eq!(e.pause(G, 0), Err(ProtocolError::Exhausted));
         assert_eq!(e, before);
         e.revision = u64::MAX;
         let before = e.clone();

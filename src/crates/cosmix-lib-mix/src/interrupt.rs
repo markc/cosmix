@@ -100,7 +100,39 @@ pub fn init(flag: Arc<AtomicBool>) -> bool {
     // handler the flag still works for the explicit-set path used by
     // the REPL's tokio task, and the pre-existing "blocking builtin
     // cannot be interrupted" behaviour is what we'd fall back to.
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag);
+    // ORDER IS LOAD-BEARING. signal_hook runs chained handlers in registration
+    // order, and the evaluator polls the flag from a different thread, on a
+    // different core, while the handler runs. Registering the flag first leaves
+    // a window in which the interrupt is already visible but the mapping saying
+    // WHICH evaluation it belongs to is not — and an evaluation that polls in
+    // that window is interrupted with no cancellation intent recorded against
+    // it. That race was observed, not theorised. Recording the mapping first
+    // means any reader that sees the flag has already seen the mapping.
+    //
+    // SAFETY: `cancel::signal_arrived` performs two relaxed atomic stores and
+    // nothing else — no allocation, no locking, no reentrant libc — which is
+    // async-signal-safe.
+    // A failure here is not cosmetic: without the mapping, cancellation cannot
+    // tell which evaluation a SIGINT belongs to, so it degrades to the old
+    // whole-process behaviour. Say so rather than swallowing it — a silently
+    // half-installed cancellation contract is worse than none, because
+    // everything downstream still reports as though it were whole.
+    if let Err(error) = unsafe {
+        signal_hook::low_level::register(signal_hook::consts::SIGINT, crate::cancel::signal_arrived)
+    } {
+        eprintln!(
+            "mix: WARNING: SIGINT mapping unavailable ({error}); \
+             Ctrl-C is no longer attributed to a specific evaluation"
+        );
+    }
+    // signal-hook stores `true` into the supplied AtomicBool from a signal
+    // handler. This is the delivery half; the registration above is the mapping.
+    if let Err(error) = signal_hook::flag::register(signal_hook::consts::SIGINT, flag) {
+        eprintln!(
+            "mix: WARNING: SIGINT delivery unavailable ({error}); \
+             blocking builtins will not observe Ctrl-C"
+        );
+    }
     true
 }
 

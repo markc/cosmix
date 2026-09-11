@@ -180,6 +180,13 @@ pub struct Job {
     pub members: Vec<Member>,
     pub modes: Option<libc::termios>,
     pub foreground: bool,
+    /// The evaluation that launched this job, or 0 when none was running.
+    ///
+    /// A cancellation names an EVALUATION, and by the time its group signal is
+    /// delivered that evaluation may have finished and a successor may own the
+    /// foreground. Stamping the owner at launch is what lets the signal refuse
+    /// to reach a job its caller never asked about.
+    pub owner_evaluation: u64,
 }
 impl Job {
     pub fn state(&self) -> JobState {
@@ -476,6 +483,7 @@ impl Controller {
                 members,
                 modes: None,
                 foreground,
+                owner_evaluation: cosmix_mix::cancel::active(),
             },
         );
         drop(s);
@@ -589,6 +597,52 @@ impl Controller {
         self.continue_job(job.id, true)?;
         println!("{}", job.command);
         Ok(self.finish(job.id, false, true, Some(lease))?.code)
+    }
+    /// Deliver a cancellation to the managed FOREGROUND job group, and report
+    /// the pgid it reached.
+    ///
+    /// This is the guarantee table's "managed interactive children" row, and it
+    /// is the one path where cancellation is not merely cooperative: the
+    /// members of an interactive job share a process group, the controller
+    /// knows which group holds the terminal, and `killpg` reaches all of them —
+    /// including a child that never polls anything.
+    ///
+    /// SIGINT only, deliberately. Escalating to TERM and then KILL needs a
+    /// grace period, and a grace period needs a clock this shell does not run;
+    /// more importantly a shell that escalates on its own would kill work a
+    /// human could still have resumed with `fg`. The documented guarantee is
+    /// exactly what this does and no more.
+    /// `evaluation` names the evaluation whose foreground job this is
+    /// meant for. Without it the signal goes to whatever is in the foreground
+    /// AT DELIVERY — and between resolving the cancellation and taking the job
+    /// lock, the target can finish and a successor's job can take its place.
+    /// The job the signal reaches must be the job the caller asked about.
+    pub fn interrupt_foreground(&self, evaluation: u64) -> Option<i32> {
+        let pgid = {
+            // Re-validated UNDER the lock, so the identity checked and the pgid
+            // taken come from the same observation of the table.
+            let state = self.shared.state.lock().unwrap();
+            state
+                .jobs
+                .values()
+                .find(|job| {
+                    job.foreground
+                        && job.state() == JobState::Running
+                        && job.owner_evaluation == evaluation
+                })
+                .map(|job| job.pgid)?
+        };
+        // Never the shell's own group: that would deliver to the evaluator
+        // thread and to every sibling, which is precisely the whole-process
+        // behaviour per-evaluation cancellation exists to replace.
+        if pgid == self.shell_pgid || pgid <= 0 {
+            return None;
+        }
+        // SAFETY: a plain signal to a group id the controller owns.
+        if unsafe { libc::killpg(pgid, libc::SIGINT) } != 0 {
+            return None;
+        }
+        Some(pgid)
     }
     pub fn background_job(&self, id: Option<usize>) -> io::Result<()> {
         let job = self.select(id)?;
@@ -1045,6 +1099,7 @@ mod tests {
                 .collect(),
             modes: None,
             foreground: false,
+            owner_evaluation: 0,
         }
     }
     #[test]

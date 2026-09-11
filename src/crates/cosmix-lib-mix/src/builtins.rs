@@ -8186,6 +8186,10 @@ fn run_pipeline_processes(
             break;
         }
         if crate::interrupt::is_interrupted() {
+            // A captured runner reports interruption as an Ok result carrying a
+            // flag, not as an error, so the cancellation report can only learn
+            // it from here.
+            crate::cancel::note_delivery();
             interrupted = true;
             break;
         }
@@ -8813,6 +8817,10 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         // explicit Ctrl-C should be reported as the cause, not the
         // wall-clock deadline that happened to expire on the same poll.
         if crate::interrupt::is_interrupted() {
+            // A captured runner reports interruption as an Ok result carrying a
+            // flag, not as an error, so the cancellation report can only learn
+            // it from here.
+            crate::cancel::note_delivery();
             interrupted = true;
             break;
         }
