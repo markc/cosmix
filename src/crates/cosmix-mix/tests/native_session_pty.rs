@@ -1063,3 +1063,102 @@ fn status_verbs_are_absent_from_legacy_surfaces() {
     }
 }
 
+fn status_flood_preserves_lease_and_restart_ack() {
+    let _fixture = fixture_guard();
+    let broker = Broker::start();
+    runtime().block_on(async {
+        let mut parent = Parent::new(&broker).await;
+        let key = fresh_key().unwrap();
+        let grant = parent
+            .grant(HexBytes(key.verifying_key().to_bytes()), 1)
+            .await;
+        let launch = LaunchFd::new(&grant, &key).unwrap();
+        let mut child = Child::spawn(&broker, &launch);
+        drop(launch);
+        drop(key);
+        child.until("RC_MARKER=[]\r\n");
+        let bound = parent
+            .wait(grant.record.record_id, BindingState::Attached, 1)
+            .await;
+        phase(&mut parent, &bound, "prompt-ready").await;
+        let mut flood = tokio::task::JoinSet::new();
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..64 {
+            let connection = parent.connection.clone();
+            let target = bound.clone();
+            let refused = refused.clone();
+            flood.spawn(async move {
+                loop {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        connection.client().call(
+                            &target.name,
+                            "shell.status",
+                            status_request(&target),
+                        ),
+                    )
+                    .await
+                    .expect("flood request must be answered or explicitly refused");
+                    match result {
+                        Ok(value) => assert_eq!(
+                            value["status"]["snapshot"]["source"],
+                            status_request(&target)["target"]
+                        ),
+                        Err(error) => {
+                            assert_eq!(error.to_string(), r#"{"error_code":"REFUSED"}"#);
+                            refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        // Longer than the initial 15s child lease: only the resident's renew
+        // arm can keep this exact attachment alive under a continuously full load.
+        let deadline = Instant::now() + Duration::from_secs(17);
+        while Instant::now() < deadline {
+            parent.renew().await;
+            assert!(flood.try_join_next().is_none(), "flood worker failed");
+            let current = parent
+                .connection
+                .session_self(bound.record_id)
+                .await
+                .unwrap()
+                .record;
+            assert_eq!(current.state, BindingState::Attached);
+            assert_eq!(
+                current.reference(),
+                bound.reference(),
+                "overflow must not reconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(refused.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        std::fs::write(child.home.path().join(".claude-resume"), "").unwrap();
+        let started = Instant::now();
+        child.send("/usr/bin/true\n");
+        loop {
+            let current = parent
+                .connection
+                .session_self(bound.record_id)
+                .await
+                .unwrap()
+                .record;
+            if current.state == BindingState::Revoked {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "restart ack starved by flood"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        flood.abort_all();
+        while flood.join_next().await.is_some() {}
+        let output = child.until("RC_MARKER=[]\r\n");
+        assert!(output.contains("record observed revoked"), "{output}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        child.exit();
+        parent.revoke_and_verify(&broker).await;
+    });
+}
