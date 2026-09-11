@@ -27,6 +27,14 @@ impl Broker {
         Self::start_named(unix, unavailable, "test-node".into()).await
     }
     async fn start_named(unix: bool, unavailable: bool, node: String) -> Self {
+        Self::start_with_grant_limit(unix, unavailable, node, 32).await
+    }
+    async fn start_with_grant_limit(
+        unix: bool,
+        unavailable: bool,
+        node: String,
+        pending_grants_per_parent: usize,
+    ) -> Self {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -50,6 +58,7 @@ impl Broker {
                 admission_mode: AdmissionMode::Off,
                 observe_allowed_services: vec!["audit-observer".into()],
                 unix_socket: unix.then(|| root.join("bus.sock")),
+                pending_grants_per_parent,
             },
             ready_tx,
         ));
@@ -851,6 +860,102 @@ async fn p0i_03_privileged_other_uid_cannot_lookup_or_consume_grant() {
     );
     rightful.client().close().await;
     parent.client().close().await;
+}
+
+#[tokio::test]
+async fn configured_grant_limit_is_advertised_isolated_and_released_on_revoke() {
+    use cosmix_bus::native_session::*;
+    use cosmix_client::session::SessionFailure;
+    use ed25519_dalek::SigningKey;
+    let broker = Broker::start_with_grant_limit(true, false, "test-node".into(), 1).await;
+    let mut raw = broker.unix().await;
+    send(&mut raw, &request("noded.ping", "noded", "limits")).await;
+    let ping: serde_json::Value = serde_json::from_str(&receive(&mut raw).await.body).unwrap();
+    assert_eq!(
+        ping["native_session_limits"]["pending_grants_per_parent"],
+        "1"
+    );
+    let first = verified(&broker).await;
+    let second = verified(&broker).await;
+    let first_record = first
+        .session_allocate(&SigningKey::from_bytes(&rand::random()), Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    let second_record = second
+        .session_allocate(&SigningKey::from_bytes(&rand::random()), Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    let key = SigningKey::from_bytes(&rand::random());
+    let mut args = GrantCreateArgs {
+        parent: first_record.reference(),
+        pane_id: DecimalU64(1),
+        pane_generation: DecimalU64(1),
+        public_key: HexBytes(key.verifying_key().to_bytes()),
+        role: Role::PaneShell,
+        capabilities: vec![Capability::Input],
+    };
+    let granted = first.session_grant_create(&args).await.unwrap();
+    let mut excess = args.clone();
+    excess.pane_id = DecimalU64(2);
+    excess.public_key = HexBytes(
+        SigningKey::from_bytes(&rand::random())
+            .verifying_key()
+            .to_bytes(),
+    );
+    assert!(matches!(
+        first.session_grant_create(&excess).await,
+        Err(SessionFailure::Refused {
+            error: SessionError {
+                error_code: ErrorCode::ResourceLimit,
+                ..
+            },
+            ..
+        })
+    ));
+    excess.parent = second_record.reference();
+    second.session_grant_create(&excess).await.unwrap();
+    assert!(
+        first
+            .session_revoke(granted.record.reference())
+            .await
+            .unwrap()
+            .revoked
+    );
+    assert!(
+        !first
+            .session_revoke(granted.record.reference())
+            .await
+            .unwrap()
+            .revoked
+    );
+    assert_eq!(
+        first
+            .session_grant_fetch(args.public_key)
+            .await
+            .unwrap()
+            .grant
+            .state,
+        GrantState::Revoked
+    );
+    assert!(matches!(
+        first.session_grant_create(&args).await,
+        Err(SessionFailure::Refused {
+            error: SessionError {
+                error_code: ErrorCode::StaleGeneration,
+                ..
+            },
+            ..
+        })
+    ));
+    args.pane_generation = DecimalU64(2);
+    let replacement = first.session_grant_create(&args).await.unwrap();
+    assert_ne!(replacement.record.name, granted.record.name);
+    assert_ne!(replacement.grant.grant_id, granted.grant.grant_id);
+    assert_eq!(replacement.grant.state, GrantState::Pending);
+    first.client().close().await;
+    second.client().close().await;
 }
 
 #[tokio::test]

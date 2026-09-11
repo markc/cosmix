@@ -283,6 +283,8 @@ pub struct NodedConfig {
     /// Published system broker endpoint (BUS-013), independent of client XDG.
     #[serde(deserialize_with = "absolute_unix_socket")]
     pub unix_socket: Option<std::path::PathBuf>,
+    /// BROKER-019 pending grants per Term; may lower the initial cap of 32.
+    pub pending_grants_per_parent: usize,
     pub mesh_config: Option<String>,
     /// SPEC 13 §9a D2 admission posture (off | observe | enforce). Default off.
     pub admission: AdmissionMode,
@@ -305,6 +307,7 @@ impl Default for NodedConfig {
         Self {
             port: 4200,
             unix_socket: None,
+            pending_grants_per_parent: 32,
             mesh_config: None,
             admission: AdmissionMode::Off,
         }

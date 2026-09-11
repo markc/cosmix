@@ -22,6 +22,10 @@ use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
 The same fence covers correlated responses and fresh topic fan-out. Retained
 topic replay preserves historical attribution and cannot refresh dependencies.
 Ping publishes the effective bounds in `native_session_limits` (decimal strings).
+`noded.pending_grants_per_parent` configures the per-Term pending-grant cap
+(integer, default 32, range 0–32). Zero disables new grants. Values above 32
+refuse startup before listener activation; the global 1,024-grant and per-UID
+64-Term ceilings still apply. Ping advertises the configured value.
 
 ## S2 fixture execution
 

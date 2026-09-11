@@ -489,6 +489,7 @@ pub struct RunConfig {
     pub session_probe: Option<oneshot::Sender<Arc<tokio::sync::Mutex<session::Sessions>>>>,
     /// None disables native ingress for isolated legacy test brokers.
     pub unix_socket: Option<PathBuf>,
+    pub pending_grants_per_parent: usize,
     pub listen: String,
     pub node: String,
     pub wg_ip: String,
@@ -503,6 +504,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         #[cfg(test)]
         session_probe,
         unix_socket,
+        pending_grants_per_parent,
         listen,
         node,
         wg_ip,
@@ -511,6 +513,10 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         admission_mode,
         observe_allowed_services,
     } = config;
+    anyhow::ensure!(
+        pending_grants_per_parent <= 32,
+        "noded.pending_grants_per_parent must be at most 32"
+    );
     // Validate before listener/readiness or background work. A configured but
     // invalid public release must never fall back to legacy directory discovery.
     let spec_release = crate::spec_release::SpecRelease::from_env()?.map(Arc::new);
@@ -818,7 +824,9 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     let change_bus = crate::props::ChangeBus::new(broker.clone());
 
     let state = AppState {
-        sessions: Default::default(),
+        sessions: Arc::new(tokio::sync::Mutex::new(
+            session::Sessions::with_grant_limit(pending_grants_per_parent),
+        )),
         protected_responses: Default::default(),
         broker_epoch: HexBytes(rand::random()),
         principal: None,
@@ -3965,7 +3973,9 @@ async fn handle_noded_command(
                 body["extensions"]["native-session-endpoint"] =
                     endpoint.to_string_lossy().into_owned().into();
                 body["native_session_limits"] = serde_json::json!({
-                    "terms_per_uid":"64","pending_grants_per_parent":"32","pending_grants_global":"1024",
+                    "terms_per_uid":"64",
+                    "pending_grants_per_parent":state.sessions.lock().await.pending_grants_per_parent().to_string(),
+                    "pending_grants_global":"1024",
                     "challenges_per_uid":"128","key_interests_per_uid":"256",
                     "recipient_dependencies_per_connection":"256","recipient_dependencies_global":"8192",
                     "lifecycle_notices_per_connection":"256","lifecycle_notices_global":"4096"
@@ -5695,6 +5705,7 @@ mod tests {
                 super::RunConfig {
                     session_probe: None,
                     unix_socket: None,
+                    pending_grants_per_parent: 32,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5781,6 +5792,7 @@ mod tests {
                 super::RunConfig {
                     session_probe: None,
                     unix_socket: None,
+                    pending_grants_per_parent: 32,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5934,6 +5946,7 @@ mod tests {
                 super::RunConfig {
                     session_probe: None,
                     unix_socket: None,
+                    pending_grants_per_parent: 32,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),

@@ -368,8 +368,8 @@ struct Outbox {
     dependencies: Vec<(RecordRef, u64)>,
 }
 
-#[derive(Default)]
 pub(crate) struct Sessions {
+    pending_grants_per_parent: usize,
     records: HashMap<Id, Record>,
     connections: HashMap<Id, Connection>,
     issued: HashSet<String>,
@@ -379,7 +379,30 @@ pub(crate) struct Sessions {
     outboxes: HashMap<Id, Outbox>,
 }
 
+impl Default for Sessions {
+    fn default() -> Self {
+        Self::with_grant_limit(32)
+    }
+}
+
 impl Sessions {
+    pub(super) fn with_grant_limit(pending_grants_per_parent: usize) -> Self {
+        Self {
+            pending_grants_per_parent,
+            records: Default::default(),
+            connections: Default::default(),
+            issued: Default::default(),
+            results: Default::default(),
+            grants: Default::default(),
+            pane_high_water: Default::default(),
+            outboxes: Default::default(),
+        }
+    }
+
+    pub(super) fn pending_grants_per_parent(&self) -> usize {
+        self.pending_grants_per_parent
+    }
+
     /// Exercise the production bounded queues with the writer excluded by the
     /// same lock. No fabricated broker or transport substitutes for delivery.
     #[cfg(test)]
@@ -1121,7 +1144,7 @@ impl Sessions {
                     self.records[&g.record_id].view.parent_instance == Some(parent_view.instance_id)
                 })
                 .count()
-                >= 32
+                >= self.pending_grants_per_parent
         {
             return Err(error(ErrorCode::ResourceLimit, "grant_limit"));
         }

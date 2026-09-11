@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
     let observe_allowed_services = node_cfg.observe.allowed_services.clone();
     let wg_ip = node_cfg.wg_ip.clone();
     let unix_socket = Some(node_cfg.noded.broker_unix_endpoint());
+    let pending_grants_per_parent = node_cfg.noded.pending_grants_per_parent;
     let mut noded_handle = tokio::spawn(async move {
         noded::run(
             noded::RunConfig {
@@ -142,6 +143,7 @@ async fn main() -> Result<()> {
                 admission_mode,
                 observe_allowed_services,
                 unix_socket,
+                pending_grants_per_parent,
             },
             ready_tx,
         )
