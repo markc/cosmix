@@ -718,17 +718,13 @@ pub fn run_repl() -> i32 {
                                                 stats_io::save_stats(&mut stats);
                                             }
                                             let _ = rl.save_history(&history_path);
+                                            job_table.shutdown();
                                             use std::os::unix::process::CommandExt;
                                             let err = std::process::Command::new(&exec_path).exec();
                                             eprintln!("Failed to restart: {}", err);
-                                            if stats_io::stats_enabled() {
-                                                eval.attach_stats(UsageStats::for_execution(
-                                                    StatsContext::new(
-                                                        ExecutionMode::Interactive,
-                                                        None,
-                                                    ),
-                                                ));
-                                            }
+                                            // Job ownership has closed; do not
+                                            // resume a prompt with a closed controller.
+                                            return 1;
                                         }
                                     }
                                 }
