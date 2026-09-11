@@ -290,7 +290,10 @@ impl Child {
     }
     fn context(&mut self) -> serde_json::Value {
         self.send("mix context\nprint(\"CONTEXT_DONE\")\n");
-        let output = self.until("\r\nCONTEXT_DONE\r\n");
+        // The owned editor emits mode/reset escapes between the preceding
+        // newline and command output. Match the output suffix, not adjacency
+        // to that newline. Echoed source ends in `")`, so it cannot match.
+        let output = self.until("CONTEXT_DONE\r\n");
         let start = output.find("{\r\n").expect("context JSON");
         let end = output[start..].find("\r\n}\r\n").unwrap() + start + 3;
         serde_json::from_str(&output[start..end]).unwrap()
@@ -456,7 +459,7 @@ fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
         assert_eq!(rebound.binding_generation, DecimalU64(1));
         assert_eq!(rebound.pane_generation, Some(DecimalU64(1)));
         child.send("print(\"SAME_CHILD_ALIVE\")\n");
-        child.until("\r\nSAME_CHILD_ALIVE\r\n");
+        child.until("SAME_CHILD_ALIVE\r\n");
         child.exit();
         parent
             .connection
@@ -495,7 +498,7 @@ fn valid_handoff_with_broker_down_does_not_delay_first_source() {
             output.push_str(&child.until("mix native-session FAILED at connect:"));
         }
         child.send("print(\"UNBOUND_WORKS\")\n");
-        output.push_str(&child.until("\r\nUNBOUND_WORKS\r\n"));
+        output.push_str(&child.until("UNBOUND_WORKS\r\n"));
         assert_eq!(output.matches("mix native-session FAILED").count(), 1);
         child.exit();
     });
@@ -520,7 +523,7 @@ fn substituted_parent_scope_is_rejected_without_failing_shell() {
             output.push_str(&child.until("mix native-session FAILED at scope:"));
         }
         child.send("print(\"REFUSED_WORKS\")\n");
-        output.push_str(&child.until("\r\nREFUSED_WORKS\r\n"));
+        output.push_str(&child.until("REFUSED_WORKS\r\n"));
         assert_eq!(output.matches("mix native-session FAILED").count(), 1);
         parent
             .wait(grant.record.record_id, BindingState::Pending, 0)
