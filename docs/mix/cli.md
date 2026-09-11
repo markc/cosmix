@@ -598,18 +598,22 @@ metadata. Snapshot phases follow these boundaries:
 | Phase | Meaning |
 |---|---|
 | `starting` | Before ShellReady, including startup hooks |
-| `idle` | After ShellReady, line acceptance or evaluation finish |
+| `idle` | After ShellReady, evaluation finish, or a line that ran nothing |
 | `prompt-preparing` | Building the primary prompt, including custom `prompt()` |
 | `prompt-ready` | Editor activated; `continuation` distinguishes secondary prompts |
-| `evaluating` | An accepted command is evaluating, with a command ID |
+| `evaluating` | An accepted line is being classified, expanded or evaluated, with a command ID |
 | `foreground-child` | A foreground producer holds a bracket |
 | `exiting` | Shell exit or replacement |
 
  Prompt generation increases for every new
 primary or continuation prompt; `continuation` distinguishes them. Custom prompt
 evaluation is `prompt-preparing` without a command ID; continuation prompts do
-not enter that phase. Accepted evaluations allocate
-monotonic command IDs, retained through foreground waits and cleared on finish.
+not enter that phase. An accepted line allocates its monotonic command ID at
+acceptance, not at evaluation, so the window in which it is classified and
+alias-expanded reports `evaluating` with that ID rather than `idle`. The ID is
+retained through foreground waits, and cleared when the evaluation finishes or
+when the line turns out to run nothing — an empty line, an incomplete
+continuation or a parse error — which returns the phase to `idle`.
 The foreground phase follows the job kernel's terminal lease for foreground
 pipelines and `fg`, and brackets the existing synchronous `run_stream` spawn/wait.
 This observation does not change `run_stream` job or signal semantics and does
@@ -649,16 +653,29 @@ Restricted policy denies ambient callers; cross-UID, TCP, unverified and sibling
 principals receive the same bounded `REFUSED` response without status or target
 details. Id-less notices never enter status admission or receive replies. Bound callers cannot fall back to ambient rights.
 Correlated lease checks revalidate both caller and target at admission, and
-detached residents do not dispatch requests. Stale targets return
+detached residents do not dispatch requests. Admitting a session-bound caller
+costs one lease check plus one re-read of the resident's own attachment: the
+connection's broker epoch and connection id are fixed for its lifetime and are
+taken once, not per check. Every session RPC serialises on that one connection,
+so a renewal that loses its deadline to admission load is retried once with a
+fresh deadline before the attachment is given up. Stale targets return
 `STALE_GENERATION`. Recovery uses S3; it never resets shell sequence or prompt
 generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
 isolated tasks, input and event publication report `UNSUPPORTED`, never `BUSY`.
 The resident runs at most four admission tasks alongside its receive/renew/restart
-loop. Excess requests receive `REFUSED`; refusal writes are polled alongside
-control rather than blocking it. Restart cancels outstanding admission tasks.
-The verified lane retains at most 64 commands of at most 64 KiB envelope/body;
-request overflow is refused on that connection, and id-less lifecycle notices
-use backpressure. Other clients retain their existing receive configuration.
+loop, one of which is reserved for the pane's own Term: other same-UID callers
+share three, so a flood by them cannot starve the owner into uniform refusals.
+That reservation is a scheduling class only — the reserved slot re-runs the whole
+admission policy like any other. Excess requests receive `REFUSED`; refusal writes
+are polled alongside control rather than blocking it, including when the transport
+has already dropped, so an admitted request is never answered with silence.
+Restart cancels outstanding admission tasks.
+The verified lane retains at most 64 commands of at most 64 KiB envelope/body.
+Its reader task neither writes nor waits: an overflowed request is handed to the
+receive owner, which writes that connection's `REFUSED`, and a dropped id-less
+lifecycle notice raises a delivery gap the resident treats exactly as it treats
+the broker's own lifecycle gap. Other clients retain their existing receive
+configuration.
 
 - `mix` is intercepted by the shell, so it never sees `$`-sigil arguments — write `mix what round`, not `mix what $name`.
 - The introspection family (`vars`/`aliases`/`functions`/`all`/`context`) is most useful **inside a REPL**, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.

@@ -892,18 +892,22 @@ Unknown request fields, invalid versions and malformed values are refused.</p>
 metadata. Snapshot phases follow these boundaries:</p>
 <table><thead><tr><th>Phase</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>starting</code></td><td>Before ShellReady, including startup hooks</td></tr>
-<tr><td><code>idle</code></td><td>After ShellReady, line acceptance or evaluation finish</td></tr>
+<tr><td><code>idle</code></td><td>After ShellReady, evaluation finish, or a line that ran nothing</td></tr>
 <tr><td><code>prompt-preparing</code></td><td>Building the primary prompt, including custom <code>prompt()</code></td></tr>
 <tr><td><code>prompt-ready</code></td><td>Editor activated; <code>continuation</code> distinguishes secondary prompts</td></tr>
-<tr><td><code>evaluating</code></td><td>An accepted command is evaluating, with a command ID</td></tr>
+<tr><td><code>evaluating</code></td><td>An accepted line is being classified, expanded or evaluated, with a command ID</td></tr>
 <tr><td><code>foreground-child</code></td><td>A foreground producer holds a bracket</td></tr>
 <tr><td><code>exiting</code></td><td>Shell exit or replacement</td></tr>
 </tbody></table>
 <p>Prompt generation increases for every new
 primary or continuation prompt; <code>continuation</code> distinguishes them. Custom prompt
 evaluation is <code>prompt-preparing</code> without a command ID; continuation prompts do
-not enter that phase. Accepted evaluations allocate
-monotonic command IDs, retained through foreground waits and cleared on finish.
+not enter that phase. An accepted line allocates its monotonic command ID at
+acceptance, not at evaluation, so the window in which it is classified and
+alias-expanded reports <code>evaluating</code> with that ID rather than <code>idle</code>. The ID is
+retained through foreground waits, and cleared when the evaluation finishes or
+when the line turns out to run nothing — an empty line, an incomplete
+continuation or a parse error — which returns the phase to <code>idle</code>.
 The foreground phase follows the job kernel's terminal lease for foreground
 pipelines and <code>fg</code>, and brackets the existing synchronous <code>run_stream</code> spawn/wait.
 This observation does not change <code>run_stream</code> job or signal semantics and does
@@ -940,16 +944,29 @@ Restricted policy denies ambient callers; cross-UID, TCP, unverified and sibling
 principals receive the same bounded <code>REFUSED</code> response without status or target
 details. Id-less notices never enter status admission or receive replies. Bound callers cannot fall back to ambient rights.
 Correlated lease checks revalidate both caller and target at admission, and
-detached residents do not dispatch requests. Stale targets return
+detached residents do not dispatch requests. Admitting a session-bound caller
+costs one lease check plus one re-read of the resident's own attachment: the
+connection's broker epoch and connection id are fixed for its lifetime and are
+taken once, not per check. Every session RPC serialises on that one connection,
+so a renewal that loses its deadline to admission load is retried once with a
+fresh deadline before the attachment is given up. Stale targets return
 <code>STALE_GENERATION</code>. Recovery uses S3; it never resets shell sequence or prompt
 generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
 isolated tasks, input and event publication report <code>UNSUPPORTED</code>, never <code>BUSY</code>.
 The resident runs at most four admission tasks alongside its receive/renew/restart
-loop. Excess requests receive <code>REFUSED</code>; refusal writes are polled alongside
-control rather than blocking it. Restart cancels outstanding admission tasks.
-The verified lane retains at most 64 commands of at most 64 KiB envelope/body;
-request overflow is refused on that connection, and id-less lifecycle notices
-use backpressure. Other clients retain their existing receive configuration.</p>
+loop, one of which is reserved for the pane's own Term: other same-UID callers
+share three, so a flood by them cannot starve the owner into uniform refusals.
+That reservation is a scheduling class only — the reserved slot re-runs the whole
+admission policy like any other. Excess requests receive <code>REFUSED</code>; refusal writes
+are polled alongside control rather than blocking it, including when the transport
+has already dropped, so an admitted request is never answered with silence.
+Restart cancels outstanding admission tasks.
+The verified lane retains at most 64 commands of at most 64 KiB envelope/body.
+Its reader task neither writes nor waits: an overflowed request is handed to the
+receive owner, which writes that connection's <code>REFUSED</code>, and a dropped id-less
+lifecycle notice raises a delivery gap the resident treats exactly as it treats
+the broker's own lifecycle gap. Other clients retain their existing receive
+configuration.</p>
 <ul>
 <li><code>mix</code> is intercepted by the shell, so it never sees <code>$</code>-sigil arguments — write <code>mix what round</code>, not <code>mix what $name</code>.</li>
 <li>The introspection family (<code>vars</code>/<code>aliases</code>/<code>functions</code>/<code>all</code>/<code>context</code>) is most useful <strong>inside a REPL</strong>, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.</li>
