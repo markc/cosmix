@@ -8,7 +8,11 @@ ownership. Omitting N selects the most recent live job. A background pipeline
 returns to the prompt after launch, without waiting for its stages to finish.
 
 Job management is selected by the interactive entry point, and requires tty
-stdin plus a controlling terminal. Scripts, `-c` (including SSH commands),
+stdin plus a controlling terminal. Setup errors produce one warning and
+start the shell with noninteractive execution policy. Foreground admission
+is bounded if an orphaned process group cannot stop. The shutdown mode
+snapshot is seeded after cold-start terminal repair.
+Scripts, `-c` (including SSH commands),
 serve mode, redirected stdin and sessions without a controlling terminal
 retain their noninteractive launch policy. Captured `run_argv` and
 `run_pipeline` retain their separate capture/cancellation process groups.

@@ -221,7 +221,24 @@ impl Controller {
         let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
         let fd = tty.as_raw_fd();
         let parent_pgid = unsafe { libc::getpgrp() };
+        // Save SIGTTIN before admission changes it, including on decline.
+        let mut inherited_ttin = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGTTIN, std::ptr::null(), &mut inherited_ttin) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut setup = SetupGuard {
+            tty: &tty,
+            parent_pgid,
+            old_signals: vec![(libc::SIGTTIN, inherited_ttin)],
+            committed: false,
+        };
+        let mut admission_attempts = 0;
         while unsafe { libc::tcgetpgrp(fd) } != unsafe { libc::getpgrp() } {
+            // Orphaned groups discard SIGTTIN. Never spin forever there.
+            if admission_attempts == 8 {
+                return Err(io::Error::other("foreground admission did not stop or acquire terminal"));
+            }
+            admission_attempts += 1;
             // A nested background shell asks its parent for foregrounding.
             unsafe {
                 libc::signal(libc::SIGTTIN, libc::SIG_DFL);
@@ -234,12 +251,6 @@ impl Controller {
                 libc::raise(libc::SIGTTIN);
             }
         }
-        let mut setup = SetupGuard {
-            tty: &tty,
-            parent_pgid,
-            old_signals: Vec::new(),
-            committed: false,
-        };
         for sig in [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
             let mut old = unsafe { std::mem::zeroed() };
             let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -250,7 +261,9 @@ impl Controller {
                     return Err(io::Error::last_os_error());
                 }
             }
-            setup.old_signals.push((sig, old));
+            if sig != libc::SIGTTIN {
+                setup.old_signals.push((sig, old));
+            }
         }
         let shell_pgid = unsafe { libc::getpid() };
         if unsafe { libc::getpgrp() } != shell_pgid && unsafe { libc::setpgid(0, 0) } < 0 {
@@ -267,6 +280,7 @@ impl Controller {
             changed: Condvar::new(),
             shell_modes: Mutex::new(modes(fd)?),
         });
+        // signal-hook's SA_RESTART is load-bearing for blocking legacy waits.
         let mut events = signal_hook::iterator::Signals::new([libc::SIGCHLD, libc::SIGHUP])?;
         let signals = events.handle();
         let monitor = shared.clone();
@@ -316,6 +330,13 @@ impl Controller {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Seed after the REPL repairs cold-start output modes, before readline.
+    pub fn seed_shell_modes(&self) {
+        if let Ok(saved) = modes(self.tty.as_raw_fd()) {
+            *self.shared.shell_modes.lock().unwrap() = saved;
+        }
     }
 
     pub fn register(

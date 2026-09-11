@@ -119,12 +119,15 @@ pub fn run_repl() -> i32 {
     let mut job_table = match JobTable::interactive() {
         Ok(table) => table,
         Err(e) => {
-            eprintln!("mix: interactive job control: {e}");
-            return 1;
+            eprintln!("mix: WARNING: interactive job control unavailable: {e}; starting without job management");
+            JobTable::new()
         }
     };
     // Still precedes prelude, rc, prompt and resume-command output.
     ensure_interactive_output_mode();
+    if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = job_table.policy() {
+        controller.seed_shell_modes();
+    }
     let rt = crate::build_runtime();
 
     let history_path = dirs::home_dir()
