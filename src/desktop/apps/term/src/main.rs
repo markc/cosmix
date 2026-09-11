@@ -182,18 +182,16 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1)
         });
-    let native = native_session::Supervisor::start()
+    let mut native = native_session::Supervisor::start()
         .map_err(|error| {
             eprintln!("term native-session disabled: {error}");
         })
         .ok();
     let terminal = Arc::new(Mutex::new(
-        TabSet::with_session(settings, native.as_ref().map(|s| s.handle.clone())).unwrap_or_else(
-            |e| {
-                eprintln!("PTY startup: {e}");
-                std::process::exit(1)
-            },
-        ),
+        TabSet::with_supervisor(settings, native.as_mut()).unwrap_or_else(|e| {
+            eprintln!("PTY startup: {e}");
+            std::process::exit(1)
+        }),
     ));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
     // Completion notifications: the reap system (render thread) hands
@@ -244,6 +242,7 @@ fn main() {
         )
         .add_observer(keyboard)
         .add_observer(on_menu)
+        .add_systems(Update, record_focus_activity)
         .add_systems(Update, (menu_focus, sync_tabs, sync_panes).chain())
         .add_systems(PostUpdate, refresh.after(bevy::ui::UiSystems::Layout))
         .run();
@@ -365,7 +364,9 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
                   core: Res<Core>,
                   view: Res<View>,
                   mut focus: ResMut<InputFocus>| {
-                core.0.lock().unwrap().select(id);
+                let mut tabs = core.0.lock().unwrap();
+                tabs.user_activity();
+                tabs.select(id);
                 focus.set(view.terminal, FocusCause::Pressed);
             },
         );
@@ -378,6 +379,7 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
          core: Res<Core>,
          view: Res<View>,
          mut focus: ResMut<InputFocus>| {
+            core.0.lock().unwrap().user_activity();
             menu_action("tab.new", &core);
             focus.set(view.terminal, FocusCause::Pressed);
         },
@@ -445,7 +447,13 @@ fn menu_focus(mut view: ResMut<View>, nodes: Query<&Node>, mut focus: ResMut<Inp
 fn on_menu(event: On<MenuActivated>, core: Res<Core>) {
     menu_action(event.id, &core);
 }
+fn record_focus_activity(mut events: MessageReader<bevy::window::WindowFocused>, core: Res<Core>) {
+    if events.read().any(|event| event.focused) {
+        core.0.lock().unwrap().user_activity();
+    }
+}
 fn menu_action(id: &str, core: &Core) {
+    core.0.lock().unwrap().user_activity();
     match id {
         "help.about" => println!(
             "CosMix Term · component=term · version={}",
@@ -485,6 +493,7 @@ fn keyboard(
     if event.input.state != ButtonState::Pressed {
         return;
     }
+    core.0.lock().unwrap().user_activity();
     let ctrl = modifiers.ctrl();
     let shift = modifiers.shift();
     let open = view
@@ -715,7 +724,9 @@ fn spawn_pane_tree(
                           core: Res<Core>,
                           mut view: ResMut<View>,
                           mut focus: ResMut<InputFocus>| {
-                        if core.0.lock().unwrap().focus(id) {
+                        let mut tabs = core.0.lock().unwrap();
+                        tabs.user_activity();
+                        if tabs.focus(id) {
                             view.terminal = entity;
                             focus.set(entity, FocusCause::Pressed);
                         }

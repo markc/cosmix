@@ -22,6 +22,11 @@ const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const RETRY_FLOOR: Duration = Duration::from_secs(120);
 const RETRY_CAP: u32 = 3;
 const STOP_BUDGET: Duration = Duration::from_secs(8);
+const STARTUP_BUDGET: Duration = Duration::from_millis(900);
+const PRESENCE_MS: u64 = 5 * 60 * 1000;
+const MINT_FLOOR: Duration = Duration::from_secs(60);
+// Four two-second RPC budgets (connect/hello/challenge/prove), plus spawn slack.
+const LAUNCH_MARGIN_MS: u64 = 10_000;
 
 fn clock_ms() -> Option<u64> {
     let mut time = libc::timespec {
@@ -37,7 +42,14 @@ fn clock_ms() -> Option<u64> {
 }
 
 async fn close_connection(connection: &VerifiedConnection) {
-    let _ = tokio::time::timeout(RPC_BUDGET, connection.client().close()).await;
+    if tokio::time::timeout(RPC_BUDGET, connection.client().close())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "term abandoned transport close; unreconciled records remain subject to 15s lease / 30s resumption window expiry"
+        );
+    }
 }
 
 fn capabilities() -> Vec<Capability> {
@@ -52,7 +64,11 @@ fn capabilities() -> Vec<Capability> {
 }
 
 #[derive(Clone)]
-pub struct NativeSession(UnboundedSender<Request>, Arc<std::sync::Mutex<Shared>>);
+pub struct NativeSession(
+    UnboundedSender<Request>,
+    Arc<std::sync::Mutex<Shared>>,
+    Arc<AtomicU64>,
+);
 
 struct Shared {
     next_id: u64,
@@ -83,11 +99,20 @@ struct Ready {
     deadline: u64,
 }
 
+impl Ready {
+    fn usable(&self, id: u64, now: u64) -> bool {
+        self.pane.id == id
+            && self.pane.live.load(Ordering::Acquire)
+            && self.deadline.saturating_sub(now) >= LAUNCH_MARGIN_MS
+    }
+}
+
 pub struct Supervisor {
     pub handle: NativeSession,
     worker: Option<std::thread::JoinHandle<()>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     done: mpsc::Receiver<()>,
+    startup: Option<mpsc::Receiver<()>>,
 }
 
 struct PaneState {
@@ -124,7 +149,7 @@ impl PaneSession {
             // acknowledgement guarantee. Local invalidation already happened.
             if rx.recv_timeout(Duration::from_secs(3)).is_err() {
                 eprintln!(
-                    "term pane {}: revoke still pending at cleanup deadline",
+                    "term pane {}: abandoned revoke acknowledgement at cleanup deadline; remote records may remain until 15s lease / 30s window expiry",
                     self.state.id
                 );
             }
@@ -153,6 +178,12 @@ enum Request {
 }
 
 impl NativeSession {
+    /// Only physical keyboard/pointer focus paths call this, not Bus mutations.
+    pub fn activity(&self) {
+        if let Some(now) = clock_ms() {
+            self.2.store(now / 1000 * 1000, Ordering::Release);
+        }
+    }
     /// Invalidates locally under a short lock, then queues remote revocation.
     /// Remote completion is asynchronous; this does not acquire the PTY mutex.
     pub fn revoke_pane(&self, id: u64) {
@@ -172,9 +203,7 @@ impl NativeSession {
         shared.next_id = id.saturating_add(1);
         let ready = shared.ready.take();
         let ready = ready.filter(|ready| {
-            let usable = ready.pane.id == id
-                && ready.pane.live.load(Ordering::Acquire)
-                && clock_ms().is_some_and(|now| now < ready.deadline);
+            let usable = clock_ms().is_some_and(|now| ready.usable(id, now));
             if !usable {
                 ready.pane.live.store(false, Ordering::Release);
             }
@@ -195,6 +224,11 @@ impl NativeSession {
                 ready.fd,
             ))
         } else {
+            if let Some(pane) = shared.panes.get(&id).and_then(|p| p.upgrade())
+                && !pane.launched.load(Ordering::Acquire)
+            {
+                pane.live.store(false, Ordering::Release);
+            }
             let reason = format!(
                 "unbound (graphics-only): no usable ready grant; {}",
                 shared.diagnostic
@@ -215,6 +249,13 @@ impl NativeSession {
 }
 
 impl Supervisor {
+    /// One bounded wait before the FIRST TabSet open only. Taking the receiver
+    /// makes repeated calls no-ops; later pane opens never wait for the actor.
+    pub fn wait_startup(&mut self) {
+        if let Some(startup) = self.startup.take() {
+            let _ = startup.recv_timeout(STARTUP_BUDGET);
+        }
+    }
     pub fn start() -> Result<Self, String> {
         // Account lookup is trusted system configuration, not the current UID
         // or the ownership of an attacker-selected socket. No numeric default.
@@ -253,6 +294,9 @@ impl Supervisor {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(std::sync::Mutex::new(Shared::default()));
         let actor_shared = shared.clone();
+        let activity = Arc::new(AtomicU64::new(clock_ms().unwrap_or(0)));
+        let actor_activity = activity.clone();
+        let (startup_tx, startup) = mpsc::sync_channel(1);
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (done_tx, done) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
@@ -272,8 +316,13 @@ impl Supervisor {
                         children: HashMap::new(),
                         shared: actor_shared,
                         provisioned: None,
+                        pool_key: None,
+                        activity: actor_activity,
+                        startup: Some(startup_tx),
                         #[cfg(test)]
                         grant_creates: 0,
+                        #[cfg(test)]
+                        faults: TestFaults::default(),
                     };
                     // Cancellation interrupts even a long reconciliation batch.
                     tokio::select! {
@@ -287,10 +336,11 @@ impl Supervisor {
             })
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            handle: NativeSession(tx, shared),
+            handle: NativeSession(tx, shared, activity),
             worker: Some(worker),
             stop: Some(stop),
             done,
+            startup: Some(startup),
         })
     }
 }
@@ -305,10 +355,14 @@ impl Drop for Supervisor {
                 if worker.is_finished() {
                     let _ = worker.join();
                 }
+                // The completion signal precedes thread return. If still
+                // finishing, dropping the handle detaches instead of joining.
             } else {
                 // Dropping a JoinHandle detaches it. A stuck OS/runtime thread
                 // cannot hold Term exit beyond this deadline.
-                eprintln!("term native-session shutdown deadline exceeded");
+                eprintln!(
+                    "term native-session shutdown deadline exceeded; abandoned revokes leave records to the 15s lease / 30s resumption window expiry"
+                );
             }
         }
     }
@@ -327,6 +381,8 @@ struct Retry {
     external: bool,
     attempts: u32,
     due: Option<Instant>,
+    // Not reset by reconnect/gap rearm, or by broker epoch replacement.
+    mint_after: Option<Instant>,
 }
 impl Retry {
     fn rearm(&mut self) {
@@ -376,6 +432,8 @@ impl PendingGrant {
 struct Actor {
     #[cfg(test)]
     grant_creates: usize,
+    #[cfg(test)]
+    faults: TestFaults,
     options: UnixConnectOptions,
     url: String,
     key: SigningKey,
@@ -384,6 +442,18 @@ struct Actor {
     children: HashMap<u64, Child>,
     shared: Arc<std::sync::Mutex<Shared>>,
     provisioned: Option<u64>,
+    // Withdrawn/unpublished pool keys only. A consumed launch retains no copy.
+    pool_key: Option<(u64, SigningKey)>,
+    activity: Arc<AtomicU64>,
+    startup: Option<mpsc::SyncSender<()>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestFaults {
+    memfd: bool,
+    create_ack: bool,
+    fetch: bool,
 }
 
 type ResultSession<T> = Result<T, SessionFailure>;
@@ -399,6 +469,13 @@ fn forbidden(error: &SessionFailure) -> bool {
 }
 
 impl Actor {
+    fn launch_fd(&mut self, grant: &GrantResult) -> std::io::Result<LaunchFd> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.memfd) {
+            return Err(std::io::Error::other("injected memfd allocation failure"));
+        }
+        LaunchFd::new(grant, &self.pool_key.as_ref().unwrap().1)
+    }
     fn diagnostic(&self, id: Option<u64>, message: impl Into<String>) {
         let message = message.into();
         eprintln!("term native session: {message}");
@@ -418,152 +495,217 @@ impl Actor {
         }
     }
 
+    fn present(&self, now_ms: u64) -> bool {
+        let last = self.activity.load(Ordering::Acquire);
+        last != 0 && now_ms >= last && now_ms - last < PRESENCE_MS
+    }
+
+    /// Withdraw under the same lock used by prepare, BEFORE any reconciliation
+    /// await. Old latches stay invalid; republishing uses a new unlaunched state.
+    fn withdraw_ready(&mut self) {
+        let mut shared = self.shared.lock().unwrap();
+        if let Some(ready) = shared.ready.take() {
+            ready.pane.live.store(false, Ordering::Release);
+            let pane = Arc::new(PaneState {
+                id: ready.pane.id,
+                generation: AtomicU64::new(ready.pane.generation.load(Ordering::Acquire)),
+                live: AtomicBool::new(true),
+                launched: AtomicBool::new(false),
+                public_key: ready.pane.public_key,
+            });
+            if let Some(child) = self.children.get_mut(&pane.id) {
+                child.pane = pane.clone();
+            }
+            shared.panes.insert(pane.id, Arc::downgrade(&pane));
+            self.pool_key = Some((pane.id, ready.key));
+            // Dropping ready.fd closes the old descriptor. Its offset, scope
+            // and generation can never escape through prepare after withdrawal.
+        }
+    }
+
     async fn provision(&mut self) {
+        if let Some(now_ms) = clock_ms() {
+            self.provision_at(Instant::now(), now_ms).await;
+        }
+    }
+
+    async fn provision_at(&mut self, now: Instant, now_ms: u64) {
         let id = self.shared.lock().unwrap().next_id;
-        if self.connection.is_none() || self.provisioned == Some(id) {
+        if self.connection.is_none() {
             return;
         }
-        self.provisioned = Some(id);
-        let stale = {
-            let mut shared = self.shared.lock().unwrap();
-            if shared
-                .ready
-                .as_ref()
-                .is_some_and(|ready| ready.pane.id != id)
-            {
-                shared.ready.take()
-            } else {
-                None
-            }
-        };
-        if let Some(stale) = stale {
-            let old_id = stale.pane.id;
-            stale.pane.live.store(false, Ordering::Release);
-            drop(stale);
-            self.close_child(old_id).await;
-        }
-        // Failed closes retain public-key tombstones for retry. Bound that
-        // accumulation: new panes remain usable, unbound, until recovery.
-        if self.children.len() >= 128 {
-            self.diagnostic(None, "revocation backlog full; opening panes unbound");
-            return;
-        }
-        // MAX_TABS is 32, coincidentally the broker's default per-parent
-        // pending quota. One look-ahead grant also spends quota; an operator
-        // may lower it. RESOURCE_LIMIT must degrade to an unbound pane.
-        let key = match fresh_key() {
-            Ok(key) => key,
-            Err(error) => {
-                self.diagnostic(None, format!("launch key unavailable: {error}"));
-                return;
-            }
-        };
-        let pane = Arc::new(PaneState {
-            id,
-            generation: AtomicU64::new(1),
-            live: AtomicBool::new(true),
-            launched: AtomicBool::new(false),
-            public_key: HexBytes(key.verifying_key().to_bytes()),
-        });
-        let mut retry = Retry::default();
-        retry.rearm();
-        self.children.insert(
-            id,
-            Child {
-                pane: pane.clone(),
-                record: None,
-                retry,
-                pending: None,
-            },
-        );
-        self.shared
+        if self
+            .shared
             .lock()
             .unwrap()
-            .panes
-            .insert(id, Arc::downgrade(&pane));
-        let result = self.grant(id).await;
+            .ready
+            .as_ref()
+            .is_some_and(|r| clock_ms().is_some_and(|clock| r.usable(id, clock)))
+        {
+            return;
+        }
+        self.withdraw_ready();
+        if let Some((old_id, _)) = &self.pool_key
+            && (*old_id != id
+                || self
+                    .children
+                    .get(old_id)
+                    .is_none_or(|child| !child.pane.live.load(Ordering::Acquire)))
+        {
+            let old_id = *old_id;
+            self.pool_key = None;
+            self.close_child(old_id).await;
+        }
+        if !self.present(now_ms) {
+            self.diagnostic(None, "launch pool held: waiting for user presence");
+            return;
+        }
+        if self.pool_key.is_none() {
+            if self.children.len() >= 128 {
+                self.provisioned = None;
+                self.diagnostic(None, "revocation backlog full; opening panes unbound");
+                return;
+            }
+            // MAX_TABS coincides with the default pending quota (32); this
+            // look-ahead slot also spends quota, and operators may lower it.
+            let key = match fresh_key() {
+                Ok(key) => key,
+                Err(error) => {
+                    self.provisioned = None;
+                    self.diagnostic(None, format!("launch key unavailable: {error}"));
+                    return;
+                }
+            };
+            let pane = Arc::new(PaneState {
+                id,
+                generation: AtomicU64::new(1),
+                live: AtomicBool::new(true),
+                launched: AtomicBool::new(false),
+                public_key: HexBytes(key.verifying_key().to_bytes()),
+            });
+            self.children.insert(
+                id,
+                Child {
+                    pane: pane.clone(),
+                    record: None,
+                    retry: Retry::default(),
+                    pending: None,
+                },
+            );
+            self.shared
+                .lock()
+                .unwrap()
+                .panes
+                .insert(id, Arc::downgrade(&pane));
+            self.pool_key = Some((id, key));
+            self.provisioned = None;
+        }
+        let child = &self.children[&id];
+        let cached_window = child
+            .record
+            .as_ref()
+            .is_some_and(|r| r.state == BindingState::Pending)
+            && child.pending.as_ref().is_some_and(|p| {
+                p.expires_ms.is_some()
+                    && clock_ms()
+                        .is_some_and(|clock| p.deadline.saturating_sub(clock) >= LAUNCH_MARGIN_MS)
+            });
+        if self.provisioned == Some(id)
+            && !cached_window
+            && child.retry.mint_after.is_some_and(|after| now < after)
+        {
+            self.diagnostic(
+                None,
+                "launch pool deliberately waiting for the 60s mint floor",
+            );
+            return;
+        }
+        let previous_mint = child.retry.mint_after;
+        self.children.get_mut(&id).unwrap().retry.rearm();
+        self.provisioned = Some(id);
+        let result = self.grant_at(id, now, false).await;
         match result {
-            Ok(grant) => match LaunchFd::new(&grant, &key) {
-                Ok(fd) => {
-                    let deadline = self.children[&id]
-                        .pending
-                        .as_ref()
-                        .expect("created grant")
-                        .deadline;
-                    let mut shared = self.shared.lock().unwrap();
-                    if shared.next_id == id && pane.live.load(Ordering::Acquire) {
-                        shared.ready = Some(Ready {
-                            pane,
-                            fd,
-                            key,
-                            deadline,
-                        });
-                        shared.diagnostic = "next pane launch grant ready".into();
+            Ok(grant) => {
+                let deadline = self.children[&id]
+                    .pending
+                    .as_ref()
+                    .expect("pending pool grant")
+                    .deadline;
+                if clock_ms().is_none_or(|clock| deadline.saturating_sub(clock) < LAUNCH_MARGIN_MS)
+                {
+                    self.diagnostic(
+                        None,
+                        "launch pool deliberately waiting for replacement of a short-window grant",
+                    );
+                    return;
+                }
+                let fd = match self.launch_fd(&grant) {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        // Keep the known grant/key: the next tick retries only
+                        // memfd delivery, not a new mint. No failed-fd dead latch.
+                        self.provisioned = None;
+                        self.diagnostic(
+                            None,
+                            format!("launch memfd unavailable; delivery will retry: {error}"),
+                        );
                         return;
                     }
-                }
-                Err(error) => self.diagnostic(None, format!("launch memfd unavailable: {error}")),
-            },
-            Err(SessionFailure::Refused { error, .. })
-                if error.error_code == ErrorCode::ResourceLimit =>
-            {
-                let kind = if error.details.get("reason").and_then(|v| v.as_str())
-                    == Some("grant_limit")
-                {
-                    "pending-grant quota"
-                } else {
-                    "resource quota"
                 };
-                self.diagnostic(
-                    None,
-                    format!("broker {kind} exhausted; opening pane unbound (graphics-only)"),
-                );
+                let pane = self.children[&id].pane.clone();
+                let mut shared = self.shared.lock().unwrap();
+                if shared.next_id == id && pane.live.load(Ordering::Acquire) {
+                    let (_, key) = self.pool_key.take().unwrap();
+                    shared.ready = Some(Ready {
+                        pane,
+                        key,
+                        fd,
+                        deadline,
+                    });
+                    shared.diagnostic = "next pane launch grant ready".into();
+                    if let Some(startup) = self.startup.take() {
+                        let _ = startup.send(());
+                    }
+                    return;
+                }
             }
-            Err(error) => self.diagnostic(None, format!("launch grant unavailable: {error}")),
+            Err(error) => {
+                // The mutation path reserves the floor only when a create was
+                // sent, and rolls it back on a definitive broker refusal.
+                // Fetch/transport failures before create are free to retry.
+                if self.children[&id].retry.mint_after == previous_mint {
+                    self.provisioned = None;
+                }
+                let message = match error {
+                    SessionFailure::Refused { error, .. }
+                        if error.error_code == ErrorCode::ResourceLimit =>
+                    {
+                        let kind = if error.details.get("reason").and_then(|v| v.as_str())
+                            == Some("grant_limit")
+                        {
+                            "pending-grant quota"
+                        } else {
+                            "resource quota"
+                        };
+                        format!("broker {kind} exhausted; delivery will retry under presence")
+                    }
+                    SessionFailure::LeaseExpired => {
+                        "launch pool deliberately waiting for grant expiry / the 60s mint floor"
+                            .into()
+                    }
+                    error => format!("launch grant unavailable: {error}"),
+                };
+                self.diagnostic(None, message);
+                return;
+            }
         }
-        // The consumer may already have opened this ID unbound. Never publish
-        // a late bundle or retain its private key for that running child.
+        // A concurrent open consumed this slot unbound while it was withdrawn.
+        self.pool_key = None;
         self.close_child(id).await;
     }
 
-    fn refresh_ready(&mut self, id: u64, grant: &GrantResult) {
-        if self.children[&id].pane.launched.load(Ordering::Acquire) {
-            return;
-        }
-        let ready = {
-            let mut shared = self.shared.lock().unwrap();
-            if shared.ready.as_ref().is_none_or(|r| r.pane.id != id) {
-                return;
-            }
-            shared.ready.take().unwrap()
-        };
-        let Some(pending) = self.children[&id].pending.as_ref() else {
-            ready.pane.live.store(false, Ordering::Release);
-            return;
-        };
-        if !clock_ms().is_some_and(|now| pending.usable(&grant.grant, now)) {
-            ready.pane.live.store(false, Ordering::Release);
-            return;
-        }
-        match LaunchFd::new(grant, &ready.key) {
-            Ok(fd) => {
-                let mut shared = self.shared.lock().unwrap();
-                if shared.next_id == id && ready.pane.live.load(Ordering::Acquire) {
-                    shared.ready = Some(Ready {
-                        fd,
-                        deadline: pending.deadline,
-                        ..ready
-                    });
-                }
-            }
-            Err(error) => {
-                ready.pane.live.store(false, Ordering::Release);
-                self.diagnostic(Some(id), format!("launch memfd refresh failed: {error}"));
-            }
-        }
-    }
-
     async fn connect(&mut self) {
+        self.withdraw_ready();
         if let Some(old) = self.connection.take() {
             close_connection(&old).await;
         }
@@ -629,6 +771,13 @@ impl Actor {
                 self.parent = Some(result.record);
                 self.connection = Some(connection);
                 if replacement {
+                    if self.pool_key.as_ref().is_some_and(|(id, _)| {
+                        self.children
+                            .get(id)
+                            .is_none_or(|child| !child.pane.live.load(Ordering::Acquire))
+                    }) {
+                        self.pool_key = None;
+                    }
                     self.children
                         .retain(|_, child| child.pane.live.load(Ordering::Acquire));
                     for child in self.children.values_mut() {
@@ -656,6 +805,10 @@ impl Actor {
         retry_now: Instant,
         prepaid: bool,
     ) -> ResultSession<GrantResult> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.fetch) {
+            return Err(SessionFailure::InvalidResponse);
+        }
         let connection = self
             .connection
             .as_ref()
@@ -734,6 +887,13 @@ impl Actor {
         }
         // Charge BEFORE sending: uncertain ACKs and quota failures spend an
         // attempt too. A fetch of an existing grant never spends a name.
+        if let Some(after) = child.retry.mint_after
+            && retry_now < after
+        {
+            // An external event may re-arm credit but cannot reset this floor.
+            child.retry.due = Some(after);
+            return Err(SessionFailure::LeaseExpired);
+        }
         if !prepaid && !child.retry.take(retry_now) {
             return Err(SessionFailure::ScopeMismatch);
         }
@@ -749,6 +909,7 @@ impl Actor {
             role: Role::PaneShell,
             capabilities: capabilities(),
         };
+        let previous_pending = child.pending.take();
         child.pending = Some(PendingGrant {
             deadline: clock_ms()
                 .ok_or(SessionFailure::InvalidResponse)?
@@ -759,7 +920,27 @@ impl Actor {
         {
             self.grant_creates += 1;
         }
-        let result = bounded(connection.session_grant_create(&args)).await?;
+        let previous_mint = child.retry.mint_after;
+        child.retry.mint_after = Some(retry_now.max(Instant::now()) + MINT_FLOOR);
+        let result = match bounded(connection.session_grant_create(&args)).await {
+            Ok(result) => result,
+            Err(error @ SessionFailure::Refused { .. }) => {
+                child.retry.mint_after = previous_mint;
+                child.pending = previous_pending;
+                return Err(error);
+            }
+            Err(error) => {
+                child.retry.mint_after = Some(retry_now.max(Instant::now()) + MINT_FLOOR);
+                return Err(error); // uncertain ACK retains the floor
+            }
+        };
+        // Start the floor at receipt, not request start: RPC latency must not
+        // shorten the interval between actual broker mints below sixty seconds.
+        child.retry.mint_after = Some(retry_now.max(Instant::now()) + MINT_FLOOR);
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.create_ack) {
+            return Err(SessionFailure::InvalidResponse);
+        }
         if result.record.state != BindingState::Pending
             || !clock_ms()
                 .is_some_and(|now| child.pending.as_ref().unwrap().usable(&result.grant, now))
@@ -772,6 +953,7 @@ impl Actor {
     }
 
     async fn reconcile(&mut self) {
+        self.withdraw_ready();
         let next = self.shared.lock().unwrap().next_id;
         if !self.children.contains_key(&next) {
             self.provisioned = None;
@@ -780,11 +962,15 @@ impl Actor {
         for id in ids {
             if !self.children[&id].pane.live.load(Ordering::Acquire) {
                 self.close_child(id).await;
+            } else if !self.children[&id].pane.launched.load(Ordering::Acquire) {
+                // Only the presence-gated pool path may refresh an unconsumed bundle.
+                continue;
             } else {
                 // Exactly one mint opportunity per successful reconnect/gap.
                 self.children.get_mut(&id).unwrap().retry.rearm();
                 match self.grant(id).await {
-                    Ok(grant) => self.refresh_ready(id, &grant),
+                    Ok(_) => {},
+                    Err(SessionFailure::LeaseExpired) => self.diagnostic(Some(id), "deliberately waiting for pending grant expiry / the 60s mint floor before replacement"),
                     Err(error) => {
                         self.diagnostic(Some(id), format!("child grant reconciliation: {error}"))
                     }
@@ -841,7 +1027,9 @@ impl Actor {
             .children
             .iter()
             .filter(|(_, c)| {
-                c.pane.live.load(Ordering::Acquire) && c.retry.due.is_some_and(|due| now >= due)
+                c.pane.live.load(Ordering::Acquire)
+                    && c.pane.launched.load(Ordering::Acquire)
+                    && c.retry.due.is_some_and(|due| now >= due)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -852,7 +1040,7 @@ impl Actor {
                 continue;
             }
             match self.grant_at(id, now, true).await {
-                Ok(grant) => self.refresh_ready(id, &grant),
+                Ok(_) => {}
                 Err(error) => {
                     self.children.get_mut(&id).unwrap().retry.expired(now);
                     let held = self.children[&id].retry.due.is_none();
@@ -927,18 +1115,35 @@ impl Actor {
     async fn shutdown(&mut self) {
         // No unconsumed launch key or descriptor survives shutdown.
         self.shared.lock().unwrap().ready = None;
+        self.pool_key = None;
         // Children first, then the parent (which recursively revokes anything
         // whose individual revoke raced a child resumption). Bound total shutdown.
-        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let children_closed = tokio::time::timeout(Duration::from_secs(3), async {
             let ids: Vec<_> = self.children.keys().copied().collect();
             for id in ids {
                 self.close_child(id).await;
             }
         })
         .await;
+        if children_closed.is_err() {
+            eprintln!(
+                "term abandoned child revoke batch; remaining records rely on parent revoke or 15s lease / 30s window expiry"
+            );
+        }
         if let (Some(connection), Some(parent)) = (&self.connection, &self.parent) {
-            let _ = bounded(connection.session_revoke(parent.reference())).await;
+            if bounded(connection.session_revoke(parent.reference()))
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "term parent revoke unconfirmed; remaining records rely on 15s lease / 30s window expiry"
+                );
+            }
             close_connection(connection).await;
+        } else {
+            eprintln!(
+                "term stopped without a current parent connection (possibly during connect); skipped parent revoke, leaving any allocated records to 15s lease / 30s window expiry"
+            );
         }
     }
 
@@ -1001,6 +1206,10 @@ impl Actor {
                 record.state = notice.state;
             }
             if notice.state == BindingState::Revoked && child.pane.live.load(Ordering::Acquire) {
+                if !child.pane.launched.load(Ordering::Acquire) {
+                    self.diagnostic(Some(id), "unconsumed bundle expired; refresh waits for user presence and the mint floor");
+                    return;
+                }
                 // Never enrol => hold until an external event. Enrolled once
                 // => at most three attempts, at 120/240/480s after expiry.
                 child.retry.expired(now);
@@ -1029,7 +1238,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    // Tests may wait for background work; production pane-open never does.
+    // Tests may await arbitrary slots; production waits only once at startup.
     pub(crate) fn wait_ready(handle: &NativeSession, id: u64) {
         handle.1.lock().unwrap().next_id = id;
         let _ = handle.0.send(Request::Provision);
@@ -1062,6 +1271,7 @@ pub(crate) mod tests {
     fn test_actor(broker: &Broker) -> Actor {
         Actor {
             grant_creates: 0,
+            faults: TestFaults::default(),
             options: broker.options(),
             url: broker.url.clone(),
             key: fresh_key().unwrap(),
@@ -1070,6 +1280,326 @@ pub(crate) mod tests {
             children: HashMap::new(),
             shared: Arc::new(std::sync::Mutex::new(Shared::default())),
             provisioned: None,
+            pool_key: None,
+            activity: Arc::new(AtomicU64::new(clock_ms().unwrap())),
+            startup: None,
+        }
+    }
+
+    fn test_handle(actor: &Actor) -> NativeSession {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        NativeSession(tx, actor.shared.clone(), actor.activity.clone())
+    }
+
+    fn settings() -> crate::config::Settings {
+        crate::config::Settings {
+            config: crate::config::Config::default(),
+            term: "xterm-256color",
+        }
+    }
+
+    fn descriptor(fd: &LaunchFd) -> GrantResult {
+        // Read only public descriptor bytes, never copy the seed into a test log.
+        let mut header = [0u8; 5];
+        assert_eq!(
+            unsafe { libc::pread(fd.mapping().0, header.as_mut_ptr().cast(), 5, 0) },
+            5
+        );
+        assert_eq!(header[0], 1);
+        let n = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        assert!(n <= 16384);
+        let mut json = vec![0; n];
+        assert_eq!(
+            unsafe { libc::pread(fd.mapping().0, json.as_mut_ptr().cast(), n, 5) },
+            n as isize
+        );
+        serde_json::from_slice(&json).unwrap()
+    }
+
+    async fn expire(actor: &mut Actor, id: u64, now: Instant) {
+        let record = actor.children[&id].record.clone().unwrap();
+        if record.state == BindingState::Revoked {
+            return;
+        }
+        actor
+            .connection
+            .as_ref()
+            .unwrap()
+            .session_revoke(record.reference())
+            .await
+            .unwrap();
+        actor.notice_at(&serde_json::json!({"target":record.reference(), "state":"revoked", "broker_epoch":record.broker_epoch}).to_string(), now).await;
+        actor
+            .children
+            .get_mut(&id)
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap()
+            .deadline = 0;
+        if let Some(ready) = &mut actor.shared.lock().unwrap().ready {
+            ready.deadline = 0;
+        }
+    }
+
+    #[test]
+    fn production_first_open_binds_within_startup_budget() {
+        let broker = Broker::start();
+        let start = Instant::now();
+        let mut supervisor =
+            Supervisor::with_options(broker.options(), broker.url.clone()).unwrap();
+        let tabs = crate::tabs::TabSet::with_supervisor(settings(), Some(&mut supervisor)).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(
+            supervisor.handle.1.lock().unwrap().panes[&1]
+                .upgrade()
+                .unwrap()
+                .launched
+                .load(Ordering::Acquire)
+        );
+        let repeated = Instant::now();
+        supervisor.wait_startup();
+        assert!(repeated.elapsed() < Duration::from_millis(50));
+        drop(tabs);
+    }
+
+    #[test]
+    fn production_first_open_without_broker_stays_within_startup_budget() {
+        let mut broker = Broker::start();
+        let options = broker.options();
+        broker.stop();
+        let start = Instant::now();
+        let mut supervisor = Supervisor::with_options(options, broker.url.clone()).unwrap();
+        let tabs = crate::tabs::TabSet::with_supervisor(settings(), Some(&mut supervisor)).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(
+            tabs.session_status()["panes"]["1"]
+                .as_str()
+                .unwrap()
+                .contains("graphics-only")
+        );
+    }
+
+    #[test]
+    fn short_window_bundle_cannot_be_consumed() {
+        let broker = Broker::start();
+        runtime().block_on(async {
+            let mut actor = test_actor(&broker);
+            actor.connect().await;
+            actor.provision().await;
+            let old = actor
+                .shared
+                .lock()
+                .unwrap()
+                .ready
+                .as_ref()
+                .unwrap()
+                .pane
+                .clone();
+            actor
+                .shared
+                .lock()
+                .unwrap()
+                .ready
+                .as_mut()
+                .unwrap()
+                .deadline = clock_ms().unwrap() + LAUNCH_MARGIN_MS - 1;
+            assert!(test_handle(&actor).prepare(1).is_none());
+            assert!(!old.live.load(Ordering::Acquire));
+            assert!(!old.launched.load(Ordering::Acquire));
+            actor.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn presence_pool_counts_at_most_1440_names_per_day_and_holds_idle() {
+        let broker = Broker::start();
+        runtime().block_on(async {
+            let mut actor = test_actor(&broker);
+            actor.connect().await;
+            let start = Instant::now();
+            let base = clock_ms().unwrap();
+            actor.provision_at(start, base).await;
+            let key = actor.children[&1].pane.public_key;
+            // Half-open day [0, 86400): initial mint plus 1439 replacements.
+            // Broker expiry/revoke and every counted create use the real UDS.
+            for cycle in 1..2880 {
+                let elapsed = GRANT_LIFETIME * cycle;
+                let now = start + elapsed;
+                let clock = base + elapsed.as_millis() as u64;
+                actor.activity.store(clock, Ordering::Release);
+                expire(&mut actor, 1, now).await;
+                actor.provision_at(now, clock).await;
+                let parent = actor.parent.as_ref().unwrap().reference();
+                actor
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .session_renew(parent)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(actor.grant_creates, 1440);
+            assert_eq!(actor.children[&1].pane.public_key, key);
+            let idle = Duration::from_secs(86400) + Duration::from_millis(PRESENCE_MS);
+            expire(&mut actor, 1, start + idle).await;
+            for cycle in 0..2880 {
+                let elapsed = idle + GRANT_LIFETIME * cycle;
+                actor
+                    .provision_at(start + elapsed, base + elapsed.as_millis() as u64)
+                    .await;
+            }
+            assert_eq!(actor.grant_creates, 1440, "idle must not spend names");
+            actor.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn pool_failure_latches_distinguish_free_retry_from_uncertain_mint() {
+        let broker = Broker::start();
+        runtime().block_on(async {
+            let mut actor = test_actor(&broker);
+            actor.connect().await;
+            actor.faults.memfd = true;
+            actor.provision().await;
+            assert_eq!(actor.provisioned, None);
+            assert_eq!(actor.grant_creates, 1);
+            actor.provision().await;
+            assert!(actor.shared.lock().unwrap().ready.is_some());
+            assert_eq!(actor.grant_creates, 1, "retry delivery of the known grant");
+            let (_pane, fd) = test_handle(&actor).prepare(1).unwrap();
+            drop(fd);
+            // Failure before create sends nothing, so no slot latch may remain.
+            actor.faults.fetch = true;
+            actor.provision().await;
+            assert_eq!(actor.provisioned, None);
+            assert_eq!(actor.grant_creates, 1);
+            actor.faults.create_ack = true;
+            actor.provision().await;
+            assert_eq!(actor.provisioned, Some(2));
+            let count = actor.grant_creates;
+            actor.provision().await;
+            assert_eq!(
+                actor.grant_creates, count,
+                "uncertain ACK must retain hold/floor"
+            );
+            actor.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn gap_storms_cannot_reset_live_child_mint_floor() {
+        let broker = Broker::start();
+        runtime().block_on(async {
+            let mut actor = test_actor(&broker);
+            actor.connect().await;
+            let start = Instant::now();
+            actor.provision_at(start, clock_ms().unwrap()).await;
+            let (_pane, fd) = test_handle(&actor).prepare(1).unwrap();
+            drop(fd);
+            for round in 1..=3 {
+                let after = actor.children[&1].retry.mint_after.unwrap();
+                expire(&mut actor, 1, after - GRANT_LIFETIME).await;
+                for _ in 0..32 {
+                    actor.reconcile().await;
+                }
+                assert_eq!(actor.grant_creates, round as usize);
+                actor.retry_due(after - Duration::from_millis(1)).await;
+                assert_eq!(actor.grant_creates, round as usize);
+                actor.retry_due(after).await;
+                assert_eq!(actor.grant_creates, round as usize + 1);
+            }
+            actor.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn quota_refusal_clears_pool_latch_and_retries_without_a_new_event() {
+        let broker = Broker::with_grant_limit(1);
+        runtime().block_on(async {
+            let mut actor = test_actor(&broker);
+            actor.connect().await;
+            actor.provision().await;
+            let (_pane, fd) = test_handle(&actor).prepare(1).unwrap();
+            drop(fd);
+            actor.provision().await;
+            assert_eq!(actor.provisioned, None);
+            assert!(actor.shared.lock().unwrap().ready.is_none());
+            let first = actor.children[&1].record.as_ref().unwrap().reference();
+            actor
+                .connection
+                .as_ref()
+                .unwrap()
+                .session_revoke(first)
+                .await
+                .unwrap();
+            actor.provision().await; // next renew tick, no reconnect / input
+            assert_eq!(
+                actor.shared.lock().unwrap().ready.as_ref().unwrap().pane.id,
+                2
+            );
+            actor.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn replacement_withdraws_generation_two_bundle_before_await() {
+        for consume_during_reconnect in [false, true] {
+            let mut broker = Broker::start();
+            runtime().block_on(async {
+                let mut actor = test_actor(&broker);
+                actor.connect().await;
+                let start = Instant::now();
+                let base = clock_ms().unwrap();
+                actor.provision_at(start, base).await;
+                expire(&mut actor, 1, start + GRANT_LIFETIME).await;
+                let after = actor.children[&1].retry.mint_after.unwrap();
+                actor.provision_at(after, base + 60_000).await;
+                let after_replacement = actor.children[&1].retry.mint_after.unwrap();
+                let (old, old_epoch, key) = {
+                    let shared = actor.shared.lock().unwrap();
+                    let ready = shared.ready.as_ref().unwrap();
+                    let grant = descriptor(&ready.fd);
+                    assert_eq!(grant.record.pane_generation, Some(DecimalU64(2)));
+                    (
+                        ready.pane.clone(),
+                        grant.record.broker_epoch,
+                        grant.grant.public_key,
+                    )
+                };
+                let handle = test_handle(&actor);
+                broker.bounce();
+                let paused = broker.pause();
+                {
+                    let connecting = actor.connect();
+                    tokio::pin!(connecting);
+                    tokio::select! {
+                        _ = &mut connecting => panic!("paused broker should delay reconnect"),
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                    }
+                    assert!(handle.1.lock().unwrap().ready.is_none());
+                    assert!(!old.live.load(Ordering::Acquire));
+                    assert!(!old.launched.load(Ordering::Acquire));
+                    if consume_during_reconnect {
+                        assert!(handle.prepare(1).is_none());
+                    }
+                    drop(paused);
+                    connecting.await;
+                }
+                actor.provision_at(after_replacement, base + 120_000).await;
+                {
+                    let shared = actor.shared.lock().unwrap();
+                    let grant = descriptor(&shared.ready.as_ref().unwrap().fd);
+                    assert_ne!(grant.record.broker_epoch, old_epoch);
+                    assert_eq!(grant.record.pane_generation, Some(DecimalU64(1)));
+                    if !consume_during_reconnect {
+                        assert_eq!(grant.grant.public_key, key);
+                    } else {
+                        assert_eq!(grant.record.pane_id, Some(DecimalU64(2)));
+                    }
+                }
+                actor.shutdown().await;
+            });
         }
     }
 
@@ -1157,11 +1687,15 @@ pub(crate) mod tests {
             }
             assert!(cycles_for(&mut actor, cycles).await.is_empty());
             assert_eq!(actor.grant_creates, 1, "never-enrolled pane must hold");
+            // Each scenario below resets its synthetic Instant origin. Floor
+            // enforcement across event storms is exercised separately above.
+            actor.children.get_mut(&1).unwrap().retry.mint_after = None;
             actor.reconcile().await; // one external gap/reconnect opportunity
             assert_eq!(actor.grant_creates, 2);
             assert!(cycles_for(&mut actor, cycles).await.is_empty());
             assert_eq!(actor.grant_creates, 2);
 
+            actor.children.get_mut(&1).unwrap().retry.mint_after = None;
             actor.reconcile().await;
             let granted = actor.grant(1).await.unwrap();
             let child = observer(&broker).await;
@@ -1194,6 +1728,7 @@ pub(crate) mod tests {
             assert_eq!(cycles_for(&mut actor, cycles).await, [150, 420, 930]);
             assert_eq!(actor.grant_creates - before, RETRY_CAP as usize);
             assert!(actor.children[&1].retry.due.is_none());
+            actor.children.get_mut(&1).unwrap().retry.mint_after = None;
             actor.reconcile().await; // external recovery re-arms a capped pane
             assert_eq!(actor.grant_creates, before + RETRY_CAP as usize + 1);
             // Transport/fetch failures must also spend scheduled attempts and
@@ -1325,8 +1860,16 @@ pub(crate) mod tests {
         connection: &VerifiedConnection,
         predicate: impl Fn(&SessionRecord) -> bool,
     ) -> SessionRecord {
+        wait_record_for(connection, predicate, Duration::from_secs(10)).await
+    }
+
+    async fn wait_record_for(
+        connection: &VerifiedConnection,
+        predicate: impl Fn(&SessionRecord) -> bool,
+        budget: Duration,
+    ) -> SessionRecord {
         // Test observation only. The production actor never polls grant state.
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(budget, async {
             loop {
                 if let Some(record) = connection
                     .session_list()
@@ -1519,9 +2062,11 @@ pub(crate) mod tests {
             let parent_hash = challenge.transcript.parent_key_hash;
             broker.bounce();
             let observer = observer(&broker).await;
-            let new = wait_record(&observer, |r| {
-                r.pane_id == Some(DecimalU64(7)) && r.state == BindingState::Pending
-            })
+            let new = wait_record_for(
+                &observer,
+                |r| r.pane_id == Some(DecimalU64(7)) && r.state == BindingState::Pending,
+                Duration::from_secs(75),
+            ) // reconnect cannot bypass the 60s floor
             .await;
             assert_ne!(old.broker_epoch, new.broker_epoch);
             assert_ne!(old.parent_instance, new.parent_instance);
@@ -1554,6 +2099,7 @@ pub(crate) mod tests {
         runtime().block_on(async {
             let mut actor = Actor {
                 grant_creates: 0,
+                faults: TestFaults::default(),
                 options: broker.options(),
                 url: broker.url.clone(),
                 key: fresh_key().unwrap(),
@@ -1562,6 +2108,9 @@ pub(crate) mod tests {
                 children: HashMap::new(),
                 shared: Arc::new(std::sync::Mutex::new(Shared::default())),
                 provisioned: None,
+                pool_key: None,
+                activity: Arc::new(AtomicU64::new(clock_ms().unwrap())),
+                startup: None,
             };
             actor.connect().await;
             let parent = actor.parent.clone().unwrap();

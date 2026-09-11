@@ -145,6 +145,24 @@ pub struct TabInfo {
 }
 
 impl TabSet {
+    pub fn user_activity(&self) {
+        if let Some(native) = &self.native {
+            native.activity();
+        }
+    }
+
+    /// Main and startup tests share this exact bounded first-open path.
+    pub fn with_supervisor(
+        settings: crate::config::Settings,
+        native: Option<&mut crate::native_session::Supervisor>,
+    ) -> Result<Self, String> {
+        if let Some(native) = native {
+            native.wait_startup();
+            Self::with_session(settings, Some(native.handle.clone()))
+        } else {
+            Self::with_session(settings, None)
+        }
+    }
     #[cfg(test)]
     pub fn probe_metadata_removal(&mut self, probe: Box<dyn FnMut(u64) + Send>) {
         self.metadata.before_remove = Some(probe);
