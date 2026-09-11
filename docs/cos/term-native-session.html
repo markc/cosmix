@@ -451,8 +451,11 @@ credential verification. Identity establishment runs on the actor. Before the
 first TabSet open, main waits once for at most 900ms for a ready bundle; healthy
 startup can therefore bind pane 1. An unavailable profile or failed grant leaves
 ordinary panes usable, including Ctrl+Shift+T.
-<code>term.session {}</code> reports per-pane binding status and the latest provisioning
-diagnostic; these are diagnostic snapshots, not evidence of live authority.</p>
+The allocated native route's <code>term.session</code> reports authorised pane binding
+status with an explicit target. The global diagnostic <code>term</code> route serves no
+protected controls. See <a href="/cos/term-native-control">native control</a> for the S4
+policy, input, properties and retry contracts. Status snapshots alone remain
+historical diagnostics, not evidence of live authority.</p>
 <p>The actor pre-provisions one keypair, grant and sealed LaunchFd for the next
 pane ID. Opening or splitting consumes a ready bundle without RPC, channel
 waiting or memfd construction on the GUI/Bus thread. If none is ready, the

@@ -398,6 +398,10 @@ impl<'de> Deserialize<'de> for SchemaVersion {
 /// set. C1 ships the field surface; C4 plumbs the Bus wire extraction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerIdentity {
+    /// Optional BUS-014 context, supplied only by an authenticated recipient.
+    /// Names, signed_ident and legacy UID fields never manufacture this value.
+    #[cfg(feature = "cosmix")]
+    pub native_session: Option<cosmix_bus::native_session::BrokerPrincipal>,
     pub unix_uid: Option<u32>,
     pub unix_gid: Option<u32>,
     pub unix_groups: Vec<String>,
@@ -408,6 +412,19 @@ pub struct PeerIdentity {
     pub signed_ident: Option<String>,
     /// Broker-attached registered service name for service peers.
     pub service_name: Option<String>,
+}
+
+#[cfg(all(test, feature = "cosmix"))]
+#[test]
+fn legacy_identity_never_implies_native_session_context() {
+    let peer = PeerIdentity {
+        unix_uid: Some(1000),
+        unix_gid: Some(1000),
+        service_name: Some("term".into()),
+        signed_ident: Some("term".into()),
+        ..Default::default()
+    };
+    assert!(peer.native_session.is_none());
 }
 
 /// SPEC 12 §7.2 — pure mapping from peer identity to capability set.

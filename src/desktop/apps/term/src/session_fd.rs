@@ -69,6 +69,18 @@ pub struct LaunchFd {
 }
 
 impl LaunchFd {
+    #[cfg(test)]
+    pub(crate) fn invalid_fixture() -> io::Result<Self> {
+        let source = File::open("/dev/null")?;
+        let raw = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            source,
+            target: unsafe { OwnedFd::from_raw_fd(raw) },
+        })
+    }
     pub fn new(descriptor: &GrantResult, key: &SigningKey) -> io::Result<Self> {
         // Byte layout v1 (the child-side Mix bootstrap parser seam):
         // [0] = 1; [1..5] = u32 big-endian JSON byte length N;

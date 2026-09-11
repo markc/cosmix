@@ -11,6 +11,7 @@ use std::{
     borrow::Cow,
     collections::VecDeque,
     io::{self, Read, Write},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -32,12 +33,19 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
 struct Pending {
     remaining: usize,
     key: Option<Instant>,
+    permit: Option<Arc<crate::control::Permit>>,
 }
 #[derive(Default)]
 struct Writes {
+    #[cfg(test)]
+    block_control: bool,
+    pty: Option<OwnedFd>,
+    group: i32,
     sender: Option<channel::Sender<Msg>>,
     pending: VecDeque<Pending>,
     bytes: usize,
+    foreground: u64,
+    owner: Option<(String, Arc<crate::control::Permit>)>,
 }
 
 #[derive(Clone)]
@@ -49,6 +57,10 @@ pub struct Listener {
     pub quit: Arc<AtomicBool>,
 }
 impl Listener {
+    #[cfg(test)]
+    pub(crate) fn block_control_writes(&self, block: bool) {
+        self.writes.lock().unwrap().block_control = block;
+    }
     pub fn wake(&self) {
         if let Some(wake) = self.wake.get() {
             wake();
@@ -64,6 +76,18 @@ impl Listener {
             return Ok(());
         }
         let mut writes = self.writes.lock().unwrap();
+        self.enqueue(&mut writes, bytes, key, None)
+    }
+    fn enqueue(
+        &self,
+        writes: &mut Writes,
+        bytes: Vec<u8>,
+        key: Option<Instant>,
+        permit: Option<Arc<crate::control::Permit>>,
+    ) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         if self.quit.load(Ordering::Acquire) {
             return Err("terminal closing".into());
         }
@@ -80,14 +104,85 @@ impl Listener {
         writes.pending.push_back(Pending {
             remaining: len,
             key,
+            permit,
         });
         Ok(())
     }
+    #[cfg(test)]
     pub fn type_text(&self, text: &str) -> Result<(), String> {
         self.write(encode_text(text)?, Some(Instant::now()))
     }
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
-        self.write(encode(key), Some(at))
+        let mut writes = self.writes.lock().unwrap();
+        Self::revoke_writer(&mut writes);
+        self.enqueue(&mut writes, encode(key), Some(at), None)
+    }
+    fn revoke_writer(writes: &mut Writes) {
+        writes.foreground = writes.foreground.saturating_add(1);
+        if let Some((_, permit)) = writes.owner.take() {
+            permit.revoke();
+        }
+        for pending in &writes.pending {
+            if let Some(permit) = &pending.permit {
+                permit.revoke();
+            }
+        }
+    }
+    pub fn revoke_control(&self) {
+        Self::revoke_writer(&mut self.writes.lock().unwrap());
+    }
+    pub fn foreground_generation(&self) -> u64 {
+        let mut writes = self.writes.lock().unwrap();
+        Self::check_foreground(&mut writes);
+        writes.foreground + 1
+    }
+    fn check_foreground(writes: &mut Writes) -> bool {
+        let Some(fd) = &writes.pty else {
+            return false;
+        };
+        // The descriptor is owned for the entire locked query; PID/name
+        // inference never establishes input authority.
+        let group = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+        if group != writes.group {
+            Self::revoke_writer(writes);
+            writes.group = group;
+        }
+        group > 0
+    }
+    pub fn control_text(
+        &self,
+        text: &str,
+        generation: u64,
+        actor: &str,
+        permit: Arc<crate::control::Permit>,
+    ) -> Result<(), &'static str> {
+        let bytes = encode_text(text).map_err(|_| "INVALID_ARGUMENT")?;
+        let mut writes = self.writes.lock().unwrap();
+        if !Self::check_foreground(&mut writes) {
+            return Err("FORBIDDEN");
+        }
+        if generation != writes.foreground + 1 {
+            return Err("STALE_GENERATION");
+        }
+        if !permit.valid() {
+            return Err("FORBIDDEN");
+        }
+        if writes
+            .owner
+            .as_ref()
+            .is_some_and(|(owner, p)| owner != actor && p.valid())
+        {
+            return Err("BUSY");
+        }
+        self.enqueue(
+            &mut writes,
+            bytes,
+            Some(Instant::now()),
+            Some(permit.clone()),
+        )
+        .map_err(|_| "RESOURCE_LIMIT")?;
+        writes.owner = Some((actor.into(), permit));
+        Ok(())
     }
 }
 impl EventListener for Listener {
@@ -113,7 +208,10 @@ impl EventListener for Listener {
                 self.quit.store(true, Ordering::Release);
                 self.wake();
             }
-            other => eprintln!("term-spike unsupported VT event, dropped: {other:?}"),
+            other => eprintln!(
+                "term unsupported VT event dropped: {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 }
@@ -205,20 +303,45 @@ impl Read for MeteredPty {
 }
 impl Write for MeteredPty {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let n = self.pty.write(bytes)?;
         let mut writes = self.listener.writes.lock().unwrap();
+        Listener::check_foreground(&mut writes);
+        #[cfg(test)]
+        if writes.block_control && writes.pending.front().is_some_and(|p| p.permit.is_some()) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        // Keep revocation, human admission and actual writes ordered. Rio may
+        // retain an unwritten remainder; report discarded bytes as consumed to
+        // its queue, never write them or count them as delivered PTY input.
+        let limit = writes
+            .pending
+            .front()
+            .map_or(bytes.len(), |p| p.remaining.min(bytes.len()));
+        let discarded = writes
+            .pending
+            .front()
+            .is_some_and(|p| p.permit.as_ref().is_some_and(|p| !p.valid()));
+        let n = if discarded {
+            limit
+        } else {
+            self.pty.write(&bytes[..limit])?
+        };
         let mut stats = self.listener.stats.lock().unwrap();
-        stats.bytes_written += n as u64;
+        if !discarded {
+            stats.bytes_written += n as u64;
+        }
         let mut left = n;
         while left > 0 {
             let Some(pending) = writes.pending.front_mut() else {
                 break;
             };
             let consumed = left.min(pending.remaining);
-            if let Some(at) = pending.key {
+            if !discarded && let Some(permit) = &pending.permit {
+                permit.written.fetch_add(consumed as u64, Ordering::Release);
+            }
+            if !discarded && let Some(at) = pending.key {
                 stats.input_written += consumed as u64;
                 stats.key_write.add(at.elapsed());
-            } else {
+            } else if !discarded {
                 stats.reply_written += consumed as u64;
             }
             pending.remaining -= consumed;
@@ -386,10 +509,22 @@ impl Terminal {
         home: String,
         environment: Vec<(String, String)>,
     ) -> Result<Self, String> {
+        Self::start_session_scoped_e2e(settings, native, 1, program, home, environment)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_session_scoped_e2e(
+        settings: crate::config::Settings,
+        native: &crate::native_session::NativeSession,
+        pane_id: u64,
+        program: &str,
+        home: String,
+        environment: Vec<(String, String)>,
+    ) -> Result<Self, String> {
         Self::start_session_with_launch(
             settings,
             Some(native),
-            1,
+            pane_id,
             LaunchSettings {
                 program,
                 cwd: Some(home.clone()),
@@ -497,6 +632,12 @@ impl Terminal {
         // No parent key material or memfd survives the successful spawn.
         drop(fd);
         let pid = *pty.child.pid;
+        let fd = unsafe { libc::fcntl(*pty.child, libc::F_DUPFD_CLOEXEC, 3) };
+        if fd >= 0 {
+            let mut writes = listener.writes.lock().unwrap();
+            writes.pty = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+            Listener::check_foreground(&mut writes);
+        }
         let machine = Machine::new(
             grid.clone(),
             MeteredPty {

@@ -127,6 +127,7 @@ pub enum Outcome {
 
 #[derive(Clone)]
 pub struct PaneInfo {
+    control: crate::terminal::Listener,
     pub id: u64,
     pub active: bool,
     pub cols: usize,
@@ -190,6 +191,17 @@ impl TabSet {
         settings: crate::config::Settings,
         native: Option<crate::native_session::NativeSession>,
     ) -> Result<Self, String> {
+        let launch = native.clone();
+        Self::with_initial(settings, native, move || {
+            Terminal::start_session(settings, launch.as_ref(), 1)
+        })
+    }
+
+    pub(crate) fn with_initial(
+        settings: crate::config::Settings,
+        native: Option<crate::native_session::NativeSession>,
+        start: impl FnOnce() -> Result<Terminal, String> + std::panic::UnwindSafe,
+    ) -> Result<Self, String> {
         let mut set = Self {
             native,
             settings,
@@ -203,7 +215,7 @@ impl TabSet {
             closing: false,
             pending: Arc::new(AtomicUsize::new(0)),
         };
-        set.open()?;
+        set.open_with(start)?;
         Ok(set)
     }
 
@@ -214,7 +226,7 @@ impl TabSet {
         self.open_with(move || Terminal::start_session(settings, native.as_ref(), id))
     }
 
-    fn open_with(
+    pub(crate) fn open_with(
         &mut self,
         start: impl FnOnce() -> Result<Terminal, String> + std::panic::UnwindSafe,
     ) -> Result<u64, String> {
@@ -226,6 +238,7 @@ impl TabSet {
             return Err("tab limit (32) reached".into());
         }
         let pane = self.start_pane(start)?;
+        self.invalidate_control_focus();
         let active_pane = pane.id;
         let id = self.next_id;
         self.next_id += 1;
@@ -277,6 +290,7 @@ impl TabSet {
         self.metadata.insert(
             id,
             PaneInfo {
+                control: terminal.listener.clone(),
                 id,
                 active: false,
                 cols: 80,
@@ -306,6 +320,68 @@ impl TabSet {
             .iter()
             .find_map(|tab| tab.tree.pane_by_id(id))
             .map(|pane| pane.terminal.clone())
+    }
+    pub fn control_tab(&self, pane: u64) -> Option<u64> {
+        self.tabs
+            .iter()
+            .find(|t| t.tree.pane_by_id(pane).is_some())
+            .map(|t| t.id)
+    }
+    pub fn control_panes(&self) -> Vec<PaneInfo> {
+        self.metadata.values().cloned().collect()
+    }
+    fn invalidate_control_focus(&self) {
+        if self.is_empty() {
+            return;
+        }
+        self.invalidate_tab_control(self.active_id());
+    }
+    fn invalidate_tab_control(&self, tab: u64) {
+        for (id, pane) in &self.metadata {
+            if self.control_tab(*id) == Some(tab) {
+                pane.control.revoke_control();
+            }
+        }
+    }
+    /// Layout operations can change focus, sibling geometry and tab selection.
+    /// Require authority over the source and destination tabs before commitment.
+    pub fn control_affected(&self, pane: u64, verb: &str) -> Vec<u64> {
+        let Some(target) = self.control_tab(pane) else {
+            return Vec::new();
+        };
+        let index = self.tabs.iter().position(|t| t.id == target).unwrap();
+        let closes_tab = verb == "term.tab.close"
+            || (verb == "term.pane.close"
+                && self.tabs[index].tree.leaves(Geometry::default()).len() == 1);
+        let replacement = if closes_tab
+            && (verb == "term.pane.close" || index == self.active)
+            && self.tabs.len() > 1
+        {
+            Some(
+                self.tabs[if index + 1 < self.tabs.len() {
+                    index + 1
+                } else {
+                    index - 1
+                }]
+                .id,
+            )
+        } else {
+            None
+        };
+        self.tabs
+            .iter()
+            .filter(|t| {
+                t.id == target
+                    || Some(t.id) == replacement
+                    || (verb != "term.tab.close" && t.id == self.active_id())
+            })
+            .flat_map(|t| {
+                t.tree
+                    .leaves(Geometry::default())
+                    .into_iter()
+                    .map(|(p, _)| p.id)
+            })
+            .collect()
     }
     pub fn leaves(&self) -> Vec<PaneInfo> {
         if self.is_empty() {
@@ -338,6 +414,7 @@ impl TabSet {
         let pane_id = self.next_pane_id;
         let pane =
             self.start_pane(move || Terminal::start_session(settings, native.as_ref(), pane_id))?;
+        self.invalidate_control_focus();
         let id = pane.id;
         let tab = &mut self.tabs[self.active];
         tab.tree.split(tab.active_pane, dir, pane);
@@ -351,6 +428,9 @@ impl TabSet {
     pub fn focus(&mut self, id: u64) -> bool {
         if self.is_empty() || self.active_tab().tree.pane_by_id(id).is_none() {
             return false;
+        }
+        if self.tabs[self.active].active_pane != id {
+            self.invalidate_control_focus();
         }
         self.tabs[self.active].active_pane = id;
         self.notify();
@@ -404,6 +484,7 @@ impl TabSet {
         else {
             return (Outcome::Unknown, None);
         };
+        self.invalidate_tab_control(self.tabs[index].id);
         let tab = &mut self.tabs[index];
         let terminal = tab.tree.pane_by_id(id).unwrap().terminal.clone();
         if let Some(native) = &self.native {
@@ -437,6 +518,7 @@ impl TabSet {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return (Outcome::Unknown, None);
         };
+        let was_active = index == self.active;
         let tab = self.tabs.remove(index);
         let ids: Vec<_> = tab
             .tree
@@ -469,6 +551,9 @@ impl TabSet {
             self.notify();
             return (Outcome::Empty, removed);
         }
+        if was_active {
+            self.invalidate_control_focus();
+        }
         self.notify();
         (Outcome::Remaining(self.tabs.len()), removed)
     }
@@ -477,7 +562,11 @@ impl TabSet {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
         };
+        if self.active != index {
+            self.invalidate_control_focus();
+        }
         self.active = index;
+        self.invalidate_control_focus();
         self.notify();
         true
     }
@@ -527,7 +616,9 @@ impl TabSet {
             return;
         }
         let offset = if forward { 1 } else { self.tabs.len() - 1 };
+        self.invalidate_control_focus();
         self.active = (self.active + offset) % self.tabs.len();
+        self.invalidate_control_focus();
         self.notify();
     }
     pub fn set_wake(&mut self, wake: Wake) {

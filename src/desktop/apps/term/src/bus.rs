@@ -1,6 +1,6 @@
-use crate::tabs::{Cleanup, CompletionNote, TabSet};
 #[cfg(test)]
 use crate::tabs::Outcome;
+use crate::tabs::{Cleanup, CompletionNote, TabSet};
 use cosmix_client::{BoundedIncomingEvent, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
@@ -12,12 +12,24 @@ pub const HELP: &str = "term: tabbed Wayland Mix terminal\nDIAGNOSTIC surface â€
 pub fn start(
     terminal: Arc<Mutex<TabSet>>,
     _cleanup: Cleanup,
+    notify_rx: tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
+) -> std::thread::JoinHandle<()> {
+    start_at(
+        terminal,
+        notify_rx,
+        cosmix_config::client_helpers::resolve_noded_url(),
+    )
+}
+
+pub(crate) fn start_at(
+    terminal: Arc<Mutex<TabSet>>,
     mut notify_rx: tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
+    url: String,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new().name("term-bus".into()).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("Bus runtime");
         runtime.block_on(async move {
-            let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options("term", &cosmix_config::client_helpers::resolve_noded_url()).bounded_incoming(16).connect()).await;
+            let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options("term", &url).bounded_incoming(16).connect()).await;
             let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("term Bus unavailable or connection timed out"); return; } };
             let Some(mut incoming) = client.incoming_bounded() else { return; };
             // The completion-note channel is disabled (TERM_NOTIFY=0 â†’ no sender)
@@ -49,9 +61,7 @@ pub fn start(
                             Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("term Bus incoming overflow"); continue; },
                             None => break,
                         };
-                        let result = if command.body.len() > 8192 { Err("request exceeds 8192 bytes".into()) } else {
-                            diagnostic(&command.command)
-                        };
+                        let result = diagnostic(&command.command);
                         let (rc,body) = match result { Ok(body) => (0,body), Err(error) => (10,error) };
                         let _ = tokio::time::timeout(Duration::from_secs(2),client.respond(&command,rc,&body)).await;
                     }
@@ -339,11 +349,27 @@ mod tests {
     use super::*;
     #[test]
     fn diagnostic_lane_has_no_protected_controls() {
-        for verb in ["term.session", "term.tabs", "term.panes", "term.snapshot",
-            "term.type", "term.tab.new", "term.tab.select", "term.tab.close",
-            "term.pane.split", "term.pane.select", "term.pane.close", "term.execute",
-            "props.get", "props.set", "props.watch"] {
-            assert_eq!(diagnostic(verb).unwrap_err(), "{\"error_code\":\"FORBIDDEN\"}");
+        for verb in [
+            "term.session",
+            "term.tabs",
+            "term.panes",
+            "term.snapshot",
+            "term.type",
+            "term.tab.new",
+            "term.tab.select",
+            "term.tab.close",
+            "term.pane.split",
+            "term.pane.select",
+            "term.pane.close",
+            "term.execute",
+            "props.get",
+            "props.set",
+            "props.watch",
+        ] {
+            assert_eq!(
+                diagnostic(verb).unwrap_err(),
+                "{\"error_code\":\"FORBIDDEN\"}"
+            );
         }
         assert!(diagnostic("HELP").is_ok());
     }

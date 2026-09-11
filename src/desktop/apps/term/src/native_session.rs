@@ -1,4 +1,5 @@
-//! Term-owned identity actor. No diagnostic verbs are installed on this lane.
+//! Term-owned identity actor and verified recipient lane. Protected controls
+//! share its attachment, ordered lifecycle stream and reconnect lifetime.
 use crate::session_fd::{LaunchFd, fresh_key};
 use cosmix_bus::native_session::*;
 use cosmix_client::session::{ExpectedScope, GrantResult, SessionFailure};
@@ -71,6 +72,9 @@ pub struct NativeSession(
 );
 
 struct Shared {
+    policy: Policy,
+    child_capabilities: Vec<Capability>,
+    control: std::sync::Weak<crate::control::Control>,
     next_id: u64,
     ready: Option<Ready>,
     panes: HashMap<u64, std::sync::Weak<PaneState>>,
@@ -81,6 +85,9 @@ struct Shared {
 impl Default for Shared {
     fn default() -> Self {
         Self {
+            policy: Policy::DefaultOpen,
+            child_capabilities: capabilities(),
+            control: std::sync::Weak::new(),
             next_id: 1,
             ready: None,
             panes: HashMap::new(),
@@ -116,6 +123,7 @@ pub struct Supervisor {
 }
 
 struct PaneState {
+    control_ready: AtomicBool,
     id: u64,
     generation: AtomicU64,
     live: AtomicBool,
@@ -178,6 +186,44 @@ enum Request {
 }
 
 impl NativeSession {
+    pub fn pane_generation(&self, id: u64) -> Option<u64> {
+        self.1
+            .lock()
+            .unwrap()
+            .panes
+            .get(&id)?
+            .upgrade()
+            .filter(|p| p.control_ready.load(Ordering::Acquire) && p.live.load(Ordering::Acquire))
+            .map(|p| p.generation.load(Ordering::Acquire))
+    }
+    pub fn install_control(
+        &self,
+        tabs: Arc<std::sync::Mutex<crate::tabs::TabSet>>,
+        cleanup: crate::tabs::Cleanup,
+    ) -> Arc<crate::control::Control> {
+        let control = Arc::new(crate::control::Control::new(tabs, cleanup, self.clone()));
+        self.1.lock().unwrap().control = Arc::downgrade(&control);
+        control
+    }
+
+    pub fn pane_guard(&self, id: u64, generation: u64) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let pane = self
+            .1
+            .lock()
+            .unwrap()
+            .panes
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        Arc::new(move || {
+            pane.upgrade().is_some_and(|p| {
+                p.live.load(Ordering::Acquire)
+                    && p.control_ready.load(Ordering::Acquire)
+                    && p.launched.load(Ordering::Acquire)
+                    && p.generation.load(Ordering::Acquire) == generation
+            })
+        })
+    }
     /// Only physical keyboard/pointer focus paths call this, not Bus mutations.
     pub fn activity(&self) {
         if let Some(now) = clock_ms() {
@@ -286,13 +332,42 @@ impl Supervisor {
         })
         .map_err(|e| e.to_string())?;
         options.require_native_session = true;
-        Self::with_options(options, cosmix_config::client_helpers::resolve_noded_url())
+        let policy = match std::env::var("COSMIX_TERM_POLICY").as_deref() {
+            Ok("restricted") => Policy::Restricted,
+            Ok("default-open") | Err(_) => Policy::DefaultOpen,
+            _ => return Err("invalid Term policy".into()),
+        };
+        let url = cosmix_config::client_helpers::resolve_noded_url();
+        if policy == Policy::DefaultOpen {
+            Self::with_options(options, url)
+        } else {
+            Self::with_policy(options, url, policy)
+        }
     }
 
     pub fn with_options(options: UnixConnectOptions, url: String) -> Result<Self, String> {
+        Self::with_policy(options, url, Policy::DefaultOpen)
+    }
+
+    pub fn with_policy(
+        options: UnixConnectOptions,
+        url: String,
+        policy: Policy,
+    ) -> Result<Self, String> {
+        Self::with_capabilities(options, url, policy, capabilities())
+    }
+
+    fn with_capabilities(
+        options: UnixConnectOptions,
+        url: String,
+        policy: Policy,
+        child_capabilities: Vec<Capability>,
+    ) -> Result<Self, String> {
         let key = fresh_key().map_err(|e| e.to_string())?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(std::sync::Mutex::new(Shared::default()));
+        shared.lock().unwrap().policy = policy;
+        shared.lock().unwrap().child_capabilities = child_capabilities;
         let actor_shared = shared.clone();
         let activity = Arc::new(AtomicU64::new(clock_ms().unwrap_or(0)));
         let actor_activity = activity.clone();
@@ -469,6 +544,9 @@ fn forbidden(error: &SessionFailure) -> bool {
 }
 
 impl Actor {
+    fn control(&self) -> Option<Arc<crate::control::Control>> {
+        self.shared.lock().unwrap().control.upgrade()
+    }
     fn launch_fd(&mut self, grant: &GrantResult) -> std::io::Result<LaunchFd> {
         #[cfg(test)]
         if std::mem::take(&mut self.faults.memfd) {
@@ -511,6 +589,7 @@ impl Actor {
                 generation: AtomicU64::new(ready.pane.generation.load(Ordering::Acquire)),
                 live: AtomicBool::new(true),
                 launched: AtomicBool::new(false),
+                control_ready: AtomicBool::new(false),
                 public_key: ready.pane.public_key,
             });
             if let Some(child) = self.children.get_mut(&pane.id) {
@@ -581,6 +660,7 @@ impl Actor {
                 generation: AtomicU64::new(1),
                 live: AtomicBool::new(true),
                 launched: AtomicBool::new(false),
+                control_ready: AtomicBool::new(false),
                 public_key: HexBytes(key.verifying_key().to_bytes()),
             });
             self.children.insert(
@@ -705,6 +785,12 @@ impl Actor {
     }
 
     async fn connect(&mut self) {
+        for child in self.children.values() {
+            child.pane.control_ready.store(false, Ordering::Release);
+        }
+        if let Some(control) = self.control() {
+            control.invalidate(None);
+        }
         self.withdraw_ready();
         if let Some(old) = self.connection.take() {
             close_connection(&old).await;
@@ -758,7 +844,8 @@ impl Actor {
                 }
             }
             Err(error) if forbidden(&error) => {
-                bounded(connection.session_allocate(&self.key, Policy::DefaultOpen)).await
+                let policy = self.shared.lock().unwrap().policy;
+                bounded(connection.session_allocate(&self.key, policy)).await
             }
             Err(error) => Err(error),
         };
@@ -847,6 +934,10 @@ impl Actor {
                         .0,
                     Ordering::Release,
                 );
+                child.pane.control_ready.store(
+                    found.record.state == BindingState::Attached,
+                    Ordering::Release,
+                );
                 child.record = Some(found.record.clone());
                 return Ok(found);
             }
@@ -907,7 +998,7 @@ impl Actor {
             pane_generation: DecimalU64(child.pane.generation.load(Ordering::Acquire)),
             public_key: child.pane.public_key,
             role: Role::PaneShell,
-            capabilities: capabilities(),
+            capabilities: self.shared.lock().unwrap().child_capabilities.clone(),
         };
         let previous_pending = child.pending.take();
         child.pending = Some(PendingGrant {
@@ -948,6 +1039,7 @@ impl Actor {
             return Err(SessionFailure::InvalidResponse);
         }
         child.pending.as_mut().unwrap().expires_ms = Some(result.grant.expires_ms);
+        child.pane.control_ready.store(false, Ordering::Release);
         child.record = Some(result.record.clone());
         Ok(result)
     }
@@ -1007,6 +1099,10 @@ impl Actor {
         // Fetch the current owned key's reference before parent-initiated revoke.
         match bounded(connection.session_grant_fetch(child.pane.public_key)).await {
             Ok(found) => {
+                child.pane.control_ready.store(
+                    found.record.state == BindingState::Attached,
+                    Ordering::Release,
+                );
                 child.record = Some(found.record.clone());
                 if bounded(connection.session_revoke(found.record.reference()))
                     .await
@@ -1068,6 +1164,8 @@ impl Actor {
 
     async fn run(&mut self, mut requests: UnboundedReceiver<Request>) {
         let mut renew = tokio::time::interval(RENEW);
+        let mut control_tick = tokio::time::interval(Duration::from_millis(100));
+        control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -1086,6 +1184,11 @@ impl Actor {
                     for id in closing { self.close_child(id).await; }
                     self.provision().await;
                 }
+                _ = control_tick.tick() => {
+                    if let (Some(control), Some(connection)) = (self.control(), &self.connection) {
+                        control.flush_notices(connection).await;
+                    }
+                }
                 request = requests.recv() => match request {
                     Some(Request::Provision) => self.provision().await,
                     Some(Request::Close(id, ack)) => {
@@ -1099,10 +1202,17 @@ impl Actor {
                         Some(event) => {
                             let command = event.command();
                             if command.command == "noded.session.lifecycle.gap" {
+                                if let Some(control) = self.control() { control.invalidate(None); }
                                 self.reconcile().await;
                                 self.provision().await;
                             } else if command.command == "noded.session.lifecycle" {
                                 self.notice(&command.body).await;
+                            } else if let (Some(control), Some(connection), Some(parent)) = (self.control(), &self.connection, &self.parent) {
+                                let reply = control.dispatch(connection, parent, &event).await;
+                                let _ = tokio::time::timeout(RPC_BUDGET, connection.client().respond(event.command(), reply.rc, &reply.body)).await;
+                            } else if let Some(connection) = &self.connection {
+                                let reply = crate::control::Reply::error("FORBIDDEN");
+                                let _ = tokio::time::timeout(RPC_BUDGET, connection.client().respond(event.command(), reply.rc, &reply.body)).await;
                             }
                         }
                         None => { self.connect().await; }
@@ -1113,6 +1223,9 @@ impl Actor {
     }
 
     async fn shutdown(&mut self) {
+        if let Some(control) = self.control() {
+            control.invalidate(None);
+        }
         // No unconsumed launch key or descriptor survives shutdown.
         self.shared.lock().unwrap().ready = None;
         self.pool_key = None;
@@ -1174,6 +1287,13 @@ impl Actor {
         {
             return;
         }
+        if let Some(control) = self.control() {
+            let mut target = notice.target.clone();
+            if notice.state == BindingState::Attached {
+                target.binding_generation.0 = target.binding_generation.0.saturating_sub(1);
+            }
+            control.invalidate(Some(&target));
+        }
         let id = self.children.iter().find_map(|(id, child)| {
             child
                 .record
@@ -1201,6 +1321,10 @@ impl Actor {
             }
             let child = self.children.get_mut(&id).unwrap();
             child.retry.enrolled |= notice.state == BindingState::Attached;
+            child
+                .pane
+                .control_ready
+                .store(notice.state == BindingState::Attached, Ordering::Release);
             if let Some(record) = &mut child.record {
                 record.binding_generation = notice.target.binding_generation;
                 record.state = notice.state;
@@ -1229,6 +1353,10 @@ impl Actor {
 #[cfg(test)]
 #[path = "native_session_e2e.rs"]
 mod production_e2e;
+
+#[cfg(test)]
+#[path = "control_tests.rs"]
+mod enforcement_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1622,6 +1750,7 @@ pub(crate) mod tests {
                         generation: AtomicU64::new(1),
                         live: AtomicBool::new(true),
                         launched: AtomicBool::new(true),
+                        control_ready: AtomicBool::new(false),
                         public_key: HexBytes(key.verifying_key().to_bytes()),
                     }),
                     record: None,
@@ -2127,6 +2256,7 @@ pub(crate) mod tests {
                         generation: AtomicU64::new(1),
                         live: AtomicBool::new(true),
                         launched: AtomicBool::new(true),
+                        control_ready: AtomicBool::new(false),
                         public_key: HexBytes(key.verifying_key().to_bytes()),
                     }),
                     record: None,

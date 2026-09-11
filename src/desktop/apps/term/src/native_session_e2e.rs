@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use term_native_test_broker::Broker;
 
-fn current_mix() -> PathBuf {
+pub(super) fn current_mix() -> PathBuf {
     let path = std::env::var_os("COSMIX_E2E_MIX_BIN").expect(
         "p0i-01 requires COSMIX_E2E_MIX_BIN: build current HEAD with cargo build --release -p cosmix-mix, set the variable to its absolute target/release/mix path, then run this test with --ignored; see the test doc comment for the exact invocation",
     );
@@ -56,7 +56,7 @@ fn current_mix() -> PathBuf {
     binary
 }
 
-fn account_name() -> String {
+pub(super) fn account_name() -> String {
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0u8; 65536];

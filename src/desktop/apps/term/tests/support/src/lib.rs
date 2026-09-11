@@ -35,6 +35,17 @@ mod subscription;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Used only in an isolated acceptance subprocess so actual broker diagnostic
+/// logging is included in the parent's stdout/stderr confidentiality check.
+pub fn trace_to_stderr() {
+    use tracing_subscriber::prelude::*;
+    let targets = tracing_subscriber::filter::Targets::new()
+        .with_target("term_native_test_broker", tracing::Level::TRACE)
+        .with_target("cosmix_client", tracing::Level::TRACE)
+        .with_target("term", tracing::Level::TRACE);
+    tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(targets)).try_init().unwrap();
+}
+
 pub struct Broker {
     pub endpoint: PathBuf,
     pub url: String,
@@ -131,7 +142,7 @@ impl Broker {
                         mesh_config_path: None,
                         spec_dir: None,
                         admission_mode: cosmix_config::node::AdmissionMode::Off,
-                        observe_allowed_services: Vec::new(),
+                        observe_allowed_services: vec!["term-policy-audit".into()],
                     },
                     tx,
                 ));
