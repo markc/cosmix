@@ -1600,8 +1600,11 @@ fn stage_d_cancellation_resolves_the_exact_operation() {
         );
         assert_eq!(result["result"]["cancellation"]["requested"], false);
         let pane = f.child.until("SUCCESSOR_RAN\r\n");
+        // The echo reproduces the submitted source, so the marker appears there
+        // by construction. What must not appear is the marker as OUTPUT — the
+        // line the print would have written, terminated by the pane's CRLF.
         assert!(
-            !pane.contains("LOOP_FINISHED"),
+            !pane.contains("LOOP_FINISHED\r\n"),
             "the cancelled loop ran to completion: {pane}"
         );
 

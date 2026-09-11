@@ -100,11 +100,14 @@ pub fn init(flag: Arc<AtomicBool>) -> bool {
     // handler the flag still works for the explicit-set path used by
     // the REPL's tokio task, and the pre-existing "blocking builtin
     // cannot be interrupted" behaviour is what we'd fall back to.
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag);
-    // Second, chained handler: records WHICH evaluation the signal was aimed
-    // at, so `cancel` can refuse to let an idle-prompt Ctrl-C land on the next
-    // evaluation. The flag registration above still delivers the interrupt
-    // itself; this only supplies the mapping.
+    // ORDER IS LOAD-BEARING. signal_hook runs chained handlers in registration
+    // order, and the evaluator polls the flag from a different thread, on a
+    // different core, while the handler runs. Registering the flag first leaves
+    // a window in which the interrupt is already visible but the mapping saying
+    // WHICH evaluation it belongs to is not — and an evaluation that polls in
+    // that window is interrupted with no cancellation intent recorded against
+    // it. That race was observed, not theorised. Recording the mapping first
+    // means any reader that sees the flag has already seen the mapping.
     //
     // SAFETY: `cancel::signal_arrived` performs two relaxed atomic stores and
     // nothing else — no allocation, no locking, no reentrant libc — which is
@@ -112,6 +115,9 @@ pub fn init(flag: Arc<AtomicBool>) -> bool {
     let _ = unsafe {
         signal_hook::low_level::register(signal_hook::consts::SIGINT, crate::cancel::signal_arrived)
     };
+    // signal-hook stores `true` into the supplied AtomicBool from a signal
+    // handler. This is the delivery half; the registration above is the mapping.
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag);
     true
 }
 
