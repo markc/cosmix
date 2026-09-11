@@ -302,14 +302,20 @@ fn fixture_editor() {
                 edit_revision: 0,
             })
             .unwrap();
-        // A reservation takes NOTHING away: §8 puts the cooked-mode restore
-        // at the commit, so the editor is still editing and the terminal is
-        // unchanged. `same_modes` asserting the modes are untouched is now the
-        // point rather than an aside — it used to hold because the restore had
-        // already happened and matched the original, and it holds now because
-        // no restore happened at all.
+        // A reservation takes NOTHING away. §8 puts the cooked-mode restore
+        // at the commit, so afterwards the terminal must be EXACTLY as the
+        // editor had it — still raw, still being read — and not restored to
+        // the modes the editor inherited. Both halves are asserted, because
+        // only the pair distinguishes "unchanged" from "restored": this used
+        // to restore at reservation time, which is what left a half-typed
+        // keystroke to the canonical line discipline.
+        let editing_modes = modes(0);
         assert!(matches!(reply, Reply::Reserved { .. }));
-        same_modes(original, modes(0));
+        same_modes(editing_modes, modes(0));
+        assert_ne!(
+            original.c_lflag, editing_modes.c_lflag,
+            "the editor must still hold the terminal in raw mode"
+        );
         // A reservation for a generation that is not current cannot be
         // released, exactly as it could not be resumed before.
         assert!(
