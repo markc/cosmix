@@ -36,6 +36,7 @@ mod node_config;
 mod repl;
 mod repl_editor;
 mod serve_runtime;
+mod result_fd;
 mod session_execute;
 mod session_state;
 mod session_status;
@@ -611,7 +612,13 @@ fn run_source(
 /// - A leading `time` is a MODIFIER, resolved before both (see
 ///   `shell::strip_time_prefix`), so `ssh host 'time shwho'` times the command
 ///   instead of hunting PATH for a `time` binary that does not exist.
-fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelude: bool) -> i32 {
+fn run_command_line(
+    code: &str,
+    load_rc: bool,
+    script_args: &[String],
+    no_prelude: bool,
+    result_fd: Option<crate::result_fd::ResultFd>,
+) -> i32 {
     cosmix_mix::set_script_argv(script_args.to_vec());
     // `-c`/stdin has no file, so its frames carry `file: None`; store under
     // `None` to match, enabling the offending-line footer for `-c` too.
@@ -743,17 +750,34 @@ fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelud
                 // Race execution (+ the event pump, for any `on` handlers)
                 // against Ctrl-C, exactly as run_source does, so a `-c` body
                 // that registers handlers can still be interrupted.
-                let res: Result<(), cosmix_mix::error::MixError> = tokio::select! {
+                // The VALUE is kept, not discarded, when a result fd is
+                // present. `-c` has never echoed it to stdout, so nothing is
+                // being suppressed here — the property the task contract wants
+                // (stdout is the program's text, the value travels the fd)
+                // already held, and this preserves it rather than creating it.
+                let res: Result<Value, cosmix_mix::error::MixError> = tokio::select! {
                     biased;
-                    _ = shutdown_signal() => Ok(()),
+                    _ = shutdown_signal() => Ok(Value::Nil),
                     r = async {
-                        eval.execute(&stmts).await?;
+                        let value = eval.execute(&stmts).await?;
                         if eval.handler_count() > 0 {
                             eval.run_event_pump().await?;
                         }
-                        Ok(())
+                        Ok(value)
                     } => r,
                 };
+                if let Some(result_fd) = result_fd {
+                    let payload = match &res {
+                        Ok(value) => crate::result_fd::Payload::Value(value.clone()),
+                        Err(error) => crate::result_fd::Payload::Error(format!("{error}")),
+                    };
+                    if let Err(error) = result_fd.write(&payload) {
+                        // Loud, because a missing frame is reported by the
+                        // supervisor as `result_missing` and the operator would
+                        // otherwise have no way to learn why.
+                        eprintln!("mix: --result-fd: could not write the result frame: {error}");
+                    }
+                }
                 match res {
                     Ok(_) => 0,
                     Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
@@ -1523,6 +1547,7 @@ fn real_main() -> i32 {
     let mut i = 1;
     let mut no_prelude = false;
     let mut interactive_rc = false;
+    let mut result_fd: Option<crate::result_fd::ResultFd> = None;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
@@ -1589,7 +1614,27 @@ fn real_main() -> i32 {
                 }
                 let code = &args[i];
                 let script_args: Vec<String> = args[i + 1..].to_vec();
-                return run_command_line(code, interactive_rc, &script_args, no_prelude);
+                return run_command_line(code, interactive_rc, &script_args, no_prelude, result_fd);
+            }
+            "--result-fd" => {
+                i += 1;
+                let raw = args.get(i).and_then(|value| value.parse::<i32>().ok());
+                let Some(raw) = raw else {
+                    eprintln!("mix: --result-fd requires a descriptor number");
+                    return 2;
+                };
+                // Refuse at startup, before any user code runs. A task promised
+                // a structured result that silently produced none is the
+                // failure with no symptom.
+                match crate::result_fd::ResultFd::validate(raw) {
+                    Ok(validated) => result_fd = Some(validated),
+                    Err(error) => {
+                        eprintln!("mix: {error}");
+                        return 2;
+                    }
+                }
+                i += 1;
+                continue;
             }
             "--no-prelude" => {
                 no_prelude = true;
