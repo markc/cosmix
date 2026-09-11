@@ -329,9 +329,10 @@ impl Pty {
     }
     fn until(&mut self, marker: &str) -> String {
         if marker == PROMPT {
-            // Fixture-specific rustyline lifecycle boundary: a repaint does
-            // not re-enable bracketed paste. Wait for a NEW readline before
-            // recognising its prompt. Never inject typeahead into a job.
+            // Ordinary repaints do not re-enable bracketed paste. Suspend /
+            // resume does, even within the same readline: those tests must
+            // observe command output before waiting for the following prompt.
+            // Never inject typeahead into a job.
             let mut out = self.read_until("\x1b[?2004h");
             out.push_str(&self.read_until(PROMPT));
             return out;
@@ -481,7 +482,12 @@ fn idle_prompt_ctrl_z_keeps_readline_usable() {
     // The interrupted editor read must retry rather than terminate the REPL.
     let mut p = Pty::interactive();
     p.send("\x1a");
-    assert!(p.command("print(97531)").contains("\r\n97531\r\n"));
+    p.send("print(97531)\n");
+    // Ctrl+Z resumes with a paste-enable + prompt repaint before processing
+    // the queued command. That repaint is not command completion. Retain the
+    // typeahead coverage and require actual output, not echoed source text.
+    p.until("\r\n97531\r\n");
+    p.until(PROMPT);
     p.exit();
 }
 
@@ -873,7 +879,9 @@ fn stop_between_terminal_transfer_and_stage_release_aborts_launch() {
         use std::collections::{BTreeMap, BTreeSet};
         let p = Pty::spawn(&[], false, true, true);
         let pid = p.shell.id() as i32;
-        let tty = p.slave.try_clone().unwrap();
+        // The observer is outside the slave's controlling session. Linux
+        // rejects tcgetpgrp(slave) there with ENOTTY; the master can query it.
+        let tty = p.master.try_clone().unwrap();
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFSTOPPED(status));
