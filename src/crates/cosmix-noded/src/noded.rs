@@ -2183,21 +2183,17 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             && bus_msg.message_type() != Some("response")
         {
             let validation = cosmix_bus::native_session::parse_bootstrap(text.as_bytes());
-            if validation.is_err()
-                && bus_msg.command_name() == Some("noded.session.prove")
-                && let Some(p) = &state.principal
-            {
-                state
-                    .sessions
-                    .lock()
-                    .await
-                    .consume_malformed(p.connection_id);
-            }
             let Some(id) = bus_msg.get("id").filter(|id| {
                 !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
             }) else {
                 break;
             };
+            if validation.is_err()
+                && bus_msg.command_name() == Some("noded.session.prove")
+                && let Some(p) = &state.principal
+            {
+                state.sessions.lock().await.consume_malformed(p.connection_id);
+            }
             let result = match (&state.principal, validation) {
                 (Some(p), Ok(request)) => {
                     let mut reg = state.registry.write().await;
@@ -2238,7 +2234,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             canonicalize_connection_from(&mut bus_msg, service_name.as_deref());
             state.observe.observe(Observation::canonical(
                 ObserveDirection::Local,
-                ObserveOutcome::Rejected,
+                if rc == 0 { ObserveOutcome::BrokerHandled } else { ObserveOutcome::Rejected },
                 &bus_msg,
                 bus_msg.get("id"),
             ));
@@ -3973,6 +3969,7 @@ async fn handle_noded_command(
                 body["extensions"]["native-session-endpoint"] =
                     endpoint.to_string_lossy().into_owned().into();
                 body["native_session_limits"] = serde_json::json!({
+                    "issued_names_per_epoch": session::MAX_ISSUED.to_string(),
                     "terms_per_uid":"64",
                     "pending_grants_per_parent":state.sessions.lock().await.pending_grants_per_parent().to_string(),
                     "pending_grants_global":"1024",

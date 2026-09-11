@@ -1,5 +1,14 @@
 # Native session implementation staging
 
+Dispatch enforces maintenance at its supplied clock instant. Non-owners receive
+uniform `FORBIDDEN` for revoke, including already revoked records. Malformed
+uncorrelated requests close before consuming a challenge. Observation records
+successful session commands as broker-handled. Retention eviction stops at an
+empty cache; an oversized result retains request high-water without caching.
+Ping advertises `issued_names_per_epoch` (65,536). Record/key, descendant and
+deadline searches remain linear in retained epoch state, bounded by this name
+ceiling; allocation churn can increase scan cost until broker restart.
+
 ## S2 lifecycle delivery boundary
 
 Lifecycle transitions offer metadata-only notices to bindings, attached parents,

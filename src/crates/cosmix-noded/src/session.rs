@@ -1,5 +1,6 @@
-//! Native binding state. Registry lock precedes this lock everywhere; all
-//! authority transitions and route installation happen in that critical section.
+//! Native binding state. No session method acquires the registry; callers
+//! needing both locks take the registry first. Authority transitions and route
+//! installation happen in that critical section.
 use super::*;
 use cosmix_bus::native_session::*;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -8,7 +9,7 @@ use std::collections::{HashSet, VecDeque};
 
 const LEASE_MS: u64 = 15_000;
 const RESUME_MS: u64 = 30_000;
-const MAX_ISSUED: usize = 65_536;
+pub(super) const MAX_ISSUED: usize = 65_536;
 type Id = HexBytes<16>;
 type Reply = Result<serde_json::Value, SessionError>;
 
@@ -110,6 +111,7 @@ pub(crate) struct Sessions {
     grants: HashMap<Id, SessionGrant>,
     pane_high_water: HashMap<(Id, u64), u64>,
     outboxes: HashMap<Id, Outbox>,
+    last_maintained: Option<u64>,
 }
 
 impl Default for Sessions {
@@ -129,6 +131,7 @@ impl Sessions {
             grants: Default::default(),
             pane_high_water: Default::default(),
             outboxes: Default::default(),
+            last_maintained: None,
         }
     }
 
@@ -474,6 +477,7 @@ impl Sessions {
     }
 
     pub(super) fn maintain(&mut self, reg: &mut HashMap<String, ServiceEntry>, now: u64) {
+        self.last_maintained = Some(now);
         let mut expired: Vec<_> = self
             .records
             .iter()
@@ -633,10 +637,15 @@ impl Sessions {
                     .expect("cached");
                 self.results.remove(index);
             }
-            while self.results.len() >= 8192
-                || self.results.iter().map(|r| r.bytes).sum::<usize>() + bytes > 16 * 1024 * 1024
+            while !self.results.is_empty() && (self.results.len() >= 8192
+                || self.results.iter().map(|r| r.bytes).sum::<usize>().saturating_add(bytes) > 16 * 1024 * 1024)
             {
                 self.results.pop_front();
+            }
+            // Preserve high-water when even an empty cache cannot fit this
+            // result: retries report unknown_outcome, never re-execute it.
+            if bytes > 16 * 1024 * 1024 {
+                return result;
             }
             self.results.push_back(Cached {
                 connection: cid,
@@ -657,6 +666,9 @@ impl Sessions {
         reg: &mut HashMap<String, ServiceEntry>,
         now: u64,
     ) -> Reply {
+        if self.last_maintained != Some(now) {
+            self.maintain(reg, now);
+        }
         match command {
             SessionCommand::GrantCreate(a) => self.grant_create(p, a, reg, now),
             SessionCommand::GrantFetch(a) => {
@@ -710,7 +722,7 @@ impl Sessions {
                         parent.connection == Some(p.connection_id)
                             && self.remaining(parent, now) > 0
                     });
-                if !owner && r.view.state != BindingState::Revoked {
+                if !owner {
                     return Err(SessionError::forbidden());
                 }
                 let revoked = r.view.state != BindingState::Revoked;
@@ -987,7 +999,7 @@ impl Sessions {
             let mut e = error(ErrorCode::Conflict, "challenge_outstanding");
             e.details.insert(
                 "retry_after_ms".into(),
-                (proof.challenge_expires_ms.0 - now).to_string().into(),
+                proof.challenge_expires_ms.0.saturating_sub(now).to_string().into(),
             );
             return Err(e);
         }
@@ -1252,6 +1264,29 @@ mod queue_tests {
         s.dispatch(&p, &command, &mut reg, 1000).unwrap();
         let id = s.attached(p.connection_id).unwrap();
         (s, reg, p, id)
+    }
+
+    #[test]
+    fn restricted_revoke_does_not_disclose_terminal_state() {
+        let (mut s, mut reg, p, id) = allocated();
+        let mut stranger = p.clone();
+        stranger.connection_id = HexBytes([9; 16]);
+        let command = SessionCommand::Revoke(TargetArgs {
+            target: s.records[&id].view.reference(),
+        });
+        let live_error = s.dispatch(&stranger, &command, &mut reg, 1001).unwrap_err();
+        s.revoke(id, &mut reg);
+        let terminal_error = s.dispatch(&stranger, &command, &mut reg, 1002).unwrap_err();
+        assert_eq!(live_error, SessionError::forbidden());
+        assert_eq!(terminal_error, live_error);
+    }
+
+    #[test]
+    fn dispatch_expires_without_caller_maintenance() {
+        let (mut s, mut reg, p, id) = allocated();
+        s.dispatch(&p, &SessionCommand::Hello, &mut reg, 50_000).unwrap();
+        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
+        assert!(reg.is_empty());
     }
 
     #[test]
