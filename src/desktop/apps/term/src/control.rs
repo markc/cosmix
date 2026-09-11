@@ -60,6 +60,16 @@ struct Request {
     source: Option<String>,
     #[serde(default)]
     prompt_generation: Option<DecimalU64>,
+    /// Task family. Relayed as sent — Term never resolves the source/argv
+    /// union, so both-or-neither reaches the child's own refusal.
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    timeout_ms: Option<DecimalU64>,
 }
 
 #[derive(Clone)]
@@ -235,7 +245,28 @@ struct State {
     /// without it a sibling agent that guesses an operation id reads another
     /// agent's result — up to 16 KiB of whatever that shell printed — or
     /// cancels its evaluation.
-    operations: HashMap<u64, String>,
+    operations: HashMap<u64, (String, Family)>,
+}
+
+/// Which surface an operation belongs to.
+///
+/// Scopes ADDRESSING only. The forwarded-id map is deliberately NOT split by
+/// this: one caller request id must map to one forwarded id across both
+/// surfaces, or the same id could mint a fresh operation on each and both would
+/// execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Family {
+    Execute,
+    Task,
+}
+impl Family {
+    fn of(verb: &str) -> Self {
+        if verb.starts_with("term.task.") {
+            Self::Task
+        } else {
+            Self::Execute
+        }
+    }
 }
 
 /// What Term already knows about a caller request it is being asked to forward.
@@ -639,7 +670,12 @@ impl Control {
         // those locks are taken.
         if matches!(
             verb,
-            "term.execute" | "term.exec.result" | "term.exec.cancel"
+            "term.execute"
+                | "term.exec.result"
+                | "term.exec.cancel"
+                | "term.task.submit"
+                | "term.task.result"
+                | "term.task.cancel"
         ) {
             return self
                 .forward_execute(connection, actor, verb, &request, &identity, digest)
@@ -949,7 +985,7 @@ impl Control {
     }
 
     /// Bind a child-minted operation id to the actor that caused it.
-    fn claim_operation(&self, identity: &str, operation: u64) {
+    fn claim_operation(&self, identity: &str, operation: u64, family: Family) {
         let mut state = self.state.lock().unwrap();
         // Bounded with the history it belongs to; an id whose mapping is gone
         // answers like an unknown one, which is a refusal and never a leak.
@@ -958,17 +994,17 @@ impl Control {
         {
             state.operations.remove(&victim);
         }
-        state.operations.insert(operation, identity.to_owned());
+        state.operations.insert(operation, (identity.to_owned(), family));
     }
     /// Whether `identity` may address `operation` at all. An unmapped id is
     /// treated as somebody else's, not as public.
-    fn owns_operation(&self, identity: &str, operation: u64) -> bool {
+    fn owns_operation(&self, identity: &str, operation: u64, family: Family) -> bool {
         self.state
             .lock()
             .unwrap()
             .operations
             .get(&operation)
-            .is_some_and(|owner| owner == identity)
+            .is_some_and(|(owner, owned_family)| owner == identity && *owned_family == family)
     }
 
     /// Retain a completed mutation's outcome so a retry replays it.
@@ -1084,22 +1120,75 @@ impl Control {
                     Some(sequence),
                 )
             }
+            // A task submission mirrors the evaluation one mechanically: same
+            // epoch rule, same forwarded-id mapping, same retry discipline.
+            // What it does NOT carry is `on_behalf_of` — a task never renders
+            // into the pane, so there is no announcement for a principal to
+            // appear in, and sending the field would be refused by the child's
+            // `deny_unknown_fields`.
+            "term.task.submit" => {
+                let Some(sequence) = request.request_id.map(|id| id.0).filter(|id| *id > 0) else {
+                    return Reply::error("INVALID_ARGUMENT");
+                };
+                match request.request_epoch {
+                    None => return Reply::error("INVALID_ARGUMENT"),
+                    Some(epoch) if epoch != actor.connection_id => {
+                        return Reply::error("UNKNOWN_OUTCOME");
+                    }
+                    Some(_) => {}
+                }
+                // The SAME forwarded map as evaluations, keyed (identity,
+                // sequence) and not split by kind: splitting it would let one
+                // caller request id mint a fresh forwarded id on each surface
+                // and BOTH execute.
+                let forwarded = match self.forwarded_id(identity, sequence, digest) {
+                    Forward::Conflict => return Reply::refuse("CONFLICT", Some(mismatch())),
+                    Forward::Retry(id) => id,
+                    Forward::Fresh(id) => {
+                        if let Err(reply) = self.reserve_request_id(identity, sequence, digest) {
+                            return reply;
+                        }
+                        id
+                    }
+                };
+                let mut body = json!({
+                    "version": 1,
+                    "target": child_target,
+                    "request_id": DecimalU64(forwarded),
+                    "cwd": request.cwd,
+                    "env": request.env,
+                    "timeout_ms": request.timeout_ms,
+                });
+                // The discriminated union is relayed as the caller sent it;
+                // Term does not choose a side, so "both" and "neither" reach
+                // the child's own refusal rather than being resolved here.
+                if let Some(source) = &request.source {
+                    body["source"] = json!(source);
+                }
+                if let Some(argv) = &request.argv {
+                    body["argv"] = json!(argv);
+                }
+                ("shell.task.submit", body, Some(sequence))
+            }
             // Reading a result and cancelling are idempotent against one
-            // immutable evaluation identity, so neither spends a request id.
+            // immutable identity, so neither spends a request id.
             _ => {
                 let Some(operation) = request.operation_id else {
                     return Reply::error("INVALID_ARGUMENT");
                 };
-                // Scoped to the actor that submitted it, and refused exactly
-                // like an id that does not exist — so the surface cannot be
-                // used to discover which operation numbers are live.
-                if !self.owns_operation(identity, operation.0) {
+                let family = Family::of(verb);
+                // Scoped to the actor that submitted it AND to the family it
+                // belongs to, refused exactly like an id that does not exist —
+                // so neither surface can read the other's operations, and
+                // neither can be used to discover which numbers are live.
+                if !self.owns_operation(identity, operation.0, family) {
                     return Reply::error("UNKNOWN_OUTCOME");
                 }
-                let shell_verb = if verb == "term.exec.cancel" {
-                    "shell.execute.cancel"
-                } else {
-                    "shell.execute.result"
+                let shell_verb = match verb {
+                    "term.exec.cancel" => "shell.execute.cancel",
+                    "term.task.cancel" => "shell.task.cancel",
+                    "term.task.result" => "shell.task.result",
+                    _ => "shell.execute.result",
                 };
                 (
                     shell_verb,
@@ -1134,7 +1223,7 @@ impl Control {
                     .as_str()
                     .and_then(|id| id.parse::<u64>().ok())
                 {
-                    self.claim_operation(identity, operation);
+                    self.claim_operation(identity, operation, Family::of(verb));
                 }
                 value["target"] = json!(request.target);
                 if let Some(sequence) = sequence {
@@ -1323,6 +1412,9 @@ pub(crate) fn capability_of(verb: &str, contents: bool) -> Option<Capability> {
         // One capability for the whole execute family. Asking what an execution
         // did is asking about an execution.
         "term.execute" | "term.exec.result" | "term.exec.cancel" => Capability::Execute,
+        // Same authority: an isolated task is still this principal causing
+        // this shell to run code. The isolation is about the process.
+        "term.task.submit" | "term.task.result" | "term.task.cancel" => Capability::Execute,
         _ => return None,
     })
 }

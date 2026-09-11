@@ -1448,6 +1448,9 @@ fn default_child_capabilities_cover_every_dispatchable_verb() {
         ("term.execute", Capability::Execute),
         ("term.exec.result", Capability::Execute),
         ("term.exec.cancel", Capability::Execute),
+        ("term.task.submit", Capability::Execute),
+        ("term.task.result", Capability::Execute),
+        ("term.task.cancel", Capability::Execute),
     ] {
         assert!(
             granted.contains(&capability),
@@ -1462,7 +1465,7 @@ fn default_child_capabilities_cover_every_dispatchable_verb() {
         );
     }
     // Nothing outside the mirror dispatches, either.
-    for verb in ["term.invented", "term.exec", "shell.execute", ""] {
+    for verb in ["term.invented", "term.exec", "term.task", "shell.task.submit", ""] {
         assert_eq!(super::super::control::capability_of(verb, false), None);
     }
     // And the reverse: a capability nobody routes to is dead weight in every
