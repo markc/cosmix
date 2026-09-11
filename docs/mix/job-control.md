@@ -1,5 +1,7 @@
 # Interactive job control
 
+Available in Mix 0.84.0.
+
 Interactive Mix shell commands use one process group per job, including all
 pipeline stages. The shell transfers its controlling terminal to foreground
 jobs and reclaims it on completion or suspension. `jobs` lists tracked jobs;
