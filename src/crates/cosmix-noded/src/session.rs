@@ -383,6 +383,31 @@ impl Sessions {
         self.delivery(p, target, now)
     }
 
+    pub(crate) fn publisher_now(
+        &mut self,
+        p: &BrokerPrincipal,
+    ) -> Result<Option<BrokerPrincipal>, SessionError> {
+        let now = self.checked_now()?;
+        self.publisher(p, now)
+    }
+
+    fn publisher(
+        &self,
+        p: &BrokerPrincipal,
+        now: u64,
+    ) -> Result<Option<BrokerPrincipal>, SessionError> {
+        if self.clock_failed {
+            return Err(error(ErrorCode::Unavailable, "clock_unavailable"));
+        }
+        match self.attached(p.connection_id) {
+            Some(id) if self.remaining(&self.records[&id], now) == 0 => {
+                Err(error(ErrorCode::Expired, ""))
+            }
+            None if p.session.is_some() => Err(error(ErrorCode::Expired, "")),
+            _ => Ok(self.principal(p.connection_id, now)),
+        }
+    }
+
     /// A read-only route lookup must still refuse an expired native target
     /// while the scheduler is waiting to acquire the registry write lock.
     pub(super) fn validate_route(&mut self, name: &str) -> Result<(), SessionError> {
@@ -404,22 +429,12 @@ impl Sessions {
         target: &mpsc::Sender<String>,
         now: u64,
     ) -> Result<Option<BrokerPrincipal>, SessionError> {
-        if self.clock_failed {
-            return Err(error(ErrorCode::Unavailable, "clock_unavailable"));
-        }
-        let principal = self.principal(p.connection_id, now);
+        let principal = self.publisher(p, now)?;
         let Some(id) = self.attached(p.connection_id) else {
-            // A stale cached bound principal cannot fall back to ambient authority.
-            if p.session.is_some() {
-                return Err(error(ErrorCode::Expired, ""));
-            }
             return Ok(principal);
         };
         let r = &self.records[&id];
         let remaining = self.remaining(r, now);
-        if remaining == 0 {
-            return Err(error(ErrorCode::Expired, ""));
-        }
         let reference = r.view.reference();
         // Topic fan-out reaches this admission path without a registry sweep.
         // Expired dependencies must not occupy either quota until an expiry wake.
@@ -1585,6 +1600,45 @@ pub(super) mod queue_tests {
     }
 
     #[tokio::test]
+    async fn expired_publisher_errors_even_without_subscribers() {
+        for subscribers in [0, 1] {
+            let now = now_ms().unwrap();
+            let (s, _, p, _) = allocated_at(now.saturating_sub(LEASE_MS));
+            let p = s.principal(p.connection_id, now).unwrap();
+            let broker = subscription::SubscriptionBroker::new();
+            broker.set_native_sessions(Arc::new(tokio::sync::Mutex::new(s)));
+            let (tx, mut rx) = mpsc::channel(8);
+            if subscribers != 0 {
+                broker
+                    .subscribe_topic("expired.test", "recipient", tx.clone())
+                    .await;
+            }
+            let wire = BusMessage::new()
+                .with_header("type", "event")
+                .with_header("command", "snapshot")
+                .to_wire();
+            let error = broker
+                .publish_with_principal(
+                    "expired.test",
+                    &wire,
+                    "publisher",
+                    tx,
+                    subscription::BrokerOrigin::Local,
+                    true,
+                    Some(&p),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.session_error().unwrap().error_code,
+                ErrorCode::Expired
+            );
+            assert_eq!(error.rc(), 10);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn fanout_refuses_only_the_recipient_at_dependency_capacity() {
         let (mut s, _, p, id) = allocated();
         let now = now_ms().unwrap();
@@ -1622,7 +1676,7 @@ pub(super) mod queue_tests {
             .with_header("type", "event")
             .with_header("command", "snapshot")
             .to_wire();
-        let (_, delivered, refused, _) = broker
+        let outcome = broker
             .publish_with_principal(
                 "session.test",
                 &wire,
@@ -1634,7 +1688,11 @@ pub(super) mod queue_tests {
             )
             .await
             .unwrap();
-        assert_eq!((delivered, refused), (2, 1));
+        assert_eq!(
+            (outcome.delivered, outcome.refused, outcome.dropped),
+            (2, 1, 0)
+        );
+        assert_eq!(outcome.body()["partial"], true);
         assert!(receivers[0].try_recv().is_ok());
         assert!(receivers[1].try_recv().is_err());
         assert!(receivers[2].try_recv().is_ok());

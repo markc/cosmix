@@ -43,11 +43,16 @@ use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
 
 The same fence covers correlated responses and fresh topic fan-out. Retained
 topic replay preserves historical attribution and cannot refresh dependencies.
-Per-recipient admission errors skip only that delivery; fan-out continues and
-closed subscriptions are still pruned. A successful `topic.publish` result adds
-`refused` and `partial` alongside `seq` and `delivered`, so committed deliveries
-remain visible when another recipient refuses. Refusal diagnostics contain only
-aggregate counts, without recipient identity or message contents.
+Recipient dependency-cap and missing-recipient refusals skip only that delivery;
+fan-out continues and closed subscriptions are still pruned. `topic.publish`
+reports `seq`, `delivered`, `refused`, `dropped` and `eligible`, with `partial`
+defined as `delivered < eligible`. Full and closed queues count as dropped.
+Publisher expiry and malformed payloads remain command errors, not recipient
+refusals. Publisher authority is checked before committing a snapshot and after
+the fan-out wait, including with no subscribers. A publisher failure mid-fan-out
+reports the original error plus partial progress; prior deliveries are not rolled
+back and accumulated prune notifications still run. Refusal diagnostics contain
+only aggregate counts, without recipient identity or message contents.
 Ping publishes the effective bounds in `native_session_limits` (decimal strings).
 One broker-owned scheduler sleeps until the earliest record lease/resumption,
 pending grant, challenge, retained result or recipient dependency deadline. State
