@@ -40,6 +40,11 @@ During an unmanaged inherited-stdio wait, Ctrl+Z stops Mix itself with its
 child so an outer shell can `fg` the group. The shell suppresses SIGTSTP
 only while a managed job holds the foreground terminal. A restricted
 job-management prompt for suspended evaluation remains deferred.
+SIGTSTP and SIGTTIN use an atomic one-shot disposition reset and reinstall
+the known handler after resume. SIGTTIN always takes the default stop path,
+so background terminal reads stop the shell rather than spinning on EINTR.
+The managed-foreground flag changes only after successful terminal transfers;
+a failed reclaim leaves it set.
 
 On normal shell exit or SIGHUP, Mix sends HUP followed by CONT to its owned
 live jobs and allows 500 ms for exit/reaping. Survivors are reported; there

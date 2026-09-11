@@ -25,22 +25,35 @@ pub fn next_launch_command_id() -> u64 {
     NEXT_LAUNCH_COMMAND_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn shell_signal_action(signal: libc::c_int) -> libc::sigaction {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = shell_signal as *const () as usize;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+    }
+    if matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
+        // Reset atomically on entry; NODEFER lets raise deliver before the
+        // known handler is reinstalled, including for orphaned groups.
+        action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+    }
+    action
+}
+
 extern "C" fn shell_signal(signal: libc::c_int) {
-    if signal != libc::SIGTSTP || MANAGED_FOREGROUND.load(Ordering::Acquire) {
+    if !matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
         return;
     }
-    // Legacy inherited-stdio waits still belong to the shell's group. Let
-    // the outer shell observe and resume us, including on repeated suspends.
-    // SA_NODEFER makes raise deliver before reinstalling the handler. Every
-    // operation here is async-signal-safe; no controller locks or allocation.
+    // SA_RESETHAND already installed SIG_DFL. Never save/restore a previous
+    // disposition: concurrent entries could otherwise save that temporary
+    // default and permanently lose the handler. Reinstall the known action
+    // after resume (or immediately when suppressing a managed-job SIGTSTP).
+    // SIGTTIN always stops: retrying a background terminal read would spin.
+    // Every operation here is async-signal-safe; no locks or allocation.
     unsafe {
-        let mut default: libc::sigaction = std::mem::zeroed();
-        libc::sigemptyset(&mut default.sa_mask);
-        default.sa_sigaction = libc::SIG_DFL;
-        let mut handler = std::mem::zeroed();
-        libc::sigaction(signal, &default, &mut handler);
-        libc::raise(signal);
-        libc::sigaction(signal, &handler, std::ptr::null_mut());
+        if signal == libc::SIGTTIN || !MANAGED_FOREGROUND.load(Ordering::Acquire) {
+            libc::raise(signal);
+        }
+        libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
     }
 }
 
@@ -295,14 +308,9 @@ impl Controller {
         }
         for sig in [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
             let mut old = unsafe { std::mem::zeroed() };
-            let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
-            ignore.sa_sigaction = shell_signal as *const () as usize;
-            if sig == libc::SIGTSTP {
-                ignore.sa_flags = libc::SA_NODEFER;
-            }
+            let action = shell_signal_action(sig);
             unsafe {
-                libc::sigemptyset(&mut ignore.sa_mask);
-                if libc::sigaction(sig, &ignore, &mut old) < 0 {
+                if libc::sigaction(sig, &action, &mut old) < 0 {
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -428,11 +436,8 @@ impl Controller {
         let ttou = TtouGuard::new()?;
         let saved = modes(self.tty.as_raw_fd())?;
         *self.shared.shell_modes.lock().unwrap() = saved;
+        foreground(self.tty.as_raw_fd(), pgid)?;
         MANAGED_FOREGROUND.store(true, Ordering::Release);
-        if let Err(error) = foreground(self.tty.as_raw_fd(), pgid) {
-            MANAGED_FOREGROUND.store(false, Ordering::Release);
-            return Err(error);
-        }
         Ok(TerminalLease {
             controller: self,
             saved,
@@ -669,12 +674,15 @@ pub struct TerminalLease<'a> {
 impl Drop for TerminalLease<'_> {
     fn drop(&mut self) {
         *self.controller.shared.shell_modes.lock().unwrap() = self.saved;
-        if let Err(e) = foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid)
-            .and_then(|_| set_modes(self.controller.tty.as_raw_fd(), &self.saved))
-        {
-            eprintln!("mix: terminal restore: {e}");
+        match foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid) {
+            Ok(()) => {
+                MANAGED_FOREGROUND.store(false, Ordering::Release);
+                if let Err(e) = set_modes(self.controller.tty.as_raw_fd(), &self.saved) {
+                    eprintln!("mix: terminal restore: {e}");
+                }
+            }
+            Err(e) => eprintln!("mix: terminal restore: {e}"),
         }
-        MANAGED_FOREGROUND.store(false, Ordering::Release);
     }
 }
 
