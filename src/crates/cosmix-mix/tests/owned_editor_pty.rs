@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 const LIMIT: Duration = Duration::from_secs(15);
 static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn fixture_guard() -> std::sync::MutexGuard<'static, ()> {
-    FIXTURE_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
 }
 const PROMPT: &str = "OWNED> ";
 
@@ -134,6 +136,9 @@ fn fixture_editor() {
         terminal.finish(&layout).unwrap();
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
         fs::write(home.join("drain-ready"), "go").unwrap();
+        // The bounded restore tests a responsive reader, not whether the
+        // parent is scheduled within its 250 ms production drain budget.
+        wait(|| home.join("drain-reader-ready").exists());
         terminal.restore().unwrap();
         same_modes(original, modes(0));
         assert_eq!(
@@ -405,7 +410,11 @@ fn bounded_drain_completes_partial_escape_output_and_finish_before_cleanup() {
     let mut p = Pty::new(Some("bounded-drain"), true);
     // Wait without draining until the child proves a partial write is pending.
     wait(|| p.home.path().join("drain-ready").exists());
-    let output = p.until("DRAIN-PASS");
+    // Regression: reader startup can be delayed beyond the restore budget.
+    // Previously the child had already started restore and tore the output.
+    std::thread::sleep(Duration::from_millis(750));
+    let ready = p.home.path().join("drain-reader-ready");
+    let output = p.until_with_reader_ack("DRAIN-PASS", Some(&ready));
     assert_eq!(output.matches("\x1b[31m").count(), 10_000);
     assert!(output.contains("TAIL> "));
     // Cooked OPOST may map queued LF to CRLF after termios restoration.
@@ -592,6 +601,13 @@ impl Pty {
         self.master.write_all(bytes).unwrap();
     }
     fn until(&mut self, marker: &str) -> String {
+        self.until_with_reader_ack(marker, None)
+    }
+    fn until_with_reader_ack(
+        &mut self,
+        marker: &str,
+        mut ready: Option<&std::path::Path>,
+    ) -> String {
         let deadline = Instant::now() + LIMIT;
         loop {
             if let Some(i) = self
@@ -621,6 +637,10 @@ impl Pty {
             let count = self.master.read(&mut bytes).unwrap();
             assert_ne!(count, 0);
             self.pending.extend_from_slice(&bytes[..count]);
+            // Acknowledge only after this reader has actually drained bytes.
+            if let Some(ready) = ready.take() {
+                fs::write(ready, "go").unwrap();
+            }
             if self.pending.windows(4).any(|w| w == b"\x1b[6n") {
                 self.send(b"\x1b[1;1R");
             }
