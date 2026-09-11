@@ -80,6 +80,10 @@ enum FailureCode {
 #[derive(Serialize)]
 struct Failure {
     error_code: FailureCode,
+    /// Omitted entirely unless a refusal carries something the caller can act
+    /// on. Denials stay uniform and detail-free so they reveal nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
 }
 impl Reply {
     fn ok(value: Value) -> Self {
@@ -89,6 +93,11 @@ impl Reply {
         }
     }
     pub fn error(code: &'static str) -> Self {
+        Self::refuse(code, None)
+    }
+    /// Only for refusals whose details tell an authorised caller how to make
+    /// progress. Never attach details to a denial.
+    fn refuse(code: &'static str, details: Option<Value>) -> Self {
         let error_code = match code {
             "INVALID_ARGUMENT" => FailureCode::InvalidArgument,
             "NOT_FOUND" => FailureCode::NotFound,
@@ -102,11 +111,22 @@ impl Reply {
             "EXPIRED" => FailureCode::Expired,
             "CANCELLED" => FailureCode::Cancelled,
             "UNKNOWN_OUTCOME" => FailureCode::UnknownOutcome,
-            _ => unreachable!("unregistered Term error token"),
+            // A token this table does not know is a typo on the author's side,
+            // not a caller's doing, and a request path must not panic over
+            // one. Fail closed with the uniform denial and make it loud in a
+            // debug build so a test catches the typo rather than production.
+            _ => {
+                debug_assert!(false, "unregistered Term error token: {code}");
+                FailureCode::Forbidden
+            }
         };
         Self {
             rc: 10,
-            body: serde_json::to_string(&Failure { error_code }).expect("owned failure schema"),
+            body: serde_json::to_string(&Failure {
+                error_code,
+                details,
+            })
+            .expect("owned failure schema"),
         }
     }
 }
@@ -207,8 +227,25 @@ pub struct Control {
     state: Mutex<State>,
     native: crate::native_session::NativeSession,
     notice_tx: tokio::sync::mpsc::Sender<InputNotice>,
+    /// Drained by exactly one caller (the identity actor, through
+    /// flush_notices). The mutex makes a second drainer safe rather than
+    /// expected: two would interleave notices and each would see only part of
+    /// the queue, so a revocation could be recorded without being sent.
     notice_rx: Mutex<tokio::sync::mpsc::Receiver<InputNotice>>,
     wake: Arc<tokio::sync::Notify>,
+    /// Debug-only single-flight detector for the invariant on `dispatch`.
+    #[cfg(debug_assertions)]
+    serving: std::sync::atomic::AtomicBool,
+}
+/// Clears the single-flight flag however dispatch returns, including its many
+/// early refusals.
+#[cfg(debug_assertions)]
+struct SingleFlight<'a>(&'a std::sync::atomic::AtomicBool);
+#[cfg(debug_assertions)]
+impl Drop for SingleFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 impl Control {
     #[cfg(test)]
@@ -233,6 +270,8 @@ impl Control {
             notice_tx,
             notice_rx: Mutex::new(notice_rx),
             wake: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(debug_assertions)]
+            serving: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -349,6 +388,12 @@ impl Control {
         });
     }
 
+    /// INVARIANT: one caller at a time. The dedupe check and the commit that
+    /// follows it do NOT hold a single lock across the whole decision, so two
+    /// concurrent callers could both pass the check for the same request ID and
+    /// both execute. The identity actor's server task is that single caller by
+    /// construction — it serves jobs serially off one queue — and the debug
+    /// guard below fails loudly if a second entry point is ever added.
     pub async fn dispatch(
         &self,
         connection: &VerifiedConnection,
@@ -356,6 +401,16 @@ impl Control {
         own: &(Hello, Deadline),
         event: &VerifiedCommand,
     ) -> Reply {
+        #[cfg(debug_assertions)]
+        let _single_flight = {
+            assert!(
+                !self
+                    .serving
+                    .swap(true, std::sync::atomic::Ordering::AcqRel),
+                "dispatch is not re-entrant: the dedupe check and its commit are not one atomic step"
+            );
+            SingleFlight(&self.serving)
+        };
         let native = &self.native;
         if !connection.client().is_connected() {
             self.invalidate(None);
@@ -539,11 +594,11 @@ impl Control {
                     return if entry.digest == digest {
                         entry.reply.clone()
                     } else {
-                        Reply::error("CONFLICT")
+                        Reply::refuse("CONFLICT", Some(mismatch()))
                     };
                 }
                 if sequence.0 <= history.high_water {
-                    return Reply::error("UNKNOWN_OUTCOME");
+                    return Reply::refuse("UNKNOWN_OUTCOME", Some(retired(history.high_water)));
                 }
             }
         }
@@ -671,11 +726,11 @@ impl Control {
                 return if entry.digest == digest {
                     entry.reply.clone()
                 } else {
-                    Reply::error("CONFLICT")
+                    Reply::refuse("CONFLICT", Some(mismatch()))
                 };
             }
             if sequence <= history.high_water {
-                return Reply::error("UNKNOWN_OUTCOME");
+                return Reply::refuse("UNKNOWN_OUTCOME", Some(retired(history.high_water)));
             }
             if total >= TOTAL {
                 return Reply::error("RESOURCE_LIMIT");
@@ -858,6 +913,22 @@ impl Control {
     }
 }
 
+/// The dedupe digest covers the request bytes as sent, deliberately: this
+/// recipient does not canonicalise, so two encodings of the same object are two
+/// different payloads. A retry MUST replay the body byte for byte, and the
+/// refusal says so rather than leaving a caller to guess why its "identical"
+/// retry conflicted.
+fn mismatch() -> Value {
+    json!({"reason":"request_mismatch","retry_requires":"byte_identical_body"})
+}
+/// The high-water mark is advanced before the verb runs, so an ID can be retired
+/// without its outcome ever being recorded (BROKER-022: a committed mutation
+/// must never re-execute, even when its result was lost). An actor holding only
+/// Input or Terminate cannot read the mark back through term.session, so the
+/// refusal carries the floor it has to climb past to make progress again.
+fn retired(high_water: u64) -> Value {
+    json!({"reason":"retired_request_id","request_high_water":DecimalU64(high_water)})
+}
 fn reference(s: &SessionIdentity) -> RecordRef {
     RecordRef {
         record_id: s.record_id,

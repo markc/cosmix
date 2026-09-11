@@ -1413,3 +1413,39 @@ fn p0i_07_actor_table_survives_reconnect_churn() {
         );
     });
 }
+
+/// A grant whose capability set misses a verb the dispatch table can route
+/// leaves a bound child permanently unable to use it, and nothing else would
+/// say so: the child would just see FORBIDDEN and have no way to tell a policy
+/// decision from a provisioning mistake. Pin the two tables against each other.
+#[test]
+fn default_child_capabilities_cover_every_dispatchable_verb() {
+    let granted = super::capabilities();
+    // Mirrors dispatch's verb-to-capability table. Execute is listed because
+    // the grant must still carry it even while the verb answers UNSUPPORTED;
+    // stage D turns the verb on without reissuing anyone's grant.
+    for (verb, capability) in [
+        ("term.session", Capability::ReadState),
+        ("term.list", Capability::ReadState),
+        ("term.tabs", Capability::ReadState),
+        ("term.panes", Capability::ReadState),
+        ("term.operation", Capability::ReadState),
+        ("term.snapshot", Capability::ReadContents),
+        ("term.type", Capability::Input),
+        ("term.tab.new", Capability::ManageLayout),
+        ("term.tab.select", Capability::ManageLayout),
+        ("term.pane.split", Capability::ManageLayout),
+        ("term.pane.select", Capability::ManageLayout),
+        ("term.tab.close", Capability::Terminate),
+        ("term.pane.close", Capability::Terminate),
+        ("term.execute", Capability::Execute),
+    ] {
+        assert!(
+            granted.contains(&capability),
+            "{verb} routes to {capability:?}, which the default grant omits"
+        );
+    }
+    // And the reverse: a capability nobody routes to is dead weight in every
+    // grant, so the two tables have to stay the same size.
+    assert_eq!(granted.len(), 6, "granted capabilities: {granted:?}");
+}

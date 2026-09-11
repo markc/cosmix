@@ -632,6 +632,14 @@ impl Terminal {
         // No parent key material or memfd survives the successful spawn.
         drop(fd);
         let pid = *pty.child.pid;
+        // INVARIANT: MeteredPty below is the ONLY writer to this PTY, and that is
+        // the whole of permit enforcement for agent input. The permit is
+        // rechecked there, at the actual write, which is the last point where
+        // revoked bytes can still be discarded. Any second write path to this
+        // descriptor — a direct write elsewhere, another wrapper, a helper that
+        // takes the fd — silently bypasses every check in control.rs. The dup
+        // below exists only so the foreground process group can be read; it
+        // must never be written to.
         let fd = unsafe { libc::fcntl(*pty.child, libc::F_DUPFD_CLOEXEC, 3) };
         if fd >= 0 {
             let mut writes = listener.writes.lock().unwrap();
