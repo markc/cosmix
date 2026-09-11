@@ -187,7 +187,13 @@ impl Controller {
             // A nested background shell asks its parent for foregrounding.
             unsafe {
                 libc::signal(libc::SIGTTIN, libc::SIG_DFL);
-                libc::kill(0, libc::SIGTTIN);
+                // The evaluator runs on a dedicated thread. A process/group
+                // directed signal may stop another thread after this thread
+                // has already tested the loop again, leaving a stale second
+                // stop after `fg`. raise targets this thread and completes
+                // delivery before returning; SIGTTIN still stops the whole
+                // shell process. No shell-owned children exist at this point.
+                libc::raise(libc::SIGTTIN);
             }
         }
         let mut setup = SetupGuard {
