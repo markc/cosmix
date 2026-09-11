@@ -25,6 +25,12 @@ Bound routed deliveries register a connection/reference dependency before enqueu
 under the same lock as revocation. Dependency caps are 256 per recipient and 8,192
 globally; exhaustion refuses the delivery. Delivery admission releases expired
 dependency slots, including during topic fan-out between maintenance ticks.
+Routing releases registry and session guards before pending registration, then
+rechecks channel ownership and recomputes the lease after that await, immediately
+before enqueue. Refusal removes the pending entry and restores caller correlation.
+Routing lookup uses a registry read guard; only actual mutations take write.
+Delivery errors carry native response headers for verified recipients and the
+legacy error header/body for legacy recipients, including correlated responses.
 `lease.check` requires an existing unexpired dependency, atomically refreshes
 its notice lifetime through the returned
 lease, and returns the minimum remaining ancestor lease. Recipients

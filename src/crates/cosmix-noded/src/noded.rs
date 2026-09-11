@@ -2311,19 +2311,16 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             if let Some(id) = bus_msg.get("id").map(|s| s.to_string()) {
                 if let Some(pending) = state.pending_responses.take_response(&id, &tx).await {
                     let observe = state.observe.for_class(pending.traffic_class);
-                    let mut reg = state.registry.write().await;
+                    let _reg = state.registry.read().await;
                     let mut sessions = state.sessions.lock().await;
-                    sessions.maintain(&mut reg, session::now_ms());
                     let principal = if let Some(p) = &state.principal {
                         match sessions.delivery(p, &pending.caller_tx, session::now_ms()) {
                             Ok(p) => p,
                             Err(error) => {
-                                let reply = BusMessage::new()
-                                    .with_header("bus", "1")
-                                    .with_header("type", "response")
-                                    .with_header("id", &pending.caller_id)
-                                    .with_header("rc", &error.rc().to_string())
-                                    .with_body(&serde_json::to_string(&error).expect("error"));
+                                let reply = session_delivery_error(
+                                    &error, pending.caller_verified,
+                                    Some(&pending.caller_id), bus_msg.command_name()
+                                );
                                 let _ = pending.caller_tx.try_send(reply.to_wire());
                                 continue;
                             }
@@ -3270,6 +3267,30 @@ struct LocalRouteResult {
     outcome: ObserveOutcome,
 }
 
+fn session_delivery_error(
+    error: &cosmix_bus::native_session::SessionError,
+    verified: bool,
+    id: Option<&str>,
+    command: Option<&str>,
+) -> BusMessage {
+    let mut body = serde_json::to_value(error).expect("session error");
+    let code = body["error_code"].as_str().expect("error code").to_owned();
+    let mut reply = BusMessage::new()
+        .with_header("type", "response")
+        .with_header("rc", &error.rc().to_string())
+        .with_header("error", &code);
+    if verified {
+        reply.set("bus", "1");
+        reply.set("native-session", "1");
+    } else {
+        body["error"] = code.into();
+    }
+    if let Some(id) = id { reply.set("id", id); }
+    if let Some(command) = command { reply.set("command", command); }
+    reply.body = body.to_string();
+    reply
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn route_local(
     state: &AppState,
@@ -3283,9 +3304,7 @@ async fn route_local(
 ) -> LocalRouteResult {
     let registry = &state.registry;
     let pending_responses = &state.pending_responses;
-    let mut reg = registry.write().await;
-    let mut sessions = state.sessions.lock().await;
-    sessions.maintain(&mut reg, session::now_ms());
+    let reg = registry.read().await;
     let traffic_class = state.observe.traffic_class().merge(
         reg.get(service)
             .map(|e| e.traffic_class)
@@ -3294,33 +3313,9 @@ async fn route_local(
     let scoped_observe = state.observe.for_class(traffic_class);
     let observe = &scoped_observe;
     if let Some(target_tx) = reg.get(service).map(|e| e.tx.clone()) {
-        let fresh_principal = if let Some(p) = &state.principal {
-            match sessions.delivery(p, &target_tx, session::now_ms()) {
-                Ok(principal) => principal,
-                Err(error) => {
-                    let mut reply = BusMessage::new()
-                        .with_header("bus", "1")
-                        .with_header("type", "response")
-                        .with_header("rc", &error.rc().to_string())
-                        .with_body(&serde_json::to_string(&error).expect("error"));
-                    if let Some(id) = msg.get("id") {
-                        reply.set("id", id);
-                    }
-                    if let Some(command) = msg.command_name() {
-                        reply.set("command", command);
-                    }
-                    let _ = caller_tx.try_send(reply.to_wire());
-                    return LocalRouteResult {
-                        traffic_class,
-                        target_tx: Some(target_tx),
-                        forwarded_wire: None,
-                        outcome: ObserveOutcome::Rejected,
-                    };
-                }
-            }
-        } else {
-            None
-        };
+        // Pending registration may contend across a lease deadline. Hold no
+        // registry/session guard until it completes, then revalidate the route.
+        drop(reg);
         // Register pending BEFORE rewriting the wire bytes so the
         // broker_id we insert under matches the id we serialise into the
         // forwarded wire. `register` is a no-op (returns `None`) for
@@ -3336,17 +3331,24 @@ async fn route_local(
                 state.principal.is_some(),
             )
             .await;
-        // Destination transport, not merely sender identity, gates metadata.
-        let principal = fresh_principal.as_ref().filter(|_| {
-            reg.get(service)
-                .is_some_and(|e| e.traffic_class.protected())
-        });
-        stamp_principal(msg, principal).expect("principal validated at upgrade");
-        let (wire, delivery) = {
+        let reg = registry.read().await;
+        let mut sessions = if state.principal.is_some() {
+            Some(state.sessions.lock().await)
+        } else {
+            None
+        };
+        let attempt = (|| {
             let _fence = state
                 .delivery_fence
                 .read()
                 .expect("delivery fence poisoned");
+            if !reg.get(service).is_some_and(|entry| entry.same_channel(&target_tx)) {
+                return Err(cosmix_bus::native_session::SessionError {
+                    error_code: cosmix_bus::native_session::ErrorCode::Unavailable,
+                    message: "recipient changed before delivery".into(),
+                    details: Default::default(),
+                });
+            }
             let owns_registration = caller_service
                 .and_then(|name| reg.get(name))
                 .is_some_and(|entry| entry.same_channel(caller_tx));
@@ -3358,6 +3360,16 @@ async fn route_local(
                 msg.set(crate::subscription::BROKER_PEER_HEADER, &peer);
                 msg.set(crate::subscription::BROKER_SERVICE_HEADER, origin_service);
             }
+            // Recompute immediately before serialisation/enqueue, after every
+            // awaited lock and the delivery fence. Revocation shares this lock.
+            let fresh_principal = match (&state.principal, sessions.as_mut()) {
+                (Some(p), Some(sessions)) => sessions.delivery(p, &target_tx, session::now_ms())?,
+                _ => None,
+            };
+            let principal = fresh_principal.as_ref().filter(|_| {
+                reg.get(service).is_some_and(|e| e.traffic_class.protected())
+            });
+            stamp_principal(msg, principal).expect("principal validated at upgrade");
             let wire = msg.to_wire();
             // Mark before enqueue: a fast recipient may respond immediately.
             // Failed enqueue may conservatively protect this connection too.
@@ -3368,9 +3380,25 @@ async fn route_local(
                     .store(true, Ordering::Release);
             }
             let delivery = target_tx.try_send(wire.clone());
-            (wire, delivery)
-        };
+            Ok((wire, delivery))
+        })();
         drop(sessions);
+        let (wire, delivery) = match attempt {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                drop(reg);
+                let caller_id = match broker_id {
+                    Some(ref bid) => pending_responses.take(bid).await.map(|p| p.caller_id),
+                    None => None,
+                };
+                let reply = session_delivery_error(&error, state.principal.is_some(), caller_id.as_deref(), msg.command_name());
+                deliver_observed_response(observe, caller_tx, &reply, ObserveDirection::Local, reply.get("id"));
+                return LocalRouteResult {
+                    traffic_class, target_tx: Some(target_tx), forwarded_wire: None,
+                    outcome: ObserveOutcome::Rejected,
+                };
+            }
+        };
         match delivery {
             Ok(()) => LocalRouteResult {
                 traffic_class,
@@ -3393,6 +3421,7 @@ async fn route_local(
                 // `msg`'s `id` is now the broker-local rewrite. If
                 // registration didn't insert anything (id-less message)
                 // there's nothing to take and no reply id to attach.
+                drop(reg);
                 let caller_id = match broker_id {
                     Some(ref bid) => pending_responses.take(bid).await.map(|p| p.caller_id),
                     None => None,
@@ -3407,7 +3436,6 @@ async fn route_local(
                 if let Some(id) = caller_id {
                     err.set("id", &id);
                 }
-                drop(reg);
                 deliver_observed_response(
                     observe,
                     caller_tx,
@@ -6639,6 +6667,41 @@ mod tests {
         let canonical = super::canonicalize_routed_from(&mut msg, None, &original);
         assert_eq!(canonical, original, "short-circuit returns original text");
         assert_eq!(msg.get("from"), None);
+    }
+
+    #[tokio::test]
+    async fn pending_contention_releases_authority_locks_and_rechecks_delivery() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let now = super::session::now_ms();
+        let (sessions, registry, principal, _) = super::session::queue_tests::allocated_at(now);
+        state.principal = sessions.principal(principal.connection_id, now);
+        state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
+        *state.registry.write().await = registry;
+        let (target, mut received) = mpsc::channel(8);
+        state.registry.write().await.insert("recipient".into(), super::ServiceEntry {
+            protected_responses: Default::default(),
+            traffic_class: super::TrafficClass::NativeSession,
+            tx: target,
+            info: Default::default(),
+        });
+        let (caller, mut replies) = mpsc::channel(8);
+        let mut request = BusMessage::new().with_header("id", "original").with_header("command", "probe.echo");
+        let pending_guard = state.pending_responses.map.write().await;
+        let admission = super::SessionAdmission::default();
+        let route = super::route_local(&state, "recipient", &mut request, &caller, None,
+            "127.0.0.1".parse().unwrap(), &admission, None);
+        tokio::pin!(route);
+        assert!(futures_util::poll!(&mut route).is_pending());
+        let mut registry = tokio::time::timeout(std::time::Duration::from_secs(1), state.registry.write()).await.unwrap();
+        state.sessions.lock().await.maintain(&mut registry, now + 15_000);
+        drop(registry);
+        drop(pending_guard);
+        assert_eq!(route.await.outcome, super::ObserveOutcome::Rejected);
+        assert!(received.try_recv().is_err());
+        assert!(state.pending_responses.map.read().await.is_empty());
+        let reply = cosmix_bus::bus::parse(&replies.recv().await.unwrap()).unwrap();
+        assert_eq!(reply.get("id"), Some("original"));
+        assert_eq!(reply.get("error"), Some("EXPIRED"));
     }
 
     async fn mesh_delivery_test_state() -> AppState {

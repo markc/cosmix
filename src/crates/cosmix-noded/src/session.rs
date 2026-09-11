@@ -1221,9 +1221,13 @@ impl Sessions {
 }
 
 #[cfg(test)]
-mod queue_tests {
+pub(super) mod queue_tests {
     use super::*;
     fn allocated() -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
+        allocated_at(1000)
+    }
+
+    pub(crate) fn allocated_at(now: u64) -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
         use ed25519_dalek::{Signer, SigningKey};
         let mut s = Sessions::default();
         let mut reg = HashMap::new();
@@ -1261,7 +1265,7 @@ mod queue_tests {
             signature,
             policy: Policy::Restricted,
         });
-        s.dispatch(&p, &command, &mut reg, 1000).unwrap();
+        s.dispatch(&p, &command, &mut reg, now).unwrap();
         let id = s.attached(p.connection_id).unwrap();
         (s, reg, p, id)
     }
