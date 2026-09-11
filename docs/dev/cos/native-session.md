@@ -14,6 +14,24 @@ globally; exhaustion refuses the delivery. `lease.check` requires an existing
 unexpired dependency and returns the minimum remaining ancestor lease. Recipients
 use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
 
+The same fence covers correlated responses and fresh topic fan-out. Retained
+topic replay preserves historical attribution and cannot refresh dependencies.
+Ping publishes the effective bounds in `native_session_limits` (decimal strings).
+
+## S2 fixture execution
+
+The native noded tests use real Unix WebSockets and kernel peer credentials.
+They include separate-process reserved-name competition, altered-scope and
+captured-proof refusal, restart/re-enrolment, parent-resume wake, lease dependency
+registration, observation/log omission, grant/Term/challenge/interest exhaustion,
+retention high-water and deterministic notice-queue overflow.
+
+The privileged multi-UID case is explicitly ignored in ordinary runs, with its
+missing prerequisites named in the test report. Run it explicitly as root with
+`COSMIX_SESSION_TEST_UID` set to a distinct unprivileged UID. It uses a real child
+process after UID/GID change. Missing prerequisites fail that explicit invocation;
+there is no early-return path that reports a skipped security assertion as passed.
+
 ## S2 grants and proof boundary
 
 `grant.create` and `grant.fetch` require the issuing attached parent. Grants

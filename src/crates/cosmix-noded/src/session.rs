@@ -46,7 +46,7 @@ mod queue_tests {
     }
 }
 
-pub(super) fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -132,7 +132,7 @@ struct Outbox {
 }
 
 #[derive(Default)]
-pub(super) struct Sessions {
+pub(crate) struct Sessions {
     records: HashMap<Id, Record>,
     connections: HashMap<Id, Connection>,
     issued: HashSet<String>,
@@ -245,7 +245,7 @@ impl Sessions {
         }
     }
 
-    pub(super) fn delivery(
+    pub(crate) fn delivery(
         &mut self,
         p: &BrokerPrincipal,
         target: &mpsc::Sender<String>,
@@ -644,12 +644,18 @@ impl Sessions {
                 let r = self
                     .records
                     .values()
-                    .find(|r| {
+                    .filter(|r| {
                         r.key == a.public_key
                             && r.view.owner_uid == p.unix_uid
                             && self
                                 .parent(r)
                                 .is_some_and(|parent| parent.connection == Some(p.connection_id))
+                    })
+                    .max_by_key(|r| {
+                        (
+                            r.view.state != BindingState::Revoked,
+                            r.view.pane_generation.map(|g| g.0).unwrap_or(0),
+                        )
                     })
                     .ok_or_else(SessionError::forbidden)?;
                 if !self.parent_live(r, now) {

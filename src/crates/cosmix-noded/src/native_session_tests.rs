@@ -355,6 +355,301 @@ async fn bound_delivery_registers_lease_dependency_and_disconnect_notifies() {
     assert_eq!(notice["state"], "suspended");
 }
 
+#[tokio::test]
+async fn session_interest_and_challenge_quotas_are_independent() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::SigningKey;
+    let broker = Broker::start().await;
+    let mut parent = broker.unix().await;
+    let term = allocate_term(&mut parent).await;
+    let key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(key.verifying_key().to_bytes());
+    let selector = serde_json::json!({"public_key":public_key,"purpose":"enrol"});
+    let mut sockets = Vec::new();
+    for n in 0..257 {
+        let mut socket = broker.unix().await;
+        let reply = session_call(&mut socket, "challenge", "interest", selector.clone()).await;
+        let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body["error_code"], "FORBIDDEN");
+        assert_eq!(body.get("wake_error").is_some(), n == 256);
+        sockets.push(socket);
+    }
+    session_call(
+        &mut parent,
+        "renew",
+        "renew",
+        serde_json::json!({"target":term.reference()}),
+    )
+    .await;
+    let grant = session_call(&mut parent,"grant.create","2",serde_json::json!({"parent":term.reference(),"pane_id":"1","pane_generation":"1","public_key":public_key,"role":"pane-shell","capabilities":["input"]})).await;
+    assert_eq!(grant.get("rc"), Some("0"), "{}", grant.body);
+    for socket in sockets.iter_mut().take(128) {
+        assert_eq!(
+            session_call(socket, "challenge", "challenge", selector.clone())
+                .await
+                .get("rc"),
+            Some("0")
+        );
+    }
+    let reply = session_call(&mut sockets[128], "challenge", "full", selector.clone()).await;
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["error_code"], "RESOURCE_LIMIT");
+    assert!(body.get("wake_error").is_none());
+    // A malformed identifiable prove releases only its own outstanding slot.
+    assert_eq!(
+        session_call(
+            &mut sockets[0],
+            "prove",
+            "malformed",
+            serde_json::json!({"signature":"bad"})
+        )
+        .await
+        .get("rc"),
+        Some("10")
+    );
+    let reply = session_call(&mut sockets[256], "challenge", "degraded-success", selector).await;
+    assert_eq!(reply.get("rc"), Some("0"), "{}", reply.body);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["wake_error"]["error_code"], "RESOURCE_LIMIT");
+    let fetched = session_call(
+        &mut parent,
+        "grant.fetch",
+        "fetch",
+        serde_json::json!({"public_key":public_key}),
+    )
+    .await;
+    let body: serde_json::Value = serde_json::from_str(&fetched.body).unwrap();
+    assert_eq!(body["grant"]["state"], "pending");
+}
+
+// This helper is invoked in a separate OS process by the fixtures below.
+// It is ignored in ordinary runs, never counted as a skipped privileged pass.
+#[tokio::test]
+#[ignore = "fixture subprocess only; requires COSMIX_SESSION_FIXTURE_ENDPOINT"]
+async fn session_process_fixture() {
+    let endpoint = std::env::var("COSMIX_SESSION_FIXTURE_ENDPOINT")
+        .expect("SKIPPED: fixture endpoint not supplied; run the parent fixture");
+    let stream = tokio::net::UnixStream::connect(endpoint).await.unwrap();
+    let mut socket = tokio_tungstenite::client_async("ws://localhost/ws", stream)
+        .await
+        .unwrap()
+        .0;
+    let name = std::env::var("COSMIX_SESSION_FIXTURE_NAME").unwrap();
+    send(
+        &mut socket,
+        &request("noded.register", "noded", "preclaim").with_header("from", &name),
+    )
+    .await;
+    assert_eq!(receive(&mut socket).await.get("rc"), Some("10"));
+    if let Ok(selector) = std::env::var("COSMIX_SESSION_FIXTURE_SELECTOR") {
+        let reply = session_call(
+            &mut socket,
+            "challenge",
+            "unowned",
+            serde_json::from_str(&selector).unwrap(),
+        )
+        .await;
+        let missing = session_call(&mut socket,"challenge","missing",serde_json::json!({"public_key":"0000000000000000000000000000000000000000000000000000000000000000","purpose":"enrol"})).await;
+        // Changing the key on this connection adds wake_error. Compare only
+        // the UID-independent lookup error, never regard a signature as proof.
+        let mut a: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let mut b: serde_json::Value = serde_json::from_str(&missing.body).unwrap();
+        a.as_object_mut().unwrap().remove("wake_error");
+        b.as_object_mut().unwrap().remove("wake_error");
+        assert_eq!(a, b);
+        assert_eq!(a["error_code"], "FORBIDDEN");
+    }
+}
+
+fn fixture_process(broker: &Broker, name: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "noded::native_session_tests::session_process_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(
+            "COSMIX_SESSION_FIXTURE_ENDPOINT",
+            broker.root.join("bus.sock"),
+        )
+        .env("COSMIX_SESSION_FIXTURE_NAME", name);
+    command
+}
+
+#[tokio::test]
+async fn p0i_02_competing_process_preclaim_preserves_allocated_route() {
+    let broker = Broker::start().await;
+    let mut process = fixture_process(&broker, "t0-aaaaaaaaaaaaaaaaaaaaaa")
+        .spawn()
+        .unwrap();
+    // Wait without blocking the current-thread broker's event loop.
+    loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let parent = verified(&broker).await;
+    let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let record = parent
+        .session_allocate(&key, cosmix_bus::native_session::Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    let mut process = fixture_process(&broker, &record.name).spawn().unwrap();
+    loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    parent.session_renew(record.reference()).await.unwrap();
+    parent.client().close().await;
+}
+
+#[tokio::test]
+#[ignore = "SKIPPED privileged multi-UID fixture: requires root and COSMIX_SESSION_TEST_UID; run explicitly with --ignored"]
+async fn p0i_03_privileged_other_uid_cannot_lookup_or_consume_grant() {
+    use cosmix_bus::native_session::*;
+    use std::os::unix::process::CommandExt;
+    // No missing-prerequisite return path may be reported as a pass.
+    let uid: u32 = std::env::var("COSMIX_SESSION_TEST_UID")
+        .expect("SKIPPED: COSMIX_SESSION_TEST_UID is required")
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::geteuid() }, 0, "SKIPPED: requires root");
+    assert_ne!(uid, 0, "fixture UID must differ from owner");
+    let broker = Broker::start().await;
+    let parent = verified(&broker).await;
+    let parent_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let record = parent
+        .session_allocate(&parent_key, Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(key.verifying_key().to_bytes());
+    parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: record.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key,
+            role: Role::PaneShell,
+            capabilities: vec![Capability::Input],
+        })
+        .await
+        .unwrap();
+    let mut command = fixture_process(&broker, &record.name);
+    command.uid(uid).gid(uid).env(
+        "COSMIX_SESSION_FIXTURE_SELECTOR",
+        serde_json::json!({"public_key":public_key,"purpose":"enrol"}).to_string(),
+    );
+    let mut process = command.spawn().unwrap();
+    loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        parent
+            .session_grant_fetch(public_key)
+            .await
+            .unwrap()
+            .grant
+            .state,
+        GrantState::Pending
+    );
+    parent.client().close().await;
+}
+
+#[tokio::test]
+async fn session_term_and_grant_quotas_and_retention_high_water() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::SigningKey;
+    let broker = Broker::start().await;
+    let mut parents = Vec::new();
+    for _ in 0..64 {
+        let c = verified(&broker).await;
+        let key = SigningKey::from_bytes(&rand::random());
+        let record = c
+            .session_allocate(&key, Policy::Restricted)
+            .await
+            .unwrap()
+            .record;
+        parents.push((c, record));
+    }
+    let excess = verified(&broker).await;
+    let key = SigningKey::from_bytes(&rand::random());
+    assert!(matches!(
+        excess.session_allocate(&key, Policy::Restricted).await,
+        Err(cosmix_client::session::SessionFailure::Refused {
+            error: SessionError {
+                error_code: ErrorCode::ResourceLimit,
+                ..
+            },
+            ..
+        })
+    ));
+    for (c, record) in parents.iter().take(32) {
+        c.session_renew(record.reference()).await.unwrap();
+        for pane in 1..=32 {
+            let key = SigningKey::from_bytes(&rand::random());
+            c.session_grant_create(&GrantCreateArgs {
+                parent: record.reference(),
+                pane_id: DecimalU64(pane),
+                pane_generation: DecimalU64(1),
+                public_key: HexBytes(key.verifying_key().to_bytes()),
+                role: Role::PaneShell,
+                capabilities: vec![Capability::Input],
+            })
+            .await
+            .unwrap();
+        }
+    }
+    for index in [0, 32] {
+        let (c, record) = &parents[index];
+        let result = c
+            .session_grant_create(&GrantCreateArgs {
+                parent: record.reference(),
+                pane_id: DecimalU64(99),
+                pane_generation: DecimalU64(1),
+                public_key: HexBytes(key.verifying_key().to_bytes()),
+                role: Role::PaneShell,
+                capabilities: vec![Capability::Input],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(cosmix_client::session::SessionFailure::Refused {
+                error: SessionError {
+                    error_code: ErrorCode::ResourceLimit,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+    // Retained refusal results are bounded too; old IDs cannot re-execute.
+    let mut raw = broker.unix().await;
+    let impossible = serde_json::json!({"target":{"record_id":HexBytes([0;16]),"incarnation":HexBytes([0;16]),"binding_generation":"1"}});
+    for id in 1..=1025 {
+        session_call(&mut raw, "revoke", &id.to_string(), impossible.clone()).await;
+    }
+    let reply = session_call(&mut raw, "revoke", "1", impossible).await;
+    assert!(reply.body.contains("unknown_outcome"), "{}", reply.body);
+    for (c, _) in parents {
+        c.client().close().await;
+    }
+    excess.client().close().await;
+}
+
 async fn assert_preclaim_refused<S: AsyncRead + AsyncWrite + Unpin>(
     caller: &mut WebSocketStream<S>,
     recipient: &mut WebSocketStream<tokio::net::UnixStream>,
@@ -651,6 +946,96 @@ async fn protected_requests_responses_and_recipient_events_never_reach_tap_paylo
     let tapped = receive(&mut tap).await;
     assert_eq!(tapped.command_name(), Some("probe.public"));
     assert_eq!(tapped.body.trim(), "public body");
+}
+
+#[derive(Clone)]
+struct CaptureLog(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for CaptureLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureLog {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn p0i_09_binding_bootstrap_omits_keys_and_proofs_from_observe_tap_and_logs() {
+    use cosmix_bus::native_session::*;
+    let logs = CaptureLog(Default::default());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let broker = Broker::start().await;
+    let mut observer = broker.tcp().await;
+    register(&mut observer, "audit-observer").await;
+    send(
+        &mut observer,
+        &request("noded.observe.start", "noded", "observe")
+            .with_body(r#"{"filter":{"verbs":["noded.session.*"]},"body":"redacted"}"#),
+    )
+    .await;
+    assert_eq!(receive(&mut observer).await.get("rc"), Some("0"));
+    let mut tap = broker.tcp().await;
+    send(&mut tap, &request("noded.tap", "noded", "tap")).await;
+    assert_eq!(receive(&mut tap).await.get("rc"), Some("0"));
+    let parent = verified(&broker).await;
+    let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let record = parent
+        .session_allocate(&key, Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    parent.session_renew(record.reference()).await.unwrap();
+    let private = serde_json::to_value(HexBytes(key.to_bytes()))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let public = serde_json::to_value(HexBytes(key.verifying_key().to_bytes()))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for _ in 0..6 {
+        let event = receive(&mut observer).await;
+        let wire = event.to_wire();
+        assert!(!wire.contains(&private));
+        assert!(!wire.contains(&public));
+        assert!(!wire.contains("signature"));
+        assert!(wire.contains("native_session_protected"));
+    }
+    // Ordered public marker drains all tap traffic produced during bootstrap.
+    let mut marker = broker.tcp().await;
+    send(
+        &mut marker,
+        &request("noded.ping", "noded", "tap-end-marker"),
+    )
+    .await;
+    receive(&mut marker).await;
+    loop {
+        let frame = receive(&mut tap).await;
+        assert!(!frame.to_wire().contains("noded.session."));
+        assert!(!frame.to_wire().contains(&public));
+        assert!(!frame.to_wire().contains(&private));
+        if frame.get("id") == Some("tap-end-marker") {
+            break;
+        }
+    }
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(!output.contains(&private));
+    assert!(!output.contains(&public));
+    parent.client().close().await;
 }
 
 #[tokio::test]
@@ -1049,6 +1434,88 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
     replacement.client().close().await;
     waiting.client().close().await;
     child.client().close().await;
+}
+
+#[tokio::test]
+async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_succeeds() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+    let parent_key = SigningKey::from_bytes(&rand::random());
+    let child_key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(child_key.verifying_key().to_bytes());
+    let mut captured = None;
+    let mut epoch = None;
+    for _ in 0..2 {
+        let broker = Broker::start().await;
+        let parent = verified(&broker).await;
+        let record = parent
+            .session_allocate(&parent_key, Policy::Restricted)
+            .await
+            .unwrap()
+            .record;
+        if let Some(old) = epoch {
+            assert_ne!(record.broker_epoch, old);
+        }
+        epoch = Some(record.broker_epoch);
+        let granted = parent
+            .session_grant_create(&GrantCreateArgs {
+                parent: record.reference(),
+                pane_id: DecimalU64(9),
+                pane_generation: DecimalU64(1),
+                public_key,
+                role: Role::PaneShell,
+                capabilities: vec![Capability::Input],
+            })
+            .await
+            .unwrap();
+        let child = verified(&broker).await;
+        if let Some(proof) = &captured {
+            assert!(child.session_prove(proof).await.is_err());
+        }
+        let scope = cosmix_client::session::ExpectedScope {
+            unix_uid: record.owner_uid,
+            parent_key_hash: Some(granted.grant.parent_key_hash),
+            pane_id: Some(DecimalU64(9)),
+            role: Role::PaneShell,
+            public_key_hash: HexBytes(Sha256::digest(public_key.0).into()),
+            capabilities_hash: HexBytes(
+                Sha256::digest(encode_capabilities(&[Capability::Input]).unwrap()).into(),
+            ),
+        };
+        let challenge = child
+            .session_challenge(&ChallengeArgs::Key(KeyChallenge {
+                public_key,
+                purpose: Purpose::Enrol,
+            }))
+            .await
+            .unwrap();
+        let proof = challenge.sign(&child_key, &scope).unwrap();
+        let attached = child.session_prove(&proof).await.unwrap();
+        assert!(child.session_prove(&proof).await.is_err());
+        assert!(
+            parent
+                .session_revoke(attached.record.reference())
+                .await
+                .unwrap()
+                .revoked
+        );
+        let fresh_connection = verified(&broker).await;
+        assert!(fresh_connection.session_prove(&proof).await.is_err());
+        assert!(
+            fresh_connection
+                .session_challenge(&ChallengeArgs::Key(KeyChallenge {
+                    public_key,
+                    purpose: Purpose::Enrol
+                }))
+                .await
+                .is_err()
+        );
+        captured = Some(proof);
+        parent.client().close().await;
+        child.client().close().await;
+        fresh_connection.client().close().await;
+    }
 }
 
 #[tokio::test]

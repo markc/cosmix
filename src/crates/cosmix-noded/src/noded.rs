@@ -44,7 +44,7 @@ use crate::protection::TrafficClass;
 #[path = "native_session_tests.rs"]
 mod native_session_tests;
 #[path = "session.rs"]
-mod session;
+pub(crate) mod session;
 use crate::subscription::{
     self, BrokerOrigin, JANITOR_INTERVAL, Notification, SubscriptionBroker, TopicInfo,
     stamp_broker_origin, strip_broker_origin,
@@ -846,6 +846,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         challenge_table: Arc::new(crate::admission::ChallengeTable::new()),
         live_sessions: Arc::new(RwLock::new(HashMap::new())),
     };
+    broker.set_native_sessions(state.sessions.clone());
 
     // Seed the change bus with the L1 snapshot so the first mutation
     // produces a diff against real state, not against `None`. Also seed
@@ -2298,13 +2299,33 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             if let Some(id) = bus_msg.get("id").map(|s| s.to_string()) {
                 if let Some(pending) = state.pending_responses.take_response(&id, &tx).await {
                     let observe = state.observe.for_class(pending.traffic_class);
+                    let mut reg = state.registry.write().await;
+                    let mut sessions = state.sessions.lock().await;
+                    sessions.maintain(&mut reg, session::now_ms());
+                    let principal = if let Some(p) = &state.principal {
+                        match sessions.delivery(p, &pending.caller_tx, session::now_ms()) {
+                            Ok(p) => p,
+                            Err(error) => {
+                                let reply = BusMessage::new()
+                                    .with_header("bus", "1")
+                                    .with_header("type", "response")
+                                    .with_header("id", &pending.caller_id)
+                                    .with_header("rc", &error.rc().to_string())
+                                    .with_body(&serde_json::to_string(&error).expect("error"));
+                                let _ = pending.caller_tx.try_send(reply.to_wire());
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let wire = canonicalize_correlated_response(
                         &mut bus_msg,
                         &pending.caller_id,
                         service_name.as_deref(),
                         pending.caller_service.as_deref(),
                         broker_origin_for_delivery(source_ip, &state.bind),
-                        state.principal.as_ref().filter(|_| pending.caller_verified),
+                        principal.as_ref().filter(|_| pending.caller_verified),
                     );
                     if observe.is_active() {
                         let outcome = match pending.caller_tx.try_send(wire.clone()) {
@@ -3932,6 +3953,12 @@ async fn handle_noded_command(
                 body["extensions"]["native-session"] = "1".into();
                 body["extensions"]["native-session-endpoint"] =
                     endpoint.to_string_lossy().into_owned().into();
+                body["native_session_limits"] = serde_json::json!({
+                    "terms_per_uid":"64","pending_grants_per_parent":"32","pending_grants_global":"1024",
+                    "challenges_per_uid":"128","key_interests_per_uid":"256",
+                    "recipient_dependencies_per_connection":"256","recipient_dependencies_global":"8192",
+                    "lifecycle_notices_per_connection":"256","lifecycle_notices_global":"4096"
+                });
                 resp.body = body.to_string();
             }
             let _ = tx.try_send(resp.to_wire());

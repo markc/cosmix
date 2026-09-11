@@ -153,6 +153,7 @@ pub struct TopicInfo {
 
 #[derive(Debug)]
 pub enum PublishError {
+    Session(cosmix_bus::native_session::SessionError),
     ReservedName,
     PayloadTooLarge {
         #[allow(dead_code)]
@@ -165,6 +166,7 @@ pub enum PublishError {
 impl PublishError {
     pub fn error_body(&self) -> String {
         match self {
+            PublishError::Session(error) => serde_json::to_string(error).expect("session error"),
             PublishError::ReservedName => r#"{"error": "reserved_name"}"#.to_string(),
             PublishError::PayloadTooLarge { limit, .. } => {
                 format!(r#"{{"error": "payload_too_large", "limit": {}}}"#, limit)
@@ -436,6 +438,8 @@ struct BrokerInner {
 
 /// The shared subscription broker.
 pub struct SubscriptionBroker {
+    native_sessions:
+        std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<crate::noded::session::Sessions>>>,
     observe: Option<std::sync::Arc<crate::observe::ObserveManager>>,
     inner: RwLock<BrokerInner>,
     topics: RwLock<HashMap<String, TopicState>>,
@@ -448,9 +452,42 @@ impl Default for SubscriptionBroker {
 }
 
 impl SubscriptionBroker {
+    pub(crate) fn set_native_sessions(
+        &self,
+        sessions: std::sync::Arc<tokio::sync::Mutex<crate::noded::session::Sessions>>,
+    ) {
+        let _ = self.native_sessions.set(sessions);
+    }
+
+    /// Only fresh fan-out can establish a dependency. Retained replay keeps
+    /// publish-time attribution and cannot refresh recipient authority.
+    async fn send_live_snapshot(
+        &self,
+        tx: &mpsc::Sender<String>,
+        wire: &str,
+        class: crate::protection::TrafficClass,
+        verified: bool,
+    ) -> Result<Result<(), mpsc::error::TrySendError<String>>, PublishError> {
+        if let Some(sessions) = self.native_sessions.get() {
+            let mut message = bus::parse(wire).expect("snapshot");
+            if let Some(p) = cosmix_bus::native_session::read_principal(&message)
+                .map_err(|_| PublishError::MalformedPayload)?
+            {
+                let mut sessions = sessions.lock().await;
+                let fresh = sessions
+                    .delivery(&p, tx, crate::noded::session::now_ms())
+                    .map_err(PublishError::Session)?;
+                cosmix_bus::native_session::stamp_principal(&mut message, fresh.as_ref())
+                    .map_err(|_| PublishError::MalformedPayload)?;
+                return Ok(self.send_snapshot(tx, &message.to_wire(), class, verified));
+            }
+        }
+        Ok(self.send_snapshot(tx, wire, class, verified))
+    }
     pub fn new() -> Self {
         Self {
             observe: None,
+            native_sessions: Default::default(),
             inner: RwLock::new(BrokerInner {
                 subscriptions: HashMap::new(),
                 by_peer: HashMap::new(),
@@ -726,12 +763,10 @@ impl SubscriptionBroker {
                         }
                         continue;
                     }
-                    match self.send_snapshot(
-                        &sub.tx,
-                        &wire,
-                        traffic_class,
-                        sub.verified_destination,
-                    ) {
+                    match self
+                        .send_live_snapshot(&sub.tx, &wire, traffic_class, sub.verified_destination)
+                        .await?
+                    {
                         Ok(()) => delivered += 1,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(
