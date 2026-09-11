@@ -21,7 +21,9 @@ pub struct JobTable {
 
 impl Drop for JobTable {
     fn drop(&mut self) {
-        // Do not depend on evaluator Rc graphs releasing their policy clone.
+        // Close jobs without depending on evaluator Rc policy clones. This
+        // does not restore terminal ownership or signal dispositions; those
+        // belong to TerminalLease and the final Controller drop respectively.
         self.shutdown();
     }
 }
@@ -116,10 +118,11 @@ impl JobTable {
         if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
             for job in controller.snapshot() {
                 println!(
-                    "[{}] {:?} pgid={} {}",
+                    "[{}] {} pgid={} command_id={} {}",
                     job.id,
                     job.state(),
                     job.pgid,
+                    job.launch_command_id,
                     job.command
                 );
             }

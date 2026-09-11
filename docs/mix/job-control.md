@@ -6,6 +6,9 @@ jobs and reclaims it on completion or suspension. `jobs` lists tracked jobs;
 `fg N` foregrounds and continues job N; `bg N` continues it without terminal
 ownership. Omitting N selects the most recent live job. A background pipeline
 returns to the prompt after launch, without waiting for its stages to finish.
+`jobs` includes a session-local launch command ID allocated before spawning,
+distinct from its job-table ID, and displays arguments after glob expansion.
+The `&` notification prints the last pipeline member's PID.
 
 Job management is selected by the interactive entry point, and requires tty
 stdin plus a controlling terminal. Setup errors produce one warning and
@@ -16,6 +19,10 @@ Scripts, `-c` (including SSH commands),
 serve mode, redirected stdin and sessions without a controlling terminal
 retain their noninteractive launch policy. Captured `run_argv` and
 `run_pipeline` retain their separate capture/cancellation process groups.
+Noninteractive `a | b &` still waits for upstream `a` before returning;
+changing that legacy behaviour is deferred by design. Each managed command
+also pays for a fork and an extra exec of the Mix trampoline before target
+exec; pipelines pay that overhead per stage.
 The shell's job-control signal handlers reset on exec. SIGTTOU is blocked
 only around terminal handoff and restoration, so captured children do not
 inherit shell-only ignored signals or a handoff-time signal mask.

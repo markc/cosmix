@@ -447,7 +447,10 @@ pipeline stages. The shell transfers its controlling terminal to foreground
 jobs and reclaims it on completion or suspension. <code>jobs</code> lists tracked jobs;
 <code>fg N</code> foregrounds and continues job N; <code>bg N</code> continues it without terminal
 ownership. Omitting N selects the most recent live job. A background pipeline
-returns to the prompt after launch, without waiting for its stages to finish.</p>
+returns to the prompt after launch, without waiting for its stages to finish.
+<code>jobs</code> includes a session-local launch command ID allocated before spawning,
+distinct from its job-table ID, and displays arguments after glob expansion.
+The <code>&amp;</code> notification prints the last pipeline member's PID.</p>
 <p>Job management is selected by the interactive entry point, and requires tty
 stdin plus a controlling terminal. Setup errors produce one warning and
 start the shell with noninteractive execution policy. Foreground admission
@@ -457,6 +460,10 @@ Scripts, <code>-c</code> (including SSH commands),
 serve mode, redirected stdin and sessions without a controlling terminal
 retain their noninteractive launch policy. Captured <code>run_argv</code> and
 <code>run_pipeline</code> retain their separate capture/cancellation process groups.
+Noninteractive <code>a | b &amp;</code> still waits for upstream <code>a</code> before returning;
+changing that legacy behaviour is deferred by design. Each managed command
+also pays for a fork and an extra exec of the Mix trampoline before target
+exec; pipelines pay that overhead per stage.
 The shell's job-control signal handlers reset on exec. SIGTTOU is blocked
 only around terminal handoff and restoration, so captured children do not
 inherit shell-only ignored signals or a handoff-time signal mask.</p>

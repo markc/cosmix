@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -19,6 +19,11 @@ const STAGE_ARG: &str = "--internal-job-stage";
 // Caught dispositions reset on exec; SIG_IGN would leak into captured runners
 // whose spawning contract deliberately remains unchanged by interactive jobs.
 static MANAGED_FOREGROUND: AtomicBool = AtomicBool::new(false);
+static NEXT_LAUNCH_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_launch_command_id() -> u64 {
+    NEXT_LAUNCH_COMMAND_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 extern "C" fn shell_signal(signal: libc::c_int) {
     if signal != libc::SIGTSTP || MANAGED_FOREGROUND.load(Ordering::Acquire) {
@@ -122,6 +127,15 @@ pub enum JobState {
     Stopped,
     Done,
 }
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Running => "Running",
+            Self::Stopped => "Stopped",
+            Self::Done => "Done",
+        })
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Member {
     pub pid: i32,
@@ -130,6 +144,8 @@ pub struct Member {
 #[derive(Clone)]
 pub struct Job {
     pub id: usize,
+    /// Session-local launch identity, allocated before spawning any member.
+    pub launch_command_id: u64,
     pub pgid: i32,
     pub command: String,
     pub members: Vec<Member>,
@@ -366,6 +382,7 @@ impl Controller {
 
     pub fn register(
         &self,
+        launch_command_id: u64,
         pgid: i32,
         children: Vec<Child>,
         command: String,
@@ -389,6 +406,7 @@ impl Controller {
             id,
             Job {
                 id,
+                launch_command_id,
                 pgid,
                 command,
                 members,
@@ -428,8 +446,12 @@ impl Controller {
         mut lease: Option<TerminalLease<'_>>,
     ) -> io::Result<Outcome> {
         if background {
-            let pgid = self.shared.state.lock().unwrap().jobs[&id].pgid;
-            println!("[{}] {}", id, pgid);
+            let pid = self.shared.state.lock().unwrap().jobs[&id]
+                .members
+                .last()
+                .unwrap()
+                .pid;
+            println!("[{}] {}", id, pid);
             return Ok(Outcome {
                 code: 0,
                 background: true,
@@ -921,6 +943,7 @@ mod tests {
     fn job(states: &[MemberState]) -> Job {
         Job {
             id: 1,
+            launch_command_id: 1,
             pgid: 1,
             command: "fixture".into(),
             members: states

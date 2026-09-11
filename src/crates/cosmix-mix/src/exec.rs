@@ -1771,16 +1771,24 @@ fn execute_managed(
     controller: &crate::job_control::Controller,
     return_on_stop: bool,
 ) -> io::Result<Outcome> {
+    let launch_command_id = crate::job_control::next_launch_command_id();
     let mut stages = Vec::new();
     let mut children = Vec::new();
+    let mut commands = Vec::new();
     let mut pgid = 0;
     let spawned = (|| -> io::Result<()> {
         let mut previous = None;
         for (i, seg) in pipeline.segments.iter().enumerate() {
             let args = expand_args_globs(&seg.args, &seg.quoted);
+            commands.push(
+                std::iter::once(seg.program.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             // Preserve the existing `mix` self-resolution contract.
             let program = if seg.program == "mix" {
-                std::env::current_exe()?.to_string_lossy().into_owned()
+                "/proc/self/exe".to_owned()
             } else {
                 seg.program.clone()
             };
@@ -1826,18 +1834,14 @@ fn execute_managed(
             .err()
             .unwrap_or_else(|| io::Error::other("empty pipeline")));
     }
-    let command = pipeline
-        .segments
-        .iter()
-        .map(|s| {
-            std::iter::once(s.program.as_str())
-                .chain(s.args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let id = controller.register(pgid, children, command, !pipeline.background);
+    let command = commands.join(" | ");
+    let id = controller.register(
+        launch_command_id,
+        pgid,
+        children,
+        command,
+        !pipeline.background,
+    );
     if let Err(e) = spawned {
         controller.abort_launch(id);
         return Err(e);
