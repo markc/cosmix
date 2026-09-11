@@ -2553,6 +2553,29 @@ pub(crate) mod tests {
         });
     }
 
+    /// The Mix fixtures this proof runs, by exact name. Deliberately a pinned
+    /// subset, not the whole inner suite: the full `native_session_pty` suite's
+    /// gate is the serial workspace battery, which runs it at the same sha in a
+    /// controlled environment. What this proof uniquely buys is the *coupling* —
+    /// Term's own suite fails when the current branch's Mix identity/exec chain
+    /// breaks, via a real cargo build plus the embedded-SHA check — not a second
+    /// copy of that coverage under an outer parallel context, where the added
+    /// load starves wall-clock lease contracts that the inner suite asserts
+    /// strictly (`status_flood_preserves_lease_and_restart_ack`). So: the p0i
+    /// bootstrap/identity fixtures, one stage-D execute end-to-end, and one P4
+    /// task end-to-end. New fixtures do not silently enter this context; adding
+    /// one here is a deliberate act.
+    const PINNED_MIX_FIXTURES: &[&str] = &[
+        "mix_child_bootstrap_proves_end_to_end",
+        "same_mix_child_resumes_and_reenrols_after_broker_bounce",
+        "valid_handoff_with_broker_down_does_not_delay_first_source",
+        "substituted_parent_scope_is_rejected_without_failing_shell",
+        "enrolled_exec_restart_revokes_and_replacement_stays_unbound",
+        "bootstrap_source_boundary_and_builtin_inventory_exclude_seed_state",
+        "stage_d_admits_at_an_idle_prompt_echoes_and_reports_a_structured_result",
+        "p4_both_modes_report_accurately_and_the_surfaces_stay_separate",
+    ];
+
     #[test]
     fn mix_child_bootstrap_proves_end_to_end() {
         // Separate Cargo workspace: build and run its actual integration target
@@ -2563,31 +2586,55 @@ pub(crate) mod tests {
             .join("../../..")
             .canonicalize()
             .unwrap();
+        let mut args: Vec<String> = [
+            "test",
+            "--locked",
+            "--manifest-path",
+            "Cargo.toml",
+            "-p",
+            "cosmix-mix",
+            "--test",
+            "native_session_pty",
+            "--",
+            "--test-threads=1",
+            "--nocapture",
+            // Every filter below is an exact fixture name, so a rename drops
+            // the fixture from the run rather than silently matching a prefix.
+            "--exact",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        args.extend(PINNED_MIX_FIXTURES.iter().map(|name| name.to_string()));
         let output = std::process::Command::new("cargo")
             .current_dir(&workspace)
             // Never contend with the enclosing desktop Cargo test's target
             // lock, including gates that export a shared CARGO_TARGET_DIR.
             .env("CARGO_TARGET_DIR", workspace.join("target/term-native-e2e"))
-            .args([
-                "test",
-                "--locked",
-                "--manifest-path",
-                "Cargo.toml",
-                "-p",
-                "cosmix-mix",
-                "--test",
-                "native_session_pty",
-                "--",
-                "--test-threads=1",
-                "--nocapture",
-            ])
+            .args(&args)
             .output()
             .expect("cannot build CURRENT branch's Mix end-to-end target");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         assert!(
             output.status.success(),
-            "CURRENT Mix end-to-end build/test failed (no fallback):\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "CURRENT Mix end-to-end build/test failed (no fallback):\n{stdout}\n{stderr}"
+        );
+        // A renamed or deleted fixture makes its filter match nothing, and a
+        // run of nothing exits zero. Count what actually passed: the proof is
+        // the pinned list having run, not the command having succeeded.
+        let passed: usize = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("test result: ok. "))
+            .filter_map(|rest| rest.split(" passed").next())
+            .filter_map(|count| count.parse::<usize>().ok())
+            .sum();
+        assert_eq!(
+            passed,
+            PINNED_MIX_FIXTURES.len(),
+            "pinned Mix fixtures did not all run — a rename or deletion broke the \
+             proof's include list (expected {}, ran {passed}):\n{stdout}",
+            PINNED_MIX_FIXTURES.len()
         );
     }
 }
