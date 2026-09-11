@@ -65,6 +65,10 @@ const RECORDS: usize = 256;
 /// Each editor round trip in the admission sequence. Three of them plus the
 /// identity recheck fit inside the 2s the request arm allows overall.
 const EDITOR_BUDGET: Duration = Duration::from_millis(400);
+/// The step-4 identity recheck. Two RPCs on the one shared connection, made
+/// while a reservation stands over a human's prompt — so it is bounded, and an
+/// admission that cannot confirm within it releases rather than waits.
+const RECHECK: Duration = Duration::from_millis(800);
 
 // ---------------------------------------------------------------- wire types
 
@@ -539,19 +543,26 @@ async fn submit(
     // Step 2-3: reserve. The editor drains observed human activity before it
     // answers, so a keystroke that arrived first wins here.
     let editor = match reserve(&control, request.prompt_generation.0).await {
-        Ok(Some(reserved)) => reserved,
-        Ok(None) => return refusal("BUSY"),
-        Err(()) => return refusal("BUSY"),
+        Reserved::Granted(reserved) => reserved,
+        Reserved::Busy => return refusal("BUSY"),
+        Reserved::Stale => return refusal("STALE_GENERATION"),
     };
 
-    // Step 4: recheck what the round trip could have invalidated.
-    let still_ours = view.snapshot.source.as_ref() == Some(&request.target)
-        && connection.client().is_connected()
-        && crate::session_status::admitted(connection, hello, actor, bound, Capability::Execute)
-            .await
+    // Step 4: recheck what the round trip could have invalidated. Bounded: the
+    // correlated checks are RPCs on the one shared connection, and an admission
+    // that waits indefinitely on the broker is holding a reservation over a
+    // human's prompt.
+    let still_ours = connection.client().is_connected()
+        && tokio::time::timeout(
+            RECHECK,
+            crate::session_status::admitted(connection, hello, actor, bound, Capability::Execute),
+        )
+        .await
+        .unwrap_or(false)
         && session_state::view().is_some_and(|now| {
             now.snapshot.source.as_ref() == Some(&request.target)
                 && now.snapshot.prompt_generation == request.prompt_generation
+                && !now.snapshot.continuation
         });
     if !still_ours {
         release(&control, editor).await;
@@ -617,34 +628,46 @@ async fn submit(
     )
 }
 
-/// `Ok(Some(..))` is a granted reservation; `Ok(None)` is the editor's own
-/// refusal, which changed nothing. `Err` is a failed round trip, reported as
-/// BUSY because the prompt's state is then unknown to us.
-async fn reserve(control: &Control, expected: u64) -> Result<Option<(Generation, u64)>, ()> {
+/// The editor's own answer to a reservation, kept distinct because BUSY and
+/// STALE_GENERATION tell a caller two different things to do next: wait, or
+/// re-read the generation. A failed round trip is BUSY — the prompt's state is
+/// then unknown to us, and claiming staleness would be a guess.
+enum Reserved {
+    Granted((Generation, u64)),
+    Busy,
+    Stale,
+}
+
+async fn reserve(control: &Control, expected: u64) -> Reserved {
     let control = control.clone();
     let result = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
         let view = control.inspect_within(EDITOR_BUDGET)?;
+        // The reducer's generation was already checked; this is the editor's
+        // own, and the two disagreeing means the prompt moved during the round
+        // trip rather than that the shell is busy.
+        if view.generation.prompt != expected {
+            return Ok(Reserved::Stale);
+        }
         if view.state != editor::State::Editing
-            || view.generation.prompt != expected
             || !view.text.is_empty()
             || view.paste
             || view.search.is_some()
             || view.decoder_pending
         {
-            return Ok(None);
+            return Ok(Reserved::Busy);
         }
         match control.reserve(view.generation, view.revision, EDITOR_BUDGET)? {
             EditorReply::Suspended {
                 generation,
                 edit_revision,
-            } => Ok(Some((generation, edit_revision))),
-            _ => Ok(None),
+            } => Ok(Reserved::Granted((generation, edit_revision))),
+            _ => Ok(Reserved::Busy),
         }
     })
     .await;
     match result {
-        Ok(Ok(reserved)) => Ok(reserved),
-        _ => Err(()),
+        Ok(Ok(reserved)) => reserved,
+        _ => Reserved::Busy,
     }
 }
 
