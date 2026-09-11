@@ -34,7 +34,7 @@
 //! declared limitation, never BUSY.
 
 use crate::editor::Generation;
-use crate::editor::runtime::{Admitted, Control};
+use crate::editor::runtime::{AdmitRequest, Admission, Admitted, Control, OwnerToken};
 use crate::editor::{self, Reply as EditorReply};
 use crate::session_state::{self, Phase, Source};
 use cosmix_lib_bus::native_session::*;
@@ -59,12 +59,30 @@ const MAX_SOURCE: usize = 4096;
 const MAX_VALUE: usize = 16 * 1024;
 pub(crate) const MAX_ERROR: usize = 4096;
 const MAX_ECHO_SOURCE: usize = 512;
+const MAX_ECHO_PRINCIPAL: usize = 96;
 /// Matches Term's retention so one retry policy spans the whole path.
 const RETENTION: Duration = Duration::from_secs(900);
 const RECORDS: usize = 256;
-/// Each editor round trip in the admission sequence. Three of them plus the
-/// identity recheck fit inside the 2s the request arm allows overall.
+/// The short editor round trips: inspect, reserve, release. None of them writes
+/// to the terminal.
 const EDITOR_BUDGET: Duration = Duration::from_millis(400);
+/// The admit envelope, which DOES write to the terminal. The echo's own drain
+/// deadline is derived from this budget (60% of it) rather than fixed, so the
+/// write can never outlive the answer its caller is waiting for. Worst-case
+/// admission is inspect + reserve + recheck + this + grace = 3.1s, comfortably
+/// inside the editor's 5s reservation deadline.
+const ADMIT_BUDGET: Duration = Duration::from_millis(1_000);
+/// After a lost abandon race the editor is provably mid-echo, so waiting out a
+/// real answer beats guessing one.
+const ADMIT_GRACE: Duration = Duration::from_millis(500);
+/// How long a submission will wait for the admission lock before answering
+/// BUSY. Shorter than one full admission on purpose: a caller queued behind a
+/// whole other admission is, from its point of view, looking at a busy shell.
+const ADMIT_QUEUE: Duration = Duration::from_millis(250);
+const _: () = assert!(
+    ADMIT_BUDGET.as_millis() + ADMIT_GRACE.as_millis() + 1_600 < 5_000,
+    "the whole admission must fit inside the editor's reservation deadline"
+);
 /// The step-4 identity recheck. Two RPCs on the one shared connection, made
 /// while a reservation stands over a human's prompt — so it is bounded, and an
 /// admission that cannot confirm within it releases rather than waits.
@@ -83,6 +101,17 @@ struct Submit {
     /// refusal instead of an execution.
     prompt_generation: DecimalU64,
     source: String,
+    /// Set ONLY by a forwarder relaying somebody else's submission, from its
+    /// own trusted actor context — never from caller-supplied text.
+    ///
+    /// On the real agent path the shell's direct caller is Term, so an
+    /// announcement naming the direct caller would name Term on every
+    /// submission and tell the human nothing about who is actually driving the
+    /// pane. The shell renders this through the same sanitiser as the source
+    /// and labels it as relayed, because the shell cannot verify it itself —
+    /// it is trusting the forwarder, and says so on the glass.
+    #[serde(default)]
+    on_behalf_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +170,27 @@ pub(crate) struct Completion {
     pub duration_ms: DecimalU64,
     pub cancellation: CancellationReport,
 }
+impl Completion {
+    /// The admission was abandoned before the editor acted: no echo reached the
+    /// pane and no line was delivered. Recorded rather than left blank, because
+    /// a record with no completion reads as "still running" forever.
+    pub(crate) fn not_started() -> Self {
+        Self {
+            outcome: "not_started",
+            status: None,
+            value: None,
+            error: Some(
+                "admission was abandoned before the editor acted; nothing executed".into(),
+            ),
+            duration_ms: DecimalU64(0),
+            cancellation: CancellationReport {
+                requested: false,
+                source: None,
+                delivered: "none",
+            },
+        }
+    }
+}
 
 /// The honest cancellation story for one evaluation. `delivered` never claims
 /// more than the guarantee table in `docs/mix/cli.md` allows.
@@ -152,18 +202,24 @@ pub(crate) struct CancellationReport {
     pub delivered: &'static str,
 }
 impl CancellationReport {
-    pub(crate) fn for_evaluation(operation: u64, interrupted: bool) -> Self {
+    /// Built from what the cancellation machinery RECORDED, never from the
+    /// shape of an error message. A wrapped spelling of "interrupted", or a
+    /// captured runner that reports interruption as an `Ok` result carrying a
+    /// flag, would both be invisible to prose-matching and are not invisible
+    /// here.
+    pub(crate) fn for_evaluation(operation: u64) -> Self {
         match cosmix_mix::cancel::state(operation) {
-            Some((true, source, _)) => Self {
+            Some((true, source, delivered)) => Self {
                 requested: true,
                 source: Some(match source {
                     Some(cosmix_mix::cancel::Source::Signal) => "signal",
                     _ => "request",
                 }),
-                // The evaluation ended; whether cancellation is what ended it
-                // is only knowable from the error it produced. Saying
-                // "requested" when it completed anyway is the truthful answer.
-                delivered: if interrupted {
+                // Intent recorded is not the same as intent landed. An
+                // evaluation that ran to completion despite a cancellation says
+                // so, because a caller that reads "cooperative" will believe
+                // the work stopped.
+                delivered: if delivered {
                     "cooperative"
                 } else {
                     "completed_anyway"
@@ -205,6 +261,36 @@ fn refusal(code: &'static str) -> (u8, String) {
     )
 }
 
+/// A refusal that names the operation it settled. Only ever attached to an
+/// answer for a caller that was already authorised and already reached
+/// admission — it tells them which id to ask `shell.execute.result` about,
+/// which is the only way to make progress from an undetermined outcome.
+fn undetermined(operation: u64) -> (u8, String) {
+    (
+        10,
+        serde_json::json!({
+            "error_code": "UNKNOWN_OUTCOME",
+            "operation_id": DecimalU64(operation),
+            "reason": "admission_claimed_without_report",
+        })
+        .to_string(),
+    )
+}
+
+/// Proven not to have executed, but the request id is spent: its outcome is
+/// recorded, so a retry replays this rather than executing.
+fn not_started(operation: u64) -> (u8, String) {
+    (
+        10,
+        serde_json::json!({
+            "error_code": "UNKNOWN_OUTCOME",
+            "operation_id": DecimalU64(operation),
+            "reason": "admission_abandoned_before_execution",
+        })
+        .to_string(),
+    )
+}
+
 // --------------------------------------------------------------------- store
 
 struct Record {
@@ -220,19 +306,56 @@ struct Record {
 #[derive(Default)]
 struct Store {
     records: Vec<Record>,
+    /// Highest request id accepted per actor, retained PAST the record itself.
+    ///
+    /// Ageing or evicting a record must never turn a spent request id back into
+    /// an executable one: a retry arriving after its record is gone would then
+    /// run the line a second time. Term and noded both keep this mark for
+    /// exactly that reason, and the cap below is what makes it load-bearing
+    /// here — a busy shell reaches 256 operations long before it reaches 15
+    /// minutes, so the cap, not the clock, is usually what ends a record's life.
+    high_water: std::collections::HashMap<String, u64>,
 }
 impl Store {
     fn sweep(&mut self) {
         self.records
             .retain(|r| r.at.elapsed() < RETENTION || r.completion.is_none());
-        while self.records.len() > RECORDS {
+    }
+    /// Make room for one more, then admit it. A full table must EVICT rather
+    /// than refuse: refusing is the S4-M1 failure, where a bounded table that
+    /// only ever fills wedges the surface permanently for every caller. The
+    /// high-water marks survive eviction, so nothing evicted can re-execute.
+    ///
+    /// `false` only when every record is still running, which is a real
+    /// resource limit rather than a bookkeeping one.
+    fn admit(&mut self, record: Record) -> bool {
+        self.sweep();
+        while self.records.len() >= RECORDS {
             // Oldest completed first; a running evaluation is never dropped,
             // because its result still has to be publishable.
             let Some(index) = self.records.iter().position(|r| r.completion.is_some()) else {
-                break;
+                return false;
             };
             self.records.remove(index);
         }
+        let mark = self.high_water.entry(record.actor.clone()).or_insert(0);
+        *mark = (*mark).max(record.request_id);
+        self.records.push(record);
+        true
+    }
+    /// Whether `request_id` from `actor` is a spent id whose record is gone.
+    fn retired(&self, actor: &str, request_id: u64) -> bool {
+        self.high_water
+            .get(actor)
+            .is_some_and(|mark| request_id <= *mark)
+    }
+    /// Operations are addressed only by the actor that submitted them. A
+    /// mismatch answers exactly like an unknown id, so the surface cannot be
+    /// used as an oracle for which operation numbers exist.
+    fn owned(&self, actor: &str, operation: u64) -> Option<&Record> {
+        self.records
+            .iter()
+            .find(|r| r.operation == operation && r.actor == actor)
     }
 }
 
@@ -293,6 +416,32 @@ fn admission_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(tokio::sync::Mutex::default)
 }
 
+/// The resident carries four concurrent dispatches. Submissions are the only
+/// ones that can occupy a slot for seconds, so they get a share of that budget
+/// rather than all of it: without this, four queued submissions starve every
+/// status request on the connection into uniform refusals — and status is how a
+/// caller finds out it should stop submitting.
+const SUBMIT_SLOTS: usize = 2;
+static SUBMITTING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct SubmitSlot;
+impl SubmitSlot {
+    fn take() -> Option<Self> {
+        SUBMITTING
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |held| (held < SUBMIT_SLOTS).then_some(held + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for SubmitSlot {
+    fn drop(&mut self) {
+        SUBMITTING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 // ------------------------------------------------------------------ dispatch
 
 /// Stable identity for retry dedupe. Same construction as Term's: a bound
@@ -334,22 +483,87 @@ fn principal_label(actor: &BrokerPrincipal) -> String {
 /// convincing forgery of a different announcement.
 fn sanitise(source: &str) -> String {
     let mut out = String::new();
+    let mut shown = 0usize;
     for character in source.chars() {
-        if out.len() >= MAX_ECHO_SOURCE {
+        let escaped = escape(character);
+        // Check BEFORE pushing. Appending first and testing afterwards let a
+        // multi-byte character push the line past the cap — the cap has to bound
+        // what is written, not notice afterwards that it was exceeded.
+        if out.len() + escaped.len() > MAX_ECHO_SOURCE {
+            break;
+        }
+        out.push_str(&escaped);
+        shown += character.len_utf8();
+    }
+    // Nothing may execute with an unannounced tail. The hidden remainder is
+    // named by length and fingerprinted, so a human who sees a truncated
+    // announcement can still tell two different submissions apart.
+    if shown < source.len() {
+        let digest = Sha256::digest(source.as_bytes());
+        let fingerprint: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        out.push_str(&format!(
+            " …[+{} bytes, sha256:{fingerprint}]",
+            source.len() - shown
+        ));
+    }
+    out
+}
+
+/// A relayed principal label goes through the same allowlist as the source —
+/// it arrives in a request body and is no more trustworthy than one — and is
+/// bounded far shorter, because a label is a name and not a payload.
+fn sanitise_label(label: &str) -> String {
+    let mut out = String::new();
+    for character in label.chars() {
+        let escaped = escape(character);
+        if out.len() + escaped.len() > MAX_ECHO_PRINCIPAL {
             out.push('…');
             break;
         }
-        match character {
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\\' => out.push_str("\\\\"),
-            c if (c.is_control() || c == '\u{7f}') => {
-                out.push_str(&format!("\\x{:02x}", c as u32 & 0xff));
-            }
-            c => out.push(c),
-        }
+        out.push_str(&escaped);
     }
     out
+}
+
+/// Escape by printable ALLOWLIST, not by a blocklist of known-bad characters.
+///
+/// A blocklist has to enumerate every way a character can lie to a terminal, and
+/// the interesting ones are not control codes at all: bidi overrides and
+/// isolates reorder what the reader sees, zero-width characters hide
+/// differences, and a soft hyphen or BOM is invisible. `is_control` catches none
+/// of them. Everything outside the allowlist is rendered as an escape, so a new
+/// Unicode trick is escaped by default rather than passed through by omission.
+fn escape(character: char) -> String {
+    match character {
+        // Ordinary printable ASCII, minus the backslash which has to escape
+        // itself or the escapes above become forgeable.
+        ' '..='~' if character != '\\' => character.to_string(),
+        '\\' => "\\\\".into(),
+        '\n' => "\\n".into(),
+        '\t' => "\\t".into(),
+        '\r' => "\\r".into(),
+        c => {
+            let code = c as u32;
+            let printable = !c.is_control()
+                && code != 0x7f
+                // Cf: bidi overrides U+202A-E, isolates U+2066-9, ZWJ/ZWNJ,
+                // word joiner, the BOM, and the soft hyphen.
+                && !matches!(code, 0x00ad | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f | 0xfeff)
+                // Line and paragraph separators are line breaks that no
+                // control-character test reports as one.
+                && !matches!(code, 0x2028 | 0x2029)
+                // Unassigned/private-use surrogate range cannot appear in a
+                // Rust char, so what is left is ordinary text.
+                ;
+            if printable {
+                c.to_string()
+            } else if code <= 0xff {
+                format!("\\x{code:02x}")
+            } else {
+                format!("\\u{{{code:04x}}}")
+            }
+        }
+    }
 }
 
 pub(crate) async fn dispatch(
@@ -372,13 +586,13 @@ pub(crate) async fn dispatch(
     }
     match command.command.as_str() {
         SUBMIT => submit(connection, hello, bound, event, actor).await,
-        RESULT => retrieve(bound, &command.body),
-        CANCEL => cancel(bound, &command.body),
+        RESULT => retrieve(bound, actor, &command.body),
+        CANCEL => cancel(bound, actor, &command.body),
         _ => refusal("UNSUPPORTED"),
     }
 }
 
-fn retrieve(bound: &SessionRecord, body: &str) -> (u8, String) {
+fn retrieve(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, String) {
     let Ok(request) = serde_json::from_str::<Operation>(body) else {
         return refusal("INVALID_REQUEST");
     };
@@ -388,13 +602,13 @@ fn retrieve(bound: &SessionRecord, body: &str) -> (u8, String) {
     if request.target != Source::from(bound) {
         return refusal("STALE_GENERATION");
     }
+    let identity = actor_key(actor);
     let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
     store.sweep();
-    let Some(record) = store
-        .records
-        .iter()
-        .find(|r| r.operation == request.operation_id.0)
-    else {
+    // Scoped to the submitting actor. An execution's result names what ran in
+    // this shell and what it returned; holding `execute` authorises driving the
+    // shell, not reading back what somebody else drove it to do.
+    let Some(record) = store.owned(&identity, request.operation_id.0) else {
         return refusal("UNKNOWN_OUTCOME");
     };
     (
@@ -413,7 +627,7 @@ fn retrieve(bound: &SessionRecord, body: &str) -> (u8, String) {
     )
 }
 
-fn cancel(bound: &SessionRecord, body: &str) -> (u8, String) {
+fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, String) {
     let Ok(request) = serde_json::from_str::<Operation>(body) else {
         return refusal("INVALID_REQUEST");
     };
@@ -423,17 +637,28 @@ fn cancel(bound: &SessionRecord, body: &str) -> (u8, String) {
     if request.target != Source::from(bound) {
         return refusal("STALE_GENERATION");
     }
+    let identity = actor_key(actor);
     let operation = request.operation_id.0;
-    // Resolve against THIS surface's record first: an id this shell never
-    // admitted must not be able to address an evaluation by number.
-    let known = {
+    // THE STORE IS AUTHORITATIVE, not the cancellation registry.
+    //
+    // An operation this surface has recorded exists, even in the window between
+    // minting its id and the evaluation actually starting. Deferring to the
+    // registry there produced two answers that contradicted each other: cancel
+    // said the id was unknown while result said it was running. The registry
+    // entry is published at mint for the same reason, so the intent recorded
+    // below is adopted when the evaluation begins rather than lost.
+    let finished = {
         let store = store().lock().unwrap_or_else(|e| e.into_inner());
-        store.records.iter().any(|r| r.operation == operation)
+        match store.owned(&identity, operation) {
+            None => return refusal("UNKNOWN_OUTCOME"),
+            Some(record) => record.completion.is_some(),
+        }
     };
-    if !known {
-        return refusal("UNKNOWN_OUTCOME");
-    }
-    let outcome = cosmix_mix::cancel::cancel(operation);
+    let outcome = if finished {
+        cosmix_mix::cancel::Outcome::AlreadyFinished
+    } else {
+        cosmix_mix::cancel::cancel(operation)
+    };
     (
         0,
         serde_json::json!({
@@ -467,6 +692,19 @@ async fn submit(
     if request.version != 1 || request.source.len() > MAX_SOURCE || request.request_id.0 == 0 {
         return refusal("INVALID_REQUEST");
     }
+    // An empty or whitespace-only submission would be announced on the pane,
+    // burn a prompt generation and execute nothing. A request that cannot do
+    // anything is a malformed request, not a no-op worth advertising.
+    if request.source.trim().is_empty() {
+        return refusal("INVALID_REQUEST");
+    }
+    if request
+        .on_behalf_of
+        .as_ref()
+        .is_some_and(|label| label.len() > MAX_SOURCE)
+    {
+        return refusal("INVALID_REQUEST");
+    }
     if request.target != Source::from(bound) {
         return refusal("STALE_GENERATION");
     }
@@ -478,8 +716,13 @@ async fn submit(
     // hold a std mutex across an await.
     enum Known {
         Replay { operation: u64, running: bool },
+        /// A spent id whose recorded outcome is that nothing executed. Replayed
+        /// as the refusal it originally produced, never as an acceptance.
+        NotStarted(u64),
         Conflict,
-        Full,
+        /// A spent id whose record is gone. Answering "unknown outcome" is the
+        /// only safe reply: re-executing would run the line twice.
+        Retired,
         Fresh,
     }
     let known = {
@@ -490,18 +733,27 @@ async fn submit(
             .iter()
             .find(|r| r.actor == identity && r.request_id == request.request_id.0)
         {
+            None if store.retired(&identity, request.request_id.0) => Known::Retired,
             Some(record) if record.digest != digest => Known::Conflict,
+            Some(record)
+                if record
+                    .completion
+                    .as_ref()
+                    .is_some_and(|c| c.outcome == "not_started") =>
+            {
+                Known::NotStarted(record.operation)
+            }
             Some(record) => Known::Replay {
                 operation: record.operation,
                 running: record.completion.is_none(),
             },
-            None if store.records.len() >= RECORDS => Known::Full,
             None => Known::Fresh,
         }
     };
     match known {
         Known::Conflict => return refusal("CONFLICT"),
-        Known::Full => return refusal("RESOURCE_LIMIT"),
+        Known::Retired => return refusal("UNKNOWN_OUTCOME"),
+        Known::NotStarted(operation) => return not_started(operation),
         Known::Replay { operation, running } => {
             return (
                 0,
@@ -522,8 +774,16 @@ async fn submit(
         // every prompt, and BUSY invites a retry that can never succeed.
         return refusal("UNSUPPORTED");
     };
+    // Bound how much of the resident's dispatch budget submissions may hold.
+    let Some(_slot) = SubmitSlot::take() else {
+        return refusal("BUSY");
+    };
     // Serialise admissions: two candidates must not both pass eligibility.
-    let _admitting = admission_lock().lock().await;
+    // Bounded, because an unbounded wait here occupies a dispatch slot for as
+    // long as the holder takes — and the holder's own worst case is seconds.
+    let Ok(_admitting) = tokio::time::timeout(ADMIT_QUEUE, admission_lock().lock()).await else {
+        return refusal("BUSY");
+    };
 
     // Step 1 eligibility, from the owned reducer. Cheap, and it produces the
     // right refusal before the editor is disturbed at all.
@@ -577,9 +837,10 @@ async fn submit(
         release(&control, editor).await;
         return refusal("RESOURCE_LIMIT");
     };
-    {
-        let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-        store.records.push(Record {
+    let admitted_to_store = store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .admit(Record {
             actor: identity,
             request_id: request.request_id.0,
             digest,
@@ -587,33 +848,95 @@ async fn submit(
             at: Instant::now(),
             completion: None,
         });
+    if !admitted_to_store {
+        release(&control, editor).await;
+        return refusal("RESOURCE_LIMIT");
     }
+    // Publish the identity before anything can run under it, so a cancellation
+    // arriving during the echo/handoff window addresses this operation instead
+    // of being told it does not exist — and so the intent it records is adopted
+    // when the evaluation begins rather than lost in the handover.
+    cosmix_mix::cancel::publish(operation);
 
     // Step 6: echo, consume, execute — one operation on the editor thread.
+    let principal = match request.on_behalf_of.as_deref() {
+        // "via" is load-bearing: the shell authenticated the forwarder, not the
+        // name it relayed, and the announcement must not imply otherwise.
+        Some(relayed) => format!(
+            "{} via {}",
+            sanitise_label(relayed),
+            principal_label(actor)
+        ),
+        None => principal_label(actor),
+    };
     let echo = format!(
-        "mix: execute #{operation} admitted for {}: {}",
-        principal_label(actor),
+        "mix: execute #{operation} admitted for {principal}: {}",
         sanitise(&request.source)
     );
     let admitted = Admitted {
         source: request.source,
         operation,
     };
+    let token = OwnerToken::new();
     let handed = tokio::task::spawn_blocking({
         let control = control.clone();
-        move || control.admit(editor.0, editor.1, echo, admitted, EDITOR_BUDGET)
+        let token = token.clone();
+        move || {
+            control.admit(
+                AdmitRequest {
+                    generation: editor.0,
+                    revision: editor.1,
+                    echo,
+                    admitted,
+                    budget: ADMIT_BUDGET,
+                    grace: ADMIT_GRACE,
+                },
+                &token,
+            )
+        }
     })
     .await;
-    if !matches!(handed, Ok(Ok(()))) {
-        // Nothing ran. Drop the acceptance so the request id is free again and
-        // the caller's retry is a real submission rather than a replay of an
-        // execution that never happened.
-        {
-            let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-            store.records.retain(|r| r.operation != operation);
+    // A panicked blocking task is the one case with no answer at all. Abandon
+    // on its behalf: winning proves nothing ran, losing is a genuine unknown.
+    let handed = handed.unwrap_or_else(|_| {
+        if token.abandon() {
+            Admission::NotStarted
+        } else {
+            Admission::Unknown
         }
-        release(&control, editor).await;
-        return refusal("BUSY");
+    });
+    match handed {
+        Admission::Executed => {}
+        Admission::Refused => {
+            // The editor refused before touching anything — most often a human
+            // keystroke arriving inside the reservation window. Nothing was
+            // announced and the id is not spent, so this is a plain BUSY the
+            // caller may simply retry.
+            {
+                let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+                store.records.retain(|r| r.operation != operation);
+            }
+            release(&control, editor).await;
+            return refusal("BUSY");
+        }
+        Admission::NotStarted => {
+            // Proven: no echo reached the pane and no line was delivered. The
+            // request id is still SPENT — its fate is written, so a retry
+            // replays "did not start" instead of becoming a second chance at
+            // execution under an id whose outcome is already recorded. The
+            // caller submits a new id to try again, and is told which operation
+            // to ask about.
+            finished(operation, Completion::not_started());
+            release(&control, editor).await;
+            return not_started(operation);
+        }
+        Admission::Unknown => {
+            // The editor claimed the work and did not report back. It may have
+            // executed. The record stays resolvable with no completion, so
+            // whatever happened lands in it and `result` answers truthfully —
+            // and the prompt is NOT released, because the editor owns it now.
+            return undetermined(operation);
+        }
     }
     (
         0,
@@ -656,7 +979,10 @@ async fn reserve(control: &Control, expected: u64) -> Reserved {
         {
             return Ok(Reserved::Busy);
         }
-        match control.reserve(view.generation, view.revision, EDITOR_BUDGET)? {
+        // A reserve that times out would otherwise still be processed later and
+        // grant a reservation over a prompt whose owner has already given up.
+        let token = OwnerToken::new();
+        match control.reserve(view.generation, view.revision, &token, EDITOR_BUDGET)? {
             EditorReply::Suspended {
                 generation,
                 edit_revision,

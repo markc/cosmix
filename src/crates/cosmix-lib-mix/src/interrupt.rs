@@ -112,12 +112,27 @@ pub fn init(flag: Arc<AtomicBool>) -> bool {
     // SAFETY: `cancel::signal_arrived` performs two relaxed atomic stores and
     // nothing else — no allocation, no locking, no reentrant libc — which is
     // async-signal-safe.
-    let _ = unsafe {
+    // A failure here is not cosmetic: without the mapping, cancellation cannot
+    // tell which evaluation a SIGINT belongs to, so it degrades to the old
+    // whole-process behaviour. Say so rather than swallowing it — a silently
+    // half-installed cancellation contract is worse than none, because
+    // everything downstream still reports as though it were whole.
+    if let Err(error) = unsafe {
         signal_hook::low_level::register(signal_hook::consts::SIGINT, crate::cancel::signal_arrived)
-    };
+    } {
+        eprintln!(
+            "mix: WARNING: SIGINT mapping unavailable ({error}); \
+             Ctrl-C is no longer attributed to a specific evaluation"
+        );
+    }
     // signal-hook stores `true` into the supplied AtomicBool from a signal
     // handler. This is the delivery half; the registration above is the mapping.
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag);
+    if let Err(error) = signal_hook::flag::register(signal_hook::consts::SIGINT, flag) {
+        eprintln!(
+            "mix: WARNING: SIGINT delivery unavailable ({error}); \
+             blocking builtins will not observe Ctrl-C"
+        );
+    }
     true
 }
 

@@ -121,10 +121,6 @@ struct Report {
     status: Option<i64>,
     value: Option<Structured>,
     error: Option<String>,
-    /// Whether the evaluation ended BECAUSE it was interrupted. Cancellation
-    /// intent alone does not make an outcome `cancelled`: work that finished
-    /// anyway finished, and the report says so.
-    interrupted: bool,
 }
 impl Report {
     fn new(operation: u64) -> Self {
@@ -135,7 +131,6 @@ impl Report {
             status: None,
             value: None,
             error: None,
-            interrupted: false,
         }
     }
     /// Bound every diagnostic that leaves the evaluator. An error message can
@@ -155,8 +150,11 @@ impl Report {
 }
 impl Drop for Report {
     fn drop(&mut self) {
-        let cancellation = CancellationReport::for_evaluation(self.operation, self.interrupted);
-        if self.interrupted && cancellation.requested {
+        let cancellation = CancellationReport::for_evaluation(self.operation);
+        // `cancelled` means the cancellation actually landed, which only the
+        // cancellation machinery knows. An evaluation that failed for its own
+        // reasons under a standing cancellation keeps its own outcome.
+        if cancellation.delivered == "cooperative" {
             self.outcome = "cancelled";
         }
         crate::session_execute::finished(
@@ -173,13 +171,6 @@ impl Drop for Report {
             },
         );
     }
-}
-
-/// True when an evaluation ended because the interrupt reached it, rather than
-/// for any other reason. Cancellation delivery is cooperative, so this is the
-/// only signal the shell actually has about whether it landed.
-fn ended_by_interrupt(error: &MixError) -> bool {
-    matches!(error, MixError::RuntimeError { msg, .. } if msg == "interrupted")
 }
 
 /// Run the interactive REPL.
@@ -499,6 +490,15 @@ pub fn run_repl() -> i32 {
                                     .into(),
                             );
                             line_buf.clear();
+                            // LineAdmitted opened an `evaluating` window that
+                            // nothing will close: the human arms of this match
+                            // reach LineAbandoned through the classifier, and
+                            // this arm returns to the prompt directly. Without
+                            // this the snapshot reports a command in flight for
+                            // the rest of the session.
+                            crate::session_state::commit(
+                                crate::session_state::Transition::LineAbandoned,
+                            );
                             continue;
                         }
                         // Don't clear line_buf — wait for more input
@@ -569,7 +569,6 @@ pub fn run_repl() -> i32 {
                                     s.track_error(&format!("{}", e));
                                 }
                                 if let Some(report) = report.as_mut() {
-                                    report.interrupted = ended_by_interrupt(&e);
                                     report.fail(format!("{}", e));
                                 }
                                 eprintln!("{}", e);
@@ -640,7 +639,6 @@ pub fn run_repl() -> i32 {
                                     s.track_error(&format!("{}", e));
                                 }
                                 if let Some(report) = report.as_mut() {
-                                    report.interrupted = ended_by_interrupt(&e);
                                     report.fail(format!("{}", e));
                                 }
                                 eprintln!("{}", e);
@@ -762,7 +760,18 @@ pub fn run_repl() -> i32 {
                                 break 'repl;
                             }
                             "cd" => {
-                                handle_cd(&pipeline.segments[0].args, &mut eval);
+                                // The shell-builtin arms return to the prompt
+                                // without touching the pipeline result, so an
+                                // admitted `cd /nonexistent` reported success.
+                                // A status the shell already computed must
+                                // reach the report.
+                                let code = handle_cd(&pipeline.segments[0].args, &mut eval);
+                                if let Some(report) = report.as_mut() {
+                                    report.status = Some(i64::from(code));
+                                    if code != 0 {
+                                        report.fail(format!("cd: exit status {code}"));
+                                    }
+                                }
                                 continue;
                             }
                             "pushd" => {
@@ -1163,10 +1172,11 @@ fn build_prompt(eval: &mut Evaluator, rt: &tokio::runtime::Runtime) -> Result<St
 /// as `$?`. Delegating fixed two REPL-only divergences: `cd -` with OLDPWD
 /// unset is now an error (was a silent no-op chdir to cwd), and `~user/...`
 /// stays literal → ENOENT (was mangled to `$HOMEuser/...`).
-fn handle_cd(args: &[impl AsRef<str>], eval: &mut Evaluator) {
+fn handle_cd(args: &[impl AsRef<str>], eval: &mut Evaluator) -> i32 {
     let args: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
     let code = exec::builtin_cd(&args);
     eval.set_global("?", Value::Number(code as f64));
+    code
 }
 
 /// Source ~/.mixrc into `eval` within an existing async context (no

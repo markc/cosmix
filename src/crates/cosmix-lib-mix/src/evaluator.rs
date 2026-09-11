@@ -4325,6 +4325,15 @@ impl Evaluator {
                     return Err(MixError::ExitRequest { code });
                 }
                 if g.interrupted.load(Ordering::Relaxed) {
+                    // DELIBERATELY outside the per-evaluation cancellation
+                    // contract: no `note_delivery`, no `reassert`. `serve`'s
+                    // interrupt is a process-wide shutdown request, and
+                    // re-raising the flag here would make the pump unable to
+                    // finish shutting down. An admitted evaluation that calls
+                    // `serve()` therefore has its cancellation consumed by the
+                    // pump's exit rather than reported as delivered — the
+                    // guarantee table says serve is not covered, and this is
+                    // where that is true.
                     g.interrupted.store(false, Ordering::Relaxed);
                     break "interrupted";
                 }
@@ -5755,6 +5764,7 @@ impl Evaluator {
                         // evaluation is under a standing cancellation the intent
                         // outlives the error, so a `catch` around cancelled work
                         // cannot resume it.
+                        crate::cancel::note_delivery();
                         crate::cancel::reassert();
                         return Err(self.runtime_err("interrupted"));
                     }
@@ -12036,6 +12046,7 @@ impl Evaluator {
             }
         };
         if interrupted {
+            crate::cancel::note_delivery();
             crate::cancel::reassert();
             return Err(self.runtime_err("interrupted"));
         }

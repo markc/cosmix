@@ -137,6 +137,86 @@ pub struct Admitted {
     pub operation: u64,
 }
 
+const TOKEN_WAITING: u8 = 0;
+const TOKEN_CLAIMED: u8 = 1;
+const TOKEN_ABANDONED: u8 = 2;
+
+/// Proof that the admission owner is still waiting for a queued envelope.
+///
+/// A bounded `recv_timeout` gives up on the REPLY CHANNEL, not on the work: the
+/// envelope is still in the editor's queue and will be processed. Without this
+/// the editor would echo and execute an admission whose caller had already been
+/// told it did not happen — and the caller's retry would then be a SECOND
+/// execution of the same line.
+///
+/// Exactly one of `claim` (the editor, immediately before it acts) and
+/// `abandon` (the owner, the moment it stops waiting) can win. Losing `abandon`
+/// is not a failure: it is the owner learning that it may no longer assume
+/// nothing ran.
+#[derive(Clone, Debug)]
+pub struct OwnerToken(Arc<std::sync::atomic::AtomicU8>);
+impl Default for OwnerToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl OwnerToken {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(TOKEN_WAITING)))
+    }
+    /// The editor's side. `true` means the owner is still waiting and this
+    /// envelope may proceed.
+    pub fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                TOKEN_WAITING,
+                TOKEN_CLAIMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    /// The owner's side. `true` PROVES the editor had not acted and never will.
+    pub fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                TOKEN_WAITING,
+                TOKEN_ABANDONED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// One admission attempt's parameters, kept as a named thing so the seam that
+/// carries them reads as a request rather than a run of positional arguments.
+pub struct AdmitRequest {
+    pub generation: Generation,
+    pub revision: u64,
+    pub echo: String,
+    pub admitted: Admitted,
+    pub budget: std::time::Duration,
+    pub grace: std::time::Duration,
+}
+
+/// What an admission attempt actually did. `NotStarted` is a PROOF, not a
+/// guess; `Unknown` is the honest answer when the editor claimed the work and
+/// then did not report back, and it is the only case in which the caller must
+/// be told its outcome is undetermined rather than refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Executed,
+    /// The editor refused BEFORE claiming: no echo, no consume, no mark on the
+    /// pane at all. The request id is not spent and the caller may simply
+    /// retry, so this is the one failure that is honestly a plain BUSY.
+    Refused,
+    /// Provably nothing executed, but the attempt got far enough to be worth
+    /// recording — the id is spent and its outcome written.
+    NotStarted,
+    Unknown,
+}
+
 #[derive(Debug)]
 pub enum Line {
     Submitted(String),
@@ -179,6 +259,13 @@ enum Request {
         revision: u64,
         echo: String,
         admitted: Admitted,
+        token: OwnerToken,
+        drain: std::time::Duration,
+    },
+    Reserve {
+        generation: Generation,
+        revision: u64,
+        token: OwnerToken,
     },
     Inspect,
     HistoryLoad(String),
@@ -333,24 +420,63 @@ impl Control {
     /// separated by a failure. Here the only failure after the echo is the
     /// consume, and the editor thread is the sole writer of the state it
     /// checks, so the two cannot disagree.
-    pub fn admit(
-        &self,
-        generation: Generation,
-        revision: u64,
-        echo: String,
-        admitted: Admitted,
-        budget: std::time::Duration,
-    ) -> io::Result<()> {
-        self.call_within(
-            Request::Admit {
-                generation,
-                revision,
-                echo,
-                admitted,
-            },
+    /// Never returns an error, because "the request failed" is not an answer an
+    /// admission can act on: the caller has to know whether a line executed.
+    ///
+    /// `budget` bounds the normal reply. If it expires the owner tries to
+    /// ABANDON the envelope; winning that race proves the editor never acted.
+    /// Losing it means the editor is already mid-echo, so the owner waits out a
+    /// second bounded `grace` for the real answer rather than guessing — and
+    /// only reports `Unknown` when even that produces nothing.
+    pub fn admit(&self, attempt: AdmitRequest, token: &OwnerToken) -> Admission {
+        let AdmitRequest {
+            generation,
+            revision,
+            echo,
+            admitted,
             budget,
-        )
-        .map(|_| ())
+            grace,
+        } = attempt;
+        // The echo's drain deadline is DERIVED from the budget its caller is
+        // held to rather than fixed, so a write can never outlive the answer
+        // somebody is waiting on.
+        let drain = budget.mul_f32(0.6);
+        let request = Request::Admit {
+            generation,
+            revision,
+            echo,
+            admitted,
+            token: token.clone(),
+            drain,
+        };
+        // Never queued: a full queue means no editor turn will ever see it.
+        let Ok(reply) = self.send(request) else {
+            return Admission::Refused;
+        };
+        // Only the Ok path delivers a line. An editor-side error is graded by
+        // the token: still un-claimed means the editor refused before touching
+        // anything, which is a clean retryable BUSY; already claimed means it
+        // got as far as the pane, so the attempt is recorded instead.
+        match reply.recv_timeout(budget) {
+            Ok(Ok(_)) => return Admission::Executed,
+            Ok(Err(_)) => return self.grade(token),
+            Err(_) => {}
+        }
+        if token.abandon() {
+            return Admission::NotStarted;
+        }
+        match reply.recv_timeout(grace) {
+            Ok(Ok(_)) => Admission::Executed,
+            Ok(Err(_)) => Admission::NotStarted,
+            Err(_) => Admission::Unknown,
+        }
+    }
+    fn grade(&self, token: &OwnerToken) -> Admission {
+        if token.abandon() {
+            Admission::Refused
+        } else {
+            Admission::NotStarted
+        }
     }
     /// Release a reservation without executing anything (step 4 refusal,
     /// cancellation, identity loss). The editor returns to editing with the
@@ -375,19 +501,32 @@ impl Control {
     /// Step 2-3: ask the editor to give up the terminal for an execution. A
     /// `Busy` reply is a refusal that changed nothing — the draft, the search
     /// and the paste in progress are all still there.
+    ///
+    /// Carries an owner token for the same reason `admit` does: without one, a
+    /// reserve that timed out would still be processed later and would grant an
+    /// ORPHANED reservation over a prompt whose owner had already given up.
     pub fn reserve(
         &self,
         generation: Generation,
         revision: u64,
+        token: &OwnerToken,
         budget: std::time::Duration,
     ) -> io::Result<Reply> {
-        match self.call_within(
-            Request::Protocol(Command::SuspendRequested {
+        let result = self.call_within(
+            Request::Reserve {
                 generation,
-                edit_revision: revision,
-            }),
+                revision,
+                token: token.clone(),
+            },
             budget,
-        )? {
+        );
+        if result.is_err() {
+            // Whether this wins or loses, the editor's own reservation deadline
+            // is the backstop; winning it means the suspension never happened
+            // at all, which is the case worth making impossible to miss.
+            token.abandon();
+        }
+        match result? {
             Response::Reply(reply) => Ok(reply),
             _ => Err(io::Error::other("unexpected reserve reply")),
         }
@@ -678,13 +817,28 @@ impl Owner {
     ) -> io::Result<()> {
         loop {
             let editing = self.editor.state() == State::Editing;
+            // §8's human-first rule has to hold through the RESERVATION too, not
+            // just while editing. The window is cooked mode with kernel echo and
+            // an unpolled tty: a keystroke that lands there would be echoed into
+            // the announcement line and then handed to the admitted execution as
+            // stdin. Watching the descriptor is what lets the human's byte
+            // refuse the admission instead of being eaten by it.
+            let reserved = self.reserved_until.is_some();
             let ready = input::wait(
-                editing.then(|| self.terminal.fd()),
+                (editing || reserved).then(|| self.terminal.fd()),
                 wake.as_raw_fd(),
                 signals.as_raw_fd(),
                 self.terminal.output_fd(),
                 self.wait_timeout(editing),
             )?;
+            if ready[0] && reserved && !editing {
+                // Deliberately NOT read: the byte belongs to the editor, which
+                // is about to take the prompt back and will decode it normally.
+                // Resuming makes `admissible` false, so an Admit envelope
+                // already in flight aborts before it echoes anything.
+                self.expire_reservation()?;
+                continue;
+            }
             // Human input observed in this poll wins before control admission.
             if ready[0] && editing {
                 match input::read(self.terminal.fd()) {
@@ -865,11 +1019,31 @@ impl Owner {
                     .map_err(protocol)?;
                 return Ok(Response::Stopped);
             }
+            Request::Reserve {
+                generation,
+                revision,
+                token,
+            } => {
+                // An owner that stopped waiting must not be given a
+                // reservation it will never consume: the prompt would sit
+                // suspended until its deadline with nobody driving it.
+                if !token.claim() {
+                    return Err(io::Error::other("reservation abandoned by its owner"));
+                }
+                self.editor
+                    .command(Command::SuspendRequested {
+                        generation,
+                        edit_revision: revision,
+                    })
+                    .map_err(protocol)?
+            }
             Request::Admit {
                 generation,
                 revision,
                 echo,
                 admitted,
+                token,
+                drain,
             } => {
                 // Refuse BEFORE the echo. Everything `admissible` reads is
                 // owned by this thread, so a true answer here still holds after
@@ -878,7 +1052,14 @@ impl Owner {
                 if !self.editor.admissible(generation, revision) {
                     return Err(protocol(super::ProtocolError::InvalidState));
                 }
-                self.terminal.echo(&echo)?;
+                // The LAST thing checked before the echo. An envelope whose
+                // owner has stopped waiting leaves no mark on the pane and
+                // executes nothing; the owner then knows that for certain
+                // rather than having to assume it.
+                if !token.claim() {
+                    return Err(io::Error::other("admission abandoned by its owner"));
+                }
+                self.terminal.echo(&echo, drain)?;
                 if let Err(error) = self.editor.consume_reservation(generation, revision) {
                     // Unreachable given the check above, but a consumed prompt
                     // with no delivered line would park the REPL on a readline

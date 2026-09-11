@@ -82,6 +82,15 @@ pub struct Evaluation {
     requested: AtomicBool,
     source: AtomicU8,
     finished: AtomicBool,
+    /// Set the moment an interrupt is actually CONVERTED into an error or an
+    /// abandoned runner while this evaluation's intent stands.
+    ///
+    /// The alternative was inspecting the error text for "interrupted", which
+    /// misses every wrapped spelling (`run: interrupted`) and every builtin
+    /// that reports interruption as an `Ok` result carrying a flag rather than
+    /// as an error at all. Whether a cancellation landed is a fact the
+    /// cancellation machinery knows; it must not be re-derived from prose.
+    delivered: AtomicBool,
 }
 impl Evaluation {
     pub fn id(&self) -> u64 {
@@ -97,6 +106,12 @@ impl Evaluation {
     }
     pub fn finished(&self) -> bool {
         self.finished.load(Ordering::Relaxed)
+    }
+    /// Whether the interrupt this evaluation's intent raised was actually
+    /// consumed by something — the only honest basis for reporting `cancelled`
+    /// rather than `completed_anyway`.
+    pub fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Relaxed)
     }
     fn request(&self, source: Source) -> bool {
         // Strongest source wins; `fetch_max` keeps a Signal from being
@@ -115,14 +130,17 @@ static ACTIVE: AtomicU64 = AtomicU64::new(0);
 static SIGNAL_LATCH: AtomicBool = AtomicBool::new(false);
 static SIGNAL_TARGET: AtomicU64 = AtomicU64::new(0);
 
-/// SIGINT ingress. Called from signal context: two relaxed stores and nothing
+/// SIGINT ingress. Called from signal context: two atomic stores and nothing
 /// else — no allocation, no locking, no reentrant library calls.
 ///
-/// The target is sampled BEFORE the latch is raised so a reader that observes
-/// the latch also observes a target that was current at or before the signal.
+/// The target is sampled BEFORE the latch is raised, and the latch is RELEASED
+/// while every reader ACQUIRES it, so a reader that observes the latch is
+/// guaranteed to observe the target that went with it. Relaxed would give that
+/// ordering on x86 by accident of the hardware and lose it on a weaker one; the
+/// pairing is stated in the code rather than inherited from the machine.
 pub fn signal_arrived() {
     SIGNAL_TARGET.store(ACTIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-    SIGNAL_LATCH.store(true, Ordering::Relaxed);
+    SIGNAL_LATCH.store(true, Ordering::Release);
 }
 
 fn raise() {
@@ -161,39 +179,88 @@ impl Drop for Guard {
     }
 }
 
-/// Open an evaluation under `id`. Ids must be unique for the life of the
-/// process; the shell uses its reducer's command id, which only ever advances.
-pub fn begin(id: u64) -> Guard {
+/// Create the registry entry for `id` without starting it, and return the
+/// existing one if it is already there.
+///
+/// Ids must be unique for the life of the process; the shell uses its reducer's
+/// command id, which only ever advances.
+fn intern(id: u64) -> Arc<Evaluation> {
+    let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = registry.iter().find(|e| e.id == id) {
+        return existing.clone();
+    }
+    if registry.len() >= RETAINED {
+        // Oldest finished first. Nothing unfinished is ever evicted — neither a
+        // running evaluation nor one that has been published and not yet begun,
+        // because both still have an outcome owed to somebody.
+        if let Some(index) = registry.iter().position(|e| e.finished()) {
+            registry.remove(index);
+        } else {
+            registry.remove(0);
+        }
+    }
     let evaluation = Arc::new(Evaluation {
         id,
         requested: AtomicBool::new(false),
         source: AtomicU8::new(0),
         finished: AtomicBool::new(false),
+        delivered: AtomicBool::new(false),
     });
-    {
-        let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if registry.len() >= RETAINED {
-            // Oldest first, and never evict something still running.
-            if let Some(index) = registry.iter().position(|e| e.finished()) {
-                registry.remove(index);
-            } else {
-                registry.remove(0);
-            }
-        }
-        registry.push(evaluation.clone());
+    registry.push(evaluation.clone());
+    evaluation
+}
+
+/// Record that an interrupt raised by this evaluation's cancellation was
+/// actually consumed. Called from the interrupt CONSUMPTION points — the
+/// evaluator's checkpoints and any runner that abandons its child on the shared
+/// flag — never from an error-message inspection.
+pub fn note_delivery() {
+    let id = ACTIVE.load(Ordering::Relaxed);
+    if id == 0 {
+        return;
     }
+    if let Some(evaluation) = find(id)
+        && evaluation.cancel_requested()
+    {
+        evaluation.delivered.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Publish an identity BEFORE anything runs under it.
+///
+/// The admission owner mints a command id, echoes it and records it, and only
+/// then hands the line over. A cancellation arriving inside that window has a
+/// real id to address, and without this it would be told the id is unknown
+/// while the result surface was already reporting it as running — two answers
+/// about the same operation that contradict each other. Intent recorded here is
+/// adopted by [`begin`], so it cannot be lost in the handover either.
+pub fn publish(id: u64) -> Arc<Evaluation> {
+    intern(id)
+}
+
+/// Open an evaluation under `id`, adopting whatever [`publish`] already
+/// recorded against it.
+pub fn begin(id: u64) -> Guard {
+    let evaluation = intern(id);
     ACTIVE.store(id, Ordering::Relaxed);
+    // Intent recorded before this evaluation started running is still intent.
+    // Raising the flag here is what makes the FIRST checkpoint fire, rather
+    // than the evaluation running to completion under a cancellation nobody
+    // ever delivered.
+    if evaluation.cancel_requested() {
+        raise();
+    }
     // A latch raised while nothing was running, or while a PREVIOUS evaluation
     // was running, is not this evaluation's. Discard it together with the
     // shared flag the signal handler set, or the interrupt would land on the
     // first checkpoint of an evaluation nobody aimed at.
-    if SIGNAL_LATCH.load(Ordering::Relaxed) && SIGNAL_TARGET.load(Ordering::Relaxed) != id {
+    if SIGNAL_LATCH.load(Ordering::Acquire) && SIGNAL_TARGET.load(Ordering::Relaxed) != id {
         SIGNAL_LATCH.store(false, Ordering::Relaxed);
         lower();
     }
     // A signal that arrived for this id before its first checkpoint still
     // applies; adopt it as real intent so it survives a catch.
-    if SIGNAL_LATCH.load(Ordering::Relaxed) && SIGNAL_TARGET.load(Ordering::Relaxed) == id {
+    if SIGNAL_LATCH.load(Ordering::Acquire) && SIGNAL_TARGET.load(Ordering::Relaxed) == id {
         evaluation.request(Source::Signal);
         raise();
     }
@@ -218,20 +285,28 @@ pub fn cancel(id: u64) -> Outcome {
         return Outcome::AlreadyFinished;
     }
     evaluation.request(Source::Request);
-    // Raise the shared flag only while this evaluation is the active one. A
-    // request that lost the race to completion has already returned above; this
-    // second check closes the window where it finished in between.
-    if ACTIVE.load(Ordering::Relaxed) == id && !evaluation.finished() {
+    // Raise the shared flag only while this evaluation is the ACTIVE one; a
+    // request that lost the race to completion has already returned above.
+    if ACTIVE.load(Ordering::Relaxed) == id {
         raise();
-        Outcome::Requested
-    } else {
+    }
+    // Intent is recorded either way, and that is what makes this `Requested`
+    // rather than `AlreadyFinished`. An evaluation that has been published but
+    // not yet begun adopts the intent when it starts; one that finished between
+    // the check above and here reports honestly on the next read. Saying
+    // "already finished" to a caller whose intent WAS recorded would be a lie
+    // the result surface then contradicts.
+    if evaluation.finished() {
         Outcome::AlreadyFinished
+    } else {
+        Outcome::Requested
     }
 }
 
-/// Report a known evaluation's cancellation state without changing it.
+/// Report a known evaluation's cancellation state without changing it:
+/// (intent recorded, what asked for it, whether the interrupt was consumed).
 pub fn state(id: u64) -> Option<(bool, Option<Source>, bool)> {
-    find(id).map(|e| (e.cancel_requested(), e.source(), e.finished()))
+    find(id).map(|e| (e.cancel_requested(), e.source(), e.delivered()))
 }
 
 /// Called by the evaluator immediately after it converts the shared flag into
@@ -245,7 +320,7 @@ pub fn reassert() {
     }
     // Adopt a signal aimed at this evaluation before deciding, so the FIRST
     // interruption a signal causes is also recorded as sticky intent.
-    if SIGNAL_LATCH.load(Ordering::Relaxed) && SIGNAL_TARGET.load(Ordering::Relaxed) == id {
+    if SIGNAL_LATCH.load(Ordering::Acquire) && SIGNAL_TARGET.load(Ordering::Relaxed) == id {
         SIGNAL_LATCH.store(false, Ordering::Relaxed);
         if let Some(evaluation) = find(id) {
             evaluation.request(Source::Signal);
