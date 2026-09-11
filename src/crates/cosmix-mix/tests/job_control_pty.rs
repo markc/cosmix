@@ -872,6 +872,9 @@ fn fixture_path_has_no_shell_metacharacters() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn stop_between_terminal_transfer_and_stage_release_aborts_launch() {
+    if run_bounded_ptrace_case("stop_between_terminal_transfer_and_stage_release_aborts_launch") {
+        return;
+    }
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     // The tracer must be the spawning thread. Hand PTY I/O to this test while
     // it follows only shell threads, leaving trampoline signals untraced.
@@ -974,6 +977,9 @@ fn stop_between_terminal_transfer_and_stage_release_aborts_launch() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn ssh_dash_c_has_zero_shell_group_or_terminal_handoff_syscalls() {
+    if run_bounded_ptrace_case("ssh_dash_c_has_zero_shell_group_or_terminal_handoff_syscalls") {
+        return;
+    }
     use std::collections::BTreeSet;
     // This is an actual syscall audit of -c on an allocated controlling PTY,
     // not a test whose isatty guard makes the assertion vacuous. Follow shell
@@ -1048,5 +1054,68 @@ fn ssh_dash_c_has_zero_shell_group_or_terminal_handoff_syscalls() {
             unsafe { libc::ptrace(libc::PTRACE_SYSCALL, tid, 0, deliver) },
             0
         );
+    }
+}
+
+/// Keep blocking waitpid and tracer.join inside an isolated libtest process.
+/// A deadline checked only between waits cannot detect a wedged tracee. The
+/// parent bounds the entire case and attributes timeout/failure to its name;
+/// killing the tracer also activates PTRACE_O_EXITKILL for its tracees.
+#[cfg(target_arch = "x86_64")]
+fn run_bounded_ptrace_case(name: &str) -> bool {
+    const CASE_LIMIT: Duration = Duration::from_secs(60);
+    const CASE_ENV: &str = "P0J_PTRACE_CASE";
+    if std::env::var(CASE_ENV).as_deref() == Ok(name) {
+        return false;
+    }
+    // Files rather than pipes: diagnostic output must not wedge the child.
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let log = output.reopen().unwrap();
+    let mut command = Command::new("/proc/self/exe");
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env(CASE_ENV, name)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let deadline = Instant::now() + CASE_LIMIT;
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("{name}: start isolated case: {e}"));
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|e| panic!("{name}: wait: {e}"))
+        {
+            let diagnostics = fs::read_to_string(output.path()).unwrap_or_default();
+            assert!(
+                status.success(),
+                "{name}: isolated ptrace case failed ({status}):\n{diagnostics}"
+            );
+            return true;
+        }
+        if Instant::now() >= deadline {
+            // Only this case's session/group. Never join or use a blocking
+            // reap on timeout: even a failed kill must not hang the test run.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < cleanup_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let diagnostics = fs::read_to_string(output.path()).unwrap_or_default();
+            panic!("{name}: ptrace case exceeded 60-second deadline:\n{diagnostics}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
