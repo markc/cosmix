@@ -159,16 +159,29 @@ retrying. The epoch constrains the ID; it never supplies the authenticated actor
 `term.session` reports the current actor's request high-water mark.
 
 Entries bind the authenticated actor, target incarnation/generation, verb and
-payload hash. Repeated accepted requests return the same operation ID and
-submission result; conflicting arguments produce `CONFLICT`. `term.operation`
+payload hash. That hash covers the request bytes AS SENT: Term does not
+canonicalise, so two encodings of the same object are two different payloads and
+a retry MUST replay the body byte for byte, not re-serialise it. Repeated
+accepted requests return the same operation ID and submission result;
+conflicting arguments produce `CONFLICT` with
+`details:{"reason":"request_mismatch","retry_requires":"byte_identical_body"}`. `term.operation`
 can report a later PTY-write outcome. Successful close retries resolve before
 live-pane lookup, so removal does not cause a duplicate action.
 
 Retention is 15 minutes or the last 1,024 accepted mutations per actor, with an
 instance cap of 4,096 retained entries and 256 actor histories. Actor high-water
-marks remain until Term exits; exhausting the actor/entry cap returns
-`RESOURCE_LIMIT`. Retired IDs, stale instance incarnations and old connection
-epochs produce `UNKNOWN_OUTCOME`, never automatic re-execution. A bound actor
+marks remain until Term exits. Ageing alone never drops an actor's key, because
+its high-water mark is what keeps a late retry from re-executing; at the actor
+cap the coldest key is evicted instead, preferring one whose entries have all
+expired. Exhausting the entry cap returns `RESOURCE_LIMIT`. Retired IDs, stale
+instance incarnations and old connection epochs produce `UNKNOWN_OUTCOME`, never
+automatic re-execution. The mark advances BEFORE the verb runs, so an ID can be
+retired without its outcome ever being recorded — deliberate, so a committed
+mutation cannot re-execute when its result was lost. Because an actor holding
+only `input` or `terminate` cannot read the mark back through `term.session`,
+`UNKNOWN_OUTCOME` carries
+`details:{"reason":"retired_request_id","request_high_water":"<n>"}` so it can
+resynchronise without a read capability. A bound actor
 can recover retained results after authenticated resumption. There is no
 exactly-once guarantee across crashes or a new authenticated actor.
 
@@ -182,3 +195,29 @@ timeout remain client transport outcomes, separate from an application reply.
 The S4 fixture inventory and explicit gate prerequisites are in
 `src/desktop/apps/term/tests/README.md`. Test/clippy acceptance is supplied by the
 orchestrator; this page describes implementation, not a claim of passing gates.
+
+The enforcement fixtures are `#[ignore]`d because each spawns a real broker and a
+real Mix child over a PTY, so a plain `cargo test` reports them as ignored and
+says nothing about enforcement. Run them mechanically from the repository root:
+
+```sh
+mix src/desktop/apps/term/check-s4-gates.mix
+```
+
+It builds the current-HEAD Mix the fixtures demand — they refuse a stale or
+installed binary — runs them by exact test path, and requires the precise
+expected pass count, because libtest exits 0 when its filter matches nothing and
+a renamed module would otherwise leave the gate green while running none of them.
+
+One fixture is deliberately outside that script. `p0i_07_other_uid_both_policies`
+needs root and a second UID, and refuses rather than passing silently without
+them. Run it explicitly:
+
+```sh
+cd src/desktop
+BIN=$(ls -t target/debug/deps/term-* | grep -v \.d | head -1)
+sudo env COSMIX_SESSION_TEST_UID=<a non-root uid> \
+     COSMIX_E2E_MIX_BIN=<abs path to src/target/release/mix> HOME=/root \
+     ./$BIN --exact \
+     native_session::enforcement_tests::p0i_07_other_uid_both_policies --ignored
+```
