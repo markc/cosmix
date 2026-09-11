@@ -202,7 +202,6 @@ impl PublishError {
                 for (key, value) in outcome.body().as_object().expect("publish result") {
                     body[key] = value.clone();
                 }
-                body["partial"] = true.into();
                 body.to_string()
             }
             PublishError::Session(error) => serde_json::to_string(error).expect("session error"),

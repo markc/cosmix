@@ -1,5 +1,10 @@
 # Native session implementation staging
 
+S2 closure patch versions: `cosmix-noded` 0.16.6, `cosmix-lib-bus` 0.3.4,
+`cosmix-lib-client` 0.4.5 and `cosmix-lib-config` 0.8.3. These advance both the
+landed main versions and the intermediate S2 fix-pass versions; gate acceptance
+remains separate from version assignment.
+
 Dispatch enforces maintenance at its supplied clock instant. Non-owners receive
 uniform `FORBIDDEN` for revoke, including already revoked records. Malformed
 uncorrelated requests close before consuming a challenge. Observation records
