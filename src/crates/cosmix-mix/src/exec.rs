@@ -5,6 +5,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 
 use cosmix_mix::evaluator::ShellVarResolver;
 
+use crate::job_control::{ExecutionPolicy, Outcome, Stage};
 use crate::jobs::JobTable;
 
 /// Reap a backgrounded (`&`) child on a detached thread. Used wherever a
@@ -395,7 +396,17 @@ pub struct ListOutcome {
 pub fn execute_command_list_outcome(
     items: &[(Connector, &str)],
     vars: &dyn ShellVarResolver,
+    jobs: Option<&mut JobTable>,
+) -> ListOutcome {
+    let policy = jobs.as_ref().map(|j| j.policy()).unwrap_or_default();
+    execute_command_list_with_policy(items, vars, jobs, &policy)
+}
+
+pub fn execute_command_list_with_policy(
+    items: &[(Connector, &str)],
+    vars: &dyn ShellVarResolver,
     mut jobs: Option<&mut JobTable>,
+    policy: &ExecutionPolicy,
 ) -> ListOutcome {
     // Up-front structural validation (no resolver → never spawns a `$(...)`),
     // matching the old behavior where parsing the whole list preceded running
@@ -457,7 +468,18 @@ pub fn execute_command_list_outcome(
             last_success = last_code == 0;
             continue;
         }
-        last_code = match execute_pipeline(&pipeline) {
+        last_code = match execute_pipeline_with_policy(&pipeline, policy) {
+            Ok(PipelineResult::Managed(outcome)) => {
+                backgrounded |= outcome.background;
+                if outcome.stopped {
+                    return ListOutcome {
+                        code: outcome.code,
+                        backgrounded,
+                        commands,
+                    };
+                }
+                outcome.code
+            }
             Ok(PipelineResult::Done(status)) => exit_code(status),
             // Backgrounded (`&`) inside a list: track it in the caller's job
             // table when one exists (the REPL), else reap it on a detached
@@ -1616,6 +1638,7 @@ fn shell_tokenize(s: &str, vars: &dyn ShellVarResolver) -> Vec<Tok> {
 
 /// Result of executing a pipeline.
 pub enum PipelineResult {
+    Managed(Outcome),
     /// Foreground command completed with exit status.
     Done(ExitStatus),
     /// Background command spawned — return the child process.
@@ -1645,6 +1668,20 @@ fn command_for(program: &str) -> Command {
 }
 
 pub fn execute_pipeline(pipeline: &Pipeline) -> io::Result<PipelineResult> {
+    execute_pipeline_with_policy(pipeline, &ExecutionPolicy::NonInteractive)
+}
+
+pub fn execute_pipeline_with_policy(
+    pipeline: &Pipeline,
+    policy: &ExecutionPolicy,
+) -> io::Result<PipelineResult> {
+    if let ExecutionPolicy::Interactive {
+        controller,
+        return_on_stop,
+    } = policy
+    {
+        return execute_managed(pipeline, controller, *return_on_stop).map(PipelineResult::Managed);
+    }
     let n = pipeline.segments.len();
 
     if n == 1 {
@@ -1727,6 +1764,107 @@ pub fn execute_pipeline(pipeline: &Pipeline) -> io::Result<PipelineResult> {
         last_status = Some(child.wait()?);
     }
     Ok(PipelineResult::Done(last_status.unwrap()))
+}
+
+fn execute_managed(
+    pipeline: &Pipeline,
+    controller: &crate::job_control::Controller,
+    return_on_stop: bool,
+) -> io::Result<Outcome> {
+    let launch_command_id = crate::job_control::next_launch_command_id();
+    let mut stages = Vec::new();
+    let mut children = Vec::new();
+    let mut commands = Vec::new();
+    let mut pgid = 0;
+    let spawned = (|| -> io::Result<()> {
+        let mut previous = None;
+        for (i, seg) in pipeline.segments.iter().enumerate() {
+            let args = expand_args_globs(&seg.args, &seg.quoted);
+            commands.push(
+                std::iter::once(seg.program.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            // Preserve the existing `mix` self-resolution contract.
+            let program = if seg.program == "mix" {
+                controller.executable().to_string_lossy().into_owned()
+            } else {
+                seg.program.clone()
+            };
+            let mut stage = Stage::new(controller.executable(), &program, &args, pgid)?;
+            for (k, v) in &seg.env_vars {
+                stage.command.env(k, v);
+            }
+            if let Some(stdout) = previous.take() {
+                stage.command.stdin(stdout);
+            } else {
+                for redir in &seg.redirects {
+                    if let Redirect::StdinFrom(path) = redir {
+                        stage.command.stdin(File::open(path)?);
+                    }
+                }
+            }
+            if i + 1 != pipeline.segments.len() {
+                stage.command.stdout(Stdio::piped());
+            }
+            apply_output_redirects(&mut stage.command, &seg.redirects)?;
+            let mut child = stage.spawn()?;
+            let pid = child.id() as i32;
+            if pgid == 0 {
+                pgid = child.id() as i32;
+            }
+            if i + 1 != pipeline.segments.len() {
+                previous = child.stdout.take().map(Stdio::from);
+            }
+            children.push(child);
+            stages.push(stage);
+            // Record ownership before checking the parent's half of setpgid:
+            // any failure below must flow through registered-child cleanup.
+            // EACCES is expected after the trampoline exec if its child-side
+            // assignment already established the correct group.
+            if unsafe { libc::setpgid(pid, pgid) } < 0 && unsafe { libc::getpgid(pid) } != pgid {
+                return Err(io::Error::other("child changed group during gated launch"));
+            }
+        }
+        Ok(())
+    })();
+    if children.is_empty() {
+        return Err(spawned
+            .err()
+            .unwrap_or_else(|| io::Error::other("empty pipeline")));
+    }
+    let command = commands.join(" | ");
+    let id = controller.register(
+        launch_command_id,
+        pgid,
+        children,
+        command,
+        !pipeline.background,
+    );
+    if let Err(e) = spawned {
+        controller.abort_launch(id);
+        return Err(e);
+    }
+    let lease = if pipeline.background {
+        None
+    } else {
+        match controller.take_terminal(pgid) {
+            Ok(lease) => Some(lease),
+            Err(e) => {
+                controller.abort_launch(id);
+                return Err(e);
+            }
+        }
+    };
+    for stage in stages {
+        if let Err(e) = stage.release(controller, id) {
+            drop(lease); // reclaim the terminal before bounded abort cleanup
+            controller.abort_launch(id);
+            return Err(e);
+        }
+    }
+    controller.finish(id, pipeline.background, return_on_stop, lease)
 }
 
 fn execute_single(seg: &PipeSegment, background: bool) -> io::Result<PipelineResult> {

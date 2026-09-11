@@ -308,7 +308,7 @@ builtin_table! {
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
     ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
-    ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). pid must be a whole NUMBER and is not coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0, which would make the reaping waitpid() collect an arbitrary child of this process group and then report a boolean as alive (strict since v0.52.0)", contract!((pid: number) -> bool)),
+    ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
     ("raise", CapabilityClass::Pure,           "system",  "Raise a catchable structured error: raise(code, message[, details]) — code is UPPER_SNAKE (e.g. \"VALIDATION_REQUIRED\", stable identifiers, scripts may define their own); a non-string message is coerced to its string form; catch with `catch $msg, $err` and read $err.code / $err.details / $err.frames (v0.29.0)", contract!((code: string, message: any, details?: map) -> nil; failure[raises])),
 
@@ -3750,6 +3750,21 @@ fn builtin_kill(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
+// Shared ownership seam: the binary registers managed children before target
+// release. Launch and process_alive run on the same evaluator thread; this
+// registry identifies which statuses the builtin must leave to the monitor.
+// The mutex also serialises registry access with monitor-side retirement.
+static MANAGED_PIDS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+pub fn register_managed_pid(pid: i32) {
+    MANAGED_PIDS.lock().unwrap().insert(pid);
+}
+
+pub fn unregister_managed_pid(pid: i32) {
+    MANAGED_PIDS.lock().unwrap().remove(&pid);
+}
+
 /// process_alive(pid) — check if a process is running (signal 0 test).
 ///
 /// First attempts a non-blocking `waitpid(pid, WNOHANG)` to reap the
@@ -3769,6 +3784,12 @@ fn builtin_process_alive(args: Vec<Value>) -> MixResult<Option<Value>> {
     // group — a side effect, not just a wrong answer — and then kill(0, 0)
     // succeeds, so `process_alive(false)` returned TRUE.
     let pid = pid_int_arg("process_alive", "pid", &args[0])?;
+    if pid <= 0 {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            "process_alive: pid must be a positive whole number",
+        ));
+    }
     #[cfg(unix)]
     {
         let mut status: libc::c_int = 0;
@@ -3776,10 +3797,14 @@ fn builtin_process_alive(args: Vec<Value>) -> MixResult<Option<Value>> {
         // non-blocking. We ignore the return value because we only care
         // about its side-effect (reaping a zombie child) — the kill(0)
         // below is the authoritative liveness check.
-        unsafe {
-            let _ = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        let managed = MANAGED_PIDS.lock().unwrap();
+        if !managed.contains(&pid) {
+            unsafe {
+                let _ = libc::waitpid(pid, &mut status, libc::WNOHANG);
+            }
         }
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         Ok(Some(Value::Bool(alive)))
     }
     #[cfg(not(unix))]
@@ -26965,6 +26990,41 @@ mod loud_numeric_argument_tests {
 
     fn bad() -> Value {
         Value::String("2x".into())
+    }
+
+    #[test]
+    fn process_alive_rejects_nonpositive_pids() {
+        for pid in [-1.0, 0.0, -100.0] {
+            let err = call_builtin("process_alive", vec![Value::Number(pid)]).unwrap_err();
+            assert_eq!(err.info().map(|i| i.code.as_str()), Some("TYPE_MISMATCH"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_alive_leaves_managed_exit_status_for_its_owner() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id() as i32;
+        super::register_managed_pid(pid);
+        // Observe exit without consuming it; no timing race with a fast child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as u32,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            call_builtin("process_alive", vec![Value::Number(pid as f64)]).unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert!(child.wait().unwrap().success());
+        super::unregister_managed_pid(pid);
     }
 
     /// pid/signal domain failures keep the TYPE_MISMATCH code documented

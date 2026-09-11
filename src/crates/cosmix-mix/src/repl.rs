@@ -114,11 +114,19 @@ fn exec_restart(
 pub fn run_repl() -> i32 {
     meta::init_start_time();
 
-    // Establish a sane interactive output baseline first thing — before the
-    // prelude, .mixrc, or a resume command can print/run, any of which would
-    // staircase on a raw inherited tty (see ensure_interactive_output_mode).
+    // Acquire foreground ownership before any terminal repair: a nested
+    // background shell must stop via SIGTTIN before touching parent termios.
+    let mut job_table = match JobTable::interactive(ensure_interactive_output_mode) {
+        Ok(table) => table,
+        Err(e) => {
+            eprintln!(
+                "mix: WARNING: interactive job control unavailable: {e}; starting without job management"
+            );
+            JobTable::new()
+        }
+    };
+    // Still precedes prelude, rc, prompt and resume-command output.
     ensure_interactive_output_mode();
-
     let rt = crate::build_runtime();
 
     let history_path = dirs::home_dir()
@@ -149,7 +157,7 @@ pub fn run_repl() -> i32 {
     // of a .mixrc). The handler only activates when the whole-file
     // Mix parse fails — pure-Mix sourced files run unchanged.
     eval.set_shell_handler(std::rc::Rc::new(
-        crate::shell_handler::ReplShellHandler::new(),
+        crate::shell_handler::ReplShellHandler::with_policy(job_table.policy().sourced()),
     ));
 
     // Register AI extension functions
@@ -191,7 +199,6 @@ pub fn run_repl() -> i32 {
 
     let mut line_buf = String::new();
     let mut dir_stack: Vec<String> = Vec::new();
-    let mut job_table = JobTable::new();
     let mut auto_diagnose = false;
 
     // Load ~/.mixrc if it exists
@@ -213,7 +220,7 @@ pub fn run_repl() -> i32 {
         if !cmd.is_empty() {
             eprintln!("Resuming: {}", cmd);
             if let Ok(pipeline) = exec::parse_pipeline(&cmd, &exec::NoVars) {
-                let _ = exec::execute_pipeline(&pipeline);
+                let _ = exec::execute_pipeline_with_policy(&pipeline, &job_table.policy());
             }
         }
     }
@@ -611,9 +618,11 @@ pub fn run_repl() -> i32 {
                                 continue;
                             }
                             "bg" => {
-                                eprintln!(
-                                    "bg: not yet implemented (jobs run in background by default with &)"
-                                );
+                                let id = pipeline.segments[0]
+                                    .args
+                                    .first()
+                                    .and_then(|s| s.parse::<usize>().ok());
+                                job_table.bg(id);
                                 continue;
                             }
                             "mix" if !meta_plumbed => {
@@ -711,17 +720,13 @@ pub fn run_repl() -> i32 {
                                                 stats_io::save_stats(&mut stats);
                                             }
                                             let _ = rl.save_history(&history_path);
+                                            job_table.shutdown();
                                             use std::os::unix::process::CommandExt;
                                             let err = std::process::Command::new(&exec_path).exec();
                                             eprintln!("Failed to restart: {}", err);
-                                            if stats_io::stats_enabled() {
-                                                eval.attach_stats(UsageStats::for_execution(
-                                                    StatsContext::new(
-                                                        ExecutionMode::Interactive,
-                                                        None,
-                                                    ),
-                                                ));
-                                            }
+                                            // Job ownership has closed; do not
+                                            // resume a prompt with a closed controller.
+                                            return 1;
                                         }
                                     }
                                 }
@@ -813,9 +818,18 @@ pub fn run_repl() -> i32 {
                             s.track_command(&first.program);
                         }
 
-                        match exec::execute_pipeline(&pipeline) {
+                        match exec::execute_pipeline_with_policy(&pipeline, &job_table.policy()) {
+                            Ok(PipelineResult::Managed(outcome)) => {
+                                eval.set_global("status", Value::Number(outcome.code as f64));
+                                if let Some(mut s) = eval.stats_mut() {
+                                    s.increment_commands();
+                                }
+                                if outcome.background {
+                                    _timer.disarm();
+                                }
+                            }
                             Ok(PipelineResult::Done(status)) => {
-                                let code = status.code().unwrap_or(-1);
+                                let code = exec::exit_code(status);
                                 eval.set_global("status", Value::Number(code as f64));
                                 if let Some(mut s) = eval.stats_mut() {
                                     s.increment_commands();
@@ -845,6 +859,7 @@ pub fn run_repl() -> i32 {
                         // If present, exec() into new Mix binary (which will then
                         // auto-start claude --continue on startup).
                         if check_resume_flag().is_some() {
+                            job_table.shutdown();
                             exec_restart(&mut eval, &mut rl, &history_path);
                         }
                     }

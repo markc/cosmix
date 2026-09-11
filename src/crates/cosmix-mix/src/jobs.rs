@@ -14,15 +14,57 @@ pub struct Job {
 }
 
 pub struct JobTable {
+    policy: crate::job_control::ExecutionPolicy,
     jobs: Vec<Job>,
     next_id: usize,
+}
+
+impl Drop for JobTable {
+    fn drop(&mut self) {
+        // Close jobs without depending on evaluator Rc policy clones. This
+        // does not restore terminal ownership or signal dispositions; those
+        // belong to TerminalLease and the final Controller drop respectively.
+        self.shutdown();
+    }
 }
 
 impl JobTable {
     pub fn new() -> Self {
         JobTable {
+            policy: crate::job_control::ExecutionPolicy::NonInteractive,
             jobs: Vec::new(),
             next_id: 1,
+        }
+    }
+
+    pub fn interactive(repair_terminal: impl FnOnce()) -> std::io::Result<Self> {
+        let mut table = Self::new();
+        if let Some(controller) = crate::job_control::Controller::interactive(repair_terminal)? {
+            table.policy = crate::job_control::ExecutionPolicy::Interactive {
+                controller,
+                return_on_stop: true,
+            };
+        }
+        Ok(table)
+    }
+
+    pub fn policy(&self) -> crate::job_control::ExecutionPolicy {
+        self.policy.clone()
+    }
+
+    pub fn shutdown(&self) {
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
+            controller.shutdown();
+        }
+    }
+
+    pub fn bg(&self, id: Option<usize>) {
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
+            if let Err(e) = controller.background_job(id) {
+                eprintln!("bg: {e}");
+            }
+        } else {
+            eprintln!("bg: interactive job control unavailable");
         }
     }
 
@@ -42,6 +84,9 @@ impl JobTable {
 
     /// Check for completed jobs, print notifications, and remove them.
     pub fn reap(&mut self) {
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
+            controller.notify_done();
+        }
         let mut done = Vec::new();
         for job in &mut self.jobs {
             if let JobStatus::Running = job.status {
@@ -70,6 +115,18 @@ impl JobTable {
     /// Print all jobs.
     pub fn list(&mut self) {
         self.reap();
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
+            for job in controller.snapshot() {
+                println!(
+                    "[{}] {} pgid={} command_id={} {}",
+                    job.id,
+                    job.state(),
+                    job.pgid,
+                    job.launch_command_id,
+                    job.command
+                );
+            }
+        }
         for job in &self.jobs {
             let status = match &job.status {
                 JobStatus::Running => "Running",
@@ -81,6 +138,15 @@ impl JobTable {
 
     /// Bring a job to the foreground and wait for it.
     pub fn fg(&mut self, id: Option<usize>) -> Option<i32> {
+        if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = &self.policy {
+            return match controller.foreground_job(id) {
+                Ok(code) => Some(code),
+                Err(e) => {
+                    eprintln!("fg: {e}");
+                    None
+                }
+            };
+        }
         let idx = if let Some(id) = id {
             self.jobs.iter().position(|j| j.id == id)
         } else {

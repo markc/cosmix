@@ -1,0 +1,91 @@
+# Interactive job control
+
+Available in Mix 0.84.0.
+
+Interactive Mix shell commands use one process group per job, including all
+pipeline stages. The shell transfers its controlling terminal to foreground
+jobs and reclaims it on completion or suspension. `jobs` lists tracked jobs;
+`fg N` foregrounds and continues job N; `bg N` continues it without terminal
+ownership. Omitting N selects the most recent live job. A background pipeline
+returns to the prompt after launch, without waiting for its stages to finish.
+`jobs` includes a session-local launch command ID allocated before spawning,
+distinct from its job-table ID, and displays arguments after glob expansion.
+The `&` notification prints the last pipeline member's PID.
+
+Job management is selected by the interactive entry point, and requires tty
+stdin plus a controlling terminal. Setup errors produce one warning and
+start the shell with noninteractive execution policy. Foreground admission
+is bounded if an orphaned process group cannot stop. The shutdown mode
+snapshot is seeded after cold-start terminal repair, before the monitor
+starts handling HUP. Declined admission does not take the parent's terminal.
+Scripts, `-c` (including SSH commands),
+serve mode, redirected stdin and sessions without a controlling terminal
+retain their noninteractive launch policy. Captured `run_argv` and
+`run_pipeline` retain their separate capture/cancellation process groups.
+Noninteractive `a | b &` still waits for upstream `a` before returning;
+changing that legacy behaviour is deferred by design. Each managed command
+also pays for a fork and an extra exec of the Mix trampoline before target
+exec; pipelines pay that overhead per stage.
+The shell's job-control signal handlers reset on exec. SIGTTOU is blocked
+only around terminal handoff and restoration, so captured children do not
+inherit shell-only ignored signals or a handoff-time signal mask.
+
+Sourced shell input in an interactive shell shares its job controller. A
+stopped foreground command inside source currently waits for external
+continuation: returning to a restricted prompt while preserving evaluation
+requires the later async host seam. `run_stream` and evaluator-owned legacy
+shell/substitution paths are not integrated in this round. Bus publication,
+remote admission and request cancellation are separate stages.
+During an unmanaged inherited-stdio wait, Ctrl+Z stops Mix itself with its
+child so an outer shell can `fg` the group. The shell suppresses SIGTSTP
+only while a managed job holds the foreground terminal. A restricted
+job-management prompt for suspended evaluation remains deferred.
+SIGTSTP and SIGTTIN use an atomic one-shot disposition reset and reinstall
+the known handler after resume. SIGTTIN always takes the default stop path,
+so background terminal reads stop the shell rather than spinning on EINTR.
+The managed-foreground flag changes only after successful terminal transfers;
+a failed reclaim leaves it set.
+
+On normal shell exit or SIGHUP, Mix sends HUP followed by CONT to its owned
+live jobs and allows 500 ms for exit/reaping. Survivors are reported; there
+is no forced-kill escalation or guarantee about deliberately detached
+descendants. Foreground terminal modes are restored even if a child exits
+leaving raw mode enabled. Stopped jobs retain their own modes for `fg`.
+Fresh jobs that exit normally retain cooked-mode changes (ICANON and ISIG still enabled), so
+commands such as `stty tostop` remain effective. Stops, signal exits and raw
+mode leakage restore the saved shell baseline. A resumed stopped job also
+restores that baseline when it completes. Mix cannot infer whether an
+arbitrary cooked-mode change was deliberate; this is the explicit policy.
+
+The launch barrier runs in a private Mix trampoline **after** its first exec.
+It executes `/proc/self/exe`, so open shells keep launching commands after
+an installation replaces or unlinks their original executable. The fleet is
+Linux; if `/proc/self/exe` is absent, or on another platform, launches fall
+back to the executable path resolved at interactive admission. That fallback
+restores only pre-replacement behaviour, not the unlink guarantee.
+This lets Rust's spawn acknowledgement complete before the barrier waits.
+Only after all children share their job group and the foreground terminal
+has transferred does Mix release target execution. A second close-on-exec
+pipe reports target-exec failures and one-byte trampoline failure reasons.
+Acknowledgement waits observe member stops and have a 30-second deadline,
+used only as a pathological-wedge backstop so cold or network-paged binaries
+have time to launch. A target that stops itself before acknowledgement is
+aborted deliberately: preserving that pre-ack job would risk wedging the
+shell. This trades that narrow self-stop case for a recoverable prompt.
+Failed launches reclaim the terminal first, send TERM/CONT, allow 500 ms,
+then send KILL/CONT and allow another 500 ms. Survivors are reported and
+remain registered for eventual reaping; an uninterruptible child cannot
+hold the prompt indefinitely.
+The survivor diagnostic in `abort_launch` is deliberately printed under the
+jobs-state lock; this is accepted because the terminal has already been
+reclaimed before abort cleanup.
+
+The process monitor is the sole consumer of registered child statuses,
+including stopped/continued states. SIGCHLD wakes it independently of REPL
+input or evaluator progress. It never waits for arbitrary child PIDs.
+`process_alive(pid)` requires a positive whole-number PID. It may reap an
+exited unmanaged child (including a legacy `spawn` child), but only probes
+controller-owned job PIDs with signal 0. A managed zombie can briefly report
+alive until the controller reaps it; the builtin never steals its status.
+Signal 0 returning `EPERM` counts as alive, including for another user's
+process. This reports existence, not permission to signal that process.
