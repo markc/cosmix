@@ -323,6 +323,38 @@ async fn p0i_03_child_proof_scope_and_challenge_consumption() {
     }
 }
 
+#[tokio::test]
+async fn bound_delivery_registers_lease_dependency_and_disconnect_notifies() {
+    let broker = Broker::start().await;
+    let mut parent = broker.unix().await;
+    let record = allocate_term(&mut parent).await;
+    let mut recipient = broker.unix().await;
+    register(&mut recipient, "lease-recipient").await;
+    let target = serde_json::json!({"target":record.reference()});
+    assert!(
+        session_call(&mut recipient, "lease.check", "before", target.clone())
+            .await
+            .body
+            .contains("dependency_missing")
+    );
+    send(
+        &mut parent,
+        &request("probe.event", "lease-recipient", "delivery").with_header("type", "event"),
+    )
+    .await;
+    let delivery = receive(&mut recipient).await;
+    let principal = read_principal(&delivery).unwrap().unwrap();
+    assert_eq!(principal.assurance, Assurance::SessionBound);
+    assert_eq!(principal.session.unwrap().record_id, record.record_id);
+    let lease = session_call(&mut recipient, "lease.check", "after", target).await;
+    assert_eq!(lease.get("rc"), Some("0"), "{}", lease.body);
+    parent.close(None).await.unwrap();
+    let notice = receive(&mut recipient).await;
+    assert_eq!(notice.command_name(), Some("noded.session.lifecycle"));
+    let notice: serde_json::Value = serde_json::from_str(&notice.body).unwrap();
+    assert_eq!(notice["state"], "suspended");
+}
+
 async fn assert_preclaim_refused<S: AsyncRead + AsyncWrite + Unpin>(
     caller: &mut WebSocketStream<S>,
     recipient: &mut WebSocketStream<tokio::net::UnixStream>,

@@ -12,6 +12,40 @@ const MAX_ISSUED: usize = 65_536;
 type Id = HexBytes<16>;
 type Reply = Result<serde_json::Value, SessionError>;
 
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    #[test]
+    fn notice_overflow_coalesces_and_global_shedding_marks_victim() {
+        let mut s = Sessions::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let epoch = HexBytes([1; 16]);
+        for n in 0..17 {
+            let id = HexBytes([n; 16]);
+            s.open_outbox(id, &tx, Arc::new(tokio::sync::Notify::new()));
+        }
+        let first = HexBytes([0; 16]);
+        for _ in 0..257 {
+            s.queue_notice(first, "notice".into());
+        }
+        assert_eq!(s.outboxes[&first].notices.len(), 256);
+        assert!(s.next_notice(first, epoch).unwrap().0);
+        assert!(!s.next_notice(first, epoch).unwrap().0);
+        for n in 1..17 {
+            for _ in 0..256 {
+                s.queue_notice(HexBytes([n; 16]), "notice".into());
+            }
+        }
+        assert_eq!(
+            s.outboxes.values().map(|o| o.notices.len()).sum::<usize>(),
+            4096
+        );
+        assert!(s.outboxes.values().any(|o| o.gap));
+        s.restore_gap(first);
+        assert!(s.next_notice(first, epoch).unwrap().0);
+    }
+}
+
 pub(super) fn now_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -86,6 +120,15 @@ struct Connection {
     interest: Option<HexBytes<32>>,
     challenge: Option<(ChallengeArgs, ProofTranscript)>,
     consumed: HashSet<Id>,
+    binding: Option<Id>,
+}
+
+struct Outbox {
+    tx: mpsc::Sender<String>,
+    wake: Arc<tokio::sync::Notify>,
+    notices: VecDeque<String>,
+    gap: bool,
+    dependencies: Vec<(RecordRef, u64)>,
 }
 
 #[derive(Default)]
@@ -96,9 +139,155 @@ pub(super) struct Sessions {
     results: VecDeque<Cached>,
     grants: HashMap<Id, SessionGrant>,
     pane_high_water: HashMap<(Id, u64), u64>,
+    outboxes: HashMap<Id, Outbox>,
 }
 
 impl Sessions {
+    pub(super) fn open_outbox(
+        &mut self,
+        id: Id,
+        tx: &mpsc::Sender<String>,
+        wake: Arc<tokio::sync::Notify>,
+    ) {
+        self.outboxes.insert(
+            id,
+            Outbox {
+                tx: tx.clone(),
+                wake,
+                notices: VecDeque::new(),
+                gap: false,
+                dependencies: Vec::new(),
+            },
+        );
+    }
+
+    pub(super) fn close_outbox(&mut self, id: Id) {
+        self.outboxes.remove(&id);
+    }
+
+    pub(super) fn next_notice(&mut self, id: Id, epoch: Id) -> Option<(bool, String)> {
+        let out = self.outboxes.get_mut(&id)?;
+        if std::mem::take(&mut out.gap) {
+            return Some((
+                true,
+                BusMessage::new()
+                    .with_header("bus", "1")
+                    .with_header("type", "event")
+                    .with_header("command", "noded.session.lifecycle.gap")
+                    .with_body(&serde_json::json!({"broker_epoch":epoch}).to_string())
+                    .to_wire(),
+            ));
+        }
+        out.notices.pop_front().map(|wire| (false, wire))
+    }
+
+    pub(super) fn restore_gap(&mut self, id: Id) {
+        if let Some(out) = self.outboxes.get_mut(&id) {
+            out.gap = true;
+            out.wake.notify_one();
+        }
+    }
+
+    fn queue_notice(&mut self, id: Id, wire: String) {
+        let Some(out) = self.outboxes.get_mut(&id) else {
+            return;
+        };
+        if out.notices.len() >= 256 {
+            out.gap = true;
+            out.wake.notify_one();
+            return;
+        }
+        if self
+            .outboxes
+            .values()
+            .map(|o| o.notices.len())
+            .sum::<usize>()
+            >= 4096
+        {
+            let largest = *self
+                .outboxes
+                .iter()
+                .max_by_key(|(_, o)| o.notices.len())
+                .expect("outbox")
+                .0;
+            let out = self.outboxes.get_mut(&largest).expect("outbox");
+            out.notices.pop_front();
+            out.gap = true;
+            out.wake.notify_one();
+        }
+        let out = self.outboxes.get_mut(&id).expect("outbox");
+        out.notices.push_back(wire);
+        out.wake.notify_one();
+    }
+
+    fn notice(&mut self, id: Id, closing: Option<Id>) {
+        let r = &self.records[&id];
+        let reference = r.view.reference();
+        let mut recipients = HashSet::new();
+        recipients.extend(closing);
+        recipients.extend(r.connection);
+        recipients.extend(self.parent(r).and_then(|p| p.connection));
+        for (cid, out) in &self.outboxes {
+            if out.dependencies.iter().any(|(target, _)| {
+                target.record_id == id && target.incarnation == reference.incarnation
+            }) {
+                recipients.insert(*cid);
+            }
+        }
+        for (cid, c) in &self.connections {
+            if c.principal.unix_uid == r.view.owner_uid && c.interest == Some(r.key) {
+                recipients.insert(*cid);
+            }
+        }
+        let wire = BusMessage::new().with_header("bus","1").with_header("type","event").with_header("command","noded.session.lifecycle").with_body(&serde_json::json!({"target":reference,"state":r.view.state,"broker_epoch":r.view.broker_epoch}).to_string()).to_wire();
+        for cid in recipients {
+            self.queue_notice(cid, wire.clone());
+        }
+    }
+
+    pub(super) fn delivery(
+        &mut self,
+        p: &BrokerPrincipal,
+        target: &mpsc::Sender<String>,
+        now: u64,
+    ) -> Result<Option<BrokerPrincipal>, SessionError> {
+        let principal = self.principal(p.connection_id, now);
+        let Some(id) = self.attached(p.connection_id) else {
+            // A stale cached bound principal cannot fall back to ambient authority.
+            if p.session.is_some() {
+                return Err(error(ErrorCode::Expired, ""));
+            }
+            return Ok(principal);
+        };
+        let r = &self.records[&id];
+        let remaining = self.remaining(r, now);
+        if remaining == 0 {
+            return Err(error(ErrorCode::Expired, ""));
+        }
+        let reference = r.view.reference();
+        let global = self
+            .outboxes
+            .values()
+            .map(|o| o.dependencies.len())
+            .sum::<usize>();
+        let out = self
+            .outboxes
+            .values_mut()
+            .find(|o| o.tx.same_channel(target))
+            .ok_or_else(|| error(ErrorCode::Unavailable, "recipient_missing"))?;
+        if let Some((_, expires)) = out.dependencies.iter_mut().find(|(r, _)| *r == reference) {
+            *expires = now + remaining;
+        } else {
+            if out.dependencies.len() >= 256 || global >= 8192 {
+                return Err(error(
+                    ErrorCode::ResourceLimit,
+                    "recipient_dependency_limit",
+                ));
+            }
+            out.dependencies.push((reference, now + remaining));
+        }
+        Ok(principal)
+    }
     pub(super) fn connect(
         &mut self,
         principal: &BrokerPrincipal,
@@ -117,6 +306,7 @@ impl Sessions {
                 interest: None,
                 challenge: None,
                 consumed: HashSet::new(),
+                binding: None,
             },
         );
     }
@@ -183,6 +373,7 @@ impl Sessions {
         if r.view.state == BindingState::Revoked {
             return;
         }
+        let closing = r.connection;
         if let Some(c) = r.connection.take().and_then(|id| self.connections.get(&id)) {
             if reg.get(&r.view.name).is_some_and(|e| e.same_channel(&c.tx)) {
                 reg.remove(&r.view.name);
@@ -197,6 +388,7 @@ impl Sessions {
         {
             g.state = GrantState::Revoked;
         }
+        self.notice(id, closing);
     }
 
     fn attached(&self, connection: Id) -> Option<Id> {
@@ -261,6 +453,7 @@ impl Sessions {
         if r.view.state != BindingState::Attached {
             return;
         }
+        let closing = r.connection;
         if let Some(c) = r.connection.take().and_then(|id| self.connections.get(&id)) {
             if reg.get(&r.view.name).is_some_and(|e| e.same_channel(&c.tx)) {
                 reg.remove(&r.view.name);
@@ -269,6 +462,7 @@ impl Sessions {
         }
         r.view.state = BindingState::Suspended;
         r.deadline = now.saturating_add(RESUME_MS);
+        self.notice(id, closing);
     }
 
     pub(super) fn maintain(&mut self, reg: &mut HashMap<String, ServiceEntry>, now: u64) {
@@ -292,6 +486,9 @@ impl Sessions {
             }
         }
         self.results.retain(|r| r.expires > now);
+        for out in self.outboxes.values_mut() {
+            out.dependencies.retain(|(_, expires)| *expires > now);
+        }
         let expired: Vec<_> = self
             .grants
             .values_mut()
@@ -328,7 +525,11 @@ impl Sessions {
     }
 
     pub(super) fn principal(&self, connection: Id, now: u64) -> Option<BrokerPrincipal> {
-        let mut p = self.connections.get(&connection)?.principal.clone();
+        let c = self.connections.get(&connection)?;
+        if c.binding.is_some() && self.attached(connection).is_none() {
+            return None;
+        }
+        let mut p = c.principal.clone();
         if let Some(id) = self.attached(connection) {
             let r = &self.records[&id];
             let v = &r.view;
@@ -447,6 +648,25 @@ impl Sessions {
             }
             SessionCommand::Challenge(a) => self.challenge(p, a, now),
             SessionCommand::Prove(a) => self.prove(p, a, reg, now),
+            SessionCommand::LeaseCheck(a) => {
+                let r = self.owned(p.unix_uid, &a.target)?;
+                let remaining = self.remaining(r, now);
+                if remaining == 0 {
+                    return Err(error(ErrorCode::Expired, ""));
+                }
+                let out = self
+                    .outboxes
+                    .get(&p.connection_id)
+                    .ok_or_else(SessionError::forbidden)?;
+                if !out
+                    .dependencies
+                    .iter()
+                    .any(|(target, expires)| *target == a.target && *expires > now)
+                {
+                    return Err(error(ErrorCode::Conflict, "dependency_missing"));
+                }
+                Ok(serde_json::json!({"lease_remaining_ms":DecimalU64(remaining)}))
+            }
             SessionCommand::Revoke(a) => {
                 let r = self.owned(p.unix_uid, &a.target)?;
                 let owner = r.connection == Some(p.connection_id)
@@ -532,6 +752,11 @@ impl Sessions {
                     },
                 );
                 self.install(id, reg);
+                self.connections
+                    .get_mut(&p.connection_id)
+                    .expect("connection")
+                    .binding = Some(id);
+                self.notice(id, None);
                 Ok(serde_json::json!({"record": view}))
             }
             SessionCommand::Renew(a) => {
@@ -571,7 +796,6 @@ impl Sessions {
                 }
                 Ok(result)
             }
-            _ => Err(error(ErrorCode::Unsupported, "")),
         }
     }
 
@@ -668,6 +892,7 @@ impl Sessions {
             },
         );
         self.grants.insert(grant.grant_id, grant.clone());
+        self.notice(id, None);
         Ok(serde_json::json!({"grant":grant,"record":view}))
     }
 
@@ -840,8 +1065,17 @@ impl Sessions {
         if let Some(c) = self.connections.get_mut(&cid)
             && let Some((_, p)) = c.challenge.take()
         {
-            c.consumed.insert(p.challenge_id);
+            Self::remember_consumed(c, p.challenge_id);
         }
+    }
+
+    fn remember_consumed(c: &mut Connection, id: Id) {
+        if c.consumed.len() >= 1024
+            && let Some(old) = c.consumed.iter().next().copied()
+        {
+            c.consumed.remove(&old);
+        }
+        c.consumed.insert(id);
     }
 
     fn prove(
@@ -857,7 +1091,7 @@ impl Sessions {
             .expect("connection");
         let outstanding = c.challenge.take();
         if let Some((_, proof)) = &outstanding {
-            c.consumed.insert(proof.challenge_id);
+            Self::remember_consumed(c, proof.challenge_id);
         }
         if c.consumed.contains(&a.challenge_id)
             && outstanding
@@ -917,6 +1151,16 @@ impl Sessions {
         r.view.binding_generation = proof.binding_generation;
         r.deadline = now + LEASE_MS;
         self.install(proof.record_id, reg);
+        self.connections
+            .get_mut(&p.connection_id)
+            .expect("connection")
+            .binding = Some(proof.record_id);
+        self.notice(proof.record_id, None);
+        for child in self.children(proof.record_id) {
+            if self.records[&child].view.state != BindingState::Revoked {
+                self.notice(child, None);
+            }
+        }
         Ok(serde_json::json!({"record":self.snapshot(&self.records[&proof.record_id],now)}))
     }
 }

@@ -1973,9 +1973,41 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
     let source_ip_str = source_ip.to_string();
 
     let (tx, mut rx) = mpsc::channel::<String>(PEER_OUTBOUND_BUFFER);
-
+    let channel_id = state
+        .principal
+        .as_ref()
+        .map(|p| p.connection_id)
+        .unwrap_or_else(|| HexBytes(rand::random()));
+    let notice_wake = Arc::new(tokio::sync::Notify::new());
+    state
+        .sessions
+        .lock()
+        .await
+        .open_outbox(channel_id, &tx, notice_wake.clone());
+    let writer_sessions = state.sessions.clone();
+    let writer_epoch = state.broker_epoch;
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        loop {
+            loop {
+                let notice = writer_sessions
+                    .lock()
+                    .await
+                    .next_notice(channel_id, writer_epoch);
+                let Some((gap, notice)) = notice else {
+                    break;
+                };
+                if ws_sink.send(Message::Text(notice.into())).await.is_err() {
+                    if gap {
+                        writer_sessions.lock().await.restore_gap(channel_id);
+                    }
+                    return;
+                }
+            }
+            let msg = tokio::select! {
+                biased;
+                _ = notice_wake.notified() => continue,
+                msg = rx.recv() => match msg { Some(msg) => msg, None => break },
+            };
             if ws_sink.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
@@ -2207,7 +2239,10 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             let mut reg = state.registry.write().await;
             let mut sessions = state.sessions.lock().await;
             sessions.maintain(&mut reg, session::now_ms());
-            state.principal = sessions.principal(p.connection_id, session::now_ms());
+            let Some(principal) = sessions.principal(p.connection_id, session::now_ms()) else {
+                break;
+            };
+            state.principal = Some(principal);
         }
 
         // SPEC 13 §9a (2-c-1b) — the D2 admission response. It carries
@@ -2830,6 +2865,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             .await
             .disconnect(p.connection_id, &mut reg);
     }
+    state.sessions.lock().await.close_outbox(channel_id);
 
     // SPEC 13 §5.5 (2-c-2c) — drop this session from the live gated set. A
     // reload teardown that selected this session already drained its pending +
@@ -3214,7 +3250,9 @@ async fn route_local(
 ) -> LocalRouteResult {
     let registry = &state.registry;
     let pending_responses = &state.pending_responses;
-    let reg = registry.read().await;
+    let mut reg = registry.write().await;
+    let mut sessions = state.sessions.lock().await;
+    sessions.maintain(&mut reg, session::now_ms());
     let traffic_class = state.observe.traffic_class().merge(
         reg.get(service)
             .map(|e| e.traffic_class)
@@ -3223,6 +3261,33 @@ async fn route_local(
     let scoped_observe = state.observe.for_class(traffic_class);
     let observe = &scoped_observe;
     if let Some(target_tx) = reg.get(service).map(|e| e.tx.clone()) {
+        let fresh_principal = if let Some(p) = &state.principal {
+            match sessions.delivery(p, &target_tx, session::now_ms()) {
+                Ok(principal) => principal,
+                Err(error) => {
+                    let mut reply = BusMessage::new()
+                        .with_header("bus", "1")
+                        .with_header("type", "response")
+                        .with_header("rc", &error.rc().to_string())
+                        .with_body(&serde_json::to_string(&error).expect("error"));
+                    if let Some(id) = msg.get("id") {
+                        reply.set("id", id);
+                    }
+                    if let Some(command) = msg.command_name() {
+                        reply.set("command", command);
+                    }
+                    let _ = caller_tx.try_send(reply.to_wire());
+                    return LocalRouteResult {
+                        traffic_class,
+                        target_tx: Some(target_tx),
+                        forwarded_wire: None,
+                        outcome: ObserveOutcome::Rejected,
+                    };
+                }
+            }
+        } else {
+            None
+        };
         // Register pending BEFORE rewriting the wire bytes so the
         // broker_id we insert under matches the id we serialise into the
         // forwarded wire. `register` is a no-op (returns `None`) for
@@ -3239,7 +3304,7 @@ async fn route_local(
             )
             .await;
         // Destination transport, not merely sender identity, gates metadata.
-        let principal = state.principal.as_ref().filter(|_| {
+        let principal = fresh_principal.as_ref().filter(|_| {
             reg.get(service)
                 .is_some_and(|e| e.traffic_class.protected())
         });
@@ -3272,6 +3337,7 @@ async fn route_local(
             let delivery = target_tx.try_send(wire.clone());
             (wire, delivery)
         };
+        drop(sessions);
         match delivery {
             Ok(()) => LocalRouteResult {
                 traffic_class,
