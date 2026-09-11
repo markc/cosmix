@@ -12876,6 +12876,7 @@ fn builtin_mix_version(_args: Vec<Value>) -> MixResult<Option<Value>> {
         "patch".into(),
         Value::Number(env!("CARGO_PKG_VERSION_PATCH").parse::<f64>().unwrap_or(0.0)),
     );
+    map.insert("string".into(), Value::String(env!("CARGO_PKG_VERSION").into()));
     Ok(Some(Value::map(map)))
 }
 
@@ -27560,4 +27561,3 @@ mod run_parallel_tests {
         );
     }
 }
-    map.insert("string".into(), Value::String(env!("CARGO_PKG_VERSION").into()));
