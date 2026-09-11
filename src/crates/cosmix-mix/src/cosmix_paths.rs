@@ -118,9 +118,96 @@ fn env_or(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
         .unwrap_or_else(fallback)
 }
 
+/// Strings only at capture time: no filesystem or name-service work on the
+/// bootstrap caller. Resolution later must not call dirs (which reads environ).
+pub(crate) struct EtcEnvironment {
+    root: Option<PathBuf>,
+    etc: Option<PathBuf>,
+    home: Option<PathBuf>,
+    xdg_config: Option<PathBuf>,
+}
+
+impl EtcEnvironment {
+    pub(crate) fn capture() -> Self {
+        Self {
+            root: std::env::var_os("COSMIX").map(PathBuf::from),
+            etc: std::env::var_os("COSMIX_ETC").map(PathBuf::from),
+            home: std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            xdg_config: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        }
+    }
+
+    pub(crate) fn resolve(self) -> (PathBuf, bool) {
+        if let Some(etc) = self.etc {
+            return (etc, true);
+        }
+        let exe = std::env::current_exe().ok(); // OS executable path, not getenv.
+        let root = locate_root(self.root, exe.as_deref());
+        let etc = match root {
+            Some(root) => root.join("etc"),
+            None if current_uid() == 0 => PathBuf::from("/etc/cosmix"),
+            None => self
+                .xdg_config
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| {
+                    self.home
+                        .unwrap_or_else(home_without_environment)
+                        .join(".config")
+                })
+                .join("cosmix"),
+        };
+        (etc, false)
+    }
+}
+
+fn home_without_environment() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 65536];
+    // Resident-only NSS fallback, matching dirs' HOME-absent Unix behaviour.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() {
+        let entry = unsafe { entry.assume_init() };
+        if !entry.pw_dir.is_null() {
+            let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+            return PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes()));
+        }
+    }
+    PathBuf::from("/root")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_etc_environment_preserves_override_and_root_precedence() {
+        let captured = |etc| EtcEnvironment {
+            root: Some(PathBuf::from("/srv/cosmix")),
+            etc,
+            home: Some(PathBuf::from("/home/alice")),
+            xdg_config: Some(PathBuf::from("/alternate/config")),
+        };
+        assert_eq!(
+            captured(Some(PathBuf::from("/isolated/etc"))).resolve(),
+            (PathBuf::from("/isolated/etc"), true)
+        );
+        assert_eq!(
+            captured(None).resolve(),
+            (PathBuf::from("/srv/cosmix/etc"), false)
+        );
+    }
 
     #[test]
     fn env_root_wins_over_self_location() {

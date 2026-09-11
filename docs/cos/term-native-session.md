@@ -160,9 +160,10 @@ object or an attachment-owner handle. Mix adds no language surface for binding.
 The existing diagnostic Bus runtime is independent. A later child receives
 neither the launch descriptor nor its marker.
 
-All environment-derived account, endpoint and URL inputs are captured before
-the evaluator starts. The resident receives owned configuration and never reads
-the process environment concurrently with evaluator `setenv`.
+Only environment strings are captured before the evaluator starts. The resident
+resolves account NSS, discovers paths and reads configuration from those owned
+strings, so name-service or filesystem latency cannot delay the prompt. It never
+reads the process environment concurrently with evaluator `setenv`.
 
 The resident task performs verified Unix connect, hello, key-selected challenge,
 owner-UID `session.self {record_id}` discovery and prove, then renews every five seconds. Immutable
@@ -187,7 +188,10 @@ malformed hints use the once-only diagnostic reporter.
 Before either REPL exec-restart path replaces Mix, it signals the private owner
 to revoke its record and waits at most 16 seconds. The owner confirms revocation
 through an independent targeted read because self-revoke can close the socket
-before its ACK arrives. One diagnostic reports the result; an unavailable broker
+before its ACK arrives. During reconnect backoff it retains the last record,
+opens an independent connection and re-proves its retained key to regain
+self-revoke authority. The restart transaction has a ten-second total budget,
+with the same two-second per-RPC limit. One diagnostic reports the result; an unavailable broker
 leaves cleanup to lease/window expiry. The replacement shell runs normally but
 stays unbound until pane restart: v1 deliberately does not retain the seed over
 exec. A surviving PID alone must not leave a phantom attachment.
@@ -273,8 +277,9 @@ The desktop test `p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes`
 also runs the production NativeSession prepare → LaunchFd → teletypewriter
 mapping → real Mix proof path, requiring attachment generation 1 and revocation
 on actual child exit. It requires a clean current-HEAD release binary supplied
-through `COSMIX_E2E_MIX_BIN`, checks live Git status and embedded SHA, and skips
-loudly when the variable is absent. See Term's `tests/README.md`. This covers
+through `COSMIX_E2E_MIX_BIN` and checks live Git status and embedded SHA. It is
+ignored by default; explicit `--ignored` runs fail if the variable is absent.
+See Term's `tests/README.md` for the exact build and gate invocation. This covers
 p0i-01's binding portion, not S4 protected mutation admission.
 
 Term's teletypewriter PTY tests remain desktop-only; that dependency is not
@@ -290,7 +295,7 @@ boundary check, not a general reachability proof. A real-broker unit test delays
 one proof beyond challenge expiry and requires recovery without a lifecycle
 notice. A real-PTY test exercises the resume-flag exec-restart path and asserts
 revocation, the same PID, one diagnostic and a usable unbound replacement.
-No end-to-end seam remains ignored. Native-session, job-control and owned-editor
+The production Term→Mix test requires an explicit gate run. Native-session, job-control and owned-editor
 PTY tests each take a process-wide fixture mutex; serialisation no longer
 depends on the runner's thread-count flag.
 The desktop suite now invokes this main-workspace integration target through
@@ -300,6 +305,8 @@ fixture uses only `CARGO_BIN_EXE_mix` and checks `--version --json` for a clean
 build whose full source SHA equals the current checkout's HEAD before spawning
 the PTY. It also runs `git status --porcelain` against the live checkout rather
 than trusting a potentially stale embedded dirty flag after dependency edits.
+Both provenance checks use `-uno`: tracked changes fail; untracked scratch
+files do not invalidate the build.
 Run from a clean committed checkout; stale or unidentifiable binaries
 fail explicitly. Earlier desktop-only passes did not execute this cross-workspace
 fixture and were not evidence of Mix enrolment.

@@ -289,14 +289,157 @@ fn fresh_proof_retry_classification_and_budget_are_bounded() {
 fn resident_uses_configuration_captured_before_thread_start() {
     let source = include_str!("native_session.rs");
     let start = source.split("pub(super) fn start()").nth(1).unwrap();
-    assert!(start.find("resolve_noded_url()").unwrap() < start.find(".spawn(move ||").unwrap());
-    let worker = source.split("async fn own(").nth(1).unwrap();
-    for forbidden in ["std::env::", "resolve_noded_url()", "native_endpoint()"] {
+    let spawn = start.find(".spawn(move ||").unwrap();
+    assert!(start.find("NativeEnvironment::capture()").unwrap() < spawn);
+    assert!(start.find("environment.resolve()").unwrap() > spawn);
+    assert!(start.find("options(account,").unwrap() > spawn);
+    let worker = source.split("impl Bootstrap {").nth(1).unwrap();
+    for forbidden in [
+        "std::env::",
+        "use std::env",
+        "resolve_noded_url()",
+        "native_endpoint()",
+    ] {
         assert!(
             !worker.contains(forbidden),
             "resident must not read mutable environ"
         );
     }
+    // Imports above the worker must not make an unqualified env read invisible.
+    assert!(!source.contains("use std::env"));
+    let paths = include_str!("cosmix_paths.rs");
+    let resolution = paths
+        .split("pub(crate) fn resolve(self)")
+        .nth(1)
+        .unwrap()
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    for forbidden in ["std::env::var", "use std::env", "dirs::"] {
+        assert!(!resolution.contains(forbidden));
+    }
+}
+
+#[tokio::test]
+async fn restart_during_reconnect_backoff_revokes_over_independent_uds() {
+    use term_native_test_broker::Broker;
+    let mut broker = Broker::start();
+    let options = broker.options();
+    let UnixConnectOutcome::VerifiedUnix(parent) =
+        NodedClient::connect_unix("", &broker.url, &options, None)
+            .await
+            .unwrap()
+    else {
+        panic!("verified parent")
+    };
+    let parent_key = SigningKey::from_bytes(&[19; 32]);
+    let parent_record = parent
+        .session_allocate(&parent_key, Policy::DefaultOpen)
+        .await
+        .unwrap()
+        .record;
+    let child_key = SigningKey::from_bytes(&[42; 32]);
+    let grant = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: parent_record.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key: HexBytes(child_key.verifying_key().to_bytes()),
+            role: Role::PaneShell,
+            capabilities: vec![Capability::ReadState],
+        })
+        .await
+        .unwrap();
+    let file = memfd(
+        serde_json::json!({"grant": grant.grant, "record": grant.record}),
+        1,
+        SEALS,
+        false,
+    );
+    let mut bootstrap = parse(&file).ok().unwrap();
+    let UnixConnectOutcome::VerifiedUnix(child) =
+        NodedClient::connect_unix("", &broker.url, &options, None)
+            .await
+            .unwrap()
+    else {
+        panic!("verified child")
+    };
+    let hello = child.session_hello().await.unwrap();
+    let bound = bootstrap
+        .attach(&child, &hello, &mut Reporter::default())
+        .await
+        .ok()
+        .unwrap();
+    assert_eq!(bound.state, BindingState::Attached);
+    close(&child).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while parent
+            .session_self(bound.record_id)
+            .await
+            .unwrap()
+            .record
+            .state
+            != BindingState::Suspended
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Exercise the production 40s backoff arm with a retained record but NO
+    // usable old connection. An unconditional ack(false) fails this test.
+    let (sender, mut restart) = tokio::sync::mpsc::unbounded_channel();
+    let (ack, received) = std::sync::mpsc::sync_channel(1);
+    sender.send(ack).unwrap();
+    assert!(
+        !tokio::time::timeout(
+            Duration::from_secs(14),
+            reconnect_backoff(
+                4,
+                &mut restart,
+                &mut bootstrap,
+                Some(&bound),
+                &broker.url,
+                &options
+            )
+        )
+        .await
+        .unwrap()
+    );
+    assert!(received.try_recv().unwrap());
+    assert_eq!(
+        parent
+            .session_self(bound.record_id)
+            .await
+            .unwrap()
+            .record
+            .state,
+        BindingState::Revoked
+    );
+
+    broker.stop();
+    let (ack, received) = std::sync::mpsc::sync_channel(1);
+    sender.send(ack).unwrap();
+    assert!(
+        !tokio::time::timeout(
+            Duration::from_secs(14),
+            reconnect_backoff(
+                4,
+                &mut restart,
+                &mut bootstrap,
+                Some(&bound),
+                &broker.url,
+                &options
+            )
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !received.try_recv().unwrap(),
+        "unreachable broker cannot confirm revocation"
+    );
 }
 
 #[tokio::test]

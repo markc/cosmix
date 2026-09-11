@@ -232,22 +232,29 @@ pub(super) fn start() {
     // Snapshot every env-derived input while main is still single-threaded.
     // The evaluator may later mutate environ; the resident must never read it.
     let account = std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
-    let endpoint = crate::node_config::native_endpoint();
-    let url = crate::node_config::resolve_noded_url();
-    let options = match options(account, endpoint) {
-        Ok(options) => options,
-        Err(stage) => {
-            quarantine_failed_bootstrap();
-            loud(stage);
-            return;
-        }
-    };
+    let environment = crate::node_config::NativeEnvironment::capture();
     let (sender, restart) = tokio::sync::mpsc::unbounded_channel();
     let _ = RESTART.set(sender);
     if std::thread::Builder::new()
         .name("mix-native-session".into())
         .spawn(move || {
             let mut reporter = Reporter::default();
+            // NSS, filesystem discovery and config reads may stall. They are
+            // off the prompt path and consume only the captured env strings.
+            let (endpoint, url) = match environment.resolve() {
+                Ok(configuration) => configuration,
+                Err(stage) => {
+                    reporter.report(stage);
+                    return;
+                }
+            };
+            let options = match options(account, endpoint) {
+                Ok(options) => options,
+                Err(stage) => {
+                    reporter.report(stage);
+                    return;
+                }
+            };
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -271,7 +278,7 @@ pub(super) fn start() {
 
 fn options(
     account: String,
-    endpoint: Result<Option<std::path::PathBuf>, &'static str>,
+    endpoint: Option<std::path::PathBuf>,
 ) -> Result<UnixConnectOptions, &'static str> {
     let name =
         std::ffi::CString::new(account).map_err(|_| "configuration: invalid broker account")?;
@@ -297,8 +304,7 @@ fn options(
         uid: entry.pw_uid,
         gid: entry.pw_gid,
     });
-    options.configured_endpoint =
-        endpoint.map_err(|_| "configuration: invalid native-session endpoint configuration")?;
+    options.configured_endpoint = endpoint;
     options.require_native_session = true;
     Ok(options)
 }
@@ -549,16 +555,24 @@ async fn own(
     mut restart: tokio::sync::mpsc::UnboundedReceiver<RestartAck>,
 ) {
     let mut failures = 0;
+    // Survives transport loss: exec restart during backoff still has a target.
+    let mut last_record: Option<SessionRecord> = None;
     loop {
         if failures >= CONNECT_CAP {
             return;
         }
-        if failures > 0 {
-            tokio::select! {
-                biased;
-                Some(ack) = restart.recv() => { let _ = ack.send(false); return; }
-                _ = tokio::time::sleep(CONNECT_BACKOFF_BASE * (1 << (failures - 1).min(3))) => {}
-            }
+        if failures > 0
+            && !reconnect_backoff(
+                failures,
+                &mut restart,
+                &mut bootstrap,
+                last_record.as_ref(),
+                &url,
+                &options,
+            )
+            .await
+        {
+            return;
         }
         failures += 1;
         let result =
@@ -598,7 +612,6 @@ async fn own(
             }
         };
         let mut record: Option<SessionRecord> = None;
-        let mut last_record: Option<SessionRecord> = None;
         let mut pending = Some(Instant::now());
         let mut next_attempt = Instant::now();
         let mut wake_retry_used = false;
@@ -609,7 +622,7 @@ async fn own(
             tokio::select! {
                 biased;
                 Some(ack) = restart.recv() => {
-                    let revoked = revoke_for_restart(&connection, record.as_ref().or(last_record.as_ref()), &url, &options).await;
+                    let revoked = revoke_for_restart(&mut bootstrap, Some(&connection), record.as_ref().or(last_record.as_ref()), &url, &options).await;
                     let _ = ack.send(revoked);
                     break false;
                 }
@@ -676,8 +689,45 @@ async fn own(
     }
 }
 
+async fn reconnect_backoff(
+    failures: u32,
+    restart: &mut tokio::sync::mpsc::UnboundedReceiver<RestartAck>,
+    bootstrap: &mut Bootstrap,
+    record: Option<&SessionRecord>,
+    url: &str,
+    options: &UnixConnectOptions,
+) -> bool {
+    tokio::select! {
+        biased;
+        Some(ack) = restart.recv() => {
+            let confirmed = revoke_for_restart(bootstrap, None, record, url, options).await;
+            let _ = ack.send(confirmed);
+            false
+        }
+        _ = tokio::time::sleep(CONNECT_BACKOFF_BASE * (1 << (failures - 1).min(3))) => true
+    }
+}
+
 async fn revoke_for_restart(
-    connection: &VerifiedConnection,
+    bootstrap: &mut Bootstrap,
+    connection: Option<&VerifiedConnection>,
+    record: Option<&SessionRecord>,
+    url: &str,
+    options: &UnixConnectOptions,
+) -> bool {
+    // All phases share a total budget, including a fresh proof during backoff.
+    // The caller's 16s wait also allows an in-flight ordinary proof to finish.
+    tokio::time::timeout(
+        RPC * 5,
+        revoke_for_restart_inner(bootstrap, connection, record, url, options),
+    )
+    .await
+    .unwrap_or(false)
+}
+
+async fn revoke_for_restart_inner(
+    bootstrap: &mut Bootstrap,
+    connection: Option<&VerifiedConnection>,
     record: Option<&SessionRecord>,
     url: &str,
     options: &UnixConnectOptions,
@@ -685,7 +735,38 @@ async fn revoke_for_restart(
     let Some(record) = record else {
         return false;
     };
+    let mut record = record.clone();
+    let independent;
+    let connection = match connection {
+        Some(connection) => connection,
+        None => {
+            let Ok(Ok(UnixConnectOutcome::VerifiedUnix(connection))) =
+                tokio::time::timeout(RPC, NodedClient::connect_unix("", url, options, None)).await
+            else {
+                return false;
+            };
+            let Ok(Ok(hello)) = tokio::time::timeout(RPC, connection.session_hello()).await else {
+                close(&connection).await;
+                return false;
+            };
+            // UID authentication permits discovery, not child revocation.
+            // Re-prove the retained key to recover self-revoke authority.
+            match bootstrap
+                .attach(&connection, &hello, &mut Reporter::default())
+                .await
+            {
+                Ok(bound) => record = bound,
+                Err(_) => {
+                    close(&connection).await;
+                    return false;
+                }
+            }
+            independent = connection;
+            &independent
+        }
+    };
     let _ = tokio::time::timeout(RPC, connection.session_revoke(record.reference())).await;
+    close(connection).await;
     // Self-revoke closes its transport before the ACK is guaranteed. Confirm
     // committed state through an independent authenticated, targeted read.
     let Ok(Ok(UnixConnectOutcome::VerifiedUnix(observer))) =

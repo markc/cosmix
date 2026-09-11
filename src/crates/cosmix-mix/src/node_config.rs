@@ -98,17 +98,46 @@ pub fn resolve_noded_url() -> String {
 
 /// Required native-session connections must not fall through a broken explicit
 /// configuration. Keep the ordinary lazy TCP resolver's behaviour unchanged.
-pub fn native_endpoint() -> Result<Option<PathBuf>, &'static str> {
-    for path in search_paths() {
+pub(crate) struct NativeEnvironment {
+    explicit: Option<String>,
+    etc: crate::cosmix_paths::EtcEnvironment,
+}
+
+impl NativeEnvironment {
+    /// Main-thread snapshot only. No file reads, self-location or NSS here.
+    pub(crate) fn capture() -> Self {
+        Self {
+            explicit: std::env::var("COSMIX_NODE_CONFIG").ok(),
+            etc: crate::cosmix_paths::EtcEnvironment::capture(),
+        }
+    }
+
+    pub(crate) fn resolve(self) -> Result<(Option<PathBuf>, String), &'static str> {
+        let paths = if let Some(path) = self.explicit {
+            vec![PathBuf::from(path)]
+        } else {
+            let (etc, explicit) = self.etc.resolve();
+            paths_from_etc(etc, explicit)
+        };
+        native_from_paths(paths)
+    }
+}
+
+fn native_from_paths(paths: Vec<PathBuf>) -> Result<(Option<PathBuf>, String), &'static str> {
+    for path in paths {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
-                return parse_native_endpoint(&contents);
+                let endpoint = parse_native_endpoint(&contents)?;
+                let url = cosmix_mix::from_conf_mix_str::<MixNodeConfig>(&contents)
+                    .map(|config| config.broker_url())
+                    .unwrap_or_else(|_| FALLBACK_URL.to_owned());
+                return Ok((endpoint, url));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err("unreadable node configuration"),
         }
     }
-    Ok(None)
+    Ok((None, FALLBACK_URL.to_owned()))
 }
 
 fn parse_native_endpoint(contents: &str) -> Result<Option<PathBuf>, &'static str> {
@@ -154,6 +183,10 @@ fn search_paths() -> Vec<PathBuf> {
     let etc = cosmix_path(CosmixDir::Etc);
     let cosmix_etc_set = std::env::var_os("COSMIX_ETC").is_some();
 
+    paths_from_etc(etc, cosmix_etc_set)
+}
+
+fn paths_from_etc(etc: PathBuf, cosmix_etc_set: bool) -> Vec<PathBuf> {
     let mut dirs = vec![etc];
     if !cosmix_etc_set {
         let system = PathBuf::from("/etc/cosmix");
@@ -187,6 +220,27 @@ fn load_from(path: &Path) -> Option<MixNodeConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_config_read_keeps_first_file_authoritative() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.conf.mix");
+        let second = root.path().join("second.conf.mix");
+        std::fs::write(
+            &second,
+            "wg_ip: \"192.0.2.5\"\nnoded: { port: 4300, unix_socket: \"/run/test.sock\" }",
+        )
+        .unwrap();
+        assert_eq!(
+            native_from_paths(vec![first.clone(), second.clone()]).unwrap(),
+            (
+                Some(PathBuf::from("/run/test.sock")),
+                "ws://192.0.2.5:4300/ws".into()
+            )
+        );
+        std::fs::write(&first, "noded: { unix_socket: 7 }").unwrap();
+        assert!(native_from_paths(vec![first, second]).is_err());
+    }
 
     #[test]
     fn native_endpoint_is_typed_without_changing_legacy_url_parsing() {
