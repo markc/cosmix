@@ -1,6 +1,10 @@
 -- Run from the repository src/ directory on the build worker.
 -- Cargo selects the package cosmix-term; its binary is named term.
-$tree = run_argv(["cargo", "tree", "--locked", "-p", "cosmix-term", "--manifest-path", "desktop/Cargo.toml", "-e", "features"], {timeout: 600})
+-- RUSTC_WRAPPER disabled as in every sibling gate. `cargo tree` shells out to
+-- rustc for its version, so a wrapper that cannot reach its server blocks this
+-- gate on a build host — and a caching layer must never be able to decide
+-- whether a gate runs at all.
+$tree = run_argv(["cargo", "tree", "--locked", "-p", "cosmix-term", "--manifest-path", "desktop/Cargo.toml", "-e", "features"], {timeout: 600, env: {"RUSTC_WRAPPER": ""}})
 if $tree["exit_code"] != 0 then
   print($tree["stderr"])
   print("GATE BLOCKED: cargo tree failed; an empty filter is not a pass")
