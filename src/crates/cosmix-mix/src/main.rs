@@ -25,6 +25,7 @@ macro_rules! eprintln {
 mod bus;
 mod completion;
 mod cosmix_paths;
+pub mod editor;
 mod exec;
 mod job_control;
 mod jobs;
@@ -32,6 +33,7 @@ mod lint;
 mod meta;
 mod node_config;
 mod repl;
+mod repl_editor;
 mod serve_runtime;
 mod shell;
 mod shell_handler;

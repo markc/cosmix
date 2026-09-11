@@ -1,4 +1,6 @@
 //! Real PTYs and a re-executed Rust fixture (no shell/interpreter helpers).
+//! REQUIRED: run with --test-threads=1. openpty has no atomic CLOEXEC option;
+//! serial execution excludes sibling fixture forks during openpty/dup/close.
 #![cfg(target_os = "linux")]
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -258,6 +260,12 @@ impl Pty {
             },
             0
         );
+        for fd in [&mut m, &mut s] {
+            let retained = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(retained >= 0);
+            unsafe { libc::close(*fd); }
+            *fd = retained;
+        }
         let master = unsafe { File::from_raw_fd(m) };
         let slave = unsafe { File::from_raw_fd(s) };
         let initial_modes = tty_modes(s);
@@ -266,11 +274,7 @@ impl Pty {
             broken.c_oflag &= !(libc::OPOST | libc::ONLCR);
             assert_eq!(unsafe { libc::tcsetattr(s, libc::TCSANOW, &broken) }, 0);
         }
-        // Keep fixture FDs out of child exec; stdio clones are explicitly duped.
-        unsafe {
-            libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
+        // Originals are closed; only CLOEXEC fds and explicit stdio clones remain.
         let executable = home.path().join("mix");
         fs::copy(env!("CARGO_BIN_EXE_mix"), &executable).unwrap();
         let mut cmd = Command::new(executable);

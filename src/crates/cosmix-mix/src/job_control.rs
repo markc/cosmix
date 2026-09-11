@@ -1,4 +1,4 @@
-//! Interactive process ownership. No evaluator, editor or Bus dependencies.
+//! Interactive process ownership. Only signal-safe stop ingress crosses into the editor.
 //!
 //! Only this controller consumes wait statuses for registered interactive
 //! children. Captured runners and noninteractive children never enter it.
@@ -32,10 +32,14 @@ fn shell_signal_action(signal: libc::c_int) -> libc::sigaction {
     unsafe {
         libc::sigemptyset(&mut action.sa_mask);
     }
-    if matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
+    if signal == libc::SIGTTIN {
         // Reset atomically on entry; NODEFER lets raise deliver before the
         // known handler is reinstalled, including for orphaned groups.
         action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+    } else if signal == libc::SIGTSTP {
+        // Keep the handler installed throughout cooperative editor routing;
+        // RESET would expose a raw-mode default-stop window to a second signal.
+        action.sa_flags = libc::SA_NODEFER;
     }
     action
 }
@@ -44,14 +48,29 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     if !matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
         return;
     }
-    // SA_RESETHAND already installed SIG_DFL. Never save/restore a previous
-    // disposition: concurrent entries could otherwise save that temporary
-    // default and permanently lose the handler. Reinstall the known action
-    // after resume (or immediately when suppressing a managed-job SIGTSTP).
+    let _stop_handler = (signal == libc::SIGTSTP)
+        .then(crate::editor::signals::StopHandler::enter);
+    // One decision: a managed-job transition must not skip routing and then
+    // take the default branch on a second, different observation.
+    let managed = MANAGED_FOREGROUND.load(Ordering::Acquire);
+    // SIGTTIN enters with SIG_DFL already installed. SIGTSTP retains its
+    // handler while routing cooperatively, and installs SIG_DFL only for the
+    // actual cooked-mode stop. Always reinstall the known action on return;
+    // never save a concurrent handler's temporary default disposition.
     // SIGTTIN always stops: retrying a background terminal read would spin.
     // Every operation here is async-signal-safe; no locks or allocation.
     unsafe {
-        if signal == libc::SIGTTIN || !MANAGED_FOREGROUND.load(Ordering::Acquire) {
+        if signal == libc::SIGTSTP
+            && !managed
+            && crate::editor::signals::request_stop()
+        {
+            libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
+            return;
+        }
+        if signal == libc::SIGTTIN || !managed {
+            if signal == libc::SIGTSTP {
+                libc::signal(signal, libc::SIG_DFL);
+            }
             libc::raise(signal);
         }
         libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
@@ -202,7 +221,10 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     shell_modes: Mutex<libc::termios>,
+    terminal_shutdown: Mutex<Option<TerminalShutdown>>,
 }
+
+type TerminalShutdown = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 pub struct Controller {
     shared: Arc<Shared>,
@@ -339,6 +361,7 @@ impl Controller {
             }),
             changed: Condvar::new(),
             shell_modes: Mutex::new(modes(fd)?),
+            terminal_shutdown: Mutex::new(None),
         });
         // signal-hook's SA_RESTART is load-bearing for blocking legacy waits.
         let mut events = signal_hook::iterator::Signals::new([libc::SIGCHLD, libc::SIGHUP])?;
@@ -350,6 +373,14 @@ impl Controller {
             .spawn(move || {
                 for signal in events.forever() {
                     if signal == libc::SIGHUP {
+                        // The input owner restores its protocols before exit.
+                        // Never invoke callbacks under controller state locks.
+                        let shutdown = monitor.terminal_shutdown.lock().unwrap().clone();
+                        if let Some(shutdown) = shutdown
+                            && let Err(e) = shutdown()
+                        {
+                            eprintln!("mix: input shutdown: {e}");
+                        }
                         close_jobs(&monitor);
                         let _ = foreground(monitor_tty.as_raw_fd(), shell_pgid);
                         let _ = set_modes(
@@ -378,6 +409,11 @@ impl Controller {
             old_signals,
             fallback_executable,
         })))
+    }
+
+    /// Install the input owner's protocol/mode shutdown, separate from PGIDs.
+    pub fn set_terminal_shutdown(&self, shutdown: TerminalShutdown) {
+        *self.shared.terminal_shutdown.lock().unwrap() = Some(shutdown);
     }
 
     /// Owned snapshots are the attachment point for stage A; no publication
@@ -691,16 +727,24 @@ pub struct TerminalLease<'a> {
 impl Drop for TerminalLease<'_> {
     fn drop(&mut self) {
         *self.controller.shared.shell_modes.lock().unwrap() = self.saved;
-        match foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid) {
-            Ok(()) => {
-                MANAGED_FOREGROUND.store(false, Ordering::Release);
-                if let Err(e) = set_modes(self.controller.tty.as_raw_fd(), &self.saved) {
-                    eprintln!("mix: terminal restore: {e}");
-                }
-            }
-            Err(e) => eprintln!("mix: terminal restore: {e}"),
+        // The managed operation is over even if reclaiming the tty fails.
+        // Retaining this bit would permanently suppress subsequent shell stops.
+        if let Err(e) = release_foreground(&MANAGED_FOREGROUND, || {
+            foreground(self.controller.tty.as_raw_fd(), self.controller.shell_pgid)?;
+            set_modes(self.controller.tty.as_raw_fd(), &self.saved)
+        }) {
+            eprintln!("mix: terminal restore: {e}");
         }
     }
+}
+
+fn release_foreground(
+    managed: &AtomicBool,
+    reclaim: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let result = reclaim();
+    managed.store(false, Ordering::Release);
+    result
 }
 
 fn reap(shared: &Shared) {
@@ -964,6 +1008,16 @@ pub fn stage_entry() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_foreground_reclaim_does_not_suppress_later_stops() {
+        let managed = super::AtomicBool::new(true);
+        let result = super::release_foreground(&managed, || {
+            assert!(managed.load(super::Ordering::Acquire));
+            Err(std::io::Error::from_raw_os_error(libc::ENOTTY))
+        });
+        assert!(result.is_err());
+        assert!(!managed.load(super::Ordering::Acquire));
+    }
     use super::*;
     fn job(states: &[MemberState]) -> Job {
         Job {

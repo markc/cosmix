@@ -31,6 +31,10 @@ The two-context split is the thing to internalise: `$(...)` and `{a,b}` are
 
 ## Where shell-dispatch happens
 
+Interactive sessions can opt into the [owned editor preview](owned-editor.md)
+with `MIX_EDITOR=owned`. Rustyline remains the default; both editors feed the
+same shell-dispatch and evaluation paths.
+
 Three entry points run the same classifier (`shell::classify_input`) and the
 same executor (`exec.rs`):
 
