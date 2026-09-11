@@ -33,7 +33,6 @@ cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bu
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 zeroize = "1"
 sha2 = "0.10"
-cosmix-props = { package = "cosmix-lib-props-store", path = "../../../crates/cosmix-lib-props-store", default-features = false, features = ["cosmix"] }
 
 [dev-dependencies]
 term-native-test-broker = { path = "tests/support" }

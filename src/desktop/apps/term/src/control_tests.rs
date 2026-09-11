@@ -997,15 +997,33 @@ fn p0i_08_stale_cleanup_and_private_event_connection_guard() {
         fixture.rebind(&successor, false).await;
         first.client().close().await;
         assert_eq!(call(successor.client(), &parent.name, "term.props.get", json!({"target":target,"property":"state"})).await.0, 0);
-        let event = tokio::time::timeout(Duration::from_millis(350), async {
+        // Fire the revocation the CLOSED connection was owed. Previously the
+        // negative below ran before any revocation existed, so it held against
+        // a completely dead notice pipeline.
+        listener.block_control_writes(false);
+        listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
+        let crossed = tokio::time::timeout(Duration::from_millis(350), async {
             loop {
                 let event = successor.recv().await.unwrap();
                 if event.command().command == "term.input.revoked" { break event; }
             }
         }).await;
-        assert!(event.is_err(), "private event crossed from old connection to successor");
+        assert!(crossed.is_err(), "private event crossed from old connection to successor");
+        // Positive control, same fixture: the pipeline that just stayed silent
+        // has to be able to deliver at all, or the assertion above proves
+        // nothing. The successor claims input itself and must receive its own
+        // revocation, addressed to its own connection.
+        listener.block_control_writes(true);
+        assert_eq!(call(successor.client(), &parent.name, "term.type", json!({"target":target,"request_id":"2","foreground_generation":listener.foreground_generation().to_string(),"text":"NEW_ATTACHMENT"})).await.0, 0);
         listener.block_control_writes(false);
         listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = successor.recv().await.unwrap();
+                if event.command().command == "term.input.revoked" { break event; }
+            }
+        }).await.expect("the successor must receive its OWN revocation");
+        assert_eq!(delivered.trusted_context().unwrap().session.as_ref().unwrap().record_id, parent.record_id);
         assert_eq!(call(successor.client(), &parent.name, "term.snapshot", json!({"target":target})).await.0, 0, "stale close revoked successor");
     });
 }

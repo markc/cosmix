@@ -555,45 +555,19 @@ impl Control {
         if !permit.valid() || tabs.pane_by_id(target.pane_id.0).is_none() {
             return Reply::error("FORBIDDEN");
         }
-        if property {
-            let peer = cosmix_props::PeerIdentity {
-                unix_uid: Some(actor.unix_uid),
-                unix_gid: Some(actor.unix_gid),
-                native_session: Some(actor.clone()),
-                ..Default::default()
-            };
-            let parent = parent.clone();
-            let target = target.clone();
-            let permit = permit.clone();
-            let token = cosmix_props::Capability::new(format!(
-                "props.{}:term.pane:{}:{}:{}",
-                if matches!(capability, Capability::ReadState | Capability::ReadContents) {
-                    "read"
-                } else {
-                    "write"
-                },
-                target.pane_id.0,
-                target.pane_generation.0,
-                capability.as_str()
-            ))
-            .unwrap();
-            let issued = token.clone();
-            let policy = cosmix_props::AuthPolicy::new(move |peer| {
-                if permit.valid()
-                    && peer
-                        .native_session
-                        .as_ref()
-                        .is_some_and(|actor| allows(&parent, actor, &target, capability))
-                {
-                    [issued.clone()].into_iter().collect()
-                } else {
-                    cosmix_props::CapabilitySet::empty()
-                }
-            });
-            if !policy.resolve(&peer).contains(&token) {
-                return Reply::error("FORBIDDEN");
-            }
-        }
+        // `term.props.*` is a VERB ALIAS, not a second authorisation surface.
+        // Each property name resolved to a verb above and everything after this
+        // point is the enforcement for both spellings, which is precisely what
+        // PROP-024 requires: the property owner shares BROKER-023's policy and
+        // current-target checks with its verb handlers.
+        //
+        // There used to be an AuthPolicy here that rebuilt a PeerIdentity from
+        // the actor this function had already authorised, then asked `allows`
+        // the same question again with the same arguments. It could not fail on
+        // any reachable path, and it read like an independent gate — which is
+        // worse than no gate, because a reader counts it as defence. If a
+        // second surface is ever wanted it has to consult something `allows`
+        // does not; until then the alias carries no separate check.
         let layout = matches!(capability, Capability::ManageLayout | Capability::Terminate);
         if layout {
             let affected = tabs.control_affected(target.pane_id.0, verb);
