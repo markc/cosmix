@@ -24,6 +24,8 @@
 $shell_prefix = "stage_d"
 $shell_fixtures = [
   "stage_d_a_cancelled_captured_runner_reports_cancelled_not_completed",
+  "stage_d_a_refused_submission_may_be_retried_under_the_same_id",
+  "stage_d_an_undetermined_admission_still_resolves_to_its_real_outcome",
   "stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact",
   "stage_d_a_signal_during_an_admitted_execution_does_not_reach_the_next_one",
   "stage_d_admits_at_an_idle_prompt_echoes_and_reports_a_structured_result",

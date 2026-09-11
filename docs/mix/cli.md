@@ -770,6 +770,11 @@ is refused exactly like one that does not exist.
 
 Retries are BROKER-018 idempotent: an identical submission under the same
 request id replays the recorded answer rather than executing a second time.
+**Request ids must be monotonic per caller.** A spent id stays spent even after
+its record is gone (see the cap below), so reusing a lower id answers
+`UNKNOWN_OUTCOME` rather than executing; callers going through Term get this
+for free, because Term mints its own sequence, but a direct caller has to keep
+its own counter.
 **Fifteen minutes is the ceiling, not a promise.** The store holds 256
 operations, and a busy shell reaches that long before it reaches the clock; the
 oldest COMPLETED record is then evicted (a running one never is). What survives
@@ -780,7 +785,9 @@ when its result no longer exists.
 Three refusals are worth telling apart, because they are different facts:
 
 * `BUSY` — nothing was announced and nothing ran. The request id is untouched
-  and the same submission may simply be retried.
+  and the same submission may simply be retried. This is the commonest refusal
+  by design: a reservation is given up the instant the human touches the
+  keyboard, so a busy pane produces it routinely.
 * `UNKNOWN_OUTCOME` with `reason: admission_abandoned_before_execution` — proven
   that nothing ran, but the id is spent and its outcome recorded. Retrying it
   replays that; use a new id to try again.

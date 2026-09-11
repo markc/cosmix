@@ -1043,6 +1043,11 @@ what somebody else drove it to do — and an operation belonging to another acto
 is refused exactly like one that does not exist.</p>
 <p>Retries are BROKER-018 idempotent: an identical submission under the same
 request id replays the recorded answer rather than executing a second time.
+<strong>Request ids must be monotonic per caller.</strong> A spent id stays spent even after
+its record is gone (see the cap below), so reusing a lower id answers
+<code>UNKNOWN_OUTCOME</code> rather than executing; callers going through Term get this
+for free, because Term mints its own sequence, but a direct caller has to keep
+its own counter.
 <strong>Fifteen minutes is the ceiling, not a promise.</strong> The store holds 256
 operations, and a busy shell reaches that long before it reaches the clock; the
 oldest COMPLETED record is then evicted (a running one never is). What survives
@@ -1052,7 +1057,9 @@ when its result no longer exists.</p>
 <p>Three refusals are worth telling apart, because they are different facts:</p>
 <ul>
 <li><code>BUSY</code> — nothing was announced and nothing ran. The request id is untouched
-and the same submission may simply be retried.</li>
+and the same submission may simply be retried. This is the commonest refusal
+by design: a reservation is given up the instant the human touches the
+keyboard, so a busy pane produces it routinely.</li>
 <li><code>UNKNOWN_OUTCOME</code> with <code>reason: admission_abandoned_before_execution</code> — proven
 that nothing ran, but the id is spent and its outcome recorded. Retrying it
 replays that; use a new id to try again.</li>

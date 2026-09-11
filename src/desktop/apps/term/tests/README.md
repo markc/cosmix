@@ -80,6 +80,7 @@ one comparison against a captured field.
 |---|---|---|
 | `MIX_ADMIT_DELAY_MS` | the editor thread, before an admission claims its owner token | the queued-envelope window, so a fixture can make the admission owner give up while the envelope is still queued |
 | `MIX_RESERVE_HOLD_MS` | the admission owner, between reserve and commit | the reservation window, so a fixture can type into it |
+| `MIX_CLAIM_DELAY_MS` | the editor thread, AFTER an admission claims its token | the committed window, the only way to reach the branch where the owner's abandon loses and the outcome is genuinely undetermined |
 
 They are not `#[cfg(test)]` because the PTY fixtures drive the real release
 binary, which is built without test cfg by construction — a hook compiled out of
