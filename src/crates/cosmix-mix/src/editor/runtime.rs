@@ -612,10 +612,14 @@ impl OwnedEditor {
         let worker_control = control.clone();
         // Captured here, before the worker starts, so no later environment
         // mutation by evaluated Mix can reach it.
-        let admit_delay = std::env::var("MIX_ADMIT_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
+        let delay = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis)
+        };
+        let admit_delay = delay("MIX_ADMIT_DELAY_MS");
+        let claim_delay = delay("MIX_CLAIM_DELAY_MS");
         let worker = std::thread::Builder::new()
             .name("mix-editor".into())
             .spawn(move || {
@@ -649,6 +653,7 @@ impl OwnedEditor {
                     control: worker_control,
                     reserved_until: None,
                     admit_delay,
+                    claim_delay,
                 };
                 // Receiver remains alive until cleanup is complete. HUP waits
                 // on the latch even on channel failure, rather than inferring
@@ -758,6 +763,8 @@ struct Owner {
     /// produce the owner-gives-up-while-queued interleaving deterministically.
     /// Captured at editor start; zero in every ordinary run.
     admit_delay: std::time::Duration,
+    /// Same, but after the claim — see the Admit handler.
+    claim_delay: std::time::Duration,
 }
 fn protocol(error: super::ProtocolError) -> io::Error {
     io::Error::other(format!("editor protocol: {error:?}"))
@@ -1111,6 +1118,13 @@ impl Owner {
                 // rather than having to assume it.
                 if !token.claim() {
                     return Err(io::Error::other("admission abandoned by its owner"));
+                }
+                // Test hook, sibling of `admit_delay` and captured the same
+                // way: stalls AFTER the claim, which is the only way to reach
+                // the branch where the owner's abandon LOSES and the answer is
+                // genuinely undetermined.
+                if !self.claim_delay.is_zero() {
+                    std::thread::sleep(self.claim_delay);
                 }
                 // §8 step 6, in order: stop reads and restore cooked mode,
                 // THEN announce, THEN execute. Everything up to this line

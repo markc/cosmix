@@ -2176,3 +2176,97 @@ fn stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human() {
         teardown(f).await;
     });
 }
+
+/// F1, end to end: the refusal the D11 design makes COMMONEST must not burn the
+/// caller's request id. Before this, `store.admit` spent the id before anything
+/// was tried, so a keystroke-refused submission answered BUSY ("simply retry")
+/// and every retry of that id then met a retired mark, permanently.
+#[test]
+fn stage_d_a_refused_submission_may_be_retried_under_the_same_id() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        let mut f = stage_d_fixture_with(
+            "owned",
+            &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())],
+        )
+        .await;
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let body = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
+        let submitting = tokio::spawn({
+            let name = f.bound.name.clone();
+            let client = f.parent.connection.clone();
+            let body = body.clone();
+            async move {
+                client
+                    .client()
+                    .call(&name, "shell.execute", body)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.child.send("x");
+        let error = tokio::time::timeout(Duration::from_secs(10), submitting)
+            .await
+            .expect("the submission must answer")
+            .unwrap()
+            .expect_err("a keystroke must refuse the admission");
+        assert_eq!(error, r#"{"error_code":"BUSY"}"#, "{error}");
+
+        // Clear the stray byte, then retry THE SAME request id. The contract
+        // that refusal states is that this is a real submission, not a replay.
+        f.child.send("\x08\n");
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let retry = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
+        let accepted = execute_call(&mut f.parent, &f.bound, "shell.execute", retry)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("the refused id was burned; retry answered {e}")
+            });
+        assert_eq!(accepted["status"], "accepted", "{accepted}");
+        let operation = counter(&accepted["operation_id"]);
+        let result = result_of(&mut f.parent, &f.bound, operation).await;
+        assert_eq!(result["result"]["outcome"], "completed", "{result}");
+        f.child.until("RETRY_RAN\r\n");
+        teardown(f).await;
+    });
+}
+
+/// The `Unknown` branch: the owner's abandon LOSES, so the editor is already
+/// committed and the outcome is genuinely undetermined. The contract is that
+/// the record stays resolvable and the real outcome lands in it — an
+/// UNKNOWN_OUTCOME that resolved to nothing would be a permanent lie.
+#[test]
+fn stage_d_an_undetermined_admission_still_resolves_to_its_real_outcome() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        // Stall AFTER the claim, past budget + grace, so abandon loses.
+        let mut f = stage_d_fixture_with(
+            "owned",
+            &[("MIX_CLAIM_DELAY_MS".into(), "2200".into())],
+        )
+        .await;
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let error = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            execute_request(&f.bound, 1, generation, "print(\"UNDETERMINED_RAN\")"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
+        let refusal: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(
+            refusal["reason"], "admission_claimed_without_report",
+            "the caller cannot tell this from the abandoned case: {refusal}"
+        );
+        let operation = counter(&refusal["operation_id"]);
+
+        // The editor DID go on to execute it. The record must carry that.
+        let result = result_of(&mut f.parent, &f.bound, operation).await;
+        assert_eq!(result["result"]["outcome"], "completed", "{result}");
+        f.child.until("UNDETERMINED_RAN\r\n");
+        teardown(f).await;
+    });
+}
