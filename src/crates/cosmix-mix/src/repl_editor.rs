@@ -95,10 +95,14 @@ impl ReplEditor {
         let editor = match duplicate(0).and_then(|input| {
             duplicate(1).and_then(|output| {
                 if crate::session_state::enabled() {
-                    OwnedEditor::start_with_activation(
+                    OwnedEditor::start_with_hooks(
                         input,
                         output,
                         Some(crate::session_state::prompt_activated),
+                        // The editor is the only party that can observe an
+                        // admission failing after it claimed the work; the
+                        // owner has already been answered by then.
+                        Some(crate::session_execute::admission_failed),
                     )
                 } else {
                     OwnedEditor::start(input, output)

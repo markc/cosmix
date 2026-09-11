@@ -190,13 +190,20 @@ fn intern(id: u64) -> Arc<Evaluation> {
         return existing.clone();
     }
     if registry.len() >= RETAINED {
-        // Oldest finished first. Nothing unfinished is ever evicted — neither a
-        // running evaluation nor one that has been published and not yet begun,
-        // because both still have an outcome owed to somebody.
+        // Oldest FINISHED first, and nothing else — neither a running
+        // evaluation nor one published and not yet begun, because both still
+        // have an outcome owed to somebody. Evicting a live entry is not a
+        // lesser evil: `cancel` then answers Unknown for a running operation,
+        // `reassert` stops re-raising so a `catch` swallows the cancellation,
+        // and `state` reports no intent — every contradiction this module
+        // exists to remove, restored silently.
+        //
+        // With nothing finished the registry simply grows past RETAINED. It
+        // cannot grow without bound: an evaluation that never runs is forgotten
+        // by its admission owner, so unfinished entries are the one running
+        // evaluation plus the admissions currently in flight.
         if let Some(index) = registry.iter().position(|e| e.finished()) {
             registry.remove(index);
-        } else {
-            registry.remove(0);
         }
     }
     let evaluation = Arc::new(Evaluation {
@@ -255,6 +262,25 @@ pub fn publish(id: u64) -> Arc<Evaluation> {
     intern(id)
 }
 
+/// Discard an identity that will never run.
+///
+/// [`publish`] creates an entry at mint; only a `Guard` drop marks one
+/// finished. An admission that is refused, abandoned or left undetermined never
+/// begins, so without this its entry stays unfinished forever — and an
+/// unfinished entry is one the eviction rule above correctly refuses to touch.
+/// Called by the admission owner on exactly those outcomes.
+pub fn forget(id: u64) {
+    let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    // Never the running one. `ACTIVE` is the authority on that, not the
+    // caller's belief about which id it owns — and an admission owner that
+    // called this about an id the editor turned out to be executing would
+    // otherwise erase a live evaluation's cancellation state.
+    if ACTIVE.load(Ordering::Relaxed) == id {
+        return;
+    }
+    registry.retain(|e| e.id != id);
+}
+
 /// Open an evaluation under `id`, adopting whatever [`publish`] already
 /// recorded against it.
 pub fn begin(id: u64) -> Guard {
@@ -302,9 +328,13 @@ pub fn cancel(id: u64) -> Outcome {
         return Outcome::AlreadyFinished;
     }
     evaluation.request(Source::Request);
-    // Raise the shared flag only while this evaluation is the ACTIVE one; a
-    // request that lost the race to completion has already returned above.
-    if ACTIVE.load(Ordering::Relaxed) == id {
+    // Raise the shared flag only while this evaluation is the ACTIVE one AND
+    // still unfinished. The second check is not redundant with the one above:
+    // between them the guard can drop, which lowers the flag — raising it after
+    // that leaves it set with nobody to consume it, and the NEXT evaluation
+    // then dies at its first checkpoint under a cancellation addressed to its
+    // predecessor.
+    if ACTIVE.load(Ordering::Relaxed) == id && !evaluation.finished() {
         raise();
     }
     // Intent is recorded either way, and that is what makes this `Requested`

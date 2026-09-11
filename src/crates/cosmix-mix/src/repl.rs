@@ -151,10 +151,16 @@ impl Report {
 impl Drop for Report {
     fn drop(&mut self) {
         let cancellation = CancellationReport::for_evaluation(self.operation);
-        // `cancelled` means the cancellation actually landed, which only the
-        // cancellation machinery knows. An evaluation that failed for its own
-        // reasons under a standing cancellation keeps its own outcome.
-        if cancellation.delivered == "cooperative" {
+        // Delivered is not the same as died. A cancellation that reached a
+        // child which ignores SIGINT, and which then ran to completion and
+        // exited zero, did not cancel anything — overwriting that to
+        // "cancelled" would report work as stopped when its own result says it
+        // finished. The outcome comes from what was RECORDED about the
+        // evaluation; the cancellation block reports the delivery separately,
+        // so a caller sees both facts and neither is inferred from the other.
+        let completed_anyway =
+            self.outcome == "completed" && self.status.is_none_or(|status| status == 0);
+        if cancellation.delivered == "cooperative" && !completed_anyway {
             self.outcome = "cancelled";
         }
         crate::session_execute::finished(
@@ -170,6 +176,21 @@ impl Drop for Report {
                 cancellation,
             },
         );
+    }
+}
+
+/// A shell-builtin arm returns to the prompt without touching the pipeline
+/// result, so a status the shell already computed reaches the report only if it
+/// is put there. The whole family needs this, not just the first one found:
+/// `cd`, `pushd` and `popd` all report a real failure, and an admitted
+/// `pushd /nonexistent` that answered "completed" would be a lie the caller has
+/// no other way to detect.
+fn record_builtin(report: &mut Option<Report>, code: i32, what: &str) {
+    if let Some(report) = report.as_mut() {
+        report.status = Some(i64::from(code));
+        if code != 0 {
+            report.fail(format!("{what}: exit status {code}"));
+        }
     }
 }
 
@@ -251,7 +272,9 @@ pub fn run_repl() -> i32 {
                 let signaller = controller.clone();
                 crate::session_execute::register(
                     control.clone(),
-                    std::sync::Arc::new(move || signaller.interrupt_foreground()),
+                    std::sync::Arc::new(move |evaluation| {
+                        signaller.interrupt_foreground(evaluation)
+                    }),
                 );
             }
             controller.set_terminal_shutdown(std::sync::Arc::new(move || control.shutdown()));
@@ -259,7 +282,7 @@ pub fn run_repl() -> i32 {
             // No job controller: the shell is not managing process groups, so
             // there is nothing to signal and the surface says so by having no
             // stronger path than the cooperative one.
-            crate::session_execute::register(control.clone(), std::sync::Arc::new(|| None));
+            crate::session_execute::register(control.clone(), std::sync::Arc::new(|_| None));
         }
     }
 
@@ -778,31 +801,30 @@ pub fn run_repl() -> i32 {
                                 // A status the shell already computed must
                                 // reach the report.
                                 let code = handle_cd(&pipeline.segments[0].args, &mut eval);
-                                if let Some(report) = report.as_mut() {
-                                    report.status = Some(i64::from(code));
-                                    if code != 0 {
-                                        report.fail(format!("cd: exit status {code}"));
-                                    }
-                                }
+                                record_builtin(&mut report, code, "cd");
                                 continue;
                             }
                             "pushd" => {
-                                if !pipeline.segments[0].args.is_empty() {
+                                let code = if !pipeline.segments[0].args.is_empty() {
                                     if let Ok(cwd) = env::current_dir() {
                                         dir_stack.push(cwd.to_string_lossy().to_string());
                                     }
-                                    handle_cd(&pipeline.segments[0].args, &mut eval);
+                                    handle_cd(&pipeline.segments[0].args, &mut eval)
                                 } else {
                                     eprintln!("pushd: no directory specified");
-                                }
+                                    2
+                                };
+                                record_builtin(&mut report, code, "pushd");
                                 continue;
                             }
                             "popd" => {
-                                if let Some(dir) = dir_stack.pop() {
-                                    handle_cd(&[dir], &mut eval);
+                                let code = if let Some(dir) = dir_stack.pop() {
+                                    handle_cd(&[dir], &mut eval)
                                 } else {
                                     eprintln!("popd: directory stack empty");
-                                }
+                                    2
+                                };
+                                record_builtin(&mut report, code, "popd");
                                 continue;
                             }
                             "history" => {
@@ -812,20 +834,28 @@ pub fn run_repl() -> i32 {
                                 continue;
                             }
                             "which" | "type" => {
+                                let mut code = 0;
                                 for arg in &pipeline.segments[0].args {
                                     match which_command(arg) {
                                         Some(path) => println!("{}", path),
-                                        None => eprintln!("{}: not found", arg),
+                                        None => {
+                                            eprintln!("{}: not found", arg);
+                                            code = 1;
+                                        }
                                     }
                                 }
+                                record_builtin(&mut report, code, "which");
                                 continue;
                             }
                             "unalias" => {
+                                let mut code = 0;
                                 for arg in &pipeline.segments[0].args {
                                     if !eval.remove_alias(arg) {
                                         eprintln!("unalias: {}: not found", arg);
+                                        code = 1;
                                     }
                                 }
+                                record_builtin(&mut report, code, "unalias");
                                 continue;
                             }
                             "jobs" => {

@@ -265,9 +265,14 @@ impl Terminal {
     /// needed, so it may fail too. Dropping whatever is still queued first is
     /// what stops the abandoned announcement from arriving later anyway.
     fn abort_echo(&mut self) {
-        self.pending.truncate(self.written);
-        let notice = b"\r\nmix: execute: announcement abandoned; nothing executed\r\n";
-        let _ = self.output.write(notice);
+        // Never write off the foreground. A background write with TOSTOP set
+        // raises SIGTTOU and STOPS the shell — recovering from a failed
+        // announcement must not be able to suspend the process it is
+        // recovering. The same guard the rest of this file writes behind.
+        if self.foreground() {
+            let notice = b"\r\nmix: execute: announcement abandoned; nothing executed\r\n";
+            let _ = self.output.write(notice);
+        }
         self.pending.clear();
         self.written = 0;
         self.cursor_row = 0;

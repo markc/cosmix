@@ -63,6 +63,11 @@ const MAX_ECHO_PRINCIPAL: usize = 96;
 /// Matches Term's retention so one retry policy spans the whole path.
 const RETENTION: Duration = Duration::from_secs(900);
 const RECORDS: usize = 256;
+/// Distinct actors whose spent-id marks are remembered. Bounded for the same
+/// reason Term bounds its own actor table: an ambient caller is keyed by a
+/// connection id that never returns, so an unbounded map grows by one key per
+/// connection that ever submitted, for the life of the shell.
+const ACTORS: usize = 64;
 /// The short editor round trips: inspect, reserve, release. None of them writes
 /// to the terminal.
 const EDITOR_BUDGET: Duration = Duration::from_millis(400);
@@ -79,8 +84,20 @@ const ADMIT_GRACE: Duration = Duration::from_millis(500);
 /// BUSY. Shorter than one full admission on purpose: a caller queued behind a
 /// whole other admission is, from its point of view, looking at a busy shell.
 const ADMIT_QUEUE: Duration = Duration::from_millis(250);
+/// The whole admission — three short editor round trips, the identity recheck,
+/// the admit and its grace — must finish inside the deadline after which the
+/// editor takes the prompt back on its own, or an admission in good standing
+/// could commit into a reservation that had already lapsed.
+///
+/// Derived from the editor's OWN constant. A guard that cannot see the value it
+/// guards is a comment: re-tuning RESERVATION would have left this asserting
+/// against a number that no longer existed anywhere.
 const _: () = assert!(
-    ADMIT_BUDGET.as_millis() + ADMIT_GRACE.as_millis() + 1_600 < 5_000,
+    EDITOR_BUDGET.as_millis() * 3
+        + RECHECK.as_millis()
+        + ADMIT_BUDGET.as_millis()
+        + ADMIT_GRACE.as_millis()
+        < crate::editor::runtime::RESERVATION.as_millis(),
     "the whole admission must fit inside the editor's reservation deadline"
 );
 /// The step-4 identity recheck. Two RPCs on the one shared connection, made
@@ -338,10 +355,50 @@ impl Store {
             };
             self.records.remove(index);
         }
-        let mark = self.high_water.entry(record.actor.clone()).or_insert(0);
-        *mark = (*mark).max(record.request_id);
         self.records.push(record);
         true
+    }
+    /// The attempt got far enough to be worth remembering. Only NOW is the id
+    /// spent.
+    ///
+    /// Raising the mark inside `admit` spent the id before anything had been
+    /// tried, so the commonest refusal of all — a human keystroke ending the
+    /// reservation — burned it. The documented contract for that refusal is
+    /// "the request id is untouched and the same submission may simply be
+    /// retried", and the retry met a retired mark instead, forever.
+    fn settle(&mut self, operation: u64) {
+        let Some((actor, request_id)) = self
+            .records
+            .iter()
+            .find(|r| r.operation == operation)
+            .map(|r| (r.actor.clone(), r.request_id))
+        else {
+            return;
+        };
+        // One bounded key per actor. An ambient caller is keyed by its
+        // connection id, which never returns, so without a cap a long-lived
+        // shell accumulates a key per connection that ever submitted.
+        if !self.high_water.contains_key(&actor) && self.high_water.len() >= ACTORS {
+            let victim = self
+                .high_water
+                .keys()
+                .find(|key| !self.records.iter().any(|r| &r.actor == *key))
+                .cloned();
+            // Prefer a key with no live record; failing that, any key. Losing a
+            // mark costs one actor's replay protection for ids whose records
+            // are already gone, which is strictly better than refusing to
+            // record marks at all.
+            if let Some(key) = victim.or_else(|| self.high_water.keys().next().cloned()) {
+                self.high_water.remove(&key);
+            }
+        }
+        let mark = self.high_water.entry(actor).or_insert(0);
+        *mark = (*mark).max(request_id);
+    }
+    /// The attempt provably did nothing and left no mark anywhere. Remove it
+    /// completely: the request id is free, exactly as the refusal promised.
+    fn forget(&mut self, operation: u64) {
+        self.records.retain(|r| r.operation != operation);
     }
     /// Whether `request_id` from `actor` is a spent id whose record is gone.
     fn retired(&self, actor: &str, request_id: u64) -> bool {
@@ -364,6 +421,15 @@ fn store() -> &'static Mutex<Store> {
     STORE.get_or_init(Mutex::default)
 }
 
+/// Called from the EDITOR thread when an admission fails after claiming its
+/// token: past that point the owner has already been answered, so only the
+/// editor knows the line never ran. Without this the record reports `running`
+/// forever and holds a slot eviction may never reclaim.
+pub(crate) fn admission_failed(operation: u64) {
+    finished(operation, Completion::not_started());
+    cosmix_mix::cancel::forget(operation);
+}
+
 /// Published by the evaluator owner when an admitted evaluation ends. The only
 /// call into this module from the REPL thread.
 pub(crate) fn finished(operation: u64, completion: Completion) {
@@ -382,7 +448,7 @@ struct Surface {
     /// Delivers a cancellation to the managed foreground job group. The one
     /// non-cooperative path in the guarantee table, and the reason a cancelled
     /// `sleep` stops rather than being merely asked to.
-    interrupt_foreground: std::sync::Arc<dyn Fn() -> Option<i32> + Send + Sync>,
+    interrupt_foreground: std::sync::Arc<dyn Fn(u64) -> Option<i32> + Send + Sync>,
 }
 fn surface() -> &'static Mutex<Option<Surface>> {
     static SURFACE: OnceLock<Mutex<Option<Surface>>> = OnceLock::new();
@@ -394,8 +460,12 @@ fn surface() -> &'static Mutex<Option<Surface>> {
 /// leaves the surface unregistered and every submission answers UNSUPPORTED.
 pub(crate) fn register(
     control: Control,
-    interrupt_foreground: std::sync::Arc<dyn Fn() -> Option<i32> + Send + Sync>,
+    interrupt_foreground: std::sync::Arc<dyn Fn(u64) -> Option<i32> + Send + Sync>,
 ) {
+    // Capture the test hook here, at startup, like its editor-side sibling.
+    // Reading it lazily at first use would let Mix evaluated in this shell set
+    // the variable and change the admission timing of a LATER submission.
+    let _ = reserve_hold();
     *surface().lock().unwrap_or_else(|e| e.into_inner()) = Some(Surface {
         control,
         interrupt_foreground,
@@ -456,7 +526,7 @@ impl Drop for SubmitSlot {
 
 /// How long to hold a granted reservation before committing. Zero in every
 /// ordinary run; a fixture widens it to type into the window.
-fn reserve_hold() -> Duration {
+pub(crate) fn reserve_hold() -> Duration {
     static HOLD: OnceLock<Duration> = OnceLock::new();
     *HOLD.get_or_init(|| {
         std::env::var("MIX_RESERVE_HOLD_MS")
@@ -692,13 +762,20 @@ fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, St
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|s| s.interrupt_foreground.clone());
-        let signalled = hook.and_then(|hook| hook());
+        // The hook re-validates the evaluation under the job lock: between
+        // resolving the cancellation and delivering it, this operation can
+        // finish and a successor's foreground job can take its place.
+        let signalled = hook.and_then(|hook| hook(operation));
         if signalled.is_some() {
             // A group signal IS a delivery, and the only one that does not
             // depend on the target noticing a flag. Without recording it here
             // an external command killed by this signal would be reported as
             // having completed normally, because nothing in the evaluator ever
             // consumed an interrupt on its behalf.
+            //
+            // Delivered is NOT died: a child that ignores SIGINT and exits 0 is
+            // reported by its own exit status, and the outcome below is built
+            // from the recorded facts rather than from having sent a signal.
             cosmix_mix::cancel::note_delivery();
         }
         signalled
@@ -981,17 +1058,27 @@ async fn submit(
             Admission::Unknown
         }
     });
+    // Spend the id only for an attempt that got somewhere. A pre-claim refusal
+    // is handled below and must leave no trace at all.
+    if handed != Admission::Refused {
+        store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settle(operation);
+    }
     match handed {
         Admission::Executed => {}
         Admission::Refused => {
             // The editor refused before touching anything — most often a human
             // keystroke arriving inside the reservation window. Nothing was
             // announced and the id is not spent, so this is a plain BUSY the
-            // caller may simply retry.
-            {
-                let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-                store.records.retain(|r| r.operation != operation);
-            }
+            // caller may simply retry, and the retry must find no trace of this
+            // attempt: no record, no high-water mark, no registry entry.
+            store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget(operation);
+            cosmix_mix::cancel::forget(operation);
             release(&control, editor).await;
             return refusal("BUSY");
         }
@@ -1003,6 +1090,10 @@ async fn submit(
             // caller submits a new id to try again, and is told which operation
             // to ask about.
             finished(operation, Completion::not_started());
+            // Nothing will ever run under this id, so its registry entry has no
+            // outcome left to carry. Leaving it would pin an unfinished entry
+            // the eviction rule refuses to touch.
+            cosmix_mix::cancel::forget(operation);
             release(&control, editor).await;
             return not_started(operation);
         }
@@ -1237,6 +1328,9 @@ mod tests {
         let mut store = Store::default();
         for operation in 0..(RECORDS as u64 + 64) {
             assert!(store.admit(record(operation, true)), "wedged at {operation}");
+            // Settling is what spends the id. `admit` alone must not, or the
+            // commonest refusal of all burns the caller's request id.
+            store.settle(operation);
         }
         assert!(store.records.len() <= RECORDS);
         // The earliest ids were evicted, and every one of them is still spent.
@@ -1280,12 +1374,36 @@ mod tests {
         );
     }
 
+    /// The documented contract for a pre-claim refusal is that the request id
+    /// is untouched and the same submission may simply be retried. Spending the
+    /// id inside `admit` broke that for the COMMONEST refusal there is — a
+    /// human keystroke ending the reservation — and the retry then met a
+    /// retired mark, permanently.
+    #[test]
+    fn a_refused_attempt_leaves_the_request_id_free_to_retry() {
+        let mut store = Store::default();
+        assert!(store.admit(record(1, false)));
+        // Refused: nothing ran, nothing announced, so nothing is remembered.
+        store.forget(1);
+        assert!(store.records.is_empty());
+        assert!(
+            !store.retired("a", 2),
+            "a pre-claim refusal burned the caller's request id"
+        );
+        // The identical retry is therefore a fresh submission, not a replay.
+        assert!(store.admit(record(1, false)));
+        // And an attempt that DID get somewhere still spends it.
+        store.settle(1);
+        assert!(store.retired("a", 2));
+    }
+
     #[test]
     fn an_expired_record_leaves_its_id_spent() {
         let mut store = Store::default();
         let mut aged = record(1, true);
         aged.at = Instant::now() - RETENTION * 2;
         store.admit(aged);
+        store.settle(1);
         store.sweep();
         assert!(store.records.is_empty(), "the record should have aged out");
         assert!(

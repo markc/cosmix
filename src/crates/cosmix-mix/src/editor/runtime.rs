@@ -19,7 +19,7 @@ const QUEUE: usize = 16;
 /// microseconds; this exists so that an owner which dies, loses its transport,
 /// or is cancelled mid-sequence cannot leave a human staring at a dead prompt.
 /// It is a deadline on an existing wait, not a clock anything ticks on.
-const RESERVATION: std::time::Duration = std::time::Duration::from_secs(5);
+pub const RESERVATION: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_CANDIDATES: usize = 4096;
 const MAX_COMPLETION_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_ENTRY_BYTES: usize = 1024 * 1024;
@@ -570,13 +570,21 @@ pub struct OwnedEditor {
 }
 impl OwnedEditor {
     pub fn start(input: File, output: File) -> io::Result<Self> {
-        Self::start_with_activation(input, output, None)
+        Self::start_with_hooks(input, output, None, None)
     }
     /// A Send-only owned acknowledgement; no session or evaluator dependency.
     pub fn start_with_activation(
         input: File,
         output: File,
         activation: Option<fn(Generation)>,
+    ) -> io::Result<Self> {
+        Self::start_with_hooks(input, output, activation, None)
+    }
+    pub fn start_with_hooks(
+        input: File,
+        output: File,
+        activation: Option<fn(Generation)>,
+        admission_failed: Option<fn(u64)>,
     ) -> io::Result<Self> {
         // Fail before installing signal hooks when an independent tty writer
         // cannot be opened (the REPL can then safely fall back to rustyline).
@@ -613,6 +621,7 @@ impl OwnedEditor {
             .spawn(move || {
                 let mut owner = Owner {
                     activation,
+                    admission_failed,
                     editor: Editor::new(0),
                     // Zero means unbound until the local session owner supplies Begin.
                     generation: Generation {
@@ -718,6 +727,10 @@ struct Cycle {
 }
 struct Owner {
     activation: Option<fn(Generation)>,
+    /// Publishes a not-started outcome for an admission that failed AFTER
+    /// claiming its token. Only this thread can know that happened, and the
+    /// owner has already been told the result is undetermined.
+    admission_failed: Option<fn(u64)>,
     stopped: bool,
     continued: Arc<std::sync::atomic::AtomicBool>,
     editor: Editor,
@@ -946,6 +959,33 @@ impl Owner {
             self.reserved_until = None;
         }
     }
+    /// The terminal half of step 6, kept together so its failure has one
+    /// recovery path rather than three. Leaves the editor Idle and the prompt
+    /// consumed only if every part succeeded.
+    fn commit_admission(
+        &mut self,
+        generation: Generation,
+        revision: u64,
+        echo: &str,
+        drain: std::time::Duration,
+    ) -> io::Result<()> {
+        let layout = super::render::layout(
+            self.profile.text(),
+            self.editor.buffer(),
+            self.terminal.size().0,
+        )
+        .map_err(|e| io::Error::other(format!("editor layout: {e:?}")))?;
+        self.terminal.finish(&layout)?;
+        self.terminal.restore()?;
+        self.terminal.echo(echo, drain)?;
+        // Unreachable given `admissible` above — this thread owns every field
+        // it reads — but a consumed prompt with no delivered line would park
+        // the REPL on a readline that never returns, so it is handled rather
+        // than assumed away.
+        self.editor
+            .consume_reservation(generation, revision)
+            .map_err(protocol)
+    }
     /// Drop a reservation whose owner never came back. Nothing to restore and
     /// nothing to redraw: a reservation never changed the terminal, so the
     /// human's prompt has been sitting there live the whole time.
@@ -1076,21 +1116,30 @@ impl Owner {
                 // THEN announce, THEN execute. Everything up to this line
                 // happened with the terminal still raw and still being read,
                 // which is what let a human keystroke win.
-                self.terminal.finish(&super::render::layout(
-                    self.profile.text(),
-                    self.editor.buffer(),
-                    self.terminal.size().0,
-                )
-                .map_err(|e| io::Error::other(format!("editor layout: {e:?}")))?)?;
-                self.terminal.restore()?;
-                self.terminal.echo(&echo, drain)?;
-                if let Err(error) = self.editor.consume_reservation(generation, revision) {
-                    // Unreachable given the check above, but a consumed prompt
-                    // with no delivered line would park the REPL on a readline
-                    // that never returns. Unblock it, then fail loudly.
-                    let _ = self.line_tx.try_send(Ok(Line::Interrupted));
+                //
+                // Past the claim, EVERY failure has to be reconciled: the owner
+                // has already been told the outcome is undetermined, so an
+                // error that just propagates leaves a record reporting
+                // "running" forever and a terminal in the wrong mode.
+                let operation = admitted.operation;
+                let committed = self.commit_admission(generation, revision, &echo, drain);
+                if let Err(error) = committed {
+                    // Put the terminal back the way the human had it. Returning
+                    // with it cooked and echoing leaves them double-echoed,
+                    // unable to reach the editor until Enter, until the next
+                    // prompt rebuilds — the failure mode the stalled-reader
+                    // case makes reachable.
+                    let _ = self.terminal.enter();
+                    if self.editor.state() == State::Editing {
+                        let _ = self.draw();
+                    }
+                    // Nothing ran, and only this thread knows it. Say so where
+                    // the result surface will find it.
+                    if let Some(publish) = self.admission_failed {
+                        publish(operation);
+                    }
                     self.reserved_until = None;
-                    return Err(protocol(error));
+                    return Err(error);
                 }
                 self.reserved_until = None;
                 self.line_tx
