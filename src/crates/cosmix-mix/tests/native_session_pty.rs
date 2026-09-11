@@ -102,7 +102,7 @@ async fn connect(broker: &Broker) -> VerifiedConnection {
 
 struct Parent {
     key: SigningKey,
-    connection: VerifiedConnection,
+    connection: std::sync::Arc<VerifiedConnection>,
     record: SessionRecord,
     last_renew: Instant,
 }
@@ -120,7 +120,7 @@ impl Parent {
             .record;
         Self {
             key,
-            connection,
+            connection: connection.into(),
             record,
             last_renew: Instant::now(),
         }
@@ -151,7 +151,7 @@ impl Parent {
     }
     async fn resume(&mut self, broker: &Broker) {
         self.connection.client().close().await;
-        self.connection = connect(broker).await;
+        self.connection = connect(broker).await.into();
         let hello = self.connection.session_hello().await.unwrap();
         let expected = ExpectedScope {
             broker_epoch: hello.broker_epoch,
@@ -180,7 +180,7 @@ impl Parent {
         self.last_renew = Instant::now();
     }
     async fn replace(&mut self, broker: &Broker) {
-        self.connection = connect(broker).await;
+        self.connection = connect(broker).await.into();
         self.record = self
             .connection
             .session_allocate(&self.key, Policy::DefaultOpen)
@@ -240,6 +240,9 @@ struct Child {
 }
 impl Child {
     fn spawn(broker: &Broker, launch: &LaunchFd) -> Self {
+        Self::spawn_editor(broker, launch, "owned")
+    }
+    fn spawn_editor(broker: &Broker, launch: &LaunchFd, editor: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("node.conf.mix");
         std::fs::write(
@@ -289,7 +292,7 @@ impl Child {
             ("COSMIX_NODE_CONFIG".into(), config.display().to_string()),
             ("COSMIX_BROKER_ACCOUNT".into(), account),
             ("MIX_STATS".into(), "off".into()),
-            ("MIX_EDITOR".into(), "owned".into()),
+            ("MIX_EDITOR".into(), editor.into()),
             ("TERM".into(), "xterm-256color".into()),
         ];
         // Same libc PTY pattern as job_control_pty, with the real LaunchFd's
@@ -508,6 +511,12 @@ fn mix_child_bootstrap_proves_end_to_end() {
 
 #[test]
 fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
+    for editor in ["owned", "legacy"] {
+        same_mix_child_scenarios(editor);
+    }
+}
+
+fn same_mix_child_scenarios(editor: &str) {
     let _fixture = fixture_guard();
     let mut broker = Broker::start();
     runtime().block_on(async {
@@ -516,7 +525,7 @@ fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
         let public_key = HexBytes(key.verifying_key().to_bytes());
         let initial = parent.grant(public_key, 2).await;
         let launch = LaunchFd::new(&initial, &key).unwrap();
-        let mut child = Child::spawn(&broker, &launch);
+        let mut child = Child::spawn_editor(&broker, &launch, editor);
         drop(launch);
         drop(key);
         child.until("RC_MARKER=[]\r\n");
@@ -791,9 +800,7 @@ async fn phase(parent: &mut Parent, record: &SessionRecord, expected: &str) -> s
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let value = status(parent, record).await;
-        if value["status"]["snapshot"]["phase"] == expected
-            && (expected != "evaluating" || value["status"]["snapshot"]["command_id"].is_string())
-        {
+        if value["status"]["snapshot"]["phase"] == expected {
             return value;
         }
         assert!(Instant::now() < deadline, "expected {expected}: {value}");
@@ -803,6 +810,12 @@ async fn phase(parent: &mut Parent, record: &SessionRecord, expected: &str) -> s
 
 #[test]
 fn status_pump_answers_idle_pure_loop_and_blocking_builtin() {
+    for editor in ["owned", "legacy"] {
+        status_pump_scenarios(editor);
+    }
+}
+
+fn status_pump_scenarios(editor: &str) {
     let _fixture = fixture_guard();
     let broker = Broker::start();
     runtime().block_on(async {
@@ -812,7 +825,7 @@ fn status_pump_answers_idle_pure_loop_and_blocking_builtin() {
             .grant(HexBytes(key.verifying_key().to_bytes()), 1)
             .await;
         let launch = LaunchFd::new(&grant, &key).unwrap();
-        let mut child = Child::spawn(&broker, &launch);
+        let mut child = Child::spawn_editor(&broker, &launch, editor);
         drop(launch);
         drop(key);
         child.until("RC_MARKER=[]\r\n");
@@ -932,6 +945,12 @@ fn status_pump_answers_idle_pure_loop_and_blocking_builtin() {
 
 #[test]
 fn status_restricted_identity_rejection_and_unsupported_verbs() {
+    for editor in ["owned", "legacy"] {
+        status_restricted_scenarios(editor);
+    }
+}
+
+fn status_restricted_scenarios(editor: &str) {
     let _fixture = fixture_guard();
     let broker = Broker::start();
     runtime().block_on(async {
@@ -941,7 +960,7 @@ fn status_restricted_identity_rejection_and_unsupported_verbs() {
             .grant(HexBytes(key.verifying_key().to_bytes()), 1)
             .await;
         let launch = LaunchFd::new(&grant, &key).unwrap();
-        let mut child = Child::spawn(&broker, &launch);
+        let mut child = Child::spawn_editor(&broker, &launch, editor);
         drop(launch);
         drop(key);
         child.until("RC_MARKER=[]\r\n");
@@ -951,7 +970,7 @@ fn status_restricted_identity_rejection_and_unsupported_verbs() {
         phase(&mut parent, &bound, "prompt-ready").await;
         let ambient = connect(&broker).await;
         let foreign = Parent::new(&broker).await;
-        for connection in [&ambient, &foreign.connection] {
+        for connection in [&ambient, foreign.connection.as_ref()] {
             let result = tokio::time::timeout(
                 Duration::from_millis(400),
                 connection
@@ -959,10 +978,10 @@ fn status_restricted_identity_rejection_and_unsupported_verbs() {
                     .call(&bound.name, "shell.status", status_request(&bound)),
             )
             .await;
-            assert!(
-                result.is_err() || result.unwrap().is_err(),
-                "foreign caller obtained status"
-            );
+            let error = result
+                .expect("denial must reply, not time out")
+                .unwrap_err();
+            assert_eq!(error.to_string(), r#"{"error_code":"REFUSED"}"#);
         }
         let tcp = NodedClient::connect_anonymous(&broker.url).await.unwrap();
         let result = tokio::time::timeout(
@@ -970,10 +989,10 @@ fn status_restricted_identity_rejection_and_unsupported_verbs() {
             tcp.call(&bound.name, "shell.status", status_request(&bound)),
         )
         .await;
-        assert!(
-            result.is_err() || result.unwrap().is_err(),
-            "unverified caller obtained status"
-        );
+        let error = result
+            .expect("unverified denial must reply, not time out")
+            .unwrap_err();
+        assert_eq!(error.to_string(), r#"{"error_code":"REFUSED"}"#);
         tcp.close().await;
         for verb in [
             "shell.jobs",
@@ -1043,3 +1062,4 @@ fn status_verbs_are_absent_from_legacy_surfaces() {
         }
     }
 }
+
