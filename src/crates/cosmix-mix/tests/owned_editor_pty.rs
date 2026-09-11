@@ -302,23 +302,25 @@ fn fixture_editor() {
                 edit_revision: 0,
             })
             .unwrap();
-        assert!(matches!(reply, Reply::Suspended { .. }));
+        // A reservation takes NOTHING away: §8 puts the cooked-mode restore
+        // at the commit, so the editor is still editing and the terminal is
+        // unchanged. `same_modes` asserting the modes are untouched is now the
+        // point rather than an aside — it used to hold because the restore had
+        // already happened and matched the original, and it holds now because
+        // no restore happened at all.
+        assert!(matches!(reply, Reply::Reserved { .. }));
         same_modes(original, modes(0));
+        // A reservation for a generation that is not current cannot be
+        // released, exactly as it could not be resumed before.
         assert!(
             editor
                 .control
-                .command(editor::Command::Resume {
-                    generation: Generation { prompt: 2, ..g },
-                    edit_revision: 0
-                })
+                .release(Generation { prompt: 2, ..g }, 0, std::time::Duration::from_secs(2))
                 .is_err()
         );
         editor
             .control
-            .command(editor::Command::Resume {
-                generation: g,
-                edit_revision: 0,
-            })
+            .release(g, 0, std::time::Duration::from_secs(2))
             .unwrap();
         println!("ADMISSION-RESUMED");
     } else {
