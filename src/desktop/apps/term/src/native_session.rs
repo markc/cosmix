@@ -237,6 +237,15 @@ impl NativeSession {
     pub fn child_binding(&self, id: u64, generation: u64) -> Option<SessionRecord> {
         let shared = self.1.lock().unwrap();
         let pane = shared.panes.get(&id)?.upgrade()?;
+        #[cfg(test)]
+        eprintln!(
+            "child_binding({id},{generation}) live={} ready={} launched={} gen={} bound={:?}",
+            pane.live.load(Ordering::Acquire),
+            pane.control_ready.load(Ordering::Acquire),
+            pane.launched.load(Ordering::Acquire),
+            pane.generation.load(Ordering::Acquire),
+            pane.binding.lock().unwrap().as_ref().map(|r| (r.state, r.pane_id, r.pane_generation))
+        );
         if !pane.live.load(Ordering::Acquire)
             || !pane.control_ready.load(Ordering::Acquire)
             || !pane.launched.load(Ordering::Acquire)
