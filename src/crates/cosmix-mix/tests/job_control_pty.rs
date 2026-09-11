@@ -209,13 +209,34 @@ impl Pty {
         traced: bool,
         inherited_signals: bool,
     ) -> Self {
+        Self::spawn_config(
+            args,
+            redirected,
+            controlling,
+            traced,
+            inherited_signals,
+            false,
+        )
+    }
+    fn spawn_config(
+        args: &[&str],
+        redirected: bool,
+        controlling: bool,
+        traced: bool,
+        inherited_signals: bool,
+        cold_output: bool,
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         // Stable executable name even if another build replaces Cargo's test
         // binary while this process is running.
         fs::copy("/proc/self/exe", home.path().join("fixture")).unwrap();
         fs::write(
             home.path().join(".mixrc"),
-            "fn prompt()\nreturn \"P0J> \"\nend\n",
+            if cold_output {
+                "print(\"COLD-READY\"); sleep(300)\n"
+            } else {
+                "fn prompt()\nreturn \"P0J> \"\nend\n"
+            },
         )
         .unwrap();
         let (mut m, mut s) = (-1, -1);
@@ -240,6 +261,11 @@ impl Pty {
         let master = unsafe { File::from_raw_fd(m) };
         let slave = unsafe { File::from_raw_fd(s) };
         let initial_modes = tty_modes(s);
+        if cold_output {
+            let mut broken = initial_modes;
+            broken.c_oflag &= !(libc::OPOST | libc::ONLCR);
+            assert_eq!(unsafe { libc::tcsetattr(s, libc::TCSANOW, &broken) }, 0);
+        }
         // Keep fixture FDs out of child exec; stdio clones are explicitly duped.
         unsafe {
             libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -771,6 +797,23 @@ fn hup_restores_retained_slave_after_foreground_raw_leak() {
     assert_eq!(restored.c_lflag, original.c_lflag);
     assert_eq!(restored.c_cc, original.c_cc);
     assert!(!alive(child[0]));
+}
+
+#[test]
+fn cold_start_hup_keeps_repaired_modes_before_any_launch() {
+    let mut p = Pty::spawn_config(&[], false, true, false, false, true);
+    p.until("COLD-READY");
+    unsafe {
+        libc::kill(p.shell.id() as i32, libc::SIGHUP);
+    }
+    wait_for(|| p.shell.try_wait().unwrap().is_some());
+    assert_eq!(p.shell.wait().unwrap().code(), Some(129));
+    let restored = tty_modes(p.slave.as_raw_fd());
+    assert_eq!(
+        restored.c_oflag & (libc::OPOST | libc::ONLCR),
+        libc::OPOST | libc::ONLCR
+    );
+    assert_eq!(restored.c_lflag, p.initial_modes.c_lflag);
 }
 
 #[test]

@@ -455,7 +455,8 @@ The <code>&amp;</code> notification prints the last pipeline member's PID.</p>
 stdin plus a controlling terminal. Setup errors produce one warning and
 start the shell with noninteractive execution policy. Foreground admission
 is bounded if an orphaned process group cannot stop. The shutdown mode
-snapshot is seeded after cold-start terminal repair.
+snapshot is seeded after cold-start terminal repair, before the monitor
+starts handling HUP. Declined admission does not take the parent's terminal.
 Scripts, <code>-c</code> (including SSH commands),
 serve mode, redirected stdin and sessions without a controlling terminal
 retain their noninteractive launch policy. Captured <code>run_argv</code> and

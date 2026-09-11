@@ -226,6 +226,7 @@ struct SetupGuard<'a> {
     tty: &'a File,
     parent_pgid: i32,
     old_signals: Vec<(i32, libc::sigaction)>,
+    terminal_transferred: bool,
     committed: bool,
 }
 impl Drop for SetupGuard<'_> {
@@ -233,7 +234,9 @@ impl Drop for SetupGuard<'_> {
         if self.committed {
             return;
         }
-        let _ = foreground(self.tty.as_raw_fd(), self.parent_pgid);
+        if self.terminal_transferred {
+            let _ = foreground(self.tty.as_raw_fd(), self.parent_pgid);
+        }
         if unsafe { libc::getpgrp() } != self.parent_pgid {
             unsafe {
                 libc::setpgid(0, self.parent_pgid);
@@ -250,7 +253,7 @@ impl Drop for SetupGuard<'_> {
 impl Controller {
     /// Called ONLY from the interactive entry point. A redirected stdin or
     /// missing controlling terminal declines job management without mutation.
-    pub fn interactive() -> io::Result<Option<Arc<Self>>> {
+    pub fn interactive(repair_terminal: impl FnOnce()) -> io::Result<Option<Arc<Self>>> {
         if unsafe { libc::isatty(0) } == 0 || unsafe { libc::tcgetpgrp(0) } < 0 {
             return Ok(None);
         }
@@ -266,6 +269,7 @@ impl Controller {
             tty: &tty,
             parent_pgid,
             old_signals: vec![(libc::SIGTTIN, inherited_ttin)],
+            terminal_transferred: false,
             committed: false,
         };
         let mut admission_attempts = 0;
@@ -311,6 +315,10 @@ impl Controller {
             return Err(io::Error::last_os_error());
         }
         foreground(fd, shell_pgid)?;
+        setup.terminal_transferred = true;
+        // Admission precedes repair; repair precedes the HUP snapshot and
+        // monitor startup, even before the first prompt or managed launch.
+        repair_terminal();
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 jobs: BTreeMap::new(),
@@ -371,13 +379,6 @@ impl Controller {
             .values()
             .cloned()
             .collect()
-    }
-
-    /// Seed after the REPL repairs cold-start output modes, before readline.
-    pub fn seed_shell_modes(&self) {
-        if let Ok(saved) = modes(self.tty.as_raw_fd()) {
-            *self.shared.shell_modes.lock().unwrap() = saved;
-        }
     }
 
     pub fn register(

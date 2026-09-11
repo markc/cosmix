@@ -116,7 +116,7 @@ pub fn run_repl() -> i32 {
 
     // Acquire foreground ownership before any terminal repair: a nested
     // background shell must stop via SIGTTIN before touching parent termios.
-    let mut job_table = match JobTable::interactive() {
+    let mut job_table = match JobTable::interactive(ensure_interactive_output_mode) {
         Ok(table) => table,
         Err(e) => {
             eprintln!(
@@ -127,10 +127,6 @@ pub fn run_repl() -> i32 {
     };
     // Still precedes prelude, rc, prompt and resume-command output.
     ensure_interactive_output_mode();
-    if let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = job_table.policy()
-    {
-        controller.seed_shell_modes();
-    }
     let rt = crate::build_runtime();
 
     let history_path = dirs::home_dir()

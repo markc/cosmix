@@ -37,9 +37,9 @@ impl JobTable {
         }
     }
 
-    pub fn interactive() -> std::io::Result<Self> {
+    pub fn interactive(repair_terminal: impl FnOnce()) -> std::io::Result<Self> {
         let mut table = Self::new();
-        if let Some(controller) = crate::job_control::Controller::interactive()? {
+        if let Some(controller) = crate::job_control::Controller::interactive(repair_terminal)? {
             table.policy = crate::job_control::ExecutionPolicy::Interactive {
                 controller,
                 return_on_stop: true,

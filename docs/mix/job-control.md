@@ -14,7 +14,8 @@ Job management is selected by the interactive entry point, and requires tty
 stdin plus a controlling terminal. Setup errors produce one warning and
 start the shell with noninteractive execution policy. Foreground admission
 is bounded if an orphaned process group cannot stop. The shutdown mode
-snapshot is seeded after cold-start terminal repair.
+snapshot is seeded after cold-start terminal repair, before the monitor
+starts handling HUP. Declined admission does not take the parent's terminal.
 Scripts, `-c` (including SSH commands),
 serve mode, redirected stdin and sessions without a controlling terminal
 retain their noninteractive launch policy. Captured `run_argv` and
