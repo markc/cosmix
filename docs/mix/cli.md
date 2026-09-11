@@ -744,6 +744,16 @@ If the whole line cannot be put on the glass, the pane says
 `announcement abandoned; nothing executed` instead — an announcement is
 zero-or-whole, because a partial one reads exactly like a real admission.
 
+**A reservation takes nothing away.** Between the moment the shell agrees to run
+a submission and the moment it commits, the prompt is still live: still in raw
+mode, still being read a byte at a time, still the human's. Any input at all
+during that window — a single character, even one that edits nothing — ends the
+reservation, and the submission is refused having announced nothing. The
+terminal only changes hands at the commit itself, which is one atomic step:
+reads stopped, cooked mode restored, announcement written, line executed. That
+ordering is why a keystroke can never be painted into the announcement by kernel
+echo, and can never arrive as the admitted execution's standard input.
+
 Execution then follows the same path a typed line takes — the same classifier,
 aliases, job integration and history policy — adopting the command id that was
 minted, echoed and recorded before it started. Admission never opens a
