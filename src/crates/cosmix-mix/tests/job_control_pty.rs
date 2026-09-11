@@ -58,6 +58,23 @@ fn fixture_process() {
     }
     fs::write(&report, data).unwrap();
     match mode.as_str() {
+        "outer-shell" => {
+            // A real same-session parent keeps the nested shell group from
+            // being orphaned, and observes its stop rather than a /proc guess.
+            let mut child = Command::new(env!("CARGO_BIN_EXE_mix")).spawn().unwrap();
+            let pid = child.id() as i32;
+            fs::write(report.with_extension("child"), pid.to_string()).unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                pid
+            );
+            assert!(libc::WIFSTOPPED(status));
+            assert_eq!(libc::WSTOPSIG(status), libc::SIGTSTP);
+            fs::write(report.with_extension("stopped"), "yes").unwrap();
+            assert_eq!(unsafe { libc::kill(-pid, libc::SIGCONT) }, 0);
+            assert!(child.wait().unwrap().success());
+        }
         "hold" | "ignore-hup" => loop {
             unsafe {
                 libc::pause();
@@ -344,6 +361,42 @@ fn external_command_survives_unlinked_shell_executable() {
     let child = p.report("after-unlink");
     assert_eq!(child[1], child[2]);
     assert!(!alive(child[0]));
+}
+
+#[test]
+fn unmanaged_stream_stop_is_visible_to_outer_parent_and_resumes() {
+    let mut p = Pty::interactive();
+    p.send(&format!("{}\n", p.fixture("outer-shell", "outer")));
+    p.report("outer");
+    p.until(PROMPT);
+    let pid_path = p.home.path().join("outer.child");
+    wait_for(|| pid_path.exists());
+    let nested: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
+    p.jobs.push(nested);
+    let report = p.home.path().join("stream");
+    p.send(&format!(
+        "run_stream([\"{}\", \"--exact\", \"fixture_process\", \"--nocapture\"], {{env: {{P0J_MODE: \"hold\", P0J_REPORT: \"{}\"}}}})\n",
+        p.home.path().join("fixture").display(), report.display()
+    ));
+    let child = p.report("stream");
+    assert_eq!(child[1], nested);
+    p.send("\x1a");
+    wait_for(|| p.home.path().join("outer.stopped").exists());
+    wait_for(|| state(nested) != Some('T') && state(child[0]) != Some('T'));
+    p.send("\x03");
+    p.until(PROMPT);
+    p.send("\x04");
+    p.until(PROMPT);
+}
+
+#[test]
+fn idle_prompt_ctrl_z_keeps_readline_usable() {
+    // This session-leader group is orphaned: default SIGTSTP is discarded.
+    // The interrupted editor read must retry rather than terminate the REPL.
+    let mut p = Pty::interactive();
+    p.send("\x1a");
+    assert!(p.command("print(97531)").contains("\r\n97531\r\n"));
+    p.exit();
 }
 
 #[test]

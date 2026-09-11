@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -17,7 +18,26 @@ const STAGE_ARG: &str = "--internal-job-stage";
 
 // Caught dispositions reset on exec; SIG_IGN would leak into captured runners
 // whose spawning contract deliberately remains unchanged by interactive jobs.
-extern "C" fn shell_signal(_: libc::c_int) {}
+static MANAGED_FOREGROUND: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn shell_signal(signal: libc::c_int) {
+    if signal != libc::SIGTSTP || MANAGED_FOREGROUND.load(Ordering::Acquire) {
+        return;
+    }
+    // Legacy inherited-stdio waits still belong to the shell's group. Let
+    // the outer shell observe and resume us, including on repeated suspends.
+    // SA_NODEFER makes raise deliver before reinstalling the handler. Every
+    // operation here is async-signal-safe; no controller locks or allocation.
+    unsafe {
+        let mut default: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut default.sa_mask);
+        default.sa_sigaction = libc::SIG_DFL;
+        let mut handler = std::mem::zeroed();
+        libc::sigaction(signal, &default, &mut handler);
+        libc::raise(signal);
+        libc::sigaction(signal, &handler, std::ptr::null_mut());
+    }
+}
 
 /// TTY handoff needs SIGTTOU blocked on the calling thread. Keep this scoped:
 /// captured children must inherit the ordinary signal mask at an idle shell.
@@ -257,6 +277,9 @@ impl Controller {
             let mut old = unsafe { std::mem::zeroed() };
             let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
             ignore.sa_sigaction = shell_signal as *const () as usize;
+            if sig == libc::SIGTSTP {
+                ignore.sa_flags = libc::SA_NODEFER;
+            }
             unsafe {
                 libc::sigemptyset(&mut ignore.sa_mask);
                 if libc::sigaction(sig, &ignore, &mut old) < 0 {
@@ -386,7 +409,11 @@ impl Controller {
         let ttou = TtouGuard::new()?;
         let saved = modes(self.tty.as_raw_fd())?;
         *self.shared.shell_modes.lock().unwrap() = saved;
-        foreground(self.tty.as_raw_fd(), pgid)?;
+        MANAGED_FOREGROUND.store(true, Ordering::Release);
+        if let Err(error) = foreground(self.tty.as_raw_fd(), pgid) {
+            MANAGED_FOREGROUND.store(false, Ordering::Release);
+            return Err(error);
+        }
         Ok(TerminalLease {
             controller: self,
             saved,
@@ -624,6 +651,7 @@ impl Drop for TerminalLease<'_> {
         {
             eprintln!("mix: terminal restore: {e}");
         }
+        MANAGED_FOREGROUND.store(false, Ordering::Release);
     }
 }
 

@@ -26,6 +26,10 @@ continuation: returning to a restricted prompt while preserving evaluation
 requires the later async host seam. `run_stream` and evaluator-owned legacy
 shell/substitution paths are not integrated in this round. Bus publication,
 remote admission and request cancellation are separate stages.
+During an unmanaged inherited-stdio wait, Ctrl+Z stops Mix itself with its
+child so an outer shell can `fg` the group. The shell suppresses SIGTSTP
+only while a managed job holds the foreground terminal. A restricted
+job-management prompt for suspended evaluation remains deferred.
 
 On normal shell exit or SIGHUP, Mix sends HUP followed by CONT to its owned
 live jobs and allows 500 ms for exit/reaping. Survivors are reported; there
