@@ -168,6 +168,23 @@ impl Parent {
             .record;
         self.last_renew = Instant::now();
     }
+    async fn revoke_and_verify(&self, broker: &Broker) {
+        // Self-revoke closes this attachment in noded before its ACK is
+        // guaranteed to arrive. Verify the committed state independently;
+        // ignoring a transport error alone would hide a failed revocation.
+        let outcome = self
+            .connection
+            .session_revoke(self.record.reference())
+            .await;
+        let observer = connect(broker).await;
+        let records = observer.session_list().await.unwrap().records;
+        assert!(
+            records.iter().any(|record| {
+                record.record_id == self.record.record_id && record.state == BindingState::Revoked
+            }),
+            "parent self-revoke did not commit: {outcome:?}"
+        );
+    }
     async fn wait(
         &mut self,
         id: HexBytes<16>,
@@ -407,11 +424,7 @@ fn mix_child_bootstrap_proves_end_to_end() {
             .await
             .unwrap();
         parent.wait(bound.record_id, BindingState::Revoked, 1).await;
-        parent
-            .connection
-            .session_revoke(parent.record.reference())
-            .await
-            .unwrap();
+        parent.revoke_and_verify(&broker).await;
     });
 }
 
@@ -469,11 +482,7 @@ fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
         parent
             .wait(rebound.record_id, BindingState::Revoked, 1)
             .await;
-        parent
-            .connection
-            .session_revoke(parent.record.reference())
-            .await
-            .unwrap();
+        parent.revoke_and_verify(&broker).await;
     });
 }
 
@@ -529,11 +538,7 @@ fn substituted_parent_scope_is_rejected_without_failing_shell() {
             .wait(grant.record.record_id, BindingState::Pending, 0)
             .await;
         child.exit();
-        parent
-            .connection
-            .session_revoke(parent.record.reference())
-            .await
-            .unwrap();
+        parent.revoke_and_verify(&broker).await;
     });
 }
 
