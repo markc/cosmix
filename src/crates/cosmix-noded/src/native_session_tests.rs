@@ -896,6 +896,25 @@ async fn session_term_and_grant_quotas_and_retention_high_water() {
             .await
             .unwrap();
         }
+        // Check the parent bound before the global grant pool is exhausted.
+        assert!(matches!(
+            c.session_grant_create(&GrantCreateArgs {
+                parent: record.reference(),
+                pane_id: DecimalU64(99),
+                pane_generation: DecimalU64(1),
+                public_key: HexBytes(key.verifying_key().to_bytes()),
+                role: Role::PaneShell,
+                capabilities: vec![Capability::Input],
+            })
+            .await,
+            Err(cosmix_client::session::SessionFailure::Refused {
+                error: SessionError {
+                    error_code: ErrorCode::ResourceLimit,
+                    ..
+                },
+                ..
+            })
+        ));
     }
     for index in [0, 32] {
         let (c, record) = &parents[index];
@@ -1779,7 +1798,30 @@ async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_
             .unwrap();
         let proof = challenge.sign(&child_key, &scope).unwrap();
         let attached = child.session_prove(&proof).await.unwrap();
+        assert_eq!(attached.record.binding_generation, DecimalU64(1));
         assert!(child.session_prove(&proof).await.is_err());
+        child.client().close().await;
+        let resumed = verified(&broker).await;
+        let selector = ChallengeArgs::Key(KeyChallenge {
+            public_key,
+            purpose: Purpose::Enrol,
+        });
+        let before_replay = resumed.session_challenge(&selector).await.unwrap();
+        assert!(resumed.session_prove(&proof).await.is_err());
+        // Even a replay naming an old challenge consumes this connection's
+        // outstanding slot. Neither captured bytes nor that slot can bind it.
+        assert!(
+            resumed
+                .session_prove(&before_replay.sign(&child_key, &scope).unwrap())
+                .await
+                .is_err()
+        );
+        let fresh = resumed.session_challenge(&selector).await.unwrap();
+        let attached = resumed
+            .session_prove(&fresh.sign(&child_key, &scope).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(attached.record.binding_generation, DecimalU64(2));
         assert!(
             parent
                 .session_revoke(attached.record.reference())
@@ -1801,6 +1843,7 @@ async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_
         captured = Some(proof);
         parent.client().close().await;
         child.client().close().await;
+        resumed.client().close().await;
         fresh_connection.client().close().await;
     }
 }

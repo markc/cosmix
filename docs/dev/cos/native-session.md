@@ -23,7 +23,8 @@ Ping publishes the effective bounds in `native_session_limits` (decimal strings)
 
 The native noded tests use real Unix WebSockets and kernel peer credentials.
 They include separate-process reserved-name competition, altered-scope and
-captured-proof refusal, restart/re-enrolment, parent-resume wake, lease dependency
+captured-proof refusal after connection loss and against a new challenge,
+fresh resumption, restart/re-enrolment, parent-resume wake, lease dependency
 registration, observation/log omission, grant/Term/challenge/interest exhaustion,
 retention high-water and deterministic notice-queue overflow. A test-only probe
 fills the real broker's notice queue under its lock, then checks gap delivery and
