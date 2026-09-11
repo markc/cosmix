@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use super::buffer::Buffer;
@@ -189,6 +189,25 @@ struct Envelope {
 pub struct Control {
     sender: mpsc::SyncSender<Envelope>,
     wake: Arc<Mutex<UnixStream>>,
+    cleanup: Arc<Cleanup>,
+}
+#[derive(Default)]
+struct Cleanup {
+    result: Mutex<Option<Result<(), String>>>,
+    done: Condvar,
+}
+impl Cleanup {
+    fn finish(&self, result: io::Result<()>) {
+        *self.result.lock().unwrap() = Some(result.map_err(|e| e.to_string()));
+        self.done.notify_all();
+    }
+    fn wait(&self) -> io::Result<()> {
+        let mut result = self.result.lock().unwrap();
+        while result.is_none() {
+            result = self.done.wait(result).unwrap();
+        }
+        result.as_ref().unwrap().clone().map_err(io::Error::other)
+    }
 }
 impl Control {
     pub fn load_history(&self, text: String) -> io::Result<()> {
@@ -277,21 +296,23 @@ impl Control {
         // Shutdown cannot be discarded on queue saturation: Drop must be able
         // to join, and the HUP owner must wait for restoration before exit.
         let (reply, receive) = mpsc::sync_channel(1);
-        self.sender
+        if self
+            .sender
             .send(Envelope {
                 request: Request::Stop,
                 reply,
             })
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .is_err()
+        {
+            return self.cleanup.wait();
+        }
         match self.wake.lock().unwrap().write(&[1]) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
+            Err(_) => return self.cleanup.wait(),
         }
-        receive
-            .recv()
-            .map_err(|_| io::Error::other("editor stopped without shutdown reply"))??;
-        Ok(())
+        let _ = receive.recv();
+        self.cleanup.wait()
     }
 }
 
@@ -307,11 +328,18 @@ impl OwnedEditor {
         wake_write.set_nonblocking(true)?;
         let (signal_read, signal_write) = UnixStream::pair()?;
         signal_read.set_nonblocking(true)?;
+        let registration = super::signals::Registration::new(signal_write.try_clone()?)?;
+        let continued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cont_flag = signal_hook::flag::register(libc::SIGCONT, continued.clone())?;
+        let cont_wake =
+            signal_hook::low_level::pipe::register(libc::SIGCONT, signal_write.try_clone()?)?;
         let resize = signal_hook::low_level::pipe::register(libc::SIGWINCH, signal_write)?;
+        let terminal = Terminal::new(input, output)?;
         let (sender, receiver) = mpsc::sync_channel(QUEUE);
         let control = Control {
             sender,
             wake: Arc::new(Mutex::new(wake_write)),
+            cleanup: Arc::new(Cleanup::default()),
         };
         let (line_tx, lines) = mpsc::sync_channel(1);
         let worker_control = control.clone();
@@ -324,7 +352,9 @@ impl OwnedEditor {
                         session: 1,
                         prompt: 0,
                     },
-                    terminal: Terminal::new(input, output),
+                    terminal,
+                    stopped: false,
+                    continued,
                     decoder: Decoder::default(),
                     profile: PromptProfile::Primary(String::new()),
                     completion: Arc::new(CompletionSnapshot::default()),
@@ -340,15 +370,22 @@ impl OwnedEditor {
                     line_tx: line_tx.clone(),
                     control: worker_control,
                 };
-                if let Err(error) = owner.run(wake_read, signal_read, receiver) {
-                    let restored = owner.terminal.restore();
-                    let message = match restored {
-                        Ok(()) => error,
-                        Err(e) => io::Error::other(format!("{error}; restore: {e}")),
-                    };
-                    let _ = line_tx.try_send(Err(message));
+                // Receiver remains alive until cleanup is complete. HUP waits
+                // on the latch even on channel failure, rather than inferring
+                // restoration from disconnect or from a protocol reply.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    owner.run(wake_read, signal_read, &receiver)
+                }))
+                .unwrap_or_else(|_| Err(io::Error::other("editor worker panicked")));
+                let restored = owner.terminal.restore();
+                owner.control.cleanup.finish(restored);
+                if let Err(error) = result {
+                    let _ = line_tx.try_send(Err(error));
                 }
+                drop(registration);
                 signal_hook::low_level::unregister(resize);
+                signal_hook::low_level::unregister(cont_flag);
+                signal_hook::low_level::unregister(cont_wake);
             });
         match worker {
             Ok(worker) => Ok(Self {
@@ -358,6 +395,8 @@ impl OwnedEditor {
             }),
             Err(error) => {
                 signal_hook::low_level::unregister(resize);
+                signal_hook::low_level::unregister(cont_flag);
+                signal_hook::low_level::unregister(cont_wake);
                 Err(error)
             }
         }
@@ -407,6 +446,8 @@ struct Cycle {
     next: usize,
 }
 struct Owner {
+    stopped: bool,
+    continued: Arc<std::sync::atomic::AtomicBool>,
     editor: Editor,
     generation: Generation,
     terminal: Terminal,
@@ -468,7 +509,13 @@ impl Owner {
         self.terminal.draw(&layout, self.profile.text())
     }
     fn finish(&mut self, line: Line) -> io::Result<()> {
-        self.terminal.fresh_line()?;
+        let layout = super::render::layout(
+            self.profile.text(),
+            self.editor.buffer(),
+            self.terminal.size().0,
+        )
+        .map_err(|e| io::Error::other(format!("editor layout: {e:?}")))?;
+        self.terminal.finish(&layout)?;
         self.terminal.restore()?;
         self.editor.finish_line().map_err(protocol)?;
         self.line_tx
@@ -479,7 +526,7 @@ impl Owner {
         &mut self,
         mut wake: UnixStream,
         mut signals: UnixStream,
-        requests: mpsc::Receiver<Envelope>,
+        requests: &mpsc::Receiver<Envelope>,
     ) -> io::Result<()> {
         loop {
             let editing = self.editor.state() == State::Editing;
@@ -487,6 +534,7 @@ impl Owner {
                 editing.then(|| self.terminal.fd()),
                 wake.as_raw_fd(),
                 signals.as_raw_fd(),
+                self.terminal.output_fd(),
                 if editing { self.decoder.timeout() } else { -1 },
             )?;
             // Human input observed in this poll wins before control admission.
@@ -511,9 +559,21 @@ impl Owner {
             }
             if ready[2] {
                 drain(&mut signals)?;
+                if super::signals::take_stop() {
+                    self.stop()?;
+                }
+                if self
+                    .continued
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.resume_foreground()?;
+                }
                 if self.editor.state() == State::Editing {
                     self.draw()?;
                 }
+            }
+            if ready[3] && self.terminal.flush_ready()? && self.editor.state() == State::Editing {
+                self.draw()?;
             }
             if ready[1] {
                 drain(&mut wake)?;
@@ -676,6 +736,40 @@ impl Owner {
         };
         self.effect(effect).map(Response::Reply)
     }
+    fn stop(&mut self) -> io::Result<()> {
+        if self.editor.state() == State::Editing {
+            let effect = self
+                .editor
+                .pause(self.generation, self.editor.edit_revision())
+                .map_err(protocol)?;
+            self.effect(effect)?;
+            self.stopped = true;
+        }
+        // Only bypass the cooperative handler while cooked. The controller
+        // still owns default-stop disposition and process-group behaviour.
+        super::signals::editing(false);
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+        super::signals::editing(true);
+        self.resume_foreground()
+    }
+    fn resume_foreground(&mut self) -> io::Result<()> {
+        // bg sends SIGCONT too. Remain cooked and exclude tty reads until fg's
+        // later SIGCONT; no timer or background tcsetattr retries.
+        if self.stopped && self.terminal.foreground() {
+            let effect = self
+                .editor
+                .command(Command::Resume {
+                    generation: self.generation,
+                    edit_revision: self.editor.edit_revision(),
+                })
+                .map_err(protocol)?;
+            self.effect(effect)?;
+            self.stopped = false;
+        }
+        Ok(())
+    }
     fn cycle(&mut self) -> io::Result<()> {
         if let Some(cycle) = &mut self.cycle {
             let text = &cycle.candidates[cycle.next % cycle.candidates.len()];
@@ -764,25 +858,7 @@ impl Owner {
                 return self.finish(Line::Eof);
             }
             Key::Control(26) => {
-                let effect = self
-                    .editor
-                    .pause(self.generation, self.editor.edit_revision())
-                    .map_err(protocol)?;
-                self.effect(effect)?;
-                // Controller's existing disposition implements shell stop/fg.
-                // Modes are cooked before it runs; the editor never tcsetpgrp's.
-                unsafe {
-                    libc::raise(libc::SIGTSTP);
-                }
-                let effect = self
-                    .editor
-                    .command(Command::Resume {
-                        generation: self.generation,
-                        edit_revision: self.editor.edit_revision(),
-                    })
-                    .map_err(protocol)?;
-                self.effect(effect)?;
-                return Ok(());
+                return self.stop();
             }
             Key::Control(9) if self.profile.allows_completion() => {
                 if self.cycle.is_some() {

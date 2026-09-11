@@ -43,7 +43,18 @@ fn fixture_editor() {
         return;
     };
     let original = modes(0);
-    let input = unsafe { File::from_raw_fd(libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3)) };
+    if scenario == "external-stop" {
+        stop_supervisor(original);
+        return;
+    }
+    let input = if scenario == "input-error" {
+        fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/fd/0")
+            .unwrap()
+    } else {
+        unsafe { File::from_raw_fd(libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3)) }
+    };
     let output = unsafe { File::from_raw_fd(libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3)) };
     let editor = OwnedEditor::start(input, output).unwrap();
     let g = Generation {
@@ -66,7 +77,46 @@ fn fixture_editor() {
             vec!["print(616)".into()],
         )
         .unwrap();
-    if scenario == "restricted" {
+    if scenario == "input-error" {
+        assert!(editor.readline().is_err());
+        // A disconnected request channel is not the cleanup acknowledgement.
+        editor.control.shutdown().unwrap();
+        same_modes(original, modes(0));
+        println!("CLEANUP-PASS");
+        return;
+    } else if scenario == "backpressure" {
+        wait(|| editor.control.inspect().unwrap().text.len() == 2000);
+        // Fill the same tty output queue explicitly to prove backpressure,
+        // rather than assuming a particular emulator queue capacity.
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/proc/self/fd/1")
+            .unwrap();
+        loop {
+            match writer.write(&[b'x'; 4096]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill tty: {e}"),
+            }
+        }
+        let view = editor.control.inspect().unwrap();
+        let start = Instant::now();
+        assert!(matches!(
+            editor.control.pause(g, view.revision).unwrap(),
+            Reply::Suspended { .. }
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        same_modes(original, modes(0));
+        editor.control.shutdown().unwrap();
+        fs::write(
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("backpressure-pass"),
+            "ok",
+        )
+        .unwrap();
+        return;
+    } else if scenario == "restricted" {
         wait(|| editor.control.inspect().unwrap().revision >= 2);
         assert_eq!(editor.control.inspect().unwrap().text, "");
         println!("RESTRICTED-CHECKED");
@@ -165,6 +215,126 @@ fn fixture_editor() {
     same_modes(original, modes(0));
     editor.control.shutdown().unwrap();
     println!("FIXTURE-PASS");
+}
+
+fn stop_supervisor(original: libc::termios) {
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mix"));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let pid = child.id() as i32;
+    let mut status = 0;
+    // Background admission stops before any mode repair or readline setup.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+        pid
+    );
+    assert!(libc::WIFSTOPPED(status));
+    assert_eq!(libc::WSTOPSIG(status), libc::SIGTTIN);
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    fs::write(home.join("nested-pid"), pid.to_string()).unwrap();
+    assert_eq!(unsafe { libc::tcsetpgrp(0, pid) }, 0);
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
+    }
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+        pid
+    );
+    assert!(libc::WIFSTOPPED(status));
+    assert_eq!(libc::WSTOPSIG(status), libc::SIGTSTP);
+    same_modes(original, modes(0));
+    assert_eq!(unsafe { libc::tcsetpgrp(0, libc::getpgrp()) }, 0);
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
+    }
+    // Give the resumed editor a chance to mishandle bg before checking modes.
+    std::thread::sleep(Duration::from_millis(100));
+    same_modes(original, modes(0));
+    println!("BG-COOKED");
+    wait(|| home.join("foreground-now").exists());
+    assert_eq!(unsafe { libc::tcsetpgrp(0, pid) }, 0);
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
+    }
+    assert!(child.wait().unwrap().success());
+    println!("SUPERVISOR-PASS");
+}
+
+#[test]
+fn external_stop_is_cooked_and_bg_waits_for_foreground_before_resuming_draft() {
+    let mut p = Pty::new(Some("external-stop"), true);
+    p.prompt();
+    p.send(b"print(731");
+    p.until("print(731");
+    let pid: i32 = fs::read_to_string(p.home.path().join("nested-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    unsafe {
+        libc::kill(pid, libc::SIGTSTP);
+    }
+    p.until("BG-COOKED");
+    same_modes(p.original, modes(p.slave.as_raw_fd()));
+    fs::write(p.home.path().join("foreground-now"), "go").unwrap();
+    p.prompt();
+    p.send(b")\n");
+    assert!(p.prompt().contains("\r\n731\r\n"));
+    p.send(b"\x04");
+    p.until("SUPERVISOR-PASS");
+    wait(|| p.child.try_wait().unwrap().is_some());
+    assert!(p.child.wait().unwrap().success());
+}
+
+#[test]
+fn undrained_master_does_not_block_suspend_or_shutdown() {
+    let mut p = Pty::new(Some("backpressure"), true);
+    p.prompt();
+    p.send(&[b'a'; 2000]);
+    // Deliberately do not drain master, including after suspension.
+    wait(|| p.home.path().join("backpressure-pass").exists());
+    same_modes(p.original, modes(p.slave.as_raw_fd()));
+    // Only after acknowledgement may the parent drain libtest's own output.
+    p.until("test result:");
+    wait(|| p.child.try_wait().unwrap().is_some());
+    assert!(p.child.wait().unwrap().success());
+}
+
+#[test]
+fn input_failure_shutdown_waits_for_terminal_cleanup() {
+    let mut p = Pty::new(Some("input-error"), true);
+    p.prompt();
+    p.send(b"x");
+    p.until("CLEANUP-PASS");
+    same_modes(p.original, modes(p.slave.as_raw_fd()));
+    wait(|| p.child.try_wait().unwrap().is_some());
+    assert!(p.child.wait().unwrap().success());
+}
+
+#[test]
+fn wrapped_submission_moves_below_tail_from_home() {
+    let mut p = Pty::new(None, true);
+    p.prompt();
+    let text = format!("print(\"{}\")", "a".repeat(100));
+    p.send(text.as_bytes());
+    p.until(&"a".repeat(40));
+    p.send(b"\x01\n");
+    let output = p.prompt();
+    assert!(
+        output.contains("\r\n\n\r\n"),
+        "finish must move down two rows: {output:?}"
+    );
+    assert!(output.contains(&format!("{}\r\n", "a".repeat(100))));
+    p.exit();
 }
 
 struct Pty {

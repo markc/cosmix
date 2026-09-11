@@ -10,6 +10,7 @@ pub mod history;
 pub mod input;
 pub mod render;
 pub mod runtime;
+pub mod signals;
 pub mod terminal;
 
 use buffer::{Buffer, EditError};

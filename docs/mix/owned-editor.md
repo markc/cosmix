@@ -18,6 +18,13 @@ editor prompt restores modes before invoking the controller's existing shell
 stop behaviour; resume preserves the draft. HUP asks the editor to restore its
 protocols before the controller exits.
 
+External SIGTSTP uses the same cooperative cooked-mode stop path. After `bg`,
+the editor stays cooked without tty reads until a later SIGCONT finds it in the
+foreground. Output uses a separate nonblocking tty description with bounded
+writes between control polls. Termios restoration precedes best-effort protocol
+cleanup; output backpressure never delays a suspension/shutdown acknowledgement.
+HUP waits for completed cleanup, including after an input-loop failure.
+
 The internal generation-tagged protocol supports prompt activation, empty-primary
 prompt reservation, resume and shutdown. Admission refuses drafts, continuation,
 paste, search and completion. A separate local lifecycle pause preserves drafts

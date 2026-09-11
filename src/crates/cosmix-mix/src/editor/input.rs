@@ -159,18 +159,21 @@ pub fn wait(
     tty: Option<RawFd>,
     control: RawFd,
     signal: RawFd,
+    output: Option<RawFd>,
     timeout: i32,
-) -> io::Result<[bool; 3]> {
-    let mut fds = [tty.unwrap_or(-1), control, signal].map(|fd| libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    });
+) -> io::Result<[bool; 4]> {
+    let mut fds =
+        [tty.unwrap_or(-1), control, signal, output.unwrap_or(-1)].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    fds[3].events = libc::POLLOUT;
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
     if rc < 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::Interrupted {
-            return Ok([false; 3]);
+            return Ok([false; 4]);
         }
         return Err(error);
     }
