@@ -4168,10 +4168,13 @@ async fn handle_noded_command(
                 )
                 .await
             {
-                Ok((seq, delivered, notices)) => {
+                Ok((seq, delivered, refused, notices)) => {
                     let mut resp = respond("0");
                     resp.set("command", "topic.publish");
-                    resp.body = format!(r#"{{"seq": {seq}, "delivered": {delivered}}}"#);
+                    resp.body = serde_json::json!({
+                        "seq": seq, "delivered": delivered, "refused": refused,
+                        "partial": refused != 0
+                    }).to_string();
                     let _ = tx.try_send(resp.to_wire());
                     dispatch_notifications(state, &notices).await;
                 }

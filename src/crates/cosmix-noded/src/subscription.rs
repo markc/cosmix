@@ -625,6 +625,7 @@ impl SubscriptionBroker {
     ) -> Result<(u64, usize, Vec<Notification>), PublishError> {
         self.publish_with_principal(name, inner_body, from, from_tx, origin, retain, None)
             .await
+            .map(|(seq, delivered, _, notices)| (seq, delivered, notices))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -637,7 +638,7 @@ impl SubscriptionBroker {
         origin: BrokerOrigin,
         retain: bool,
         principal: Option<&cosmix_bus::native_session::BrokerPrincipal>,
-    ) -> Result<(u64, usize, Vec<Notification>), PublishError> {
+    ) -> Result<(u64, usize, usize, Vec<Notification>), PublishError> {
         if name.starts_with('$') {
             return Err(PublishError::ReservedName);
         }
@@ -740,6 +741,7 @@ impl SubscriptionBroker {
         // channels. Topic.active transitions are handled only on subscribe
         // (not publish), so no notifications here.
         let mut delivered = 0usize;
+        let mut refused = 0usize;
         let mut to_prune: Vec<SubscriptionId> = Vec::new();
         {
             let inner_state = self.inner.read().await;
@@ -765,17 +767,23 @@ impl SubscriptionBroker {
                     }
                     match self
                         .send_live_snapshot(&sub.tx, &wire, traffic_class, sub.verified_destination)
-                        .await?
+                        .await
                     {
-                        Ok(()) => delivered += 1,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                        Err(_) => {
+                            refused += 1;
+                            if sub.tx.is_closed() {
+                                to_prune.push(sub.id.clone());
+                            }
+                        }
+                        Ok(Ok(())) => delivered += 1,
+                        Ok(Err(mpsc::error::TrySendError::Full(_))) => {
                             tracing::warn!(
                                 peer = %sub.peer,
                                 topic = %name,
                                 "Topic delivery dropped: subscriber outbound full"
                             );
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Ok(Err(mpsc::error::TrySendError::Closed(_))) => {
                             to_prune.push(sub.id.clone());
                         }
                     }
@@ -797,7 +805,10 @@ impl SubscriptionBroker {
             Vec::new()
         };
 
-        Ok((seq, delivered, notifications))
+        if refused != 0 {
+            tracing::debug!(delivered, refused, "Topic fan-out completed with recipient refusals");
+        }
+        Ok((seq, delivered, refused, notifications))
     }
 
     // ── `topic.subscribe` ──

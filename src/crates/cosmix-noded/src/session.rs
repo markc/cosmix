@@ -1281,6 +1281,42 @@ mod queue_tests {
         assert_eq!(terminal_error, live_error);
     }
 
+    #[tokio::test]
+    async fn fanout_refuses_only_the_recipient_at_dependency_capacity() {
+        let (mut s, _, p, id) = allocated();
+        let now = now_ms();
+        s.records.get_mut(&id).unwrap().deadline = now + LEASE_MS;
+        let p = s.principal(p.connection_id, now).unwrap();
+        let broker = subscription::SubscriptionBroker::new();
+        let mut receivers = Vec::new();
+        for index in 0..3 {
+            let (tx, rx) = mpsc::channel(8);
+            let cid = HexBytes([index + 10; 16]);
+            s.open_outbox(cid, &tx, Default::default());
+            if index == 1 {
+                let reference = RecordRef {
+                    record_id: HexBytes([99; 16]),
+                    incarnation: HexBytes([99; 16]),
+                    binding_generation: DecimalU64(1),
+                };
+                s.outboxes.get_mut(&cid).unwrap().dependencies = vec![(reference, now + LEASE_MS); 256];
+            }
+            broker.subscribe_topic_verified("session.test", &format!("recipient{index}"), tx, None, true).await;
+            receivers.push(rx);
+        }
+        broker.set_native_sessions(Arc::new(tokio::sync::Mutex::new(s)));
+        let (publisher, _rx) = mpsc::channel(8);
+        let wire = BusMessage::new().with_header("type", "event").with_header("command", "snapshot").to_wire();
+        let (_, delivered, refused, _) = broker.publish_with_principal(
+            "session.test", &wire, "publisher", publisher,
+            subscription::BrokerOrigin::Local, false, Some(&p)
+        ).await.unwrap();
+        assert_eq!((delivered, refused), (2, 1));
+        assert!(receivers[0].try_recv().is_ok());
+        assert!(receivers[1].try_recv().is_err());
+        assert!(receivers[2].try_recv().is_ok());
+    }
+
     #[test]
     fn dispatch_expires_without_caller_maintenance() {
         let (mut s, mut reg, p, id) = allocated();

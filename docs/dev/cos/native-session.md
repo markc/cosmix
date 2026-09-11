@@ -32,6 +32,11 @@ use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
 
 The same fence covers correlated responses and fresh topic fan-out. Retained
 topic replay preserves historical attribution and cannot refresh dependencies.
+Per-recipient admission errors skip only that delivery; fan-out continues and
+closed subscriptions are still pruned. A successful `topic.publish` result adds
+`refused` and `partial` alongside `seq` and `delivered`, so committed deliveries
+remain visible when another recipient refuses. Refusal diagnostics contain only
+aggregate counts, without recipient identity or message contents.
 Ping publishes the effective bounds in `native_session_limits` (decimal strings).
 `noded.pending_grants_per_parent` configures the per-Term pending-grant cap
 (integer, default 32, range 0–32). Zero disables new grants. Values above 32
