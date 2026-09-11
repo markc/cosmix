@@ -1453,6 +1453,17 @@ fn default_child_capabilities_cover_every_dispatchable_verb() {
             granted.contains(&capability),
             "{verb} routes to {capability:?}, which the default grant omits"
         );
+        // And the mirror is checked AGAINST the real table rather than merely
+        // sitting beside it — a hand-kept copy is what drifted before.
+        assert_eq!(
+            super::super::control::capability_of(verb, verb == "term.snapshot"),
+            Some(capability),
+            "{verb} disagrees with dispatch's own table"
+        );
+    }
+    // Nothing outside the mirror dispatches, either.
+    for verb in ["term.invented", "term.exec", "shell.execute", ""] {
+        assert_eq!(super::super::control::capability_of(verb, false), None);
     }
     // And the reverse: a capability nobody routes to is dead weight in every
     // grant, so the two tables have to stay the same size.

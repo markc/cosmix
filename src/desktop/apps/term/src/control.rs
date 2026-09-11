@@ -227,6 +227,15 @@ struct State {
     /// (Term, forwarded-seq) and nothing collides.
     forwarded: HashMap<String, (u64, [u8; 32])>,
     next_forward: u64,
+    /// Operation ids the child minted, and the ACTOR each belongs to.
+    ///
+    /// Every forwarded submission travels on Term's one connection, so at the
+    /// child they all share Term's identity and the child's own per-actor
+    /// scoping cannot separate them. Ownership therefore has to be kept HERE:
+    /// without it a sibling agent that guesses an operation id reads another
+    /// agent's result — up to 16 KiB of whatever that shell printed — or
+    /// cancels its evaluation.
+    operations: HashMap<u64, String>,
 }
 
 /// What Term already knows about a caller request it is being asked to forward.
@@ -482,27 +491,13 @@ impl Control {
             (verb, _) if !property => verb,
             _ => return Reply::error("UNSUPPORTED"),
         };
-        let capability = match verb {
-            "term.session" | "term.list" | "term.tabs" | "term.panes" | "term.operation" => {
-                Capability::ReadState
-            }
-            "term.snapshot" if !request.contents => Capability::ReadState,
-            "term.snapshot" => Capability::ReadContents,
-            "term.type" => Capability::Input,
-            "term.tab.new" | "term.tab.select" | "term.pane.split" | "term.pane.select" => {
-                Capability::ManageLayout
-            }
-            "term.tab.close" | "term.pane.close" => Capability::Terminate,
-            // One capability for the whole execute family. Asking what an
-            // execution did is asking about an execution.
-            "term.execute" | "term.exec.result" | "term.exec.cancel" => Capability::Execute,
-            // An unknown verb is resolved against the WEAKEST capability rather
-            // than answered here. Answering early would tell an unauthorised
-            // caller which verbs exist — a known one comes back FORBIDDEN and
-            // an unknown one UNSUPPORTED, which is a probe of the verb table.
-            // The UNSUPPORTED fall-through is below, after `allows`.
-            _ => Capability::ReadState,
-        };
+        // An unknown verb is resolved against the WEAKEST capability rather
+        // than answered here. Answering early would tell an unauthorised caller
+        // which verbs exist — a known one comes back FORBIDDEN and an unknown
+        // one UNSUPPORTED, which is a probe of the verb table. The UNSUPPORTED
+        // fall-through is below, after `allows`.
+        let capability =
+            capability_of(verb, request.contents).unwrap_or(Capability::ReadState);
         if (request.request_id.is_some() || request.operation_id.is_some())
             && actor.session.is_none()
             && (request.target.instance_id != parent.instance_id
@@ -515,25 +510,11 @@ impl Control {
         }
         // Only now, to a caller that WOULD have been allowed. An unauthorised
         // one was refused above and learns nothing about the verb table.
-        if !matches!(
-            verb,
-            "term.session"
-                | "term.list"
-                | "term.tabs"
-                | "term.panes"
-                | "term.operation"
-                | "term.snapshot"
-                | "term.type"
-                | "term.tab.new"
-                | "term.tab.select"
-                | "term.pane.split"
-                | "term.pane.select"
-                | "term.tab.close"
-                | "term.pane.close"
-                | "term.execute"
-                | "term.exec.result"
-                | "term.exec.cancel"
-        ) {
+        //
+        // Derived from the capability match, not a third hand-written copy of
+        // it: the same list already existed there and in the coverage test, and
+        // a fourth would drift the way the second one did.
+        if capability_of(verb, request.contents).is_none() {
             return Reply::error("UNSUPPORTED");
         }
         if matches!(verb, "term.tab.new" | "term.pane.split")
@@ -954,13 +935,40 @@ impl Control {
         }
         state.next_forward += 1;
         let minted = state.next_forward;
-        // Bounded alongside the history it belongs to: the mapping is only
-        // useful while the entry that produced it can still be retried.
-        if state.forwarded.len() >= TOTAL {
-            state.forwarded.clear();
+        // Bounded alongside the history it belongs to. Evict ONE key, not
+        // the whole table: clearing it would strip every live caller of its
+        // retry path at once, turning a capacity event into a fleet-wide
+        // outage of exactly the property the mapping exists to provide.
+        if state.forwarded.len() >= TOTAL
+            && let Some(victim) = state.forwarded.keys().next().cloned()
+        {
+            state.forwarded.remove(&victim);
         }
         state.forwarded.insert(key, (minted, digest));
         Forward::Fresh(minted)
+    }
+
+    /// Bind a child-minted operation id to the actor that caused it.
+    fn claim_operation(&self, identity: &str, operation: u64) {
+        let mut state = self.state.lock().unwrap();
+        // Bounded with the history it belongs to; an id whose mapping is gone
+        // answers like an unknown one, which is a refusal and never a leak.
+        if state.operations.len() >= TOTAL
+            && let Some(victim) = state.operations.keys().next().copied()
+        {
+            state.operations.remove(&victim);
+        }
+        state.operations.insert(operation, identity.to_owned());
+    }
+    /// Whether `identity` may address `operation` at all. An unmapped id is
+    /// treated as somebody else's, not as public.
+    fn owns_operation(&self, identity: &str, operation: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .operations
+            .get(&operation)
+            .is_some_and(|owner| owner == identity)
     }
 
     /// Retain a completed mutation's outcome so a retry replays it.
@@ -1082,6 +1090,12 @@ impl Control {
                 let Some(operation) = request.operation_id else {
                     return Reply::error("INVALID_ARGUMENT");
                 };
+                // Scoped to the actor that submitted it, and refused exactly
+                // like an id that does not exist — so the surface cannot be
+                // used to discover which operation numbers are live.
+                if !self.owns_operation(identity, operation.0) {
+                    return Reply::error("UNKNOWN_OUTCOME");
+                }
                 let shell_verb = if verb == "term.exec.cancel" {
                     "shell.execute.cancel"
                 } else {
@@ -1113,6 +1127,15 @@ impl Control {
         let (mut reply, mut retain) = match answer {
             Ok(Ok(value)) => {
                 let mut value = value;
+                // Record who owns the operation the child just minted, before
+                // the id reaches anyone. A sibling that learns the number some
+                // other way still cannot address it.
+                if let Some(operation) = value["operation_id"]
+                    .as_str()
+                    .and_then(|id| id.parse::<u64>().ok())
+                {
+                    self.claim_operation(identity, operation);
+                }
                 value["target"] = json!(request.target);
                 if let Some(sequence) = sequence {
                     value["operation_id_request"] = json!(DecimalU64(sequence));
@@ -1212,17 +1235,34 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
     #[derive(Deserialize)]
     struct Refusal {
         error_code: String,
+        #[serde(flatten)]
+        rest: serde_json::Map<String, Value>,
     }
-    let code = serde_json::from_str::<Refusal>(body)
-        .map(|refusal| refusal.error_code)
+    let refusal = serde_json::from_str::<Refusal>(body).ok();
+    let code = refusal
+        .as_ref()
+        .map(|r| r.error_code.clone())
         .unwrap_or_default();
+    // The child's refusals CARRY things a caller has to act on: the
+    // `operation_id` to ask `term.exec.result` about, and the `reason` that
+    // separates "provably did not start, use a new id" from "may have run, go
+    // and find out". Relaying only the code discarded both, which left the
+    // three-refusal contract unreachable on the only real agent path — the one
+    // where every submission goes through Term.
+    let relayed = |mapped: &'static str| {
+        let details = refusal.as_ref().map(|r| &r.rest).filter(|rest| !rest.is_empty());
+        match details {
+            Some(rest) => Reply::refuse(mapped, Some(Value::Object(rest.clone()))),
+            None => Reply::error(mapped),
+        }
+    };
     match code.as_str() {
-        "BUSY" => Reply::error("BUSY"),
-        "STALE_GENERATION" => Reply::error("STALE_GENERATION"),
+        "BUSY" => relayed("BUSY"),
+        "STALE_GENERATION" => relayed("STALE_GENERATION"),
         "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
         "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
         "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
-        "UNKNOWN_OUTCOME" => Reply::error("UNKNOWN_OUTCOME"),
+        "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
         // A settled denial: the child looked at the request and said no.
         "REFUSED" => Reply::error("FORBIDDEN"),
@@ -1263,6 +1303,30 @@ fn actor_key(actor: &BrokerPrincipal) -> String {
         ),
     }
 }
+/// The ONE verb-to-capability table. `dispatch`'s gate, its UNSUPPORTED
+/// fall-through and the grant-coverage test all read this, because the moment
+/// there were two copies the second one drifted — it kept answering UNSUPPORTED
+/// before `allows`, which is how an unauthorised caller could tell a real verb
+/// from an invented one.
+pub(crate) fn capability_of(verb: &str, contents: bool) -> Option<Capability> {
+    Some(match verb {
+        "term.session" | "term.list" | "term.tabs" | "term.panes" | "term.operation" => {
+            Capability::ReadState
+        }
+        "term.snapshot" if !contents => Capability::ReadState,
+        "term.snapshot" => Capability::ReadContents,
+        "term.type" => Capability::Input,
+        "term.tab.new" | "term.tab.select" | "term.pane.split" | "term.pane.select" => {
+            Capability::ManageLayout
+        }
+        "term.tab.close" | "term.pane.close" => Capability::Terminate,
+        // One capability for the whole execute family. Asking what an execution
+        // did is asking about an execution.
+        "term.execute" | "term.exec.result" | "term.exec.cancel" => Capability::Execute,
+        _ => return None,
+    })
+}
+
 /// The name the PANE announces for a forwarded submission. Built from Term's
 /// own broker-stamped actor context and nothing else: a caller has no field
 /// through which to supply a name, because a name a caller chose would let one

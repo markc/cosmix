@@ -118,15 +118,20 @@ struct Submit {
     /// refusal instead of an execution.
     prompt_generation: DecimalU64,
     source: String,
-    /// Set ONLY by a forwarder relaying somebody else's submission, from its
-    /// own trusted actor context — never from caller-supplied text.
+    /// A forwarder's claim about who it is relaying for.
     ///
     /// On the real agent path the shell's direct caller is Term, so an
-    /// announcement naming the direct caller would name Term on every
-    /// submission and tell the human nothing about who is actually driving the
-    /// pane. The shell renders this through the same sanitiser as the source
-    /// and labels it as relayed, because the shell cannot verify it itself —
-    /// it is trusting the forwarder, and says so on the glass.
+    /// announcement naming the direct caller would say "Term" for every
+    /// submission and tell the human nothing about who is driving the pane.
+    ///
+    /// THE SHELL CANNOT VERIFY THIS. Any caller with `execute` may put any text
+    /// here; what the shell authenticates is the SUFFIX it appends itself. The
+    /// defence is therefore the rendering, not the field: the announcement
+    /// always reads `<claim> via <authenticated caller>`, the claim is escaped
+    /// by the same allowlist as the source, and " via " is escaped INSIDE the
+    /// claim so a forged label cannot manufacture a second, more trustworthy-
+    /// looking attribution. A reader who trusts only the text after the last
+    /// " via " is reading a name the broker stamped.
     #[serde(default)]
     on_behalf_of: Option<String>,
 }
@@ -605,6 +610,10 @@ fn sanitise(source: &str) -> String {
 /// it arrives in a request body and is no more trustworthy than one — and is
 /// bounded far shorter, because a label is a name and not a payload.
 fn sanitise_label(label: &str) -> String {
+    // Escaped so a claimed label cannot contain the separator and fake an
+    // authenticated suffix of its own — `evil via Term ffff` must not be
+    // constructible from the caller-supplied half.
+    let label = label.replace(" via ", " \\x76ia ");
     let mut out = String::new();
     for character in label.chars() {
         let escaped = escape(character);
@@ -634,22 +643,28 @@ fn escape(character: char) -> String {
         '\n' => "\\n".into(),
         '\t' => "\\t".into(),
         '\r' => "\\r".into(),
+        // Non-ASCII is admitted ONLY as letters, digits and the marks that
+        // compose them. That is a real default-deny, not a list of characters
+        // someone thought of: it is decided by the Unicode properties in std,
+        // which move with the toolchain, and it admits nothing from Cf, Cn, Co,
+        // Cc, Zl or Zp by construction — bidi overrides and isolates, the
+        // invisible tag block at U+E0000, variation selectors, U+FFF9-FFFB,
+        // U+180E, the BOM, U+2028/9 and every unassigned code point are escaped
+        // because they are not letters, without any of them being named.
+        //
+        // The cost is that non-ASCII PUNCTUATION is escaped too, so an
+        // announcement of CJK text is noisier than it strictly needs to be.
+        // That is the right side to err on: a noisy announcement is readable,
+        // and a forged one is not detectable.
+        // Combining marks are escaped too, and that is deliberate rather than
+        // an oversight: a decomposed "e" + U+0301 and a precomposed "é" look
+        // identical on the glass, and an announcement whose whole job is to let
+        // a human tell one submission from another should not render two
+        // different byte sequences the same way.
+        c if c.is_alphanumeric() => c.to_string(),
         c => {
             let code = c as u32;
-            let printable = !c.is_control()
-                && code != 0x7f
-                // Cf: bidi overrides U+202A-E, isolates U+2066-9, ZWJ/ZWNJ,
-                // word joiner, the BOM, and the soft hyphen.
-                && !matches!(code, 0x00ad | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f | 0xfeff)
-                // Line and paragraph separators are line breaks that no
-                // control-character test reports as one.
-                && !matches!(code, 0x2028 | 0x2029)
-                // Unassigned/private-use surrogate range cannot appear in a
-                // Rust char, so what is left is ordinary text.
-                ;
-            if printable {
-                c.to_string()
-            } else if code <= 0xff {
+            if code <= 0xff {
                 format!("\\x{code:02x}")
             } else {
                 format!("\\u{{{code:04x}}}")
@@ -1219,10 +1234,39 @@ mod tests {
                 "{name} was not escaped: {echoed}"
             );
         }
-        // Ordinary non-ASCII text is NOT mangled — an allowlist that escaped
-        // every accent would make the announcement unreadable for most people.
+        // Ordinary non-ASCII LETTERS are not mangled — an allowlist that
+        // escaped every accent would make the announcement unreadable.
         assert_eq!(sanitise("print(\"héllo wörld\")"), "print(\"héllo wörld\")");
         assert_eq!(sanitise("print(\"日本語\")"), "print(\"日本語\")");
+    }
+
+    /// The characters that make the previous blocklist a blocklist. None of
+    /// them is named in `escape`; they are escaped because they are not
+    /// letters, which is what makes the rule default-deny rather than a list
+    /// someone has to keep extending.
+    #[test]
+    fn the_echo_escapes_invisible_and_unassigned_characters_nobody_enumerated() {
+        for (name, hostile) in [
+            // Cf, the same reordering power as RLO and absent from the old list.
+            ("ALM U+061C", "print(1)\u{61c}x"),
+            // The tag block: fully invisible, can spell an entire second
+            // command beside the one on screen.
+            ("tag block", "print(1)\u{e0041}\u{e0042}"),
+            ("annotation U+FFF9", "print(1)\u{fff9}x"),
+            ("Mongolian vowel separator", "print(1)\u{180e}x"),
+            ("variation selector", "print(1)\u{fe0f}"),
+            // Unassigned today; a future assignment must not silently become
+            // printable in an announcement.
+            ("unassigned U+0870-ish", "print(1)\u{2fe0}"),
+        ] {
+            let echoed = sanitise(hostile);
+            for character in hostile.chars().filter(|c| !c.is_ascii()) {
+                assert!(
+                    !echoed.contains(character),
+                    "{name}: {character:?} survived: {echoed}"
+                );
+            }
+        }
     }
 
     #[test]
