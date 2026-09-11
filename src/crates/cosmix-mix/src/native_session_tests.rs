@@ -47,7 +47,7 @@ fn memfd(descriptor: serde_json::Value, version: u8, seals: i32, extra: bool) ->
 fn parse_v1_uses_pread_checks_scope_and_ignores_stale_lease() {
     let mut file = memfd(descriptor(), 1, SEALS, false);
     assert!(file.stream_position().unwrap() > 0); // deliberately at EOF
-    let parsed = parse(&file).ok().expect("valid bootstrap");
+    let parsed = parse(&file).expect("valid bootstrap");
     assert_eq!(parsed.scope.pane_high_water, Some(DecimalU64(2)));
     assert_eq!(parsed.scope.unix_uid, unsafe { libc::geteuid() });
     assert_eq!(parsed.scope.purpose, Purpose::Enrol);
