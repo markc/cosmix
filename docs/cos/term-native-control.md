@@ -102,11 +102,20 @@ admission is atomic and actual nonblocking PTY writes recheck the permit. Expire
 or revoked, unwritten agent bytes are discarded without counting them as PTY
 writes. Already written bytes cannot be recalled.
 
-Term establishes conservative `Deadline`s with real `lease.check` calls outside
-the model/property locks. Queued permits retain those deadlines and a read-only
-connection-liveness probe. Lifecycle revocation/suspension, successor binding
-generations, gaps, connection loss, pane close and child exit invalidate permits.
-No missed notice can extend a deadline. The verified client inbox is bounded at
+Term establishes conservative `Deadline`s outside the model/property locks, from
+two different sources because `lease.check` answers only for a record the asking
+connection holds a delivery dependency on. A bound caller's request registers
+exactly that dependency, so its lease is a real `lease.check`, reused within one
+five-second lease window and dropped by the lifecycle notices and gaps that drop
+the permits it authorised. Term's own attachment never has such a dependency, so
+its deadline comes from the renewal it must issue every five seconds anyway:
+renew refuses unless the record is attached on that very connection, and returns
+the refreshed remainder. A failed renew, a reconnect, a gap or a notice about
+Term's own attachment leaves no deadline at all rather than a stale one. Queued
+permits retain those deadlines and a read-only connection-liveness probe.
+Lifecycle revocation/suspension, successor binding generations, gaps, connection
+loss, pane close and child exit invalidate permits. No missed notice can extend
+a deadline. The verified client inbox is bounded at
 256 deliveries; a full inbox drops that delivery without disconnecting, because
 a gapped recipient must still resynchronise on the same connection
 (BROKER-022). Only receiver closure or transport loss retires the reader and
