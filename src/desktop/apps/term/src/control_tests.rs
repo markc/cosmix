@@ -1563,13 +1563,21 @@ fn p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges() {
             json!({"target":target,"contents":true}),
         )
         .await;
+        // The snapshot is a SCREEN, so a long announcement is hard-wrapped at
+        // the column and padded with NULs. Counting the raw text would depend
+        // on where the wrap happened to land, which is not what is under test.
+        let screen: String = snapshot.1["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\0')
+            .collect();
         assert_eq!(
-            snapshot.1["text"].as_str().unwrap().matches("TERM_EXEC_OK").count(),
+            screen.matches("TERM_EXEC_OK").count(),
             // Once as the admission echo, once as the output. A third would be
             // a second execution.
             2,
-            "exactly one execution reached the pane: {}",
-            snapshot.1["text"]
+            "exactly one execution reached the pane: {screen}"
         );
 
         // The child's refusals are RELAYED, not replaced: BUSY and
@@ -1615,12 +1623,8 @@ fn p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges() {
         // announcement built from the direct caller would say "Term" for every
         // submission and tell the human nothing about who is driving the pane.
         assert!(
-            snapshot.1["text"]
-                .as_str()
-                .unwrap()
-                .contains(" via Term "),
-            "the announcement did not name the originator and its relay: {}",
-            snapshot.1["text"]
+            screen.contains(" via Term "),
+            "the announcement did not name the originator and its relay: {screen}"
         );
 
         // Term namespaces what it forwards. Two DIFFERENT actors using the same
