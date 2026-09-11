@@ -189,6 +189,7 @@ pub fn encode_text(text: &str) -> Result<Vec<u8>, String> {
 struct MeteredPty {
     pty: teletypewriter::Pty,
     listener: Listener,
+    session_exit: Option<Box<dyn Fn() + Send + Sync>>,
 }
 impl Read for MeteredPty {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -272,7 +273,13 @@ impl EventedPty for MeteredPty {
         self.pty.child_event_token()
     }
     fn next_child_event(&mut self) -> Option<ChildEvent> {
-        self.pty.next_child_event()
+        let event = self.pty.next_child_event();
+        if event.is_some()
+            && let Some(notify) = self.session_exit.take()
+        {
+            notify();
+        }
+        event
     }
 }
 
@@ -292,6 +299,7 @@ pub struct Screen {
     pub updated: Instant,
 }
 pub struct Terminal {
+    session: Option<crate::native_session::PaneSession>,
     pub listener: Listener,
     pub stats: Stats,
     grid: Grid,
@@ -307,8 +315,7 @@ fn reap_child(pid: i32, timeout: Duration) {
     loop {
         let mut status = 0;
         let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if rc == pid
-            || (rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        if rc == pid || (rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
         {
             return;
         }
@@ -342,7 +349,16 @@ fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<St
 }
 
 impl Terminal {
+    #[cfg(test)]
     pub fn start(settings: crate::config::Settings) -> Result<Self, String> {
+        Self::start_session(settings, None, 0)
+    }
+
+    pub fn start_session(
+        settings: crate::config::Settings,
+        native: Option<&crate::native_session::NativeSession>,
+        pane_id: u64,
+    ) -> Result<Self, String> {
         if std::path::Path::new("/.flatpak-info").exists() {
             return Err("spike requires native session (controlling PTY)".into());
         }
@@ -382,23 +398,50 @@ impl Terminal {
         let mix_bin = std::ffi::CString::new(MIX_BIN).map_err(|e| e.to_string())?;
         // SAFETY: mix_bin is NUL-terminated and alive for this effective-ID check.
         let mix_executable = unsafe {
-            libc::faccessat(libc::AT_FDCWD, mix_bin.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+            libc::faccessat(
+                libc::AT_FDCWD,
+                mix_bin.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            ) == 0
         };
         if !mix_executable {
             return Err(format!("{MIX_BIN} is not installed or not executable"));
         }
         // Explicit program + argv: native create_pty_with_spawn selects
         // setsid + TIOCSCTTY (Flatpak's non-controlling branch refused above).
+        let launch = native
+            .map(|native| native.prepare(pane_id))
+            .transpose()?
+            .flatten();
+        let (session, fd) = match launch {
+            Some((session, fd)) => (Some(session), Some(fd)),
+            None => (None, None),
+        };
         let spawn = |dir: String| {
-            teletypewriter::create_pty_with_spawn(
+            let mut env = vec![("TERM".into(), settings.term.into())];
+            if let Some(fd) = &fd {
+                env.push(fd.marker());
+            }
+            let mut args = vec!["-u".into(), "TERM_CWD".into()];
+            // Never propagate a marker inherited by Term itself. The one
+            // current launch marker is supplied explicitly after env's unsets.
+            args.extend(["-u".into(), crate::session_fd::MARKER.into()]);
+            if let Some(fd) = &fd {
+                let (name, value) = fd.marker();
+                args.push(format!("{name}={value}"));
+            }
+            args.push(MIX_BIN.into());
+            teletypewriter::create_pty_with_spawn_fd(
                 Some("/usr/bin/env"),
-                vec!["-u".into(), "TERM_CWD".into(), MIX_BIN.into()],
+                args,
                 &Some(dir),
-                Some(vec![("TERM".into(), settings.term.into())]),
+                Some(env),
                 80,
                 24,
                 800,
                 480,
+                fd.as_ref().map(crate::session_fd::LaunchFd::mapping),
             )
         };
         // Search access can change after the probe. A spawn/chdir error gets
@@ -409,12 +452,17 @@ impl Terminal {
                 _ => Err(error),
             })
             .map_err(|e| e.to_string())?;
+        // No parent key material or memfd survives the successful spawn.
+        drop(fd);
         let pid = *pty.child.pid;
         let machine = Machine::new(
             grid.clone(),
             MeteredPty {
                 pty,
                 listener: listener.clone(),
+                session_exit: session
+                    .as_ref()
+                    .map(|pane| Box::new(pane.exit_notifier()) as Box<dyn Fn() + Send + Sync>),
             },
             listener.clone(),
             WindowId::from(0),
@@ -437,6 +485,7 @@ impl Terminal {
             };
         listener.dirty();
         Ok(Self {
+            session,
             listener,
             stats,
             grid,
@@ -556,6 +605,9 @@ impl Terminal {
         self.listener.dirty();
     }
     pub fn shutdown(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.revoke_before_cleanup();
+        }
         let Some(thread) = self.thread.take() else {
             return;
         };

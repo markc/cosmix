@@ -7,8 +7,10 @@ mod input_tests;
 #[cfg(test)]
 mod layout_tests;
 mod metrics;
+mod native_session;
 mod panes;
 mod raster;
+mod session_fd;
 mod tabs;
 mod terminal;
 
@@ -179,18 +181,27 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1)
         });
-    let terminal = Arc::new(Mutex::new(TabSet::with_settings(settings).unwrap_or_else(
-        |e| {
-            eprintln!("PTY startup: {e}");
-            std::process::exit(1)
-        },
-    )));
+    let native = native_session::Supervisor::start()
+        .map_err(|error| {
+            eprintln!("term native-session disabled: {error}");
+        })
+        .ok();
+    let terminal = Arc::new(Mutex::new(
+        TabSet::with_session(settings, native.as_ref().map(|s| s.handle.clone())).unwrap_or_else(
+            |e| {
+                eprintln!("PTY startup: {e}");
+                std::process::exit(1)
+            },
+        ),
+    ));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
     // Completion notifications: the reap system (render thread) hands
     // self-exited pane identities to the Bus task, which emits interact.notify.
     // TERM_NOTIFY=0 disables it — the sender is dropped, so notes are never
     // queued and the Bus task retires its receive branch on the first close.
-    let notify_enabled = std::env::var("TERM_NOTIFY").map(|value| value != "0").unwrap_or(true);
+    let notify_enabled = std::env::var("TERM_NOTIFY")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
     let bus = bus::start(terminal.clone(), cleanup.clone(), notify_rx);
     App::new()
@@ -241,6 +252,7 @@ fn main() {
     let _ = bus.join();
     drop(cleanup);
     let _ = reaper.join();
+    drop(native);
 }
 fn setup(
     mut commands: Commands,
