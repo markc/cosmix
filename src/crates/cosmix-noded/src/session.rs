@@ -1848,7 +1848,10 @@ pub(super) mod queue_tests {
 
     #[test]
     fn retained_expiry_keeps_unknown_outcome_high_water() {
-        let (mut s, mut reg, p, id) = allocated();
+        // execute() samples real BOOTTIME, unlike the synthetic-clock tests.
+        // Start with a live owned lease so this exercises result retention,
+        // rather than an expired record's uniform revoke refusal.
+        let (mut s, mut reg, p, id) = allocated_at(now_ms().unwrap());
         let args = TargetArgs {
             target: s.records[&id].view.reference(),
         };
@@ -1858,7 +1861,7 @@ pub(super) mod queue_tests {
             command: SessionCommand::Revoke(args),
         };
         let first = s.execute(&p, &request, &mut reg);
-        assert!(first.is_ok());
+        assert_eq!(first.as_ref().unwrap()["revoked"], true);
         assert_eq!(s.execute(&p, &request, &mut reg), first);
         for result in &mut s.results {
             result.expires = 0;

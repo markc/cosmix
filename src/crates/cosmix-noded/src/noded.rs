@@ -7001,39 +7001,53 @@ mod tests {
             );
         }
         let pending_guard = state.pending_responses.map.write().await;
-        let task_state = state.clone();
-        let task = tokio::spawn(async move {
-            let mut request = BusMessage::new()
-                .with_header("id", "original")
-                .with_header("broker_origin", "mesh");
-            let admission = super::SessionAdmission {
-                admitted_node: Some("beta".into()),
-                response_seen: true,
-                last_detail: None,
-            };
-            super::route_local(
-                &task_state,
-                "desktop",
-                &mut request,
-                &caller,
-                Some("bridge-beta"),
-                "192.0.2.2".parse().unwrap(),
-                &admission,
-                Some("desktopctl"),
-            )
-            .await;
-        });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while state.registry.try_write().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut request = BusMessage::new()
+            .with_header("id", "original")
+            .with_header("broker_origin", "mesh");
+        let admission = super::SessionAdmission {
+            admitted_node: Some("beta".into()),
+            response_seen: true,
+            last_detail: None,
+        };
+        let source = "192.0.2.2".parse().unwrap();
+        assert_eq!(
+            super::admitted_delivery_peer(&state, source, Some("bridge-beta"), &admission),
+            Some("beta".into()),
+            "the old authority must permit the stamp before the reload"
+        );
+        let next_id = state.pending_responses.next_id.load(Ordering::Relaxed);
+        let route = super::route_local(
+            &state,
+            "desktop",
+            &mut request,
+            &caller,
+            Some("bridge-beta"),
+            source,
+            &admission,
+            Some("desktopctl"),
+        );
+        tokio::pin!(route);
+        // Poll directly to the held pending lock. Registry ownership is no
+        // longer a wait signal: M1 deliberately releases it before this await.
+        assert!(futures_util::poll!(&mut route).is_pending());
+        assert_eq!(
+            state.pending_responses.next_id.load(Ordering::Relaxed),
+            next_id + 1
+        );
+        assert!(state.registry.try_write().is_ok());
+        assert!(target_rx.try_recv().is_err());
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            apply_inventory_reload(&state, reload_posture(2, vec![])),
+        )
         .await
         .unwrap();
-        apply_inventory_reload(&state, reload_posture(2, vec![])).await;
         drop(pending_guard);
-        task.await.unwrap();
-        let delivered = bus_mod::parse(&target_rx.recv().await.unwrap()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), route)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, super::ObserveOutcome::Delivered);
+        let delivered = bus_mod::parse(&target_rx.try_recv().unwrap()).unwrap();
         assert_eq!(delivered.get("broker_peer"), None);
         assert_eq!(delivered.get("broker_service"), None);
     }
