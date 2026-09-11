@@ -108,6 +108,7 @@ pub enum UnixConnectOutcome {
 pub struct VerifiedConnection {
     client: NodedClient,
     incoming: mpsc::UnboundedReceiver<VerifiedCommand>,
+    pub(crate) session_lock: tokio::sync::Mutex<()>,
 }
 impl VerifiedConnection {
     /// Requests/replies use the existing ABP client API. Its raw receive lane
@@ -235,7 +236,11 @@ async fn connect_verified(
             Ok(error) => error,
             Err(error) => ConnectError::Protocol(error),
         })?;
-    Ok(VerifiedConnection { client, incoming })
+    Ok(VerifiedConnection {
+        client,
+        incoming,
+        session_lock: tokio::sync::Mutex::new(()),
+    })
 }
 
 /// Check every component, rejecting symlinks and unprotected replacement

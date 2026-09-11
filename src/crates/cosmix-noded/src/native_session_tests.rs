@@ -912,6 +912,145 @@ fn client_options(broker: &Broker) -> cosmix_client::UnixConnectOptions {
     options
 }
 
+async fn verified(broker: &Broker) -> cosmix_client::VerifiedConnection {
+    let cosmix_client::UnixConnectOutcome::VerifiedUnix(c) =
+        cosmix_client::NodedClient::connect_unix("", &broker.url, &client_options(broker), None)
+            .await
+            .unwrap()
+    else {
+        panic!("Unix required")
+    };
+    c
+}
+
+#[tokio::test]
+async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+    let broker = Broker::start().await;
+    let parent = verified(&broker).await;
+    let parent_key = SigningKey::from_bytes(&rand::random());
+    let parent_record = parent
+        .session_allocate(&parent_key, Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    let key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(key.verifying_key().to_bytes());
+    let granted = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: parent_record.reference(),
+            pane_id: DecimalU64(7),
+            pane_generation: DecimalU64(1),
+            public_key,
+            role: Role::PaneShell,
+            capabilities: vec![Capability::Input],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        parent.session_grant_fetch(public_key).await.unwrap().grant,
+        granted.grant
+    );
+    let child = verified(&broker).await;
+    let selector = ChallengeArgs::Key(KeyChallenge {
+        public_key,
+        purpose: Purpose::Enrol,
+    });
+    let scope = cosmix_client::session::ExpectedScope {
+        unix_uid: parent_record.owner_uid,
+        parent_key_hash: Some(HexBytes(
+            Sha256::digest(parent_key.verifying_key().to_bytes()).into(),
+        )),
+        pane_id: Some(DecimalU64(7)),
+        role: Role::PaneShell,
+        public_key_hash: HexBytes(Sha256::digest(public_key.0).into()),
+        capabilities_hash: HexBytes(
+            Sha256::digest(encode_capabilities(&[Capability::Input]).unwrap()).into(),
+        ),
+    };
+    let challenge = child.session_challenge(&selector).await.unwrap();
+    let proof = challenge.sign(&key, &scope).unwrap();
+    let record = child.session_prove(&proof).await.unwrap().record;
+    child.session_renew(record.reference()).await.unwrap();
+    let mut legacy = broker.tcp().await;
+    send(&mut legacy, &request("noded.list", "noded", "list")).await;
+    let list: serde_json::Value = serde_json::from_str(&receive(&mut legacy).await.body).unwrap();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .contains(&serde_json::json!(record.name))
+    );
+    let discovery = parent.client().service_inventory().await.unwrap();
+    assert!(discovery.iter().any(|s| {
+        s.native_session
+            .as_ref()
+            .is_some_and(|r| r.record_id == record.record_id)
+    }));
+    let mut waiting = verified(&broker).await;
+    // Register interest before parent loss; this first challenge is consumed
+    // by an invalid proof so it cannot mask the post-resume fresh transcript.
+    let wake_challenge = waiting.session_challenge(&selector).await.unwrap();
+    assert!(
+        waiting
+            .session_prove(&ProveArgs {
+                challenge_id: wake_challenge.transcript.challenge_id,
+                signature: HexBytes([0; 64])
+            })
+            .await
+            .is_err()
+    );
+    parent.client().close().await;
+    // Wait for the affected child's suspension notice on its key-interest lane.
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), waiting.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if event.command().command == "noded.session.lifecycle" {
+            break;
+        }
+    }
+    let replacement = verified(&broker).await;
+    let challenge = replacement
+        .session_challenge(&ChallengeArgs::Key(KeyChallenge {
+            public_key: HexBytes(parent_key.verifying_key().to_bytes()),
+            purpose: Purpose::Enrol,
+        }))
+        .await
+        .unwrap();
+    let parent_scope = cosmix_client::session::ExpectedScope {
+        unix_uid: parent_record.owner_uid,
+        parent_key_hash: None,
+        pane_id: None,
+        role: Role::Term,
+        public_key_hash: HexBytes(Sha256::digest(parent_key.verifying_key().to_bytes()).into()),
+        capabilities_hash: HexBytes(
+            Sha256::digest(encode_capabilities(&parent_record.capabilities).unwrap()).into(),
+        ),
+    };
+    replacement
+        .session_prove(&challenge.sign(&parent_key, &parent_scope).unwrap())
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(3), waiting.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.command().command, "noded.session.lifecycle");
+    let challenge = waiting.session_challenge(&selector).await.unwrap();
+    let resumed = waiting
+        .session_prove(&challenge.sign(&key, &scope).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resumed.record.binding_generation, DecimalU64(2));
+    assert_eq!(resumed.record.pane_id, Some(DecimalU64(7)));
+    replacement.client().close().await;
+    waiting.client().close().await;
+    child.client().close().await;
+}
+
 #[tokio::test]
 async fn p0i_06_client_verified_delivery_and_tcp_has_no_trusted_context() {
     use cosmix_client::{NodedClient, UnixConnectOutcome};

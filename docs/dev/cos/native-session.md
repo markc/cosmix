@@ -51,11 +51,9 @@ ping-advertised `native-session-endpoint`, otherwise
 `/run/cosmix/noded/bus.sock`, independently of client XDG directories.
 
 The contracts remain [BUS-013–017](../../spec/04-bus-wire.md) and
-[BROKER-016–025](../../spec/05-broker-topics.md). Session allocation, grants,
-proof verification, binding leases and policy enforcement are S2 and later work;
-this foundation does not establish a session-bound principal.
-Valid bootstrap requests currently receive structured `UNSUPPORTED`; malformed
-bootstrap requests are rejected by the strict wire parser. No grants are minted.
+[BROKER-016–025](../../spec/05-broker-topics.md). S2 builds the binding lifecycle
+on that foundation. The strict parser still rejects malformed requests before
+mutation. Recipient verb/property policy enforcement remains S4 work.
 
 ## S2 first boundary: reserve the allocation namespace
 
@@ -68,9 +66,7 @@ the displayed UID as authority. Neighbouring legacy names remain valid.
 
 The p0i-02 namespace slice exercises TCP and real Unix WebSocket connections,
 pre-claim refusal, retained alias authority and forged `from` canonicalisation.
-The allocator, records, proof handling, leases, notices and typed client commands
-are still pending. No attached identity is exposed before those lifecycle
-protections exist. The broker starts with an empty, non-persistent registry;
+The broker starts with an empty, non-persistent registry;
 there is no live profile-activation switch in this boundary.
 
 ## Observation and transport boundary
@@ -90,6 +86,21 @@ legacy mesh wire has no protected-classification propagation contract. This
 does not restrict existing TCP/D2 routing or establish cross-node UID trust.
 
 ## Client opt-in boundary
+
+`VerifiedConnection` now exposes `session_hello`, `session_allocate`,
+`session_grant_create`, `session_grant_fetch`, `session_challenge`, `session_prove`,
+`session_renew`, `session_revoke`, `session_list` and `session_lease_check`.
+An empty connect name selects anonymous Unix bootstrap. Calls are serialised
+per verified handle; responses require explicit native framing and RC. Allocation
+signs the exact BUS-016 bytes with Ed25519. Challenge signing requires independently
+retained expected UID, parent-key hash, pane, role, key hash and capability hash;
+the application also tracks pane-generation high-water within each parent instance.
+No uncertain mutation is retried automatically. Wake errors remain visible on
+success and refusal. Private signing keys are never serialised into requests.
+
+Same-UID discovery includes the broker-owned `native_session` snapshot. Other
+transports and UIDs see bare allocated names. Caller provenance cannot set the
+field. Session list and discovery share `SessionRecord`; neither is live authority.
 
 Ordinary `NodedClient::connect` and config-layer default helpers stay on TCP.
 `NodedClient::connect_unix` explicitly opts into node-local traffic; it takes

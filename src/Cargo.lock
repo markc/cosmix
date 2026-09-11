@@ -1245,6 +1245,7 @@ version = "0.4.3"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
+ "ed25519-dalek",
  "futures-channel",
  "futures-util",
  "gloo-net",

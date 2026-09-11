@@ -31,6 +31,9 @@ tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
 # Native test harness — dev-dependencies for the in-process stub
 # broker used by the supervised-reconnect tests. cosmix-noded itself
 # has no embeddable variant; the stub stands in.

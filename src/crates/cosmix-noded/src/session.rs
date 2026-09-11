@@ -434,6 +434,7 @@ impl Sessions {
     fn install(&self, id: Id, reg: &mut HashMap<String, ServiceEntry>) {
         let r = &self.records[&id];
         let c = &self.connections[&r.connection.expect("attached")];
+        reg.retain(|_, entry| !entry.same_channel(&c.tx));
         reg.insert(
             r.view.name.clone(),
             ServiceEntry {
@@ -522,6 +523,21 @@ impl Sessions {
     pub(super) fn name(&self, connection: Id) -> Option<String> {
         self.attached(connection)
             .map(|id| self.records[&id].view.name.clone())
+    }
+
+    pub(super) fn discovery(
+        &self,
+        name: &str,
+        uid: Option<u32>,
+        now: u64,
+    ) -> Option<serde_json::Value> {
+        let r = self.records.values().find(|r| r.view.name == name)?;
+        if uid != Some(r.view.owner_uid) {
+            return Some(serde_json::Value::String(name.into()));
+        }
+        let mut info = cosmix_bus::ServiceInfo::from_name(name);
+        info.native_session = Some(self.snapshot(r, now));
+        Some(serde_json::to_value(info).expect("discovery"))
     }
 
     pub(super) fn principal(&self, connection: Id, now: u64) -> Option<BrokerPrincipal> {

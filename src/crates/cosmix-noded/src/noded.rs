@@ -3666,6 +3666,7 @@ async fn handle_noded_command(
                 })
             };
             let info = cosmix_bus::ServiceInfo {
+                native_session: None,
                 name: from.clone(),
                 binary: prov.binary,
                 version: prov.version,
@@ -3841,11 +3842,26 @@ async fn handle_noded_command(
             // (cosmix_bus::ServiceInfo tolerates both shapes) so a new
             // client tolerates an old broker during the client-first
             // rollout (§9).
-            let mut services: Vec<cosmix_bus::ServiceInfo> = {
-                let reg = state.registry.read().await;
-                reg.values().map(|e| e.info.clone()).collect()
+            let services: Vec<serde_json::Value> = {
+                let mut reg = state.registry.write().await;
+                let mut sessions = state.sessions.lock().await;
+                let now = session::now_ms();
+                sessions.maintain(&mut reg, now);
+                let mut entries: Vec<_> = reg.values().collect();
+                entries.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+                entries
+                    .into_iter()
+                    .map(|e| {
+                        sessions
+                            .discovery(
+                                &e.info.name,
+                                state.principal.as_ref().map(|p| p.unix_uid),
+                                now,
+                            )
+                            .unwrap_or_else(|| serde_json::to_value(&e.info).expect("service info"))
+                    })
+                    .collect()
             };
-            services.sort_by(|a, b| a.name.cmp(&b.name));
             let body = serde_json::to_string(&services).unwrap_or_else(|_| "[]".to_string());
 
             let mut resp = respond("0");
@@ -3861,6 +3877,7 @@ async fn handle_noded_command(
             let service_count = { state.registry.read().await.len() as u16 };
             let bi = cosmix_buildinfo::build_info!();
             let noded_self = cosmix_bus::ServiceInfo {
+                native_session: None,
                 name: "noded".to_string(),
                 binary: Some(bi.pkg.to_string()),
                 version: Some(bi.version.to_string()),
