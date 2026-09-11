@@ -14,6 +14,12 @@ use super::terminal::Terminal;
 use super::{Command, Editor, Effect, Generation, ModeAction, PromptProfile, Reply, State};
 
 const QUEUE: usize = 16;
+/// How long a granted reservation may stand before the editor takes the prompt
+/// back by itself. The admission owner normally consumes or releases it within
+/// microseconds; this exists so that an owner which dies, loses its transport,
+/// or is cancelled mid-sequence cannot leave a human staring at a dead prompt.
+/// It is a deadline on an existing wait, not a clock anything ticks on.
+const RESERVATION: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_CANDIDATES: usize = 4096;
 const MAX_COMPLETION_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_ENTRY_BYTES: usize = 1024 * 1024;
@@ -123,9 +129,18 @@ impl CompletionSnapshot {
     }
 }
 
+/// A line the shell never typed. Carries the operation identity the reducer and
+/// the result store both key off, so one admitted submission is one command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    pub source: String,
+    pub operation: u64,
+}
+
 #[derive(Debug)]
 pub enum Line {
     Submitted(String),
+    Admitted(Admitted),
     Interrupted,
     Eof,
 }
@@ -158,6 +173,12 @@ enum Request {
     Consume {
         generation: Generation,
         revision: u64,
+    },
+    Admit {
+        generation: Generation,
+        revision: u64,
+        echo: String,
+        admitted: Admitted,
     },
     Inspect,
     HistoryLoad(String),
@@ -266,6 +287,15 @@ impl Control {
             .recv()
             .map_err(|_| io::Error::other("editor stopped without reply"))?
     }
+    /// Bounded variant for the admission owner, which runs on a Bus task and
+    /// must not park a blocking-pool thread on an editor that is wedged. A
+    /// timeout here is not a hang: a reservation the owner abandons is released
+    /// by the editor's own reservation deadline.
+    fn call_within(&self, request: Request, budget: std::time::Duration) -> io::Result<Response> {
+        self.send(request)?
+            .recv_timeout(budget)
+            .map_err(|_| io::Error::other("editor did not answer within the admission budget"))?
+    }
     pub fn command(&self, command: Command) -> io::Result<Reply> {
         match self.call(Request::Protocol(command))? {
             Response::Reply(reply) => Ok(reply),
@@ -294,6 +324,79 @@ impl Control {
             revision,
         })
         .map(|_| ())
+    }
+    /// Steps 5-6 of the admission sequence, as ONE operation on the thread that
+    /// owns the terminal: echo the announcement while the reservation still
+    /// stands, then consume the prompt generation, then hand the line over.
+    ///
+    /// Doing it anywhere else would let the announcement and the execution be
+    /// separated by a failure. Here the only failure after the echo is the
+    /// consume, and the editor thread is the sole writer of the state it
+    /// checks, so the two cannot disagree.
+    pub fn admit(
+        &self,
+        generation: Generation,
+        revision: u64,
+        echo: String,
+        admitted: Admitted,
+        budget: std::time::Duration,
+    ) -> io::Result<()> {
+        self.call_within(
+            Request::Admit {
+                generation,
+                revision,
+                echo,
+                admitted,
+            },
+            budget,
+        )
+        .map(|_| ())
+    }
+    /// Release a reservation without executing anything (step 4 refusal,
+    /// cancellation, identity loss). The editor returns to editing with the
+    /// same, untouched, empty draft.
+    pub fn release(
+        &self,
+        generation: Generation,
+        revision: u64,
+        budget: std::time::Duration,
+    ) -> io::Result<Reply> {
+        match self.call_within(
+            Request::Protocol(Command::Resume {
+                generation,
+                edit_revision: revision,
+            }),
+            budget,
+        )? {
+            Response::Reply(reply) => Ok(reply),
+            _ => Err(io::Error::other("unexpected release reply")),
+        }
+    }
+    /// Step 2-3: ask the editor to give up the terminal for an execution. A
+    /// `Busy` reply is a refusal that changed nothing — the draft, the search
+    /// and the paste in progress are all still there.
+    pub fn reserve(
+        &self,
+        generation: Generation,
+        revision: u64,
+        budget: std::time::Duration,
+    ) -> io::Result<Reply> {
+        match self.call_within(
+            Request::Protocol(Command::SuspendRequested {
+                generation,
+                edit_revision: revision,
+            }),
+            budget,
+        )? {
+            Response::Reply(reply) => Ok(reply),
+            _ => Err(io::Error::other("unexpected reserve reply")),
+        }
+    }
+    pub fn inspect_within(&self, budget: std::time::Duration) -> io::Result<View> {
+        match self.call_within(Request::Inspect, budget)? {
+            Response::View(view) => Ok(view),
+            _ => Err(io::Error::other("unexpected view reply")),
+        }
     }
     pub fn shutdown(&self) -> io::Result<()> {
         // Shutdown cannot be discarded on queue saturation: Drop must be able
@@ -388,6 +491,7 @@ impl OwnedEditor {
                     search_forward: false,
                     line_tx: line_tx.clone(),
                     control: worker_control,
+                    reserved_until: None,
                 };
                 // Receiver remains alive until cleanup is complete. HUP waits
                 // on the latch even on channel failure, rather than inferring
@@ -487,6 +591,8 @@ struct Owner {
     search_forward: bool,
     line_tx: mpsc::SyncSender<io::Result<Line>>,
     control: Control,
+    /// Set when a SuspendRequested was granted for an execution admission.
+    reserved_until: Option<std::time::Instant>,
 }
 fn protocol(error: super::ProtocolError) -> io::Error {
     io::Error::other(format!("editor protocol: {error:?}"))
@@ -577,7 +683,7 @@ impl Owner {
                 wake.as_raw_fd(),
                 signals.as_raw_fd(),
                 self.terminal.output_fd(),
-                if editing { self.decoder.timeout() } else { -1 },
+                self.wait_timeout(editing),
             )?;
             // Human input observed in this poll wins before control admission.
             if ready[0] && editing {
@@ -644,7 +750,62 @@ impl Owner {
                 self.editor.set_interaction(interaction).map_err(protocol)?;
                 self.key(key)?;
             }
+            self.sync_reservation();
+            if self
+                .reserved_until
+                .is_some_and(|until| std::time::Instant::now() >= until)
+            {
+                self.expire_reservation()?;
+            }
         }
+    }
+    /// The editor waits on input, control and output readiness; a standing
+    /// reservation adds its own deadline to that same wait so an abandoned
+    /// admission cannot leave the human without a prompt.
+    fn wait_timeout(&self, editing: bool) -> i32 {
+        let decoder = if editing { self.decoder.timeout() } else { -1 };
+        let Some(until) = self.reserved_until else {
+            return decoder;
+        };
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        let reservation = left
+            .as_millis()
+            .saturating_add(u128::from(!left.is_zero()))
+            .min(i32::MAX as u128) as i32;
+        if decoder < 0 {
+            reservation
+        } else {
+            decoder.min(reservation)
+        }
+    }
+    /// Derive the deadline from the editor's own state rather than keeping a
+    /// second copy of it: whatever ended the reservation — consumption, a
+    /// release, a shutdown — has already been recorded there.
+    fn sync_reservation(&mut self) {
+        if self.editor.reserved() && self.editor.state() == State::Suspended {
+            self.reserved_until
+                .get_or_insert_with(|| std::time::Instant::now() + RESERVATION);
+        } else {
+            self.reserved_until = None;
+        }
+    }
+    /// Take the prompt back from an admission owner that never came back. The
+    /// draft is empty by construction (only an empty primary prompt can be
+    /// reserved), so this restores exactly what the human was looking at.
+    fn expire_reservation(&mut self) -> io::Result<()> {
+        self.reserved_until = None;
+        if self.editor.state() != State::Suspended || !self.editor.reserved() {
+            return Ok(());
+        }
+        let effect = self
+            .editor
+            .command(Command::Resume {
+                generation: self.generation,
+                edit_revision: self.editor.edit_revision(),
+            })
+            .map_err(protocol)?;
+        self.effect(effect)?;
+        Ok(())
     }
     fn request(&mut self, request: Request) -> io::Result<Response> {
         let effect = match request {
@@ -702,6 +863,34 @@ impl Owner {
                 self.editor
                     .consume_reservation(generation, revision)
                     .map_err(protocol)?;
+                return Ok(Response::Stopped);
+            }
+            Request::Admit {
+                generation,
+                revision,
+                echo,
+                admitted,
+            } => {
+                // Refuse BEFORE the echo. Everything `admissible` reads is
+                // owned by this thread, so a true answer here still holds after
+                // the write below — the announcement and the execution it
+                // announces cannot be separated by a concurrent change.
+                if !self.editor.admissible(generation, revision) {
+                    return Err(protocol(super::ProtocolError::InvalidState));
+                }
+                self.terminal.echo(&echo)?;
+                if let Err(error) = self.editor.consume_reservation(generation, revision) {
+                    // Unreachable given the check above, but a consumed prompt
+                    // with no delivered line would park the REPL on a readline
+                    // that never returns. Unblock it, then fail loudly.
+                    let _ = self.line_tx.try_send(Ok(Line::Interrupted));
+                    self.reserved_until = None;
+                    return Err(protocol(error));
+                }
+                self.reserved_until = None;
+                self.line_tx
+                    .try_send(Ok(Line::Admitted(admitted)))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 return Ok(Response::Stopped);
             }
             Request::Pause {

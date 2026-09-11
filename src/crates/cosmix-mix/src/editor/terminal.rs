@@ -210,6 +210,39 @@ impl Terminal {
     pub fn bell(&mut self) -> io::Result<()> {
         self.queue(b"\x07")
     }
+    /// Write one line and DRAIN it before returning, unlike every other writer
+    /// here. The admission echo has to be on the glass before the evaluation it
+    /// announces produces any output of its own, and the evaluator writes
+    /// straight to the shared stdout — it does not go through this buffer. A
+    /// queued echo would race that output and could surface after it.
+    ///
+    /// Called only from the admission path, with modes already restored and the
+    /// editor idle, so the bounded wait below is for tty flow control alone.
+    pub fn echo(&mut self, text: &str) -> io::Result<()> {
+        self.queue(text.as_bytes())?;
+        self.queue(b"\r\n")?;
+        self.cursor_row = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.written < self.pending.len() {
+            if !self.foreground() {
+                // Writing would raise SIGTTOU against a shell that no longer
+                // owns the terminal. Refusing is correct: the caller turns this
+                // into a refusal and nothing executes unannounced.
+                return Err(io::Error::other("editor lost the terminal before the echo"));
+            }
+            if Instant::now() >= deadline {
+                OUTPUT_TEARS.fetch_add(1, Ordering::Relaxed);
+                return Err(io::Error::other("echo could not be flushed"));
+            }
+            self.flush_ready()?;
+            if self.written < self.pending.len() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        // flush_ready consumed the dirty bit above; the caller is not drawing.
+        self.dirty = false;
+        Ok(())
+    }
     pub fn notice(&mut self, layout: &Layout, message: &str) -> io::Result<()> {
         self.finish(layout)?;
         self.queue(message.as_bytes())?;

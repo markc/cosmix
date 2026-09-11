@@ -507,7 +507,7 @@ async fn cached_status_delivery_rechecks_broker_suspend_without_notices() {
         }
     };
     let principal = delivery.trusted_context().unwrap();
-    assert!(crate::session_status::admitted(&observer, &observer_hello, principal, &bound).await);
+    assert!(crate::session_status::admitted(&observer, &observer_hello, principal, &bound, Capability::ReadState).await);
     parent.client().close().await; // real broker recursively suspends the child
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -521,7 +521,7 @@ async fn cached_status_delivery_rechecks_broker_suspend_without_notices() {
     // Never consume a lifecycle hint. The saved delivery + old Attached record
     // alone would pass policy; a fresh verified reader isolates the Attached
     // re-read gate from the original connection's compulsory broker close.
-    assert!(!crate::session_status::admitted(&observer, &observer_hello, principal, &bound).await);
+    assert!(!crate::session_status::admitted(&observer, &observer_hello, principal, &bound, Capability::ReadState).await);
     request.abort();
     let _ = request.await;
 }
@@ -969,7 +969,7 @@ async fn a_session_bound_admission_costs_two_round_trips() {
     // three, and every one of them serialises on the connection the resident
     // renews over.
     let started = Instant::now();
-    assert!(crate::session_status::admitted(&child, &hello, principal, &bound).await);
+    assert!(crate::session_status::admitted(&child, &hello, principal, &bound, Capability::ReadState).await);
     let elapsed = started.elapsed();
     assert!(
         elapsed < delay * 5,

@@ -219,6 +219,22 @@ impl Editor {
     pub fn state(&self) -> State {
         self.state
     }
+    /// Whether a granted execution reservation is standing. A local lifecycle
+    /// `pause` never sets this, so suspension alone is not a permit.
+    pub fn reserved(&self) -> bool {
+        self.reserved
+    }
+    /// Would [`Self::consume_reservation`] succeed right now? The admission
+    /// owner writes its visible echo between this question and the consume;
+    /// both run on the thread that owns every field read here, so a true answer
+    /// stays true across that write and the announcement can never be separated
+    /// from the execution it announces.
+    pub fn admissible(&self, generation: Generation, revision: u64) -> bool {
+        self.generation == Some(generation)
+            && revision == self.revision
+            && self.state == State::Suspended
+            && self.reserved
+    }
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -353,6 +369,10 @@ impl Editor {
                 if self.state != State::Suspended {
                     return Err(ProtocolError::InvalidState);
                 }
+                // Returning the prompt to the human ends any reservation over
+                // it. An admission owner that comes back after a release —
+                // late, cancelled, or timed out — finds nothing to consume.
+                self.reserved = false;
                 self.modes(State::Activating, ModeAction::EnterEditing)
             }
             Command::Shutdown { generation } => {

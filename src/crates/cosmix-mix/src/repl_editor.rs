@@ -1,6 +1,6 @@
 //! Opt-in adapter. The legacy editor receives the same calls when unselected.
 use crate::completion::MixHelper;
-use crate::editor::runtime::{Control, Line, OwnedEditor};
+use crate::editor::runtime::{Admitted, Control, Line, OwnedEditor};
 use crate::editor::{Generation, PromptProfile};
 use rustyline::error::ReadlineError;
 use std::collections::HashSet;
@@ -57,6 +57,14 @@ fn read_complete_history(path: &Path) -> io::Result<String> {
         return Err(io::Error::other("history exceeds 16 MiB ingestion limit"));
     }
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// What the prompt produced. An admitted line is not a human line with a tag
+/// on it: it carries an identity that was minted, echoed and recorded before it
+/// arrived, and the REPL adopts that identity rather than opening its own.
+pub enum ReplInput {
+    Human(String),
+    Admitted(Admitted),
 }
 
 pub enum ReplEditor {
@@ -122,7 +130,7 @@ impl ReplEditor {
             Self::Owned { helper: target, .. } => *target = helper,
         }
     }
-    pub fn readline(&mut self, prompt: &str, continuation: bool) -> rustyline::Result<String> {
+    pub fn readline(&mut self, prompt: &str, continuation: bool) -> rustyline::Result<ReplInput> {
         match self {
             Self::Legacy(editor) => {
                 // Legacy has no activation acknowledgement; this is the last
@@ -130,7 +138,7 @@ impl ReplEditor {
                 if let Some(generation) = crate::session_state::prepare_prompt(continuation) {
                     crate::session_state::prompt_activated(generation);
                 }
-                editor.readline(prompt)
+                editor.readline(prompt).map(ReplInput::Human)
             }
             Self::Owned {
                 editor,
@@ -165,7 +173,8 @@ impl ReplEditor {
                 // The editor owner publishes only an actual Editing acknowledgement,
                 // including deferred foreground activation. Suspended/Err publish nothing.
                 match editor.readline()? {
-                    Line::Submitted(line) => Ok(line),
+                    Line::Submitted(line) => Ok(ReplInput::Human(line)),
+                    Line::Admitted(admitted) => Ok(ReplInput::Admitted(admitted)),
                     Line::Interrupted => Err(ReadlineError::Interrupted),
                     Line::Eof => Err(ReadlineError::Eof),
                 }

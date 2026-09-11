@@ -63,6 +63,11 @@ struct Capabilities {
 }
 impl Default for Capabilities {
     fn default() -> Self {
+        // Reported from what this build can actually do, not from what the
+        // caller is allowed to ask for. The owned editor is what makes an
+        // admission possible; under rustyline the answer is the declared
+        // limitation, which is UNSUPPORTED and never BUSY.
+        let execution = crate::session_execute::available();
         Self {
             shell_phase: "snapshot",
             cwd: "last-observed-snapshot",
@@ -70,8 +75,16 @@ impl Default for Capabilities {
             jobs: "UNSUPPORTED",
             job_signal: "UNSUPPORTED",
             foreground: "UNSUPPORTED",
-            evaluation_submit: "UNSUPPORTED",
-            evaluation_inspect: "UNSUPPORTED",
+            evaluation_submit: if execution {
+                "idle-prompt-admission"
+            } else {
+                "UNSUPPORTED"
+            },
+            evaluation_inspect: if execution {
+                "result-and-cancel"
+            } else {
+                "UNSUPPORTED"
+            },
             input: "UNSUPPORTED",
             isolated_task: "UNSUPPORTED",
             events: "UNSUPPORTED",
@@ -88,7 +101,16 @@ struct Reply {
 
 /// Pure policy step, called only with a broker-authenticated stamp. Bound
 /// principals never fall back to ambient owner authority on the same connection.
-fn permitted(principal: &BrokerPrincipal, target: &SessionRecord) -> bool {
+///
+/// `capability` is the one the verb family requires — `ReadState` for a
+/// snapshot, `Execute` for an admission. It is a parameter rather than a
+/// constant because a reader must never be able to reach the execute surface by
+/// holding the capability that answers questions.
+pub(crate) fn permitted(
+    principal: &BrokerPrincipal,
+    target: &SessionRecord,
+    capability: Capability,
+) -> bool {
     if principal.broker_epoch != target.broker_epoch
         || principal.unix_uid != target.owner_uid
         || principal.owner_node != target.owner_node
@@ -101,7 +123,7 @@ fn permitted(principal: &BrokerPrincipal, target: &SessionRecord) -> bool {
             let parent = caller.role == Role::Term
                 && Some(caller.instance_id) == target.parent_instance
                 && Some(caller.incarnation) == target.parent_incarnation
-                && caller.capabilities.contains(&Capability::ReadState);
+                && caller.capabilities.contains(&capability);
             let own_pane = caller.role == Role::PaneShell
                 && caller.record_id == target.record_id
                 && caller.instance_id == target.instance_id
@@ -109,7 +131,7 @@ fn permitted(principal: &BrokerPrincipal, target: &SessionRecord) -> bool {
                 && caller.binding_generation == target.binding_generation
                 && caller.pane_id == target.pane_id
                 && caller.pane_generation == target.pane_generation
-                && caller.capabilities.contains(&Capability::ReadState);
+                && caller.capabilities.contains(&capability);
             parent || own_pane
         }
         _ => false,
@@ -121,8 +143,9 @@ pub(crate) async fn admitted(
     hello: &Hello,
     principal: &BrokerPrincipal,
     bound: &SessionRecord,
+    capability: Capability,
 ) -> bool {
-    if !permitted(principal, bound) {
+    if !permitted(principal, bound, capability) {
         return false;
     }
     // Fresh correlated checks refresh the delivered caller's dependency. No cached
@@ -175,15 +198,38 @@ pub(crate) async fn dispatch(
         refuse(connection, event).await;
         return;
     };
-    if !tokio::time::timeout(ADMISSION, admitted(connection, hello, principal, bound))
-        .await
-        .unwrap_or(false)
+    // One capability per verb family, resolved before any correlated check:
+    // an unauthorised caller learns nothing about which families exist.
+    let capability = match command.command.as_str() {
+        VERB => Capability::ReadState,
+        crate::session_execute::SUBMIT
+        | crate::session_execute::RESULT
+        | crate::session_execute::CANCEL => Capability::Execute,
+        // An unknown verb is answered without any lease work at all; there is
+        // no capability that would make it exist.
+        _ => {
+            let _ = tokio::time::timeout(
+                ADMISSION,
+                connection
+                    .client()
+                    .respond(command, 10, "{\"error_code\":\"UNSUPPORTED\"}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if !tokio::time::timeout(
+        ADMISSION,
+        admitted(connection, hello, principal, bound, capability),
+    )
+    .await
+    .unwrap_or(false)
     {
         refuse(connection, event).await;
         return;
     }
-    let response = if command.command != VERB {
-        (10, "{\"error_code\":\"UNSUPPORTED\"}".to_owned())
+    let response = if capability == Capability::Execute {
+        crate::session_execute::dispatch(connection, hello, bound, event, principal).await
     } else {
         let request = (command.body.len() <= MAX_REQUEST)
             .then(|| serde_json::from_str::<Request>(&command.body).ok())
@@ -288,14 +334,14 @@ mod tests {
     fn policy_cross_uid_epoch_and_bound_scope_never_fall_back() {
         let mut target = target();
         let mut caller = ambient();
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         target.policy = Policy::DefaultOpen;
-        assert!(permitted(&caller, &target));
+        assert!(permitted(&caller, &target, Capability::ReadState));
         caller.unix_uid += 1;
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         caller.unix_uid -= 1;
         caller.broker_epoch = HexBytes([9; 16]);
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         caller.broker_epoch = target.broker_epoch;
         caller.assurance = Assurance::SessionBound;
         caller.session = Some(SessionIdentity {
@@ -311,13 +357,13 @@ mod tests {
             capabilities: vec![Capability::ReadState],
             lease_remaining_ms: DecimalU64(1000),
         });
-        assert!(permitted(&caller, &target));
+        assert!(permitted(&caller, &target, Capability::ReadState));
         target.policy = Policy::Restricted;
-        assert!(permitted(&caller, &target));
+        assert!(permitted(&caller, &target, Capability::ReadState));
         caller.session.as_mut().unwrap().capabilities.clear();
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         target.policy = Policy::DefaultOpen;
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         caller
             .session
             .as_mut()
@@ -325,10 +371,56 @@ mod tests {
             .capabilities
             .push(Capability::ReadState);
         caller.session.as_mut().unwrap().pane_id = Some(DecimalU64(99));
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         caller.session.as_mut().unwrap().pane_id = target.pane_id;
         caller.session.as_mut().unwrap().binding_generation = DecimalU64(1);
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
+    }
+
+    /// Reading the shell's state and driving it are different authorities. A
+    /// caller holding only ReadState must not reach the execute family, and a
+    /// caller holding only Execute must not be able to read snapshots — the
+    /// capability is a parameter precisely so neither can stand in for the
+    /// other.
+    #[test]
+    fn read_authority_is_not_execute_authority_in_either_direction() {
+        let target = target();
+        let mut caller = ambient();
+        caller.assurance = Assurance::SessionBound;
+        caller.session = Some(SessionIdentity {
+            record_id: HexBytes([10; 16]),
+            instance_id: target.parent_instance.unwrap(),
+            incarnation: target.parent_incarnation.unwrap(),
+            role: Role::Term,
+            parent_instance: None,
+            parent_incarnation: None,
+            pane_id: None,
+            pane_generation: None,
+            binding_generation: DecimalU64(1),
+            capabilities: vec![Capability::ReadState],
+            lease_remaining_ms: DecimalU64(1000),
+        });
+        assert!(permitted(&caller, &target, Capability::ReadState));
+        assert!(!permitted(&caller, &target, Capability::Execute));
+        caller.session.as_mut().unwrap().capabilities = vec![Capability::Execute];
+        assert!(permitted(&caller, &target, Capability::Execute));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
+        // The own-pane arm is held to the same split.
+        caller.session = Some(SessionIdentity {
+            record_id: target.record_id,
+            instance_id: target.instance_id,
+            incarnation: target.incarnation,
+            role: Role::PaneShell,
+            parent_instance: target.parent_instance,
+            parent_incarnation: target.parent_incarnation,
+            pane_id: target.pane_id,
+            pane_generation: target.pane_generation,
+            binding_generation: target.binding_generation,
+            capabilities: vec![Capability::ReadState],
+            lease_remaining_ms: DecimalU64(1000),
+        });
+        assert!(permitted(&caller, &target, Capability::ReadState));
+        assert!(!permitted(&caller, &target, Capability::Execute));
     }
 
     #[test]
@@ -361,13 +453,13 @@ mod tests {
             capabilities: Vec::new(),
             lease_remaining_ms: DecimalU64(1000),
         });
-        assert!(!permitted(&caller, &target));
+        assert!(!permitted(&caller, &target, Capability::ReadState));
         caller
             .session
             .as_mut()
             .unwrap()
             .capabilities
             .push(Capability::ReadState);
-        assert!(permitted(&caller, &target));
+        assert!(permitted(&caller, &target, Capability::ReadState));
     }
 }
