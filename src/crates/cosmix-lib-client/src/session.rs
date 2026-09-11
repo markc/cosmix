@@ -59,10 +59,12 @@ struct LeaseResult {
 }
 
 /// Conservative local CLOCK_BOOTTIME deadline for one checked reference.
-/// Discard on connection/epoch loss or a lifecycle gap.
+/// Validate against hello from the current connection; discard on lifecycle gaps.
 #[derive(Debug, Clone)]
 pub struct Deadline {
     target: RecordRef,
+    broker_epoch: HexBytes<16>,
+    connection_id: HexBytes<16>,
     expires_ms: u64,
 }
 
@@ -71,7 +73,12 @@ impl Deadline {
         &self.target
     }
 
-    pub fn is_live(&self) -> SessionResult<bool> {
+    /// Supply context from the current verified connection, not a cached old hello.
+    pub fn is_live(&self, current: &Hello) -> SessionResult<bool> {
+        if self.broker_epoch != current.broker_epoch || self.connection_id != current.connection_id
+        {
+            return Ok(false);
+        }
         Ok(boottime_ms()? < self.expires_ms)
     }
 }
@@ -249,6 +256,9 @@ impl VerifiedConnection {
     }
     /// Captures request-start CLOCK_BOOTTIME internally. Gaps invalidate results.
     pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
+        // This handle owns one transport and does not reconnect transparently.
+        // Bind the check to its broker epoch and connection, not just a ref.
+        let context = self.session_hello().await?;
         let start = boottime_ms()?;
         let result: LeaseResult = self
             .session_rpc(
@@ -260,11 +270,52 @@ impl VerifiedConnection {
             .await?;
         let deadline = Deadline {
             target,
+            broker_epoch: context.broker_epoch,
+            connection_id: context.connection_id,
             expires_ms: start.saturating_add(result.lease_remaining_ms.0),
         };
-        if !deadline.is_live()? {
+        if !deadline.is_live(&context)? {
             return Err(SessionFailure::LeaseExpired);
         }
         Ok(deadline)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_refuses_broker_restart_and_same_epoch_reconnection() {
+        let current = Hello {
+            broker_epoch: HexBytes([1; 16]),
+            connection_id: HexBytes([2; 16]),
+        };
+        let deadline = Deadline {
+            target: RecordRef {
+                record_id: HexBytes([3; 16]),
+                incarnation: HexBytes([4; 16]),
+                binding_generation: DecimalU64(1),
+            },
+            broker_epoch: current.broker_epoch,
+            connection_id: current.connection_id,
+            expires_ms: u64::MAX,
+        };
+        assert!(deadline.is_live(&current).unwrap());
+        let restarted = Hello {
+            broker_epoch: HexBytes([5; 16]),
+            ..current.clone()
+        };
+        assert!(!deadline.is_live(&restarted).unwrap());
+        let reconnected = Hello {
+            connection_id: HexBytes([6; 16]),
+            ..current.clone()
+        };
+        assert!(!deadline.is_live(&reconnected).unwrap());
+        let expired = Deadline {
+            expires_ms: 0,
+            ..deadline
+        };
+        assert!(!expired.is_live(&current).unwrap());
     }
 }

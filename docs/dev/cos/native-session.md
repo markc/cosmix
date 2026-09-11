@@ -180,6 +180,10 @@ within each parent instance (reset it when that parent instance changes).
 `session_lease_check` captures local CLOCK_BOOTTIME before the request and returns
 an opaque `Deadline` for the checked reference, refusing an already elapsed
 result. `Deadline::is_live` fails closed on clock errors; no raw delta is exposed.
+Each deadline stores the broker epoch and connection ID obtained by `hello` on
+the checking handle. `is_live(&current_hello)` returns false after either changes,
+including reconnection within the same broker epoch. Use hello from the current
+verified connection; lifecycle gaps still require discarding cached deadlines.
 No uncertain mutation is retried automatically. Wake errors remain visible on
 success and refusal. Private signing keys are never serialised into requests.
 
