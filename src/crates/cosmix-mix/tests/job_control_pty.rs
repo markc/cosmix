@@ -102,6 +102,30 @@ fn fixture_process() {
             assert_ne!(t.c_lflag & libc::ECHO, 0);
             fs::write(report.with_extension("canonical"), "yes").unwrap();
         }
+        "signals" => {
+            let mut mask = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) },
+                0
+            );
+            for sig in [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe { libc::sigaction(sig, std::ptr::null(), &mut action) },
+                    0
+                );
+                assert_eq!(
+                    action.sa_sigaction,
+                    libc::SIG_DFL,
+                    "inherited ignored signal {sig}"
+                );
+                assert_eq!(
+                    unsafe { libc::sigismember(&mask, sig) },
+                    0,
+                    "inherited blocked signal {sig}"
+                );
+            }
+        }
         "exit" | "identity" => {}
         _ => panic!("unknown fixture mode"),
     }
@@ -552,6 +576,12 @@ fn captured_runners_keep_their_wait_owner_inside_an_interactive_session() {
         !jobs.contains("[2]"),
         "captured process became a job: {jobs:?}"
     );
+    let output = p.command(&format!(
+        r#"$r = run_argv(["{}", "--exact", "fixture_process", "--nocapture"], {{env: {{P0J_MODE: "signals", P0J_REPORT: "{}"}}}}); print($r.ok); print($r.stderr)"#,
+        p.home.path().join("fixture").display(),
+        p.home.path().join("signals").display()
+    ));
+    assert!(output.contains("\r\ntrue\r\n"), "{output:?}");
 }
 
 #[test]

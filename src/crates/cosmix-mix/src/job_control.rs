@@ -15,6 +15,42 @@ use std::time::{Duration, Instant};
 const CLOSE_GRACE: Duration = Duration::from_millis(500);
 const STAGE_ARG: &str = "--internal-job-stage";
 
+// Caught dispositions reset on exec; SIG_IGN would leak into captured runners
+// whose spawning contract deliberately remains unchanged by interactive jobs.
+extern "C" fn shell_signal(_: libc::c_int) {}
+
+/// TTY handoff needs SIGTTOU blocked on the calling thread. Keep this scoped:
+/// captured children must inherit the ordinary signal mask at an idle shell.
+struct TtouGuard {
+    previous: libc::sigset_t,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl TtouGuard {
+    fn new() -> io::Result<Self> {
+        let mut set = unsafe { std::mem::zeroed() };
+        let mut previous = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTTOU);
+        }
+        let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        Ok(Self {
+            previous,
+            _thread: std::marker::PhantomData,
+        })
+    }
+}
+impl Drop for TtouGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub enum ExecutionPolicy {
     /// Includes SSH -c, scripts and serve. Never initialise terminal ownership.
@@ -136,12 +172,14 @@ fn modes(fd: i32) -> io::Result<libc::termios> {
     Ok(unsafe { t.assume_init() })
 }
 fn set_modes(fd: i32, t: &libc::termios) -> io::Result<()> {
+    let _ttou = TtouGuard::new()?;
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 fn foreground(fd: i32, pgid: i32) -> io::Result<()> {
+    let _ttou = TtouGuard::new()?;
     if unsafe { libc::tcsetpgrp(fd, pgid) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -205,7 +243,7 @@ impl Controller {
         for sig in [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
             let mut old = unsafe { std::mem::zeroed() };
             let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
-            ignore.sa_sigaction = libc::SIG_IGN;
+            ignore.sa_sigaction = shell_signal as *const () as usize;
             unsafe {
                 libc::sigemptyset(&mut ignore.sa_mask);
                 if libc::sigaction(sig, &ignore, &mut old) < 0 {
@@ -319,12 +357,14 @@ impl Controller {
         }
     }
     pub fn take_terminal(&self, pgid: i32) -> io::Result<TerminalLease<'_>> {
+        let ttou = TtouGuard::new()?;
         let saved = modes(self.tty.as_raw_fd())?;
         *self.shared.shell_modes.lock().unwrap() = saved;
         foreground(self.tty.as_raw_fd(), pgid)?;
         Ok(TerminalLease {
             controller: self,
             saved,
+            _ttou: ttou,
         })
     }
     pub fn finish(
@@ -511,6 +551,7 @@ impl Drop for Controller {
 pub struct TerminalLease<'a> {
     controller: &'a Controller,
     saved: libc::termios,
+    _ttou: TtouGuard,
 }
 impl Drop for TerminalLease<'_> {
     fn drop(&mut self) {
@@ -597,6 +638,7 @@ fn close_jobs(shared: &Shared) {
                 .map(|j| (j.id, j.pgid))
                 .collect();
             drop(s);
+            let _ttou = TtouGuard::new();
             for (id, pgid) in survivors {
                 eprintln!("mix: job {} (pgid {}) survived HUP/CONT grace", id, pgid);
             }

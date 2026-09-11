@@ -12,6 +12,9 @@ stdin plus a controlling terminal. Scripts, `-c` (including SSH commands),
 serve mode, redirected stdin and sessions without a controlling terminal
 retain their noninteractive launch policy. Captured `run_argv` and
 `run_pipeline` retain their separate capture/cancellation process groups.
+The shell's job-control signal handlers reset on exec. SIGTTOU is blocked
+only around terminal handoff and restoration, so captured children do not
+inherit shell-only ignored signals or a handoff-time signal mask.
 
 Sourced shell input in an interactive shell shares its job controller. A
 stopped foreground command inside source currently waits for external
