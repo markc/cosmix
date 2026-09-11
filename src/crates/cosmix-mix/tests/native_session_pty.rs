@@ -50,13 +50,14 @@ fn current_mix() -> &'static std::path::Path {
             let expected = String::from_utf8(revision.stdout).unwrap();
             // Build-script git_dirty can be stale after dependency-only edits.
             let status = Command::new("git")
-                .args(["status", "--porcelain", "--untracked-files=normal"])
+                .args(["status", "--porcelain", "--untracked-files=no"])
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .output()
                 .expect("git status is required for fixture provenance");
             assert!(
                 status.status.success() && status.stdout.is_empty(),
-                "fixture requires a clean CURRENT checkout, including dependency edits"
+                "fixture provenance requires no tracked checkout changes (including dependencies); untracked files are ignored. git status: {}{}",
+                String::from_utf8_lossy(&status.stdout), String::from_utf8_lossy(&status.stderr)
             );
             let output = std::process::Command::new(&binary)
                 .args(["--version", "--json"])
@@ -570,6 +571,8 @@ fn valid_handoff_with_broker_down_does_not_delay_first_source() {
             .await;
         let launch = LaunchFd::new(&grant, &key).unwrap();
         broker.stop();
+        // Account NSS lookup and config-file reads are resident-only again;
+        // neither name-service latency nor broker retry delays first source.
         let start = Instant::now();
         let mut child = Child::spawn(&broker, &launch);
         drop(launch);

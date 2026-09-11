@@ -2,7 +2,8 @@
 
 `p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes` exercises the
 production teletypewriter hop with an explicit current-HEAD Mix release binary.
-See `tests/README.md`; its loud missing-binary skip is not enrolment evidence.
+See `tests/README.md`; it is ignored by default and must run with `--ignored`.
+An explicit run without the binary variable fails, never passes or skips.
 The test-only `LaunchSettings` injection shares the production spawn body.
 The embedded vendor `patch_guard.rs` also makes Term tests sensitive to the
 recorded upstream pins and patched source hashes; see the desktop patch README.

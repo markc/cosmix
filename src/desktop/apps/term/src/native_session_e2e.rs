@@ -1,30 +1,28 @@
 //! p0i-01: production Term prepare/fd mapping/Machine path to a real Mix proof.
 //! See tests/README.md for the explicit current-HEAD release binary prerequisite.
 use super::*;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use term_native_test_broker::Broker;
 
-fn current_mix() -> Option<PathBuf> {
-    let Some(path) = std::env::var_os("COSMIX_E2E_MIX_BIN") else {
-        // Direct stderr is deliberate: libtest must not hide the skip in its
-        // successful-test capture. An absent prerequisite is not E2E evidence.
-        writeln!(std::io::stderr(), "SKIPPED p0i-01 production Term→Mix proof: build current HEAD with cargo build --release -p cosmix-mix, then set COSMIX_E2E_MIX_BIN to target/release/mix").unwrap();
-        return None;
-    };
+fn current_mix() -> PathBuf {
+    let path = std::env::var_os("COSMIX_E2E_MIX_BIN").expect(
+        "p0i-01 requires COSMIX_E2E_MIX_BIN: build current HEAD with cargo build --release -p cosmix-mix, set the variable to its absolute target/release/mix path, then run this test with --ignored; see the test doc comment for the exact invocation",
+    );
     let binary = PathBuf::from(path)
         .canonicalize()
         .expect("COSMIX_E2E_MIX_BIN must name an existing current-HEAD Mix binary");
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let status = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(repo)
         .output()
         .unwrap();
     assert!(
         status.status.success() && status.stdout.is_empty(),
-        "p0i-01 requires a clean current checkout, including dependency edits"
+        "p0i-01 provenance requires no tracked checkout changes (including dependencies); untracked files are ignored. git status: {}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
     );
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -55,7 +53,7 @@ fn current_mix() -> Option<PathBuf> {
         binary.display(),
         head.trim()
     );
-    Some(binary)
+    binary
 }
 
 fn account_name() -> String {
@@ -82,11 +80,16 @@ fn account_name() -> String {
         .to_owned()
 }
 
+/// From a clean committed checkout, with COSMIX naming its absolute root:
+/// ```mix
+/// print(run_argv_must(["env", "RUSTC_WRAPPER=", "cargo", "build", "--release", "-p", "cosmix-mix"], {cwd: env("COSMIX") .. "/src"}))
+/// print(run_argv_must(["env", "RUSTC_WRAPPER=", "COSMIX_E2E_MIX_BIN=" .. env("COSMIX") .. "/src/target/release/mix", "cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "native_session::production_e2e::p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes", "--", "--exact", "--ignored", "--nocapture"], {cwd: env("COSMIX") .. "/src"}))
+/// ```
+/// If CARGO_TARGET_DIR is overridden, supply its release/mix path instead.
 #[test]
+#[ignore = "requires COSMIX_E2E_MIX_BIN — run explicitly via the gate battery"]
 fn p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes() {
-    let Some(binary) = current_mix() else {
-        return;
-    };
+    let binary = current_mix();
     let broker = Broker::start();
     let root = broker.endpoint.parent().unwrap();
     let home = root.join("mix-home");
