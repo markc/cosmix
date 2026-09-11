@@ -1427,9 +1427,10 @@ fn p0i_07_actor_table_survives_reconnect_churn() {
 #[test]
 fn default_child_capabilities_cover_every_dispatchable_verb() {
     let granted = super::capabilities();
-    // Mirrors dispatch's verb-to-capability table. Execute is listed because
-    // the grant must still carry it even while the verb answers UNSUPPORTED;
-    // stage D turns the verb on without reissuing anyone's grant.
+    // Mirrors dispatch's verb-to-capability table, and has to stay a COMPLETE
+    // mirror: a verb missing from here is a verb this gate silently stops
+    // covering. Stage D turned `execute` on and added two operation verbs to
+    // the same capability, without reissuing anyone's grant.
     for (verb, capability) in [
         ("term.session", Capability::ReadState),
         ("term.list", Capability::ReadState),
@@ -1445,6 +1446,8 @@ fn default_child_capabilities_cover_every_dispatchable_verb() {
         ("term.tab.close", Capability::Terminate),
         ("term.pane.close", Capability::Terminate),
         ("term.execute", Capability::Execute),
+        ("term.exec.result", Capability::Execute),
+        ("term.exec.cancel", Capability::Execute),
     ] {
         assert!(
             granted.contains(&capability),
