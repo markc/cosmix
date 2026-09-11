@@ -39,17 +39,27 @@ pub struct Broker {
 }
 
 impl Default for Broker {
-    fn default() -> Self { Self::start() }
+    fn default() -> Self {
+        Self::start()
+    }
 }
 
 impl Broker {
     pub fn start() -> Self {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("term-native-{:032x}", rand::random::<u128>()));
+        let root =
+            std::env::temp_dir().join(format!("term-native-{:032x}", rand::random::<u128>()));
         std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // BUS-013 requires user-traversable, broker-owned ancestors. A 0700
+        // directory deliberately disables noded's native profile; TCP readiness
+        // alone cannot establish that a native-session fixture is usable.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut broker = Self {
-            endpoint: root.join("bus.sock"), root, url: String::new(), stop: None, worker: None,
+            endpoint: root.join("bus.sock"),
+            root,
+            url: String::new(),
+            stop: None,
+            worker: None,
         };
         broker.boot();
         broker
@@ -58,7 +68,8 @@ impl Broker {
     pub fn options(&self) -> cosmix_client::UnixConnectOptions {
         let mut options = cosmix_client::UnixConnectOptions::new(cosmix_client::BrokerAccount {
             // Real kernel credentials of the embedded broker, not a wire claim.
-            uid: unsafe { libc::geteuid() }, gid: unsafe { libc::getegid() },
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
         });
         options.endpoint = Some(self.endpoint.clone());
         options.require_native_session = true;
@@ -71,21 +82,47 @@ impl Broker {
         drop(probe);
         self.url = format!("ws://{listen}/ws");
         let endpoint = self.endpoint.clone();
+        let options = self.options();
+        let url = self.url.clone();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         self.stop = Some(stop_tx);
         self.worker = Some(std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             runtime.block_on(async {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let broker = tokio::spawn(noded::run(noded::RunConfig {
-                    unix_socket: Some(endpoint), pending_grants_per_parent: 32,
-                    listen, node: "test-node".into(), wg_ip: "127.0.0.1".into(),
-                    mesh_config_path: None, spec_dir: None,
-                    admission_mode: cosmix_config::node::AdmissionMode::Off,
-                    observe_allowed_services: Vec::new(),
-                }, tx));
-                tokio::time::timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+                let broker = tokio::spawn(noded::run(
+                    noded::RunConfig {
+                        unix_socket: Some(endpoint),
+                        pending_grants_per_parent: 32,
+                        listen,
+                        node: "test-node".into(),
+                        wg_ip: "127.0.0.1".into(),
+                        mesh_config_path: None,
+                        spec_dir: None,
+                        admission_mode: cosmix_config::node::AdmissionMode::Off,
+                        observe_allowed_services: Vec::new(),
+                    },
+                    tx,
+                ));
+                tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let probe = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    cosmix_client::NodedClient::connect_unix("", &url, &options, None),
+                )
+                .await
+                .expect("native fixture profile negotiation deadline")
+                .expect("native fixture must provide verified Unix ingress");
+                let cosmix_client::UnixConnectOutcome::VerifiedUnix(probe) = probe else {
+                    panic!("native fixture must not fall back to TCP");
+                };
+                probe.client().close().await;
                 ready_tx.send(()).unwrap();
                 let _ = stop_rx.await;
                 broker.abort();
@@ -98,8 +135,12 @@ impl Broker {
     }
 
     pub fn stop(&mut self) {
-        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
-        if let Some(worker) = self.worker.take() { worker.join().unwrap(); }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
     }
 
     pub fn bounce(&mut self) {
