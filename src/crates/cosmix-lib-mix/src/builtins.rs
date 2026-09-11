@@ -829,7 +829,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         // (tcp_* share the ws feature's tungstenite/rustls stack.)
         #[cfg(not(feature = "ws"))]
         name @ ("ws_connect" | "ws_send" | "ws_recv" | "ws_close" | "tcp_connect" | "tcp_send"
-        | "tcp_recv" | "tcp_recv_line" | "tcp_close") => Err(MixError::RuntimeError {
+            | "tcp_recv" | "tcp_recv_line" | "tcp_close") => Err(MixError::RuntimeError {
             span: None,
             msg: format!("{name}() requires the `ws` feature (tungstenite/rustls)"),
         }),
@@ -1417,12 +1417,7 @@ fn builtin_strip(args: Vec<Value>) -> MixResult<Option<Value>> {
     // ends. Before this the second argument was accepted and silently
     // IGNORED — the exact no-op a PHP-style trim(s, chars) caller hits.
     let cs = args.get(1).map(|v| v.to_mix_string());
-    Ok(Some(Value::String(charset_trim(
-        &s,
-        cs.as_deref(),
-        true,
-        true,
-    ))))
+    Ok(Some(Value::String(charset_trim(&s, cs.as_deref(), true, true))))
 }
 
 // Exact-match string ops boundary (char-aware strings P2): `replace`, `contains`,
@@ -1450,9 +1445,7 @@ fn nonempty_delim(name: &str, d: &str) -> MixResult<()> {
     if d.is_empty() {
         return Err(MixError::RuntimeError {
             span: None,
-            msg: format!(
-                "{name}: empty delimiter (matching \"\" everywhere answers nothing — pass a real delimiter)"
-            ),
+            msg: format!("{name}: empty delimiter (matching \"\" everywhere answers nothing — pass a real delimiter)"),
         });
     }
     Ok(())
@@ -1621,24 +1614,14 @@ fn builtin_ltrim(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("ltrim", &args, 1)?;
     let s = args[0].to_mix_string();
     let cs = args.get(1).map(|v| v.to_mix_string());
-    Ok(Some(Value::String(charset_trim(
-        &s,
-        cs.as_deref(),
-        true,
-        false,
-    ))))
+    Ok(Some(Value::String(charset_trim(&s, cs.as_deref(), true, false))))
 }
 
 fn builtin_rtrim(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("rtrim", &args, 1)?;
     let s = args[0].to_mix_string();
     let cs = args.get(1).map(|v| v.to_mix_string());
-    Ok(Some(Value::String(charset_trim(
-        &s,
-        cs.as_deref(),
-        false,
-        true,
-    ))))
+    Ok(Some(Value::String(charset_trim(&s, cs.as_deref(), false, true))))
 }
 
 fn builtin_lines(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -5515,10 +5498,7 @@ fn parse_run_parallel_opts(caller: &str, value: Option<&Value>) -> MixResult<Run
         match k.as_str() {
             "max" => {
                 let n = extract_number(val, InputPolicy::NumberOnly).ok_or_else(|| {
-                    opt_invalid(
-                        caller,
-                        format!("max must be a number, got {}", val.type_name()),
-                    )
+                    opt_invalid(caller, format!("max must be a number, got {}", val.type_name()))
                 })?;
                 if !(n.is_finite() && n >= 1.0 && n.fract() == 0.0) {
                     return Err(opt_invalid(
@@ -5532,10 +5512,7 @@ fn parse_run_parallel_opts(caller: &str, value: Option<&Value>) -> MixResult<Run
                 let t = extract_number(val, InputPolicy::NumberOnly).ok_or_else(|| {
                     opt_invalid(
                         caller,
-                        format!(
-                            "timeout must be a number of seconds, got {}",
-                            val.type_name()
-                        ),
+                        format!("timeout must be a number of seconds, got {}", val.type_name()),
                     )
                 })?;
                 // > 0 and not absurd: 0 disables the deadline (refused — a
@@ -5553,10 +5530,7 @@ fn parse_run_parallel_opts(caller: &str, value: Option<&Value>) -> MixResult<Run
             other => {
                 return Err(opt_invalid(
                     caller,
-                    format!(
-                        "unknown option '{}' (supported: max, timeout)",
-                        sanitize_for_diag(other)
-                    ),
+                    format!("unknown option '{}' (supported: max, timeout)", sanitize_for_diag(other)),
                 ));
             }
         }
@@ -5618,10 +5592,7 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     if args.is_empty() || args.len() > 2 {
         return Err(MixError::structured(
             "TYPE_MISMATCH",
-            format!(
-                "{caller}: expected 1 or 2 args (jobs, [opts]), got {}",
-                args.len()
-            ),
+            format!("{caller}: expected 1 or 2 args (jobs, [opts]), got {}", args.len()),
         ));
     }
     let jobs = match &args[0] {
@@ -5688,21 +5659,19 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     let workers = popts.max.min(n).min(MAX_WORKERS);
     std::thread::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    let p = &parsed[i];
-                    let outcome = run_process(&proc_spec_from(&p.argv, &p.opts, caller)).map_err(
-                        |e| match e {
-                            MixError::Structured(info) => (info.code.clone(), info.message.clone()),
-                            other => ("RUNTIME_ERROR".to_string(), other.to_string()),
-                        },
-                    );
-                    *slots[i].lock().expect("run_parallel slot poisoned") = Some(outcome);
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
                 }
+                let p = &parsed[i];
+                let outcome = run_process(&proc_spec_from(&p.argv, &p.opts, caller)).map_err(|e| {
+                    match e {
+                        MixError::Structured(info) => (info.code.clone(), info.message.clone()),
+                        other => ("RUNTIME_ERROR".to_string(), other.to_string()),
+                    }
+                });
+                *slots[i].lock().expect("run_parallel slot poisoned") = Some(outcome);
             });
         }
     });
@@ -9436,7 +9405,10 @@ fn builtin_ssh_mix(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// decoding partial data would hand back corrupt results with `ok: true`.
 /// Callers that want partial output inspect `stdout`/`stdout_truncated`
 /// without `decode`.
-fn decode_ssh_stdout(m: &mut indexmap::IndexMap<String, Value>, mode: &str) -> MixResult<()> {
+fn decode_ssh_stdout(
+    m: &mut indexmap::IndexMap<String, Value>,
+    mode: &str,
+) -> MixResult<()> {
     if !matches!(m.get("ok"), Some(Value::Bool(true))) {
         return Ok(());
     }
@@ -11159,7 +11131,10 @@ fn try_fcntl_fd(
             return Ok(true);
         }
         let err = std::io::Error::last_os_error();
-        let conflict = matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EACCES));
+        let conflict = matches!(
+            err.raw_os_error(),
+            Some(libc::EAGAIN) | Some(libc::EACCES)
+        );
         if !conflict {
             return Err(err);
         }
@@ -12186,9 +12161,7 @@ fn yaml_to_mix_at(doc: &yaml_rust2::Yaml, depth: usize) -> MixResult<Value> {
                 // catches CROSS-TYPE collisions the stringification
                 // introduces (`1:` and `"1":` both become "1") — silent
                 // last-wins would hide one of two live config entries.
-                if m.insert(key.clone(), yaml_to_mix_at(v, depth + 1)?)
-                    .is_some()
-                {
+                if m.insert(key.clone(), yaml_to_mix_at(v, depth + 1)?).is_some() {
                     return Err(MixError::RuntimeError {
                         span: None,
                         msg: format!(
@@ -12267,7 +12240,10 @@ fn mix_to_yaml_at(v: &Value, path: &str, depth: usize) -> MixResult<yaml_rust2::
         other => {
             return Err(MixError::RuntimeError {
                 span: None,
-                msg: format!("yaml_encode: cannot encode {} at {path}", other.type_name()),
+                msg: format!(
+                    "yaml_encode: cannot encode {} at {path}",
+                    other.type_name()
+                ),
             });
         }
     })
@@ -12890,31 +12866,15 @@ fn builtin_mix_version(_args: Vec<Value>) -> MixResult<Option<Value>> {
     // Cargo supplies these split at compile time; parse-free and exact.
     map.insert(
         "major".into(),
-        Value::Number(
-            env!("CARGO_PKG_VERSION_MAJOR")
-                .parse::<f64>()
-                .unwrap_or(0.0),
-        ),
+        Value::Number(env!("CARGO_PKG_VERSION_MAJOR").parse::<f64>().unwrap_or(0.0)),
     );
     map.insert(
         "minor".into(),
-        Value::Number(
-            env!("CARGO_PKG_VERSION_MINOR")
-                .parse::<f64>()
-                .unwrap_or(0.0),
-        ),
+        Value::Number(env!("CARGO_PKG_VERSION_MINOR").parse::<f64>().unwrap_or(0.0)),
     );
     map.insert(
         "patch".into(),
-        Value::Number(
-            env!("CARGO_PKG_VERSION_PATCH")
-                .parse::<f64>()
-                .unwrap_or(0.0),
-        ),
-    );
-    map.insert(
-        "string".into(),
-        Value::String(env!("CARGO_PKG_VERSION").into()),
+        Value::Number(env!("CARGO_PKG_VERSION_PATCH").parse::<f64>().unwrap_or(0.0)),
     );
     Ok(Some(Value::map(map)))
 }
@@ -13362,7 +13322,11 @@ fn sprintf_error(msg: impl Into<String>) -> MixError {
 }
 
 /// Pull the next argument or raise the uniform too-few-arguments error.
-fn sprintf_next<'a>(args: &'a [Value], idx: &mut usize, conv: char) -> MixResult<&'a Value> {
+fn sprintf_next<'a>(
+    args: &'a [Value],
+    idx: &mut usize,
+    conv: char,
+) -> MixResult<&'a Value> {
     let v = args.get(*idx).ok_or_else(|| {
         sprintf_error(format!(
             "sprintf: too few arguments (format needs another for %{conv})"
@@ -13431,10 +13395,7 @@ fn sprintf_nonfinite(spec: &SprintfSpec, n: f64, upper: bool) -> String {
         (false, true) => "INF",
     };
     let sign = sprintf_sign(spec, n.is_sign_negative() && !n.is_nan());
-    let no_zero = SprintfSpec {
-        zero: false,
-        ..*spec
-    };
+    let no_zero = SprintfSpec { zero: false, ..*spec };
     sprintf_pad(&no_zero, sign, "", body.to_string())
 }
 
@@ -13448,11 +13409,7 @@ fn sprintf_exp_body(abs: f64, prec: usize, alt: bool, upper: bool) -> String {
         mant.push('.');
     }
     let e = if upper { 'E' } else { 'e' };
-    format!(
-        "{mant}{e}{}{:02}",
-        if exp < 0 { '-' } else { '+' },
-        exp.abs()
-    )
+    format!("{mant}{e}{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
 }
 
 fn sprintf_convert(
@@ -13626,7 +13583,9 @@ fn sprintf_convert(
                 .ok()
                 .and_then(char::from_u32)
                 .ok_or_else(|| {
-                    sprintf_error(format!("sprintf: %c needs a Unicode scalar value, got {n}"))
+                    sprintf_error(format!(
+                        "sprintf: %c needs a Unicode scalar value, got {n}"
+                    ))
                 })?;
             let spec = SprintfSpec {
                 zero: false,
@@ -14744,11 +14703,7 @@ impl HeaderCharset {
     fn from_token(token: &str) -> Self {
         // RFC 2231 §5 allows `charset*language`; the language tag is not part
         // of the charset name and must not defeat the match.
-        let base = token
-            .split('*')
-            .next()
-            .unwrap_or(token)
-            .to_ascii_lowercase();
+        let base = token.split('*').next().unwrap_or(token).to_ascii_lowercase();
         match base.as_str() {
             "utf-8" | "utf8" | "us-ascii" | "ascii" | "iso-8859-1" | "iso8859-1" | "latin1"
             | "latin-1" | "l1" => {
@@ -15367,9 +15322,12 @@ fn operand_bytes(name: &str, what: &str, v: &Value) -> MixResult<Vec<u8>> {
         Value::Bytes(b) => Ok(b.to_vec()),
         Value::Buffer(b) => Ok(b.borrow().clone()),
         Value::String(s) => Ok(s.as_bytes().to_vec()),
-        Value::Number(n) => Ok(vec![
-            as_exact_integer(&format!("{name}(): {what}"), *n, 0, 255)? as u8,
-        ]),
+        Value::Number(n) => Ok(vec![as_exact_integer(
+            &format!("{name}(): {what}"),
+            *n,
+            0,
+            255,
+        )? as u8]),
         other => Err(MixError::RuntimeError {
             span: None,
             msg: format!(
@@ -15556,10 +15514,7 @@ fn builtin_bytes_from_hex(args: Vec<Value>) -> MixResult<Option<Value>> {
         other => {
             return Err(MixError::RuntimeError {
                 span: None,
-                msg: format!(
-                    "bytes_from_hex(): expected string, got {}",
-                    other.type_name()
-                ),
+                msg: format!("bytes_from_hex(): expected string, got {}", other.type_name()),
             });
         }
     };
@@ -15888,10 +15843,7 @@ impl DigestAlgo {
     /// `"md5", "sha1", "sha256" or "blake3"` — the accepted-values half of
     /// an error message, built from `ALL`.
     pub(crate) fn accepted_list() -> String {
-        let names: Vec<String> = Self::ALL
-            .iter()
-            .map(|a| format!("\"{}\"", a.name()))
-            .collect();
+        let names: Vec<String> = Self::ALL.iter().map(|a| format!("\"{}\"", a.name())).collect();
         match names.split_last() {
             Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
             _ => names.join(""),
@@ -17105,12 +17057,7 @@ fn builtin_dns_lookup(args: Vec<Value>) -> MixResult<Option<Value>> {
 fn builtin_udp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("udp_send", &args, 3)?;
     let host = args[0].to_mix_string();
-    let port = as_exact_integer(
-        "udp_send(): port",
-        number_arg("udp_send", &args, 1)?,
-        1,
-        65535,
-    )?;
+    let port = as_exact_integer("udp_send(): port", number_arg("udp_send", &args, 1)?, 1, 65535)?;
     let payload: std::borrow::Cow<[u8]> = match &args[2] {
         Value::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
         Value::Buffer(b) => std::borrow::Cow::Owned(b.borrow().clone()),
@@ -17125,10 +17072,11 @@ fn builtin_udp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
             });
         }
     };
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| MixError::RuntimeError {
-        span: None,
-        msg: format!("udp_send: bind: {e}"),
-    })?;
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("udp_send: bind: {e}"),
+        })?;
     let sent = sock
         .send_to(&payload, format!("{host}:{port}"))
         .map_err(|e| MixError::RuntimeError {
@@ -17151,12 +17099,7 @@ fn builtin_udp_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args_between("udp_recv", &args, 1, 2)?;
     // Port 0 would bind an ephemeral port the caller can never learn from
     // the result map — a guaranteed silent timeout, so it is refused.
-    let port = as_exact_integer(
-        "udp_recv(): port",
-        number_arg("udp_recv", &args, 0)?,
-        1,
-        65535,
-    )?;
+    let port = as_exact_integer("udp_recv(): port", number_arg("udp_recv", &args, 0)?, 1, 65535)?;
     let mut timeout_seconds = 30.0;
     let mut bind_host = "0.0.0.0".to_string();
     let mut max: usize = 65535;
@@ -17175,16 +17118,15 @@ fn builtin_udp_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
                     }
                 }
                 if let Some(v) = m.get("timeout") {
-                    timeout_seconds =
-                        extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
-                            MixError::RuntimeError {
-                                span: None,
-                                msg: format!(
-                                    "udp_recv(): option 'timeout' must be a number, got {}",
-                                    v.type_name()
-                                ),
-                            }
-                        })?;
+                    timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                        MixError::RuntimeError {
+                            span: None,
+                            msg: format!(
+                                "udp_recv(): option 'timeout' must be a number, got {}",
+                                v.type_name()
+                            ),
+                        }
+                    })?;
                     as_duration("udp_recv(): option 'timeout'", timeout_seconds)?;
                 }
                 if let Some(v) = m.get("host") {
@@ -17250,10 +17192,7 @@ fn builtin_udp_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
             let mut m = indexmap::IndexMap::new();
             m.insert("bytes".to_string(), Value::bytes(buf));
             m.insert("text".to_string(), text);
-            m.insert(
-                "from_host".to_string(),
-                Value::String(from.ip().to_string()),
-            );
+            m.insert("from_host".to_string(), Value::String(from.ip().to_string()));
             m.insert("from_port".to_string(), Value::Number(from.port() as f64));
             Ok(Some(Value::map(m)))
         }
@@ -17347,7 +17286,9 @@ mod ws_client {
             Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            self.0.signature_verification_algorithms.supported_schemes()
+            self.0
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 }
@@ -17396,10 +17337,7 @@ fn builtin_ws_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
                         other => {
                             return Err(ws_err(
                                 "ws_connect()",
-                                format!(
-                                    "option 'insecure' must be a boolean, got {}",
-                                    other.type_name()
-                                ),
+                                format!("option 'insecure' must be a boolean, got {}", other.type_name()),
                             ));
                         }
                     }
@@ -17414,28 +17352,18 @@ fn builtin_ws_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
                         other => {
                             return Err(ws_err(
                                 "ws_connect()",
-                                format!(
-                                    "option 'headers' must be a map, got {}",
-                                    other.type_name()
-                                ),
+                                format!("option 'headers' must be a map, got {}", other.type_name()),
                             ));
                         }
                     }
                 }
                 if let Some(v) = m.get("timeout") {
-                    timeout_seconds =
-                        extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
-                            ws_err(
-                                "ws_connect()",
-                                format!("option 'timeout' must be a number, got {}", v.type_name()),
-                            )
-                        })?;
+                    timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                        ws_err("ws_connect()", format!("option 'timeout' must be a number, got {}", v.type_name()))
+                    })?;
                     as_duration("ws_connect(): option 'timeout'", timeout_seconds)?;
                     if timeout_seconds == 0.0 {
-                        return Err(ws_err(
-                            "ws_connect()",
-                            "option 'timeout' must be positive — an unbounded connect can hang forever",
-                        ));
+                        return Err(ws_err("ws_connect()", "option 'timeout' must be positive — an unbounded connect can hang forever"));
                     }
                 }
             }
@@ -17454,9 +17382,8 @@ fn builtin_ws_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
         .into_client_request()
         .map_err(|e| ws_err("ws_connect", e))?;
     for (k, v) in &headers {
-        let name: tungstenite::http::header::HeaderName = k
-            .parse()
-            .map_err(|_| ws_err("ws_connect", format!("invalid header name '{k}'")))?;
+        let name: tungstenite::http::header::HeaderName =
+            k.parse().map_err(|_| ws_err("ws_connect", format!("invalid header name '{k}'")))?;
         let value = tungstenite::http::header::HeaderValue::from_str(v)
             .map_err(|_| ws_err("ws_connect", format!("invalid header value for '{k}'")))?;
         request.headers_mut().insert(name, value);
@@ -17587,10 +17514,7 @@ fn builtin_ws_send(args: Vec<Value>) -> MixResult<Option<Value>> {
         other => {
             return Err(ws_err(
                 "ws_send()",
-                format!(
-                    "payload must be a string, bytes or buffer, got {}",
-                    other.type_name()
-                ),
+                format!("payload must be a string, bytes or buffer, got {}", other.type_name()),
             ));
         }
     };
@@ -17631,10 +17555,7 @@ fn builtin_ws_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
         && !matches!(v, Value::Nil)
     {
         timeout_seconds = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
-            ws_err(
-                "ws_recv()",
-                format!("timeout must be a number, got {}", v.type_name()),
-            )
+            ws_err("ws_recv()", format!("timeout must be a number, got {}", v.type_name()))
         })?;
         as_duration("ws_recv(): timeout", timeout_seconds)?;
     }
@@ -17675,10 +17596,7 @@ fn builtin_ws_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
             }
             None => {
                 put_back(conn);
-                return Err(ws_err(
-                    "ws_recv",
-                    "unsupported stream type for timeout control",
-                ));
+                return Err(ws_err("ws_recv", "unsupported stream type for timeout control"));
             }
         }
         match conn.read() {
@@ -17812,12 +17730,7 @@ fn tcp_handle(name: &str, args: &[Value]) -> MixResult<u64> {
 fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args_between("tcp_connect", &args, 2, 3)?;
     let host = args[0].to_mix_string();
-    let port = as_exact_integer(
-        "tcp_connect(): port",
-        number_arg("tcp_connect", &args, 1)?,
-        1,
-        65535,
-    )? as u16;
+    let port = as_exact_integer("tcp_connect(): port", number_arg("tcp_connect", &args, 1)?, 1, 65535)? as u16;
     let mut timeout_seconds = 30.0;
     let mut tls = false;
     let mut insecure = false;
@@ -17827,26 +17740,15 @@ fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
             Value::Map(m) => {
                 for k in m.keys() {
                     if !matches!(k.as_str(), "timeout" | "tls" | "insecure") {
-                        return Err(tcp_err(
-                            "tcp_connect()",
-                            format!("unknown option '{k}' (supported: timeout, tls, insecure)"),
-                        ));
+                        return Err(tcp_err("tcp_connect()", format!("unknown option '{k}' (supported: timeout, tls, insecure)")));
                     }
                 }
                 if let Some(v) = m.get("timeout") {
-                    timeout_seconds =
-                        extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
-                            tcp_err(
-                                "tcp_connect()",
-                                format!("option 'timeout' must be a number, got {}", v.type_name()),
-                            )
-                        })?;
+                    timeout_seconds = extract_number(v, InputPolicy::NumberOnly)
+                        .ok_or_else(|| tcp_err("tcp_connect()", format!("option 'timeout' must be a number, got {}", v.type_name())))?;
                     as_duration("tcp_connect(): option 'timeout'", timeout_seconds)?;
                     if timeout_seconds == 0.0 {
-                        return Err(tcp_err(
-                            "tcp_connect()",
-                            "option 'timeout' must be positive",
-                        ));
+                        return Err(tcp_err("tcp_connect()", "option 'timeout' must be positive"));
                     }
                 }
                 // Strict booleans (like ws_connect): a typo'd `{tls: "no"}`
@@ -17856,45 +17758,21 @@ fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
                 if let Some(v) = m.get("tls") {
                     match v {
                         Value::Bool(b) => tls = *b,
-                        other => {
-                            return Err(tcp_err(
-                                "tcp_connect()",
-                                format!(
-                                    "option 'tls' must be a boolean, got {}",
-                                    other.type_name()
-                                ),
-                            ));
-                        }
+                        other => return Err(tcp_err("tcp_connect()", format!("option 'tls' must be a boolean, got {}", other.type_name()))),
                     }
                 }
                 if let Some(v) = m.get("insecure") {
                     match v {
                         Value::Bool(b) => insecure = *b,
-                        other => {
-                            return Err(tcp_err(
-                                "tcp_connect()",
-                                format!(
-                                    "option 'insecure' must be a boolean, got {}",
-                                    other.type_name()
-                                ),
-                            ));
-                        }
+                        other => return Err(tcp_err("tcp_connect()", format!("option 'insecure' must be a boolean, got {}", other.type_name()))),
                     }
                 }
             }
-            other => {
-                return Err(tcp_err(
-                    "tcp_connect()",
-                    format!("options must be a map or nil, got {}", other.type_name()),
-                ));
-            }
+            other => return Err(tcp_err("tcp_connect()", format!("options must be a map or nil, got {}", other.type_name()))),
         }
     }
     if insecure && !tls {
-        return Err(tcp_err(
-            "tcp_connect()",
-            "option 'insecure' has no meaning without tls: true",
-        ));
+        return Err(tcp_err("tcp_connect()", "option 'insecure' has no meaning without tls: true"));
     }
     let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
 
@@ -17943,12 +17821,7 @@ fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
                 .with_no_client_auth()
         };
         let server_name = rustls::pki_types::ServerName::try_from(resolve_host.to_string())
-            .map_err(|_| {
-                tcp_err(
-                    "tcp_connect",
-                    format!("invalid TLS server name '{resolve_host}'"),
-                )
-            })?;
+            .map_err(|_| tcp_err("tcp_connect", format!("invalid TLS server name '{resolve_host}'")))?;
         let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), server_name)
             .map_err(|e| tcp_err("tcp_connect", e))?;
         let mut tls_stream = rustls::StreamOwned::new(conn, sock);
@@ -17966,32 +17839,18 @@ fn builtin_tcp_connect(args: Vec<Value>) -> MixResult<Option<Value>> {
         // still finishing lazily, the first tcp_send that drives it reads
         // under a bound, not indefinitely. Each tcp_recv sets its own read
         // timeout anyway, so this never shortens a later recv.
-        tls_stream
-            .get_ref()
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
-        tls_stream
-            .get_ref()
-            .set_write_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
+        tls_stream.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        tls_stream.get_ref().set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
         tcp_client::Stream::Tls(Box::new(tls_stream))
     } else {
         // Plain socket: benign 30s defaults (each recv overrides read).
-        sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
-        sock.set_write_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        sock.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
         tcp_client::Stream::Plain(sock)
     };
 
     let id = tcp_client::NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tcp_client::MAP.lock().unwrap().insert(
-        id,
-        tcp_client::Conn {
-            stream,
-            buf: Vec::new(),
-        },
-    );
+    tcp_client::MAP.lock().unwrap().insert(id, tcp_client::Conn { stream, buf: Vec::new() });
     Ok(Some(Value::Number(id as f64)))
 }
 
@@ -18004,15 +17863,7 @@ fn builtin_tcp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
         Value::String(s) => s.as_bytes().to_vec(),
         Value::Bytes(b) => b.to_vec(),
         Value::Buffer(b) => b.borrow().clone(),
-        other => {
-            return Err(tcp_err(
-                "tcp_send()",
-                format!(
-                    "payload must be a string, bytes or buffer, got {}",
-                    other.type_name()
-                ),
-            ));
-        }
+        other => return Err(tcp_err("tcp_send()", format!("payload must be a string, bytes or buffer, got {}", other.type_name()))),
     };
     let mut conn = tcp_client::MAP
         .lock()
@@ -18033,20 +17884,13 @@ fn builtin_tcp_send(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// Returns Ok(true) if bytes were read into conn.buf, Ok(false) on
 /// timeout, Err on a real error or peer close.
 #[cfg(feature = "ws")]
-fn tcp_fill(
-    name: &str,
-    conn: &mut tcp_client::Conn,
-    timeout_seconds: f64,
-    max: usize,
-) -> MixResult<bool> {
+fn tcp_fill(name: &str, conn: &mut tcp_client::Conn, timeout_seconds: f64, max: usize) -> MixResult<bool> {
     let dur = if timeout_seconds == 0.0 {
         None
     } else {
         Some(std::time::Duration::from_secs_f64(timeout_seconds))
     };
-    conn.tcp()
-        .set_read_timeout(dur)
-        .map_err(|e| tcp_err(name, e))?;
+    conn.tcp().set_read_timeout(dur).map_err(|e| tcp_err(name, e))?;
     // Read buffer sized to `max` but capped at 256 KiB per syscall — a
     // single read returns at most this many bytes regardless, which is
     // fine: tcp_recv serves buffered bytes first and the caller polls
@@ -18066,10 +17910,7 @@ fn tcp_fill(
                 return Ok(true);
             }
             Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
             {
                 return Ok(false);
             }
@@ -18084,10 +17925,7 @@ fn tcp_fill(
                 }
                 eintr += 1;
                 if eintr > 10_000 {
-                    return Err(tcp_err(
-                        name,
-                        "read interrupted repeatedly (a signal storm?)",
-                    ));
+                    return Err(tcp_err(name, "read interrupted repeatedly (a signal storm?)"));
                 }
                 continue;
             }
@@ -18156,17 +17994,12 @@ fn builtin_tcp_recv_line(args: Vec<Value>) -> MixResult<Option<Value>> {
             return Ok(Some(Value::String(s)));
         }
         if conn.buf.len() > max {
-            return Err(tcp_err(
-                "tcp_recv_line",
-                format!("line exceeds max ({max} bytes) with no newline"),
-            ));
+            return Err(tcp_err("tcp_recv_line", format!("line exceeds max ({max} bytes) with no newline")));
         }
         let left = match deadline {
             None => 0.0, // forever
             Some(d) => {
-                let l = d
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_secs_f64();
+                let l = d.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
                 if l <= 0.0 {
                     tcp_client::MAP.lock().unwrap().insert(id, conn);
                     return Ok(Some(Value::Nil));
@@ -18195,43 +18028,21 @@ fn tcp_recv_opts(name: &str, opts: Option<&Value>, default_max: usize) -> MixRes
             Value::Map(m) => {
                 for k in m.keys() {
                     if !matches!(k.as_str(), "timeout" | "max") {
-                        return Err(tcp_err(
-                            name,
-                            format!("unknown option '{k}' (supported: timeout, max)"),
-                        ));
+                        return Err(tcp_err(name, format!("unknown option '{k}' (supported: timeout, max)")));
                     }
                 }
                 if let Some(t) = m.get("timeout") {
-                    timeout_seconds =
-                        extract_number(t, InputPolicy::NumberOnly).ok_or_else(|| {
-                            tcp_err(
-                                name,
-                                format!("option 'timeout' must be a number, got {}", t.type_name()),
-                            )
-                        })?;
+                    timeout_seconds = extract_number(t, InputPolicy::NumberOnly)
+                        .ok_or_else(|| tcp_err(name, format!("option 'timeout' must be a number, got {}", t.type_name())))?;
                     as_duration(&format!("{name}(): option 'timeout'"), timeout_seconds)?;
                 }
                 if let Some(x) = m.get("max") {
-                    let n = extract_number(x, InputPolicy::NumberOnly).ok_or_else(|| {
-                        tcp_err(
-                            name,
-                            format!("option 'max' must be a number, got {}", x.type_name()),
-                        )
-                    })?;
-                    max = as_exact_integer(
-                        &format!("{name}(): option 'max'"),
-                        n,
-                        1,
-                        64 * 1024 * 1024,
-                    )? as usize;
+                    let n = extract_number(x, InputPolicy::NumberOnly)
+                        .ok_or_else(|| tcp_err(name, format!("option 'max' must be a number, got {}", x.type_name())))?;
+                    max = as_exact_integer(&format!("{name}(): option 'max'"), n, 1, 64 * 1024 * 1024)? as usize;
                 }
             }
-            other => {
-                return Err(tcp_err(
-                    name,
-                    format!("options must be a map or nil, got {}", other.type_name()),
-                ));
-            }
+            other => return Err(tcp_err(name, format!("options must be a map or nil, got {}", other.type_name()))),
         }
     }
     Ok((timeout_seconds, max))
@@ -18448,19 +18259,8 @@ mod http_srv {
         let mut out = String::with_capacity(s.len());
         for b in s.bytes() {
             match b {
-                b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b'-'
-                | b'_'
-                | b'.'
-                | b'~'
-                | b'+'
-                | b'@'
-                | b','
-                | b'='
-                | b'('
-                | b')' => out.push(b as char),
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'+'
+                | b'@' | b',' | b'=' | b'(' | b')' => out.push(b as char),
                 _ => out.push_str(&format!("%{b:02X}")),
             }
         }
@@ -18656,15 +18456,8 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                 for k in m.keys() {
                     if !matches!(
                         k.as_str(),
-                        "port"
-                            | "host"
-                            | "duration"
-                            | "index"
-                            | "listing"
-                            | "render_md"
-                            | "requests"
-                            | "spa"
-                            | "clean_urls"
+                        "port" | "host" | "duration" | "index" | "listing" | "render_md"
+                            | "requests" | "spa" | "clean_urls"
                     ) {
                         return Err(MixError::RuntimeError {
                             span: None,
@@ -18686,7 +18479,8 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                     host = v.to_mix_string();
                 }
                 if let Some(v) = m.get("duration") {
-                    duration = required_number_value("http_serve(): option 'duration'", v)?;
+                    duration =
+                        required_number_value("http_serve(): option 'duration'", v)?;
                     as_duration("http_serve(): option 'duration'", duration)?;
                 }
                 if let Some(v) = m.get("index") {
@@ -18723,8 +18517,7 @@ fn builtin_http_serve(args: Vec<Value>) -> MixResult<Option<Value>> {
                         Value::Number(_) => {
                             return Err(MixError::RuntimeError {
                                 span: None,
-                                msg: "http_serve(): option 'spa' must be true or a shell filename"
-                                    .to_string(),
+                                msg: "http_serve(): option 'spa' must be true or a shell filename".to_string(),
                             });
                         }
                         other => other.to_mix_string(),
@@ -18851,22 +18644,23 @@ fn http_serve_one(
     // it served. Shared by the not-found arm AND the directory branch (a
     // `bus.html` section page sits beside a `bus/` children dir — Pages
     // resolves `/bus` to that page when there is no `bus/index.html`).
-    let try_clean_url = |stream: &mut std::net::TcpStream, rel: &str, head_only: bool| -> bool {
-        if !clean_urls || rel.is_empty() {
-            return false;
-        }
-        if rel.rsplit('/').next().unwrap_or("").contains('.') {
-            return false;
-        }
-        if let Ok(html) = std::fs::canonicalize(root.join(format!("{rel}.html")))
-            && html.starts_with(root)
-            && html.is_file()
-        {
-            http_send_file(stream, &html, render_md, head_only);
-            return true;
-        }
-        false
-    };
+    let try_clean_url =
+        |stream: &mut std::net::TcpStream, rel: &str, head_only: bool| -> bool {
+            if !clean_urls || rel.is_empty() {
+                return false;
+            }
+            if rel.rsplit('/').next().unwrap_or("").contains('.') {
+                return false;
+            }
+            if let Ok(html) = std::fs::canonicalize(root.join(format!("{rel}.html")))
+                && html.starts_with(root)
+                && html.is_file()
+            {
+                http_send_file(stream, &html, render_md, head_only);
+                return true;
+            }
+            false
+        };
     // The SPA fallback: a would-be 404 on a path with NO extension serves
     // the shell (200) so a client-side router boots. Only extensionless
     // paths fall back — a missing /app.js or /style.css must stay a real
@@ -19060,7 +18854,14 @@ fn http_send_file(
         Ok(b) => b,
         Err(_) => return http_srv::write_error(stream, 500, "unreadable file"),
     };
-    let _ = http_srv::write_response(stream, 200, http_srv::mime_for(path), &[], &body, head_only);
+    let _ = http_srv::write_response(
+        stream,
+        200,
+        http_srv::mime_for(path),
+        &[],
+        &body,
+        head_only,
+    );
 }
 
 /// `http_recv(port[, opts])` — accept ONE request, answer it, return it
@@ -19095,7 +18896,8 @@ fn builtin_http_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
                     }
                 }
                 if let Some(v) = m.get("timeout") {
-                    timeout_seconds = required_number_value("http_recv(): option 'timeout'", v)?;
+                    timeout_seconds =
+                        required_number_value("http_recv(): option 'timeout'", v)?;
                     as_duration("http_recv(): option 'timeout'", timeout_seconds)?;
                 }
                 if let Some(v) = m.get("host") {
@@ -19268,10 +19070,7 @@ fn builtin_http_recv(args: Vec<Value>) -> MixResult<Option<Value>> {
     out.insert("headers".to_string(), Value::map(headers));
     out.insert("body".to_string(), text);
     out.insert("bytes".to_string(), Value::bytes(body_bytes));
-    out.insert(
-        "from_host".to_string(),
-        Value::String(peer.ip().to_string()),
-    );
+    out.insert("from_host".to_string(), Value::String(peer.ip().to_string()));
     out.insert("from_port".to_string(), Value::Number(peer.port() as f64));
     Ok(Some(Value::map(out)))
 }
@@ -19317,13 +19116,9 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("           udp_send udp_recv (one datagram each way — v0.71.0)");
     println!("           ws_connect ws_send ws_recv ws_close (websocket client — v0.74.0)");
     println!("           http_serve http_recv (static server + one-shot catch — v0.75.0)");
-    println!(
-        "           tcp_connect tcp_send tcp_recv tcp_recv_line tcp_close (raw TCP client — v0.78.0)"
-    );
+    println!("           tcp_connect tcp_send tcp_recv tcp_recv_line tcp_close (raw TCP client — v0.78.0)");
     println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
-    println!(
-        "           bytes_ends_with bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex"
-    );
+    println!("           bytes_ends_with bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
     println!("           (also $b[i], length, slice, `for each` — v0.64.0 — and take, drop,");
     println!("           reverse, index_of, contains — v0.70.0)");
     println!("SQL:       sqlopen sqlexec sqlclose");
@@ -21438,9 +21233,7 @@ mod ssh_helpers_tests {
         m.insert("ok".to_string(), Value::Bool(true));
         m.insert("stdout".to_string(), Value::String("count: 12".into()));
         m.insert("stdout_truncated".to_string(), Value::Bool(true));
-        let err = super::decode_ssh_stdout(&mut m, "data")
-            .unwrap_err()
-            .to_string();
+        let err = super::decode_ssh_stdout(&mut m, "data").unwrap_err().to_string();
         assert!(err.contains("refusing to decode"), "{err}");
         assert!(!m.contains_key("value"), "no value on refusal");
 
@@ -23670,9 +23463,7 @@ mod bytes_tests {
     fn slice_on_bytes_clamps_and_reverses_empty() {
         let v = b(&[1, 2, 3, 4, 5]);
         assert_eq!(
-            as_bytes(
-                builtin_slice(vec![v.clone(), Value::Number(1.0), Value::Number(3.0)]).unwrap()
-            ),
+            as_bytes(builtin_slice(vec![v.clone(), Value::Number(1.0), Value::Number(3.0)]).unwrap()),
             vec![2, 3]
         );
         // Omitted end runs to the end; negative indices count back.
@@ -23683,8 +23474,7 @@ mod bytes_tests {
         // Out of range clamps rather than raising...
         assert_eq!(
             as_bytes(
-                builtin_slice(vec![v.clone(), Value::Number(-100.0), Value::Number(100.0)])
-                    .unwrap()
+                builtin_slice(vec![v.clone(), Value::Number(-100.0), Value::Number(100.0)]).unwrap()
             ),
             vec![1, 2, 3, 4, 5]
         );
@@ -23720,12 +23510,8 @@ mod bytes_tests {
             Some(Value::Number(3.0))
         );
         assert_eq!(
-            builtin_bytes_find(vec![
-                v.clone(),
-                Value::String("l".into()),
-                Value::Number(4.0)
-            ])
-            .unwrap(),
+            builtin_bytes_find(vec![v.clone(), Value::String("l".into()), Value::Number(4.0)])
+                .unwrap(),
             Some(Value::Number(10.0))
         );
         // A single byte number is a legal needle (0x2C = ',').
@@ -23739,11 +23525,9 @@ mod bytes_tests {
     fn bytes_find_rejects_string_subject() {
         // The whole point of the strict subject: a string would otherwise
         // be answered about as text, or worse, its `<bytes:N>` placeholder.
-        let err = builtin_bytes_find(vec![
-            Value::String("hello".into()),
-            Value::String("l".into()),
-        ])
-        .unwrap_err();
+        let err =
+            builtin_bytes_find(vec![Value::String("hello".into()), Value::String("l".into())])
+                .unwrap_err();
         assert!(
             format!("{err}").contains("expected bytes or buffer"),
             "{err}"
@@ -23765,10 +23549,7 @@ mod bytes_tests {
             }
         };
         // Same shapes `split()` produces for the same inputs.
-        assert_eq!(
-            pieces("a,b,,c", ","),
-            vec![b"a".to_vec(), b"b".to_vec(), vec![], b"c".to_vec()]
-        );
+        assert_eq!(pieces("a,b,,c", ","), vec![b"a".to_vec(), b"b".to_vec(), vec![], b"c".to_vec()]);
         assert_eq!(pieces(",a,", ","), vec![vec![], b"a".to_vec(), vec![]]);
         assert_eq!(pieces("abc", "x"), vec![b"abc".to_vec()]);
         assert_eq!(pieces("", ","), vec![Vec::<u8>::new()]);
@@ -23874,10 +23655,7 @@ mod bytes_tests {
         }
         // A wrong-typed subject raises like the rest of the family.
         let err = builtin_bytes_ends_with(vec![Value::String("x".into()), b(b"x")]).unwrap_err();
-        assert!(
-            format!("{err}").contains("expected bytes or buffer"),
-            "{err}"
-        );
+        assert!(format!("{err}").contains("expected bytes or buffer"), "{err}");
     }
 
     // --- generic ops on bytes/buffer (v0.70.0) ---
@@ -23922,11 +23700,7 @@ mod bytes_tests {
     /// would break this test rather than pass silently.
     #[test]
     fn take_drop_pathological_n_parity_bytes_vs_list() {
-        let l = Value::list(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0),
-        ]);
+        let l = Value::list(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
         let bs = b(b"abc");
         fn list_len(v: &Option<Value>) -> usize {
             match v {
@@ -24068,15 +23842,27 @@ mod bytes_tests {
         );
         // * width and .* precision; a negative * width left-justifies.
         assert_eq!(
-            sprintf_format("%*lld|", &[Value::Number(6.0), Value::Number(42.0)]).unwrap(),
+            sprintf_format(
+                "%*lld|",
+                &[Value::Number(6.0), Value::Number(42.0)]
+            )
+            .unwrap(),
             "    42|"
         );
         assert_eq!(
-            sprintf_format("%*lld|", &[Value::Number(-6.0), Value::Number(42.0)]).unwrap(),
+            sprintf_format(
+                "%*lld|",
+                &[Value::Number(-6.0), Value::Number(42.0)]
+            )
+            .unwrap(),
             "42    |"
         );
         assert_eq!(
-            sprintf_format("%.*f", &[Value::Number(2.0), Value::Number(2.5)]).unwrap(),
+            sprintf_format(
+                "%.*f",
+                &[Value::Number(2.0), Value::Number(2.5)]
+            )
+            .unwrap(),
             "2.50"
         );
         // %c takes a Unicode scalar; %% is literal.
@@ -24104,18 +23890,14 @@ mod bytes_tests {
         let v = builtin_yaml_parse(vec![Value::String(src.into())])
             .unwrap()
             .unwrap();
-        let Value::Map(top) = &v else {
-            panic!("expected map, got {v:?}")
-        };
+        let Value::Map(top) = &v else { panic!("expected map, got {v:?}") };
         let Some(Value::List(groups)) = top.get("groups") else {
             panic!("groups missing")
         };
         let Value::Map(g) = &groups[0] else { panic!() };
         assert_eq!(g.get("name"), Some(&Value::String("memory".into())));
         assert_eq!(g.get("interval"), Some(&Value::String("5m".into())));
-        let Some(Value::List(rules)) = g.get("rules") else {
-            panic!()
-        };
+        let Some(Value::List(rules)) = g.get("rules") else { panic!() };
         let Value::Map(r) = &rules[0] else { panic!() };
         assert_eq!(r.get("enabled"), Some(&Value::Bool(true)));
         assert_eq!(r.get("threshold"), Some(&Value::Number(0.85)));
@@ -24146,9 +23928,7 @@ mod bytes_tests {
         // round trip is proven by re-encoding: same value ⇒ same YAML.
         let reencoded = builtin_yaml_encode(vec![back.clone()]).unwrap().unwrap();
         assert_eq!(encoded, reencoded);
-        let (Value::Map(a), Value::Map(b)) = (&orig, &back) else {
-            panic!()
-        };
+        let (Value::Map(a), Value::Map(b)) = (&orig, &back) else { panic!() };
         assert_eq!(a.len(), b.len());
         assert_eq!(b.get("name"), Some(&Value::String("x".into())));
         assert_eq!(b.get("count"), Some(&Value::Number(3.0)));
@@ -24163,9 +23943,7 @@ mod bytes_tests {
         let v = builtin_yaml_parse(vec![Value::String(multi.into()), Value::map(opts)])
             .unwrap()
             .unwrap();
-        let Value::List(docs) = &v else {
-            panic!("{v:?}")
-        };
+        let Value::List(docs) = &v else { panic!("{v:?}") };
         assert_eq!(docs.len(), 2);
         // Empty input is nil; bytes value in encode raises.
         assert_eq!(
@@ -24180,7 +23958,8 @@ mod bytes_tests {
         assert!(format!("{err}").contains("non-finite"), "{err}");
         // Cross-type key collision (`1:` vs `"1":`) raises rather than
         // silently last-wins after stringification.
-        let err = builtin_yaml_parse(vec![Value::String("1: a\n\"1\": b\n".into())]).unwrap_err();
+        let err =
+            builtin_yaml_parse(vec![Value::String("1: a\n\"1\": b\n".into())]).unwrap_err();
         assert!(format!("{err}").contains("collide"), "{err}");
     }
 
@@ -24239,25 +24018,25 @@ mod bytes_tests {
     fn password_hash_and_verify_round_trip() {
         // Cost 4 (the bcrypt minimum) keeps the test fast; the default 12
         // is a release-binary concern, not a unit-test one.
-        let hashed =
-            builtin_password_hash(vec![Value::String("s3cret".into()), Value::Number(4.0)])
-                .unwrap()
-                .unwrap();
+        let hashed = builtin_password_hash(vec![
+            Value::String("s3cret".into()),
+            Value::Number(4.0),
+        ])
+        .unwrap()
+        .unwrap();
         let h = match &hashed {
             Value::String(h) => h.clone(),
             other => panic!("{other:?}"),
         };
         assert!(h.starts_with("$2"), "bcrypt marker: {h}");
         assert_eq!(
-            builtin_password_verify(vec![
-                Value::String("s3cret".into()),
-                Value::String(h.clone())
-            ])
-            .unwrap(),
+            builtin_password_verify(vec![Value::String("s3cret".into()), Value::String(h.clone())])
+                .unwrap(),
             Some(Value::Bool(true))
         );
         assert_eq!(
-            builtin_password_verify(vec![Value::String("wrong".into()), Value::String(h)]).unwrap(),
+            builtin_password_verify(vec![Value::String("wrong".into()), Value::String(h)])
+                .unwrap(),
             Some(Value::Bool(false))
         );
         // A malformed hash raises — never "wrong password".
@@ -24268,8 +24047,8 @@ mod bytes_tests {
         .unwrap_err();
         assert!(format!("{err}").contains("invalid bcrypt hash"), "{err}");
         // Cost bounds are named; >72-byte input is refused, not truncated.
-        let err =
-            builtin_password_hash(vec![Value::String("x".into()), Value::Number(3.0)]).unwrap_err();
+        let err = builtin_password_hash(vec![Value::String("x".into()), Value::Number(3.0)])
+            .unwrap_err();
         assert!(format!("{err}").contains("4..=31"), "{err}");
         let err = builtin_password_hash(vec![Value::String("x".repeat(73))]).unwrap_err();
         assert!(format!("{err}").contains("72 bytes"), "{err}");
@@ -24285,15 +24064,9 @@ mod bytes_tests {
         let path = dir.join("lock");
         let p = || Value::String(path.to_string_lossy().to_string());
 
-        assert_eq!(
-            builtin_fcntl_lock(vec![p()]).unwrap(),
-            Some(Value::Bool(true))
-        );
+        assert_eq!(builtin_fcntl_lock(vec![p()]).unwrap(), Some(Value::Bool(true)));
         // Idempotent within the process.
-        assert_eq!(
-            builtin_fcntl_lock(vec![p()]).unwrap(),
-            Some(Value::Bool(true))
-        );
+        assert_eq!(builtin_fcntl_lock(vec![p()]).unwrap(), Some(Value::Bool(true)));
 
         // The lock must be visible in the fcntl record-lock namespace: a
         // traditional F_GETLK probe from a separate open sees a write lock.
@@ -24330,11 +24103,7 @@ mod bytes_tests {
             unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETLK, &mut fl2) },
             0
         );
-        assert_ne!(
-            fl2.l_type as i32,
-            libc::F_UNLCK,
-            "lock lost after open/close"
-        );
+        assert_ne!(fl2.l_type as i32, libc::F_UNLCK, "lock lost after open/close");
 
         assert_eq!(
             builtin_fcntl_unlock(vec![p()]).unwrap(),
@@ -24394,9 +24163,7 @@ mod bytes_tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let sent = sender.join().unwrap().unwrap();
         assert_eq!(sent, "ping-π".len());
-        let Value::Map(m) = &got else {
-            panic!("{got:?}")
-        };
+        let Value::Map(m) = &got else { panic!("{got:?}") };
         assert_eq!(m.get("text"), Some(&Value::String("ping-π".into())));
         assert_eq!(m.get("from_host"), Some(&Value::String("127.0.0.1".into())));
         match m.get("bytes") {
@@ -24447,9 +24214,7 @@ mod bytes_tests {
         let h = builtin_ws_connect(vec![Value::String(format!("ws://127.0.0.1:{port}/echo"))])
             .unwrap()
             .unwrap();
-        let Value::Number(id) = h else {
-            panic!("{h:?}")
-        };
+        let Value::Number(id) = h else { panic!("{h:?}") };
 
         // Text frame echoes as a string.
         builtin_ws_send(vec![Value::Number(id), Value::String("ping-π".into())]).unwrap();
@@ -24459,11 +24224,7 @@ mod bytes_tests {
         assert_eq!(got, Value::String("ping-π".into()));
 
         // Binary frame echoes as bytes.
-        builtin_ws_send(vec![
-            Value::Number(id),
-            Value::bytes(vec![0, 159, 146, 150]),
-        ])
-        .unwrap();
+        builtin_ws_send(vec![Value::Number(id), Value::bytes(vec![0, 159, 146, 150])]).unwrap();
         let got = builtin_ws_recv(vec![Value::Number(id), Value::Number(5.0)])
             .unwrap()
             .unwrap();
@@ -24479,14 +24240,8 @@ mod bytes_tests {
         );
 
         // Close: true once, false after; further sends raise unknown-handle.
-        assert_eq!(
-            builtin_ws_close(vec![Value::Number(id)]).unwrap(),
-            Some(Value::Bool(true))
-        );
-        assert_eq!(
-            builtin_ws_close(vec![Value::Number(id)]).unwrap(),
-            Some(Value::Bool(false))
-        );
+        assert_eq!(builtin_ws_close(vec![Value::Number(id)]).unwrap(), Some(Value::Bool(true)));
+        assert_eq!(builtin_ws_close(vec![Value::Number(id)]).unwrap(), Some(Value::Bool(false)));
         let err = builtin_ws_send(vec![Value::Number(id), Value::String("x".into())]).unwrap_err();
         assert!(format!("{err}").contains("unknown ws handle"), "{err}");
 
@@ -24510,9 +24265,7 @@ mod bytes_tests {
         let h = builtin_ws_connect(vec![Value::String(format!("ws://127.0.0.1:{port}/"))])
             .unwrap()
             .unwrap();
-        let Value::Number(id) = h else {
-            panic!("{h:?}")
-        };
+        let Value::Number(id) = h else { panic!("{h:?}") };
         let err = builtin_ws_recv(vec![Value::Number(id), Value::Number(5.0)]).unwrap_err();
         assert!(format!("{err}").contains("closed"), "{err}");
         // Retired: a second recv is unknown-handle, not another close error.
@@ -24579,20 +24332,14 @@ mod bytes_tests {
         assert!(r.ends_with("hi there\n"), "{r}");
         // 2. Nested file.
         let r = http_raw(port, "GET /sub/page.html HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(
-            r.starts_with("HTTP/1.1 200") && r.contains("text/html"),
-            "{r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/html"), "{r}");
         // 3. TRAVERSAL, plain: verbatim ../ on the wire never reaches the
         // secret (404: the canonicalised path resolves outside → prefix
         // check, but the join may also simply not exist — either way the
         // body must not leak).
         let r = http_raw(port, "GET /../mix-http-secret HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(!r.contains("SECRET"), "{r}");
-        assert!(
-            r.starts_with("HTTP/1.1 403") || r.starts_with("HTTP/1.1 404"),
-            "{r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 403") || r.starts_with("HTTP/1.1 404"), "{r}");
         // 4. TRAVERSAL, percent-encoded: %2e%2e%2f decodes to ../ BEFORE
         // the check — the gate must fail this too, provably.
         let r = http_raw(
@@ -24602,20 +24349,11 @@ mod bytes_tests {
         assert!(!r.contains("SECRET"), "{r}");
         // 5. Symlink escape: exists, resolves outside root → 403 exactly.
         let r = http_raw(port, "GET /leak HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(
-            r.starts_with("HTTP/1.1 403"),
-            "symlink escape must 403: {r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 403"), "symlink escape must 403: {r}");
         assert!(!r.contains("SECRET"), "{r}");
         // 6. Non-GET is 405 with Allow.
-        let r = http_raw(
-            port,
-            "POST /hello.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
-        );
-        assert!(
-            r.starts_with("HTTP/1.1 405") && r.contains("Allow: GET, HEAD"),
-            "{r}"
-        );
+        let r = http_raw(port, "POST /hello.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 405") && r.contains("Allow: GET, HEAD"), "{r}");
         // 7. Directory listing (opted in) links both entries.
         let r = http_raw(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(r.contains("hello.txt") && r.contains("sub/"), "{r}");
@@ -24648,18 +24386,12 @@ mod bytes_tests {
         assert!(r.starts_with("HTTP/1.1 200") && r.contains("router"), "{r}");
         // 2. A deep extensionless route the router owns → the shell, 200.
         let r = http_raw(port, "GET /bus/props-core HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(
-            r.starts_with("HTTP/1.1 200") && r.contains("id=app"),
-            "deep route → shell: {r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("id=app"), "deep route → shell: {r}");
         // 3. A MISSING ASSET must stay a real 404, never the shell (else a
         //    broken /main.css silently becomes HTML and the app breaks
         //    confusingly).
         let r = http_raw(port, "GET /missing.css HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(
-            r.starts_with("HTTP/1.1 404"),
-            "missing asset stays 404: {r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 404"), "missing asset stays 404: {r}");
         assert!(!r.contains("id=app"), "{r}");
         // 4. A traversal attempt decodes to an extensionless path
         //    (`../etc`), so it DOES receive the shell (200) — but the shell
@@ -24702,9 +24434,7 @@ mod bytes_tests {
         // Clean URL → the .html page, styled/served as HTML.
         let r = http_raw(port, "GET /bus/props-core HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(
-            r.starts_with("HTTP/1.1 200")
-                && r.contains("props-core page")
-                && r.contains("text/html"),
+            r.starts_with("HTTP/1.1 200") && r.contains("props-core page") && r.contains("text/html"),
             "{r}"
         );
         // The explicit .html still works.
@@ -24712,10 +24442,7 @@ mod bytes_tests {
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         // A path WITH an extension is never .html-appended (no /plain.txt.html).
         let r = http_raw(port, "GET /plain.txt HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(
-            r.starts_with("HTTP/1.1 200") && r.contains("text/plain"),
-            "{r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/plain"), "{r}");
         // A genuinely missing clean URL is still a 404 (no shell configured).
         let r = http_raw(port, "GET /bus/nope HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
@@ -24757,10 +24484,7 @@ mod bytes_tests {
         // /bus/ (trailing slash) is a directory request → 403 (no index,
         // no listing), NOT the sibling page.
         let r = http_raw(port, "GET /bus/ HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(
-            r.starts_with("HTTP/1.1 403"),
-            "trailing slash is a dir request: {r}"
-        );
+        assert!(r.starts_with("HTTP/1.1 403"), "trailing slash is a dir request: {r}");
         server.join().unwrap().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -24772,11 +24496,9 @@ mod bytes_tests {
         let mut opts = indexmap::IndexMap::new();
         opts.insert("port".to_string(), Value::Number(free_port() as f64));
         opts.insert("spa".to_string(), Value::String("nope.html".into()));
-        let err = builtin_http_serve(vec![
-            Value::String(dir.to_string_lossy().into_owned()),
-            Value::map(opts),
-        ])
-        .unwrap_err();
+        let err =
+            builtin_http_serve(vec![Value::String(dir.to_string_lossy().into_owned()), Value::map(opts)])
+                .unwrap_err();
         assert!(format!("{err}").contains("spa shell"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -24813,18 +24535,14 @@ mod bytes_tests {
         ])
         .unwrap()
         .unwrap();
-        let Value::Number(id) = h else {
-            panic!("{h:?}")
-        };
+        let Value::Number(id) = h else { panic!("{h:?}") };
         let opts = || {
             let mut o = indexmap::IndexMap::new();
             o.insert("timeout".to_string(), Value::Number(5.0));
             Value::map(o)
         };
         builtin_tcp_send(vec![Value::Number(id), Value::String("ping".into())]).unwrap();
-        let got = builtin_tcp_recv(vec![Value::Number(id), opts()])
-            .unwrap()
-            .unwrap();
+        let got = builtin_tcp_recv(vec![Value::Number(id), opts()]).unwrap().unwrap();
         match &got {
             Value::Bytes(b) => assert_eq!(b.as_slice(), b"ping"),
             other => panic!("expected bytes, got {other:?}"),
@@ -24846,10 +24564,7 @@ mod bytes_tests {
         };
         assert!(format!("{err}").contains("closed"), "{err}");
         let err = builtin_tcp_recv(vec![Value::Number(id), opts()]).unwrap_err();
-        assert!(
-            format!("{err}").contains("unknown tcp handle"),
-            "retired: {err}"
-        );
+        assert!(format!("{err}").contains("unknown tcp handle"), "retired: {err}");
         server.join().unwrap();
     }
 
@@ -24991,16 +24706,12 @@ mod bytes_tests {
         let got = builtin_http_recv(vec![Value::Number(port as f64), Value::map(opts)])
             .unwrap()
             .unwrap();
-        let Value::Map(m) = &got else {
-            panic!("{got:?}")
-        };
+        let Value::Map(m) = &got else { panic!("{got:?}") };
         assert_eq!(m.get("method"), Some(&Value::String("POST".into())));
         assert_eq!(m.get("path"), Some(&Value::String("/hook".into())));
         assert_eq!(m.get("query"), Some(&Value::String("run=42".into())));
         assert_eq!(m.get("body"), Some(&Value::String("payload=1".into())));
-        let Some(Value::Map(h)) = m.get("headers") else {
-            panic!()
-        };
+        let Some(Value::Map(h)) = m.get("headers") else { panic!() };
         assert_eq!(h.get("x-token"), Some(&Value::String("abc".into())));
         // The client saw the configured response.
         let resp = client.join().unwrap();
@@ -25033,8 +24744,7 @@ mod bytes_tests {
             Some(Value::Bool(true))
         );
         assert_eq!(
-            builtin_has_builtin(vec![Value::String("definitely_not_a_builtin_xyz".into())])
-                .unwrap(),
+            builtin_has_builtin(vec![Value::String("definitely_not_a_builtin_xyz".into())]).unwrap(),
             Some(Value::Bool(false))
         );
         // The m1 fix: eval-special names (printf, read_stdin, …) are
@@ -25055,9 +24765,7 @@ mod bytes_tests {
         // parts and string, consistent with each other.
         let v = builtin_mix_version(vec![]).unwrap().unwrap();
         let Value::Map(m) = &v else { panic!("{v:?}") };
-        let Some(Value::String(s)) = m.get("string") else {
-            panic!()
-        };
+        let Some(Value::String(s)) = m.get("string") else { panic!() };
         assert_eq!(s, env!("CARGO_PKG_VERSION"));
         let parts: Vec<String> = ["major", "minor", "patch"]
             .iter()
@@ -25079,8 +24787,9 @@ mod bytes_tests {
     fn take_on_buffer_is_a_snapshot() {
         // Mutating the buffer afterwards must not change the taken bytes.
         let rc = std::rc::Rc::new(std::cell::RefCell::new(b"abc".to_vec()));
-        let taken =
-            as_bytes(builtin_take(vec![Value::Buffer(rc.clone()), Value::Number(3.0)]).unwrap());
+        let taken = as_bytes(
+            builtin_take(vec![Value::Buffer(rc.clone()), Value::Number(3.0)]).unwrap(),
+        );
         rc.borrow_mut()[0] = b'X';
         assert_eq!(taken, b"abc");
     }
@@ -26714,11 +26423,7 @@ mod getopt_tests {
         // A genuinely unknown algo and a missing path both error, not silently
         // return a bogus digest.
         assert!(
-            call_builtin(
-                "hash_file",
-                vec![ps.clone(), Value::String("sha512".into())]
-            )
-            .is_err()
+            call_builtin("hash_file", vec![ps.clone(), Value::String("sha512".into())]).is_err()
         );
         assert!(
             call_builtin(
@@ -27643,19 +27348,8 @@ mod man_topic_tests {
     #[test]
     fn every_emitted_topic_names_a_real_page() {
         const PAGES: &[&str] = &[
-            "buffer",
-            "bus",
-            "collections",
-            "data",
-            "datastar",
-            "datetime",
-            "http",
-            "io",
-            "math",
-            "regex",
-            "remote",
-            "strings",
-            "system",
+            "buffer", "bus", "collections", "data", "datastar", "datetime",
+            "http", "io", "math", "regex", "remote", "strings", "system",
         ];
         let names = super::BUILTIN_NAMES
             .iter()
@@ -27681,8 +27375,8 @@ mod compiled_features_tests {
         // this list may be empty — the invariant is that whatever appears is a
         // real optional feature name and each appears at most once.
         const KNOWN: &[&str] = &[
-            "json", "regex", "markdown", "toml", "serde", "datetime", "url", "crypto", "http",
-            "sqlite", "dkim", "datastar", "xml", "yaml", "ws",
+            "json", "regex", "markdown", "toml", "serde", "datetime", "url",
+            "crypto", "http", "sqlite", "dkim", "datastar", "xml", "yaml", "ws",
         ];
         let f = compiled_features();
         for name in &f {
@@ -27702,8 +27396,8 @@ mod compiled_features_tests {
     #[test]
     fn every_cargo_feature_is_reported_or_deliberately_skipped() {
         const KNOWN: &[&str] = &[
-            "json", "regex", "markdown", "toml", "serde", "datetime", "url", "crypto", "http",
-            "sqlite", "dkim", "datastar", "xml", "yaml", "ws",
+            "json", "regex", "markdown", "toml", "serde", "datetime", "url",
+            "crypto", "http", "sqlite", "dkim", "datastar", "xml", "yaml", "ws",
         ];
         const SKIP: &[&str] = &["default", "tokio-sleep"];
         let manifest = include_str!("../Cargo.toml");
@@ -27754,12 +27448,7 @@ mod run_parallel_tests {
     use crate::value::Value;
 
     fn argv(words: &[&str]) -> Value {
-        Value::list(
-            words
-                .iter()
-                .map(|w| Value::String((*w).to_string()))
-                .collect(),
-        )
+        Value::list(words.iter().map(|w| Value::String((*w).to_string())).collect())
     }
 
     fn run(jobs: Vec<Value>, opts: Option<Value>) -> Vec<Value> {
@@ -27782,14 +27471,7 @@ mod run_parallel_tests {
 
     #[test]
     fn results_are_in_input_order() {
-        let r = run(
-            vec![
-                argv(&["echo", "a"]),
-                argv(&["echo", "b"]),
-                argv(&["echo", "c"]),
-            ],
-            None,
-        );
+        let r = run(vec![argv(&["echo", "a"]), argv(&["echo", "b"]), argv(&["echo", "c"])], None);
         assert_eq!(r.len(), 3);
         for (i, want) in ["a", "b", "c"].iter().enumerate() {
             match field(&r[i], "stdout") {
@@ -27804,21 +27486,14 @@ mod run_parallel_tests {
         // `false` exits 1; a bogus command is a PROCESS_SPAWN encoded in the
         // map. Neither aborts the batch; the good job still succeeds.
         let r = run(
-            vec![
-                argv(&["false"]),
-                argv(&["echo", "ok"]),
-                argv(&["definitely_no_such_cmd_zzz"]),
-            ],
+            vec![argv(&["false"]), argv(&["echo", "ok"]), argv(&["definitely_no_such_cmd_zzz"])],
             None,
         );
         assert_eq!(r.len(), 3);
         assert_eq!(field(&r[0], "ok"), &Value::Bool(false));
         assert_eq!(field(&r[1], "ok"), &Value::Bool(true));
         assert_eq!(field(&r[2], "ok"), &Value::Bool(false));
-        assert_eq!(
-            field(&r[2], "error_code"),
-            &Value::String("PROCESS_SPAWN".to_string())
-        );
+        assert_eq!(field(&r[2], "error_code"), &Value::String("PROCESS_SPAWN".to_string()));
     }
 
     #[test]
@@ -27885,3 +27560,4 @@ mod run_parallel_tests {
         );
     }
 }
+    map.insert("string".into(), Value::String(env!("CARGO_PKG_VERSION").into()));
