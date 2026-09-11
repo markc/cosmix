@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message as WsMessage};
 
 struct Broker {
+    sessions: Arc<tokio::sync::Mutex<session::Sessions>>,
     task: tokio::task::JoinHandle<Result<()>>,
     root: PathBuf,
     url: String,
@@ -37,8 +38,10 @@ impl Broker {
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o750)).unwrap();
         }
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (probe_tx, probe_rx) = oneshot::channel();
         let task = tokio::spawn(run(
             RunConfig {
+                session_probe: Some(probe_tx),
                 listen: listen.clone(),
                 node,
                 wg_ip: "127.0.0.1".into(),
@@ -55,6 +58,7 @@ impl Broker {
             .unwrap()
             .unwrap();
         Self {
+            sessions: probe_rx.await.unwrap(),
             task,
             root,
             url: format!("ws://{listen}/ws"),
@@ -459,6 +463,135 @@ async fn parent_revocation_is_ordered_against_inflight_child_prove() {
         child.client().close().await;
     }
     observer.client().close().await;
+}
+
+#[tokio::test]
+async fn recipient_dependency_cap_refuses_the_bound_delivery() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    let broker = Broker::start().await;
+    let mut parent = broker.unix().await;
+    let term = allocate_term(&mut parent).await;
+    let mut recipient = broker.unix().await;
+    register(&mut recipient, "dependency-recipient").await;
+    let mut children = Vec::new();
+    for pane in 0..257 {
+        let key = SigningKey::from_bytes(&rand::random());
+        let public_key = HexBytes(key.verifying_key().to_bytes());
+        let grant = session_call(&mut parent,"grant.create",&(pane+2).to_string(),serde_json::json!({"parent":term.reference(),"pane_id":pane.to_string(),"pane_generation":"1","public_key":public_key,"role":"pane-shell","capabilities":["input"]})).await;
+        assert_eq!(grant.get("rc"), Some("0"), "{}", grant.body);
+        let mut child = broker.unix().await;
+        let challenge = session_call(
+            &mut child,
+            "challenge",
+            "challenge",
+            serde_json::json!({"public_key":public_key,"purpose":"enrol"}),
+        )
+        .await;
+        let proof: ProofTranscript = serde_json::from_str(&challenge.body).unwrap();
+        let signature = HexBytes(key.sign(&encode_proof(&proof).unwrap()).to_bytes());
+        let attached = session_call(
+            &mut child,
+            "prove",
+            "prove",
+            serde_json::json!({"challenge_id":proof.challenge_id,"signature":signature}),
+        )
+        .await;
+        assert_eq!(attached.get("rc"), Some("0"), "{}", attached.body);
+        send(
+            &mut child,
+            &request("probe.dependency", "dependency-recipient", "delivery"),
+        )
+        .await;
+        if pane < 256 {
+            let received = receive(&mut recipient).await;
+            assert_eq!(received.command_name(), Some("probe.dependency"));
+            send(
+                &mut recipient,
+                &request("probe.dependency", "noded", received.get("id").unwrap())
+                    .with_header("type", "response")
+                    .with_header("rc", "0"),
+            )
+            .await;
+        }
+        let response = loop {
+            let response = receive(&mut child).await;
+            if response.message_type() == Some("response") && response.get("id") == Some("delivery")
+            {
+                break response;
+            }
+        };
+        if pane < 256 {
+            assert_eq!(response.get("rc"), Some("0"));
+        } else {
+            assert_eq!(response.get("rc"), Some("10"));
+            assert!(response.body.contains("recipient_dependency_limit"));
+        }
+        children.push(child);
+    }
+    // No refused envelope was queued. A subsequent unbound marker is next.
+    let mut ambient = broker.unix().await;
+    send(
+        &mut ambient,
+        &request("probe.marker", "dependency-recipient", "marker").with_header("type", "event"),
+    )
+    .await;
+    assert_eq!(
+        receive(&mut recipient).await.command_name(),
+        Some("probe.marker")
+    );
+}
+
+#[tokio::test]
+async fn notice_overflow_delivers_gap_before_notices_and_key_resync_succeeds() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::SigningKey;
+    let broker = Broker::start().await;
+    let parent = verified(&broker).await;
+    let key = SigningKey::from_bytes(&rand::random());
+    let term = parent
+        .session_allocate(&key, Policy::Restricted)
+        .await
+        .unwrap()
+        .record;
+    let child_key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(child_key.verifying_key().to_bytes());
+    let grant = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: term.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key,
+            role: Role::PaneShell,
+            capabilities: vec![Capability::Input],
+        })
+        .await
+        .unwrap();
+    let mut waiting = verified(&broker).await;
+    let selector = ChallengeArgs::Key(KeyChallenge {
+        public_key,
+        purpose: Purpose::Enrol,
+    });
+    waiting.session_challenge(&selector).await.unwrap();
+    // Real broker queues, atomically filled while their writer cannot drain.
+    // Duplicate notices are legal and must be idempotent at the recipient.
+    broker
+        .sessions
+        .lock()
+        .await
+        .test_notice_burst(grant.record.record_id, 257);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(3), waiting.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.command().command, "noded.session.lifecycle.gap");
+    assert!(event.trusted_context().is_none());
+    let challenge = waiting.session_challenge(&selector).await.unwrap();
+    assert_eq!(challenge.transcript.record_id, grant.record.record_id);
+    assert_eq!(challenge.transcript.binding_generation, DecimalU64(1));
+    parent.session_renew(term.reference()).await.unwrap();
+    parent.client().close().await;
+    waiting.client().close().await;
 }
 
 #[tokio::test]

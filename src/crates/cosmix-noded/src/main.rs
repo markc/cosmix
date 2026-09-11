@@ -132,6 +132,8 @@ async fn main() -> Result<()> {
     let mut noded_handle = tokio::spawn(async move {
         noded::run(
             noded::RunConfig {
+                #[cfg(test)]
+                session_probe: None,
                 listen,
                 node: noded_node,
                 wg_ip,

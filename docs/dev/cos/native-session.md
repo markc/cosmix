@@ -24,7 +24,10 @@ The native noded tests use real Unix WebSockets and kernel peer credentials.
 They include separate-process reserved-name competition, altered-scope and
 captured-proof refusal, restart/re-enrolment, parent-resume wake, lease dependency
 registration, observation/log omission, grant/Term/challenge/interest exhaustion,
-retention high-water and deterministic notice-queue overflow.
+retention high-water and deterministic notice-queue overflow. A test-only probe
+fills the real broker's notice queue under its lock, then checks gap delivery and
+key-selected resynchronisation over the real Unix connection. Clock-boundary
+unit tests supplement that transport coverage with exact expiry instants.
 
 The privileged multi-UID case is explicitly ignored in ordinary runs, with its
 missing prerequisites named in the test report. Run it explicitly as root with
@@ -53,8 +56,10 @@ to 65,536 names. Exhaustion refuses allocation. Each UID may hold 64 nonterminal
 Terms. Retained mutations use increasing decimal IDs and bounded cached results.
 Clients renew every five seconds; successful renewal refreshes the 15-second
 CLOCK_BOOTTIME lease, including repeated request IDs. Disconnect or expiry
-suspends the record for 30 seconds. Further S2 boundaries add child grants,
-resumption, notices and the typed client API.
+suspends the record for 30 seconds. Delayed maintenance uses the original lease
+deadline and processes expiries in time order, preserving earlier descendant
+windows. The other S2 boundaries provide child grants, resumption, notices and
+the typed client API.
 
 The S1 foundation implements the wire types in `cosmix-lib-bus` and shares
 noded's existing Axum WebSocket handler between transport identities. TCP
@@ -116,7 +121,8 @@ the application also tracks pane-generation high-water within each parent instan
 No uncertain mutation is retried automatically. Wake errors remain visible on
 success and refusal. Private signing keys are never serialised into requests.
 
-Same-UID discovery includes the broker-owned `native_session` snapshot. Other
+Same-UID discovery includes the broker-owned `native_session` snapshot for attached,
+pending and suspended records. Other
 transports and UIDs see bare allocated names. Caller provenance cannot set the
 field. Session list and discovery share `SessionRecord`; neither is live authority.
 
@@ -146,7 +152,7 @@ creates immutable `VerifiedCommand` deliveries with a `trusted_context`
 accessor; raw `IncomingCommand` headers cannot create this type. A missing
 context denotes an unverified sender or a direct broker message. A typed stamp
 is not a live lease: retained deliveries remain historical, and session-bound
-authorisation will require S2 lease checks. Use `client().close()` for explicit
+authorisation requires correlated lease checks. Use `client().close()` for explicit
 connection teardown, as with the existing client.
 
 The listener walks ancestry with directory FDs and `openat(O_NOFOLLOW)`, and

@@ -188,6 +188,7 @@ fn strict_key(bytes: HexBytes<32>) -> Result<VerifyingKey, SessionError> {
 }
 
 struct Record {
+    sequence: usize,
     view: SessionRecord,
     key: HexBytes<32>,
     connection: Option<Id>,
@@ -235,6 +236,14 @@ pub(crate) struct Sessions {
 }
 
 impl Sessions {
+    /// Exercise the production bounded queues with the writer excluded by the
+    /// same lock. No fabricated broker or transport substitutes for delivery.
+    #[cfg(test)]
+    pub(super) fn test_notice_burst(&mut self, id: Id, count: usize) {
+        for _ in 0..count {
+            self.notice(id, None);
+        }
+    }
     pub(super) fn open_outbox(
         &mut self,
         id: Id,
@@ -637,6 +646,13 @@ impl Sessions {
         Some(serde_json::to_value(info).expect("discovery"))
     }
 
+    pub(super) fn discovery_names(&self) -> impl Iterator<Item = &str> {
+        self.records
+            .values()
+            .filter(|r| r.view.state != BindingState::Revoked)
+            .map(|r| r.view.name.as_str())
+    }
+
     pub(super) fn principal(&self, connection: Id, now: u64) -> Option<BrokerPrincipal> {
         let c = self.connections.get(&connection)?;
         if c.binding.is_some() && self.attached(connection).is_none() {
@@ -748,12 +764,7 @@ impl Sessions {
                                 .parent(r)
                                 .is_some_and(|parent| parent.connection == Some(p.connection_id))
                     })
-                    .max_by_key(|r| {
-                        (
-                            r.view.state != BindingState::Revoked,
-                            r.view.pane_generation.map(|g| g.0).unwrap_or(0),
-                        )
-                    })
+                    .max_by_key(|r| r.sequence)
                     .ok_or_else(SessionError::forbidden)?;
                 if !self.parent_live(r, now) {
                     return Err(SessionError::forbidden());
@@ -864,6 +875,7 @@ impl Sessions {
                 self.records.insert(
                     id,
                     Record {
+                        sequence: self.issued.len(),
                         view: view.clone(),
                         key: a.public_key,
                         connection: Some(p.connection_id),
@@ -1004,6 +1016,7 @@ impl Sessions {
         self.records.insert(
             id,
             Record {
+                sequence: self.issued.len(),
                 view: view.clone(),
                 key: a.public_key,
                 connection: None,

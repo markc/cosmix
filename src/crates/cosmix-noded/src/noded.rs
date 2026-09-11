@@ -485,6 +485,8 @@ enum AdmitOutcome {
 // ── Entry point ──
 
 pub struct RunConfig {
+    #[cfg(test)]
+    pub session_probe: Option<oneshot::Sender<Arc<tokio::sync::Mutex<session::Sessions>>>>,
     /// None disables native ingress for isolated legacy test brokers.
     pub unix_socket: Option<PathBuf>,
     pub listen: String,
@@ -498,6 +500,8 @@ pub struct RunConfig {
 
 pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()> {
     let RunConfig {
+        #[cfg(test)]
+        session_probe,
         unix_socket,
         listen,
         node,
@@ -847,6 +851,10 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         live_sessions: Arc::new(RwLock::new(HashMap::new())),
     };
     broker.set_native_sessions(state.sessions.clone());
+    #[cfg(test)]
+    if let Some(probe) = session_probe {
+        let _ = probe.send(state.sessions.clone());
+    }
 
     // Seed the change bus with the L1 snapshot so the first mutation
     // produces a diff against real state, not against `None`. Also seed
@@ -3868,18 +3876,21 @@ async fn handle_noded_command(
                 let mut sessions = state.sessions.lock().await;
                 let now = session::now_ms();
                 sessions.maintain(&mut reg, now);
-                let mut entries: Vec<_> = reg.values().collect();
-                entries.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+                let mut entries: Vec<_> = reg
+                    .keys()
+                    .map(String::as_str)
+                    .chain(sessions.discovery_names())
+                    .collect();
+                entries.sort_unstable();
+                entries.dedup();
                 entries
                     .into_iter()
-                    .map(|e| {
+                    .map(|name| {
                         sessions
-                            .discovery(
-                                &e.info.name,
-                                state.principal.as_ref().map(|p| p.unix_uid),
-                                now,
-                            )
-                            .unwrap_or_else(|| serde_json::to_value(&e.info).expect("service info"))
+                            .discovery(name, state.principal.as_ref().map(|p| p.unix_uid), now)
+                            .unwrap_or_else(|| {
+                                serde_json::to_value(&reg[name].info).expect("service info")
+                            })
                     })
                     .collect()
             };
@@ -5682,6 +5693,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    session_probe: None,
                     unix_socket: None,
                     listen: listen_for_run,
                     node: "test-node".into(),
@@ -5767,6 +5779,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    session_probe: None,
                     unix_socket: None,
                     listen: listen_for_run,
                     node: "test-node".into(),
@@ -5919,6 +5932,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    session_probe: None,
                     unix_socket: None,
                     listen: listen_for_run,
                     node: "test-node".into(),
