@@ -120,17 +120,29 @@ a deadline. The verified client inbox is bounded at
 a gapped recipient must still resynchronise on the same connection
 (BROKER-022). Only receiver closure or transport loss retires the reader and
 invalidates connection liveness; broker-side lifecycle queue/gap behaviour is
-unchanged.
+unchanged. A drop is not a delivery, though: it raises a sticky gap flag the
+consumer reads, and Term treats that flag as identical to a broker-signalled
+gap, discarding cached lifecycle authority and resynchronising. The flag is
+only read when the next delivery is handled, so a dropped notice can leave
+cached authority live until then, bounded by the five-second lease window.
 
-`term.input.revoked` is a private event carrying target, request ID and a
-`partial_or_unknown` outcome with a delivered-byte lower bound. Its
+`term.input.revoked` is a private event carrying target, request ID, a
+delivered-byte lower bound and an outcome derived from it: `complete` when every
+byte reached the PTY before the lease ended, `partial_or_unknown` otherwise. The
+retained operation result reports that same distinction, so the event and the
+query never disagree about what happened. Its
 `recipient_connection` routing constraint contains the original verified broker
 epoch and connection ID. Noded accepts this direct event only from a currently
 attached same-UID Term, checks the exact destination connection under its session
 lock, and stamps its source. This also serves unnamed ambient owners without
 inventing service names. Old names or successor attachments cannot collect an
 old connection's event. Event queues are bounded and best-effort; retained
-operation queries remain available within the retry window. A completed input
+operation queries remain available within the retry window. Delivering one of
+these events also takes a recipient dependency slot on the destination
+connection, and those slots are capped: at the cap the notice is simply not
+delivered. That is within BROKER-022's best-effort contract and is why the
+retained operation result, not the event, is the answer of record — a client
+that needs the outcome asks for it rather than waiting to be told. A completed input
 outcome means bytes reached the PTY, never that a shell command completed.
 
 Protected requests, replies, refusal bodies, property contents and private input

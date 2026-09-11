@@ -401,7 +401,19 @@ fn p0i_07_real_recipient_both_policies() {
             forbidden(call(bound.client(), &parent.name, "term.props.set", json!({"target":sibling_target,"request_id":"4","property":"selected","value":true})).await);
             forbidden(call(bound.client(), &parent.name, "term.tab.new", json!({"target":target,"affected":[sibling_target],"request_id":"5"})).await);
             // Body assertions cannot manufacture a principal or change policy.
+            // Sent from the VERIFIED owner as well as the anonymous peer: an
+            // anonymous caller is refused before its body is even parsed, so
+            // that arm alone would prove nothing about the body. From a caller
+            // who IS otherwise authorised, the request schema simply has no
+            // field through which to assert either one.
             let forged = json!({"target":target,"principal":{"unix_uid":parent.owner_uid},"policy":"default-open"});
+            let reply = call(owner.client(), &parent.name, "term.session", forged.clone()).await;
+            assert_ne!(reply.0, 0, "forged body accepted from a verified owner: {reply:?}");
+            if policy == Policy::DefaultOpen {
+                assert_eq!(reply.1["error_code"], "INVALID_ARGUMENT", "{reply:?}");
+            } else {
+                forbidden(reply);
+            }
             forbidden(call(&tcp, &parent.name, "term.session", forged).await);
         });
     }
@@ -442,9 +454,19 @@ fn p0i_08_queued_input_human_revoke_and_deadline() {
         assert_eq!(call(owner.client(), &parent.name, "term.type", body).await.0, 0);
         let paused = fixture.broker.pause();
         tokio::time::sleep(Duration::from_millis(2200)).await;
+        drop(paused);
+        // Prove the permit aged out on its own deadline BEFORE any human key.
+        // A keypress revokes it regardless, so asserting only after one would
+        // pass whether or not the deadline did anything. Another actor being
+        // admitted is only possible once the previous permit is invalid.
+        let expiry = verified(&fixture.broker).await;
+        assert_eq!(
+            call(expiry.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","foreground_generation":listener.foreground_generation().to_string(),"text":"AFTER_EXPIRY"})).await.0,
+            0,
+            "an expired permit must not still hold the one-writer lease"
+        );
         listener.block_control_writes(false);
         listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
-        drop(paused);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(pane.lock().unwrap().stats.lock().unwrap().input_written - before, 3);
         // Removing the pane invalidates locally before asynchronous cleanup.
@@ -687,6 +709,17 @@ fn p0i_09_real_payload_tap_observe_and_logs() {
         let listener = fixture.tabs.lock().unwrap().pane_by_id(1).unwrap().lock().unwrap().listener.clone();
         let input = json!({"target":target,"request_id":"1","foreground_generation":listener.foreground_generation().to_string(),"text":"print(\"PRIVATE_S4_SENTINEL\")\n"});
         assert_eq!(call(owner.client(), &parent.name, "term.type", input).await.0, 0);
+        // A revocation while both subscriptions are live. term.input.revoked is
+        // itself a protected private event carrying the target and a delivered
+        // byte count, so it has to be excluded from tap and observe exactly as
+        // the request that created it was. Nothing else in the suite watches
+        // that event with real subscribers attached.
+        listener.block_control_writes(true);
+        let revoked_input = json!({"target":target,"request_id":"2","foreground_generation":listener.foreground_generation().to_string(),"text":"PRIVATE_S4_SENTINEL_REVOKED"});
+        assert_eq!(call(owner.client(), &parent.name, "term.type", revoked_input).await.0, 0);
+        listener.block_control_writes(false);
+        listener.key(crate::terminal::Key::Interrupt, Instant::now()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let reply = call(owner.client(), &parent.name, "term.props.get", json!({"target":target,"property":"contents"})).await;
@@ -1164,5 +1197,84 @@ fn p0i_07_affected_set_and_live_generation_authority() {
             .0,
             0
         );
+    });
+}
+
+#[test]
+#[ignore = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit S4 gate only"]
+fn p0i_08_lease_window_refresh_and_successor_binding_invalidation() {
+    eprintln!("{REQUIRE_MIX}");
+    let fixture = Fixture::new(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let bound = verified(&fixture.broker).await;
+        let (parent, target) = fixture.bound(&bound).await;
+        assert_eq!(
+            call(
+                bound.client(),
+                &parent.name,
+                "term.session",
+                json!({"target":target})
+            )
+            .await
+            .0,
+            0
+        );
+
+        // A bound caller's lease check is reused for one five-second window.
+        // Every other fixture finishes well inside it, so the branch that lets
+        // the cache expire and takes a fresh check has never run.
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        assert_eq!(
+            call(
+                bound.client(),
+                &parent.name,
+                "term.session",
+                json!({"target":target})
+            )
+            .await
+            .0,
+            0,
+            "a bound caller must survive its cached lease check expiring"
+        );
+
+        // A successor binding retires what the previous one authorised. Proved
+        // without a keypress, which would revoke the permit regardless: another
+        // actor is admitted to the one-writer lease only once the queued permit
+        // has actually been invalidated.
+        let pane = fixture.tabs.lock().unwrap().pane_by_id(1).unwrap();
+        let listener = pane.lock().unwrap().listener.clone();
+        listener.block_control_writes(true);
+        let generation = listener.foreground_generation().to_string();
+        assert_eq!(
+            call(
+                bound.client(),
+                &parent.name,
+                "term.type",
+                json!({"target":target,"request_id":"1","foreground_generation":generation,"text":"NEVER_AFTER_REBIND"})
+            )
+            .await
+            .0,
+            0
+        );
+        let claimed = Instant::now();
+        let owner = verified(&fixture.broker).await;
+        assert_eq!(
+            call(owner.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","foreground_generation":listener.foreground_generation().to_string(),"text":"BLOCKED"})).await.1["error_code"],
+            "BUSY",
+            "the queued permit must hold the lease before the successor lands"
+        );
+        let (parent, target) = fixture.rebind(&bound, false).await;
+        assert_eq!(
+            call(owner.client(), &parent.name, "term.type", json!({"target":target,"request_id":"2","foreground_generation":listener.foreground_generation().to_string(),"text":"ADMITTED"})).await.0,
+            0,
+            "a successor binding must invalidate the previous permit"
+        );
+        // Without this the permit's own two-second deadline would explain the
+        // admission just as well, and the assertion above would prove nothing.
+        assert!(
+            claimed.elapsed() < Duration::from_secs(2),
+            "permit aged out on its own deadline; this says nothing about the successor binding"
+        );
+        listener.block_control_writes(false);
     });
 }
