@@ -1084,8 +1084,15 @@ fn status_flood_preserves_lease_and_restart_ack() {
         phase(&mut parent, &bound, "prompt-ready").await;
         let mut flood = tokio::task::JoinSet::new();
         let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for _ in 0..64 {
-            let connection = parent.connection.clone();
+        // The flood is other same-UID processes, not the owning Term: this
+        // child's policy admits ambient callers, so they compete for the very
+        // dispatch slots the Term needs.
+        let mut ambient = Vec::new();
+        for _ in 0..8 {
+            ambient.push(std::sync::Arc::new(connect(&broker).await));
+        }
+        for index in 0..64 {
+            let connection = ambient[index % ambient.len()].clone();
             let target = bound.clone();
             let refused = refused.clone();
             flood.spawn(async move {
@@ -1117,6 +1124,7 @@ fn status_flood_preserves_lease_and_restart_ack() {
         // Longer than the initial 15s child lease: only the resident's renew
         // arm can keep this exact attachment alive under a continuously full load.
         let deadline = Instant::now() + Duration::from_secs(17);
+        let mut answered = 0;
         while Instant::now() < deadline {
             parent.renew().await;
             assert!(flood.try_join_next().is_none(), "flood worker failed");
@@ -1132,8 +1140,27 @@ fn status_flood_preserves_lease_and_restart_ack() {
                 bound.reference(),
                 "overflow must not reconnect"
             );
+            // One dispatch slot is the owning Term's, so a saturating flood by
+            // other same-UID callers cannot starve it into uniform refusals.
+            let value = tokio::time::timeout(
+                Duration::from_secs(3),
+                parent.connection.client().call(
+                    &bound.name,
+                    "shell.status",
+                    status_request(&bound),
+                ),
+            )
+            .await
+            .expect("the owning Term must be answered during a flood")
+            .expect("the owning Term must not be refused during a flood");
+            assert_eq!(
+                value["status"]["snapshot"]["source"],
+                status_request(&bound)["target"]
+            );
+            answered += 1;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        assert!(answered > 0);
         assert!(refused.load(std::sync::atomic::Ordering::Relaxed) > 0);
         std::fs::write(child.home.path().join(".claude-resume"), "").unwrap();
         let started = Instant::now();
@@ -1156,6 +1183,9 @@ fn status_flood_preserves_lease_and_restart_ack() {
         }
         flood.abort_all();
         while flood.join_next().await.is_some() {}
+        for connection in &ambient {
+            connection.client().close().await;
+        }
         let output = child.until("RC_MARKER=[]\r\n");
         assert!(output.contains("record observed revoked"), "{output}");
         assert!(started.elapsed() < Duration::from_secs(5));
