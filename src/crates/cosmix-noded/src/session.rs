@@ -70,6 +70,11 @@ mod queue_tests {
             Arc::new(tokio::sync::Notify::new()),
             Default::default(),
         );
+        s.open_outbox(
+            recipient.connection_id,
+            &tx,
+            Arc::new(tokio::sync::Notify::new()),
+        );
         s.delivery(&p, &tx, 1000).unwrap();
         let target = s.records[&id].view.reference();
         s.dispatch(
