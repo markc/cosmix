@@ -1185,10 +1185,15 @@ impl Actor {
 
     async fn run(&mut self, mut requests: UnboundedReceiver<Request>) {
         let mut renew = tokio::time::interval(RENEW);
-        let mut control_tick = tokio::time::interval(Duration::from_millis(100));
-        control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Revocation wakes this lane; it is never woken by a clock. The wake
+        // appears once the render thread installs the control surface, so it
+        // is picked up lazily rather than required at actor startup.
+        let mut control_wake: Option<Arc<tokio::sync::Notify>> = None;
         loop {
+            if control_wake.is_none() {
+                control_wake = self.control().map(|control| control.wake());
+            }
             tokio::select! {
                 biased;
                 _ = renew.tick() => {
@@ -1198,8 +1203,14 @@ impl Actor {
                     let closing: Vec<_> = self.children.iter().filter(|(_, c)| !c.pane.live.load(Ordering::Acquire)).map(|(id, _)| *id).collect();
                     for id in closing { self.close_child(id).await; }
                     self.provision().await;
+                    // Backstop only, on a cadence BROKER-020 already requires:
+                    // a permit that merely aged out queues its notice here
+                    // rather than waiting for the next revocation to wake us.
+                    if let (Some(control), Some(connection)) = (self.control(), &self.connection) {
+                        control.flush_notices(connection).await;
+                    }
                 }
-                _ = control_tick.tick() => {
+                _ = async { match &control_wake { Some(wake) => wake.notified().await, None => std::future::pending().await } } => {
                     if let (Some(control), Some(connection)) = (self.control(), &self.connection) {
                         control.flush_notices(connection).await;
                     }
@@ -1312,6 +1323,17 @@ impl Actor {
                 target.binding_generation.0 = target.binding_generation.0.saturating_sub(1);
             }
             control.invalidate(Some(&target));
+        }
+        // A notice about this attachment retires the deadline the control lane
+        // reads, rather than leaving it live until the next renew would have
+        // noticed. Nothing protected resolves again until a renew re-earns it.
+        if self
+            .parent
+            .as_ref()
+            .is_some_and(|p| p.record_id == notice.target.record_id)
+            && notice.state != BindingState::Attached
+        {
+            self.own_lease = None;
         }
         let id = self.children.iter().find_map(|(id, child)| {
             child

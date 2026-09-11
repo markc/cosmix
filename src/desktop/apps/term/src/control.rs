@@ -123,6 +123,9 @@ pub struct Permit {
     pub pane: Arc<dyn Fn() -> bool + Send + Sync>,
     pub written: std::sync::atomic::AtomicU64,
     notice: Mutex<Option<(tokio::sync::mpsc::Sender<InputNotice>, InputNotice)>>,
+    /// Woken the instant a revocation queues a notice, so the actor drains on
+    /// the event rather than on a clock.
+    wake: Arc<tokio::sync::Notify>,
 }
 impl Permit {
     pub fn valid(&self) -> bool {
@@ -141,7 +144,12 @@ impl Permit {
             && let Some((sender, mut notice)) = self.notice.lock().unwrap().take()
         {
             notice.written = self.written.load(std::sync::atomic::Ordering::Acquire);
-            let _ = sender.try_send(notice);
+            if sender.try_send(notice).is_ok() {
+                // Revocation is the event; the actor never polls for it. This
+                // runs on the render thread under the write lock, so it must
+                // stay a bare wakeup and do no Bus work of its own.
+                self.wake.notify_one();
+            }
         }
     }
 }
@@ -189,6 +197,7 @@ pub struct Control {
     native: crate::native_session::NativeSession,
     notice_tx: tokio::sync::mpsc::Sender<InputNotice>,
     notice_rx: Mutex<tokio::sync::mpsc::Receiver<InputNotice>>,
+    wake: Arc<tokio::sync::Notify>,
 }
 impl Control {
     #[cfg(test)]
@@ -212,7 +221,15 @@ impl Control {
             state: Mutex::new(State::default()),
             notice_tx,
             notice_rx: Mutex::new(notice_rx),
+            wake: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// The actor waits on this instead of ticking. Revocation queues a notice
+    /// and wakes it; a permit that merely aged out is collected on the next
+    /// wake or renew, since nothing is owed to anyone until one is queued.
+    pub fn wake(&self) -> Arc<tokio::sync::Notify> {
+        self.wake.clone()
     }
 
     pub async fn flush_notices(&self, connection: &VerifiedConnection) {
@@ -509,6 +526,7 @@ impl Control {
             pane: live,
             written: std::sync::atomic::AtomicU64::new(0),
             notice: Mutex::new(None),
+            wake: self.wake.clone(),
         });
         let mut tabs = self.terminal.lock().unwrap();
         if !permit.valid() || tabs.pane_by_id(target.pane_id.0).is_none() {
