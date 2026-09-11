@@ -460,8 +460,22 @@ fn p0i_08_queued_input_human_revoke_and_deadline() {
         // pass whether or not the deadline did anything. Another actor being
         // admitted is only possible once the previous permit is invalid.
         let expiry = verified(&fixture.broker).await;
+        // Term's own renew failed while the broker was paused, so it has to
+        // re-earn its deadline first. Asking it anything protected before then
+        // races that recovery instead of testing the permit.
+        let epoch = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let session = call(expiry.client(), &parent.name, "term.session", json!({"target":target})).await;
+                if session.0 == 0 {
+                    return session.1["request_epoch"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Term re-establishes its own attachment after the broker pause");
         assert_eq!(
-            call(expiry.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","foreground_generation":listener.foreground_generation().to_string(),"text":"AFTER_EXPIRY"})).await.0,
+            call(expiry.client(), &parent.name, "term.type", json!({"target":target,"request_id":"1","request_epoch":epoch,"foreground_generation":listener.foreground_generation().to_string(),"text":"AFTER_EXPIRY"})).await.0,
             0,
             "an expired permit must not still hold the one-writer lease"
         );
