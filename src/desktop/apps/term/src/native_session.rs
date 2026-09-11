@@ -1450,6 +1450,9 @@ pub(crate) mod tests {
             let url = broker.url.clone();
             let record_id = child.record_id;
             terminal.lock().unwrap().before_pty_cleanup = Some(Box::new(move || {
+                // Signal boundary entry before any operation the paused broker
+                // can block; otherwise the negative ordering assertion is blind.
+                cleanup_tx.send(()).unwrap();
                 // This probe runs after the revoke wait, immediately before
                 // PTY cleanup. Query the real broker at that boundary.
                 runtime().block_on(async {
@@ -1474,7 +1477,6 @@ pub(crate) mod tests {
                         "PTY cleanup preceded broker revoke"
                     );
                 });
-                cleanup_tx.send(()).unwrap();
             }));
             let paused = broker.pause();
             // The mutation must not acquire the PTY mutex. Reordering revoke

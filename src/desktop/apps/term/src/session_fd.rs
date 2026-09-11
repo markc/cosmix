@@ -8,12 +8,16 @@ use zeroize::Zeroizing;
 
 pub const MARKER: &str = "COSMIX_SESSION_FD";
 
+fn inherited_fd(value: &str) -> Option<RawFd> {
+    value.parse::<RawFd>().ok().filter(|fd| *fd >= 3)
+}
+
 /// Run before any threads or child spawns. Term might itself be launched by a
 /// native parent; its inherited handoff must never leak into a pane's exec.
 pub fn quarantine_inherited() {
     if let Ok(value) = std::env::var(MARKER) {
-        match value.parse::<RawFd>() {
-            Ok(fd) if fd >= 0 => {
+        match inherited_fd(&value) {
+            Some(fd) => {
                 // SAFETY: fcntl changes flags only; ownership is not assumed.
                 if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
                     eprintln!(
@@ -25,6 +29,15 @@ pub fn quarantine_inherited() {
             _ => eprintln!("term inherited session descriptor marker is invalid"),
         }
     }
+}
+
+#[test]
+fn inherited_marker_never_selects_stdio() {
+    for value in ["-1", "0", "1", "2", "invalid", "2147483648"] {
+        assert_eq!(inherited_fd(value), None);
+    }
+    assert_eq!(inherited_fd("3"), Some(3));
+    assert_eq!(inherited_fd("64"), Some(64));
 }
 
 pub fn fresh_key() -> io::Result<SigningKey> {
