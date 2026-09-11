@@ -3,6 +3,7 @@
 use super::*;
 use cosmix_bus::native_session::*;
 use ed25519_dalek::{Signature, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 
 const LEASE_MS: u64 = 15_000;
@@ -37,12 +38,27 @@ fn error(code: ErrorCode, reason: &str) -> SessionError {
 }
 
 fn verify(key: HexBytes<32>, signature: HexBytes<64>, bytes: &[u8]) -> Result<(), SessionError> {
-    let key = VerifyingKey::from_bytes(&key.0).map_err(|_| SessionError::forbidden())?;
+    let key = strict_key(key)?;
+    key.verify_strict(bytes, &Signature::from_bytes(&signature.0))
+        .map_err(|_| SessionError::forbidden())
+}
+
+fn strict_key(bytes: HexBytes<32>) -> Result<VerifyingKey, SessionError> {
+    // Compressed Edwards y must be canonical (< 2^255-19), independently
+    // of dalek's field decoding. The high bit encodes the x sign.
+    let mut y = bytes.0;
+    y[31] &= 127;
+    let mut prime = [255; 32];
+    prime[0] = 237;
+    prime[31] = 127;
+    if y.iter().rev().cmp(prime.iter().rev()) != std::cmp::Ordering::Less {
+        return Err(SessionError::forbidden());
+    }
+    let key = VerifyingKey::from_bytes(&bytes.0).map_err(|_| SessionError::forbidden())?;
     if key.is_weak() {
         return Err(SessionError::forbidden());
     }
-    key.verify_strict(bytes, &Signature::from_bytes(&signature.0))
-        .map_err(|_| SessionError::forbidden())
+    Ok(key)
 }
 
 struct Record {
@@ -67,6 +83,9 @@ struct Connection {
     close: Arc<tokio::sync::Notify>,
     protected: Arc<AtomicBool>,
     high_water: u64,
+    interest: Option<HexBytes<32>>,
+    challenge: Option<(ChallengeArgs, ProofTranscript)>,
+    consumed: HashSet<Id>,
 }
 
 #[derive(Default)]
@@ -75,6 +94,8 @@ pub(super) struct Sessions {
     connections: HashMap<Id, Connection>,
     issued: HashSet<String>,
     results: VecDeque<Cached>,
+    grants: HashMap<Id, SessionGrant>,
+    pane_high_water: HashMap<(Id, u64), u64>,
 }
 
 impl Sessions {
@@ -93,15 +114,89 @@ impl Sessions {
                 close,
                 protected,
                 high_water: 0,
+                interest: None,
+                challenge: None,
+                consumed: HashSet::new(),
             },
         );
     }
 
     fn snapshot(&self, record: &Record, now: u64) -> SessionRecord {
         let mut view = record.view.clone();
-        view.lease_remaining_ms = (view.state == BindingState::Attached)
-            .then(|| DecimalU64(record.deadline.saturating_sub(now)));
+        view.lease_remaining_ms =
+            (view.state == BindingState::Attached).then(|| DecimalU64(self.remaining(record, now)));
         view
+    }
+
+    fn parent(&self, r: &Record) -> Option<&Record> {
+        let instance = r.view.parent_instance?;
+        self.records.values().find(|p| {
+            p.view.instance_id == instance && Some(p.view.incarnation) == r.view.parent_incarnation
+        })
+    }
+
+    fn remaining(&self, r: &Record, now: u64) -> u64 {
+        if r.view.state != BindingState::Attached {
+            return 0;
+        }
+        let own = r.deadline.saturating_sub(now);
+        match self.parent(r) {
+            Some(p) => own.min(self.remaining(p, now)),
+            None if r.view.role == Role::Term => own,
+            None => 0,
+        }
+    }
+
+    fn parent_live(&self, r: &Record, now: u64) -> bool {
+        r.view.role == Role::Term || self.parent(r).is_some_and(|p| self.remaining(p, now) > 0)
+    }
+
+    fn owned(&self, uid: u32, target: &RecordRef) -> Result<&Record, SessionError> {
+        let r = self
+            .records
+            .get(&target.record_id)
+            .filter(|r| r.view.owner_uid == uid)
+            .ok_or_else(SessionError::forbidden)?;
+        if r.view.reference() != *target {
+            return Err(error(ErrorCode::StaleGeneration, ""));
+        }
+        Ok(r)
+    }
+
+    fn children(&self, id: Id) -> Vec<Id> {
+        let p = &self.records[&id].view;
+        self.records
+            .iter()
+            .filter(|(_, r)| {
+                r.view.parent_instance == Some(p.instance_id)
+                    && r.view.parent_incarnation == Some(p.incarnation)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn revoke(&mut self, id: Id, reg: &mut HashMap<String, ServiceEntry>) {
+        for child in self.children(id) {
+            self.revoke(child, reg);
+        }
+        let r = self.records.get_mut(&id).expect("record");
+        if r.view.state == BindingState::Revoked {
+            return;
+        }
+        if let Some(c) = r.connection.take().and_then(|id| self.connections.get(&id)) {
+            if reg.get(&r.view.name).is_some_and(|e| e.same_channel(&c.tx)) {
+                reg.remove(&r.view.name);
+            }
+            c.close.notify_one();
+        }
+        r.view.state = BindingState::Revoked;
+        for g in self
+            .grants
+            .values_mut()
+            .filter(|g| g.record_id == id && g.state == GrantState::Pending)
+        {
+            g.state = GrantState::Revoked;
+        }
     }
 
     fn attached(&self, connection: Id) -> Option<Id> {
@@ -159,6 +254,9 @@ impl Sessions {
     }
 
     fn suspend(&mut self, id: Id, reg: &mut HashMap<String, ServiceEntry>, now: u64) {
+        for child in self.children(id) {
+            self.suspend(child, reg, now);
+        }
         let r = self.records.get_mut(&id).expect("record");
         if r.view.state != BindingState::Attached {
             return;
@@ -190,10 +288,30 @@ impl Sessions {
             if state == BindingState::Attached {
                 self.suspend(id, reg, now);
             } else {
-                self.records.get_mut(&id).expect("record").view.state = BindingState::Revoked;
+                self.revoke(id, reg);
             }
         }
         self.results.retain(|r| r.expires > now);
+        let expired: Vec<_> = self
+            .grants
+            .values_mut()
+            .filter(|g| g.state == GrantState::Pending && g.expires_ms.0 <= now)
+            .map(|g| {
+                g.state = GrantState::Expired;
+                g.record_id
+            })
+            .collect();
+        for id in expired {
+            self.revoke(id, reg);
+        }
+        for c in self.connections.values_mut() {
+            if c.challenge
+                .as_ref()
+                .is_some_and(|(_, p)| p.challenge_expires_ms.0 <= now)
+            {
+                c.challenge = None;
+            }
+        }
     }
 
     pub(super) fn disconnect(&mut self, id: Id, reg: &mut HashMap<String, ServiceEntry>) {
@@ -226,7 +344,7 @@ impl Sessions {
                 pane_generation: v.pane_generation,
                 binding_generation: v.binding_generation,
                 capabilities: v.capabilities.clone(),
-                lease_remaining_ms: DecimalU64(r.deadline.saturating_sub(now)),
+                lease_remaining_ms: DecimalU64(self.remaining(r, now)),
             });
         }
         Some(p)
@@ -304,6 +422,45 @@ impl Sessions {
         now: u64,
     ) -> Reply {
         match command {
+            SessionCommand::GrantCreate(a) => self.grant_create(p, a, reg, now),
+            SessionCommand::GrantFetch(a) => {
+                let r = self
+                    .records
+                    .values()
+                    .find(|r| {
+                        r.key == a.public_key
+                            && r.view.owner_uid == p.unix_uid
+                            && self
+                                .parent(r)
+                                .is_some_and(|parent| parent.connection == Some(p.connection_id))
+                    })
+                    .ok_or_else(SessionError::forbidden)?;
+                if !self.parent_live(r, now) {
+                    return Err(SessionError::forbidden());
+                }
+                let g = self
+                    .grants
+                    .values()
+                    .find(|g| g.record_id == r.view.record_id)
+                    .ok_or_else(SessionError::forbidden)?;
+                Ok(serde_json::json!({"grant":g,"record":self.snapshot(r,now)}))
+            }
+            SessionCommand::Challenge(a) => self.challenge(p, a, now),
+            SessionCommand::Prove(a) => self.prove(p, a, reg, now),
+            SessionCommand::Revoke(a) => {
+                let r = self.owned(p.unix_uid, &a.target)?;
+                let owner = r.connection == Some(p.connection_id)
+                    || self.parent(r).is_some_and(|parent| {
+                        parent.connection == Some(p.connection_id)
+                            && self.remaining(parent, now) > 0
+                    });
+                if !owner && r.view.state != BindingState::Revoked {
+                    return Err(SessionError::forbidden());
+                }
+                let revoked = r.view.state != BindingState::Revoked;
+                self.revoke(a.target.record_id, reg);
+                Ok(serde_json::json!({"revoked":revoked}))
+            }
             SessionCommand::Hello => Ok(
                 serde_json::json!({"broker_epoch": p.broker_epoch, "connection_id": p.connection_id}),
             ),
@@ -378,6 +535,9 @@ impl Sessions {
                 Ok(serde_json::json!({"record": view}))
             }
             SessionCommand::Renew(a) => {
+                if !self.parent_live(self.owned(p.unix_uid, &a.target)?, now) {
+                    return Err(error(ErrorCode::Expired, ""));
+                }
                 let r = self
                     .records
                     .get_mut(&a.target.record_id)
@@ -413,5 +573,350 @@ impl Sessions {
             }
             _ => Err(error(ErrorCode::Unsupported, "")),
         }
+    }
+
+    fn grant_create(
+        &mut self,
+        p: &BrokerPrincipal,
+        a: &GrantCreateArgs,
+        reg: &mut HashMap<String, ServiceEntry>,
+        now: u64,
+    ) -> Reply {
+        let parent = self.owned(p.unix_uid, &a.parent)?;
+        if parent.view.role != Role::Term
+            || parent.connection != Some(p.connection_id)
+            || self.remaining(parent, now) == 0
+        {
+            return Err(SessionError::forbidden());
+        }
+        strict_key(a.public_key)?;
+        let parent_view = parent.view.clone();
+        let parent_hash = HexBytes(Sha256::digest(parent.key.0).into());
+        if self.records.values().any(|r| {
+            r.view.owner_uid == p.unix_uid
+                && r.key == a.public_key
+                && r.view.state != BindingState::Revoked
+        }) {
+            return Err(error(ErrorCode::Conflict, "key_in_use"));
+        }
+        if a.pane_generation.0
+            <= *self
+                .pane_high_water
+                .get(&(parent_view.instance_id, a.pane_id.0))
+                .unwrap_or(&0)
+        {
+            return Err(error(ErrorCode::StaleGeneration, ""));
+        }
+        let pending: Vec<_> = self
+            .grants
+            .values()
+            .filter(|g| g.state == GrantState::Pending)
+            .collect();
+        if pending.len() >= 1024
+            || pending
+                .iter()
+                .filter(|g| {
+                    self.records[&g.record_id].view.parent_instance == Some(parent_view.instance_id)
+                })
+                .count()
+                >= 32
+        {
+            return Err(error(ErrorCode::ResourceLimit, "grant_limit"));
+        }
+        let name = self.issue_name(p.unix_uid, true, reg)?;
+        let id = HexBytes(rand::random());
+        let mut capabilities = a.capabilities.clone();
+        capabilities.sort_by_key(|c| c.as_str());
+        let view = SessionRecord {
+            name,
+            record_assurance: RecordAssurance::Reserved,
+            owner_node: p.owner_node.clone(),
+            owner_uid: p.unix_uid,
+            broker_epoch: p.broker_epoch,
+            record_id: id,
+            instance_id: HexBytes(rand::random()),
+            incarnation: HexBytes(rand::random()),
+            role: Role::PaneShell,
+            parent_instance: Some(parent_view.instance_id),
+            parent_incarnation: Some(parent_view.incarnation),
+            pane_id: Some(a.pane_id),
+            pane_generation: Some(a.pane_generation),
+            binding_generation: DecimalU64(0),
+            state: BindingState::Pending,
+            capabilities,
+            policy: parent_view.policy,
+            lease_remaining_ms: None,
+        };
+        let grant = SessionGrant {
+            grant_id: HexBytes(rand::random()),
+            record_id: id,
+            incarnation: view.incarnation,
+            public_key: a.public_key,
+            parent_key_hash: parent_hash,
+            expires_ms: DecimalU64(now + 30_000),
+            state: GrantState::Pending,
+        };
+        self.pane_high_water
+            .insert((parent_view.instance_id, a.pane_id.0), a.pane_generation.0);
+        self.records.insert(
+            id,
+            Record {
+                view: view.clone(),
+                key: a.public_key,
+                connection: None,
+                deadline: grant.expires_ms.0,
+            },
+        );
+        self.grants.insert(grant.grant_id, grant.clone());
+        Ok(serde_json::json!({"grant":grant,"record":view}))
+    }
+
+    fn challenge(&mut self, p: &BrokerPrincipal, a: &ChallengeArgs, now: u64) -> Reply {
+        let cid = p.connection_id;
+        let wake_failed = if let ChallengeArgs::Key(key) = a {
+            let existing = self.connections[&cid].interest;
+            let full = self
+                .connections
+                .values()
+                .filter(|c| c.principal.unix_uid == p.unix_uid && c.interest.is_some())
+                .count()
+                >= 256;
+            if existing == Some(key.public_key) {
+                false
+            } else if existing.is_some() || full {
+                true
+            } else {
+                self.connections.get_mut(&cid).expect("connection").interest = Some(key.public_key);
+                false
+            }
+        } else {
+            false
+        };
+        let result = self.challenge_inner(p, a, now);
+        if !wake_failed {
+            return result;
+        }
+        // The unsigned extension is added by the response wrapper, including
+        // uniform forbidden errors. It never changes lookup or challenge state.
+        let wake = serde_json::json!({"error_code":"RESOURCE_LIMIT","message":"wake registration unavailable","details":{"reason":"interest_limit","retry_after_ms":"60000"}});
+        match result {
+            Ok(mut body) => {
+                body["wake_error"] = wake;
+                Ok(body)
+            }
+            Err(mut e) => {
+                e.details.insert("wake_error".into(), wake);
+                Err(e)
+            }
+        }
+    }
+
+    fn challenge_inner(&mut self, p: &BrokerPrincipal, a: &ChallengeArgs, now: u64) -> Reply {
+        let cid = p.connection_id;
+        if let Some((selector, proof)) = &self.connections[&cid].challenge {
+            if selector == a {
+                return Ok(serde_json::to_value(proof).expect("proof"));
+            }
+            let mut e = error(ErrorCode::Conflict, "challenge_outstanding");
+            e.details.insert(
+                "retry_after_ms".into(),
+                (proof.challenge_expires_ms.0 - now).to_string().into(),
+            );
+            return Err(e);
+        }
+        let (r, purpose, grant) = match a {
+            ChallengeArgs::Key(k) => {
+                let r = self
+                    .records
+                    .values()
+                    .find(|r| {
+                        r.view.owner_uid == p.unix_uid
+                            && r.key == k.public_key
+                            && r.view.state != BindingState::Revoked
+                    })
+                    .ok_or_else(SessionError::forbidden)?;
+                let purpose = if r.view.state == BindingState::Pending {
+                    Purpose::Enrol
+                } else {
+                    Purpose::Resume
+                };
+                let grant = (purpose == Purpose::Enrol)
+                    .then(|| {
+                        self.grants
+                            .values()
+                            .find(|g| g.record_id == r.view.record_id)
+                    })
+                    .flatten();
+                (r, purpose, grant)
+            }
+            ChallengeArgs::Record(a) => {
+                let r = self
+                    .records
+                    .get(&a.record_id)
+                    .filter(|r| {
+                        r.view.owner_uid == p.unix_uid
+                            && r.view.incarnation == a.incarnation
+                            && r.view.state != BindingState::Revoked
+                    })
+                    .ok_or_else(SessionError::forbidden)?;
+                let grant = if let Some(id) = a.grant_id {
+                    Some(
+                        self.grants
+                            .get(&id)
+                            .filter(|g| g.record_id == a.record_id)
+                            .ok_or_else(SessionError::forbidden)?,
+                    )
+                } else {
+                    None
+                };
+                (r, a.purpose, grant)
+            }
+        };
+        if purpose == Purpose::Enrol {
+            let g = grant.ok_or_else(SessionError::forbidden)?;
+            if g.state == GrantState::Consumed {
+                return Err(error(ErrorCode::Conflict, "grant_consumed"));
+            }
+            if g.state != GrantState::Pending || g.expires_ms.0 <= now {
+                return Err(error(ErrorCode::Expired, ""));
+            }
+        } else if r.view.state == BindingState::Pending {
+            return Err(error(ErrorCode::Conflict, "binding_pending"));
+        }
+        if self
+            .connections
+            .values()
+            .filter(|c| c.principal.unix_uid == p.unix_uid && c.challenge.is_some())
+            .count()
+            >= 128
+        {
+            return Err(error(ErrorCode::ResourceLimit, "challenge_limit"));
+        }
+        let v = &r.view;
+        let generation = if purpose == Purpose::Enrol {
+            1
+        } else {
+            v.binding_generation
+                .0
+                .checked_add(1)
+                .ok_or_else(|| error(ErrorCode::ResourceLimit, "generation_limit"))?
+        };
+        let proof = ProofTranscript {
+            purpose,
+            broker_epoch: p.broker_epoch,
+            connection_id: cid,
+            challenge_id: HexBytes(rand::random()),
+            nonce: HexBytes(rand::random()),
+            grant_id: grant.map(|g| g.grant_id),
+            record_id: v.record_id,
+            instance_id: v.instance_id,
+            incarnation: v.incarnation,
+            unix_uid: p.unix_uid,
+            parent_instance: v.parent_instance,
+            parent_incarnation: v.parent_incarnation,
+            parent_key_hash: self
+                .parent(r)
+                .map(|parent| HexBytes(Sha256::digest(parent.key.0).into())),
+            pane_id: v.pane_id,
+            pane_generation: v.pane_generation,
+            role: v.role,
+            public_key_hash: HexBytes(Sha256::digest(r.key.0).into()),
+            capabilities_hash: HexBytes(
+                Sha256::digest(encode_capabilities(&v.capabilities).expect("stored capabilities"))
+                    .into(),
+            ),
+            binding_generation: DecimalU64(generation),
+            grant_expires_ms: grant.map(|g| g.expires_ms),
+            challenge_expires_ms: DecimalU64((now + 5000).min(r.deadline)),
+        };
+        self.connections
+            .get_mut(&cid)
+            .expect("connection")
+            .challenge = Some((a.clone(), proof.clone()));
+        Ok(serde_json::to_value(proof).expect("proof"))
+    }
+
+    pub(super) fn consume_malformed(&mut self, cid: Id) {
+        if let Some(c) = self.connections.get_mut(&cid)
+            && let Some((_, p)) = c.challenge.take()
+        {
+            c.consumed.insert(p.challenge_id);
+        }
+    }
+
+    fn prove(
+        &mut self,
+        p: &BrokerPrincipal,
+        a: &ProveArgs,
+        reg: &mut HashMap<String, ServiceEntry>,
+        now: u64,
+    ) -> Reply {
+        let c = self
+            .connections
+            .get_mut(&p.connection_id)
+            .expect("connection");
+        let outstanding = c.challenge.take();
+        if let Some((_, proof)) = &outstanding {
+            c.consumed.insert(proof.challenge_id);
+        }
+        if c.consumed.contains(&a.challenge_id)
+            && outstanding
+                .as_ref()
+                .is_none_or(|(_, proof)| proof.challenge_id != a.challenge_id)
+        {
+            return Err(error(ErrorCode::Conflict, "challenge_consumed"));
+        }
+        let (_, proof) = outstanding
+            .filter(|(_, proof)| proof.challenge_id == a.challenge_id)
+            .ok_or_else(SessionError::forbidden)?;
+        if proof.challenge_expires_ms.0 <= now {
+            return Err(error(ErrorCode::Expired, ""));
+        }
+        let r = self
+            .records
+            .get(&proof.record_id)
+            .filter(|r| r.view.owner_uid == p.unix_uid && r.view.incarnation == proof.incarnation)
+            .ok_or_else(SessionError::forbidden)?;
+        if r.view.state == BindingState::Revoked || !self.parent_live(r, now) {
+            return Err(error(ErrorCode::Expired, ""));
+        }
+        if self
+            .attached(p.connection_id)
+            .is_some_and(|id| id != proof.record_id)
+        {
+            return Err(error(ErrorCode::Conflict, "already_bound"));
+        }
+        if r.view.binding_generation.0.checked_add(1) != Some(proof.binding_generation.0) {
+            return Err(error(ErrorCode::StaleGeneration, ""));
+        }
+        verify(
+            r.key,
+            a.signature,
+            &encode_proof(&proof).map_err(|_| SessionError::forbidden())?,
+        )?;
+        if let Some(id) = proof.grant_id {
+            let g = self
+                .grants
+                .get_mut(&id)
+                .ok_or_else(SessionError::forbidden)?;
+            if g.state != GrantState::Pending || g.expires_ms.0 <= now {
+                return Err(error(ErrorCode::Conflict, "grant_consumed"));
+            }
+            g.state = GrantState::Consumed;
+        }
+        let r = self.records.get_mut(&proof.record_id).expect("record");
+        if let Some(old) = r.connection
+            && old != p.connection_id
+            && let Some(c) = self.connections.get(&old)
+        {
+            c.close.notify_one();
+        }
+        r.connection = Some(p.connection_id);
+        r.view.state = BindingState::Attached;
+        r.view.record_assurance = RecordAssurance::SessionBound;
+        r.view.binding_generation = proof.binding_generation;
+        r.deadline = now + LEASE_MS;
+        self.install(proof.record_id, reg);
+        Ok(serde_json::json!({"record":self.snapshot(&self.records[&proof.record_id],now)}))
     }
 }

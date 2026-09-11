@@ -1,6 +1,26 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantState {
+    Pending,
+    Consumed,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGrant {
+    pub grant_id: HexBytes<16>,
+    pub record_id: HexBytes<16>,
+    pub incarnation: HexBytes<16>,
+    pub public_key: HexBytes<32>,
+    pub parent_key_hash: HexBytes<32>,
+    pub expires_ms: DecimalU64,
+    pub state: GrantState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecordAssurance {
     Reserved,

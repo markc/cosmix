@@ -1,5 +1,17 @@
 # Native session implementation staging
 
+## S2 grants and proof boundary
+
+`grant.create` and `grant.fetch` require the issuing attached parent. Grants
+reserve generation-qualified pane records, expire after 30 seconds, and consume
+only on successful strict Ed25519 proof. Both challenge selectors are supported;
+identical outstanding selectors retain their original five-second deadline.
+Key lookups register wake interest (256 per UID) independently of lookup success.
+At most 128 challenges per UID and one per connection are outstanding. Malformed
+identifiable proof attempts consume that connection's challenge, never a grant.
+Fresh proof supports enrolment and attached/suspended resumption. Parent terminal
+transitions recursively revoke children under the registry/lifecycle lock.
+
 ## S2 allocation boundary
 
 The broker implements `hello`, allocation with a connection-bound Ed25519

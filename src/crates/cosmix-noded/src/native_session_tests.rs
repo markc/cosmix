@@ -208,6 +208,121 @@ fn reserved_session_namespace_matches_shape_not_canonical_uid() {
     }
 }
 
+async fn allocate_term(
+    socket: &mut WebSocketStream<tokio::net::UnixStream>,
+) -> cosmix_bus::native_session::SessionRecord {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    let hello = session_call(socket, "hello", "hello", serde_json::json!({})).await;
+    let h: serde_json::Value = serde_json::from_str(&hello.body).unwrap();
+    let key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(key.verifying_key().to_bytes());
+    let signature = HexBytes(
+        key.sign(&encode_allocate(
+            serde_json::from_value(h["broker_epoch"].clone()).unwrap(),
+            serde_json::from_value(h["connection_id"].clone()).unwrap(),
+            public_key,
+            Policy::Restricted,
+        ))
+        .to_bytes(),
+    );
+    let reply = session_call(
+        socket,
+        "allocate",
+        "1",
+        serde_json::json!({"public_key":public_key,"signature":signature,"policy":"restricted"}),
+    )
+    .await;
+    assert_eq!(reply.get("rc"), Some("0"), "{}", reply.body);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    serde_json::from_value(body["record"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn p0i_03_child_proof_scope_and_challenge_consumption() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    let broker = Broker::start().await;
+    let mut parent = broker.unix().await;
+    let term = allocate_term(&mut parent).await;
+    let key = SigningKey::from_bytes(&rand::random());
+    let public_key = HexBytes(key.verifying_key().to_bytes());
+    let args = serde_json::json!({"parent":term.reference(),"pane_id":"7","pane_generation":"1","public_key":public_key,"role":"pane-shell","capabilities":["input"]});
+    let reply = session_call(&mut parent, "grant.create", "2", args).await;
+    assert_eq!(reply.get("rc"), Some("0"), "{}", reply.body);
+    let created: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    let child: SessionRecord = serde_json::from_value(created["record"].clone()).unwrap();
+    assert_eq!(child.binding_generation, DecimalU64(0));
+    let grant: SessionGrant = serde_json::from_value(created["grant"].clone()).unwrap();
+    let mut socket = broker.unix().await;
+    let selector = serde_json::json!({"record_id":child.record_id,"incarnation":child.incarnation,"purpose":"enrol","grant_id":grant.grant_id});
+    let reply = session_call(&mut socket, "challenge", "first", selector.clone()).await;
+    assert_eq!(reply.get("rc"), Some("0"), "{}", reply.body);
+    assert_eq!(
+        session_call(&mut socket, "challenge", "repeat", selector.clone())
+            .await
+            .body,
+        reply.body
+    );
+    let proof: ProofTranscript = serde_json::from_str(&reply.body).unwrap();
+    let mut wrong = proof.clone();
+    wrong.pane_id = Some(DecimalU64(8));
+    let signature = HexBytes(key.sign(&encode_proof(&wrong).unwrap()).to_bytes());
+    let attempt = serde_json::json!({"challenge_id":proof.challenge_id,"signature":signature});
+    assert_eq!(
+        session_call(&mut socket, "prove", "bad", attempt.clone())
+            .await
+            .get("rc"),
+        Some("10")
+    );
+    assert!(
+        session_call(&mut socket, "prove", "bad-again", attempt)
+            .await
+            .body
+            .contains("challenge_consumed")
+    );
+    let fetched = session_call(
+        &mut parent,
+        "grant.fetch",
+        "fetch",
+        serde_json::json!({"public_key":public_key}),
+    )
+    .await;
+    let fetched: serde_json::Value = serde_json::from_str(&fetched.body).unwrap();
+    assert_eq!(fetched["grant"]["state"], "pending");
+    for generation in [1, 2] {
+        let reply = session_call(
+            &mut socket,
+            "challenge",
+            "fresh",
+            serde_json::json!({"public_key":public_key,"purpose":"enrol"}),
+        )
+        .await;
+        let proof: ProofTranscript = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(proof.binding_generation, DecimalU64(generation));
+        if generation == 2 {
+            assert_eq!(proof.purpose, Purpose::Resume);
+            assert_eq!(proof.grant_id, None);
+        }
+        let signature = HexBytes(key.sign(&encode_proof(&proof).unwrap()).to_bytes());
+        let attempt = serde_json::json!({"challenge_id":proof.challenge_id,"signature":signature});
+        let mut impostor = broker.unix().await;
+        assert_eq!(
+            session_call(&mut impostor, "prove", "stolen", attempt.clone())
+                .await
+                .get("rc"),
+            Some("10")
+        );
+        let attached = session_call(&mut socket, "prove", "good", attempt).await;
+        assert_eq!(attached.get("rc"), Some("0"), "{}", attached.body);
+        let attached: serde_json::Value = serde_json::from_str(&attached.body).unwrap();
+        assert_eq!(
+            attached["record"]["binding_generation"],
+            generation.to_string()
+        );
+    }
+}
+
 async fn assert_preclaim_refused<S: AsyncRead + AsyncWrite + Unpin>(
     caller: &mut WebSocketStream<S>,
     recipient: &mut WebSocketStream<tokio::net::UnixStream>,

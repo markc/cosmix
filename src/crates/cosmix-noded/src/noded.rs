@@ -2134,6 +2134,16 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             && bus_msg.message_type() != Some("response")
         {
             let validation = cosmix_bus::native_session::parse_bootstrap(text.as_bytes());
+            if validation.is_err()
+                && bus_msg.command_name() == Some("noded.session.prove")
+                && let Some(p) = &state.principal
+            {
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .consume_malformed(p.connection_id);
+            }
             let Some(id) = bus_msg.get("id").filter(|id| {
                 !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
             }) else {
@@ -2158,10 +2168,15 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             };
             let (rc, body) = match result {
                 Ok(body) => (0, body),
-                Err(error) => (
-                    error.rc(),
-                    serde_json::to_value(error).expect("session error"),
-                ),
+                Err(mut error) => {
+                    let wake = error.details.remove("wake_error");
+                    let rc = error.rc();
+                    let mut body = serde_json::to_value(error).expect("session error");
+                    if let Some(wake) = wake {
+                        body["wake_error"] = wake;
+                    }
+                    (rc, body)
+                }
             };
             let reply = BusMessage::new()
                 .with_header("bus", "1")
