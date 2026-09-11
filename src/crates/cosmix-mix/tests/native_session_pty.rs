@@ -243,6 +243,14 @@ impl Child {
         Self::spawn_editor(broker, launch, "owned")
     }
     fn spawn_editor(broker: &Broker, launch: &LaunchFd, editor: &str) -> Self {
+        Self::spawn_with(broker, launch, editor, &[])
+    }
+    fn spawn_with(
+        broker: &Broker,
+        launch: &LaunchFd,
+        editor: &str,
+        extra: &[(String, String)],
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("node.conf.mix");
         std::fs::write(
@@ -297,6 +305,8 @@ impl Child {
         ];
         // Same libc PTY pattern as job_control_pty, with the real LaunchFd's
         // reserved mapping duplicated only in this child's pre_exec hook.
+        let mut env = env;
+        env.extend_from_slice(extra);
         let (mut master_fd, mut slave_fd) = (-1, -1);
         let size = libc::winsize {
             ws_row: 30,
@@ -1792,6 +1802,334 @@ fn stage_d_reports_its_own_capability_and_refuses_unauthorised_callers() {
         let pane = f.child.until("SWEEP_DONE\r\n");
         assert!(!pane.contains("STOLEN"), "{pane}");
         foreign.revoke_and_verify(&f.broker).await;
+        teardown(f).await;
+    });
+}
+
+async fn stage_d_fixture_with(editor: &str, extra: &[(String, String)]) -> Fixture {
+    let broker = Broker::start();
+    let mut parent = Parent::new(&broker).await;
+    let key = fresh_key().unwrap();
+    let grant = parent
+        .grant(HexBytes(key.verifying_key().to_bytes()), 1)
+        .await;
+    let launch = LaunchFd::new(&grant, &key).unwrap();
+    let mut child = Child::spawn_with(&broker, &launch, editor, extra);
+    drop(launch);
+    drop(key);
+    child.until("RC_MARKER=[]\r\n");
+    let bound = parent
+        .wait(grant.record.record_id, BindingState::Attached, 1)
+        .await;
+    phase(&mut parent, &bound, "prompt-ready").await;
+    Fixture {
+        broker,
+        parent,
+        child,
+        bound,
+    }
+}
+
+/// THE BLOCKER. A bounded wait gives up on the reply channel, not on the work:
+/// the envelope is still queued and will be processed. The failure this refuses
+/// is the one where the shell tells the caller nothing happened, executes
+/// anyway, and then runs the line a SECOND time on the caller's retry.
+#[test]
+fn stage_d_an_abandoned_admission_never_executes_and_its_retry_does_not_re_run() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        // Stall the editor past the admit budget, so the owner gives up while
+        // the envelope is still queued — the one interleaving timing alone
+        // cannot produce.
+        let mut f = stage_d_fixture_with(
+            "owned",
+            &[("MIX_ADMIT_DELAY_MS".into(), "2500".into())],
+        )
+        .await;
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let submission =
+            execute_request(&f.bound, 1, generation, "print(\"MUST_NOT_RUN\")");
+        let error = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            submission.clone(),
+        )
+        .await
+        .unwrap_err();
+        // Never BUSY: a caller told BUSY retries, and a retry of something that
+        // might have executed is how the line runs twice.
+        assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
+        assert!(!error.contains("BUSY"), "{error}");
+        let refusal: serde_json::Value = serde_json::from_str(&error).unwrap();
+        let operation = counter(&refusal["operation_id"]);
+
+        // The record stays RESOLVABLE. Deleting it was what made the retry a
+        // fresh submission instead of a replay.
+        let result = result_of(&mut f.parent, &f.bound, operation).await;
+        assert_eq!(result["result"]["outcome"], "not_started", "{result}");
+
+        // The byte-identical retry replays that outcome. It must not execute.
+        let retry = execute_call(&mut f.parent, &f.bound, "shell.execute", submission)
+            .await
+            .unwrap_err();
+        assert!(retry.contains("UNKNOWN_OUTCOME"), "{retry}");
+
+        // And the pane is the real proof: no announcement, no output, ever —
+        // including after the editor finally processes the stale envelope.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        f.child.send("print(\"SWEEP_DONE\")\n");
+        let pane = f.child.until("SWEEP_DONE\r\n");
+        assert!(
+            !pane.contains("MUST_NOT_RUN"),
+            "an abandoned admission executed: {pane}"
+        );
+        assert!(
+            !pane.contains("admitted for"),
+            "an abandoned admission still marked the pane: {pane}"
+        );
+        teardown(f).await;
+    });
+}
+
+/// §8's human-first rule has to hold through the reservation window too. The
+/// window is cooked mode with kernel echo and, before the fix, an unpolled tty:
+/// a keystroke landing there was echoed into the announcement line and then
+/// handed to the admitted execution as stdin.
+#[test]
+fn stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        // Long enough that the human types while the reservation stands.
+        let mut f = stage_d_fixture_with(
+            "owned",
+            &[("MIX_ADMIT_DELAY_MS".into(), "700".into())],
+        )
+        .await;
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let submitting = tokio::spawn({
+            let name = f.bound.name.clone();
+            let client = f.parent.connection.clone();
+            let body = execute_request(&f.bound, 1, generation, "print(\"STOLEN\")");
+            async move {
+                client
+                    .client()
+                    .call(&name, "shell.execute", body)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // Land the keystroke inside the reservation window.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        f.child.send("print(\"HUMAN");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), submitting)
+            .await
+            .expect("the submission must answer")
+            .unwrap();
+        let error = outcome.expect_err("a human keystroke must refuse the admission");
+        assert!(error.contains("BUSY"), "{error}");
+
+        // The human's bytes are intact and still editable: finishing the line
+        // runs exactly what they typed, and nothing else.
+        f.child.send("_WINS\")\n");
+        let pane = f.child.until("HUMAN_WINS\r\n");
+        assert!(!pane.contains("STOLEN"), "the agent's line ran: {pane}");
+        teardown(f).await;
+    });
+}
+
+/// The guarantee table's managed-children row, exercised rather than asserted.
+/// A `sleep` polls nothing, so a cooperative flag alone would never reach it —
+/// only the group signal does.
+#[test]
+fn stage_d_cancelling_a_managed_foreground_job_signals_its_process_group() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        let mut f = stage_d_fixture("owned").await;
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let accepted = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            execute_request(
+                &f.bound,
+                1,
+                generation,
+                "run_argv([\"sleep\", \"30\"])\nprint(\"SLEPT_THROUGH\")",
+            ),
+        )
+        .await
+        .expect("admitted");
+        let operation = counter(&accepted["operation_id"]);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let started = Instant::now();
+        let cancelled = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute.cancel",
+            operation_request(&f.bound, operation),
+        )
+        .await
+        .expect("a live operation resolves");
+        assert_eq!(cancelled["outcome"], "requested");
+        assert!(
+            cancelled["signalled_pgid"].is_string() || cancelled["signalled_pgid"].is_number(),
+            "the managed foreground job was not signalled: {cancelled}"
+        );
+        let result = result_of(&mut f.parent, &f.bound, operation).await;
+        // Promptly: a 30s sleep that was merely asked to stop would still be
+        // running, and the result would not have arrived at all.
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cancellation did not reach the job group"
+        );
+        assert_eq!(result["result"]["outcome"], "cancelled", "{result}");
+        assert_eq!(result["result"]["cancellation"]["delivered"], "cooperative");
+        let pane = f.child.until("$ ");
+        assert!(!pane.contains("SLEPT_THROUGH"), "{pane}");
+        teardown(f).await;
+    });
+}
+
+/// A captured runner reports interruption as an `Ok` result carrying a flag,
+/// not as an error, so a report derived from error prose called this
+/// `completed`. Whether a cancellation landed is a fact the machinery records.
+#[test]
+fn stage_d_a_cancelled_captured_runner_reports_cancelled_not_completed() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        let mut f = stage_d_fixture("owned").await;
+        for (id, source) in [
+            (1u64, "$r = run_argv([\"sleep\", \"20\"])\nprint(\"RAN_THROUGH\")"),
+            (2, "$r = run(\"sleep 20\")\nprint(\"RAN_THROUGH\")"),
+        ] {
+            let generation = prompt_generation(&mut f.parent, &f.bound).await;
+            let accepted = execute_call(
+                &mut f.parent,
+                &f.bound,
+                "shell.execute",
+                execute_request(&f.bound, id, generation, source),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("admitted: {e}"));
+            let operation = counter(&accepted["operation_id"]);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            execute_call(
+                &mut f.parent,
+                &f.bound,
+                "shell.execute.cancel",
+                operation_request(&f.bound, operation),
+            )
+            .await
+            .expect("cancel resolves");
+            let result = result_of(&mut f.parent, &f.bound, operation).await;
+            assert_eq!(
+                result["result"]["cancellation"]["delivered"], "cooperative",
+                "{source}: {result}"
+            );
+            assert_eq!(result["result"]["outcome"], "cancelled", "{source}: {result}");
+        }
+        teardown(f).await;
+    });
+}
+
+/// Drafts that are not plain text are drafts too. Each of these refuses with
+/// the EXACT code — pinned, not an or-of-two — and leaves the human's state
+/// byte-intact.
+#[test]
+fn stage_d_paste_and_search_drafts_are_preserved_with_exact_refusals() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        let mut f = stage_d_fixture("owned").await;
+
+        // A bracketed paste in progress.
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        f.child.send("\x1b[200~print(\"PASTED");
+        f.child.until("PASTED");
+        let error = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            execute_request(&f.bound, 1, generation, "print(\"STOLEN\")"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, r#"{"error_code":"BUSY"}"#, "paste: {error}");
+        f.child.send("_OK\")\x1b[201~\n");
+        let pane = f.child.until("PASTED_OK\r\n");
+        assert!(!pane.contains("STOLEN"), "{pane}");
+
+        // A reverse history search in progress.
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        f.child.send("\x12PASTED");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let error = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            execute_request(&f.bound, 2, generation, "print(\"STOLEN\")"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, r#"{"error_code":"BUSY"}"#, "search: {error}");
+        // Leaving the search restores the recalled line, which still runs.
+        f.child.send("\x07\n");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        f.child.send("print(\"SEARCH_DONE\")\n");
+        let pane = f.child.until("SEARCH_DONE\r\n");
+        assert!(!pane.contains("STOLEN"), "{pane}");
+
+        // And the empty/whitespace submission, which would otherwise be
+        // announced on the pane and burn a generation to run nothing.
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        for blank in ["", "   ", "\n\t "] {
+            let error = execute_call(
+                &mut f.parent,
+                &f.bound,
+                "shell.execute",
+                execute_request(&f.bound, 3, generation, blank),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, r#"{"error_code":"INVALID_REQUEST"}"#, "{blank:?}");
+        }
+        assert_eq!(
+            prompt_generation(&mut f.parent, &f.bound).await,
+            generation,
+            "a refused submission must not consume a prompt generation"
+        );
+        teardown(f).await;
+    });
+}
+
+/// An admission owner that dies mid-sequence must not leave a human without a
+/// prompt. The editor's own reservation deadline is the backstop, and this is
+/// the only thing that exercises it.
+#[test]
+fn stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        let mut f = stage_d_fixture_with(
+            "owned",
+            &[("MIX_ADMIT_DELAY_MS".into(), "2500".into())],
+        )
+        .await;
+        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        let _ = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.execute",
+            execute_request(&f.bound, 1, generation, "print(\"NEVER\")"),
+        )
+        .await
+        .unwrap_err();
+        // The prompt comes back on its own, with no keystroke to prod it, and
+        // the shell is fully usable afterwards.
+        let recovered = phase(&mut f.parent, &f.bound, "prompt-ready").await;
+        assert_eq!(recovered["status"]["snapshot"]["continuation"], false);
+        f.child.send("print(\"HUMAN_AGAIN\")\n");
+        let pane = f.child.until("HUMAN_AGAIN\r\n");
+        assert!(!pane.contains("NEVER"), "{pane}");
         teardown(f).await;
     });
 }

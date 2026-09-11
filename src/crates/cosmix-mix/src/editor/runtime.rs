@@ -600,6 +600,12 @@ impl OwnedEditor {
         };
         let (line_tx, lines) = mpsc::sync_channel(1);
         let worker_control = control.clone();
+        // Captured here, before the worker starts, so no later environment
+        // mutation by evaluated Mix can reach it.
+        let admit_delay = std::env::var("MIX_ADMIT_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
         let worker = std::thread::Builder::new()
             .name("mix-editor".into())
             .spawn(move || {
@@ -631,6 +637,7 @@ impl OwnedEditor {
                     line_tx: line_tx.clone(),
                     control: worker_control,
                     reserved_until: None,
+                    admit_delay,
                 };
                 // Receiver remains alive until cleanup is complete. HUP waits
                 // on the latch even on channel failure, rather than inferring
@@ -732,6 +739,10 @@ struct Owner {
     control: Control,
     /// Set when a SuspendRequested was granted for an execution admission.
     reserved_until: Option<std::time::Instant>,
+    /// Test-only stall before an admission claims its token, so a fixture can
+    /// produce the owner-gives-up-while-queued interleaving deterministically.
+    /// Captured at editor start; zero in every ordinary run.
+    admit_delay: std::time::Duration,
 }
 fn protocol(error: super::ProtocolError) -> io::Error {
     io::Error::other(format!("editor protocol: {error:?}"))
@@ -1051,6 +1062,14 @@ impl Owner {
                 // announces cannot be separated by a concurrent change.
                 if !self.editor.admissible(generation, revision) {
                     return Err(protocol(super::ProtocolError::InvalidState));
+                }
+                // Test hook for the one interleaving that cannot be produced by
+                // timing alone: an envelope whose owner gives up while it is
+                // still queued. Read ONCE at editor start, so nothing later in
+                // the process can turn it on, and zero by default — the cost in
+                // production is one comparison against a field.
+                if !self.admit_delay.is_zero() {
+                    std::thread::sleep(self.admit_delay);
                 }
                 // The LAST thing checked before the echo. An envelope whose
                 // owner has stopped waiting leaves no mark on the pane and
