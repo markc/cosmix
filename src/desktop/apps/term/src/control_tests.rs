@@ -660,10 +660,10 @@ fn p0i_09_real_payload_tap_observe_and_logs() {
     let fixture = Fixture::new(Policy::DefaultOpen);
     runtime().block_on(async {
         let audit = NodedClient::connect("term-policy-audit", &fixture.broker.url).await.unwrap();
-        let mut observed = audit.incoming().unwrap();
+        let mut observed = audit.incoming_async().await.unwrap();
         audit.call("noded", "noded.observe.start", json!({"filter":{"verbs":["term.*"]},"body":"redacted"})).await.unwrap();
         let tap = NodedClient::connect_anonymous(&fixture.broker.url).await.unwrap();
-        let mut tapped = tap.incoming().unwrap();
+        let mut tapped = tap.incoming_async().await.unwrap();
         tap.call("noded", "noded.tap", json!({})).await.unwrap();
         let owner = verified(&fixture.broker).await;
         let (parent, child) = fixture.records(&owner, 1).await;
