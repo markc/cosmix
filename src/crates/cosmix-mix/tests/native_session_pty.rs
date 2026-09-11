@@ -950,7 +950,7 @@ fn status_restricted_identity_rejection_and_unsupported_verbs() {
             .await;
         phase(&mut parent, &bound, "prompt-ready").await;
         let ambient = connect(&broker).await;
-        let mut foreign = Parent::new(&broker).await;
+        let foreign = Parent::new(&broker).await;
         for connection in [&ambient, &foreign.connection] {
             let result = tokio::time::timeout(
                 Duration::from_millis(400),
