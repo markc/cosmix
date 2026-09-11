@@ -280,6 +280,7 @@ derived from authenticated state, never caller assertions.
 | `renew` | `{target:ref}` | `{record}`; renew this connection's current attachment |
 | `revoke` | `{target:ref}` | `{revoked:true}` or `{revoked:false}`; revoke own record or an owned child and its pending grant |
 | `list` | `{}` | `{broker_epoch,records}`; bounded owner-UID snapshot including pending and suspended records |
+| `self` | `{record_id}` | `{record}`; one owner-UID record, including terminal state; absent and foreign-UID IDs both return `FORBIDDEN` |
 | `lease.check` | `{target:ref}` | `{lease_remaining_ms}`; authorised recipient obtains a fresh remaining-lease delta and lifecycle interest |
 
 `allocate` requires an unbound kernel-verified local owner connection; its key
@@ -372,7 +373,7 @@ After connection/epoch loss, clients MUST reconcile with `grant.fetch` or
 key-selected challenge and MUST NOT automatically resubmit an uncertain
 allocation as a fresh mutation. No cross-restart dedupe is claimed.
 
-`hello`, `renew`, `list`, `grant.fetch` and `lease.check` are exempt from
+`hello`, `renew`, `list`, `self`, `grant.fetch` and `lease.check` are exempt from
 result retention. Every successful renew, including a repeated ID, MUST refresh
 the current live lease deadline; it MUST NOT revive a suspended/terminal record.
 Challenges/proofs use their one-use state instead: any repeated consumed proof

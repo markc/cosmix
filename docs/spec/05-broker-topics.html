@@ -671,6 +671,7 @@ derived from authenticated state, never caller assertions.</p>
 <tr><td><code>renew</code></td><td><code>{target:ref}</code></td><td><code>{record}</code>; renew this connection's current attachment</td></tr>
 <tr><td><code>revoke</code></td><td><code>{target:ref}</code></td><td><code>{revoked:true}</code> or <code>{revoked:false}</code>; revoke own record or an owned child and its pending grant</td></tr>
 <tr><td><code>list</code></td><td><code>{}</code></td><td><code>{broker_epoch,records}</code>; bounded owner-UID snapshot including pending and suspended records</td></tr>
+<tr><td><code>self</code></td><td><code>{record_id}</code></td><td><code>{record}</code>; one owner-UID record, including terminal state; absent and foreign-UID IDs both return <code>FORBIDDEN</code></td></tr>
 <tr><td><code>lease.check</code></td><td><code>{target:ref}</code></td><td><code>{lease_remaining_ms}</code>; authorised recipient obtains a fresh remaining-lease delta and lifecycle interest</td></tr>
 </tbody></table>
 <p><code>allocate</code> requires an unbound kernel-verified local owner connection; its key
@@ -756,7 +757,7 @@ IDs below that mark are refused too. Exhausted u64 space requires reconnect.
 After connection/epoch loss, clients MUST reconcile with <code>grant.fetch</code> or
 key-selected challenge and MUST NOT automatically resubmit an uncertain
 allocation as a fresh mutation. No cross-restart dedupe is claimed.</p>
-<p><code>hello</code>, <code>renew</code>, <code>list</code>, <code>grant.fetch</code> and <code>lease.check</code> are exempt from
+<p><code>hello</code>, <code>renew</code>, <code>list</code>, <code>self</code>, <code>grant.fetch</code> and <code>lease.check</code> are exempt from
 result retention. Every successful renew, including a repeated ID, MUST refresh
 the current live lease deadline; it MUST NOT revive a suspended/terminal record.
 Challenges/proofs use their one-use state instead: any repeated consumed proof

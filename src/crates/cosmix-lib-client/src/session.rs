@@ -273,6 +273,10 @@ impl VerifiedConnection {
     pub async fn session_list(&self) -> SessionResult<ListResult> {
         self.session_rpc("list", serde_json::json!({})).await
     }
+    /// Owner-UID scoped single-record read, independent of diagnostic list caps.
+    pub async fn session_self(&self, record_id: HexBytes<16>) -> SessionResult<RecordResult> {
+        self.session_rpc("self", SelfArgs { record_id }).await
+    }
     /// Captures request-start CLOCK_BOOTTIME internally. Gaps invalidate results.
     pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
         // This handle owns one transport and does not reconnect transparently.

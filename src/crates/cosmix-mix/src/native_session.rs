@@ -344,23 +344,23 @@ impl Bootstrap {
             reporter.wake();
         }
         let wake_failed = challenge.wake_error.is_some();
-        let list = rpc("discovery: session list failed", connection.session_list())
-            .await
-            .map_err(|mut error| {
-                error.wake |= wake_failed;
-                error
-            })?;
-        if list.broker_epoch != hello.broker_epoch {
+        let result = rpc(
+            "discovery: record lookup failed",
+            connection.session_self(challenge.transcript.record_id),
+        )
+        .await
+        .map_err(|mut error| {
+            error.wake |= wake_failed;
+            error
+        })?;
+        // The challenge supplies only a selector. Expected immutable scope is
+        // retained from launch and checked against this authenticated UID read.
+        let record = &result.record;
+        if record.record_id != challenge.transcript.record_id
+            || record.incarnation != challenge.transcript.incarnation
+        {
             return Err(Failure::scope());
         }
-        let record = list
-            .records
-            .iter()
-            .find(|record| {
-                record.record_id == challenge.transcript.record_id
-                    && record.incarnation == challenge.transcript.incarnation
-            })
-            .ok_or_else(Failure::scope)?;
         let expected = self.expected(hello, record)?;
         self.check_challenge(&challenge, hello, record)?;
         let key = SigningKey::from_bytes(&self.seed);
