@@ -1788,11 +1788,11 @@ fn execute_managed(
             );
             // Preserve the existing `mix` self-resolution contract.
             let program = if seg.program == "mix" {
-                "/proc/self/exe".to_owned()
+                controller.executable().to_string_lossy().into_owned()
             } else {
                 seg.program.clone()
             };
-            let mut stage = Stage::new(&program, &args, pgid)?;
+            let mut stage = Stage::new(controller.executable(), &program, &args, pgid)?;
             for (k, v) in &seg.env_vars {
                 stage.command.env(k, v);
             }

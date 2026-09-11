@@ -59,16 +59,26 @@ arbitrary cooked-mode change was deliberate; this is the explicit policy.
 
 The launch barrier runs in a private Mix trampoline **after** its first exec.
 It executes `/proc/self/exe`, so open shells keep launching commands after
-an installation replaces or unlinks their original executable.
+an installation replaces or unlinks their original executable. The fleet is
+Linux; if `/proc/self/exe` is absent, or on another platform, launches fall
+back to the executable path resolved at interactive admission. That fallback
+restores only pre-replacement behaviour, not the unlink guarantee.
 This lets Rust's spawn acknowledgement complete before the barrier waits.
 Only after all children share their job group and the foreground terminal
 has transferred does Mix release target execution. A second close-on-exec
 pipe reports target-exec failures and one-byte trampoline failure reasons.
-Acknowledgement waits observe member stops and have a five-second deadline.
+Acknowledgement waits observe member stops and have a 30-second deadline,
+used only as a pathological-wedge backstop so cold or network-paged binaries
+have time to launch. A target that stops itself before acknowledgement is
+aborted deliberately: preserving that pre-ack job would risk wedging the
+shell. This trades that narrow self-stop case for a recoverable prompt.
 Failed launches reclaim the terminal first, send TERM/CONT, allow 500 ms,
 then send KILL/CONT and allow another 500 ms. Survivors are reported and
 remain registered for eventual reaping; an uninterruptible child cannot
 hold the prompt indefinitely.
+The survivor diagnostic in `abort_launch` is deliberately printed under the
+jobs-state lock; this is accepted because the terminal has already been
+reclaimed before abort cleanup.
 
 The process monitor is the sole consumer of registered child statuses,
 including stopped/continued states. SIGCHLD wakes it independently of REPL
@@ -77,3 +87,5 @@ input or evaluator progress. It never waits for arbitrary child PIDs.
 exited unmanaged child (including a legacy `spawn` child), but only probes
 controller-owned job PIDs with signal 0. A managed zombie can briefly report
 alive until the controller reaps it; the builtin never steals its status.
+Signal 0 returning `EPERM` counts as alive, including for another user's
+process. This reports existence, not permission to signal that process.

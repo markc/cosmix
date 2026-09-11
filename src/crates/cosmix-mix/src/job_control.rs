@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -211,6 +212,7 @@ pub struct Controller {
     signals: signal_hook::iterator::Handle,
     worker: Mutex<Option<JoinHandle<()>>>,
     old_signals: Vec<(i32, libc::sigaction)>,
+    fallback_executable: PathBuf,
 }
 
 fn modes(fd: i32) -> io::Result<libc::termios> {
@@ -271,6 +273,7 @@ impl Controller {
             return Ok(None);
         }
         let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+        let fallback_executable = std::env::current_exe()?;
         let fd = tty.as_raw_fd();
         let parent_pgid = unsafe { libc::getpgrp() };
         // Save SIGTTIN before admission changes it, including on decline.
@@ -373,6 +376,7 @@ impl Controller {
             signals,
             worker: Mutex::new(Some(worker)),
             old_signals,
+            fallback_executable,
         })))
     }
 
@@ -387,6 +391,17 @@ impl Controller {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub fn executable(&self) -> &Path {
+        // The fleet is Linux: proc keeps the running inode executable after
+        // unlink. Without proc (or on other platforms), the path resolved at
+        // admission restores only the old, pre-replacement behaviour.
+        #[cfg(target_os = "linux")]
+        if Path::new("/proc/self/exe").exists() {
+            return Path::new("/proc/self/exe");
+        }
+        &self.fallback_executable
     }
 
     pub fn register(
@@ -624,6 +639,8 @@ impl Controller {
                 .filter(|m| !m.state.terminal())
                 .map(|m| m.pid)
                 .collect();
+            // Accepted diagnostic under the state lock: the launch caller
+            // already reclaimed the terminal before entering abort cleanup.
             eprintln!("mix: failed job {id} survived TERM/KILL grace: {survivors:?}");
         }
     }
@@ -792,14 +809,12 @@ pub struct Stage {
     inherited: (File, File),
 }
 impl Stage {
-    pub fn new(program: &str, args: &[String], pgid: i32) -> io::Result<Self> {
+    pub fn new(executable: &Path, program: &str, args: &[String], pgid: i32) -> io::Result<Self> {
         let (gate_read, gate) = pipe()?;
         let (error, error_write) = pipe()?;
         let g = gate_read.as_raw_fd();
         let e = error_write.as_raw_fd();
-        // The proc link remains executable after an installer unlinks us;
-        // current_exe() would return an unusable path ending in " (deleted)".
-        let mut command = Command::new("/proc/self/exe");
+        let mut command = Command::new(executable);
         command
             .args([STAGE_ARG, &g.to_string(), &e.to_string(), program])
             .args(args);
@@ -847,7 +862,8 @@ impl Stage {
         self.gate.write_all(&[1])?;
         drop(self.gate);
         let mut errno = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Only a pathological-wedge backstop; allow cold/network-paged exec.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if stopped() {
                 return Err(io::Error::other("job stopped before exec acknowledgement"));
