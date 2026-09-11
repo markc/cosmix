@@ -555,7 +555,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         crate::authority::Posture::Unverified { .. } => (false, 0),
     };
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    let unix_listener = match unix_socket.as_deref() {
+    let mut unix_listener = match unix_socket.as_deref() {
         Some(path) => match crate::native_ingress::bind(path).await {
             Ok(listener) => Some(listener),
             Err(error) => {
@@ -564,6 +564,20 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
             }
         },
         None => None,
+    };
+    // The expiry timer is part of native profile readiness, not background
+    // best-effort work. Drop the socket/guard before advertising on failure.
+    let session_timer = if unix_listener.is_some() {
+        match session::deadline_timer() {
+            Ok(timer) => Some(timer),
+            Err(error) => {
+                tracing::error!(%error, "native-session expiry timer unavailable; continuing with TCP only");
+                unix_listener = None;
+                None
+            }
+        }
+    } else {
+        None
     };
     let listener_port = listener.local_addr()?.port();
     // SPEC 13 §9a B1 self-check — is the listener bound to our own WG IP?
@@ -859,8 +873,9 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         live_sessions: Arc::new(RwLock::new(HashMap::new())),
     };
     broker.set_native_sessions(state.sessions.clone());
-    let _session_maintenance =
-        session::spawn_maintenance(state.registry.clone(), state.sessions.clone());
+    let _session_maintenance = session_timer.map(|timer| {
+        session::spawn_maintenance(state.registry.clone(), state.sessions.clone(), timer)
+    });
     #[cfg(test)]
     if let Some(probe) = session_probe {
         let _ = probe.send(state.sessions.clone());

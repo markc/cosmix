@@ -54,6 +54,11 @@ reads session deadlines. Writers drain notices only after a notice wake, with
 gap-before-notice priority, so ordinary outbound messages take no session lock.
 Clock/timer failure returns `UNAVAILABLE`, revokes native authority and closes
 native connections; it cannot panic or silently mint a fresh lease.
+The timer is created synchronously before native advertisement and readiness;
+creation failure drops the Unix listener and advertises TCP only, just like bind
+failure. A clock failure after activation stays latched until broker restart.
+Explicit-time maintenance remains available for synthetic-clock regression tests;
+live callers obtain BOOTTIME through `maintain_now` or the scheduler.
 `noded.pending_grants_per_parent` configures the per-Term pending-grant cap
 (integer, default 32, range 0–32). Zero disables new grants. Values above 32
 refuse startup before listener activation; the global 1,024-grant and per-UID

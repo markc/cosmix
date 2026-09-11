@@ -48,7 +48,7 @@ impl Drop for MaintenanceTask {
     }
 }
 
-fn deadline_timer() -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+pub(super) fn deadline_timer() -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
     use std::os::fd::FromRawFd;
     // SAFETY: timerfd_create returns a new owned descriptor on success.
     let fd = unsafe {
@@ -120,17 +120,9 @@ async fn sleep_until(
 pub(super) fn spawn_maintenance(
     registry: Arc<RwLock<HashMap<String, ServiceEntry>>>,
     sessions: Arc<tokio::sync::Mutex<Sessions>>,
+    timer: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
 ) -> MaintenanceTask {
     MaintenanceTask(tokio::spawn(async move {
-        let timer = match deadline_timer() {
-            Ok(timer) => timer,
-            Err(_) => {
-                let mut reg = registry.write().await;
-                sessions.lock().await.fail_clock(&mut reg);
-                tracing::error!("Native session expiry timer unavailable");
-                return;
-            }
-        };
         let wake = sessions.lock().await.deadline_wake.clone();
         loop {
             let (failed, deadline) = {
@@ -648,6 +640,7 @@ impl Sessions {
     }
 
     fn fail_clock(&mut self, reg: &mut HashMap<String, ServiceEntry>) {
+        // Deliberately sticky until broker restart: clock recovery cannot revive authority.
         self.clock_failed = true;
         for id in self.records.keys().copied().collect::<Vec<_>>() {
             self.revoke(id, reg);
@@ -674,6 +667,7 @@ impl Sessions {
     }
 
     /// One absolute BOOTTIME deadline for pure-expiry work; no periodic sweep.
+    /// O(n) over bounded epoch state, cheaper than per-connection periodic sweeps.
     fn next_deadline(&self) -> Option<u64> {
         self.records
             .values()
@@ -705,6 +699,7 @@ impl Sessions {
     }
 
     pub(super) fn maintain(&mut self, reg: &mut HashMap<String, ServiceEntry>, now: u64) {
+        // Explicit time supports synthetic-clock regressions; live callers use maintain_now or the scheduler.
         self.last_maintained = Some(now);
         let mut expired: Vec<_> = self
             .records
@@ -1539,7 +1534,11 @@ pub(super) mod queue_tests {
         let close = s.connections[&p.connection_id].close.clone();
         let sessions = Arc::new(tokio::sync::Mutex::new(s));
         let registry = Arc::new(RwLock::new(reg));
-        let _scheduler = spawn_maintenance(registry.clone(), sessions.clone());
+        let _scheduler = spawn_maintenance(
+            registry.clone(),
+            sessions.clone(),
+            deadline_timer().unwrap(),
+        );
         // Re-arm while the scheduler may already be sleeping on the old lease.
         let deadline = now_ms().unwrap() + 30;
         {
