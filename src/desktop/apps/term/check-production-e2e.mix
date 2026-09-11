@@ -6,7 +6,9 @@
 -- and require the literal "1 passed" — a renamed test filtering to zero
 -- matches must fail this gate, not pass it.
 -- Run from the repository src/ directory (build worker or dev checkout).
-$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 900})
+-- RUSTC_WRAPPER disabled: the workers' sccache remote intermittently times
+-- out and a caching layer must never be able to fail this gate.
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 900, env: {"RUSTC_WRAPPER": ""}})
 if $build["exit_code"] != 0 then
   print($build["stderr"])
   print("GATE BLOCKED: mix release build failed")
@@ -21,7 +23,7 @@ $test = run_argv(["cargo", "test", "--manifest-path", "desktop/Cargo.toml",
   "-p", "cosmix-term",
   "p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes",
   "--", "--ignored", "--test-threads=1"],
-  {timeout: 900, env: {"COSMIX_E2E_MIX_BIN": $bin}})
+  {timeout: 900, env: {"COSMIX_E2E_MIX_BIN": $bin, "RUSTC_WRAPPER": ""}})
 print($test["stdout"])
 if $test["exit_code"] != 0 then
   print($test["stderr"])
