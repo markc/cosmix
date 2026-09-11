@@ -15,6 +15,98 @@ type Reply = Result<serde_json::Value, SessionError>;
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    fn allocated() -> (Sessions, HashMap<String, ServiceEntry>, BrokerPrincipal, Id) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut s = Sessions::default();
+        let mut reg = HashMap::new();
+        let p = BrokerPrincipal {
+            version: PrincipalVersion::V1,
+            assurance: Assurance::LocalUnix,
+            owner_node: "alpha".into(),
+            unix_uid: 123,
+            unix_gid: 123,
+            peer_pid: 1,
+            broker_epoch: HexBytes([1; 16]),
+            connection_id: HexBytes([2; 16]),
+            session: None,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        s.connect(
+            &p,
+            &tx,
+            Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
+        let key = SigningKey::from_bytes(&rand::random());
+        let public_key = HexBytes(key.verifying_key().to_bytes());
+        let signature = HexBytes(
+            key.sign(&encode_allocate(
+                p.broker_epoch,
+                p.connection_id,
+                public_key,
+                Policy::Restricted,
+            ))
+            .to_bytes(),
+        );
+        let command = SessionCommand::Allocate(AllocateArgs {
+            public_key,
+            signature,
+            policy: Policy::Restricted,
+        });
+        s.dispatch(&p, &command, &mut reg, 1000).unwrap();
+        let id = s.attached(p.connection_id).unwrap();
+        (s, reg, p, id)
+    }
+
+    #[test]
+    fn lease_boundary_and_delayed_sweep_do_not_extend_resumption() {
+        let (mut s, mut reg, p, id) = allocated();
+        let reference = s.records[&id].view.reference();
+        s.maintain(&mut reg, 15_999);
+        assert_eq!(s.records[&id].view.state, BindingState::Attached);
+        s.maintain(&mut reg, 16_000);
+        assert_eq!(s.records[&id].view.state, BindingState::Suspended);
+        assert_eq!(s.records[&id].deadline, 46_000);
+        assert!(
+            s.dispatch(
+                &p,
+                &SessionCommand::Renew(TargetArgs { target: reference }),
+                &mut reg,
+                16_000
+            )
+            .is_err()
+        );
+        s.suspend(id, &mut reg, 20_000);
+        assert_eq!(s.records[&id].deadline, 46_000);
+        s.maintain(&mut reg, 46_000);
+        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
+        let (mut s, mut reg, _, id) = allocated();
+        s.maintain(&mut reg, 50_000);
+        assert_eq!(s.records[&id].view.state, BindingState::Revoked);
+    }
+
+    #[test]
+    fn retained_expiry_keeps_unknown_outcome_high_water() {
+        let (mut s, mut reg, p, id) = allocated();
+        let args = TargetArgs {
+            target: s.records[&id].view.reference(),
+        };
+        let message = BusMessage::new().with_header("id", "7");
+        let request = BootstrapRequest {
+            message,
+            command: SessionCommand::Revoke(args),
+        };
+        let first = s.execute(&p, &request, &mut reg);
+        assert!(first.is_ok());
+        assert_eq!(s.execute(&p, &request, &mut reg), first);
+        for result in &mut s.results {
+            result.expires = 0;
+        }
+        assert_eq!(
+            s.execute(&p, &request, &mut reg).unwrap_err().details["reason"],
+            "unknown_outcome"
+        );
+    }
     #[test]
     fn notice_overflow_coalesces_and_global_shedding_marks_victim() {
         let mut s = Sessions::default();
@@ -467,7 +559,7 @@ impl Sessions {
     }
 
     pub(super) fn maintain(&mut self, reg: &mut HashMap<String, ServiceEntry>, now: u64) {
-        let expired: Vec<_> = self
+        let mut expired: Vec<_> = self
             .records
             .iter()
             .filter(|(_, r)| {
@@ -477,11 +569,15 @@ impl Sessions {
                         BindingState::Attached | BindingState::Suspended
                     )
             })
-            .map(|(id, r)| (*id, r.view.state))
+            .map(|(id, r)| (*id, r.view.state, r.deadline))
             .collect();
-        for (id, state) in expired {
+        expired.sort_by_key(|(_, _, deadline)| *deadline);
+        for (id, state, deadline) in expired {
             if state == BindingState::Attached {
-                self.suspend(id, reg, now);
+                self.suspend(id, reg, deadline);
+                if self.records[&id].deadline <= now {
+                    self.revoke(id, reg);
+                }
             } else {
                 self.revoke(id, reg);
             }
@@ -513,6 +609,7 @@ impl Sessions {
     }
 
     pub(super) fn disconnect(&mut self, id: Id, reg: &mut HashMap<String, ServiceEntry>) {
+        self.maintain(reg, now_ms());
         if let Some(record) = self.attached(id) {
             self.suspend(record, reg, now_ms());
         }

@@ -290,6 +290,34 @@ async fn p0i_03_child_proof_scope_and_challenge_consumption() {
     .await;
     let fetched: serde_json::Value = serde_json::from_str(&fetched.body).unwrap();
     assert_eq!(fetched["grant"]["state"], "pending");
+    for scope_error in ["role", "parent", "uid"] {
+        let reply = session_call(&mut socket, "challenge", "wrong-scope", selector.clone()).await;
+        let mut proof: ProofTranscript = serde_json::from_str(&reply.body).unwrap();
+        match scope_error {
+            "role" => {
+                proof.role = Role::Term;
+                proof.parent_instance = None;
+                proof.parent_incarnation = None;
+                proof.parent_key_hash = None;
+                proof.pane_id = None;
+                proof.pane_generation = None;
+            }
+            "parent" => proof.parent_instance = Some(HexBytes([0; 16])),
+            _ => proof.unix_uid = proof.unix_uid.wrapping_add(1),
+        }
+        let signature = HexBytes(key.sign(&encode_proof(&proof).unwrap()).to_bytes());
+        assert_eq!(
+            session_call(
+                &mut socket,
+                "prove",
+                "wrong-scope-proof",
+                serde_json::json!({"challenge_id":proof.challenge_id,"signature":signature})
+            )
+            .await
+            .get("rc"),
+            Some("10")
+        );
+    }
     for generation in [1, 2] {
         let reply = session_call(
             &mut socket,
@@ -353,6 +381,84 @@ async fn bound_delivery_registers_lease_dependency_and_disconnect_notifies() {
     assert_eq!(notice.command_name(), Some("noded.session.lifecycle"));
     let notice: serde_json::Value = serde_json::from_str(&notice.body).unwrap();
     assert_eq!(notice["state"], "suspended");
+}
+
+#[tokio::test]
+async fn parent_revocation_is_ordered_against_inflight_child_prove() {
+    use cosmix_bus::native_session::*;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+    let broker = Broker::start().await;
+    let observer = verified(&broker).await;
+    for _ in 0..4 {
+        let parent = verified(&broker).await;
+        let parent_key = SigningKey::from_bytes(&rand::random());
+        let record = parent
+            .session_allocate(&parent_key, Policy::Restricted)
+            .await
+            .unwrap()
+            .record;
+        let key = SigningKey::from_bytes(&rand::random());
+        let public_key = HexBytes(key.verifying_key().to_bytes());
+        let grant = parent
+            .session_grant_create(&GrantCreateArgs {
+                parent: record.reference(),
+                pane_id: DecimalU64(1),
+                pane_generation: DecimalU64(1),
+                public_key,
+                role: Role::PaneShell,
+                capabilities: vec![Capability::Input],
+            })
+            .await
+            .unwrap();
+        let child = verified(&broker).await;
+        let challenge = child
+            .session_challenge(&ChallengeArgs::Key(KeyChallenge {
+                public_key,
+                purpose: Purpose::Enrol,
+            }))
+            .await
+            .unwrap();
+        let scope = cosmix_client::session::ExpectedScope {
+            unix_uid: record.owner_uid,
+            parent_key_hash: Some(grant.grant.parent_key_hash),
+            pane_id: Some(DecimalU64(1)),
+            role: Role::PaneShell,
+            public_key_hash: HexBytes(Sha256::digest(public_key.0).into()),
+            capabilities_hash: HexBytes(
+                Sha256::digest(encode_capabilities(&[Capability::Input]).unwrap()).into(),
+            ),
+        };
+        let proof = challenge.sign(&key, &scope).unwrap();
+        let (_, _) = tokio::join!(
+            parent.session_revoke(record.reference()),
+            child.session_prove(&proof)
+        );
+        let list = observer.session_list().await.unwrap();
+        for id in [record.record_id, grant.record.record_id] {
+            assert_eq!(
+                list.records
+                    .iter()
+                    .find(|r| r.record_id == id)
+                    .unwrap()
+                    .state,
+                BindingState::Revoked
+            );
+        }
+        assert!(observer.session_prove(&proof).await.is_err());
+        assert!(
+            observer
+                .session_challenge(&ChallengeArgs::Key(KeyChallenge {
+                    public_key,
+                    purpose: Purpose::Enrol
+                }))
+                .await
+                .is_err()
+        );
+        parent.client().close().await;
+        child.client().close().await;
+    }
+    observer.client().close().await;
 }
 
 #[tokio::test]
@@ -1017,9 +1123,12 @@ async fn p0i_09_binding_bootstrap_omits_keys_and_proofs_from_observe_tap_and_log
     }
     // Ordered public marker drains all tap traffic produced during bootstrap.
     let mut marker = broker.tcp().await;
+    register(&mut marker, "tap-marker").await;
     send(
         &mut marker,
-        &request("noded.ping", "noded", "tap-end-marker"),
+        &request("probe.marker", "tap-marker", "tap-end-marker")
+            .with_header("type", "event")
+            .with_body("tap-end-marker"),
     )
     .await;
     receive(&mut marker).await;
@@ -1028,7 +1137,7 @@ async fn p0i_09_binding_bootstrap_omits_keys_and_proofs_from_observe_tap_and_log
         assert!(!frame.to_wire().contains("noded.session."));
         assert!(!frame.to_wire().contains(&public));
         assert!(!frame.to_wire().contains(&private));
-        if frame.get("id") == Some("tap-end-marker") {
+        if frame.body.trim() == "tap-end-marker" {
             break;
         }
     }
