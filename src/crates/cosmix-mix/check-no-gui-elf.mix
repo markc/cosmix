@@ -29,7 +29,9 @@ if $hit["exit_code"] == 0 then
 end
 -- Size ceiling: release mix is ~tens of MB; a GUI stack would multiply it.
 -- Ceiling 64 MiB gives honest headroom while catching a Bevy-class leak.
-$sz = size($bin)
+-- `size()` is not a builtin and never was, so this gate's second half has never
+-- run: the script died here and the NEEDED check above carried it alone.
+$sz = stat($bin)["size"]
 if $sz > 67108864 then
   print("GATE FAIL: mix release binary is " .. to_string($sz) .. " bytes (> 64 MiB ceiling)")
   exit(1)
