@@ -454,6 +454,18 @@ impl Drop for SubmitSlot {
 
 // ------------------------------------------------------------------ dispatch
 
+/// How long to hold a granted reservation before committing. Zero in every
+/// ordinary run; a fixture widens it to type into the window.
+fn reserve_hold() -> Duration {
+    static HOLD: OnceLock<Duration> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::env::var("MIX_RESERVE_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_millis)
+    })
+}
+
 /// Stable identity for retry dedupe. Same construction as Term's: a bound
 /// caller is its record, an ambient one is its connection, which never returns.
 fn actor_key(actor: &BrokerPrincipal) -> String {
@@ -680,7 +692,16 @@ fn cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u8, St
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|s| s.interrupt_foreground.clone());
-        hook.and_then(|hook| hook())
+        let signalled = hook.and_then(|hook| hook());
+        if signalled.is_some() {
+            // A group signal IS a delivery, and the only one that does not
+            // depend on the target noticing a flag. Without recording it here
+            // an external command killed by this signal would be reported as
+            // having completed normally, because nothing in the evaluator ever
+            // consumed an interrupt on its behalf.
+            cosmix_mix::cancel::note_delivery();
+        }
+        signalled
     } else {
         None
     };
@@ -839,6 +860,14 @@ async fn submit(
         Reserved::Busy => return refusal("BUSY"),
         Reserved::Stale => return refusal("STALE_GENERATION"),
     };
+
+    // Test hook for the reservation window — the interval in which the editor
+    // holds a suspended prompt for an owner that has not committed yet. It is
+    // naturally sub-millisecond, so a fixture cannot type into it without a way
+    // to widen it. Read once, zero by default.
+    if !reserve_hold().is_zero() {
+        tokio::time::sleep(reserve_hold()).await;
+    }
 
     // Step 4: recheck what the round trip could have invalidated. Bounded: the
     // correlated checks are RPCs on the one shared connection, and an admission

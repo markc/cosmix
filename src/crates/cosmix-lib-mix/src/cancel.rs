@@ -219,10 +219,27 @@ pub fn note_delivery() {
     if id == 0 {
         return;
     }
+    // Adopt first. A SIGINT's intent is recorded when the latch is claimed, and
+    // the consumption point runs BEFORE that — so asking "was this cancelled?"
+    // without adopting would answer no for every signal, and every
+    // signal-cancelled evaluation would report `completed_anyway`.
+    adopt_signal(id);
     if let Some(evaluation) = find(id)
         && evaluation.cancel_requested()
     {
         evaluation.delivered.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Claim a latched signal aimed at `id` as that evaluation's own intent. Once
+/// only: the latch is cleared by whichever of the consumption point and the
+/// re-assertion gets there first.
+fn adopt_signal(id: u64) {
+    if SIGNAL_LATCH.load(Ordering::Acquire) && SIGNAL_TARGET.load(Ordering::Relaxed) == id {
+        SIGNAL_LATCH.store(false, Ordering::Relaxed);
+        if let Some(evaluation) = find(id) {
+            evaluation.request(Source::Signal);
+        }
     }
 }
 
@@ -326,12 +343,7 @@ pub fn reassert() {
     }
     // Adopt a signal aimed at this evaluation before deciding, so the FIRST
     // interruption a signal causes is also recorded as sticky intent.
-    if SIGNAL_LATCH.load(Ordering::Acquire) && SIGNAL_TARGET.load(Ordering::Relaxed) == id {
-        SIGNAL_LATCH.store(false, Ordering::Relaxed);
-        if let Some(evaluation) = find(id) {
-            evaluation.request(Source::Signal);
-        }
-    }
+    adopt_signal(id);
     if find(id).is_some_and(|e| e.cancel_requested() && !e.finished()) {
         raise();
     }

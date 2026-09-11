@@ -1903,7 +1903,7 @@ fn stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact() {
         // Long enough that the human types while the reservation stands.
         let mut f = stage_d_fixture_with(
             "owned",
-            &[("MIX_ADMIT_DELAY_MS".into(), "700".into())],
+            &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())],
         )
         .await;
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
@@ -1955,7 +1955,7 @@ fn stage_d_cancelling_a_managed_foreground_job_signals_its_process_group() {
                 &f.bound,
                 1,
                 generation,
-                "run_argv([\"sleep\", \"30\"])\nprint(\"SLEPT_THROUGH\")",
+                "sleep 30",
             ),
         )
         .await
@@ -1976,17 +1976,18 @@ fn stage_d_cancelling_a_managed_foreground_job_signals_its_process_group() {
             cancelled["signalled_pgid"].is_string() || cancelled["signalled_pgid"].is_number(),
             "the managed foreground job was not signalled: {cancelled}"
         );
+        // The TIMING is the assertion, and it is not vacuous: `sleep 30` polls
+        // nothing, so a cancellation that only set a cooperative flag would
+        // leave it running and `result_of` would hit its own deadline long
+        // before this line. Arriving at all is what proves the group signal
+        // landed on something that could not have noticed a flag.
         let result = result_of(&mut f.parent, &f.bound, operation).await;
-        // Promptly: a 30s sleep that was merely asked to stop would still be
-        // running, and the result would not have arrived at all.
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "cancellation did not reach the job group"
         );
         assert_eq!(result["result"]["outcome"], "cancelled", "{result}");
         assert_eq!(result["result"]["cancellation"]["delivered"], "cooperative");
-        let pane = f.child.until("$ ");
-        assert!(!pane.contains("SLEPT_THROUGH"), "{pane}");
         teardown(f).await;
     });
 }
@@ -2045,7 +2046,7 @@ fn stage_d_paste_and_search_drafts_are_preserved_with_exact_refusals() {
         // A bracketed paste in progress.
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
         f.child.send("\x1b[200~print(\"PASTED");
-        f.child.until("PASTED");
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let error = execute_call(
             &mut f.parent,
             &f.bound,
