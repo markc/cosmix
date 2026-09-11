@@ -29,3 +29,7 @@ rio-vt = { git = "https://github.com/raphamorim/rio", rev = "932c1a7d9e07b4db592
 teletypewriter = { git = "https://github.com/raphamorim/rio", rev = "932c1a7d9e07b4db5924f7a0dd689e823c3a1442", default-features = false }
 swash = "0.2.10"
 libc = "0.2.189"
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+zeroize = "1"
+sha2 = "0.10"

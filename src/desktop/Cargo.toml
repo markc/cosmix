@@ -49,6 +49,9 @@ smithay = { path = "vendor/smithay" }
 wgpu = { path = "vendor/wgpu" }
 wgpu-core = { path = "vendor/wgpu-core" }
 
+[patch."https://github.com/raphamorim/rio"]
+teletypewriter = { path = "vendor/teletypewriter" }
+
 [profile.release]
 strip = true
 lto = "thin"
