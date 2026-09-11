@@ -8,6 +8,9 @@
 #[allow(dead_code)]
 #[path = "../src/editor/mod.rs"]
 mod editor;
+#[allow(dead_code)]
+#[path = "../src/session_state.rs"]
+mod session_state;
 
 use editor::runtime::{CompletionSnapshot, Line, OwnedEditor};
 use editor::{Generation, PromptProfile, Reply};
@@ -122,6 +125,79 @@ fn fixture_editor() {
         unsafe { File::from_raw_fd(libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3)) }
     };
     let output = unsafe { File::from_raw_fd(libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3)) };
+    if scenario == "activation" {
+        session_state::enable();
+        let ticket = session_state::prepare_prompt(false).unwrap();
+        let editor = OwnedEditor::start_with_activation(
+            input,
+            output,
+            Some(session_state::prompt_activated),
+        )
+        .unwrap();
+        unsafe {
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        }
+        let mut holder = Command::new("/bin/sleep");
+        holder.arg("10");
+        unsafe {
+            holder.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut holder = holder.spawn().unwrap();
+        assert_eq!(unsafe { libc::tcsetpgrp(0, holder.id() as i32) }, 0);
+        let reply = editor
+            .begin(
+                ticket,
+                PromptProfile::Primary(PROMPT.into()),
+                CompletionSnapshot::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(reply, Reply::Suspended { .. }));
+        assert_eq!(
+            session_state::view().unwrap().snapshot.prompt_generation.0,
+            0
+        );
+        assert_eq!(unsafe { libc::tcsetpgrp(0, libc::getpgrp()) }, 0);
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGCONT) }, 0);
+        wait(|| session_state::view().unwrap().snapshot.prompt_generation.0 == ticket.prompt);
+        assert_eq!(editor.control.inspect().unwrap().generation, ticket);
+        let sequence = session_state::view().unwrap().snapshot.sequence;
+        editor.control.pause(ticket, 0).unwrap();
+        editor
+            .control
+            .command(editor::Command::Resume {
+                generation: ticket,
+                edit_revision: 0,
+            })
+            .unwrap();
+        assert_eq!(session_state::view().unwrap().snapshot.sequence, sequence);
+        editor.control.shutdown().unwrap();
+        let next = session_state::prepare_prompt(false).unwrap();
+        assert!(
+            editor
+                .begin(
+                    next,
+                    PromptProfile::Primary("x".repeat(65537)),
+                    CompletionSnapshot::default(),
+                    Vec::new()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            session_state::view().unwrap().snapshot.prompt_generation.0,
+            ticket.prompt
+        );
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        same_modes(original, modes(0));
+        println!("ACTIVATION-PASS");
+        return;
+    }
     if scenario == "bounded-drain" {
         let mut terminal = editor::terminal::Terminal::new(input, output).unwrap();
         terminal.enter().unwrap();
@@ -388,6 +464,15 @@ fn external_stop_is_cooked_and_bg_waits_for_foreground_before_resuming_draft() {
     assert!(p.prompt().contains("\r\n731\r\n"));
     p.send(b"\x04");
     p.until("SUPERVISOR-PASS");
+    wait(|| p.child.try_wait().unwrap().is_some());
+    assert!(p.child.wait().unwrap().success());
+}
+
+#[test]
+fn published_prompt_waits_for_deferred_editing_ack_and_ignores_errors() {
+    let _fixture = fixture_guard();
+    let mut p = Pty::new(Some("activation"), true);
+    p.until("ACTIVATION-PASS");
     wait(|| p.child.try_wait().unwrap().is_some());
     assert!(p.child.wait().unwrap().success());
 }

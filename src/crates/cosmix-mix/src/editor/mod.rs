@@ -258,6 +258,24 @@ impl Editor {
         self.state = state;
         Ok(Effect::Modes { token, action })
     }
+    /// Only the local Begin path may move to a new attachment between prompts.
+    /// All in-flight control commands still require an exact generation match.
+    pub(crate) fn bind_prompt_session(
+        &mut self,
+        generation: Generation,
+    ) -> Result<(), ProtocolError> {
+        if self.state != State::Idle {
+            return Err(ProtocolError::InvalidState);
+        }
+        if self
+            .generation
+            .is_some_and(|g| generation.prompt <= g.prompt)
+        {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        self.session = generation.session;
+        Ok(())
+    }
     pub fn command(&mut self, command: Command) -> Result<Effect, ProtocolError> {
         match command {
             Command::BeginPrompt {

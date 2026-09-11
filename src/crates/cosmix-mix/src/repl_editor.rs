@@ -64,7 +64,7 @@ pub enum ReplEditor {
     Owned {
         editor: OwnedEditor,
         helper: Option<MixHelper>,
-        generation: u64,
+        unbound_generation: u64,
         history_refusals: HistoryRefusals,
     },
 }
@@ -84,9 +84,19 @@ impl ReplEditor {
                 Ok(unsafe { File::from_raw_fd(fd) })
             }
         }
-        let editor = match duplicate(0)
-            .and_then(|input| duplicate(1).and_then(|output| OwnedEditor::start(input, output)))
-        {
+        let editor = match duplicate(0).and_then(|input| {
+            duplicate(1).and_then(|output| {
+                if crate::session_state::enabled() {
+                    OwnedEditor::start_with_activation(
+                        input,
+                        output,
+                        Some(crate::session_state::prompt_activated),
+                    )
+                } else {
+                    OwnedEditor::start(input, output)
+                }
+            })
+        }) {
             Ok(editor) => editor,
             Err(error) => {
                 eprintln!("mix: owned editor unavailable; using rustyline: {error}");
@@ -96,7 +106,7 @@ impl ReplEditor {
         Ok(Self::Owned {
             editor,
             helper: None,
-            generation: 0,
+            unbound_generation: 0,
             history_refusals: HistoryRefusals::default(),
         })
     }
@@ -117,38 +127,43 @@ impl ReplEditor {
             Self::Legacy(editor) => {
                 // Legacy has no activation acknowledgement; this is the last
                 // observed readline boundary, never an admission permit.
-                crate::session_state::commit(crate::session_state::Transition::PromptReady {
-                    continuation,
-                });
+                if let Some(generation) = crate::session_state::prepare_prompt(continuation) {
+                    crate::session_state::prompt_activated(generation);
+                }
                 editor.readline(prompt)
             }
             Self::Owned {
                 editor,
                 helper,
-                generation,
+                unbound_generation,
                 ..
             } => {
-                *generation = generation
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("prompt generation exhausted"))?;
+                let generation = if crate::session_state::enabled() {
+                    crate::session_state::prepare_prompt(continuation)
+                        .ok_or_else(|| io::Error::other("prompt generation exhausted"))?
+                } else {
+                    // No status reducer exists for ordinary, unattached shells.
+                    *unbound_generation = unbound_generation
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("prompt generation exhausted"))?;
+                    Generation {
+                        session: 0,
+                        prompt: *unbound_generation,
+                    }
+                };
                 let profile = if continuation {
                     PromptProfile::Continuation
                 } else {
                     PromptProfile::Primary(prompt.to_owned())
                 };
                 editor.begin(
-                    Generation {
-                        // Real attachment/session identity is deferred to stage D.
-                        session: 1,
-                        prompt: *generation,
-                    },
+                    generation,
                     profile,
                     helper.as_ref().map(MixHelper::snapshot).unwrap_or_default(),
                     Vec::new(),
                 )?;
-                crate::session_state::commit(crate::session_state::Transition::PromptReady {
-                    continuation,
-                });
+                // The editor owner publishes only an actual Editing acknowledgement,
+                // including deferred foreground activation. Suspended/Err publish nothing.
                 match editor.readline()? {
                     Line::Submitted(line) => Ok(line),
                     Line::Interrupted => Err(ReadlineError::Interrupted),

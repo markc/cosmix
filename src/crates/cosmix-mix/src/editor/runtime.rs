@@ -326,6 +326,14 @@ pub struct OwnedEditor {
 }
 impl OwnedEditor {
     pub fn start(input: File, output: File) -> io::Result<Self> {
+        Self::start_with_activation(input, output, None)
+    }
+    /// A Send-only owned acknowledgement; no session or evaluator dependency.
+    pub fn start_with_activation(
+        input: File,
+        output: File,
+        activation: Option<fn(Generation)>,
+    ) -> io::Result<Self> {
         // Fail before installing signal hooks when an independent tty writer
         // cannot be opened (the REPL can then safely fall back to rustyline).
         let terminal = Terminal::new(input, output)?;
@@ -354,10 +362,11 @@ impl OwnedEditor {
             .name("mix-editor".into())
             .spawn(move || {
                 let mut owner = Owner {
-                    editor: Editor::new(1),
-                    // Attachment/session generation is intentionally stage-D work.
+                    activation,
+                    editor: Editor::new(0),
+                    // Zero means unbound until the local session owner supplies Begin.
                     generation: Generation {
-                        session: 1,
+                        session: 0,
                         prompt: 0,
                     },
                     terminal,
@@ -456,6 +465,7 @@ struct Cycle {
     next: usize,
 }
 struct Owner {
+    activation: Option<fn(Generation)>,
     stopped: bool,
     continued: Arc<std::sync::atomic::AtomicBool>,
     editor: Editor,
@@ -517,6 +527,9 @@ impl Owner {
                         self.request(result)?;
                     }
                     self.draw()?;
+                    if let Some(activation) = self.activation {
+                        activation(self.generation);
+                    }
                     reply = Reply::Editing {
                         generation: self.generation,
                         edit_revision: self.editor.edit_revision(),
@@ -645,6 +658,9 @@ impl Owner {
                     completion = CompletionSnapshot::default();
                     history.clear();
                 }
+                self.editor
+                    .bind_prompt_session(generation)
+                    .map_err(protocol)?;
                 let effect = self
                     .editor
                     .command(Command::BeginPrompt {
