@@ -443,6 +443,90 @@ async fn restart_during_reconnect_backoff_revokes_over_independent_uds() {
 }
 
 #[tokio::test]
+async fn cached_status_delivery_rechecks_broker_suspend_without_notices() {
+    use term_native_test_broker::Broker;
+    let broker = Broker::start();
+    async fn connect(broker: &Broker) -> VerifiedConnection {
+        let UnixConnectOutcome::VerifiedUnix(connection) =
+            NodedClient::connect_unix("", &broker.url, &broker.options(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("verified connection required")
+        };
+        connection
+    }
+    let parent = connect(&broker).await;
+    let parent_record = parent
+        .session_allocate(&SigningKey::from_bytes(&[21; 32]), Policy::DefaultOpen)
+        .await
+        .unwrap()
+        .record;
+    // The memfd fixture seeds the child half with [42; 32]; the grant must
+    // name that exact key or parse() rejects the bootstrap.
+    let child_key = SigningKey::from_bytes(&[42; 32]);
+    let grant = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: parent_record.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key: HexBytes(child_key.verifying_key().to_bytes()),
+            role: Role::PaneShell,
+            capabilities: vec![Capability::ReadState],
+        })
+        .await
+        .unwrap();
+    let file = memfd(
+        serde_json::json!({"grant":grant.grant,"record":grant.record}),
+        1,
+        SEALS,
+        false,
+    );
+    let mut bootstrap = parse(&file).ok().unwrap();
+    let child = connect(&broker).await;
+    let hello = child.session_hello().await.unwrap();
+    let bound = bootstrap
+        .attach(&child, &hello, &mut Reporter::default())
+        .await
+        .ok()
+        .unwrap();
+    let observer = std::sync::Arc::new(connect(&broker).await);
+    let observer_hello = observer.session_hello().await.unwrap();
+    let sending = observer.clone();
+    let name = bound.name.clone();
+    let request = tokio::spawn(async move {
+        sending
+            .client()
+            .call(&name, "shell.status", serde_json::json!({}))
+            .await
+    });
+    let delivery = loop {
+        let event = child.recv_shared().await.unwrap();
+        if event.command().command == "shell.status" {
+            break event;
+        }
+    };
+    let principal = delivery.trusted_context().unwrap();
+    assert!(crate::session_status::admitted(&observer, &observer_hello, principal, &bound).await);
+    parent.client().close().await; // real broker recursively suspends the child
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let current = observer.session_self(bound.record_id).await.unwrap().record;
+        if current.state == BindingState::Suspended {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Never consume a lifecycle hint. The saved delivery + old Attached record
+    // alone would pass policy; a fresh verified reader isolates the Attached
+    // re-read gate from the original connection's compulsory broker close.
+    assert!(!crate::session_status::admitted(&observer, &observer_hello, principal, &bound).await);
+    request.abort();
+    let _ = request.await;
+}
+
+#[tokio::test]
 async fn real_broker_challenge_expiry_recovers_without_a_lifecycle_notice() {
     use term_native_test_broker::{Broker, session_fd::LaunchFd};
     let broker = Broker::start();

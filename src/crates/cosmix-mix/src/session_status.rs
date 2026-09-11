@@ -87,7 +87,7 @@ fn permitted(principal: &BrokerPrincipal, target: &SessionRecord) -> bool {
     }
 }
 
-async fn admitted(
+pub(crate) async fn admitted(
     connection: &VerifiedConnection,
     hello: &Hello,
     principal: &BrokerPrincipal,
@@ -307,5 +307,33 @@ mod tests {
         value.as_object_mut().unwrap().remove("after_sequence");
         value["command"] = serde_json::json!("execute");
         assert!(serde_json::from_value::<Request>(value).is_err());
+    }
+
+    #[test]
+    fn parent_linkage_without_read_state_is_not_authority() {
+        let target = target();
+        let mut caller = ambient();
+        caller.assurance = Assurance::SessionBound;
+        caller.session = Some(SessionIdentity {
+            record_id: HexBytes([10; 16]),
+            instance_id: target.parent_instance.unwrap(),
+            incarnation: target.parent_incarnation.unwrap(),
+            role: Role::Term,
+            parent_instance: None,
+            parent_incarnation: None,
+            pane_id: None,
+            pane_generation: None,
+            binding_generation: DecimalU64(1),
+            capabilities: Vec::new(),
+            lease_remaining_ms: DecimalU64(1000),
+        });
+        assert!(!permitted(&caller, &target));
+        caller
+            .session
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(Capability::ReadState);
+        assert!(permitted(&caller, &target));
     }
 }
