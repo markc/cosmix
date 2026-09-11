@@ -1,6 +1,9 @@
 //! Disposable real controlling-PTY tests. Fixtures execute in isolated libtest
 //! processes so signal handlers never interfere with the parent test runner.
 //! A process-wide fixture lock excludes sibling forks during openpty/dup/close.
+//! It spans each whole fixture: same-process runs include lock wait in latency.
+//! Nextest uses separate test processes (no shared mutex); its timeout budget
+//! still needs to allow setup plus the real editor fixture durations.
 #![cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[path = "../src/editor/mod.rs"]

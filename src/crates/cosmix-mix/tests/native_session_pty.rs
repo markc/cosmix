@@ -2,6 +2,9 @@
 //! The fixture owns the Term-side record/renew/re-grant/revoke duties. Term's
 //! GUI mutation and exit-notifier ordering remain covered in its own workspace.
 //! A process-wide fixture lock excludes sibling forks across openpty/dup/spawn.
+//! It spans each whole fixture: same-process runs include lock wait in latency.
+//! Nextest uses separate test processes (no shared mutex); its timeout budget
+//! still needs to allow setup plus the real lease/retry fixture durations.
 #![cfg(target_os = "linux")]
 
 use cosmix_lib_bus::native_session::*;
@@ -650,7 +653,7 @@ fn enrolled_exec_restart_revokes_and_replacement_stays_unbound() {
             1,
             "{output}"
         );
-        assert!(output.contains("record revoked"), "{output}");
+        assert!(output.contains("record observed revoked"), "{output}");
         assert_eq!(child.pid(), pid);
         parent.wait(bound.record_id, BindingState::Revoked, 1).await;
         child.send("print(\"REPLACEMENT_WORKS\")\n");

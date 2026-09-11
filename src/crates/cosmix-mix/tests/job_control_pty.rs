@@ -1,6 +1,9 @@
 //! Real PTYs and a re-executed Rust fixture (no shell/interpreter helpers).
 //! A process-wide fixture lock serialises tests: openpty has no atomic CLOEXEC
 //! option, so sibling fixture forks must not overlap openpty/dup/close.
+//! It spans each whole fixture: same-process runs include lock wait in latency.
+//! Nextest uses separate test processes (no shared mutex); its timeout budget
+//! still needs to allow setup plus the real job-control fixture durations.
 #![cfg(target_os = "linux")]
 use std::fs::{self, File};
 use std::io::{Read, Write};

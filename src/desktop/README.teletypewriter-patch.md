@@ -21,6 +21,8 @@ and workspace override. Hunk hashes use trailing whitespace removal followed
 by one LF; the whole-file hash is byte-exact. A revision or content change
 requires a fresh upstream diff and an intentional recording update. Do not
 update hashes merely to silence the guard.
+Failures distinguish revision movement, patched-hunk drift, other file drift
+and manifest/record shape changes, so the message identifies what needs review.
 
 Exit strategy: submit an upstream PR for an optional child-only FD mapping
 spawn API, including seal/inheritance tests. Once an accepted upstream revision

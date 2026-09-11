@@ -574,7 +574,10 @@ offset and stale lease field never affect validation. Invalid stdio markers
 are removed without touching the corresponding descriptor.
 On bootstrap failure Mix scans <code>/proc/self/fd</code> and closes descriptors &gt;=3
 linking to <code>memfd:cosmix-session*</code>, even when the marker named the wrong fd.
-Successful consumption also closes duplicate launch fds before starting threads.</p>
+Successful consumption also closes duplicate launch fds before starting threads.
+If <code>/proc/self/fd</code> is unavailable, the sweep cannot discover mislabelled or
+duplicate fds. The known valid-marker descriptor is still closed; the extra
+sweep is defence in depth and requires procfs.</p>
 <p>The binary-only <code>cosmix-mix/src/native_session.rs</code> module keeps the 32-byte seed
 in private <code>Zeroizing&lt;[u8; 32]&gt;</code> storage. It moves into a dedicated resident
 thread with its own Tokio runtime; temporary Ed25519 signing keys zeroize on
@@ -611,7 +614,9 @@ through an independent targeted read because self-revoke can close the socket
 before its ACK arrives. During reconnect backoff it retains the last record,
 opens an independent connection and re-proves its retained key to regain
 self-revoke authority. The restart transaction has a ten-second total budget,
-with the same two-second per-RPC limit. One diagnostic reports the result; an unavailable broker
+with the same two-second per-RPC limit. A confirmed result means the same record
+was observed revoked, not that this particular RPC caused revocation (Term or
+expiry may have done so). One diagnostic reports the result; an unavailable broker
 leaves cleanup to lease/window expiry. The replacement shell runs normally but
 stays unbound until pane restart: v1 deliberately does not retain the seed over
 exec. A surviving PID alone must not leave a phantom attachment.</p>

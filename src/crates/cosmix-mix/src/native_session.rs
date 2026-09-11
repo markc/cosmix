@@ -53,7 +53,7 @@ pub(super) fn before_exec_restart() {
     eprintln!(
         "mix native-session: exec restart leaves this pane unbound until pane restart; {}",
         if revoked {
-            "record revoked"
+            "record observed revoked"
         } else {
             "revocation unconfirmed; remaining records expire by lease/window"
         }
@@ -93,6 +93,8 @@ fn consume() -> Result<Option<Bootstrap>, &'static str> {
 // Startup only, before any other threads or descriptor-owning application
 // objects exist. A malformed marker may name the wrong fd: close every named
 // launch memfd, including duplicates. Never touch stdio or unrelated memfds.
+// Without procfs the sweep is best-effort; consume_inner still closes the
+// descriptor actually named by a valid marker, but cannot find mislabelled copies.
 fn quarantine_failed_bootstrap() {
     if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
         let descriptors: Vec<_> = entries
@@ -774,10 +776,14 @@ async fn revoke_for_restart_inner(
     else {
         return false;
     };
-    let revoked = matches!(tokio::time::timeout(RPC, observer.session_self(record.record_id)).await,
-        Ok(Ok(result)) if result.record.state == BindingState::Revoked);
+    // Confirms an observed state, not that our revoke RPC caused it. Term or
+    // expiry may already have revoked the record before this read.
+    let confirmed = matches!(tokio::time::timeout(RPC, observer.session_self(record.record_id)).await,
+        Ok(Ok(result)) if result.record.state == BindingState::Revoked
+            && result.record.broker_epoch == record.broker_epoch
+            && result.record.incarnation == record.incarnation);
     close(&observer).await;
-    revoked
+    confirmed
 }
 
 fn relevant_notice(

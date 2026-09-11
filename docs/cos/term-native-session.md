@@ -150,6 +150,9 @@ are removed without touching the corresponding descriptor.
 On bootstrap failure Mix scans `/proc/self/fd` and closes descriptors >=3
 linking to `memfd:cosmix-session*`, even when the marker named the wrong fd.
 Successful consumption also closes duplicate launch fds before starting threads.
+If `/proc/self/fd` is unavailable, the sweep cannot discover mislabelled or
+duplicate fds. The known valid-marker descriptor is still closed; the extra
+sweep is defence in depth and requires procfs.
 
 The binary-only `cosmix-mix/src/native_session.rs` module keeps the 32-byte seed
 in private `Zeroizing<[u8; 32]>` storage. It moves into a dedicated resident
@@ -191,7 +194,9 @@ through an independent targeted read because self-revoke can close the socket
 before its ACK arrives. During reconnect backoff it retains the last record,
 opens an independent connection and re-proves its retained key to regain
 self-revoke authority. The restart transaction has a ten-second total budget,
-with the same two-second per-RPC limit. One diagnostic reports the result; an unavailable broker
+with the same two-second per-RPC limit. A confirmed result means the same record
+was observed revoked, not that this particular RPC caused revocation (Term or
+expiry may have done so). One diagnostic reports the result; an unavailable broker
 leaves cleanup to lease/window expiry. The replacement shell runs normally but
 stays unbound until pane restart: v1 deliberately does not retain the seed over
 exec. A surviving PID alone must not leave a phantom attachment.
