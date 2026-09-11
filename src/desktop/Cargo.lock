@@ -2858,7 +2858,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-lib-bus"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "libc",
@@ -2870,13 +2870,15 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.4.2"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
+ "ed25519-dalek",
  "futures-channel",
  "futures-util",
  "gloo-net",
+ "libc",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -2889,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.0"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3722,6 +3724,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",

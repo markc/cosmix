@@ -6,12 +6,14 @@
 
 mod bootstrap;
 mod principal;
+mod record;
 #[cfg(test)]
 mod tests;
 mod transcript;
 
 pub use bootstrap::*;
 pub use principal::*;
+pub use record::*;
 pub use transcript::*;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};

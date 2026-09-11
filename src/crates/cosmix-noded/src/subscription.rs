@@ -153,6 +153,11 @@ pub struct TopicInfo {
 
 #[derive(Debug)]
 pub enum PublishError {
+    Session(cosmix_bus::native_session::SessionError),
+    Interrupted {
+        cause: Box<PublishError>,
+        outcome: Box<PublishResult>,
+    },
     ReservedName,
     PayloadTooLarge {
         #[allow(dead_code)]
@@ -163,14 +168,67 @@ pub enum PublishError {
 }
 
 impl PublishError {
+    fn recipient_scoped(&self) -> bool {
+        use cosmix_bus::native_session::ErrorCode;
+        matches!(self, Self::Session(error) if
+            (error.error_code == ErrorCode::ResourceLimit && error.details.get("reason").and_then(|v| v.as_str()) == Some("recipient_dependency_limit")) ||
+            (error.error_code == ErrorCode::Unavailable && error.details.get("reason").and_then(|v| v.as_str()) == Some("recipient_missing")))
+    }
+
+    pub fn session_error(&self) -> Option<&cosmix_bus::native_session::SessionError> {
+        match self {
+            Self::Session(error) => Some(error),
+            Self::Interrupted { cause, .. } => cause.session_error(),
+            _ => None,
+        }
+    }
+
+    pub fn rc(&self) -> u8 {
+        self.session_error().map_or(10, |e| e.rc())
+    }
+
+    pub fn notifications(&self) -> &[Notification] {
+        match self {
+            Self::Interrupted { outcome, .. } => &outcome.notifications,
+            _ => &[],
+        }
+    }
+
     pub fn error_body(&self) -> String {
         match self {
+            Self::Interrupted { cause, outcome } => {
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&cause.error_body()).expect("error body");
+                for (key, value) in outcome.body().as_object().expect("publish result") {
+                    body[key] = value.clone();
+                }
+                body.to_string()
+            }
+            PublishError::Session(error) => serde_json::to_string(error).expect("session error"),
             PublishError::ReservedName => r#"{"error": "reserved_name"}"#.to_string(),
             PublishError::PayloadTooLarge { limit, .. } => {
                 format!(r#"{{"error": "payload_too_large", "limit": {}}}"#, limit)
             }
             PublishError::MalformedPayload => r#"{"error": "malformed_payload"}"#.to_string(),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct PublishResult {
+    pub seq: u64,
+    pub delivered: usize,
+    pub refused: usize,
+    pub dropped: usize,
+    pub eligible: usize,
+    pub notifications: Vec<Notification>,
+}
+
+impl PublishResult {
+    pub fn body(&self) -> serde_json::Value {
+        serde_json::json!({"seq":self.seq, "delivered":self.delivered,
+            "refused":self.refused, "dropped":self.dropped, "eligible":self.eligible,
+            "partial":self.delivered < self.eligible})
     }
 }
 
@@ -436,6 +494,8 @@ struct BrokerInner {
 
 /// The shared subscription broker.
 pub struct SubscriptionBroker {
+    native_sessions:
+        std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<crate::noded::session::Sessions>>>,
     observe: Option<std::sync::Arc<crate::observe::ObserveManager>>,
     inner: RwLock<BrokerInner>,
     topics: RwLock<HashMap<String, TopicState>>,
@@ -448,9 +508,42 @@ impl Default for SubscriptionBroker {
 }
 
 impl SubscriptionBroker {
+    pub(crate) fn set_native_sessions(
+        &self,
+        sessions: std::sync::Arc<tokio::sync::Mutex<crate::noded::session::Sessions>>,
+    ) {
+        let _ = self.native_sessions.set(sessions);
+    }
+
+    /// Only fresh fan-out can establish a dependency. Retained replay keeps
+    /// publish-time attribution and cannot refresh recipient authority.
+    async fn send_live_snapshot(
+        &self,
+        tx: &mpsc::Sender<String>,
+        wire: &str,
+        class: crate::protection::TrafficClass,
+        verified: bool,
+    ) -> Result<Result<(), mpsc::error::TrySendError<String>>, PublishError> {
+        if let Some(sessions) = self.native_sessions.get() {
+            let mut message = bus::parse(wire).map_err(|_| PublishError::MalformedPayload)?;
+            if let Some(p) = cosmix_bus::native_session::read_principal(&message)
+                .map_err(|_| PublishError::MalformedPayload)?
+            {
+                let mut sessions = sessions.lock().await;
+                let fresh = sessions
+                    .delivery_now(&p, tx)
+                    .map_err(PublishError::Session)?;
+                cosmix_bus::native_session::stamp_principal(&mut message, fresh.as_ref())
+                    .map_err(|_| PublishError::MalformedPayload)?;
+                return Ok(self.send_snapshot(tx, &message.to_wire(), class, verified));
+            }
+        }
+        Ok(self.send_snapshot(tx, wire, class, verified))
+    }
     pub fn new() -> Self {
         Self {
             observe: None,
+            native_sessions: Default::default(),
             inner: RwLock::new(BrokerInner {
                 subscriptions: HashMap::new(),
                 by_peer: HashMap::new(),
@@ -588,6 +681,7 @@ impl SubscriptionBroker {
     ) -> Result<(u64, usize, Vec<Notification>), PublishError> {
         self.publish_with_principal(name, inner_body, from, from_tx, origin, retain, None)
             .await
+            .map(|outcome| (outcome.seq, outcome.delivered, outcome.notifications))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -600,7 +694,7 @@ impl SubscriptionBroker {
         origin: BrokerOrigin,
         retain: bool,
         principal: Option<&cosmix_bus::native_session::BrokerPrincipal>,
-    ) -> Result<(u64, usize, Vec<Notification>), PublishError> {
+    ) -> Result<PublishResult, PublishError> {
         if name.starts_with('$') {
             return Err(PublishError::ReservedName);
         }
@@ -647,6 +741,15 @@ impl SubscriptionBroker {
         // the topics write lock so publishes to the same topic serialize.
         let (seq, wire) = {
             let mut topics = self.topics.write().await;
+            if let (Some(p), Some(sessions)) = (principal, self.native_sessions.get()) {
+                let fresh = sessions
+                    .lock()
+                    .await
+                    .publisher_now(p)
+                    .map_err(PublishError::Session)?;
+                cosmix_bus::native_session::stamp_principal(&mut inner, fresh.as_ref())
+                    .map_err(|_| PublishError::MalformedPayload)?;
+            }
             let state = topics
                 .entry(name.to_string())
                 .or_insert_with(|| TopicState {
@@ -703,9 +806,31 @@ impl SubscriptionBroker {
         // channels. Topic.active transitions are handled only on subscribe
         // (not publish), so no notifications here.
         let mut delivered = 0usize;
+        let mut refused = 0usize;
+        let mut dropped = 0usize;
+        let eligible;
+        let mut failure = None;
         let mut to_prune: Vec<SubscriptionId> = Vec::new();
-        {
+        'fanout: {
             let inner_state = self.inner.read().await;
+            eligible = inner_state
+                .subscriptions
+                .values()
+                .filter(|sub| {
+                    matches!(&sub.kind, SubKind::Topic { name: topic } if topic == name)
+                        && sub.filter.as_ref().is_none_or(|filter| {
+                            body_namespace.as_deref() == Some(filter.namespace.as_str())
+                        })
+                })
+                .count();
+            // Check even with no subscribers; waiting for the fan-out snapshot
+            // must not turn an expired publisher into a successful empty publish.
+            if let (Some(p), Some(sessions)) = (principal, self.native_sessions.get())
+                && let Err(error) = sessions.lock().await.publisher_now(p)
+            {
+                failure = Some(PublishError::Session(error));
+                break 'fanout;
+            }
             for sub in inner_state.subscriptions.values() {
                 if let SubKind::Topic { name: topic_name } = &sub.kind
                     && topic_name == name
@@ -726,21 +851,31 @@ impl SubscriptionBroker {
                         }
                         continue;
                     }
-                    match self.send_snapshot(
-                        &sub.tx,
-                        &wire,
-                        traffic_class,
-                        sub.verified_destination,
-                    ) {
-                        Ok(()) => delivered += 1,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                    match self
+                        .send_live_snapshot(&sub.tx, &wire, traffic_class, sub.verified_destination)
+                        .await
+                    {
+                        Err(error) if error.recipient_scoped() => {
+                            refused += 1;
+                            if sub.tx.is_closed() {
+                                to_prune.push(sub.id.clone());
+                            }
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                        Ok(Ok(())) => delivered += 1,
+                        Ok(Err(mpsc::error::TrySendError::Full(_))) => {
+                            dropped += 1;
                             tracing::warn!(
                                 peer = %sub.peer,
                                 topic = %name,
                                 "Topic delivery dropped: subscriber outbound full"
                             );
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Ok(Err(mpsc::error::TrySendError::Closed(_))) => {
+                            dropped += 1;
                             to_prune.push(sub.id.clone());
                         }
                     }
@@ -762,7 +897,28 @@ impl SubscriptionBroker {
             Vec::new()
         };
 
-        Ok((seq, delivered, notifications))
+        if refused != 0 {
+            tracing::debug!(
+                delivered,
+                refused,
+                "Topic fan-out completed with recipient refusals"
+            );
+        }
+        let outcome = PublishResult {
+            seq,
+            delivered,
+            refused,
+            dropped,
+            eligible,
+            notifications,
+        };
+        if let Some(cause) = failure {
+            return Err(PublishError::Interrupted {
+                cause: Box::new(cause),
+                outcome: Box::new(outcome),
+            });
+        }
+        Ok(outcome)
     }
 
     // ── `topic.subscribe` ──
@@ -1702,6 +1858,75 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn publish_reports_full_and_closed_queues_as_partial_drops() {
+        let broker = SubscriptionBroker::new();
+        let (publisher, _publisher_rx) = mpsc::channel(8);
+        let (live, mut received) = mpsc::channel(8);
+        let (full, _full_rx) = mpsc::channel(1);
+        let (closed, closed_rx) = mpsc::channel(1);
+        broker.subscribe_topic("queue.test", "live", live).await;
+        broker
+            .subscribe_topic("queue.test", "full", full.clone())
+            .await;
+        broker.subscribe_topic("queue.test", "closed", closed).await;
+        full.try_send("occupied".into()).unwrap();
+        drop(closed_rx);
+        let result = broker
+            .publish_with_principal(
+                "queue.test",
+                &sample_inner_body("producer", 1),
+                "producer",
+                publisher,
+                BrokerOrigin::Local,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                result.delivered,
+                result.refused,
+                result.dropped,
+                result.eligible
+            ),
+            (1, 0, 2, 3)
+        );
+        assert_eq!(result.body()["partial"], true);
+        assert!(received.try_recv().is_ok());
+        assert_eq!(broker.inner.read().await.subscriptions.len(), 2);
+    }
+
+    #[test]
+    fn publisher_failures_preserve_their_error_and_partial_progress() {
+        use cosmix_bus::native_session::{ErrorCode, SessionError};
+        let expired = PublishError::Session(SessionError {
+            error_code: ErrorCode::Expired,
+            message: "session request refused".into(),
+            details: Default::default(),
+        });
+        assert!(!expired.recipient_scoped());
+        assert!(!PublishError::MalformedPayload.recipient_scoped());
+        let failure = PublishError::Interrupted {
+            cause: Box::new(expired),
+            outcome: Box::new(PublishResult {
+                seq: 1,
+                delivered: 1,
+                refused: 0,
+                dropped: 1,
+                eligible: 3,
+                notifications: Vec::new(),
+            }),
+        };
+        let body: serde_json::Value = serde_json::from_str(&failure.error_body()).unwrap();
+        assert_eq!(failure.rc(), 10);
+        assert_eq!(body["error_code"], "EXPIRED");
+        assert_eq!(body["delivered"], 1);
+        assert_eq!(body["refused"], 0);
+        assert_eq!(body["partial"], true);
     }
 
     #[tokio::test]

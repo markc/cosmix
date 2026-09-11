@@ -285,7 +285,11 @@ impl NodedClient {
             if ping["extensions"]["native-session"].as_str() != Some("1") {
                 return Err(crate::unix::ConnectError::UnsupportedVersion.into());
             }
-            client.register().await
+            if service_name.is_empty() {
+                Ok(())
+            } else {
+                client.register().await
+            }
         }
         .await;
         if let Err(error) = setup {
@@ -705,6 +709,48 @@ impl NodedClient {
         let rc: u8 = response.get("rc").and_then(|s| s.parse().ok()).unwrap_or(0);
         let error_header = response.get("error").map(str::to_string);
         Ok((rc, response.body, error_header))
+    }
+
+    /// Strict native-session lane, available only through VerifiedConnection.
+    #[cfg(unix)]
+    pub(crate) async fn session_request(&self, command: &str, body: String) -> Result<BusMessage> {
+        let id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| anyhow::anyhow!("session request IDs exhausted; reconnect"))?
+            .to_string();
+        let msg = BusMessage::new()
+            .with_header("bus", "1")
+            .with_header("native-session", "1")
+            .with_header("type", "request")
+            .with_header("to", "noded")
+            .with_header("id", &id)
+            .with_header("command", command)
+            .with_body(&body);
+        cosmix_bus::native_session::parse_bootstrap(msg.to_wire().as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid session arguments"))?;
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .insert(id.clone(), tx);
+        let mut guard = PendingGuard::arm(self.pending.clone(), id.clone());
+        self.send_raw(&msg).await?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("session outcome unknown: response timed out"))?
+            .map_err(|_| anyhow::anyhow!("session outcome unknown: connection closed"))?;
+        guard.disarm();
+        if response.get("bus") != Some("1")
+            || response.get("native-session") != Some("1")
+            || response.message_type() != Some("response")
+            || response.command_name() != Some(command)
+            || response.get("id") != Some(id.as_str())
+            || !matches!(response.get("rc"), Some("0" | "10" | "20"))
+        {
+            anyhow::bail!("invalid session response envelope");
+        }
+        Ok(response)
     }
 
     /// Send a fire-and-forget message to another service.

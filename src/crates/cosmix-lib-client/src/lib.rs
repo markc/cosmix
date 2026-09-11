@@ -45,6 +45,8 @@ mod native;
 pub use native::{NameCollision, NodedClient, RegistrationRejected};
 
 #[cfg(unix)]
+pub mod session;
+#[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::{

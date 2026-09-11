@@ -47,6 +47,9 @@ fn is_empty_map(m: &serde_json::Map<String, serde_json::Value>) -> bool {
 /// the contract's "immutable facts only" rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct ServiceInfo {
+    /// Broker-owned same-UID native-session discovery snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session: Option<crate::native_session::SessionRecord>,
     /// Registered Bus service name (the broker registry key). Required.
     pub name: String,
     /// Binary / package name when it differs from the logical service
@@ -103,6 +106,8 @@ impl ServiceInfo {
 // re-listing every field. Kept in lockstep with `ServiceInfo`.
 #[derive(Deserialize)]
 struct ServiceInfoObj {
+    #[serde(default)]
+    native_session: Option<crate::native_session::SessionRecord>,
     name: String,
     #[serde(default)]
     binary: Option<String>,
@@ -130,6 +135,7 @@ impl From<ServiceInfoObj> for ServiceInfo {
     fn from(o: ServiceInfoObj) -> Self {
         Self {
             name: o.name,
+            native_session: o.native_session,
             binary: o.binary,
             version: o.version,
             git_sha: o.git_sha,

@@ -1,5 +1,129 @@
 # Native session implementation staging
 
+S2 closure patch versions: `cosmix-noded` 0.16.6, `cosmix-lib-bus` 0.3.4,
+`cosmix-lib-client` 0.4.5 and `cosmix-lib-config` 0.8.3. These advance both the
+landed main versions and the intermediate S2 fix-pass versions; gate acceptance
+remains separate from version assignment.
+
+Dispatch enforces maintenance at its supplied clock instant. Non-owners receive
+uniform `FORBIDDEN` for revoke, including already revoked records. Malformed
+uncorrelated requests close before consuming a challenge. Observation records
+successful session commands as broker-handled. Retention eviction stops at an
+empty cache; an oversized result retains request high-water without caching.
+Ping advertises `issued_names_per_epoch` (65,536). Record/key, descendant and
+deadline searches remain linear in retained epoch state, bounded by this name
+ceiling; allocation churn can increase scan cost until broker restart.
+
+## S2 lifecycle delivery boundary
+
+Lifecycle transitions offer metadata-only notices to bindings, attached parents,
+key interests and affected recipients. Notice storage is bounded to 256 entries
+per connection and 4,096 globally. Overflow sets a separate coalesced gap bit;
+global pressure sheds from a largest backlog. The writer sends gaps before queued
+notices. Slow readers are never disconnected because of notice overflow.
+Replacement attachment offers the new generation to the closing channel as well
+as the successor. A channel that has held a binding cannot allocate or prove a
+different record while its close is pending; queued bootstrap work preserves
+the original binding scope.
+
+Bound routed deliveries register a connection/reference dependency before enqueue,
+under the same lock as revocation. Dependency caps are 256 per recipient and 8,192
+globally; exhaustion refuses the delivery. Delivery admission releases expired
+dependency slots, including during topic fan-out between expiry wakes.
+Routing releases registry and session guards before pending registration, then
+rechecks channel ownership and recomputes the lease after that await, immediately
+before enqueue. Refusal removes the pending entry and restores caller correlation.
+Routing lookup uses a registry read guard; only actual mutations take write.
+It also refuses an expired native target while its route awaits scheduler removal.
+Post-await classification includes any newly protected destination. Principal
+encoding failure returns a refusal without panicking under the delivery fence.
+Refusal observations use the pre-mutation envelope, never headers from an
+unshipped delivery attempt.
+Delivery errors carry native response headers for verified recipients and the
+legacy error header/body for legacy recipients, including correlated responses.
+`lease.check` requires an existing unexpired dependency, atomically refreshes
+its notice lifetime through the returned
+lease, and returns the minimum remaining ancestor lease. Recipients
+use request-start CLOCK_BOOTTIME plus that delta, never receive time plus delta.
+
+The same fence covers correlated responses and fresh topic fan-out. Retained
+topic replay preserves historical attribution and cannot refresh dependencies.
+Recipient dependency-cap and missing-recipient refusals skip only that delivery;
+fan-out continues and closed subscriptions are still pruned. `topic.publish`
+reports `seq`, `delivered`, `refused`, `dropped` and `eligible`, with `partial`
+defined as `delivered < eligible`. Full and closed queues count as dropped.
+Publisher expiry and malformed payloads remain command errors, not recipient
+refusals. Publisher authority is checked before committing a snapshot and after
+the fan-out wait, including with no subscribers. A publisher failure mid-fan-out
+reports the original error plus partial progress; prior deliveries are not rolled
+back and accumulated prune notifications still run. Refusal diagnostics contain
+only aggregate counts, without recipient identity or message contents.
+Ping publishes the effective bounds in `native_session_limits` (decimal strings).
+One broker-owned scheduler sleeps until the earliest record lease/resumption,
+pending grant, challenge, retained result or recipient dependency deadline. State
+changes notify it to recompute; idle connections have no maintenance interval.
+Its single absolute CLOCK_BOOTTIME timerfd includes suspend time and is cancelled
+with the broker. Expiry alone takes the registry write lock; rescheduling only
+reads session deadlines. Writers drain notices only after a notice wake, with
+gap-before-notice priority, so ordinary outbound messages take no session lock.
+Clock/timer failure returns `UNAVAILABLE`, revokes native authority and closes
+native connections; it cannot panic or silently mint a fresh lease.
+The timer is created synchronously before native advertisement and readiness;
+creation failure drops the Unix listener and advertises TCP only, just like bind
+failure. A clock failure after activation stays latched until broker restart.
+Explicit-time maintenance remains available for synthetic-clock regression tests;
+live callers obtain BOOTTIME through `maintain_now` or the scheduler.
+`noded.pending_grants_per_parent` configures the per-Term pending-grant cap
+(integer, default 32, range 0–32). Zero disables new grants. Values above 32
+refuse startup before listener activation; the global 1,024-grant and per-UID
+64-Term ceilings still apply. Ping advertises the configured value.
+
+## S2 fixture execution
+
+The native noded tests use real Unix WebSockets and kernel peer credentials.
+They include separate-process reserved-name competition, altered-scope and
+captured-proof refusal after connection loss and against a new challenge,
+fresh resumption, restart/re-enrolment, competing-proof refusal, lease dependency
+registration, wake retention after a suspended-parent
+proof refusal, configurable per-parent grant isolation and cancellation,
+observation/log omission, grant/Term/challenge/interest exhaustion,
+retention high-water and deterministic notice-queue overflow. A test-only probe
+fills the real broker's notice queue under its lock, then checks gap delivery and
+key-selected resynchronisation over the real Unix connection. Clock-boundary
+unit tests supplement that transport coverage with exact expiry instants.
+
+The privileged multi-UID case is explicitly ignored in ordinary runs, with its
+missing prerequisites named in the test report. Run it explicitly as root with
+`COSMIX_SESSION_TEST_UID` set to a distinct unprivileged UID. It uses a real child
+process after UID/GID change. Missing prerequisites fail that explicit invocation;
+there is no early-return path that reports a skipped security assertion as passed.
+
+## S2 grants and proof boundary
+
+`grant.create` and `grant.fetch` require the issuing attached parent. Grants
+reserve generation-qualified pane records, expire after 30 seconds, and consume
+only on successful strict Ed25519 proof. Both challenge selectors are supported;
+identical outstanding selectors retain their original five-second deadline.
+Key lookups register wake interest (256 per UID) independently of lookup success.
+At most 128 challenges per UID and one per connection are outstanding. Malformed
+identifiable proof attempts consume that connection's challenge, never a grant.
+Fresh proof supports enrolment and attached/suspended resumption. Parent terminal
+transitions recursively revoke children under the registry/lifecycle lock.
+
+## S2 allocation boundary
+
+The broker implements `hello`, allocation with a connection-bound Ed25519
+proof, attach-on-allocate, owner-UID `list`, and `renew`. Term names use the
+canonical UID encoding and 110 random bits; the epoch exclusion set is bounded
+to 65,536 names. Exhaustion refuses allocation. Each UID may hold 64 nonterminal
+Terms. Retained mutations use increasing decimal IDs and bounded cached results.
+Clients renew every five seconds; successful renewal refreshes the 15-second
+CLOCK_BOOTTIME lease, including repeated request IDs. Disconnect or expiry
+suspends the record for 30 seconds. Delayed maintenance uses the original lease
+deadline and processes expiries in time order, preserving earlier descendant
+windows. The other S2 boundaries provide child grants, resumption, notices and
+the typed client API.
+
 The S1 foundation implements the wire types in `cosmix-lib-bus` and shares
 noded's existing Axum WebSocket handler between transport identities. TCP
 registration, D2 admission and response-channel ownership remain unchanged.
@@ -13,11 +137,25 @@ ping-advertised `native-session-endpoint`, otherwise
 `/run/cosmix/noded/bus.sock`, independently of client XDG directories.
 
 The contracts remain [BUS-013–017](../../spec/04-bus-wire.md) and
-[BROKER-016–025](../../spec/05-broker-topics.md). Session allocation, grants,
-proof verification, binding leases and policy enforcement are S2 and later work;
-this foundation does not establish a session-bound principal.
-Valid bootstrap requests currently receive structured `UNSUPPORTED`; malformed
-bootstrap requests are rejected by the strict wire parser. No grants are minted.
+[BROKER-016–025](../../spec/05-broker-topics.md). S2 builds the binding lifecycle
+on that foundation. The strict parser still rejects malformed requests before
+mutation. Recipient verb/property policy enforcement remains S4 work.
+
+## S2 first boundary: reserve the allocation namespace
+
+The BROKER-017 shape `^[tc][0-9a-z]{1,7}-[a-z2-7]{22}$` is now refused by
+`noded.register` on every ingress, including brokers without a Unix listener.
+Refusal returns `rc:10` with `reserved_name` and preserves any previous
+registration on that connection. Leading-zero and overflowing UID lookalikes
+are reserved too; the check does not depend on allocation state or interpret
+the displayed UID as authority. Neighbouring legacy names remain valid.
+
+The p0i-02 namespace slice exercises TCP and real Unix WebSocket connections,
+pre-claim refusal, retained alias authority and forged `from` canonicalisation.
+The broker starts with an empty, non-persistent registry;
+there is no live profile-activation switch in this boundary.
+
+## Observation and transport boundary
 
 Observation classification follows native senders, native recipients, correlated
 responses, bootstrap commands and private property topics. Retained snapshots
@@ -34,6 +172,30 @@ legacy mesh wire has no protected-classification propagation contract. This
 does not restrict existing TCP/D2 routing or establish cross-node UID trust.
 
 ## Client opt-in boundary
+
+`VerifiedConnection` now exposes `session_hello`, `session_allocate`,
+`session_grant_create`, `session_grant_fetch`, `session_challenge`, `session_prove`,
+`session_renew`, `session_revoke`, `session_list` and `session_lease_check`.
+An empty connect name selects anonymous Unix bootstrap. Calls are serialised
+per verified handle; responses require explicit native framing and RC. Allocation
+signs the exact BUS-016 bytes with Ed25519. Challenge signing requires independently
+retained expected UID, parent-key hash, pane, role, key hash and capability hash;
+`ExpectedScope::pane_high_water` enforces the application's retained generation
+within each parent instance (reset it when that parent instance changes).
+`session_lease_check` captures local CLOCK_BOOTTIME before the request and returns
+an opaque `Deadline` for the checked reference, refusing an already elapsed
+result. `Deadline::is_live` fails closed on clock errors; no raw delta is exposed.
+Each deadline stores the broker epoch and connection ID obtained by `hello` on
+the checking handle. `is_live(&current_hello)` returns false after either changes,
+including reconnection within the same broker epoch. Use hello from the current
+verified connection; lifecycle gaps still require discarding cached deadlines.
+No uncertain mutation is retried automatically. Wake errors remain visible on
+success and refusal. Private signing keys are never serialised into requests.
+
+Same-UID discovery includes the broker-owned `native_session` snapshot for attached,
+pending and suspended records. Other
+transports and UIDs see bare allocated names. Caller provenance cannot set the
+field. Session list and discovery share `SessionRecord`; neither is live authority.
 
 Ordinary `NodedClient::connect` and config-layer default helpers stay on TCP.
 `NodedClient::connect_unix` explicitly opts into node-local traffic; it takes
@@ -61,7 +223,7 @@ creates immutable `VerifiedCommand` deliveries with a `trusted_context`
 accessor; raw `IncomingCommand` headers cannot create this type. A missing
 context denotes an unverified sender or a direct broker message. A typed stamp
 is not a live lease: retained deliveries remain historical, and session-bound
-authorisation will require S2 lease checks. Use `client().close()` for explicit
+authorisation requires correlated lease checks. Use `client().close()` for explicit
 connection teardown, as with the existing client.
 
 The listener walks ancestry with directory FDs and `openat(O_NOFOLLOW)`, and

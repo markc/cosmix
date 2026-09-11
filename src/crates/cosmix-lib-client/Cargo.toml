@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-client"
-version = "0.4.3"
+version = "0.4.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -30,6 +30,10 @@ tokio = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # Native test harness — dev-dependencies for the in-process stub
 # broker used by the supervised-reconnect tests. cosmix-noded itself

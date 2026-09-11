@@ -43,6 +43,8 @@ use crate::protection::TrafficClass;
 #[cfg(test)]
 #[path = "native_session_tests.rs"]
 mod native_session_tests;
+#[path = "session.rs"]
+pub(crate) mod session;
 use crate::subscription::{
     self, BrokerOrigin, JANITOR_INTERVAL, Notification, SubscriptionBroker, TopicInfo,
     stamp_broker_origin, strip_broker_origin,
@@ -343,6 +345,7 @@ impl PendingResponseTable {
 
 #[derive(Clone)]
 struct AppState {
+    sessions: Arc<tokio::sync::Mutex<session::Sessions>>,
     protected_responses: Arc<AtomicBool>,
     native_session_endpoint: Option<PathBuf>,
     broker_epoch: HexBytes<16>,
@@ -482,8 +485,11 @@ enum AdmitOutcome {
 // ── Entry point ──
 
 pub struct RunConfig {
+    #[cfg(test)]
+    pub session_probe: Option<oneshot::Sender<Arc<tokio::sync::Mutex<session::Sessions>>>>,
     /// None disables native ingress for isolated legacy test brokers.
     pub unix_socket: Option<PathBuf>,
+    pub pending_grants_per_parent: usize,
     pub listen: String,
     pub node: String,
     pub wg_ip: String,
@@ -495,7 +501,10 @@ pub struct RunConfig {
 
 pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()> {
     let RunConfig {
+        #[cfg(test)]
+        session_probe,
         unix_socket,
+        pending_grants_per_parent,
         listen,
         node,
         wg_ip,
@@ -504,6 +513,10 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         admission_mode,
         observe_allowed_services,
     } = config;
+    anyhow::ensure!(
+        pending_grants_per_parent <= 32,
+        "noded.pending_grants_per_parent must be at most 32"
+    );
     // Validate before listener/readiness or background work. A configured but
     // invalid public release must never fall back to legacy directory discovery.
     let spec_release = crate::spec_release::SpecRelease::from_env()?.map(Arc::new);
@@ -542,7 +555,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         crate::authority::Posture::Unverified { .. } => (false, 0),
     };
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    let unix_listener = match unix_socket.as_deref() {
+    let mut unix_listener = match unix_socket.as_deref() {
         Some(path) => match crate::native_ingress::bind(path).await {
             Ok(listener) => Some(listener),
             Err(error) => {
@@ -551,6 +564,20 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
             }
         },
         None => None,
+    };
+    // The expiry timer is part of native profile readiness, not background
+    // best-effort work. Drop the socket/guard before advertising on failure.
+    let session_timer = if unix_listener.is_some() {
+        match session::deadline_timer() {
+            Ok(timer) => Some(timer),
+            Err(error) => {
+                tracing::error!(%error, "native-session expiry timer unavailable; continuing with TCP only");
+                unix_listener = None;
+                None
+            }
+        }
+    } else {
+        None
     };
     let listener_port = listener.local_addr()?.port();
     // SPEC 13 §9a B1 self-check — is the listener bound to our own WG IP?
@@ -811,6 +838,9 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
     let change_bus = crate::props::ChangeBus::new(broker.clone());
 
     let state = AppState {
+        sessions: Arc::new(tokio::sync::Mutex::new(
+            session::Sessions::with_grant_limit(pending_grants_per_parent),
+        )),
         protected_responses: Default::default(),
         broker_epoch: HexBytes(rand::random()),
         principal: None,
@@ -842,6 +872,14 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         challenge_table: Arc::new(crate::admission::ChallengeTable::new()),
         live_sessions: Arc::new(RwLock::new(HashMap::new())),
     };
+    broker.set_native_sessions(state.sessions.clone());
+    let _session_maintenance = session_timer.map(|timer| {
+        session::spawn_maintenance(state.registry.clone(), state.sessions.clone(), timer)
+    });
+    #[cfg(test)]
+    if let Some(probe) = session_probe {
+        let _ = probe.send(state.sessions.clone());
+    }
 
     // Seed the change bus with the L1 snapshot so the first mutation
     // produces a diff against real state, not against `None`. Also seed
@@ -1969,9 +2007,36 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
     let source_ip_str = source_ip.to_string();
 
     let (tx, mut rx) = mpsc::channel::<String>(PEER_OUTBOUND_BUFFER);
-
+    let channel_id = state
+        .principal
+        .as_ref()
+        .map(|p| p.connection_id)
+        .unwrap_or_else(|| HexBytes(rand::random()));
+    let notice_wake = Arc::new(tokio::sync::Notify::new());
+    state
+        .sessions
+        .lock()
+        .await
+        .open_outbox(channel_id, &tx, notice_wake.clone());
+    let writer_sessions = state.sessions.clone();
+    let writer_epoch = state.broker_epoch;
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = notice_wake.notified() => {
+                    loop {
+                        let notice = writer_sessions.lock().await.next_notice(channel_id, writer_epoch);
+                        let Some((gap, notice)) = notice else { break; };
+                        if ws_sink.send(Message::Text(notice.into())).await.is_err() {
+                            if gap { writer_sessions.lock().await.restore_gap(channel_id); }
+                            return;
+                        }
+                    }
+                    continue;
+                },
+                msg = rx.recv() => match msg { Some(msg) => msg, None => break },
+            };
             if ws_sink.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
@@ -2000,6 +2065,14 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
     // teardown. The read loop `select!`s on it; the reload watcher calls
     // `notify_one()` to break the loop and drop a revoked member's session.
     let close_signal = Arc::new(tokio::sync::Notify::new());
+    if let Some(p) = &state.principal {
+        state.sessions.lock().await.connect(
+            p,
+            &tx,
+            close_signal.clone(),
+            state.protected_responses.clone(),
+        );
+    }
 
     // SPEC 13 §9a (2-c-1b) — broker-speaks-first: when admission is enabled the
     // broker's FIRST frame is a D2 challenge. Non-blocking + additive — an
@@ -2109,8 +2182,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             let _ = tx.try_send(reply.to_wire());
             continue;
         }
-        // S1 supplies the wire profile, not S2's session state machine. Validate
-        // before returning an explicit unsupported result; never mutate identity.
+        // The strict raw parser remains ahead of all lifecycle mutation.
         if bus_msg
             .command_name()
             .is_some_and(|c| c.starts_with("noded.session."))
@@ -2122,32 +2194,61 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             }) else {
                 break;
             };
-            let error = cosmix_bus::native_session::SessionError {
-                error_code: if validation.is_ok() {
-                    cosmix_bus::native_session::ErrorCode::Unsupported
-                } else {
-                    cosmix_bus::native_session::ErrorCode::InvalidArgument
-                },
-                message: if validation.is_ok() {
-                    "session commands are not available"
-                } else {
-                    "invalid session request"
+            if validation.is_err()
+                && bus_msg.command_name() == Some("noded.session.prove")
+                && let Some(p) = &state.principal
+            {
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .consume_malformed(p.connection_id);
+            }
+            let result = match (&state.principal, validation) {
+                (Some(p), Ok(request)) => {
+                    let mut reg = state.registry.write().await;
+                    let mut sessions = state.sessions.lock().await;
+                    let result = sessions.execute(p, &request, &mut reg);
+                    if let Some(name) = sessions.name(p.connection_id) {
+                        service_name = Some(name);
+                    }
+                    result
                 }
-                .into(),
-                details: Default::default(),
+                (None, Ok(_)) => Err(cosmix_bus::native_session::SessionError::forbidden()),
+                (_, Err(_)) => Err(cosmix_bus::native_session::SessionError {
+                    error_code: cosmix_bus::native_session::ErrorCode::InvalidArgument,
+                    message: "invalid session request".into(),
+                    details: Default::default(),
+                }),
+            };
+            let (rc, body) = match result {
+                Ok(body) => (0, body),
+                Err(mut error) => {
+                    let wake = error.details.remove("wake_error");
+                    let rc = error.rc();
+                    let mut body = serde_json::to_value(error).expect("session error");
+                    if let Some(wake) = wake {
+                        body["wake_error"] = wake;
+                    }
+                    (rc, body)
+                }
             };
             let reply = BusMessage::new()
                 .with_header("bus", "1")
                 .with_header("native-session", "1")
                 .with_header("type", "response")
-                .with_header("rc", "10")
+                .with_header("rc", &rc.to_string())
                 .with_header("id", id)
                 .with_header("command", bus_msg.command_name().unwrap_or("noded.session"))
-                .with_body(&serde_json::to_string(&error).expect("session error"));
+                .with_body(&body.to_string());
             canonicalize_connection_from(&mut bus_msg, service_name.as_deref());
             state.observe.observe(Observation::canonical(
                 ObserveDirection::Local,
-                ObserveOutcome::Rejected,
+                if rc == 0 {
+                    ObserveOutcome::BrokerHandled
+                } else {
+                    ObserveOutcome::Rejected
+                },
                 &bus_msg,
                 bus_msg.get("id"),
             ));
@@ -2159,6 +2260,18 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 reply.get("id"),
             );
             continue;
+        }
+
+        if let Some(p) = &state.principal {
+            let mut reg = state.registry.write().await;
+            let mut sessions = state.sessions.lock().await;
+            let Ok(now) = sessions.maintain_now(&mut reg) else {
+                break;
+            };
+            let Some(principal) = sessions.principal(p.connection_id, now) else {
+                break;
+            };
+            state.principal = Some(principal);
         }
 
         // SPEC 13 §9a (2-c-1b) — the D2 admission response. It carries
@@ -2214,13 +2327,32 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             if let Some(id) = bus_msg.get("id").map(|s| s.to_string()) {
                 if let Some(pending) = state.pending_responses.take_response(&id, &tx).await {
                     let observe = state.observe.for_class(pending.traffic_class);
+                    let _reg = state.registry.read().await;
+                    let mut sessions = state.sessions.lock().await;
+                    let principal = if let Some(p) = &state.principal {
+                        match sessions.delivery_now(p, &pending.caller_tx) {
+                            Ok(p) => p,
+                            Err(error) => {
+                                let reply = session_delivery_error(
+                                    &error,
+                                    pending.caller_verified,
+                                    Some(&pending.caller_id),
+                                    bus_msg.command_name(),
+                                );
+                                let _ = pending.caller_tx.try_send(reply.to_wire());
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let wire = canonicalize_correlated_response(
                         &mut bus_msg,
                         &pending.caller_id,
                         service_name.as_deref(),
                         pending.caller_service.as_deref(),
                         broker_origin_for_delivery(source_ip, &state.bind),
-                        state.principal.as_ref().filter(|_| pending.caller_verified),
+                        principal.as_ref().filter(|_| pending.caller_verified),
                     );
                     if observe.is_active() {
                         let outcome = match pending.caller_tx.try_send(wire.clone()) {
@@ -2535,6 +2667,7 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 let origin = broker_origin_for_delivery(source_ip, &state.bind);
                 stamp_broker_origin(&mut bus_msg, origin);
                 let canonical_text = bus_msg.to_wire();
+                let canonical_message = observing.then(|| bus_msg.clone());
                 // `route_local` mutates `bus_msg`'s `id` to the broker-local
                 // rewrite. Use the wire bytes it returns (id-rewritten) for
                 // the tap so observers see exactly what the target service
@@ -2567,7 +2700,10 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                         Observation::from_message(
                             ObserveDirection::Local,
                             route_result.outcome,
-                            &bus_msg,
+                            canonical_message
+                                .as_ref()
+                                .filter(|_| route_result.forwarded_wire.is_none())
+                                .unwrap_or(&bus_msg),
                             observed_wire,
                             correlation_id.as_deref(),
                         )
@@ -2772,6 +2908,16 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
             break;
         }
     }
+
+    if let Some(p) = &state.principal {
+        let mut reg = state.registry.write().await;
+        state
+            .sessions
+            .lock()
+            .await
+            .disconnect(p.connection_id, &mut reg);
+    }
+    state.sessions.lock().await.close_outbox(channel_id);
 
     // SPEC 13 §5.5 (2-c-2c) — drop this session from the live gated set. A
     // reload teardown that selected this session already drained its pending +
@@ -3143,6 +3289,34 @@ struct LocalRouteResult {
     outcome: ObserveOutcome,
 }
 
+fn session_delivery_error(
+    error: &cosmix_bus::native_session::SessionError,
+    verified: bool,
+    id: Option<&str>,
+    command: Option<&str>,
+) -> BusMessage {
+    let mut body = serde_json::to_value(error).expect("session error");
+    let code = body["error_code"].as_str().expect("error code").to_owned();
+    let mut reply = BusMessage::new()
+        .with_header("type", "response")
+        .with_header("rc", &error.rc().to_string())
+        .with_header("error", &code);
+    if verified {
+        reply.set("bus", "1");
+        reply.set("native-session", "1");
+    } else {
+        body["error"] = code.into();
+    }
+    if let Some(id) = id {
+        reply.set("id", id);
+    }
+    if let Some(command) = command {
+        reply.set("command", command);
+    }
+    reply.body = body.to_string();
+    reply
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn route_local(
     state: &AppState,
@@ -3165,6 +3339,9 @@ async fn route_local(
     let scoped_observe = state.observe.for_class(traffic_class);
     let observe = &scoped_observe;
     if let Some(target_tx) = reg.get(service).map(|e| e.tx.clone()) {
+        // Pending registration may contend across a lease deadline. Hold no
+        // registry/session guard until it completes, then revalidate the route.
+        drop(reg);
         // Register pending BEFORE rewriting the wire bytes so the
         // broker_id we insert under matches the id we serialise into the
         // forwarded wire. `register` is a no-op (returns `None`) for
@@ -3180,17 +3357,36 @@ async fn route_local(
                 state.principal.is_some(),
             )
             .await;
-        // Destination transport, not merely sender identity, gates metadata.
-        let principal = state.principal.as_ref().filter(|_| {
+        let reg = registry.read().await;
+        // An entry may become protected on the same channel while pending
+        // registration waits. Preserve old protection and include its new class.
+        let traffic_class = traffic_class.merge(
             reg.get(service)
-                .is_some_and(|e| e.traffic_class.protected())
-        });
-        stamp_principal(msg, principal).expect("principal validated at upgrade");
-        let (wire, delivery) = {
+                .map(|e| e.traffic_class)
+                .unwrap_or_default(),
+        );
+        let scoped_observe = state.observe.for_class(traffic_class);
+        let observe = &scoped_observe;
+        let mut sessions = if state.principal.is_some() || traffic_class.protected() {
+            Some(state.sessions.lock().await)
+        } else {
+            None
+        };
+        let attempt = (|| {
             let _fence = state
                 .delivery_fence
                 .read()
                 .expect("delivery fence poisoned");
+            if !reg
+                .get(service)
+                .is_some_and(|entry| entry.same_channel(&target_tx))
+            {
+                return Err(cosmix_bus::native_session::SessionError {
+                    error_code: cosmix_bus::native_session::ErrorCode::Unavailable,
+                    message: "recipient changed before delivery".into(),
+                    details: Default::default(),
+                });
+            }
             let owns_registration = caller_service
                 .and_then(|name| reg.get(name))
                 .is_some_and(|entry| entry.same_channel(caller_tx));
@@ -3202,6 +3398,26 @@ async fn route_local(
                 msg.set(crate::subscription::BROKER_PEER_HEADER, &peer);
                 msg.set(crate::subscription::BROKER_SERVICE_HEADER, origin_service);
             }
+            // Recompute immediately before serialisation/enqueue, after every
+            // awaited lock and the delivery fence. Revocation shares this lock.
+            if let Some(sessions) = sessions.as_mut() {
+                sessions.validate_route(service)?;
+            }
+            let fresh_principal = match (&state.principal, sessions.as_mut()) {
+                (Some(p), Some(sessions)) => sessions.delivery_now(p, &target_tx)?,
+                _ => None,
+            };
+            let principal = fresh_principal.as_ref().filter(|_| {
+                reg.get(service)
+                    .is_some_and(|e| e.traffic_class.protected())
+            });
+            stamp_principal(msg, principal).map_err(|_| {
+                cosmix_bus::native_session::SessionError {
+                    error_code: cosmix_bus::native_session::ErrorCode::Unavailable,
+                    message: "broker principal cannot be encoded".into(),
+                    details: Default::default(),
+                }
+            })?;
             let wire = msg.to_wire();
             // Mark before enqueue: a fast recipient may respond immediately.
             // Failed enqueue may conservatively protect this connection too.
@@ -3212,7 +3428,37 @@ async fn route_local(
                     .store(true, Ordering::Release);
             }
             let delivery = target_tx.try_send(wire.clone());
-            (wire, delivery)
+            Ok((wire, delivery))
+        })();
+        drop(sessions);
+        let (wire, delivery) = match attempt {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                drop(reg);
+                let caller_id = match broker_id {
+                    Some(ref bid) => pending_responses.take(bid).await.map(|p| p.caller_id),
+                    None => None,
+                };
+                let reply = session_delivery_error(
+                    &error,
+                    state.principal.is_some(),
+                    caller_id.as_deref(),
+                    msg.command_name(),
+                );
+                deliver_observed_response(
+                    observe,
+                    caller_tx,
+                    &reply,
+                    ObserveDirection::Local,
+                    reply.get("id"),
+                );
+                return LocalRouteResult {
+                    traffic_class,
+                    target_tx: Some(target_tx),
+                    forwarded_wire: None,
+                    outcome: ObserveOutcome::Rejected,
+                };
+            }
         };
         match delivery {
             Ok(()) => LocalRouteResult {
@@ -3236,6 +3482,7 @@ async fn route_local(
                 // `msg`'s `id` is now the broker-local rewrite. If
                 // registration didn't insert anything (id-less message)
                 // there's nothing to take and no reply id to attach.
+                drop(reg);
                 let caller_id = match broker_id {
                     Some(ref bid) => pending_responses.take(bid).await.map(|p| p.caller_id),
                     None => None,
@@ -3250,7 +3497,6 @@ async fn route_local(
                 if let Some(id) = caller_id {
                     err.set("id", &id);
                 }
-                drop(reg);
                 deliver_observed_response(
                     observe,
                     caller_tx,
@@ -3307,7 +3553,7 @@ async fn route_local(
                 LocalRouteResult {
                     traffic_class,
                     target_tx: None,
-                    forwarded_wire: Some(wire),
+                    forwarded_wire: None,
                     outcome: ObserveOutcome::Rejected,
                 }
             }
@@ -3485,6 +3731,16 @@ async fn handle_noded_command(
 
     match command {
         "noded.register" => {
+            if state
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.session.is_some())
+            {
+                let mut resp = respond("10");
+                resp.body = r#"{"error_code":"CONFLICT","message":"attached identity cannot be renamed","details":{}}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             let from = match msg.from_addr() {
                 Some(f) => f.to_string(),
                 None => {
@@ -3500,6 +3756,16 @@ async fn handle_noded_command(
                     "error",
                     "noded.register 'from' must match ^[a-z][a-z0-9-]{1,30}$",
                 );
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
+            // BROKER-017 reserves the SHAPE, including unissued names and
+            // non-canonical UID lookalikes. This precedes provenance parsing
+            // and registry mutation on every ingress, even without Unix.
+            if reserved_session_name(&from) {
+                let mut resp = respond("10");
+                resp.set("error", "reserved_name");
+                resp.body = r#"{"error":"reserved_name"}"#.into();
                 let _ = tx.try_send(resp.to_wire());
                 return;
             }
@@ -3522,6 +3788,7 @@ async fn handle_noded_command(
                 })
             };
             let info = cosmix_bus::ServiceInfo {
+                native_session: None,
                 name: from.clone(),
                 binary: prov.binary,
                 version: prov.version,
@@ -3619,6 +3886,16 @@ async fn handle_noded_command(
         }
 
         "noded.deregister" => {
+            if state
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.session.is_some())
+            {
+                let mut resp = respond("10");
+                resp.body = r#"{"error_code":"CONFLICT","message":"attached identity requires session revoke","details":{}}"#.into();
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
             // SPEC 18 §3.5 graceful shutdown: a citizen removes its own
             // registered name and awaits this response BEFORE exiting, so
             // the broker never routes a request to a dead name in the race
@@ -3687,11 +3964,40 @@ async fn handle_noded_command(
             // (cosmix_bus::ServiceInfo tolerates both shapes) so a new
             // client tolerates an old broker during the client-first
             // rollout (§9).
-            let mut services: Vec<cosmix_bus::ServiceInfo> = {
-                let reg = state.registry.read().await;
-                reg.values().map(|e| e.info.clone()).collect()
+            let services: Vec<serde_json::Value> = {
+                let mut reg = state.registry.write().await;
+                let mut sessions = state.sessions.lock().await;
+                let now = match sessions.maintain_now(&mut reg) {
+                    Ok(now) => now,
+                    Err(error) => {
+                        let reply = session_delivery_error(
+                            &error,
+                            state.principal.is_some(),
+                            msg.get("id"),
+                            msg.command_name(),
+                        );
+                        let _ = tx.try_send(reply.to_wire());
+                        return;
+                    }
+                };
+                let mut entries: Vec<_> = reg
+                    .keys()
+                    .map(String::as_str)
+                    .chain(sessions.discovery_names())
+                    .collect();
+                entries.sort_unstable();
+                entries.dedup();
+                entries
+                    .into_iter()
+                    .map(|name| {
+                        sessions
+                            .discovery(name, state.principal.as_ref().map(|p| p.unix_uid), now)
+                            .unwrap_or_else(|| {
+                                serde_json::to_value(&reg[name].info).expect("service info")
+                            })
+                    })
+                    .collect()
             };
-            services.sort_by(|a, b| a.name.cmp(&b.name));
             let body = serde_json::to_string(&services).unwrap_or_else(|_| "[]".to_string());
 
             let mut resp = respond("0");
@@ -3707,6 +4013,7 @@ async fn handle_noded_command(
             let service_count = { state.registry.read().await.len() as u16 };
             let bi = cosmix_buildinfo::build_info!();
             let noded_self = cosmix_bus::ServiceInfo {
+                native_session: None,
                 name: "noded".to_string(),
                 binary: Some(bi.pkg.to_string()),
                 version: Some(bi.version.to_string()),
@@ -3761,6 +4068,15 @@ async fn handle_noded_command(
                 body["extensions"]["native-session"] = "1".into();
                 body["extensions"]["native-session-endpoint"] =
                     endpoint.to_string_lossy().into_owned().into();
+                body["native_session_limits"] = serde_json::json!({
+                    "issued_names_per_epoch": session::MAX_ISSUED.to_string(),
+                    "terms_per_uid":"64",
+                    "pending_grants_per_parent":state.sessions.lock().await.pending_grants_per_parent().to_string(),
+                    "pending_grants_global":"1024",
+                    "challenges_per_uid":"128","key_interests_per_uid":"256",
+                    "recipient_dependencies_per_connection":"256","recipient_dependencies_global":"8192",
+                    "lifecycle_notices_per_connection":"256","lifecycle_notices_global":"4096"
+                });
                 resp.body = body.to_string();
             }
             let _ = tx.try_send(resp.to_wire());
@@ -3952,18 +4268,27 @@ async fn handle_noded_command(
                 )
                 .await
             {
-                Ok((seq, delivered, notices)) => {
+                Ok(outcome) => {
                     let mut resp = respond("0");
                     resp.set("command", "topic.publish");
-                    resp.body = format!(r#"{{"seq": {seq}, "delivered": {delivered}}}"#);
+                    resp.body = outcome.body().to_string();
                     let _ = tx.try_send(resp.to_wire());
-                    dispatch_notifications(state, &notices).await;
+                    dispatch_notifications(state, &outcome.notifications).await;
                 }
                 Err(e) => {
-                    let mut resp = respond("10");
+                    let mut resp = match e.session_error() {
+                        Some(error) => session_delivery_error(
+                            error,
+                            state.principal.is_some(),
+                            msg.get("id"),
+                            Some("topic.publish"),
+                        ),
+                        None => respond(&e.rc().to_string()),
+                    };
                     resp.set("command", "topic.publish");
                     resp.body = e.error_body();
                     let _ = tx.try_send(resp.to_wire());
+                    dispatch_notifications(state, e.notifications()).await;
                 }
             }
         }
@@ -4414,6 +4739,24 @@ async fn handle_noded_command(
             let _ = tx.try_send(resp.to_wire());
         }
     }
+}
+
+/// BROKER-017: deliberately does not decode the UID. Leading-zero and
+/// overflowing encodings are reserved just like canonically issued names.
+fn reserved_session_name(name: &str) -> bool {
+    let Some((prefix, suffix)) = name.split_once('-') else {
+        return false;
+    };
+    let bytes = prefix.as_bytes();
+    (2..=8).contains(&bytes.len())
+        && matches!(bytes[0], b't' | b'c')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && suffix.len() == 22
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
 }
 
 fn valid_service_name(name: &str) -> bool {
@@ -5136,6 +5479,7 @@ mod tests {
         let broker = Arc::new(SubscriptionBroker::new());
         let started = Instant::now();
         AppState {
+            sessions: Default::default(),
             protected_responses: Default::default(),
             broker_epoch: super::HexBytes([1; 16]),
             principal: None,
@@ -5465,7 +5809,9 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    session_probe: None,
                     unix_socket: None,
+                    pending_grants_per_parent: 32,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5550,7 +5896,9 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    session_probe: None,
                     unix_socket: None,
+                    pending_grants_per_parent: 32,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -5702,7 +6050,9 @@ mod tests {
         tokio::spawn(async move {
             let _ = super::run(
                 super::RunConfig {
+                    session_probe: None,
                     unix_socket: None,
+                    pending_grants_per_parent: 32,
                     listen: listen_for_run,
                     node: "test-node".into(),
                     wg_ip: "127.0.0.1".into(),
@@ -6397,6 +6747,168 @@ mod tests {
         assert_eq!(msg.get("from"), None);
     }
 
+    #[tokio::test]
+    async fn oversized_principal_refuses_without_poisoning_delivery_fence() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let (mut sessions, _, mut principal, _) =
+            super::session::queue_tests::allocated_at(super::session::now_ms().unwrap());
+        let (caller, mut replies) = mpsc::channel(8);
+        principal.owner_node = "x".repeat(5000);
+        sessions.connect(&principal, &caller, Default::default(), Default::default());
+        state.principal = Some(principal);
+        state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
+        let (target, mut received) = mpsc::channel(8);
+        state.registry.write().await.insert(
+            "recipient".into(),
+            super::ServiceEntry {
+                tx: target,
+                traffic_class: super::TrafficClass::NativeSession,
+                protected_responses: Default::default(),
+                info: Default::default(),
+            },
+        );
+        let mut request = BusMessage::new().with_header("id", "oversized");
+        let admission = super::SessionAdmission::default();
+        let result = super::route_local(
+            &state,
+            "recipient",
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, super::ObserveOutcome::Rejected);
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            bus_mod::parse(&replies.try_recv().unwrap())
+                .unwrap()
+                .get("rc"),
+            Some("20")
+        );
+        assert!(!state.delivery_fence.is_poisoned());
+        assert!(state.pending_responses.map.read().await.is_empty());
+        state.principal = None;
+        let result = super::route_local(
+            &state,
+            "recipient",
+            &mut BusMessage::new(),
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, super::ObserveOutcome::Delivered);
+    }
+
+    #[tokio::test]
+    async fn pending_wait_reclassifies_a_newly_protected_expired_target() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let (sessions, mut registry, _, _) = super::session::queue_tests::allocated_at(
+            super::session::now_ms().unwrap().saturating_sub(15_000),
+        );
+        let name = registry.keys().next().unwrap().clone();
+        let (target, mut received) = mpsc::channel(8);
+        let entry = registry.get_mut(&name).unwrap();
+        entry.tx = target;
+        entry.traffic_class = super::TrafficClass::Legacy;
+        *state.registry.write().await = registry;
+        state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
+        let (caller, mut replies) = mpsc::channel(8);
+        let mut request = BusMessage::new().with_header("id", "reclassify");
+        let admission = super::SessionAdmission::default();
+        let pending = state.pending_responses.map.write().await;
+        let route = super::route_local(
+            &state,
+            &name,
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        );
+        tokio::pin!(route);
+        assert!(futures_util::poll!(&mut route).is_pending());
+        state
+            .registry
+            .write()
+            .await
+            .get_mut(&name)
+            .unwrap()
+            .traffic_class = super::TrafficClass::NativeSession;
+        drop(pending);
+        let result = route.await;
+        assert_eq!(result.outcome, super::ObserveOutcome::Rejected);
+        assert!(result.traffic_class.protected());
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            bus_mod::parse(&replies.try_recv().unwrap())
+                .unwrap()
+                .get("error"),
+            Some("EXPIRED")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_contention_releases_authority_locks_and_rechecks_delivery() {
+        let mut state = reload_test_state(reload_posture(1, vec![]), vec![]).await;
+        let now = super::session::now_ms().unwrap();
+        let (sessions, registry, principal, _) = super::session::queue_tests::allocated_at(now);
+        state.principal = sessions.principal(principal.connection_id, now);
+        state.sessions = Arc::new(tokio::sync::Mutex::new(sessions));
+        *state.registry.write().await = registry;
+        let (target, mut received) = mpsc::channel(8);
+        state.registry.write().await.insert(
+            "recipient".into(),
+            super::ServiceEntry {
+                protected_responses: Default::default(),
+                traffic_class: super::TrafficClass::NativeSession,
+                tx: target,
+                info: Default::default(),
+            },
+        );
+        let (caller, mut replies) = mpsc::channel(8);
+        let mut request = BusMessage::new()
+            .with_header("id", "original")
+            .with_header("command", "probe.echo");
+        let pending_guard = state.pending_responses.map.write().await;
+        let admission = super::SessionAdmission::default();
+        let route = super::route_local(
+            &state,
+            "recipient",
+            &mut request,
+            &caller,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &admission,
+            None,
+        );
+        tokio::pin!(route);
+        assert!(futures_util::poll!(&mut route).is_pending());
+        let mut registry =
+            tokio::time::timeout(std::time::Duration::from_secs(1), state.registry.write())
+                .await
+                .unwrap();
+        state
+            .sessions
+            .lock()
+            .await
+            .maintain(&mut registry, now + 15_000);
+        drop(registry);
+        drop(pending_guard);
+        assert_eq!(route.await.outcome, super::ObserveOutcome::Rejected);
+        assert!(received.try_recv().is_err());
+        assert!(state.pending_responses.map.read().await.is_empty());
+        let reply = cosmix_bus::bus::parse(&replies.recv().await.unwrap()).unwrap();
+        assert_eq!(reply.get("id"), Some("original"));
+        assert_eq!(reply.get("error"), Some("EXPIRED"));
+    }
+
     async fn mesh_delivery_test_state() -> AppState {
         use base64::Engine as _;
         let mut posture = reload_posture(1, vec![]);
@@ -6635,39 +7147,53 @@ mod tests {
             );
         }
         let pending_guard = state.pending_responses.map.write().await;
-        let task_state = state.clone();
-        let task = tokio::spawn(async move {
-            let mut request = BusMessage::new()
-                .with_header("id", "original")
-                .with_header("broker_origin", "mesh");
-            let admission = super::SessionAdmission {
-                admitted_node: Some("beta".into()),
-                response_seen: true,
-                last_detail: None,
-            };
-            super::route_local(
-                &task_state,
-                "desktop",
-                &mut request,
-                &caller,
-                Some("bridge-beta"),
-                "192.0.2.2".parse().unwrap(),
-                &admission,
-                Some("desktopctl"),
-            )
-            .await;
-        });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while state.registry.try_write().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut request = BusMessage::new()
+            .with_header("id", "original")
+            .with_header("broker_origin", "mesh");
+        let admission = super::SessionAdmission {
+            admitted_node: Some("beta".into()),
+            response_seen: true,
+            last_detail: None,
+        };
+        let source = "192.0.2.2".parse().unwrap();
+        assert_eq!(
+            super::admitted_delivery_peer(&state, source, Some("bridge-beta"), &admission),
+            Some("beta".into()),
+            "the old authority must permit the stamp before the reload"
+        );
+        let next_id = state.pending_responses.next_id.load(Ordering::Relaxed);
+        let route = super::route_local(
+            &state,
+            "desktop",
+            &mut request,
+            &caller,
+            Some("bridge-beta"),
+            source,
+            &admission,
+            Some("desktopctl"),
+        );
+        tokio::pin!(route);
+        // Poll directly to the held pending lock. Registry ownership is no
+        // longer a wait signal: M1 deliberately releases it before this await.
+        assert!(futures_util::poll!(&mut route).is_pending());
+        assert_eq!(
+            state.pending_responses.next_id.load(Ordering::Relaxed),
+            next_id + 1
+        );
+        assert!(state.registry.try_write().is_ok());
+        assert!(target_rx.try_recv().is_err());
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            apply_inventory_reload(&state, reload_posture(2, vec![])),
+        )
         .await
         .unwrap();
-        apply_inventory_reload(&state, reload_posture(2, vec![])).await;
         drop(pending_guard);
-        task.await.unwrap();
-        let delivered = bus_mod::parse(&target_rx.recv().await.unwrap()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), route)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, super::ObserveOutcome::Delivered);
+        let delivered = bus_mod::parse(&target_rx.try_recv().unwrap()).unwrap();
         assert_eq!(delivered.get("broker_peer"), None);
         assert_eq!(delivered.get("broker_service"), None);
     }
