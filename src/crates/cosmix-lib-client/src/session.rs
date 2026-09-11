@@ -296,6 +296,50 @@ impl VerifiedConnection {
     pub async fn session_self(&self, record_id: HexBytes<16>) -> SessionResult<RecordResult> {
         self.session_rpc("self", SelfArgs { record_id }).await
     }
+    /// Renew the caller's OWN attachment and bind the conservative local
+    /// deadline that renewal establishes, plus the context it is bound to.
+    ///
+    /// `lease.check` cannot answer for this record. That verb requires the
+    /// asking connection to hold a delivery dependency on the target
+    /// (PROP-025), which is registered when the target's stamped traffic is
+    /// routed to the asker — so a recipient never holds one on its own
+    /// attachment and always gets `CONFLICT`/`dependency_missing`. Renew is
+    /// the honest source: BROKER-020 makes it refuse unless the record is
+    /// attached on this very connection, and it returns the refreshed
+    /// remainder. Recipients call this on their existing renew cadence, so an
+    /// own-attachment deadline costs no extra round trip and is never
+    /// established inside request resolution.
+    pub async fn session_renew_lease(
+        &self,
+        target: RecordRef,
+    ) -> SessionResult<(RecordResult, Hello, Deadline)> {
+        let context = self.session_hello().await?;
+        let start = boottime_ms()?;
+        let result: RecordResult = self
+            .session_rpc(
+                "renew",
+                TargetArgs {
+                    target: target.clone(),
+                },
+            )
+            .await?;
+        // An attached record always reports its remainder; absence means the
+        // peer answered about something other than a live attachment.
+        let remaining = result
+            .record
+            .lease_remaining_ms
+            .ok_or(SessionFailure::InvalidResponse)?;
+        let deadline = Deadline {
+            target,
+            broker_epoch: context.broker_epoch,
+            connection_id: context.connection_id,
+            expires_ms: start.saturating_add(remaining.0),
+        };
+        if !deadline.is_live(&context)? {
+            return Err(SessionFailure::LeaseExpired);
+        }
+        Ok((result, context, deadline))
+    }
     /// Captures request-start CLOCK_BOOTTIME internally. Gaps invalidate results.
     pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
         // This handle owns one transport and does not reconnect transparently.

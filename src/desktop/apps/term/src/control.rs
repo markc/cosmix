@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const RETENTION: Duration = Duration::from_secs(900);
+/// BROKER-020's renew cadence. A cached bound-caller check is reused no longer
+/// than one such window, so a revocation missed by every notice still closes
+/// the lane within the lease it was granted under.
+const LEASE_WINDOW: Duration = Duration::from_secs(5);
 const PER_ACTOR: usize = 1024;
 const TOTAL: usize = 4096;
 const ACTORS: usize = 256;
@@ -159,6 +163,12 @@ struct History {
 struct State {
     history: HashMap<String, History>,
     permits: Vec<(Option<RecordRef>, std::sync::Weak<Permit>)>,
+    /// Bound-caller lease checks, reused within one lease window. Lifecycle
+    /// notices and gaps drop these with the permits they authorised, so a
+    /// cached check can never outlive the authority it recorded. A list, not a
+    /// map: `RecordRef` is a wire type without `Hash`, and this holds at most
+    /// one entry per live bound child.
+    leases: Vec<(RecordRef, Instant, Deadline)>,
 }
 
 struct InputNotice {
@@ -262,6 +272,17 @@ impl Control {
 
     pub fn invalidate(&self, target: Option<&RecordRef>) {
         let mut state = self.state.lock().unwrap();
+        // Drop the cached checks first: a notice or gap means the authority
+        // they recorded is no longer current, and the next request must pay
+        // for a fresh one rather than resolve against a stale window.
+        match target {
+            None => state.leases.clear(),
+            Some(t) => state.leases.retain(|(reference, _, _)| {
+                reference.record_id != t.record_id
+                    || reference.incarnation != t.incarnation
+                    || reference.binding_generation.0 > t.binding_generation.0
+            }),
+        }
         state.permits.retain(|(actor, weak)| {
             let Some(permit) = weak.upgrade() else {
                 return false;
@@ -287,6 +308,7 @@ impl Control {
         &self,
         connection: &VerifiedConnection,
         parent: &SessionRecord,
+        own: &(Hello, Deadline),
         event: &VerifiedCommand,
     ) -> Reply {
         let native = &self.native;
@@ -367,33 +389,67 @@ impl Control {
         if capability == Capability::Execute {
             return Reply::error("UNSUPPORTED");
         }
-        // RPCs run outside both the model and policy locks. A failed check
-        // grants no authority, including to an otherwise ambient owner when
-        // the recipient's own native attachment has become unavailable.
-        let checked = tokio::time::timeout(Duration::from_secs(2), async {
-            let hello = connection.session_hello().await.ok()?;
-            let parent_deadline = connection
-                .session_lease_check(parent.reference())
-                .await
-                .ok()?;
-            let actor_deadline = if let Some(s) = &actor.session {
-                Some(connection.session_lease_check(reference(s)).await.ok()?)
-            } else {
-                None
-            };
-            Some((hello, parent_deadline, actor_deadline))
-        })
-        .await;
-        let Ok(Some((hello, parent_deadline, actor_deadline))) = checked else {
-            return Reply::error("FORBIDDEN");
-        };
-        if !parent_deadline.is_live(&hello).unwrap_or(false)
-            || actor_deadline
-                .as_ref()
-                .is_some_and(|a| !a.is_live(&hello).unwrap_or(false))
+        // The recipient's own deadline comes from its renew cadence, never
+        // from a check made here: `lease.check` answers only for a record this
+        // connection holds a delivery dependency on (PROP-025), which a
+        // recipient never holds on its own attachment. A failed or stale renew
+        // leaves no deadline at all, so an otherwise ambient owner loses
+        // protected access the moment Term's own attachment does.
+        let (hello, parent_deadline) = (own.0.clone(), own.1.clone());
+        if parent_deadline.target() != &parent.reference()
+            || !parent_deadline.is_live(&hello).unwrap_or(false)
         {
             return Reply::error("FORBIDDEN");
         }
+        // A bound caller's own lease is checked against the broker. Its request
+        // registered the dependency this needs, so the check is answerable, and
+        // it completes here — outside the synchronous capability resolution
+        // below, which may never block on a Bus call (PROP-024). A live cached
+        // check from this lease window satisfies the requirement instead.
+        let actor_deadline = if let Some(s) = &actor.session {
+            let reference = reference(s);
+            let cached = self
+                .state
+                .lock()
+                .unwrap()
+                .leases
+                .iter()
+                .find(|(target, at, deadline)| {
+                    *target == reference
+                        && at.elapsed() < LEASE_WINDOW
+                        && deadline.is_live(&hello).unwrap_or(false)
+                })
+                .map(|(_, _, deadline)| deadline.clone());
+            let deadline = match cached {
+                Some(deadline) => deadline,
+                None => {
+                    let fresh = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        connection.session_lease_check(reference.clone()),
+                    )
+                    .await;
+                    let Ok(Ok(deadline)) = fresh else {
+                        return Reply::error("FORBIDDEN");
+                    };
+                    let mut state = self.state.lock().unwrap();
+                    state.leases.retain(|(target, at, _)| {
+                        *target != reference && at.elapsed() < LEASE_WINDOW
+                    });
+                    if state.leases.len() < ACTORS {
+                        state
+                            .leases
+                            .push((reference, Instant::now(), deadline.clone()));
+                    }
+                    deadline
+                }
+            };
+            if !deadline.is_live(&hello).unwrap_or(false) {
+                return Reply::error("FORBIDDEN");
+            }
+            Some(deadline)
+        } else {
+            None
+        };
         // A completed close can be retried after removal of its pane. Resolve
         // retained results after actor/recipient lease checks but before live
         // target lookup. Retired IDs never re-enter the mutation path.
