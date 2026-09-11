@@ -36,6 +36,19 @@ pub struct Broker {
     root: PathBuf,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    pause: Option<tokio::sync::mpsc::UnboundedSender<PauseRequest>>,
+    grant_limit: usize,
+}
+
+type PauseRequest = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+pub struct Paused(std::sync::mpsc::SyncSender<()>);
+impl Drop for Paused {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 impl Default for Broker {
@@ -46,6 +59,10 @@ impl Default for Broker {
 
 impl Broker {
     pub fn start() -> Self {
+        Self::with_grant_limit(32)
+    }
+
+    pub fn with_grant_limit(grant_limit: usize) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let root =
             std::env::temp_dir().join(format!("term-native-{:032x}", rand::random::<u128>()));
@@ -60,6 +77,8 @@ impl Broker {
             url: String::new(),
             stop: None,
             worker: None,
+            pause: None,
+            grant_limit,
         };
         broker.boot();
         broker
@@ -84,7 +103,10 @@ impl Broker {
         let endpoint = self.endpoint.clone();
         let options = self.options();
         let url = self.url.clone();
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let (pause_tx, mut pause_rx) = tokio::sync::mpsc::unbounded_channel::<PauseRequest>();
+        self.pause = Some(pause_tx);
+        let grant_limit = self.grant_limit;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         self.stop = Some(stop_tx);
         self.worker = Some(std::thread::spawn(move || {
@@ -97,7 +119,7 @@ impl Broker {
                 let broker = tokio::spawn(noded::run(
                     noded::RunConfig {
                         unix_socket: Some(endpoint),
-                        pending_grants_per_parent: 32,
+                        pending_grants_per_parent: grant_limit,
                         listen,
                         node: "test-node".into(),
                         wg_ip: "127.0.0.1".into(),
@@ -124,7 +146,18 @@ impl Broker {
                 };
                 probe.client().close().await;
                 ready_tx.send(()).unwrap();
-                let _ = stop_rx.await;
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        Some((entered, release)) = pause_rx.recv() => {
+                            // Deliberately stall the real single-thread broker
+                            // runtime, including accepted UDS sockets. Drop of
+                            // Paused releases it even if a test assertion panics.
+                            let _ = entered.send(());
+                            let _ = release.recv_timeout(Duration::from_secs(15));
+                        }
+                    }
+                }
                 broker.abort();
                 let _ = broker.await;
             });
@@ -141,6 +174,18 @@ impl Broker {
         if let Some(worker) = self.worker.take() {
             worker.join().unwrap();
         }
+    }
+
+    pub fn pause(&self) -> Paused {
+        let (entered, ack) = std::sync::mpsc::sync_channel(1);
+        let (release, resumed) = std::sync::mpsc::sync_channel(1);
+        self.pause
+            .as_ref()
+            .unwrap()
+            .send((entered, resumed))
+            .unwrap();
+        ack.recv_timeout(Duration::from_secs(3)).unwrap();
+        Paused(release)
     }
 
     pub fn bounce(&mut self) {
