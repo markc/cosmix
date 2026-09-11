@@ -8,9 +8,11 @@
 -- gate passing while running zero enforcement tests. Requiring the exact
 -- expected "N passed" turns any of those into a failure.
 --
--- Run from the repository root. The cross-UID fixture is NOT included: it needs
--- root plus a second UID, refuses to pass silently without them, and is
--- documented separately in docs/cos/term-native-control.md.
+-- Run from the repository src/ directory, like its sibling
+-- check-production-e2e.mix. That script owns p0i-01, so this one does not
+-- repeat it. The cross-UID fixture is NOT included either: it needs root plus a
+-- second UID, refuses to pass silently without them, and is documented in
+-- docs/cos/term-native-control.md.
 
 -- Every S4 fixture this gate is responsible for, by full test path, and nothing
 -- else. Full paths so a module rename cannot be absorbed by a prefix match.
@@ -28,14 +30,13 @@ $fixtures = [
   "native_session::enforcement_tests::p0i_10_launch_failures_reach_real_recipient_denial",
   "native_session::enforcement_tests::p0i_10_parent_bootstrap_outage_has_only_diagnostic_lane",
   "native_session::enforcement_tests::p0i_10_real_tcp_fallback_is_control_free",
-  "native_session::enforcement_tests::p0i_10_unbound_pane_has_no_control",
-  "native_session::production_e2e::p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes"
+  "native_session::enforcement_tests::p0i_10_unbound_pane_has_no_control"
 ]
 $expected = length($fixtures)
 
 $root = cwd()
-if not exists($root + "/src/desktop/apps/term/src/control.rs") then
-  print("GATE BLOCKED: run from the repository root (src/desktop/apps/term not found)")
+if not exists($root + "/desktop/apps/term/src/control.rs") then
+  print("GATE BLOCKED: run from the repository src/ directory")
   exit(2)
 end
 
@@ -43,28 +44,29 @@ end
 -- build's git sha against HEAD and require a clean checkout. Build it here so
 -- the gate cannot be satisfied by whatever happens to be lying in target/.
 print("building the current-HEAD Mix the fixtures require ...")
-$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {cwd: $root + "/src", timeout: 3000})
+-- RUSTC_WRAPPER disabled as in the sibling gate: a caching layer must never
+-- be able to decide whether this passes.
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 3000, env: {"RUSTC_WRAPPER": ""}})
 if $build["exit_code"] != 0 then
   print($build["stderr"])
   print("GATE BLOCKED: could not build cosmix-mix; an unbuilt binary is not a pass")
   exit(2)
 end
-$binary = $root + "/src/target/release/mix"
+$binary = $root + "/target/release/mix"
 if not exists($binary) then
   print("GATE BLOCKED: " + $binary + " missing after a successful build")
   exit(2)
 end
 
 $argv = concat(
-  ["cargo", "test", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
   $fixtures
 )
 
 print("running " + $expected + " S4 enforcement fixtures ...")
 $run = run_argv($argv, {
-  cwd: $root + "/src/desktop",
   timeout: 3000,
-  env: {COSMIX_E2E_MIX_BIN: $binary}
+  env: {COSMIX_E2E_MIX_BIN: $binary, "RUSTC_WRAPPER": ""}
 })
 print($run["stdout"])
 
@@ -84,7 +86,7 @@ if not contains($run["stdout"], $want) then
 end
 
 print("GATE PASS: " + $expected + " S4 enforcement fixtures ran and passed")
-print("NOT covered here: p0i_07_other_uid_both_policies needs root plus a second")
-print("UID. It refuses rather than passing silently; see the manual for how to")
-print("run it deliberately.")
+print("NOT covered here: p0i-01 belongs to check-production-e2e.mix, and")
+print("p0i_07_other_uid_both_policies needs root plus a second UID. That one")
+print("refuses rather than passing silently; see the manual to run it.")
 exit(0)
