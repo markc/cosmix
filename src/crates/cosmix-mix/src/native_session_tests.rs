@@ -612,3 +612,371 @@ async fn real_broker_challenge_expiry_recovers_without_a_lifecycle_notice() {
     );
     assert!(received.try_recv().unwrap());
 }
+
+/// A byte relay that adds an adjustable one-way delay to everything it
+/// forwards, so a resident on one connection pays a realistic per-RPC cost
+/// against an embedded broker whose real round trip is microseconds. It runs in
+/// the same process and under the same uid as the broker, so BUS-013 endpoint
+/// ownership and peer-credential verification are unchanged by it.
+struct SlowEndpoint {
+    path: std::path::PathBuf,
+    root: std::path::PathBuf,
+    delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SlowEndpoint {
+    fn start(target: &std::path::Path, delay: Duration) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        // The broker's own root is 0755 for the same reason: a 0700 ancestor
+        // fails endpoint verification outright, which would look like a
+        // profile problem rather than a fixture one.
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("mix-slow-session-{unique}"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("bus.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let delay_ms =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(delay.as_millis() as u64));
+        let target = target.to_path_buf();
+        let forwarded = delay_ms.clone();
+        tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                let target = target.clone();
+                let forwarded = forwarded.clone();
+                tokio::spawn(async move {
+                    let Ok(outbound) = tokio::net::UnixStream::connect(&target).await else {
+                        return;
+                    };
+                    let (from_client, to_client) = inbound.into_split();
+                    let (from_broker, to_broker) = outbound.into_split();
+                    tokio::join!(
+                        pump(from_client, to_broker, forwarded.clone()),
+                        pump(from_broker, to_client, forwarded),
+                    );
+                });
+            }
+        });
+        Self {
+            path,
+            root,
+            delay_ms,
+        }
+    }
+
+    /// Every later forwarded chunk waits this long. Read per chunk, so a window
+    /// opened here applies to whatever crosses the relay while it is open.
+    fn set_delay(&self, delay: Duration) {
+        self.delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+impl Drop for SlowEndpoint {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+async fn pump(
+    mut read: tokio::net::unix::OwnedReadHalf,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut bytes = vec![0u8; 65536];
+    while let Ok(forwarded @ 1..) = read.read(&mut bytes).await {
+        tokio::time::sleep(Duration::from_millis(
+            delay_ms.load(std::sync::atomic::Ordering::Acquire),
+        ))
+        .await;
+        if write.write_all(&bytes[..forwarded]).await.is_err() {
+            break;
+        }
+    }
+    let _ = write.shutdown().await;
+}
+
+/// Reports when the resident's next renewal lands, read from the lease this
+/// authenticated observation sees jump back up. Nothing in the resident is
+/// instrumented: the broker's own committed state is the signal.
+async fn next_renewal(observer: &VerifiedConnection, record: HexBytes<16>) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut previous = u64::MAX;
+    loop {
+        let remaining = observer
+            .session_self(record)
+            .await
+            .unwrap()
+            .record
+            .lease_remaining_ms
+            .unwrap()
+            .0;
+        if remaining > previous {
+            return;
+        }
+        previous = remaining;
+        assert!(Instant::now() < deadline, "no renewal observed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn admission_contention_delays_a_renewal_instead_of_dropping_the_attachment() {
+    use term_native_test_broker::{Broker, session_fd::LaunchFd};
+    let broker = Broker::start();
+    // Every session RPC on the resident's connection now costs a real round
+    // trip. The observer half connects straight to the broker: the fixture must
+    // be able to read committed state without paying the resident's latency.
+    let relay = SlowEndpoint::start(&broker.endpoint, Duration::from_millis(100));
+    let UnixConnectOutcome::VerifiedUnix(parent) =
+        NodedClient::connect_unix("", &broker.url, &broker.options(), None)
+            .await
+            .unwrap()
+    else {
+        panic!("verified parent required")
+    };
+    let parent_key = SigningKey::from_bytes(&[23; 32]);
+    let parent_record = parent
+        .session_allocate(&parent_key, Policy::DefaultOpen)
+        .await
+        .unwrap()
+        .record;
+    let child_key = SigningKey::from_bytes(&[42; 32]);
+    let grant = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: parent_record.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key: HexBytes(child_key.verifying_key().to_bytes()),
+            role: Role::PaneShell,
+            capabilities: vec![Capability::ReadState],
+        })
+        .await
+        .unwrap();
+    let launch = LaunchFd::new(&grant, &child_key).unwrap();
+    let raw = unsafe { libc::fcntl(launch.mapping().0, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(raw >= 3);
+    let file = unsafe { File::from_raw_fd(raw) };
+    let bootstrap = parse(&file).ok().unwrap();
+    drop(file);
+    drop(launch);
+
+    let mut options = broker.options();
+    options.endpoint = Some(relay.path.clone());
+    options.require_native_session = true;
+    options.incoming_capacity = Some(64);
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let url = broker.url.clone();
+    let resident = tokio::spawn(async move {
+        let mut reporter = Reporter::default();
+        own(bootstrap, options, url, &mut reporter, receiver).await;
+        reporter.reported
+    });
+
+    let parent = std::sync::Arc::new(parent);
+    // The Term half of the fixture owes its own lease; its reference is stable
+    // across renewals, so one retained reference keeps it alive throughout.
+    let keepalive = tokio::spawn({
+        let renewing = parent.clone();
+        let reference = parent_record.reference();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if renewing.session_renew(reference.clone()).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let bound = loop {
+        let record = parent
+            .session_self(grant.record.record_id)
+            .await
+            .unwrap()
+            .record;
+        if record.state == BindingState::Attached {
+            break record;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "child did not attach through the relay"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(bound.binding_generation, DecimalU64(1));
+    let request = serde_json::json!({"version":1,"target":{
+        "broker_epoch":bound.broker_epoch,"record":bound.reference(),
+        "instance_id":bound.instance_id,"pane_id":bound.pane_id,
+        "pane_generation":bound.pane_generation
+    }});
+
+    // Four concurrent admissions, continuously. This caller is session-bound,
+    // so each one costs the resident session RPCs on the very connection its
+    // renewal uses; the resident must stay attached through them.
+    let mut flood = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let caller = parent.clone();
+        let name = bound.name.clone();
+        let request = request.clone();
+        flood.spawn(async move {
+            loop {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    caller.client().call(&name, "shell.status", request.clone()),
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let current = parent.session_self(bound.record_id).await.unwrap().record;
+        assert_eq!(current.state, BindingState::Attached);
+        assert_eq!(
+            current.reference(),
+            bound.reference(),
+            "admission load must not reconnect the attachment"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    flood.abort_all();
+    while flood.join_next().await.is_some() {}
+
+    // With the lane quiet again the renewal is the only traffic left on the
+    // relay, so a stall opened just before one is due is a stall that renewal
+    // meets. It is longer than a single RPC deadline and shorter than the
+    // retry's: one attempt cannot survive it, an attempt plus a retry can.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    next_renewal(&parent, bound.record_id).await;
+    tokio::time::sleep(RENEW_CADENCE - Duration::from_millis(700)).await;
+    relay.set_delay(RPC * 2 / 3);
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    relay.set_delay(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let current = parent.session_self(bound.record_id).await.unwrap().record;
+        assert_eq!(current.state, BindingState::Attached);
+        assert_eq!(
+            current.reference(),
+            bound.reference(),
+            "a stalled renewal must be retried, not abandoned"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let (ack, received) = std::sync::mpsc::sync_channel(1);
+    sender.send(ack).unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(20), resident)
+            .await
+            .unwrap()
+            .unwrap(),
+        "the resident reported a failure it should have ridden out"
+    );
+    assert!(received.try_recv().unwrap());
+    keepalive.abort();
+}
+
+#[tokio::test]
+async fn a_session_bound_admission_costs_two_round_trips() {
+    use term_native_test_broker::Broker;
+    let broker = Broker::start();
+    let delay = Duration::from_millis(150);
+    let relay = SlowEndpoint::start(&broker.endpoint, delay);
+    async fn connect(broker: &Broker, endpoint: Option<&std::path::Path>) -> VerifiedConnection {
+        let mut options = broker.options();
+        if let Some(endpoint) = endpoint {
+            options.endpoint = Some(endpoint.to_path_buf());
+        }
+        let UnixConnectOutcome::VerifiedUnix(connection) =
+            NodedClient::connect_unix("", &broker.url, &options, None)
+                .await
+                .unwrap()
+        else {
+            panic!("verified connection required")
+        };
+        connection
+    }
+    let parent = connect(&broker, None).await;
+    let parent_record = parent
+        .session_allocate(&SigningKey::from_bytes(&[24; 32]), Policy::DefaultOpen)
+        .await
+        .unwrap()
+        .record;
+    // The memfd fixture seeds the child half with [42; 32].
+    let child_key = SigningKey::from_bytes(&[42; 32]);
+    let grant = parent
+        .session_grant_create(&GrantCreateArgs {
+            parent: parent_record.reference(),
+            pane_id: DecimalU64(1),
+            pane_generation: DecimalU64(1),
+            public_key: HexBytes(child_key.verifying_key().to_bytes()),
+            role: Role::PaneShell,
+            capabilities: vec![Capability::ReadState],
+        })
+        .await
+        .unwrap();
+    let file = memfd(
+        serde_json::json!({"grant":grant.grant,"record":grant.record}),
+        1,
+        SEALS,
+        false,
+    );
+    let mut bootstrap = parse(&file).ok().unwrap();
+    let child = connect(&broker, Some(&relay.path)).await;
+    // One hello for the connection, exactly as the resident takes it.
+    let hello = child.session_context().await.unwrap();
+    let bound = bootstrap
+        .attach(&child, &hello, &mut Reporter::default())
+        .await
+        .ok()
+        .unwrap();
+    let caller = std::sync::Arc::new(parent);
+    let sending = caller.clone();
+    let name = bound.name.clone();
+    let request = tokio::spawn(async move {
+        sending
+            .client()
+            .call(&name, "shell.status", serde_json::json!({}))
+            .await
+    });
+    let delivery = loop {
+        let event = child.recv_shared().await.unwrap();
+        if event.command().command == "shell.status" {
+            break event;
+        }
+    };
+    let principal = delivery.trusted_context().unwrap();
+    assert_eq!(principal.assurance, Assurance::SessionBound);
+
+    // A session-bound caller's admission is one lease check plus one re-read of
+    // our own attachment. The hello that used to precede the lease check made it
+    // three, and every one of them serialises on the connection the resident
+    // renews over.
+    let started = Instant::now();
+    assert!(crate::session_status::admitted(&child, &hello, principal, &bound).await);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < delay * 5,
+        "admission took {elapsed:?}: two round trips cost about {:?}, three about {:?}",
+        delay * 4,
+        delay * 6
+    );
+    request.abort();
+    let _ = request.await;
+}
