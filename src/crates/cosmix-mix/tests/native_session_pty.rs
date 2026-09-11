@@ -1063,6 +1063,7 @@ fn status_verbs_are_absent_from_legacy_surfaces() {
     }
 }
 
+#[test]
 fn status_flood_preserves_lease_and_restart_ack() {
     let _fixture = fixture_guard();
     let broker = Broker::start();
