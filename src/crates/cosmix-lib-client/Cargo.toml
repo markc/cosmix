@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-client"
-version = "0.4.3"
+version = "0.4.4"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -32,6 +32,7 @@ futures-util = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
+libc.workspace = true
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # Native test harness — dev-dependencies for the in-process stub

@@ -10,6 +10,7 @@ pub enum SessionFailure {
     Transport(anyhow::Error),
     InvalidResponse,
     ScopeMismatch,
+    LeaseExpired,
     Refused {
         error: SessionError,
         wake_error: Option<SessionError>,
@@ -21,6 +22,7 @@ impl std::fmt::Display for SessionFailure {
             Self::Transport(_) => "session transport failed; outcome may be unknown",
             Self::InvalidResponse => "invalid session response",
             Self::ScopeMismatch => "challenge does not match expected scope",
+            Self::LeaseExpired => "lease check elapsed before receipt",
             Self::Refused { .. } => "broker refused session request",
         })
     }
@@ -51,9 +53,41 @@ pub struct ListResult {
 pub struct RevokeResult {
     pub revoked: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeaseResult {
-    pub lease_remaining_ms: DecimalU64,
+#[derive(Deserialize)]
+struct LeaseResult {
+    lease_remaining_ms: DecimalU64,
+}
+
+/// Conservative local CLOCK_BOOTTIME deadline for one checked reference.
+/// Discard on connection/epoch loss or a lifecycle gap.
+#[derive(Debug, Clone)]
+pub struct Deadline {
+    target: RecordRef,
+    expires_ms: u64,
+}
+
+impl Deadline {
+    pub fn target(&self) -> &RecordRef {
+        &self.target
+    }
+
+    pub fn is_live(&self) -> SessionResult<bool> {
+        Ok(boottime_ms()? < self.expires_ms)
+    }
+}
+
+fn boottime_ms() -> SessionResult<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: ts is a valid writable timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+            return Err(SessionFailure::Transport(std::io::Error::last_os_error().into()));
+        }
+        Ok((ts.tv_sec as u64).saturating_mul(1000).saturating_add(ts.tv_nsec as u64 / 1_000_000))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(SessionFailure::Transport(anyhow::anyhow!("CLOCK_BOOTTIME is unavailable")))
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +105,8 @@ pub struct ExpectedScope {
     pub unix_uid: u32,
     pub parent_key_hash: Option<HexBytes<32>>,
     pub pane_id: Option<DecimalU64>,
+    /// High-water for this (parent_instance, pane_id); reset for a new parent instance.
+    pub pane_high_water: Option<DecimalU64>,
     pub role: Role,
     pub public_key_hash: HexBytes<32>,
     pub capabilities_hash: HexBytes<32>,
@@ -78,13 +114,16 @@ pub struct ExpectedScope {
 
 impl ChallengeResult {
     /// The caller supplies independently retained scope, not a copy of this
-    /// challenge. Check pane-generation high-water separately within each parent
-    /// instance; parent random IDs may change during broker recovery.
+    /// challenge. Retain pane-generation high-water within each parent instance;
+    /// parent random IDs may change during broker recovery.
     pub fn sign(&self, key: &SigningKey, expected: &ExpectedScope) -> SessionResult<ProveArgs> {
         let p = &self.transcript;
         if p.unix_uid != expected.unix_uid
             || p.parent_key_hash != expected.parent_key_hash
             || p.pane_id != expected.pane_id
+            || expected.pane_high_water.is_some_and(|high| {
+                p.pane_generation.is_none_or(|generation| generation.0 < high.0)
+            })
             || p.role != expected.role
             || p.public_key_hash != expected.public_key_hash
             || p.capabilities_hash != expected.capabilities_hash
@@ -198,9 +237,17 @@ impl VerifiedConnection {
     pub async fn session_list(&self) -> SessionResult<ListResult> {
         self.session_rpc("list", serde_json::json!({})).await
     }
-    /// Record local CLOCK_BOOTTIME before this call; add the returned delta to
-    /// that start, never to receive time. Gaps invalidate cached results.
-    pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<LeaseResult> {
-        self.session_rpc("lease.check", TargetArgs { target }).await
+    /// Captures request-start CLOCK_BOOTTIME internally. Gaps invalidate results.
+    pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
+        let start = boottime_ms()?;
+        let result: LeaseResult = self.session_rpc("lease.check", TargetArgs { target: target.clone() }).await?;
+        let deadline = Deadline {
+            target,
+            expires_ms: start.saturating_add(result.lease_remaining_ms.0),
+        };
+        if !deadline.is_live()? {
+            return Err(SessionFailure::LeaseExpired);
+        }
+        Ok(deadline)
     }
 }

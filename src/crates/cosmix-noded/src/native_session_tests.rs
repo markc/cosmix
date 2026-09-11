@@ -436,6 +436,7 @@ async fn parent_revocation_is_ordered_against_inflight_child_prove() {
             unix_uid: record.owner_uid,
             parent_key_hash: Some(grant.grant.parent_key_hash),
             pane_id: Some(DecimalU64(1)),
+            pane_high_water: None,
             role: Role::PaneShell,
             public_key_hash: HexBytes(Sha256::digest(public_key.0).into()),
             capabilities_hash: HexBytes(
@@ -1760,6 +1761,7 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
             Sha256::digest(parent_key.verifying_key().to_bytes()).into(),
         )),
         pane_id: Some(DecimalU64(7)),
+        pane_high_water: None,
         role: Role::PaneShell,
         public_key_hash: HexBytes(Sha256::digest(public_key.0).into()),
         capabilities_hash: HexBytes(
@@ -1767,6 +1769,11 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
         ),
     };
     let challenge = child.session_challenge(&selector).await.unwrap();
+    let mut higher_scope = scope.clone();
+    higher_scope.pane_high_water = Some(DecimalU64(challenge.transcript.pane_generation.unwrap().0 + 1));
+    assert!(matches!(challenge.sign(&key, &higher_scope), Err(cosmix_client::session::SessionFailure::ScopeMismatch)));
+    higher_scope.pane_high_water = challenge.transcript.pane_generation;
+    assert!(challenge.sign(&key, &higher_scope).is_ok());
     let proof = challenge.sign(&key, &scope).unwrap();
     let record = child.session_prove(&proof).await.unwrap().record;
     child.session_renew(record.reference()).await.unwrap();
@@ -1835,6 +1842,7 @@ async fn typed_session_parent_resume_wakes_child_and_discovery_is_uid_gated() {
         unix_uid: parent_record.owner_uid,
         parent_key_hash: None,
         pane_id: None,
+        pane_high_water: None,
         role: Role::Term,
         public_key_hash: HexBytes(Sha256::digest(parent_key.verifying_key().to_bytes()).into()),
         capabilities_hash: HexBytes(
@@ -1903,6 +1911,7 @@ async fn p0i_04_captured_child_proof_fails_after_revoke_and_restart_fresh_enrol_
             unix_uid: record.owner_uid,
             parent_key_hash: Some(granted.grant.parent_key_hash),
             pane_id: Some(DecimalU64(9)),
+            pane_high_water: None,
             role: Role::PaneShell,
             public_key_hash: HexBytes(Sha256::digest(public_key.0).into()),
             capabilities_hash: HexBytes(

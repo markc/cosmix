@@ -131,7 +131,11 @@ An empty connect name selects anonymous Unix bootstrap. Calls are serialised
 per verified handle; responses require explicit native framing and RC. Allocation
 signs the exact BUS-016 bytes with Ed25519. Challenge signing requires independently
 retained expected UID, parent-key hash, pane, role, key hash and capability hash;
-the application also tracks pane-generation high-water within each parent instance.
+`ExpectedScope::pane_high_water` enforces the application's retained generation
+within each parent instance (reset it when that parent instance changes).
+`session_lease_check` captures local CLOCK_BOOTTIME before the request and returns
+an opaque `Deadline` for the checked reference, refusing an already elapsed
+result. `Deadline::is_live` fails closed on clock errors; no raw delta is exposed.
 No uncertain mutation is retried automatically. Wake errors remain visible on
 success and refusal. Private signing keys are never serialised into requests.
 
