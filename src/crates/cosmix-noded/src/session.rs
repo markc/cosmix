@@ -189,6 +189,8 @@ fn strict_key(bytes: HexBytes<32>) -> Result<VerifyingKey, SessionError> {
 
 struct Record {
     sequence: usize,
+    parent_id: Option<Id>,
+    grant_id: Option<Id>,
     view: SessionRecord,
     key: HexBytes<32>,
     connection: Option<Id>,
@@ -420,10 +422,10 @@ impl Sessions {
     }
 
     fn parent(&self, r: &Record) -> Option<&Record> {
-        let instance = r.view.parent_instance?;
-        self.records.values().find(|p| {
-            p.view.instance_id == instance && Some(p.view.incarnation) == r.view.parent_incarnation
-        })
+        let p = self.records.get(&r.parent_id?)?;
+        (Some(p.view.instance_id) == r.view.parent_instance
+            && Some(p.view.incarnation) == r.view.parent_incarnation)
+            .then_some(p)
     }
 
     fn remaining(&self, r: &Record, now: u64) -> u64 {
@@ -456,6 +458,9 @@ impl Sessions {
 
     fn children(&self, id: Id) -> Vec<Id> {
         let p = &self.records[&id].view;
+        if p.role != Role::Term {
+            return Vec::new();
+        }
         self.records
             .iter()
             .filter(|(_, r)| {
@@ -482,10 +487,8 @@ impl Sessions {
             c.close.notify_one();
         }
         r.view.state = BindingState::Revoked;
-        for g in self
-            .grants
-            .values_mut()
-            .filter(|g| g.record_id == id && g.state == GrantState::Pending)
+        if let Some(g) = r.grant_id.and_then(|id| self.grants.get_mut(&id))
+            && g.state == GrantState::Pending
         {
             g.state = GrantState::Revoked;
         }
@@ -769,10 +772,9 @@ impl Sessions {
                 if !self.parent_live(r, now) {
                     return Err(SessionError::forbidden());
                 }
-                let g = self
-                    .grants
-                    .values()
-                    .find(|g| g.record_id == r.view.record_id)
+                let g = r
+                    .grant_id
+                    .and_then(|id| self.grants.get(&id))
                     .ok_or_else(SessionError::forbidden)?;
                 Ok(serde_json::json!({"grant":g,"record":self.snapshot(r,now)}))
             }
@@ -876,6 +878,8 @@ impl Sessions {
                     id,
                     Record {
                         sequence: self.issued.len(),
+                        parent_id: None,
+                        grant_id: None,
                         view: view.clone(),
                         key: a.public_key,
                         connection: Some(p.connection_id),
@@ -1017,6 +1021,8 @@ impl Sessions {
             id,
             Record {
                 sequence: self.issued.len(),
+                parent_id: Some(a.parent.record_id),
+                grant_id: Some(grant.grant_id),
                 view: view.clone(),
                 key: a.public_key,
                 connection: None,

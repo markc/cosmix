@@ -480,12 +480,13 @@ async fn recipient_dependency_cap_refuses_the_bound_delivery() {
         let public_key = HexBytes(key.verifying_key().to_bytes());
         let grant = session_call(&mut parent,"grant.create",&(pane+2).to_string(),serde_json::json!({"parent":term.reference(),"pane_id":pane.to_string(),"pane_generation":"1","public_key":public_key,"role":"pane-shell","capabilities":["input"]})).await;
         assert_eq!(grant.get("rc"), Some("0"), "{}", grant.body);
+        let descriptor: serde_json::Value = serde_json::from_str(&grant.body).unwrap();
         let mut child = broker.unix().await;
         let challenge = session_call(
             &mut child,
             "challenge",
             "challenge",
-            serde_json::json!({"public_key":public_key,"purpose":"enrol"}),
+            serde_json::json!({"record_id":descriptor["grant"]["record_id"],"incarnation":descriptor["grant"]["incarnation"],"grant_id":descriptor["grant"]["grant_id"],"purpose":"enrol"}),
         )
         .await;
         let proof: ProofTranscript = serde_json::from_str(&challenge.body).unwrap();
@@ -697,6 +698,20 @@ async fn session_process_fixture() {
         b.as_object_mut().unwrap().remove("wake_error");
         assert_eq!(a, b);
         assert_eq!(a["error_code"], "FORBIDDEN");
+        send(&mut socket, &request("noded.list", "noded", "discovery")).await;
+        let list: serde_json::Value =
+            serde_json::from_str(&receive(&mut socket).await.body).unwrap();
+        assert!(list.as_array().unwrap().contains(&serde_json::json!(name)));
+        if let Ok(proof) = std::env::var("COSMIX_SESSION_FIXTURE_PROOF") {
+            let reply = session_call(
+                &mut socket,
+                "prove",
+                "stolen-proof",
+                serde_json::from_str(&proof).unwrap(),
+            )
+            .await;
+            assert_eq!(reply.get("rc"), Some("10"));
+        }
     }
 }
 
@@ -754,6 +769,7 @@ async fn p0i_02_competing_process_preclaim_preserves_allocated_route() {
 #[ignore = "SKIPPED privileged multi-UID fixture: requires root and COSMIX_SESSION_TEST_UID; run explicitly with --ignored"]
 async fn p0i_03_privileged_other_uid_cannot_lookup_or_consume_grant() {
     use cosmix_bus::native_session::*;
+    use ed25519_dalek::Signer;
     use std::os::unix::process::CommandExt;
     // No missing-prerequisite return path may be reported as a pass.
     let uid: u32 = std::env::var("COSMIX_SESSION_TEST_UID")
@@ -784,6 +800,25 @@ async fn p0i_03_privileged_other_uid_cannot_lookup_or_consume_grant() {
         .await
         .unwrap();
     let mut command = fixture_process(&broker, &record.name);
+    let rightful = verified(&broker).await;
+    let challenge = rightful
+        .session_challenge(&ChallengeArgs::Key(KeyChallenge {
+            public_key,
+            purpose: Purpose::Enrol,
+        }))
+        .await
+        .unwrap();
+    let proof = ProveArgs {
+        challenge_id: challenge.transcript.challenge_id,
+        signature: HexBytes(
+            key.sign(&encode_proof(&challenge.transcript).unwrap())
+                .to_bytes(),
+        ),
+    };
+    command.env(
+        "COSMIX_SESSION_FIXTURE_PROOF",
+        serde_json::to_string(&proof).unwrap(),
+    );
     command.uid(uid).gid(uid).env(
         "COSMIX_SESSION_FIXTURE_SELECTOR",
         serde_json::json!({"public_key":public_key,"purpose":"enrol"}).to_string(),
@@ -805,6 +840,16 @@ async fn p0i_03_privileged_other_uid_cannot_lookup_or_consume_grant() {
             .state,
         GrantState::Pending
     );
+    assert_eq!(
+        rightful
+            .session_prove(&proof)
+            .await
+            .unwrap()
+            .record
+            .binding_generation,
+        DecimalU64(1)
+    );
+    rightful.client().close().await;
     parent.client().close().await;
 }
 
