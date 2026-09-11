@@ -1,10 +1,10 @@
 //! Pure reflow from a logical line, with no terminal reads, writes or modes.
 //! Positions use zero-based cells and canonical eager wrapping: an exact fit
-//! ends at column zero of the next row. The future terminal writer must resolve
+//! ends at column zero of the next row. The terminal writer must resolve
 //! the terminal's pending-wrap state to that position explicitly.
 //!
-//! Prompt escapes carry no width. Layout contains visible text only; a future
-//! colour renderer must associate styles separately, never replay cursor-control
+//! Prompt escapes carry no width. Layout contains visible text only; the
+//! terminal renderer associates SGR styles separately, never replaying cursor-control
 //! escapes. Buffer controls are displayed as caret notation, not executed.
 use super::buffer::Buffer;
 use std::ops::Range;
@@ -21,7 +21,7 @@ pub struct Position {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
-    Prompt,
+    Prompt(Range<usize>),
     Buffer(Range<usize>),
 }
 
@@ -52,7 +52,14 @@ pub enum LayoutError {
 /// Strip CSI, OSC (BEL or ST), DCS/SOS/PM/APC (ST), and ordinary ESC sequences.
 /// Unterminated sequences are discarded to the end, never shown as text.
 pub fn visible_prompt(prompt: &str) -> String {
+    prompt_parts(prompt).0
+}
+
+/// Only SGR colour/style sequences may be replayed. Cursor movement, terminal
+/// queries, OSC and other protocols remain stripped from evaluated prompts.
+pub fn prompt_parts(prompt: &str) -> (String, Vec<(usize, String)>) {
     let mut out = String::with_capacity(prompt.len());
+    let mut styles = Vec::new();
     let mut chars = prompt.chars().peekable();
     while let Some(ch) = chars.next() {
         let sequence = match ch {
@@ -70,10 +77,19 @@ pub fn visible_prompt(prompt: &str) -> String {
         };
         match sequence {
             Some('[') => {
+                let mut parameters = String::new();
                 for c in chars.by_ref() {
                     if ('@'..='~').contains(&c) {
+                        if c == 'm'
+                            && parameters
+                                .chars()
+                                .all(|p| p.is_ascii_digit() || matches!(p, ';' | ':'))
+                        {
+                            styles.push((out.len(), format!("\x1b[{parameters}m")));
+                        }
                         break;
                     }
+                    parameters.push(c);
                 }
             }
             Some(kind @ (']' | 'P' | 'X' | '^' | '_')) => {
@@ -97,7 +113,7 @@ pub fn visible_prompt(prompt: &str) -> String {
             _ => {}
         }
     }
-    out
+    (out, styles)
 }
 
 /// Intrinsic printable-cell width; line breaks/control characters add no width.
@@ -133,8 +149,8 @@ pub fn layout_text(
         end: Position::default(),
         runs: Vec::new(),
     };
-    for grapheme in visible_prompt(prompt).graphemes(true) {
-        result.place(grapheme, Source::Prompt);
+    for (byte, grapheme) in visible_prompt(prompt).grapheme_indices(true) {
+        result.place(grapheme, Source::Prompt(byte..byte + grapheme.len()));
     }
     for (byte, grapheme) in text.grapheme_indices(true) {
         let before = result.place(grapheme, Source::Buffer(byte..byte + grapheme.len()));

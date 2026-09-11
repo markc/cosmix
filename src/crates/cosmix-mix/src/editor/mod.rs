@@ -1,13 +1,16 @@
 //! Pure owned-editor core. No tty, evaluator, Bus, or process-group ownership.
 //!
-//! The future input owner must drain already-observed human activity before
+//! The input owner must drain already-observed human activity before
 //! processing control requests. Effects are instructions, not acknowledgements:
 //! mode restoration must succeed before `Suspended`/`RestoredAndStopped`.
 //! The admission owner still rechecks identity, deadline and revision before
 //! consuming a prompt. A suspension acknowledgement alone is not permission.
 pub mod buffer;
 pub mod history;
+pub mod input;
 pub mod render;
+pub mod runtime;
+pub mod terminal;
 
 use buffer::{Buffer, EditError};
 
@@ -155,9 +158,36 @@ pub struct Editor {
     revision: u64,
     serial: u64,
     pending: Option<ModeToken>,
+    reserved: bool,
 }
 
 impl Editor {
+    /// Local lifecycle suspension preserves drafts. It does not reserve an
+    /// empty prompt for evaluation; only SuspendRequested can do that.
+    pub fn pause(
+        &mut self,
+        generation: Generation,
+        revision: u64,
+    ) -> Result<Effect, ProtocolError> {
+        self.check(generation)?;
+        if revision != self.revision {
+            return Err(ProtocolError::StaleRevision);
+        }
+        if self.state != State::Editing {
+            return Err(ProtocolError::InvalidState);
+        }
+        let effect = self.modes(State::RestoringForSuspend, ModeAction::Restore)?;
+        self.reserved = false;
+        Ok(effect)
+    }
+    /// The input owner has restored modes before returning a human line.
+    pub fn finish_line(&mut self) -> Result<(), ProtocolError> {
+        if self.state != State::Editing {
+            return Err(ProtocolError::InvalidState);
+        }
+        self.state = State::Idle;
+        Ok(())
+    }
     pub fn new(session: u64) -> Self {
         Self {
             session,
@@ -169,6 +199,7 @@ impl Editor {
             revision: 0,
             serial: 0,
             pending: None,
+            reserved: false,
         }
     }
     pub fn state(&self) -> State {
@@ -269,7 +300,9 @@ impl Editor {
                         edit_revision: self.revision,
                     }));
                 }
-                self.modes(State::RestoringForSuspend, ModeAction::Restore)
+                let effect = self.modes(State::RestoringForSuspend, ModeAction::Restore)?;
+                self.reserved = true;
+                Ok(effect)
             }
             Command::Resume {
                 generation,
@@ -347,10 +380,11 @@ impl Editor {
         if revision != self.revision {
             return Err(ProtocolError::StaleRevision);
         }
-        if self.state != State::Suspended {
+        if self.state != State::Suspended || !self.reserved {
             return Err(ProtocolError::InvalidState);
         }
         self.state = State::Idle;
+        self.reserved = false;
         Ok(())
     }
 }
@@ -590,6 +624,28 @@ mod tests {
         );
         assert_eq!(e.modes_completed(t, false), Err(ProtocolError::ModeFailure));
         assert_eq!(e.edit(Buffer::backspace), Err(ProtocolError::InvalidState));
+    }
+
+    #[test]
+    fn lifecycle_pause_is_not_an_evaluation_reservation() {
+        let mut e = editing(PromptProfile::Primary(String::new()));
+        e.edit(|b| b.insert("draft")).unwrap();
+        let revision = e.edit_revision();
+        let t = token(e.pause(G, revision).unwrap());
+        e.modes_completed(t, true).unwrap();
+        assert_eq!(
+            e.consume_reservation(G, revision),
+            Err(ProtocolError::InvalidState)
+        );
+        let t = token(
+            e.command(Command::Resume {
+                generation: G,
+                edit_revision: revision,
+            })
+            .unwrap(),
+        );
+        e.modes_completed(t, true).unwrap();
+        assert_eq!(e.buffer().text(), "draft");
     }
 
     #[test]

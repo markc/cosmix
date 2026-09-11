@@ -4,13 +4,13 @@ use cosmix_mix::error::MixError;
 use cosmix_mix::evaluator::Evaluator;
 use cosmix_mix::stats::{ExecutionMode, StatsContext, UsageStats};
 use cosmix_mix::value::Value;
-use rustyline::Editor;
 use rustyline::error::ReadlineError;
 
 use crate::completion::MixHelper;
 use crate::exec::{self, PipelineResult};
 use crate::jobs::JobTable;
 use crate::meta;
+use crate::repl_editor::ReplEditor as Editor;
 use crate::shell::{self, InputKind};
 use crate::stats_io;
 
@@ -90,14 +90,14 @@ fn clear_resume_flag() {
 /// picks up the resume flag on startup.
 fn exec_restart(
     eval: &mut Evaluator,
-    rl: &mut Editor<MixHelper, rustyline::history::DefaultHistory>,
+    rl: &mut Editor,
     history_path: &std::path::Path,
 ) -> ! {
     // Save state before exec
     if let Some(mut stats) = eval.take_stats() {
         stats_io::save_stats(&mut stats);
     }
-    let _ = rl.save_history(&history_path);
+    let _ = rl.save_history(history_path);
 
     let mix_bin = crate::cosmix_paths::cosmix_path(crate::cosmix_paths::CosmixDir::Bin)
         .join("mix")
@@ -148,6 +148,12 @@ pub fn run_repl() -> i32 {
     };
 
     let _ = rl.load_history(&history_path);
+
+    if let Some(control) = rl.control()
+        && let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = job_table.policy()
+    {
+        controller.set_terminal_shutdown(std::sync::Arc::new(move || control.shutdown()));
+    }
 
     let mut eval = Evaluator::new();
     eval.set_limits(crate::script_limits());
@@ -270,7 +276,7 @@ pub fn run_repl() -> i32 {
         // snapshot in readline() is the sane one.
         ensure_interactive_output_mode();
 
-        match rl.readline(&prompt) {
+        match rl.readline(&prompt, !line_buf.is_empty()) {
             Ok(line) => {
                 if line_buf.is_empty() && line.trim().is_empty() {
                     continue;

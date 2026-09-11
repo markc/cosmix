@@ -202,7 +202,10 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     shell_modes: Mutex<libc::termios>,
+    terminal_shutdown: Mutex<Option<TerminalShutdown>>,
 }
+
+type TerminalShutdown = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 pub struct Controller {
     shared: Arc<Shared>,
@@ -339,6 +342,7 @@ impl Controller {
             }),
             changed: Condvar::new(),
             shell_modes: Mutex::new(modes(fd)?),
+            terminal_shutdown: Mutex::new(None),
         });
         // signal-hook's SA_RESTART is load-bearing for blocking legacy waits.
         let mut events = signal_hook::iterator::Signals::new([libc::SIGCHLD, libc::SIGHUP])?;
@@ -350,6 +354,14 @@ impl Controller {
             .spawn(move || {
                 for signal in events.forever() {
                     if signal == libc::SIGHUP {
+                        // The input owner restores its protocols before exit.
+                        // Never invoke callbacks under controller state locks.
+                        let shutdown = monitor.terminal_shutdown.lock().unwrap().clone();
+                        if let Some(shutdown) = shutdown
+                            && let Err(e) = shutdown()
+                        {
+                            eprintln!("mix: input shutdown: {e}");
+                        }
                         close_jobs(&monitor);
                         let _ = foreground(monitor_tty.as_raw_fd(), shell_pgid);
                         let _ = set_modes(
@@ -378,6 +390,11 @@ impl Controller {
             old_signals,
             fallback_executable,
         })))
+    }
+
+    /// Install the input owner's protocol/mode shutdown, separate from PGIDs.
+    pub fn set_terminal_shutdown(&self, shutdown: TerminalShutdown) {
+        *self.shared.terminal_shutdown.lock().unwrap() = Some(shutdown);
     }
 
     /// Owned snapshots are the attachment point for stage A; no publication

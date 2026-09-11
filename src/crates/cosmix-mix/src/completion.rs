@@ -24,6 +24,25 @@ pub struct MixHelper {
 }
 
 impl MixHelper {
+    /// Called on the evaluator owner; only owned names and paths cross threads.
+    pub fn snapshot(&self) -> crate::editor::runtime::CompletionSnapshot {
+        let history = rustyline::history::DefaultHistory::new();
+        let context = Context::new(&history);
+        let commands = self
+            .complete("", 0, &context)
+            .unwrap_or_default()
+            .1
+            .into_iter()
+            .map(|p| p.replacement)
+            .collect();
+        crate::editor::runtime::CompletionSnapshot {
+            variables: self.state.borrow().variable_names.clone(),
+            commands,
+            cwd: env::current_dir().unwrap_or_default(),
+            home: dirs::home_dir().unwrap_or_default(),
+        }
+        .bounded()
+    }
     pub fn new() -> Self {
         let path_commands = scan_path_commands();
         MixHelper {
@@ -83,28 +102,7 @@ impl Completer for MixHelper {
         if !is_first_word {
             let leading = before[..word_start].trim();
             if leading == "mix" {
-                let subcmds = &[
-                    "vars",
-                    "aliases",
-                    "functions",
-                    "all",
-                    "type",
-                    "history",
-                    "config",
-                    "reload",
-                    "build",
-                    "test",
-                    "update",
-                    "help",
-                    "man",
-                    "status",
-                    "check",
-                    "trace",
-                    "time",
-                    "mesh",
-                    "ports",
-                    "ping",
-                ];
+                let subcmds = crate::editor::runtime::MIX_SUBCOMMANDS;
                 let matches: Vec<Pair> = subcmds
                     .iter()
                     .filter(|s| s.starts_with(word))

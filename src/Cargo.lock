@@ -1764,6 +1764,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width",
  "ureq",
 ]
 

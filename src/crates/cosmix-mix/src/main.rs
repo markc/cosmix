@@ -33,6 +33,7 @@ mod lint;
 mod meta;
 mod node_config;
 mod repl;
+mod repl_editor;
 mod serve_runtime;
 mod shell;
 mod shell_handler;
