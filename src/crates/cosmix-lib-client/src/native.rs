@@ -50,12 +50,18 @@ impl NativeIncomingReceiver {
 enum NativeIncomingSender {
     #[cfg(unix)]
     Verified(mpsc::UnboundedSender<crate::unix::VerifiedCommand>),
+    #[cfg(unix)]
+    VerifiedBounded {
+        commands: mpsc::Sender<crate::unix::VerifiedCommand>,
+        refusals: mpsc::Sender<crate::unix::VerifiedCommand>,
+        gap: Arc<AtomicBool>,
+    },
     Unbounded(mpsc::UnboundedSender<IncomingCommand>),
     Bounded(BoundedIncomingSender),
 }
 
 impl NativeIncomingSender {
-    fn send(
+    async fn send(
         &self,
         command: IncomingCommand,
         _principal: Option<cosmix_bus::native_session::BrokerPrincipal>,
@@ -65,6 +71,58 @@ impl NativeIncomingSender {
             Self::Verified(tx) => tx
                 .send(crate::unix::VerifiedCommand::new(command, _principal))
                 .is_ok(),
+            // This arm runs on the reader task, which owns response delivery
+            // for every in-flight RPC on this connection. It therefore never
+            // writes to the shared sink and never waits for lane capacity:
+            // both would gate every pending reply on an unrelated consumer.
+            #[cfg(unix)]
+            Self::VerifiedBounded {
+                commands,
+                refusals,
+                gap,
+            } => {
+                let bytes = command
+                    .headers
+                    .iter()
+                    .fold(command.body.len(), |n, (k, v)| {
+                        n.saturating_add(k.len()).saturating_add(v.len())
+                    });
+                // Broker notices are id-less, so there is nothing to refuse and
+                // no reply a caller is waiting for. A dropped one is reported as
+                // a sticky gap instead: the receive owner re-reads its state
+                // exactly as it would for a broker lifecycle gap.
+                if command.id.is_none() {
+                    if bytes > 65536 {
+                        gap.store(true, Ordering::Release);
+                        return true;
+                    }
+                    return match commands
+                        .try_send(crate::unix::VerifiedCommand::new(command, _principal))
+                    {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            gap.store(true, Ordering::Release);
+                            true
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    };
+                }
+                let event = crate::unix::VerifiedCommand::new(command, _principal);
+                let refused = if bytes > 65536 {
+                    event
+                } else {
+                    match commands.try_send(event) {
+                        Ok(()) => return true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                        Err(mpsc::error::TrySendError::Full(event)) => event,
+                    }
+                };
+                // A full refusal queue means the owner has not drained the ones
+                // already handed over, so writing more cannot help; the caller
+                // still has its own deadline.
+                let _ = refusals.try_send(refused.refusal());
+                true
+            }
             Self::Unbounded(sender) => sender.send(command).is_ok(),
             Self::Bounded(sender) => sender.try_send(command),
         }
@@ -254,22 +312,53 @@ impl NodedClient {
         socket: WebSocketStream<tokio::net::UnixStream>,
         service_name: &str,
         provenance: Option<cosmix_bus::RegisterProvenance>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<crate::unix::VerifiedCommand>)> {
+        incoming_capacity: Option<usize>,
+    ) -> Result<(Self, crate::unix::VerifiedIncoming)> {
         let (sink, stream) = socket.split();
+        let sink: Arc<Mutex<WsSink>> = Arc::new(Mutex::new(Box::pin(sink)));
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = match incoming_capacity {
+            Some(capacity @ 1..=1024) => {
+                let (tx, commands) = mpsc::channel(capacity);
+                // Refusals are correlation only; the owner drains them ahead of
+                // ordinary work, so a short queue is enough to keep the reader
+                // from ever having to wait.
+                let (refusal_tx, refusals) = mpsc::channel(capacity.min(8));
+                let gap = Arc::new(AtomicBool::new(false));
+                (
+                    NativeIncomingSender::VerifiedBounded {
+                        commands: tx,
+                        refusals: refusal_tx,
+                        gap: gap.clone(),
+                    },
+                    crate::unix::VerifiedIncoming::Bounded {
+                        commands,
+                        refusals,
+                        gap,
+                    },
+                )
+            }
+            Some(_) => anyhow::bail!("invalid verified incoming capacity"),
+            None => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (
+                    NativeIncomingSender::Verified(tx),
+                    crate::unix::VerifiedIncoming::Unbounded(rx),
+                )
+            }
+        };
         let reader = tokio::spawn(Self::reader_loop(
             stream,
             pending.clone(),
-            NativeIncomingSender::Verified(tx),
+            tx,
             connected.clone(),
             service_name.into(),
         ));
         let mut guard = AbortOnDrop::new(reader.abort_handle());
         let client = Self {
             service_name: RwLock::new(service_name.into()),
-            sink: Arc::new(Mutex::new(Box::pin(sink))),
+            sink,
             pending,
             incoming_rx: Mutex::new(None),
             next_id: AtomicU64::new(1),
@@ -1031,7 +1120,10 @@ impl NodedClient {
         service_name: String,
     ) {
         #[cfg(unix)]
-        let verified = matches!(&incoming_tx, NativeIncomingSender::Verified(_));
+        let verified = matches!(
+            &incoming_tx,
+            NativeIncomingSender::Verified(_) | NativeIncomingSender::VerifiedBounded { .. }
+        );
         #[cfg(not(unix))]
         let verified = false;
         while let Some(result) = stream.next().await {
@@ -1116,7 +1208,7 @@ impl NodedClient {
                     body: msg.body.clone(),
                     headers: msg.headers.clone(),
                 };
-                if !incoming_tx.send(cmd, principal) {
+                if !incoming_tx.send(cmd, principal).await {
                     tracing::debug!("{service_name}: incoming channel closed");
                     break;
                 }
@@ -1128,6 +1220,51 @@ impl NodedClient {
 
         // Resolve all pending requests with an error
         pending.lock().expect("pending mutex poisoned").clear();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod verified_bound_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn overflow_hands_off_refusals_and_reports_dropped_notices_as_a_gap() {
+        let (tx, mut commands) = mpsc::channel(1);
+        let (refusal_tx, mut refusals) = mpsc::channel(4);
+        let gap = Arc::new(AtomicBool::new(false));
+        let sender = NativeIncomingSender::VerifiedBounded {
+            commands: tx,
+            refusals: refusal_tx,
+            gap: gap.clone(),
+        };
+        let command = |id| IncomingCommand {
+            from: "caller".into(),
+            command: "shell.status".into(),
+            id,
+            args: serde_json::Value::Null,
+            body: "{}".into(),
+            headers: Default::default(),
+        };
+        assert!(sender.send(command(Some("1".into())), None).await);
+        assert!(sender.send(command(Some("2".into())), None).await);
+        // The reader hands the overflowed request to the receive owner instead
+        // of writing to the sink it does not own.
+        let refused = refusals.recv().await.unwrap();
+        assert_eq!(refused.delivery(), crate::unix::Delivery::Refuse);
+        assert_eq!(refused.command().id.as_deref(), Some("2"));
+        assert!(!gap.load(Ordering::Acquire));
+        // A dropped id-less notice is a delivery gap, not a refusal: nothing is
+        // queued for reply and the reader still does not block on a full lane.
+        assert!(sender.send(command(None), None).await);
+        assert!(gap.swap(false, Ordering::AcqRel));
+        assert!(refusals.try_recv().is_err(), "notices are never refused");
+        assert_eq!(
+            commands.recv().await.unwrap().command().id.as_deref(),
+            Some("1")
+        );
+        assert!(sender.send(command(None), None).await);
+        assert!(commands.recv().await.unwrap().command().id.is_none());
+        assert!(!gap.load(Ordering::Acquire));
     }
 }
 

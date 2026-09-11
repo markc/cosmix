@@ -142,7 +142,10 @@ fn pad_loop_idiom_gets_a_note_not_a_warning() {
     let other = "$o = \"x\"\n$pad = \" \"\nwhile len($o) < 8\n  $o = $o .. $pad\nend\nprint($o)\n";
     let path = write_temp("padloop_var", other);
     let (_, out) = lint(&[path.to_str().unwrap()]);
-    assert!(!out.contains("MIX-D3013"), "variable append stays quiet: {out}");
+    assert!(
+        !out.contains("MIX-D3013"),
+        "variable append stays quiet: {out}"
+    );
 }
 
 #[test]
@@ -204,12 +207,30 @@ fn advisory_pass_sees_wrapped_and_expression_shapes() {
     let path = write_temp("blind_shapes", src);
     let (code, out) = lint(&[path.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("blind_shapes.mix:1: MIX-D3008"), "piped loop body: {out}");
-    assert!(out.contains("blind_shapes.mix:2: MIX-D3008"), "chained: {out}");
-    assert!(out.contains("blind_shapes.mix:3: MIX-D3008"), "if-expr cond: {out}");
-    assert!(out.contains("blind_shapes.mix:4: MIX-D3008"), "lambda default: {out}");
-    assert!(out.contains("blind_shapes.mix:4: MIX-D3009"), "lambda expr body: {out}");
-    assert!(out.contains("blind_shapes.mix:5: MIX-D3010"), "fn expr body: {out}");
+    assert!(
+        out.contains("blind_shapes.mix:1: MIX-D3008"),
+        "piped loop body: {out}"
+    );
+    assert!(
+        out.contains("blind_shapes.mix:2: MIX-D3008"),
+        "chained: {out}"
+    );
+    assert!(
+        out.contains("blind_shapes.mix:3: MIX-D3008"),
+        "if-expr cond: {out}"
+    );
+    assert!(
+        out.contains("blind_shapes.mix:4: MIX-D3008"),
+        "lambda default: {out}"
+    );
+    assert!(
+        out.contains("blind_shapes.mix:4: MIX-D3009"),
+        "lambda expr body: {out}"
+    );
+    assert!(
+        out.contains("blind_shapes.mix:5: MIX-D3010"),
+        "fn expr body: {out}"
+    );
     // Exactly one composed note for the nested substr — not two.
     assert_eq!(
         out.matches("composes a 1-based position").count(),

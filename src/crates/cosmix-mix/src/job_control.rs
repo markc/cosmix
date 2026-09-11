@@ -48,8 +48,7 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     if !matches!(signal, libc::SIGTSTP | libc::SIGTTIN) {
         return;
     }
-    let _stop_handler = (signal == libc::SIGTSTP)
-        .then(crate::editor::signals::StopHandler::enter);
+    let _stop_handler = (signal == libc::SIGTSTP).then(crate::editor::signals::StopHandler::enter);
     // One decision: a managed-job transition must not skip routing and then
     // take the default branch on a second, different observation.
     let managed = MANAGED_FOREGROUND.load(Ordering::Acquire);
@@ -60,10 +59,7 @@ extern "C" fn shell_signal(signal: libc::c_int) {
     // SIGTTIN always stops: retrying a background terminal read would spin.
     // Every operation here is async-signal-safe; no locks or allocation.
     unsafe {
-        if signal == libc::SIGTSTP
-            && !managed
-            && crate::editor::signals::request_stop()
-        {
+        if signal == libc::SIGTSTP && !managed && crate::editor::signals::request_stop() {
             libc::sigaction(signal, &shell_signal_action(signal), std::ptr::null_mut());
             return;
         }
@@ -235,6 +231,7 @@ pub struct Controller {
     worker: Mutex<Option<JoinHandle<()>>>,
     old_signals: Vec<(i32, libc::sigaction)>,
     fallback_executable: PathBuf,
+    foreground_observer: std::sync::OnceLock<fn(bool)>,
 }
 
 fn modes(fd: i32) -> io::Result<libc::termios> {
@@ -408,12 +405,19 @@ impl Controller {
             worker: Mutex::new(Some(worker)),
             old_signals,
             fallback_executable,
+            foreground_observer: std::sync::OnceLock::new(),
         })))
     }
 
     /// Install the input owner's protocol/mode shutdown, separate from PGIDs.
     pub fn set_terminal_shutdown(&self, shutdown: TerminalShutdown) {
         *self.shared.terminal_shutdown.lock().unwrap() = Some(shutdown);
+    }
+
+    /// Observation only. Called outside controller locks after terminal
+    /// transitions; the subscriber accepts owned data and must not wait.
+    pub fn observe_foreground(&self, observer: fn(bool)) {
+        let _ = self.foreground_observer.set(observer);
     }
 
     /// Owned snapshots are the attachment point for stage A; no publication
@@ -489,6 +493,9 @@ impl Controller {
         *self.shared.shell_modes.lock().unwrap() = saved;
         foreground(self.tty.as_raw_fd(), pgid)?;
         MANAGED_FOREGROUND.store(true, Ordering::Release);
+        if let Some(observer) = self.foreground_observer.get() {
+            observer(true);
+        }
         Ok(TerminalLease {
             controller: self,
             saved,
@@ -734,6 +741,9 @@ impl Drop for TerminalLease<'_> {
             set_modes(self.controller.tty.as_raw_fd(), &self.saved)
         }) {
             eprintln!("mix: terminal restore: {e}");
+        }
+        if let Some(observer) = self.controller.foreground_observer.get() {
+            observer(false);
         }
     }
 }

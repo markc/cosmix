@@ -218,12 +218,12 @@ impl PropTree for MixServeRuntime {
         // hiding: a citizen that swallowed a raise used to look exactly
         // like a healthy one (the blind-but-healthy failure shape).
         let faults = self.handler_faults.get();
-        let health = if faults > 0 { HEALTH_DEGRADED } else { HEALTH_OK };
-        let last_fault = self
-            .last_fault
-            .borrow()
-            .clone()
-            .unwrap_or_default();
+        let health = if faults > 0 {
+            HEALTH_DEGRADED
+        } else {
+            HEALTH_OK
+        };
+        let last_fault = self.last_fault.borrow().clone().unwrap_or_default();
         build_snapshot([
             (
                 PropPath::new("lifecycle.started_at").unwrap(),

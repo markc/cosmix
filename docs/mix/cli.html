@@ -877,6 +877,96 @@ the <code>cosmix-claude</code> Bus port daemon (socket
 (searched in <code>$COSMIX_SRC/target/{release,debug}/</code>, then <code>$PATH</code>), <code>stop</code>
 removes the socket, <code>status</code> probes it and flags a stale socket.</p>
 <h2 id="notes">Notes</h2>
+<h3 id="native-pane-shell-status-stage-a">Native pane-shell status (stage A)</h3>
+<p>An S3-enrolled interactive shell answers <code>shell.status</code> on its existing,
+broker-allocated pane-shell name and connection. It creates no extra service,
+transport, builtin or legacy <code>--serve</code> handler. The resident remains responsive
+while readline, Mix evaluation or a managed foreground child occupies the shell.
+Non-attached shells allocate no status state, timers or worker threads.</p>
+<p>The bounded JSON request (at most 2048 bytes) has <code>version: 1</code>, <code>target</code> and
+no replay cursor. <code>target</code> contains <code>broker_epoch</code>,
+<code>record</code> (<code>record_id</code>, <code>incarnation</code>, <code>binding_generation</code>), <code>instance_id</code>,
+<code>pane_id</code> and <code>pane_generation</code>, exactly as supplied by current S3 discovery.
+Unknown request fields, invalid versions and malformed values are refused.</p>
+<p>Replies contain a versioned <code>status.snapshot</code>, capabilities and freshness
+metadata. Snapshot phases follow these boundaries:</p>
+<table><thead><tr><th>Phase</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>starting</code></td><td>Before ShellReady, including startup hooks</td></tr>
+<tr><td><code>idle</code></td><td>After ShellReady, evaluation finish, or a line that ran nothing</td></tr>
+<tr><td><code>prompt-preparing</code></td><td>Building the primary prompt, including custom <code>prompt()</code></td></tr>
+<tr><td><code>prompt-ready</code></td><td>Editor activated; <code>continuation</code> distinguishes secondary prompts</td></tr>
+<tr><td><code>evaluating</code></td><td>An accepted line is being classified, expanded or evaluated, with a command ID</td></tr>
+<tr><td><code>foreground-child</code></td><td>A foreground producer holds a bracket</td></tr>
+<tr><td><code>exiting</code></td><td>Shell exit or replacement</td></tr>
+</tbody></table>
+<p>Prompt generation increases for every new
+primary or continuation prompt; <code>continuation</code> distinguishes them. Custom prompt
+evaluation is <code>prompt-preparing</code> without a command ID; continuation prompts do
+not enter that phase. An accepted line allocates its monotonic command ID at
+acceptance, not at evaluation, so the window in which it is classified and
+alias-expanded reports <code>evaluating</code> with that ID rather than <code>idle</code>. The ID is
+retained through foreground waits, and cleared when the evaluation finishes or
+when the line turns out to run nothing — an empty line, an incomplete
+continuation or a parse error — which returns the phase to <code>idle</code>.
+The foreground phase follows the job kernel's terminal lease for foreground
+pipelines and <code>fg</code>, and brackets the existing synchronous <code>run_stream</code> spawn/wait.
+This observation does not change <code>run_stream</code> job or signal semantics and does
+not enumerate jobs.</p>
+<p>The reducer supplies the owned editor's next prompt generation. Only its actual
+Editing acknowledgement commits that value and prompt-ready; a deferred,
+suspended or failed begin publishes nothing. Deferred foreground activation
+commits exactly once, and later suspend/resume of the same prompt does not bump
+it. <code>prompt_binding_generation</code> and <code>prompt_source</code> retain the identity supplied
+at Begin, while <code>source</code> names the current attachment. Zero/null means the prompt
+began before attachment. The full source plus prompt generation is required for
+future admission; the editor's numeric binding component alone is not identity.
+Legacy readline reports its entry boundary because it has no activation
+acknowledgement. <code>cwd</code> is the last observed directory, captured at shell startup
+and successful shell <code>cd</code> (including <code>cd -</code>, pushd/popd and sourced shell lines)
+or Mix <code>chdir()</code> transitions. Failed changes preserve it. Paths are bounded to
+4096 UTF-8 bytes with explicit truncation; unavailable observations are null.</p>
+<p>The version-1 reply's <code>status</code> has exactly <code>snapshot</code>, <code>sampled_ms</code>,
+<code>transition_age_ms</code> and <code>cwd_age_ms</code>. These times use the shared CLOCK_BOOTTIME
+clock, in milliseconds since status-state creation, including time suspended;
+they are not wall time. Admission lease-age comparisons use that same clock.
+<code>sampled_ms</code>, <code>transition_age_ms</code> and <code>cwd_age_ms</code> state freshness at sampling;
+delivery delay adds to those ages. A snapshot is information, never an execution
+permit. No background polling of cwd, editor or evaluator occurs. Producers
+commit owned transitions under a short state lock; transport, serialisation,
+filesystem calls, evaluator calls and child waits occur outside that lock.
+The 64-transition replay ring is internal in stage A. Replay cursors, gap
+reporting and event delivery are deferred to stage B and absent from this v1
+request/reply contract. Binding changes advance the same sequence. Historical
+transitions retain their original source, while replies name the current source.</p>
+<p>Admission uses BROKER-023 <code>read_state</code>: owning Term and explicitly scoped current
+principals, plus independent same-UID verified owners under <code>default-open</code>.
+Restricted policy denies ambient callers; cross-UID, TCP, unverified and sibling
+principals receive the same bounded <code>REFUSED</code> response without status or target
+details. Id-less notices never enter status admission or receive replies. Bound callers cannot fall back to ambient rights.
+Correlated lease checks revalidate both caller and target at admission, and
+detached residents do not dispatch requests. Admitting a session-bound caller
+costs one lease check plus one re-read of the resident's own attachment: the
+connection's broker epoch and connection id are fixed for its lifetime and are
+taken once, not per check. Every session RPC serialises on that one connection,
+so a renewal that loses its deadline to admission load is retried once with a
+fresh deadline before the attachment is given up. Stale targets return
+<code>STALE_GENERATION</code>. Recovery uses S3; it never resets shell sequence or prompt
+generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
+isolated tasks, input and event publication report <code>UNSUPPORTED</code>, never <code>BUSY</code>.
+The resident runs at most four admission tasks alongside its receive/renew/restart
+loop, one of which is reserved for the pane's own Term: other same-UID callers
+share three, so a flood by them cannot starve the owner into uniform refusals.
+That reservation is a scheduling class only — the reserved slot re-runs the whole
+admission policy like any other. Excess requests receive <code>REFUSED</code>; refusal writes
+are polled alongside control rather than blocking it, including when the transport
+has already dropped, so an admitted request is never answered with silence.
+Restart cancels outstanding admission tasks.
+The verified lane retains at most 64 commands of at most 64 KiB envelope/body.
+Its reader task neither writes nor waits: an overflowed request is handed to the
+receive owner, which writes that connection's <code>REFUSED</code>, and a dropped id-less
+lifecycle notice raises a delivery gap the resident treats exactly as it treats
+the broker's own lifecycle gap. Other clients retain their existing receive
+configuration.</p>
 <ul>
 <li><code>mix</code> is intercepted by the shell, so it never sees <code>$</code>-sigil arguments — write <code>mix what round</code>, not <code>mix what $name</code>.</li>
 <li>The introspection family (<code>vars</code>/<code>aliases</code>/<code>functions</code>/<code>all</code>/<code>context</code>) is most useful <strong>inside a REPL</strong>, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.</li>

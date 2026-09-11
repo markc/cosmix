@@ -6179,10 +6179,14 @@ fn builtin_run_stream(args: Vec<Value>) -> MixResult<Option<Value>> {
     if let Some(dir) = opts.cwd.as_deref() {
         cmd.current_dir(dir);
     }
+    // Observation only: stage A does not alter this runner's existing job,
+    // signal or wait semantics. The guard also closes the phase on spawn error.
+    let foreground = crate::shell_observation::foreground();
     let status = cmd.status().map_err(|e| MixError::RuntimeError {
         span: None,
         msg: format!("run_stream: failed to spawn {}: {}", argv[0], e),
     })?;
+    drop(foreground);
     let code = match status.code() {
         Some(c) => c,
         None => {
@@ -12831,6 +12835,7 @@ fn builtin_chdir(args: Vec<Value>) -> MixResult<Option<Value>> {
         span: None,
         msg: format!("chdir '{}': {}", path, e),
     })?;
+    crate::shell_observation::directory_changed();
     Ok(Some(Value::Nil))
 }
 

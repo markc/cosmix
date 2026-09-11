@@ -88,11 +88,7 @@ fn clear_resume_flag() {
 
 /// exec() into the new Mix binary, preserving args so the new instance
 /// picks up the resume flag on startup.
-fn exec_restart(
-    eval: &mut Evaluator,
-    rl: &mut Editor,
-    history_path: &std::path::Path,
-) -> ! {
+fn exec_restart(eval: &mut Evaluator, rl: &mut Editor, history_path: &std::path::Path) -> ! {
     // Save state before exec
     if let Some(mut stats) = eval.take_stats() {
         stats_io::save_stats(&mut stats);
@@ -113,6 +109,20 @@ fn exec_restart(
 
 /// Run the interactive REPL.
 pub fn run_repl() -> i32 {
+    let _session_lifetime = crate::session_state::ShellLifetime;
+    if crate::session_state::enabled() {
+        cosmix_mix::shell_observation::set_observer(|observation| {
+            use crate::session_state::Transition;
+            use cosmix_mix::shell_observation::Observation;
+            crate::session_state::commit(match observation {
+                Observation::DirectoryChanged { cwd } => Transition::DirectoryChanged { cwd },
+                Observation::ForegroundChanged { active } => {
+                    Transition::ForegroundChanged { active }
+                }
+            });
+        });
+        crate::session_state::observe_directory();
+    }
     meta::init_start_time();
 
     // Acquire foreground ownership before any terminal repair: a nested
@@ -127,6 +137,16 @@ pub fn run_repl() -> i32 {
         }
     };
     // Still precedes prelude, rc, prompt and resume-command output.
+    if crate::session_state::enabled()
+        && let crate::job_control::ExecutionPolicy::Interactive { controller, .. } =
+            job_table.policy()
+    {
+        controller.observe_foreground(|active| {
+            crate::session_state::commit(crate::session_state::Transition::ForegroundChanged {
+                active,
+            });
+        });
+    }
     ensure_interactive_output_mode();
     let rt = crate::build_runtime();
 
@@ -151,7 +171,8 @@ pub fn run_repl() -> i32 {
     let _ = rl.load_history(&history_path);
 
     if let Some(control) = rl.control()
-        && let crate::job_control::ExecutionPolicy::Interactive { controller, .. } = job_table.policy()
+        && let crate::job_control::ExecutionPolicy::Interactive { controller, .. } =
+            job_table.policy()
     {
         controller.set_terminal_shutdown(std::sync::Arc::new(move || control.shutdown()));
     }
@@ -233,6 +254,7 @@ pub fn run_repl() -> i32 {
     }
 
     let mut exit_code = 0;
+    crate::session_state::commit(crate::session_state::Transition::ShellReady);
     'repl: loop {
         // Discard any interrupt left over from a just-finished command. When
         // Ctrl-C lands during a blocking child (e.g. `tail -f` via run_stream),
@@ -260,6 +282,7 @@ pub fn run_repl() -> i32 {
         ensure_interactive_output_mode();
 
         let prompt = if line_buf.is_empty() {
+            crate::session_state::commit(crate::session_state::Transition::PromptPreparing);
             match build_prompt(&mut eval, &rt) {
                 Ok(prompt) => prompt,
                 Err(code) => {
@@ -279,7 +302,9 @@ pub fn run_repl() -> i32 {
 
         match rl.readline(&prompt, !line_buf.is_empty()) {
             Ok(line) => {
+                crate::session_state::commit(crate::session_state::Transition::LineAccepted);
                 if line_buf.is_empty() && line.trim().is_empty() {
+                    crate::session_state::commit(crate::session_state::Transition::LineAbandoned);
                     continue;
                 }
 
@@ -299,6 +324,9 @@ pub fn run_repl() -> i32 {
                     Some("") => {
                         eprintln!("mix: time: usage: time <command | mix expression>");
                         line_buf.clear();
+                        crate::session_state::commit(
+                            crate::session_state::Transition::LineAbandoned,
+                        );
                         continue;
                     }
                     Some(rest) => (true, rest.to_string()),
@@ -340,6 +368,7 @@ pub fn run_repl() -> i32 {
                     InputKind::Empty | InputKind::Incomplete | InputKind::ParseError(_)
                 );
                 let mut _timer = shell::TimeGuard::armed(timed && executing);
+                let _evaluation = crate::session_state::evaluation(executing);
                 match kind {
                     InputKind::Incomplete => {
                         // Don't clear line_buf — wait for more input

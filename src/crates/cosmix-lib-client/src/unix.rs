@@ -21,6 +21,7 @@ pub struct BrokerAccount {
 /// Explicit Unix opt-in. Supply the node-config value from the cos layer;
 /// this crate deliberately has no dependency on cosmix-lib-config.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UnixConnectOptions {
     pub broker_account: BrokerAccount,
     pub endpoint: Option<PathBuf>,
@@ -31,6 +32,10 @@ pub struct UnixConnectOptions {
     /// Explicitly allow a fresh TCP connection after Unix setup fails. It
     /// never carries trusted context, even if TCP advertises native-session.
     pub allow_unverified_tcp_fallback: bool,
+    /// Opt-in bounded verified command lane (1..=1024). Excess requests receive a uniform refusal; lifecycle notices
+    /// use backpressure rather than being dropped.
+    /// Individual retained commands are limited to 64 KiB of envelope/body.
+    pub incoming_capacity: Option<usize>,
 }
 
 impl UnixConnectOptions {
@@ -41,6 +46,7 @@ impl UnixConnectOptions {
             configured_endpoint: None,
             require_native_session: false,
             allow_unverified_tcp_fallback: false,
+            incoming_capacity: None,
         }
     }
 
@@ -107,8 +113,10 @@ pub enum UnixConnectOutcome {
 /// Only endpoint verification plus profile negotiation can construct this.
 pub struct VerifiedConnection {
     client: NodedClient,
-    incoming: mpsc::UnboundedReceiver<VerifiedCommand>,
+    incoming: tokio::sync::Mutex<VerifiedIncoming>,
     pub(crate) session_lock: tokio::sync::Mutex<()>,
+    /// One hello per connection: see [`VerifiedConnection::session_context`].
+    pub(crate) session_context: tokio::sync::OnceCell<crate::session::Hello>,
 }
 impl VerifiedConnection {
     /// Requests/replies use the existing ABP client API. Its raw receive lane
@@ -118,8 +126,57 @@ impl VerifiedConnection {
     }
 
     pub async fn recv(&mut self) -> Option<VerifiedCommand> {
-        self.incoming.recv().await
+        self.recv_shared().await
     }
+
+    /// Single receive owner may share this connection with bounded RPC tasks.
+    pub async fn recv_shared(&self) -> Option<VerifiedCommand> {
+        match &mut *self.incoming.lock().await {
+            VerifiedIncoming::Unbounded(receiver) => receiver.recv().await,
+            VerifiedIncoming::Bounded {
+                commands,
+                refusals,
+                gap,
+            } => {
+                if gap.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    return Some(VerifiedCommand::gap());
+                }
+                // Refusals first: a request the lane dropped is already waiting
+                // on its caller's deadline, and answering it frees that caller.
+                tokio::select! {
+                    biased;
+                    refused = refusals.recv() => match refused {
+                        Some(refused) => Some(refused),
+                        None => commands.recv().await,
+                    },
+                    command = commands.recv() => command,
+                }
+            }
+        }
+    }
+}
+
+pub(crate) enum VerifiedIncoming {
+    Unbounded(mpsc::UnboundedReceiver<VerifiedCommand>),
+    Bounded {
+        commands: mpsc::Receiver<VerifiedCommand>,
+        refusals: mpsc::Receiver<VerifiedCommand>,
+        gap: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+/// What the receive owner owes this delivery. The reader task never writes to
+/// the shared sink and never waits on a full lane, so both of the non-ordinary
+/// outcomes it can reach are reported here and settled by the owner instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// An ordinary broker delivery to act on.
+    Command,
+    /// The bounded lane was full; the owner owes this request one refusal.
+    Refuse,
+    /// One or more id-less broker notices were dropped. Indistinguishable from
+    /// a missed lifecycle change: treat it exactly as a broker lifecycle gap.
+    Gap,
 }
 
 /// Immutable delivery paired with context parsed on its verified transport.
@@ -140,10 +197,44 @@ impl VerifiedConnection {
 pub struct VerifiedCommand {
     command: IncomingCommand,
     principal: Option<BrokerPrincipal>,
+    delivery: Delivery,
 }
 impl VerifiedCommand {
     pub(crate) fn new(command: IncomingCommand, principal: Option<BrokerPrincipal>) -> Self {
-        Self { command, principal }
+        Self {
+            command,
+            principal,
+            delivery: Delivery::Command,
+        }
+    }
+    /// Keeps the correlation the reply needs and nothing that could be mistaken
+    /// for an admitted request: the delivery itself says it must be refused.
+    pub(crate) fn refusal(self) -> Self {
+        Self {
+            delivery: Delivery::Refuse,
+            ..self
+        }
+    }
+    /// Carries no broker content and no principal: a gap is the absence of a
+    /// delivery, never a delivery to act on.
+    pub(crate) fn gap() -> Self {
+        Self {
+            command: IncomingCommand {
+                from: String::new(),
+                command: String::new(),
+                id: None,
+                args: serde_json::Value::Null,
+                body: String::new(),
+                headers: Default::default(),
+            },
+            principal: None,
+            delivery: Delivery::Gap,
+        }
+    }
+    /// What the receive owner owes this delivery. Check this before the verb:
+    /// a refusal or a gap carries no admissible request.
+    pub fn delivery(&self) -> Delivery {
+        self.delivery
     }
     pub fn command(&self) -> &IncomingCommand {
         &self.command
@@ -230,16 +321,18 @@ async fn connect_verified(
     let (ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", socket)
         .await
         .map_err(|error| ConnectError::Protocol(error.into()))?;
-    let (client, incoming) = NodedClient::from_verified_unix(ws, service_name, provenance)
-        .await
-        .map_err(|error| match error.downcast::<ConnectError>() {
-            Ok(error) => error,
-            Err(error) => ConnectError::Protocol(error),
-        })?;
+    let (client, incoming) =
+        NodedClient::from_verified_unix(ws, service_name, provenance, options.incoming_capacity)
+            .await
+            .map_err(|error| match error.downcast::<ConnectError>() {
+                Ok(error) => error,
+                Err(error) => ConnectError::Protocol(error),
+            })?;
     Ok(VerifiedConnection {
         client,
-        incoming,
+        incoming: tokio::sync::Mutex::new(incoming),
         session_lock: tokio::sync::Mutex::new(()),
+        session_context: tokio::sync::OnceCell::new(),
     })
 }
 

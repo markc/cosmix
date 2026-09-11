@@ -12,6 +12,7 @@ pub mod lint_docs;
 mod numeric;
 pub mod parser;
 pub mod scope;
+pub mod shell_observation;
 pub mod stats;
 pub mod token;
 pub mod value;

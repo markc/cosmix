@@ -17,7 +17,9 @@ const PROMPT: &str = "P0J> ";
 const LIMIT: Duration = Duration::from_secs(10);
 static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn fixture_guard() -> std::sync::MutexGuard<'static, ()> {
-    FIXTURE_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
 }
 static RESIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 extern "C" fn resized(_: i32) {
@@ -271,7 +273,9 @@ impl Pty {
         for fd in [&mut m, &mut s] {
             let retained = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
             assert!(retained >= 0);
-            unsafe { libc::close(*fd); }
+            unsafe {
+                libc::close(*fd);
+            }
             *fd = retained;
         }
         let master = unsafe { File::from_raw_fd(m) };

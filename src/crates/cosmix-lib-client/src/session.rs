@@ -73,7 +73,9 @@ impl Deadline {
         &self.target
     }
 
-    /// Supply context from the current verified connection, not a cached old hello.
+    /// Supply context from the connection that produced this deadline, never a
+    /// hello retained across a reconnect. `session_context` is that context:
+    /// it is scoped to one connection and discarded with it.
     pub fn is_live(&self, current: &Hello) -> SessionResult<bool> {
         if self.broker_epoch != current.broker_epoch || self.connection_id != current.connection_id
         {
@@ -83,7 +85,8 @@ impl Deadline {
     }
 }
 
-fn boottime_ms() -> SessionResult<u64> {
+/// Suspend-inclusive milliseconds on the native session clock.
+pub fn boottime_ms() -> SessionResult<u64> {
     #[cfg(target_os = "linux")]
     {
         let mut ts = libc::timespec {
@@ -192,12 +195,28 @@ impl VerifiedConnection {
     pub async fn session_hello(&self) -> SessionResult<Hello> {
         self.session_rpc("hello", serde_json::json!({})).await
     }
+    /// The broker epoch and connection id hello reports are fixed for the life
+    /// of a verified connection, and this handle never reconnects
+    /// transparently, so one hello answers every later caller. Callers that
+    /// need connection context on a hot path (lease checks, admission) must
+    /// use this rather than `session_hello`: each RPC takes `session_lock`, so
+    /// a per-check hello serialises ahead of the resident's own renew.
+    pub async fn session_context(&self) -> SessionResult<Hello> {
+        match self
+            .session_context
+            .get_or_try_init(|| self.session_hello())
+            .await
+        {
+            Ok(hello) => Ok(hello.clone()),
+            Err(error) => Err(error),
+        }
+    }
     pub async fn session_allocate(
         &self,
         key: &SigningKey,
         policy: Policy,
     ) -> SessionResult<RecordResult> {
-        let hello = self.session_hello().await?;
+        let hello = self.session_context().await?;
         let public_key = HexBytes(key.verifying_key().to_bytes());
         let signature = HexBytes(
             key.sign(&encode_allocate(
@@ -281,7 +300,9 @@ impl VerifiedConnection {
     pub async fn session_lease_check(&self, target: RecordRef) -> SessionResult<Deadline> {
         // This handle owns one transport and does not reconnect transparently.
         // Bind the check to its broker epoch and connection, not just a ref.
-        let context = self.session_hello().await?;
+        // That context is fixed for the connection, so it costs one hello per
+        // connection rather than one per check.
+        let context = self.session_context().await?;
         let start = boottime_ms()?;
         let result: LeaseResult = self
             .session_rpc(

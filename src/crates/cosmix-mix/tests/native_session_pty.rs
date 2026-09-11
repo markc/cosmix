@@ -102,22 +102,25 @@ async fn connect(broker: &Broker) -> VerifiedConnection {
 
 struct Parent {
     key: SigningKey,
-    connection: VerifiedConnection,
+    connection: std::sync::Arc<VerifiedConnection>,
     record: SessionRecord,
     last_renew: Instant,
 }
 impl Parent {
     async fn new(broker: &Broker) -> Self {
+        Self::with_policy(broker, Policy::DefaultOpen).await
+    }
+    async fn with_policy(broker: &Broker, policy: Policy) -> Self {
         let key = fresh_key().unwrap();
         let connection = connect(broker).await;
         let record = connection
-            .session_allocate(&key, Policy::DefaultOpen)
+            .session_allocate(&key, policy)
             .await
             .unwrap()
             .record;
         Self {
             key,
-            connection,
+            connection: connection.into(),
             record,
             last_renew: Instant::now(),
         }
@@ -148,7 +151,7 @@ impl Parent {
     }
     async fn resume(&mut self, broker: &Broker) {
         self.connection.client().close().await;
-        self.connection = connect(broker).await;
+        self.connection = connect(broker).await.into();
         let hello = self.connection.session_hello().await.unwrap();
         let expected = ExpectedScope {
             broker_epoch: hello.broker_epoch,
@@ -177,7 +180,7 @@ impl Parent {
         self.last_renew = Instant::now();
     }
     async fn replace(&mut self, broker: &Broker) {
-        self.connection = connect(broker).await;
+        self.connection = connect(broker).await.into();
         self.record = self
             .connection
             .session_allocate(&self.key, Policy::DefaultOpen)
@@ -237,6 +240,9 @@ struct Child {
 }
 impl Child {
     fn spawn(broker: &Broker, launch: &LaunchFd) -> Self {
+        Self::spawn_editor(broker, launch, "owned")
+    }
+    fn spawn_editor(broker: &Broker, launch: &LaunchFd, editor: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("node.conf.mix");
         std::fs::write(
@@ -286,7 +292,7 @@ impl Child {
             ("COSMIX_NODE_CONFIG".into(), config.display().to_string()),
             ("COSMIX_BROKER_ACCOUNT".into(), account),
             ("MIX_STATS".into(), "off".into()),
-            ("MIX_EDITOR".into(), "owned".into()),
+            ("MIX_EDITOR".into(), editor.into()),
             ("TERM".into(), "xterm-256color".into()),
         ];
         // Same libc PTY pattern as job_control_pty, with the real LaunchFd's
@@ -505,6 +511,12 @@ fn mix_child_bootstrap_proves_end_to_end() {
 
 #[test]
 fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
+    for editor in ["owned", "legacy"] {
+        same_mix_child_scenarios(editor);
+    }
+}
+
+fn same_mix_child_scenarios(editor: &str) {
     let _fixture = fixture_guard();
     let mut broker = Broker::start();
     runtime().block_on(async {
@@ -513,19 +525,36 @@ fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
         let public_key = HexBytes(key.verifying_key().to_bytes());
         let initial = parent.grant(public_key, 2).await;
         let launch = LaunchFd::new(&initial, &key).unwrap();
-        let mut child = Child::spawn(&broker, &launch);
+        let mut child = Child::spawn_editor(&broker, &launch, editor);
         drop(launch);
         drop(key);
         child.until("RC_MARKER=[]\r\n");
         let first = parent
             .wait(initial.record.record_id, BindingState::Attached, 1)
             .await;
+        let before = phase(&mut parent, &first, "prompt-ready").await;
         let pid = child.pid();
         parent.resume(&broker).await;
         let resumed = parent
             .wait(first.record_id, BindingState::Attached, 2)
             .await;
         assert_eq!(resumed.pane_generation, Some(DecimalU64(2)));
+        let after = phase(&mut parent, &resumed, "prompt-ready").await;
+        assert!(
+            counter(&after["status"]["snapshot"]["sequence"])
+                > counter(&before["status"]["snapshot"]["sequence"])
+        );
+        assert_eq!(
+            after["status"]["snapshot"]["prompt_generation"],
+            before["status"]["snapshot"]["prompt_generation"]
+        );
+        let stale = parent
+            .connection
+            .client()
+            .call(&resumed.name, "shell.status", status_request(&first))
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("STALE_GENERATION"));
         broker.bounce();
         parent.replace(&broker).await;
         // Let the child connect first and retain key interest while no grant
@@ -547,6 +576,22 @@ fn same_mix_child_resumes_and_reenrols_after_broker_bounce() {
         // permits resetting the old pane high-water of 2 to the new parent's 1.
         assert_eq!(rebound.binding_generation, DecimalU64(1));
         assert_eq!(rebound.pane_generation, Some(DecimalU64(1)));
+        let recovered = phase(&mut parent, &rebound, "prompt-ready").await;
+        assert!(
+            counter(&recovered["status"]["snapshot"]["sequence"])
+                > counter(&after["status"]["snapshot"]["sequence"])
+        );
+        assert_eq!(
+            recovered["status"]["snapshot"]["prompt_generation"],
+            after["status"]["snapshot"]["prompt_generation"]
+        );
+        let stale = parent
+            .connection
+            .client()
+            .call(&rebound.name, "shell.status", status_request(&resumed))
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("STALE_GENERATION"));
         child.send("print(\"SAME_CHILD_ALIVE\")\n");
         child.until("SAME_CHILD_ALIVE\r\n");
         child.exit();
@@ -701,4 +746,450 @@ fn bootstrap_source_boundary_and_builtin_inventory_exclude_seed_state() {
     for forbidden in ["COSMIX_SESSION_FD", "native_session", "session_seed"] {
         assert!(!builtins.contains(forbidden));
     }
+}
+
+fn status_request(record: &SessionRecord) -> serde_json::Value {
+    serde_json::json!({"version":1,"target":{
+        "broker_epoch":record.broker_epoch,"record":record.reference(),
+        "instance_id":record.instance_id,"pane_id":record.pane_id,
+        "pane_generation":record.pane_generation
+    }})
+}
+
+fn counter(value: &serde_json::Value) -> u64 {
+    value
+        .as_str()
+        .expect("decimal-string counter")
+        .parse()
+        .unwrap()
+}
+
+async fn status(parent: &mut Parent, record: &SessionRecord) -> serde_json::Value {
+    parent.renew().await;
+    let start = Instant::now();
+    let value = tokio::time::timeout(
+        Duration::from_secs(3),
+        parent
+            .connection
+            .client()
+            .call(&record.name, "shell.status", status_request(record)),
+    )
+    .await
+    .expect("status blocked behind shell activity")
+    .unwrap();
+    eprintln!(
+        "status response {:?}, phase={}",
+        start.elapsed(),
+        value["status"]["snapshot"]["phase"]
+    );
+    assert_eq!(value["version"], 1);
+    assert_eq!(
+        value["status"]["snapshot"]["source"],
+        status_request(record)["target"]
+    );
+    assert!(
+        value["freshness"]
+            .as_str()
+            .unwrap()
+            .contains("never an execution permit")
+    );
+    value
+}
+
+async fn phase(parent: &mut Parent, record: &SessionRecord, expected: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let value = status(parent, record).await;
+        if value["status"]["snapshot"]["phase"] == expected {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "expected {expected}: {value}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[test]
+fn status_pump_answers_idle_pure_loop_and_blocking_builtin() {
+    for editor in ["owned", "legacy"] {
+        status_pump_scenarios(editor);
+    }
+}
+
+fn status_pump_scenarios(editor: &str) {
+    let _fixture = fixture_guard();
+    let broker = Broker::start();
+    runtime().block_on(async {
+        let mut parent = Parent::new(&broker).await;
+        let key = fresh_key().unwrap();
+        let grant = parent
+            .grant(HexBytes(key.verifying_key().to_bytes()), 1)
+            .await;
+        let launch = LaunchFd::new(&grant, &key).unwrap();
+        let mut child = Child::spawn_editor(&broker, &launch, editor);
+        drop(launch);
+        drop(key);
+        child.until("RC_MARKER=[]\r\n");
+        let bound = parent
+            .wait(grant.record.record_id, BindingState::Attached, 1)
+            .await;
+        let idle = phase(&mut parent, &bound, "prompt-ready").await;
+        let owner = connect(&broker).await;
+        let owner_view = tokio::time::timeout(
+            Duration::from_secs(3),
+            owner
+                .client()
+                .call(&bound.name, "shell.status", status_request(&bound)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            owner_view["status"]["snapshot"]["source"],
+            status_request(&bound)["target"]
+        );
+        owner.client().close().await;
+        assert_eq!(
+            idle["status"]["snapshot"]["command_id"],
+            serde_json::Value::Null
+        );
+        let initial_sequence = counter(&idle["status"]["snapshot"]["sequence"]);
+        let initial_prompt = counter(&idle["status"]["snapshot"]["prompt_generation"]);
+        assert_eq!(
+            idle["status"]["snapshot"]["cwd"],
+            child.home.path().to_str().unwrap()
+        );
+        // No keystroke is needed for either request, and idle does not produce
+        // synthetic transitions. Freshness ages still advance between samples.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let still_idle = status(&mut parent, &bound).await;
+        assert_eq!(
+            counter(&still_idle["status"]["snapshot"]["sequence"]),
+            initial_sequence
+        );
+        assert!(
+            counter(&still_idle["status"]["transition_age_ms"])
+                > counter(&idle["status"]["transition_age_ms"])
+        );
+        for feature in [
+            "jobs",
+            "job_signal",
+            "foreground",
+            "evaluation_submit",
+            "evaluation_inspect",
+            "input",
+            "isolated_task",
+            "events",
+        ] {
+            assert_eq!(idle["capabilities"][feature], "UNSUPPORTED");
+        }
+
+        child.send("while true; 1 + 1; done\n");
+        let evaluating = phase(&mut parent, &bound, "evaluating").await;
+        let command = counter(&evaluating["status"]["snapshot"]["command_id"]);
+        let second = status(&mut parent, &bound).await;
+        assert_eq!(
+            second["status"]["snapshot"]["command_id"],
+            evaluating["status"]["snapshot"]["command_id"]
+        );
+        assert_eq!(second["status"]["snapshot"]["phase"], "evaluating");
+        unsafe {
+            assert_eq!(libc::kill(child.pid(), libc::SIGINT), 0);
+        }
+        let next = phase(&mut parent, &bound, "prompt-ready").await;
+        assert!(counter(&next["status"]["snapshot"]["prompt_generation"]) > initial_prompt);
+
+        child.send("run_stream([\"/bin/sleep\", \"30\"])\n");
+        let foreground = phase(&mut parent, &bound, "foreground-child").await;
+        assert!(counter(&foreground["status"]["snapshot"]["command_id"]) > command);
+        assert_eq!(
+            status(&mut parent, &bound).await["status"]["snapshot"]["phase"],
+            "foreground-child"
+        );
+        child.send("\x03");
+        phase(&mut parent, &bound, "prompt-ready").await;
+
+        // Both directory mutation paths emit transitions even before an
+        // evaluation finishes; neither requires prompt-time cwd polling.
+        let directory = child.home.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        child.send("cd directory\n");
+        let cd = phase(&mut parent, &bound, "prompt-ready").await;
+        // The next query below waits on cwd too, avoiding an old prompt race.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut cd = cd;
+        while cd["status"]["snapshot"]["cwd"] != directory.to_str().unwrap() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            cd = status(&mut parent, &bound).await;
+        }
+        child.send("chdir(\"..\"); print(\"CWD_CHANGED\"); while true; 1 + 1; done\n");
+        child.until("CWD_CHANGED\r\n");
+        let changed = phase(&mut parent, &bound, "evaluating").await;
+        assert_eq!(
+            changed["status"]["snapshot"]["cwd"],
+            child.home.path().to_str().unwrap()
+        );
+        unsafe {
+            assert_eq!(libc::kill(child.pid(), libc::SIGINT), 0);
+        }
+        phase(&mut parent, &bound, "prompt-ready").await;
+        child.exit();
+        parent
+            .connection
+            .session_revoke(bound.reference())
+            .await
+            .unwrap();
+        parent.revoke_and_verify(&broker).await;
+    });
+}
+
+#[test]
+fn status_restricted_identity_rejection_and_unsupported_verbs() {
+    for editor in ["owned", "legacy"] {
+        status_restricted_scenarios(editor);
+    }
+}
+
+fn status_restricted_scenarios(editor: &str) {
+    let _fixture = fixture_guard();
+    let broker = Broker::start();
+    runtime().block_on(async {
+        let mut parent = Parent::with_policy(&broker, Policy::Restricted).await;
+        let key = fresh_key().unwrap();
+        let grant = parent
+            .grant(HexBytes(key.verifying_key().to_bytes()), 1)
+            .await;
+        let launch = LaunchFd::new(&grant, &key).unwrap();
+        let mut child = Child::spawn_editor(&broker, &launch, editor);
+        drop(launch);
+        drop(key);
+        child.until("RC_MARKER=[]\r\n");
+        let bound = parent
+            .wait(grant.record.record_id, BindingState::Attached, 1)
+            .await;
+        phase(&mut parent, &bound, "prompt-ready").await;
+        let ambient = connect(&broker).await;
+        let foreign = Parent::new(&broker).await;
+        for connection in [&ambient, foreign.connection.as_ref()] {
+            let result = tokio::time::timeout(
+                Duration::from_millis(400),
+                connection
+                    .client()
+                    .call(&bound.name, "shell.status", status_request(&bound)),
+            )
+            .await;
+            let error = result
+                .expect("denial must reply, not time out")
+                .unwrap_err();
+            assert_eq!(error.to_string(), r#"{"error_code":"REFUSED"}"#);
+        }
+        let tcp = NodedClient::connect_anonymous(&broker.url).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(400),
+            tcp.call(&bound.name, "shell.status", status_request(&bound)),
+        )
+        .await;
+        let error = result
+            .expect("unverified denial must reply, not time out")
+            .unwrap_err();
+        assert_eq!(error.to_string(), r#"{"error_code":"REFUSED"}"#);
+        tcp.close().await;
+        for verb in [
+            "shell.jobs",
+            "shell.evaluate",
+            "shell.evaluation.inspect",
+            "shell.input",
+            "shell.foreground",
+        ] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(3),
+                parent
+                    .connection
+                    .client()
+                    .call(&bound.name, verb, status_request(&bound)),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains("UNSUPPORTED"), "{error}");
+            assert!(!error.to_string().contains("BUSY"));
+        }
+        let mut stale = status_request(&bound);
+        stale["target"]["pane_generation"] = serde_json::json!("999");
+        let error = parent
+            .connection
+            .client()
+            .call(&bound.name, "shell.status", stale)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("STALE_GENERATION"));
+        let mut malformed = status_request(&bound);
+        malformed["extra"] = serde_json::json!(true);
+        let error = parent
+            .connection
+            .client()
+            .call(&bound.name, "shell.status", malformed)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("INVALID_REQUEST"));
+        ambient.client().close().await;
+        foreign.revoke_and_verify(&broker).await;
+        child.exit();
+        parent
+            .connection
+            .session_revoke(bound.reference())
+            .await
+            .unwrap();
+        parent.revoke_and_verify(&broker).await;
+    });
+}
+
+#[test]
+fn status_verbs_are_absent_from_legacy_surfaces() {
+    for source in [
+        include_str!("../src/bus.rs"),
+        include_str!("../src/serve_runtime.rs"),
+        include_str!("../src/meta.rs"),
+        include_str!("../../cosmix-lib-mix/src/builtins.rs"),
+    ] {
+        for verb in [
+            "shell.status",
+            "shell.jobs",
+            "shell.evaluate",
+            "shell.input",
+        ] {
+            assert!(!source.contains(verb), "legacy surface contains {verb}");
+        }
+    }
+}
+
+#[test]
+fn status_flood_preserves_lease_and_restart_ack() {
+    let _fixture = fixture_guard();
+    let broker = Broker::start();
+    runtime().block_on(async {
+        let mut parent = Parent::new(&broker).await;
+        let key = fresh_key().unwrap();
+        let grant = parent
+            .grant(HexBytes(key.verifying_key().to_bytes()), 1)
+            .await;
+        let launch = LaunchFd::new(&grant, &key).unwrap();
+        let mut child = Child::spawn(&broker, &launch);
+        drop(launch);
+        drop(key);
+        child.until("RC_MARKER=[]\r\n");
+        let bound = parent
+            .wait(grant.record.record_id, BindingState::Attached, 1)
+            .await;
+        phase(&mut parent, &bound, "prompt-ready").await;
+        let mut flood = tokio::task::JoinSet::new();
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The flood is other same-UID processes, not the owning Term: this
+        // child's policy admits ambient callers, so they compete for the very
+        // dispatch slots the Term needs.
+        let mut ambient = Vec::new();
+        for _ in 0..8 {
+            ambient.push(std::sync::Arc::new(connect(&broker).await));
+        }
+        for index in 0..64 {
+            let connection = ambient[index % ambient.len()].clone();
+            let target = bound.clone();
+            let refused = refused.clone();
+            flood.spawn(async move {
+                loop {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        connection.client().call(
+                            &target.name,
+                            "shell.status",
+                            status_request(&target),
+                        ),
+                    )
+                    .await
+                    .expect("flood request must be answered or explicitly refused");
+                    match result {
+                        Ok(value) => assert_eq!(
+                            value["status"]["snapshot"]["source"],
+                            status_request(&target)["target"]
+                        ),
+                        Err(error) => {
+                            assert_eq!(error.to_string(), r#"{"error_code":"REFUSED"}"#);
+                            refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        // Longer than the initial 15s child lease: only the resident's renew
+        // arm can keep this exact attachment alive under a continuously full load.
+        let deadline = Instant::now() + Duration::from_secs(17);
+        let mut answered = 0;
+        while Instant::now() < deadline {
+            parent.renew().await;
+            assert!(flood.try_join_next().is_none(), "flood worker failed");
+            let current = parent
+                .connection
+                .session_self(bound.record_id)
+                .await
+                .unwrap()
+                .record;
+            assert_eq!(current.state, BindingState::Attached);
+            assert_eq!(
+                current.reference(),
+                bound.reference(),
+                "overflow must not reconnect"
+            );
+            // One dispatch slot is the owning Term's, so a saturating flood by
+            // other same-UID callers cannot starve it into uniform refusals.
+            let value = tokio::time::timeout(
+                Duration::from_secs(3),
+                parent.connection.client().call(
+                    &bound.name,
+                    "shell.status",
+                    status_request(&bound),
+                ),
+            )
+            .await
+            .expect("the owning Term must be answered during a flood")
+            .expect("the owning Term must not be refused during a flood");
+            assert_eq!(
+                value["status"]["snapshot"]["source"],
+                status_request(&bound)["target"]
+            );
+            answered += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(answered > 0);
+        assert!(refused.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        std::fs::write(child.home.path().join(".claude-resume"), "").unwrap();
+        let started = Instant::now();
+        child.send("/usr/bin/true\n");
+        loop {
+            let current = parent
+                .connection
+                .session_self(bound.record_id)
+                .await
+                .unwrap()
+                .record;
+            if current.state == BindingState::Revoked {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "restart ack starved by flood"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        flood.abort_all();
+        while flood.join_next().await.is_some() {}
+        for connection in &ambient {
+            connection.client().close().await;
+        }
+        let output = child.until("RC_MARKER=[]\r\n");
+        assert!(output.contains("record observed revoked"), "{output}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        child.exit();
+        parent.revoke_and_verify(&broker).await;
+    });
 }

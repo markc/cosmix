@@ -11,7 +11,7 @@
 use cosmix_lib_bus::native_session::*;
 use cosmix_lib_client::session::{ChallengeResult, ExpectedScope, Hello, SessionFailure};
 use cosmix_lib_client::{
-    BrokerAccount, ConnectError, NodedClient, UnixConnectOptions, UnixConnectOutcome,
+    BrokerAccount, ConnectError, Delivery, NodedClient, UnixConnectOptions, UnixConnectOutcome,
     VerifiedConnection,
 };
 use ed25519_dalek::SigningKey;
@@ -42,6 +42,7 @@ static RESTART: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<RestartAc
 /// The shell's two exec-restart paths call this before replacing the process.
 /// This is intentionally not a builtin: it can only stop the private owner.
 pub(super) fn before_exec_restart() {
+    crate::session_state::commit(crate::session_state::Transition::ShellReplacement);
     let Some(sender) = RESTART.get() else {
         return;
     };
@@ -231,6 +232,7 @@ pub(super) fn start() {
     // Also remove duplicate launch descriptors before threads start. This
     // makes later runtime/worker failures incapable of leaving inherited fds.
     quarantine_failed_bootstrap();
+    crate::session_state::enable();
     // Snapshot every env-derived input while main is still single-threaded.
     // The evaluator may later mutate environ; the resident must never read it.
     let account = std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
@@ -308,6 +310,7 @@ fn options(
     });
     options.configured_endpoint = endpoint;
     options.require_native_session = true;
+    options.incoming_capacity = Some(64);
     Ok(options)
 }
 
@@ -579,7 +582,7 @@ async fn own(
         failures += 1;
         let result =
             tokio::time::timeout(RPC, NodedClient::connect_unix("", &url, &options, None)).await;
-        let mut connection = match result {
+        let connection = match result {
             Ok(Ok(UnixConnectOutcome::VerifiedUnix(connection))) => connection,
             Ok(Err(
                 ConnectError::InvalidEndpoint
@@ -600,9 +603,13 @@ async fn own(
                 continue;
             }
         };
+        let connection = std::sync::Arc::new(connection);
+        // One hello for this connection's whole life. Every later user of the
+        // context — lease checks on the admission path above all — reads the
+        // cache instead of queuing another RPC behind the renew.
         let hello = match rpc(
             "hello: broker context unavailable",
-            connection.session_hello(),
+            connection.session_context(),
         )
         .await
         {
@@ -620,10 +627,15 @@ async fn own(
         let mut proof_retries = ProofRetries::default();
         let mut tick = tokio::time::interval(RENEW_CADENCE);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut requests = tokio::task::JoinSet::new();
+        let mut refusal: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+            None;
         let reconnect = loop {
             tokio::select! {
                 biased;
                 Some(ack) = restart.recv() => {
+                    requests.abort_all();
+                    while requests.join_next().await.is_some() {}
                     let revoked = revoke_for_restart(&mut bootstrap, Some(&connection), record.as_ref().or(last_record.as_ref()), &url, &options).await;
                     let _ = ack.send(revoked);
                     break false;
@@ -633,9 +645,13 @@ async fn own(
                         pending = None;
                         next_attempt = Instant::now() + NOTICE_COALESCING_FLOOR;
                         match bootstrap.attach(&connection, &hello, reporter).await {
-                            Ok(bound) => { last_record = Some(bound.clone()); record = Some(bound); failures = 0; proof_retries = ProofRetries::default(); }
+                            Ok(bound) => {
+                                crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: Some((&bound).into()) });
+                                last_record = Some(bound.clone()); record = Some(bound); failures = 0; proof_retries = ProofRetries::default();
+                            }
                             Err(error) => {
                                 record = None;
+                                crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: None });
                                 if error.wake { reporter.wake(); } else { reporter.report(error.stage); }
                                 match error.recovery {
                                     Recovery::Reconnect => break true,
@@ -657,31 +673,69 @@ async fn own(
                             }
                         }
                     } else if let Some(bound) = &record {
-                        match rpc("renew: attachment lost", connection.session_renew(bound.reference())).await {
-                            Ok(result) if result.record.reference() == bound.reference() && result.record.state == BindingState::Attached => record = Some(result.record),
-                            _ => { reporter.report("renew: attachment lost; bounded reconnect"); break true; }
+                        match renew(&connection, bound).await {
+                            Some(renewed) => record = Some(renewed),
+                            None => { reporter.report("renew: attachment lost; bounded reconnect"); break true; }
                         }
                     }
                 }
-                event = connection.recv() => {
+                _ = requests.join_next(), if !requests.is_empty() => {}
+                _ = async { if let Some(work) = &mut refusal { work.await } }, if refusal.is_some() => { refusal = None; }
+                event = connection.recv_shared(), if refusal.is_none() => {
                     let Some(event) = event else { break true };
+                    if !connection.client().is_connected() { break true; }
                     let command = event.command();
-                    if command.command == "noded.session.lifecycle.gap" || command.command == "noded.session.lifecycle" {
+                    if event.delivery() == Delivery::Refuse {
+                        // The reader never writes: an overflowed request is
+                        // refused here, on the one arm that owns the sink.
+                        let connection = connection.clone();
+                        refusal = Some(Box::pin(async move {
+                            crate::session_status::refuse(&connection, &event).await;
+                        }));
+                    } else if event.delivery() == Delivery::Gap || command.command == "noded.session.lifecycle.gap" || command.command == "noded.session.lifecycle" {
                         // Authenticated notices are hints, never scope or authority.
                         // Coalesce them behind the floor. Attached notices at our
                         // own generation must not trigger a self-resume feedback loop.
-                        let relevant = match relevant_notice(&command.command, &command.body, &hello, record.as_ref()) {
+                        // A lane gap carries no notice to decode and no choice:
+                        // something was dropped, so nothing about the current
+                        // attachment can still be assumed.
+                        let relevant = event.delivery() == Delivery::Gap || match relevant_notice(&command.command, &command.body, &hello, record.as_ref()) {
                             Ok(relevant) => relevant,
                             Err(_) => { reporter.report("notice decode: malformed lifecycle hint dropped"); false }
                         };
                         if relevant {
                             record = None;
+                            crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: None });
                             pending.get_or_insert(next_attempt);
+                        }
+                    } else if command.id.is_some() {
+                        let connection = connection.clone();
+                        // The last slot belongs to this pane's own Term; other
+                        // same-UID callers share the rest.
+                        let admitted = record
+                            .as_ref()
+                            .filter(|bound| requests.len() < crate::session_status::dispatch_slots(&event, bound))
+                            .cloned();
+                        if let Some(bound) = admitted {
+                            let hello = hello.clone();
+                            requests.spawn(async move {
+                                crate::session_status::dispatch(&connection, &hello, &bound, &event).await;
+                            });
+                        } else {
+                            refusal = Some(Box::pin(async move {
+                                crate::session_status::refuse(&connection, &event).await;
+                            }));
                         }
                     }
                 }
             }
         };
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
+        drop(refusal);
+        crate::session_state::commit(crate::session_state::Transition::AttachmentChanged {
+            source: None,
+        });
         close(&connection).await;
         if !reconnect {
             return;
@@ -689,6 +743,35 @@ async fn own(
         reporter.report("transport: attachment disconnected; bounded reconnects");
         failures = failures.max(1);
     }
+}
+
+/// One bounded retry with a fresh timeout before the attachment is given up.
+/// Every session RPC serialises on this connection, so a burst of admissions
+/// can push one renewal past its 2s timeout; a 5s cadence against a 15s lease
+/// leaves room for the extra attempt. Transient contention must delay a
+/// renewal, not drop the attachment and force a full reconnect.
+async fn renew(connection: &VerifiedConnection, bound: &SessionRecord) -> Option<SessionRecord> {
+    for attempt in 0..2 {
+        match rpc(
+            "renew: attachment lost",
+            connection.session_renew(bound.reference()),
+        )
+        .await
+        {
+            Ok(result)
+                if result.record.reference() == bound.reference()
+                    && result.record.state == BindingState::Attached =>
+            {
+                return Some(result.record);
+            }
+            // Only transport loss or an elapsed deadline is contention. A
+            // refusal, or a record that came back changed, is an answer about
+            // this attachment: retrying it would only delay the reconnect.
+            Err(failure) if attempt == 0 && matches!(failure.recovery, Recovery::Reconnect) => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 async fn reconnect_backoff(
@@ -747,7 +830,8 @@ async fn revoke_for_restart_inner(
             else {
                 return false;
             };
-            let Ok(Ok(hello)) = tokio::time::timeout(RPC, connection.session_hello()).await else {
+            let Ok(Ok(hello)) = tokio::time::timeout(RPC, connection.session_context()).await
+            else {
                 close(&connection).await;
                 return false;
             };
