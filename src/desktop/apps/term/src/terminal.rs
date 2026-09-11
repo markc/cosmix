@@ -332,6 +332,13 @@ fn reap_child(pid: i32, timeout: Duration) {
 /// shell). Probed for executability before spawn; see `Terminal::start_session`.
 const MIX_BIN: &str = "/opt/cosmix/bin/mix";
 
+struct LaunchSettings<'a> {
+    program: &'a str,
+    home: Option<String>,
+    cwd: Option<String>,
+    environment: Vec<(String, String)>,
+}
+
 fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<String, String> {
     term_cwd
         .filter(|dir| {
@@ -355,6 +362,48 @@ impl Terminal {
         settings: crate::config::Settings,
         native: Option<&crate::native_session::NativeSession>,
         pane_id: u64,
+    ) -> Result<Self, String> {
+        Self::start_session_with_launch(
+            settings,
+            native,
+            pane_id,
+            LaunchSettings {
+                program: MIX_BIN,
+                home: std::env::var("HOME").ok(),
+                cwd: std::env::var("TERM_CWD").ok(),
+                environment: Vec::new(),
+            },
+        )
+    }
+
+    /// Test inputs only; every spawn, fd mapping, Machine and exit-notifier
+    /// operation below is shared with start_session, not a fixture launcher.
+    #[cfg(test)]
+    pub(crate) fn start_session_e2e(
+        settings: crate::config::Settings,
+        native: &crate::native_session::NativeSession,
+        program: &str,
+        home: String,
+        environment: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        Self::start_session_with_launch(
+            settings,
+            Some(native),
+            1,
+            LaunchSettings {
+                program,
+                cwd: Some(home.clone()),
+                home: Some(home),
+                environment,
+            },
+        )
+    }
+
+    fn start_session_with_launch(
+        settings: crate::config::Settings,
+        native: Option<&crate::native_session::NativeSession>,
+        pane_id: u64,
+        launch_settings: LaunchSettings<'_>,
     ) -> Result<Self, String> {
         if std::path::Path::new("/.flatpak-info").exists() {
             return Err("spike requires native session (controlling PTY)".into());
@@ -381,8 +430,8 @@ impl Terminal {
         // invoking cwd). Absent or invalid, fall back to HOME so a bare
         // desktop launch keeps its historical home-directory default.
         // The pinned PTY API takes String; non-UTF-8 TERM_CWD falls back to HOME.
-        let home = std::env::var("HOME").ok();
-        let cwd = launch_directory(std::env::var("TERM_CWD").ok(), home.clone())?;
+        let home = launch_settings.home;
+        let cwd = launch_directory(launch_settings.cwd, home.clone())?;
         // The PTY API only adds environment entries. env removes TERM_CWD in
         // the child before execing Mix, without mutating our threaded process's
         // environment; later mix --gui launches can stamp their own cwd.
@@ -392,7 +441,8 @@ impl Terminal {
         // Probe the real target up front so startup fails loudly instead; the
         // probe-to-exec race is a broken install mid-launch, not a state this
         // check needs to survive.
-        let mix_bin = std::ffi::CString::new(MIX_BIN).map_err(|e| e.to_string())?;
+        let program = launch_settings.program;
+        let mix_bin = std::ffi::CString::new(program).map_err(|e| e.to_string())?;
         // SAFETY: mix_bin is NUL-terminated and alive for this effective-ID check.
         let mix_executable = unsafe {
             libc::faccessat(
@@ -403,7 +453,7 @@ impl Terminal {
             ) == 0
         };
         if !mix_executable {
-            return Err(format!("{MIX_BIN} is not installed or not executable"));
+            return Err(format!("{program} is not installed or not executable"));
         }
         // Explicit program + argv: native create_pty_with_spawn selects
         // setsid + TIOCSCTTY (Flatpak's non-controlling branch refused above).
@@ -413,7 +463,8 @@ impl Terminal {
             None => (None, None),
         };
         let spawn = |dir: String| {
-            let env = vec![("TERM".into(), settings.term.into())];
+            let mut env = launch_settings.environment.clone();
+            env.push(("TERM".into(), settings.term.into()));
             let mut args = vec!["-u".into(), "TERM_CWD".into()];
             // Never propagate a marker inherited by Term itself. The one
             // current launch marker is supplied explicitly after env's unsets.
@@ -422,7 +473,7 @@ impl Terminal {
                 let (name, value) = fd.marker();
                 args.push(format!("{name}={value}"));
             }
-            args.push(MIX_BIN.into());
+            args.push(program.into());
             teletypewriter::create_pty_with_spawn_fd(
                 Some("/usr/bin/env"),
                 args,

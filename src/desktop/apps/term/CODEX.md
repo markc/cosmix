@@ -1,5 +1,12 @@
 # Native-session tests
 
+`p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes` exercises the
+production teletypewriter hop with an explicit current-HEAD Mix release binary.
+See `tests/README.md`; its loud missing-binary skip is not enrolment evidence.
+The test-only `LaunchSettings` injection shares the production spawn body.
+The embedded vendor `patch_guard.rs` also makes Term tests sensitive to the
+recorded upstream pins and patched source hashes; see the desktop patch README.
+
 `tests/support` embeds noded production modules with `#[path]` rather than a
 mock command engine. Changes to those modules can break or change Term's
 integration tests even when Term's own source is untouched. Gate both the

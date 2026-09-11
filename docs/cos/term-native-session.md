@@ -269,6 +269,14 @@ beyond 15 seconds on that original attachment (resumption cannot substitute),
 scrubbed rc/context/descendant state and post-exit revocation.
 Its parent fixture drives Term's typed allocate/renew/re-grant/revoke duties;
 the GUI and exit-notifier ordering remain covered by the Term workspace tests.
+The desktop test `p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes`
+also runs the production NativeSession prepare → LaunchFd → teletypewriter
+mapping → real Mix proof path, requiring attachment generation 1 and revocation
+on actual child exit. It requires a clean current-HEAD release binary supplied
+through `COSMIX_E2E_MIX_BIN`, checks live Git status and embedded SHA, and skips
+loudly when the variable is absent. See Term's `tests/README.md`. This covers
+p0i-01's binding portion, not S4 protected mutation admission.
+
 Term's teletypewriter PTY tests remain desktop-only; that dependency is not
 part of the main workspace.
 A second real-PTY test keeps the same child alive across parent resumption and

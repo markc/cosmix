@@ -1227,6 +1227,10 @@ impl Actor {
 }
 
 #[cfg(test)]
+#[path = "native_session_e2e.rs"]
+mod production_e2e;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use term_native_test_broker::Broker;
