@@ -23,10 +23,16 @@
 -- The shell half, by prefix, with the exact set pinned below it.
 $shell_prefix = "stage_d"
 $shell_fixtures = [
+  "stage_d_a_cancelled_captured_runner_reports_cancelled_not_completed",
+  "stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact",
   "stage_d_a_signal_during_an_admitted_execution_does_not_reach_the_next_one",
   "stage_d_admits_at_an_idle_prompt_echoes_and_reports_a_structured_result",
+  "stage_d_an_abandoned_admission_never_executes_and_its_retry_does_not_re_run",
+  "stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human",
   "stage_d_cancellation_resolves_the_exact_operation",
+  "stage_d_cancelling_a_managed_foreground_job_signals_its_process_group",
   "stage_d_is_unsupported_rather_than_busy_without_the_owned_editor",
+  "stage_d_paste_and_search_drafts_are_preserved_with_exact_refusals",
   "stage_d_refuses_every_ineligible_prompt_state_without_discarding_anything",
   "stage_d_reports_its_own_capability_and_refuses_unauthorised_callers"
 ]
