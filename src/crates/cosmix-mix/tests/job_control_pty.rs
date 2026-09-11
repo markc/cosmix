@@ -1,4 +1,6 @@
 //! Real PTYs and a re-executed Rust fixture (no shell/interpreter helpers).
+//! REQUIRED: run with --test-threads=1. openpty has no atomic CLOEXEC option;
+//! serial execution excludes sibling fixture forks during openpty/dup/close.
 #![cfg(target_os = "linux")]
 use std::fs::{self, File};
 use std::io::{Read, Write};

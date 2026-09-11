@@ -1,5 +1,7 @@
 //! Disposable real controlling-PTY tests. Fixtures execute in isolated libtest
 //! processes so signal handlers never interfere with the parent test runner.
+//! REQUIRED: run with --test-threads=1. openpty has no atomic CLOEXEC option;
+//! serial execution excludes sibling fixture forks during openpty/dup/close.
 #![cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[path = "../src/editor/mod.rs"]
@@ -108,6 +110,32 @@ fn fixture_editor() {
         unsafe { File::from_raw_fd(libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3)) }
     };
     let output = unsafe { File::from_raw_fd(libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3)) };
+    if scenario == "bounded-drain" {
+        let mut terminal = editor::terminal::Terminal::new(input, output).unwrap();
+        terminal.enter().unwrap();
+        let prompt = format!("{}TAIL> ", "\x1b[31m".repeat(10_000));
+        let mut buffer = editor::buffer::Buffer::default();
+        buffer.insert(&"a".repeat(100)).unwrap();
+        buffer.move_to(0).unwrap();
+        let layout = editor::render::layout(&prompt, &buffer, 50).unwrap();
+        terminal.draw(&layout, &prompt).unwrap();
+        let (written, pending) = terminal.output_progress();
+        assert!(
+            written > 0 && written < pending,
+            "must exercise partial output"
+        );
+        terminal.finish(&layout).unwrap();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        fs::write(home.join("drain-ready"), "go").unwrap();
+        terminal.restore().unwrap();
+        same_modes(original, modes(0));
+        assert_eq!(
+            editor::terminal::OUTPUT_TEARS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        println!("DRAIN-PASS");
+        return;
+    }
     let editor = OwnedEditor::start(input, output).unwrap();
     let g = Generation {
         session: 1,
@@ -161,6 +189,7 @@ fn fixture_editor() {
         ));
         assert!(start.elapsed() < Duration::from_secs(2));
         same_modes(original, modes(0));
+        assert!(editor::terminal::OUTPUT_TEARS.load(std::sync::atomic::Ordering::Relaxed) > 0);
         editor.control.shutdown().unwrap();
         fs::write(
             std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("backpressure-pass"),
@@ -362,6 +391,23 @@ fn undrained_master_does_not_block_suspend_or_shutdown() {
 }
 
 #[test]
+fn bounded_drain_completes_partial_escape_output_and_finish_before_cleanup() {
+    let mut p = Pty::new(Some("bounded-drain"), true);
+    // Wait without draining until the child proves a partial write is pending.
+    wait(|| p.home.path().join("drain-ready").exists());
+    let output = p.until("DRAIN-PASS");
+    assert_eq!(output.matches("\x1b[31m").count(), 10_000);
+    assert!(output.contains("TAIL> "));
+    // Cooked OPOST may map queued LF to CRLF after termios restoration.
+    assert!(
+        output.contains("\r\n\n\r\n\x1b[?2004l") || output.contains("\r\r\n\r\n\r\r\n\x1b[?2004l")
+    );
+    same_modes(p.original, modes(p.slave.as_raw_fd()));
+    wait(|| p.child.try_wait().unwrap().is_some());
+    assert!(p.child.wait().unwrap().success());
+}
+
+#[test]
 fn input_failure_shutdown_waits_for_terminal_cleanup() {
     let mut p = Pty::new(Some("input-error"), true);
     p.prompt();
@@ -387,6 +433,44 @@ fn wrapped_submission_moves_below_tail_from_home() {
     );
     assert!(output.contains(&format!("{}\r\n", "a".repeat(100))));
     p.exit();
+}
+
+#[test]
+fn taller_than_viewport_submission_only_moves_below_visible_tail() {
+    let mut p = Pty::new(None, true);
+    p.prompt();
+    let text = format!("print(\"{}\")", "a".repeat(15_000));
+    p.send(b"\x1b[200~");
+    p.send(text.as_bytes());
+    p.send(b"\x1b[201~\x01");
+    p.until(PROMPT);
+    p.send(b"\n");
+    let output = p.prompt();
+    let finish = format!("\r{}\r\n", "\n".repeat(11));
+    assert!(
+        output.contains(&finish),
+        "finish must use the 12-row viewport"
+    );
+    assert!(
+        !output.contains(&"\n".repeat(12)),
+        "hidden rows must not scroll"
+    );
+    assert!(output.contains(&format!("{}\r\n", "a".repeat(15_000))));
+    p.exit();
+}
+
+#[test]
+fn invalid_utf8_history_is_warned_and_never_rewritten() {
+    let original = b"#V2\nvalid\n\xff";
+    let mut p = Pty::with_history(None, true, PROMPT, Some(original));
+    p.until("history saving disabled");
+    p.prompt();
+    p.command("print(101)");
+    p.exit();
+    assert_eq!(
+        fs::read(p.home.path().join(".mix_history")).unwrap(),
+        original
+    );
 }
 
 struct Pty {
@@ -439,8 +523,8 @@ impl Pty {
             },
             0
         );
-        // Atomically mark the retained descriptors CLOEXEC and immediately
-        // close openpty's originals, before any concurrent fixture can exec.
+        // Serial execution (required above) excludes concurrent fixture forks
+        // until openpty's originals are closed and retained fds are CLOEXEC.
         for fd in [&mut m, &mut s] {
             let retained = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
             assert!(retained >= 0);

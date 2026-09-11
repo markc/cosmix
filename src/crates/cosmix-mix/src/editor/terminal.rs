@@ -4,6 +4,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+// Process-local diagnostic record, even when the tty cannot accept a warning.
+pub static OUTPUT_TEARS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Terminal {
     // The controller separately records job modes. The ordering contract is
@@ -57,7 +62,9 @@ impl Terminal {
         raw.c_cc[libc::VTIME] = 0;
         // TCSANOW deliberately preserves pending typeahead.
         if unsafe { libc::tcsetattr(self.fd(), libc::TCSANOW, &raw) } < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            self.require_foreground()?;
+            return Err(error);
         }
         self.saved = Some(saved);
         self.protocols = true;
@@ -68,8 +75,9 @@ impl Terminal {
         Ok(())
     }
     pub fn restore(&mut self) -> io::Result<()> {
-        // Cooked modes are the handoff guarantee. Output backpressure must
-        // never gate restoration or acknowledgement; protocol cleanup is best effort.
+        // Cooked modes are the handoff guarantee and precede output cleanup.
+        // One shared 250 ms deadline bounds the pending
+        // drain AND protocol cleanup: acknowledgements never wait indefinitely.
         if let Some(saved) = self.saved {
             self.require_foreground()?;
             if unsafe { libc::tcsetattr(self.fd(), libc::TCSANOW, &saved) } < 0 {
@@ -77,14 +85,63 @@ impl Terminal {
             }
             self.saved = None;
         }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut complete = true;
+        while self.written < self.pending.len() {
+            if !self.drain_once(deadline) {
+                complete = false;
+                break;
+            }
+        }
         self.pending.clear();
         self.written = 0;
         self.dirty = false;
-        if self.protocols && self.foreground() {
-            let _ = self.output.write(b"\x1b[?2004l\x1b[0m");
+        if self.protocols {
+            self.pending.extend_from_slice(b"\x1b[?2004l\x1b[0m");
+            while self.written < self.pending.len() {
+                if !self.drain_once(deadline) {
+                    complete = false;
+                    break;
+                }
+            }
         }
+        // On expiry/error we accept a torn escape sequence: the emulator may
+        // need a reset. Record it without attempting a potentially blocked log.
+        if !complete {
+            OUTPUT_TEARS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.pending.clear();
+        self.written = 0;
         self.protocols = false;
         Ok(())
+    }
+    fn drain_once(&mut self, deadline: Instant) -> bool {
+        if !self.foreground() || Instant::now() >= deadline {
+            return false;
+        }
+        match self.output.write(&self.pending[self.written..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                self.written += n;
+                return true;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return true,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+        let mut fd = libc::pollfd {
+            fd: self.output.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let millis = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis();
+        if millis == 0 {
+            return false;
+        }
+        unsafe { libc::poll(&mut fd, 1, millis.min(250) as i32) };
+        Instant::now() < deadline
     }
     pub fn foreground(&self) -> bool {
         unsafe { libc::tcgetpgrp(self.fd()) == libc::getpgrp() }
@@ -100,7 +157,11 @@ impl Terminal {
         }
     }
     pub fn output_fd(&self) -> Option<RawFd> {
-        (self.written < self.pending.len()).then(|| self.output.as_raw_fd())
+        (self.written < self.pending.len() && self.foreground()).then(|| self.output.as_raw_fd())
+    }
+    #[cfg(test)]
+    pub fn output_progress(&self) -> (usize, usize) {
+        (self.written, self.pending.len())
     }
     pub fn flush_ready(&mut self) -> io::Result<bool> {
         // One bounded write per poll iteration; controls/signals run between retries.
@@ -156,8 +217,11 @@ impl Terminal {
     }
     pub fn finish(&mut self, layout: &Layout) -> io::Result<()> {
         let mut bytes = String::from("\r");
-        // LF scrolls when necessary; finish below the logical tail, not the cursor.
-        for _ in layout.cursor.row..layout.end.row {
+        // Finish below the visible tail; hidden logical rows must not scroll.
+        let (_, height) = self.size();
+        let top = layout.cursor.row.saturating_sub(height - 1);
+        let bottom = layout.rows.min(top + height);
+        for _ in layout.cursor.row..layout.end.row.min(bottom.saturating_sub(1)) {
             bytes.push('\n');
         }
         bytes.push_str("\r\n");
@@ -265,6 +329,12 @@ mod tests {
         let mut terminal =
             Terminal::new(input.try_clone().unwrap(), input.try_clone().unwrap()).unwrap();
         assert!(terminal.enter().is_err());
+        terminal.queue(b"pending").unwrap();
+        assert_eq!(terminal.output_progress(), (0, 7));
+        assert!(
+            terminal.output_fd().is_none(),
+            "background POLLOUT must not spin"
+        );
         let mut restored: libc::termios = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::tcgetattr(slave, &mut restored) }, 0);
         assert_eq!(restored.c_lflag, original.c_lflag);
