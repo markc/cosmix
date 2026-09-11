@@ -1317,11 +1317,24 @@ fn p0i_07_actor_table_survives_reconnect_churn() {
         let mut actors = Vec::new();
         for cycle in 0..320u32 {
             let actor = verified(&fixture.broker).await;
+            // Read this connection's epoch and pass it explicitly. The helper
+            // would otherwise cache one per client ADDRESS, and every iteration
+            // builds its connection in the same stack slot, so cycle 1 would
+            // reuse cycle 0's epoch and every mutation would come back
+            // UNKNOWN_OUTCOME for a reason that has nothing to do with the cap.
+            let session = call(
+                actor.client(),
+                &parent.name,
+                "term.session",
+                json!({"target":target}),
+            )
+            .await;
+            assert_eq!(session.0, 0, "cycle {cycle} session refused: {session:?}");
             let reply = call(
                 actor.client(),
                 &parent.name,
                 "term.pane.select",
-                json!({"target":target,"request_id":"1"}),
+                json!({"target":target,"request_id":"1","request_epoch":session.1["request_epoch"]}),
             )
             .await;
             assert_eq!(reply.0, 0, "cycle {cycle} refused: {reply:?}");
