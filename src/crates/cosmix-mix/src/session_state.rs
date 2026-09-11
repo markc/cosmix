@@ -1,9 +1,10 @@
 //! Owned, bounded stage-A state. No evaluator, transport or child waits here.
+use crate::editor::Generation;
 use cosmix_lib_bus::native_session::{DecimalU64, HexBytes, RecordRef, SessionRecord};
+use cosmix_lib_client::session::boottime_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 const REPLAY: usize = 64;
 const MAX_CWD: usize = 4096;
@@ -34,6 +35,8 @@ impl From<&SessionRecord> for Source {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Phase {
     Starting,
+    Idle,
+    PromptPreparing,
     PromptReady,
     Evaluating,
     ForegroundChild,
@@ -80,6 +83,8 @@ pub(crate) struct Snapshot {
     pub cwd_truncated: bool,
     pub cwd_observed_ms: DecimalU64,
     pub prompt_generation: DecimalU64,
+    pub prompt_binding_generation: DecimalU64,
+    pub prompt_source: Option<Source>,
     pub continuation: bool,
     pub command_id: Option<DecimalU64>,
     pub transition_ms: DecimalU64,
@@ -91,23 +96,22 @@ pub(crate) struct View {
     pub sampled_ms: DecimalU64,
     pub transition_age_ms: DecimalU64,
     pub cwd_age_ms: DecimalU64,
-    pub oldest_retained_sequence: DecimalU64,
-    /// A consumer behind the retained ring must discard replay and resnapshot.
-    pub gap: bool,
 }
 
 pub(crate) struct Reducer {
-    origin: Instant,
+    origin: u64,
     snapshot: Snapshot,
     replay: VecDeque<Event>,
     next_command: u64,
     foreground_return: Phase,
+    foreground_depth: u32,
     evaluation_started_ms: Option<u64>,
+    pending_prompt: Option<(Generation, bool, Option<Source>)>,
 }
 impl Reducer {
     fn new() -> Self {
         Self {
-            origin: Instant::now(),
+            origin: boottime_ms().unwrap_or(0),
             snapshot: Snapshot {
                 version: 1,
                 source: None,
@@ -117,6 +121,8 @@ impl Reducer {
                 cwd_truncated: false,
                 cwd_observed_ms: DecimalU64(0),
                 prompt_generation: DecimalU64(0),
+                prompt_binding_generation: DecimalU64(0),
+                prompt_source: None,
                 continuation: false,
                 command_id: None,
                 transition_ms: DecimalU64(0),
@@ -124,11 +130,41 @@ impl Reducer {
             replay: VecDeque::with_capacity(REPLAY),
             next_command: 0,
             foreground_return: Phase::Starting,
+            foreground_depth: 0,
             evaluation_started_ms: None,
+            pending_prompt: None,
         }
     }
+    fn prepare_prompt(&mut self, continuation: bool) -> Option<Generation> {
+        let generation = Generation {
+            session: self
+                .snapshot
+                .source
+                .as_ref()
+                .map_or(0, |s| s.record.binding_generation.0),
+            prompt: self.snapshot.prompt_generation.0.checked_add(1)?,
+        };
+        self.pending_prompt = Some((generation, continuation, self.snapshot.source.clone()));
+        Some(generation)
+    }
+    fn activate_prompt(&mut self, generation: Generation) {
+        if self
+            .pending_prompt
+            .as_ref()
+            .is_none_or(|(expected, _, _)| *expected != generation)
+        {
+            return;
+        }
+        let (_, continuation, source) = self.pending_prompt.take().unwrap();
+        self.snapshot.prompt_binding_generation = DecimalU64(generation.session);
+        self.snapshot.prompt_source = source;
+        self.commit(Transition::PromptReady { continuation });
+        debug_assert_eq!(self.snapshot.prompt_generation.0, generation.prompt);
+    }
     fn now(&self) -> u64 {
-        self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64
+        boottime_ms()
+            .unwrap_or(u64::MAX)
+            .saturating_sub(self.origin)
     }
     fn commit(&mut self, mut transition: Transition) {
         let now = self.now();
@@ -140,8 +176,8 @@ impl Reducer {
             return;
         };
         match &mut transition {
-            Transition::ShellReady => s.phase = Phase::Starting,
-            Transition::PromptPreparing => s.phase = Phase::Evaluating,
+            Transition::ShellReady => s.phase = Phase::Idle,
+            Transition::PromptPreparing => s.phase = Phase::PromptPreparing,
             Transition::PromptReady { continuation } => {
                 let Some(generation) = s.prompt_generation.0.checked_add(1) else {
                     return;
@@ -150,7 +186,7 @@ impl Reducer {
                 s.continuation = *continuation;
                 s.phase = Phase::PromptReady;
             }
-            Transition::LineAccepted => s.phase = Phase::Starting,
+            Transition::LineAccepted => s.phase = Phase::Idle,
             Transition::EvaluationAccepted => {
                 let Some(id) = self.next_command.checked_add(1) else {
                     return;
@@ -167,14 +203,22 @@ impl Reducer {
                     .evaluation_started_ms
                     .take()
                     .map(|start| DecimalU64(now.saturating_sub(start)));
-                s.phase = Phase::Starting;
+                s.phase = Phase::Idle;
             }
             Transition::ForegroundChanged { active } => {
                 if *active {
-                    self.foreground_return = s.phase;
+                    debug_assert_eq!(self.foreground_depth, 0, "nested foreground bracket");
+                    if self.foreground_depth == 0 {
+                        self.foreground_return = s.phase;
+                    }
+                    self.foreground_depth = self.foreground_depth.saturating_add(1);
                     s.phase = Phase::ForegroundChild;
                 } else {
-                    s.phase = self.foreground_return;
+                    debug_assert!(self.foreground_depth > 0, "unbalanced foreground bracket");
+                    self.foreground_depth = self.foreground_depth.saturating_sub(1);
+                    if self.foreground_depth == 0 {
+                        s.phase = self.foreground_return;
+                    }
                 }
             }
             Transition::DirectoryChanged { cwd } => {
@@ -219,21 +263,13 @@ impl Reducer {
             s.command_id = None;
         }
     }
-    fn view(&self, after: Option<DecimalU64>) -> View {
+    fn view(&self) -> View {
         let now = self.now();
-        let oldest = self
-            .replay
-            .front()
-            .map_or(self.snapshot.sequence, |e| e.sequence);
         View {
             snapshot: self.snapshot.clone(),
             sampled_ms: DecimalU64(now),
             transition_age_ms: DecimalU64(now.saturating_sub(self.snapshot.transition_ms.0)),
             cwd_age_ms: DecimalU64(now.saturating_sub(self.snapshot.cwd_observed_ms.0)),
-            oldest_retained_sequence: oldest,
-            gap: after.is_some_and(|v| {
-                v.0.saturating_add(1) < oldest.0 || v.0 > self.snapshot.sequence.0
-            }),
         }
     }
 }
@@ -246,11 +282,36 @@ pub(crate) fn enabled() -> bool {
 }
 pub(crate) fn commit(transition: Transition) {
     if let Some(state) = STATE.get() {
-        state.lock().unwrap().commit(transition);
+        state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .commit(transition);
     }
 }
-pub(crate) fn view(after: Option<DecimalU64>) -> Option<View> {
-    STATE.get().map(|state| state.lock().unwrap().view(after))
+pub(crate) fn view() -> Option<View> {
+    STATE.get().map(|state| {
+        state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .view()
+    })
+}
+/// Reserve the next value without publishing it. Only actual activation commits.
+pub(crate) fn prepare_prompt(continuation: bool) -> Option<Generation> {
+    STATE.get().and_then(|state| {
+        state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .prepare_prompt(continuation)
+    })
+}
+pub(crate) fn prompt_activated(generation: Generation) {
+    if let Some(state) = STATE.get() {
+        state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .activate_prompt(generation);
+    }
 }
 pub(crate) fn observe_directory() {
     if enabled() {
@@ -288,6 +349,73 @@ impl Drop for ShellLifetime {
 mod tests {
     use super::*;
     #[test]
+    fn prompt_ack_is_the_only_generation_commit() {
+        let mut state = Reducer::new();
+        assert_eq!(state.snapshot.phase, Phase::Starting);
+        state.commit(Transition::ShellReady);
+        assert_eq!(state.snapshot.phase, Phase::Idle);
+        state.commit(Transition::PromptPreparing);
+        assert_eq!(state.snapshot.phase, Phase::PromptPreparing);
+        let ticket = state.prepare_prompt(false).unwrap();
+        // Failed/suspended begin has no Editing ack and publishes nothing.
+        assert_eq!(state.snapshot.prompt_generation, DecimalU64(0));
+        let sequence = state.snapshot.sequence;
+        state.activate_prompt(Generation {
+            prompt: ticket.prompt + 1,
+            ..ticket
+        });
+        assert_eq!(state.snapshot.sequence, sequence);
+        state.activate_prompt(ticket);
+        assert_eq!(state.snapshot.prompt_generation.0, ticket.prompt);
+        assert_eq!(state.snapshot.phase, Phase::PromptReady);
+        let sequence = state.snapshot.sequence;
+        state.activate_prompt(ticket); // redraw/resume, not a new prompt
+        assert_eq!(state.snapshot.sequence, sequence);
+        state.commit(Transition::LineAccepted);
+        assert_eq!(state.snapshot.phase, Phase::Idle);
+        let continuation = state.prepare_prompt(true).unwrap();
+        assert_eq!(state.snapshot.phase, Phase::Idle);
+        state.activate_prompt(continuation);
+        assert!(state.snapshot.continuation);
+        assert_eq!(state.snapshot.prompt_generation.0, ticket.prompt + 1);
+        state.commit(Transition::EvaluationAccepted);
+        state.commit(Transition::EvaluationStarted);
+        assert_eq!(state.snapshot.phase, Phase::Evaluating);
+        assert!(state.snapshot.command_id.is_some());
+        state.commit(Transition::EvaluationFinished);
+        assert_eq!(state.snapshot.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn suspend_inclusive_age_is_not_capped_at_last_transition() {
+        let mut state = Reducer::new();
+        // Deterministically model a snapshot captured eight hours earlier on
+        // the same suspend-inclusive clock. No host suspend is required.
+        let eight_hours = 8 * 60 * 60 * 1000;
+        state.origin = state.origin.saturating_sub(eight_hours);
+        let view = state.view();
+        let elapsed = boottime_ms().unwrap().saturating_sub(state.origin);
+        assert!(view.cwd_age_ms.0 <= elapsed);
+        assert_eq!(view.cwd_age_ms, view.transition_age_ms);
+        assert!(view.cwd_age_ms.0 >= boottime_ms().unwrap().min(eight_hours).saturating_sub(100));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unbalanced foreground bracket")]
+    fn foreground_underflow_is_detected() {
+        Reducer::new().commit(Transition::ForegroundChanged { active: false });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "nested foreground bracket")]
+    fn nested_foreground_is_detected() {
+        let mut state = Reducer::new();
+        state.commit(Transition::ForegroundChanged { active: true });
+        state.commit(Transition::ForegroundChanged { active: true });
+    }
+    #[test]
     fn bounded_replay_gap_and_atomic_snapshot() {
         fn send<T: Send>() {}
         send::<Reducer>();
@@ -300,8 +428,7 @@ mod tests {
             });
         }
         assert_eq!(state.replay.len(), REPLAY);
-        assert!(state.view(Some(DecimalU64(0))).gap);
-        assert!(!state.view(Some(DecimalU64(99))).gap);
+        assert_eq!(state.replay.front().unwrap().sequence, DecimalU64(37));
         assert_eq!(
             state.snapshot.sequence,
             state.replay.back().unwrap().sequence
@@ -362,6 +489,5 @@ mod tests {
         assert_eq!(state.snapshot.prompt_generation, original.prompt_generation);
         assert_eq!(state.replay[1].source, original.source);
         assert_eq!(state.snapshot.source, Some(source));
-        assert!(!state.view(Some(original.sequence)).gap);
     }
 }

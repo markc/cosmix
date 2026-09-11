@@ -281,8 +281,8 @@ pub fn run_repl() -> i32 {
         // itself and every command for the rest of the session.
         ensure_interactive_output_mode();
 
-        crate::session_state::commit(crate::session_state::Transition::PromptPreparing);
         let prompt = if line_buf.is_empty() {
+            crate::session_state::commit(crate::session_state::Transition::PromptPreparing);
             match build_prompt(&mut eval, &rt) {
                 Ok(prompt) => prompt,
                 Err(code) => {

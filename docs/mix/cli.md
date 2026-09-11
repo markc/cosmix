@@ -586,54 +586,79 @@ transport, builtin or legacy `--serve` handler. The resident remains responsive
 while readline, Mix evaluation or a managed foreground child occupies the shell.
 Non-attached shells allocate no status state, timers or worker threads.
 
-The bounded JSON request (at most 2048 bytes) has `version: 1`, `target` and an
-optional decimal-string `after_sequence`. `target` contains `broker_epoch`,
+The bounded JSON request (at most 2048 bytes) has `version: 1`, `target` and
+no replay cursor. `target` contains `broker_epoch`,
 `record` (`record_id`, `incarnation`, `binding_generation`), `instance_id`,
 `pane_id` and `pane_generation`, exactly as supplied by current S3 discovery.
 Unknown request fields, invalid versions and malformed values are refused.
 
 Replies contain a versioned `status.snapshot`, capabilities and freshness
-metadata. Snapshot phases are `starting`, `prompt-ready`, `evaluating`,
-`foreground-child` and `exiting`. Prompt generation increases for every new
+metadata. Snapshot phases follow these boundaries:
+
+| Phase | Meaning |
+|---|---|
+| `starting` | Before ShellReady, including startup hooks |
+| `idle` | After ShellReady, line acceptance or evaluation finish |
+| `prompt-preparing` | Building the primary prompt, including custom `prompt()` |
+| `prompt-ready` | Editor activated; `continuation` distinguishes secondary prompts |
+| `evaluating` | An accepted command is evaluating, with a command ID |
+| `foreground-child` | A foreground producer holds a bracket |
+| `exiting` | Shell exit or replacement |
+
+ Prompt generation increases for every new
 primary or continuation prompt; `continuation` distinguishes them. Custom prompt
-evaluation is `evaluating` without a command ID. Accepted evaluations allocate
+evaluation is `prompt-preparing` without a command ID; continuation prompts do
+not enter that phase. Accepted evaluations allocate
 monotonic command IDs, retained through foreground waits and cleared on finish.
 The foreground phase follows the job kernel's terminal lease for foreground
 pipelines and `fg`, and brackets the existing synchronous `run_stream` spawn/wait.
 This observation does not change `run_stream` job or signal semantics and does
 not enumerate jobs.
 
-The owned editor acknowledges activation before prompt-ready is recorded.
+The reducer supplies the owned editor's next prompt generation. Only its actual
+Editing acknowledgement commits that value and prompt-ready; a deferred,
+suspended or failed begin publishes nothing. Deferred foreground activation
+commits exactly once, and later suspend/resume of the same prompt does not bump
+it. `prompt_binding_generation` and `prompt_source` retain the identity supplied
+at Begin, while `source` names the current attachment. Zero/null means the prompt
+began before attachment. The full source plus prompt generation is required for
+future admission; the editor's numeric binding component alone is not identity.
 Legacy readline reports its entry boundary because it has no activation
 acknowledgement. `cwd` is the last observed directory, captured at shell startup
 and successful shell `cd` (including `cd -`, pushd/popd and sourced shell lines)
 or Mix `chdir()` transitions. Failed changes preserve it. Paths are bounded to
 4096 UTF-8 bytes with explicit truncation; unavailable observations are null.
 
-Times are monotonic milliseconds since status-state creation, not wall time.
+The version-1 reply's `status` has exactly `snapshot`, `sampled_ms`,
+`transition_age_ms` and `cwd_age_ms`. These times use the shared CLOCK_BOOTTIME
+clock, in milliseconds since status-state creation, including time suspended;
+they are not wall time. Admission lease-age comparisons use that same clock.
 `sampled_ms`, `transition_age_ms` and `cwd_age_ms` state freshness at sampling;
 delivery delay adds to those ages. A snapshot is information, never an execution
 permit. No background polling of cwd, editor or evaluator occurs. Producers
 commit owned transitions under a short state lock; transport, serialisation,
 filesystem calls, evaluator calls and child waits occur outside that lock.
-The 64-transition replay ring is internal in stage A. `oldest_retained_sequence`
-and `gap` tell a consumer with an old `after_sequence` to resnapshot; events are
-not yet published. Binding changes advance the same sequence. Historical
+The 64-transition replay ring is internal in stage A. Replay cursors, gap
+reporting and event delivery are deferred to stage B and absent from this v1
+request/reply contract. Binding changes advance the same sequence. Historical
 transitions retain their original source, while replies name the current source.
 
 Admission uses BROKER-023 `read_state`: owning Term and explicitly scoped current
 principals, plus independent same-UID verified owners under `default-open`.
 Restricted policy denies ambient callers; cross-UID, TCP, unverified and sibling
-principals receive no status. Bound callers cannot fall back to ambient rights.
+principals receive the same bounded `REFUSED` response without status or target
+details. Id-less notices never enter status admission or receive replies. Bound callers cannot fall back to ambient rights.
 Correlated lease checks revalidate both caller and target at admission, and
 detached residents do not dispatch requests. Stale targets return
 `STALE_GENERATION`. Recovery uses S3; it never resets shell sequence or prompt
 generation. Jobs, signals, foreground/resume, evaluation submit/inspect,
 isolated tasks, input and event publication report `UNSUPPORTED`, never `BUSY`.
-The resident opts into a 64-command verified receive queue, with a 64 KiB
-envelope/body limit per retained command. Overflow closes that connection and
-uses S3 recovery; lifecycle notices are never silently dropped. Other clients
-retain their existing receive configuration.
+The resident runs at most four admission tasks alongside its receive/renew/restart
+loop. Excess requests receive `REFUSED`; refusal writes are polled alongside
+control rather than blocking it. Restart cancels outstanding admission tasks.
+The verified lane retains at most 64 commands of at most 64 KiB envelope/body;
+request overflow is refused on that connection, and id-less lifecycle notices
+use backpressure. Other clients retain their existing receive configuration.
 
 - `mix` is intercepted by the shell, so it never sees `$`-sigil arguments — write `mix what round`, not `mix what $name`.
 - The introspection family (`vars`/`aliases`/`functions`/`all`/`context`) is most useful **inside a REPL**, where the session has accumulated state; from a one-shot OS-shell invocation it reports only the freshly-loaded prelude.

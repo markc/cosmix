@@ -83,7 +83,8 @@ impl Deadline {
     }
 }
 
-fn boottime_ms() -> SessionResult<u64> {
+/// Suspend-inclusive milliseconds on the native session clock.
+pub fn boottime_ms() -> SessionResult<u64> {
     #[cfg(target_os = "linux")]
     {
         let mut ts = libc::timespec {

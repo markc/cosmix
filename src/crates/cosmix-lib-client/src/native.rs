@@ -51,13 +51,16 @@ enum NativeIncomingSender {
     #[cfg(unix)]
     Verified(mpsc::UnboundedSender<crate::unix::VerifiedCommand>),
     #[cfg(unix)]
-    VerifiedBounded(mpsc::Sender<crate::unix::VerifiedCommand>),
+    VerifiedBounded(
+        mpsc::Sender<crate::unix::VerifiedCommand>,
+        Arc<Mutex<WsSink>>,
+    ),
     Unbounded(mpsc::UnboundedSender<IncomingCommand>),
     Bounded(BoundedIncomingSender),
 }
 
 impl NativeIncomingSender {
-    fn send(
+    async fn send(
         &self,
         command: IncomingCommand,
         _principal: Option<cosmix_bus::native_session::BrokerPrincipal>,
@@ -68,17 +71,45 @@ impl NativeIncomingSender {
                 .send(crate::unix::VerifiedCommand::new(command, _principal))
                 .is_ok(),
             #[cfg(unix)]
-            Self::VerifiedBounded(tx) => {
+            Self::VerifiedBounded(tx, sink) => {
                 let bytes = command
                     .headers
                     .iter()
                     .fold(command.body.len(), |n, (k, v)| {
                         n.saturating_add(k.len()).saturating_add(v.len())
                     });
-                bytes <= 65536
-                    && tx
-                        .try_send(crate::unix::VerifiedCommand::new(command, _principal))
-                        .is_ok()
+                // Broker notices are id-less and must not be lost on overflow.
+                if command.id.is_none() {
+                    return bytes <= 65536
+                        && tx
+                            .send(crate::unix::VerifiedCommand::new(command, _principal))
+                            .await
+                            .is_ok();
+                }
+                let event = crate::unix::VerifiedCommand::new(command, _principal);
+                let refused = if bytes > 65536 {
+                    event
+                } else {
+                    match tx.try_send(event) {
+                        Ok(()) => return true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                        Err(mpsc::error::TrySendError::Full(event)) => event,
+                    }
+                };
+                let command = refused.command();
+                let mut reply = BusMessage::new()
+                    .with_header("type", "response")
+                    .with_header("from", "")
+                    .with_header("to", &command.from)
+                    .with_header("command", &command.command)
+                    .with_header("id", command.id.as_deref().unwrap_or(""))
+                    .with_header("rc", "10");
+                reply.body = r#"{"error_code":"REFUSED"}"#.into();
+                sink.lock()
+                    .await
+                    .send(Message::Text(reply.to_wire().into()))
+                    .await
+                    .is_ok()
             }
             Self::Unbounded(sender) => sender.send(command).is_ok(),
             Self::Bounded(sender) => sender.try_send(command),
@@ -272,13 +303,14 @@ impl NodedClient {
         incoming_capacity: Option<usize>,
     ) -> Result<(Self, crate::unix::VerifiedIncoming)> {
         let (sink, stream) = socket.split();
+        let sink: Arc<Mutex<WsSink>> = Arc::new(Mutex::new(Box::pin(sink)));
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
         let (tx, rx) = match incoming_capacity {
             Some(capacity @ 1..=1024) => {
                 let (tx, rx) = mpsc::channel(capacity);
                 (
-                    NativeIncomingSender::VerifiedBounded(tx),
+                    NativeIncomingSender::VerifiedBounded(tx, sink.clone()),
                     crate::unix::VerifiedIncoming::Bounded(rx),
                 )
             }
@@ -301,7 +333,7 @@ impl NodedClient {
         let mut guard = AbortOnDrop::new(reader.abort_handle());
         let client = Self {
             service_name: RwLock::new(service_name.into()),
-            sink: Arc::new(Mutex::new(Box::pin(sink))),
+            sink,
             pending,
             incoming_rx: Mutex::new(None),
             next_id: AtomicU64::new(1),
@@ -1065,7 +1097,7 @@ impl NodedClient {
         #[cfg(unix)]
         let verified = matches!(
             &incoming_tx,
-            NativeIncomingSender::Verified(_) | NativeIncomingSender::VerifiedBounded(_)
+            NativeIncomingSender::Verified(_) | NativeIncomingSender::VerifiedBounded(..)
         );
         #[cfg(not(unix))]
         let verified = false;
@@ -1151,7 +1183,7 @@ impl NodedClient {
                     body: msg.body.clone(),
                     headers: msg.headers.clone(),
                 };
-                if !incoming_tx.send(cmd, principal) {
+                if !incoming_tx.send(cmd, principal).await {
                     tracing::debug!("{service_name}: incoming channel closed");
                     break;
                 }
@@ -1169,27 +1201,38 @@ impl NodedClient {
 #[cfg(all(test, unix))]
 mod verified_bound_tests {
     use super::*;
-    fn command(body: String) -> IncomingCommand {
-        IncomingCommand {
+
+    #[tokio::test]
+    async fn overflow_refuses_without_disconnecting_and_preserves_notices() {
+        let (wire_tx, mut wire_rx) = mpsc::unbounded_channel();
+        let sink: WsSink = Box::pin(futures_util::sink::unfold(wire_tx, |tx, message| async {
+            tx.send(message).unwrap();
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
+        }));
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = NativeIncomingSender::VerifiedBounded(tx, Arc::new(Mutex::new(sink)));
+        let command = |id| IncomingCommand {
             from: "caller".into(),
             command: "shell.status".into(),
-            id: Some("1".into()),
+            id,
             args: serde_json::Value::Null,
-            body,
+            body: "{}".into(),
             headers: Default::default(),
-        }
-    }
-    #[tokio::test]
-    async fn full_verified_lane_fails_closed_without_waiting() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let sender = NativeIncomingSender::VerifiedBounded(sender);
-        assert!(sender.send(command("first".into()), None));
-        // false tells the real reader loop to disconnect and invalidate pending
-        // authority; this lane must never silently drop a lifecycle notice.
-        assert!(!sender.send(command("second".into()), None));
-        assert_eq!(receiver.recv().await.unwrap().command().body, "first");
-        assert!(!sender.send(command("x".repeat(65537)), None));
-        assert!(receiver.try_recv().is_err());
+        };
+        assert!(sender.send(command(Some("1".into())), None).await);
+        assert!(sender.send(command(Some("2".into())), None).await);
+        let response = wire_rx.recv().await.unwrap();
+        let response = bus::parse(response.to_text().unwrap()).unwrap();
+        assert_eq!(response.get("id"), Some("2"));
+        assert_eq!(response.get("rc"), Some("10"));
+        assert_eq!(response.body, r#"{"error_code":"REFUSED"}"#);
+        assert_eq!(rx.recv().await.unwrap().command().id.as_deref(), Some("1"));
+        assert!(sender.send(command(None), None).await);
+        assert!(rx.recv().await.unwrap().command().id.is_none());
+        assert!(
+            wire_rx.try_recv().is_err(),
+            "notices must not receive replies"
+        );
     }
 }
 

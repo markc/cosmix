@@ -2,9 +2,10 @@
 use crate::session_state::{self, Source, View};
 use cosmix_lib_bus::native_session::*;
 use cosmix_lib_client::session::Hello;
+use cosmix_lib_client::session::boottime_ms;
 use cosmix_lib_client::{VerifiedCommand, VerifiedConnection};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_REQUEST: usize = 2048;
 const ADMISSION: Duration = Duration::from_secs(2);
@@ -15,8 +16,6 @@ pub(crate) const VERB: &str = "shell.status";
 struct Request {
     version: u8,
     target: Source,
-    #[serde(default)]
-    after_sequence: Option<DecimalU64>,
 }
 
 #[derive(Serialize)]
@@ -72,7 +71,8 @@ fn permitted(principal: &BrokerPrincipal, target: &SessionRecord) -> bool {
         (Assurance::SessionBound, Some(caller)) => {
             let parent = caller.role == Role::Term
                 && Some(caller.instance_id) == target.parent_instance
-                && Some(caller.incarnation) == target.parent_incarnation;
+                && Some(caller.incarnation) == target.parent_incarnation
+                && caller.capabilities.contains(&Capability::ReadState);
             let own_pane = caller.role == Role::PaneShell
                 && caller.record_id == target.record_id
                 && caller.instance_id == target.instance_id
@@ -116,22 +116,22 @@ async fn admitted(
     // lease.check is recipient-only: broker delivery creates a dependency on
     // the CALLER, not on ourselves. Re-read our own attachment by record ID,
     // retaining request-start time so latency cannot extend its reported lease.
-    let started = Instant::now();
+    let Ok(started) = boottime_ms() else {
+        return false;
+    };
     let Ok(current) = connection.session_self(bound.record_id).await else {
         return false;
     };
     current.record.state == BindingState::Attached
         && Source::from(&current.record) == Source::from(bound)
         && current.record.policy == bound.policy
-        && current
-            .record
-            .lease_remaining_ms
-            .is_some_and(|remaining| started.elapsed() < Duration::from_millis(remaining.0))
+        && current.record.lease_remaining_ms.is_some_and(|remaining| {
+            boottime_ms().is_ok_and(|now| now.saturating_sub(started) < remaining.0)
+        })
         && caller_lease.is_none_or(|lease| lease.is_live(hello).unwrap_or(false))
 }
 
-/// No worker spawn and no evaluator queue. One bounded request is admitted at
-/// a time, with an outer timeout so renewals and recovery cannot be starved.
+/// Runs in the resident's bounded sibling task set, never in its receive arm.
 pub(crate) async fn dispatch(
     connection: &VerifiedConnection,
     hello: &Hello,
@@ -139,13 +139,18 @@ pub(crate) async fn dispatch(
     event: &VerifiedCommand,
 ) {
     let command = event.command();
+    if command.id.is_none() {
+        return;
+    }
     let Some(principal) = event.trusted_context() else {
+        refuse(connection, event).await;
         return;
     };
     if !tokio::time::timeout(ADMISSION, admitted(connection, hello, principal, bound))
         .await
         .unwrap_or(false)
     {
+        refuse(connection, event).await;
         return;
     }
     let response = if command.command != VERB {
@@ -156,7 +161,8 @@ pub(crate) async fn dispatch(
             .flatten();
         match request {
             Some(request) if request.version == 1 && request.target == Source::from(bound) => {
-                let Some(status) = session_state::view(request.after_sequence) else {
+                let Some(status) = session_state::view() else {
+                    refuse(connection, event).await;
                     return;
                 };
                 if !connection.client().is_connected() {
@@ -165,13 +171,14 @@ pub(crate) async fn dispatch(
                 // Source changes atomically with the reducer's sequence. Never
                 // relabel an old-generation snapshot with a new attachment.
                 if status.snapshot.source.as_ref() != Some(&request.target) {
+                    refuse(connection, event).await;
                     return;
                 }
                 let reply = Reply {
                     version: 1,
                     status,
                     capabilities: Capabilities::default(),
-                    freshness: "last-observed; monotonic milliseconds since shell state startup; a snapshot is information, never an execution permit",
+                    freshness: "last-observed; CLOCK_BOOTTIME milliseconds since shell state startup (includes suspend); a snapshot is information, never an execution permit",
                 };
                 (
                     0,
@@ -191,6 +198,18 @@ pub(crate) async fn dispatch(
             .respond(command, response.0, &response.1),
     )
     .await;
+}
+
+pub(crate) async fn refuse(connection: &VerifiedConnection, event: &VerifiedCommand) {
+    if event.command().id.is_some() {
+        let _ = tokio::time::timeout(
+            ADMISSION,
+            connection
+                .client()
+                .respond(event.command(), 10, r#"{"error_code":"REFUSED"}"#),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -281,11 +300,11 @@ mod tests {
     #[test]
     fn bounded_typed_request_rejects_unknown_fields_and_bad_counters() {
         let target = Source::from(&target());
-        let mut value = serde_json::json!({"version":1,"target":target,"after_sequence":"12"});
+        let mut value = serde_json::json!({"version":1,"target":target});
         assert!(serde_json::from_value::<Request>(value.clone()).is_ok());
         value["after_sequence"] = serde_json::json!(12);
         assert!(serde_json::from_value::<Request>(value.clone()).is_err());
-        value["after_sequence"] = serde_json::json!("12");
+        value.as_object_mut().unwrap().remove("after_sequence");
         value["command"] = serde_json::json!("execute");
         assert!(serde_json::from_value::<Request>(value).is_err());
     }

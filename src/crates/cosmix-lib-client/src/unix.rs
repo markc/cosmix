@@ -21,6 +21,7 @@ pub struct BrokerAccount {
 /// Explicit Unix opt-in. Supply the node-config value from the cos layer;
 /// this crate deliberately has no dependency on cosmix-lib-config.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UnixConnectOptions {
     pub broker_account: BrokerAccount,
     pub endpoint: Option<PathBuf>,
@@ -31,8 +32,8 @@ pub struct UnixConnectOptions {
     /// Explicitly allow a fresh TCP connection after Unix setup fails. It
     /// never carries trusted context, even if TCP advertises native-session.
     pub allow_unverified_tcp_fallback: bool,
-    /// Opt-in bounded verified command lane (1..=1024). A full lane closes
-    /// the connection rather than losing lifecycle notices or blocking I/O.
+    /// Opt-in bounded verified command lane (1..=1024). Excess requests receive a uniform refusal; lifecycle notices
+    /// use backpressure rather than being dropped.
     /// Individual retained commands are limited to 64 KiB of envelope/body.
     pub incoming_capacity: Option<usize>,
 }
@@ -112,7 +113,7 @@ pub enum UnixConnectOutcome {
 /// Only endpoint verification plus profile negotiation can construct this.
 pub struct VerifiedConnection {
     client: NodedClient,
-    incoming: VerifiedIncoming,
+    incoming: tokio::sync::Mutex<VerifiedIncoming>,
     pub(crate) session_lock: tokio::sync::Mutex<()>,
 }
 impl VerifiedConnection {
@@ -123,7 +124,12 @@ impl VerifiedConnection {
     }
 
     pub async fn recv(&mut self) -> Option<VerifiedCommand> {
-        match &mut self.incoming {
+        self.recv_shared().await
+    }
+
+    /// Single receive owner may share this connection with bounded RPC tasks.
+    pub async fn recv_shared(&self) -> Option<VerifiedCommand> {
+        match &mut *self.incoming.lock().await {
             VerifiedIncoming::Unbounded(receiver) => receiver.recv().await,
             VerifiedIncoming::Bounded(receiver) => receiver.recv().await,
         }
@@ -252,7 +258,7 @@ async fn connect_verified(
             })?;
     Ok(VerifiedConnection {
         client,
-        incoming,
+        incoming: tokio::sync::Mutex::new(incoming),
         session_lock: tokio::sync::Mutex::new(()),
     })
 }

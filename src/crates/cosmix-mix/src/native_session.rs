@@ -582,7 +582,7 @@ async fn own(
         failures += 1;
         let result =
             tokio::time::timeout(RPC, NodedClient::connect_unix("", &url, &options, None)).await;
-        let mut connection = match result {
+        let connection = match result {
             Ok(Ok(UnixConnectOutcome::VerifiedUnix(connection))) => connection,
             Ok(Err(
                 ConnectError::InvalidEndpoint
@@ -603,6 +603,7 @@ async fn own(
                 continue;
             }
         };
+        let connection = std::sync::Arc::new(connection);
         let hello = match rpc(
             "hello: broker context unavailable",
             connection.session_hello(),
@@ -623,10 +624,15 @@ async fn own(
         let mut proof_retries = ProofRetries::default();
         let mut tick = tokio::time::interval(RENEW_CADENCE);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut requests = tokio::task::JoinSet::new();
+        let mut refusal: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+            None;
         let reconnect = loop {
             tokio::select! {
                 biased;
                 Some(ack) = restart.recv() => {
+                    requests.abort_all();
+                    while requests.join_next().await.is_some() {}
                     let revoked = revoke_for_restart(&mut bootstrap, Some(&connection), record.as_ref().or(last_record.as_ref()), &url, &options).await;
                     let _ = ack.send(revoked);
                     break false;
@@ -670,7 +676,9 @@ async fn own(
                         }
                     }
                 }
-                event = connection.recv() => {
+                _ = requests.join_next(), if !requests.is_empty() => {}
+                _ = async { if let Some(work) = &mut refusal { work.await } }, if refusal.is_some() => { refusal = None; }
+                event = connection.recv_shared(), if refusal.is_none() => {
                     let Some(event) = event else { break true };
                     if !connection.client().is_connected() { break true; }
                     let command = event.command();
@@ -687,12 +695,26 @@ async fn own(
                             crate::session_state::commit(crate::session_state::Transition::AttachmentChanged { source: None });
                             pending.get_or_insert(next_attempt);
                         }
-                    } else if let Some(bound) = &record {
-                        crate::session_status::dispatch(&connection, &hello, bound, &event).await;
+                    } else if command.id.is_some() {
+                        let connection = connection.clone();
+                        if requests.len() < 4 && record.is_some() {
+                            let bound = record.as_ref().unwrap().clone();
+                            let hello = hello.clone();
+                            requests.spawn(async move {
+                                crate::session_status::dispatch(&connection, &hello, &bound, &event).await;
+                            });
+                        } else {
+                            refusal = Some(Box::pin(async move {
+                                crate::session_status::refuse(&connection, &event).await;
+                            }));
+                        }
                     }
                 }
             }
         };
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
+        drop(refusal);
         crate::session_state::commit(crate::session_state::Transition::AttachmentChanged {
             source: None,
         });
