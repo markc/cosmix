@@ -1760,6 +1760,34 @@ fn stage_d_reports_its_own_capability_and_refuses_unauthorised_callers() {
         .to_string();
         assert!(error.contains("REFUSED"), "{error}");
         tcp.close().await;
+
+        // An unauthorised caller must not be able to tell a verb that EXISTS
+        // from one that does not. If a known verb answered REFUSED and an
+        // unknown one UNSUPPORTED, the refusal would itself be a probe of the
+        // verb table — so both answer the same, and the distinction is only
+        // ever visible to a caller that was admitted.
+        for verb in [
+            "shell.status",
+            "shell.execute",
+            "shell.execute.result",
+            "shell.execute.cancel",
+            "shell.does.not.exist",
+        ] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                foreign.connection.client().call(
+                    &f.bound.name,
+                    verb,
+                    execute_request(&f.bound, 3, generation, "print(1)"),
+                ),
+            )
+            .await
+            .expect("a denial must reply, not time out")
+            .unwrap_err()
+            .to_string();
+            assert_eq!(error, r#"{"error_code":"REFUSED"}"#, "{verb} leaked: {error}");
+        }
+
         f.child.send("print(\"SWEEP_DONE\")\n");
         let pane = f.child.until("SWEEP_DONE\r\n");
         assert!(!pane.contains("STOLEN"), "{pane}");

@@ -198,25 +198,21 @@ pub(crate) async fn dispatch(
         refuse(connection, event).await;
         return;
     };
-    // One capability per verb family, resolved before any correlated check:
-    // an unauthorised caller learns nothing about which families exist.
+    // One capability per verb family. Reading the shell's state and driving it
+    // are different authorities, so an execute verb is admitted against
+    // `Execute` and a caller holding only `ReadState` never reaches it.
+    //
+    // An UNKNOWN verb is deliberately admitted against the WEAKEST capability
+    // rather than answered early. Answering it before admission would tell an
+    // unauthorised caller which verbs exist — a known verb would come back
+    // REFUSED and an unknown one UNSUPPORTED, which is a probe of the verb
+    // table. Admitted callers still get UNSUPPORTED below, and unadmitted ones
+    // get the same uniform refusal for everything.
     let capability = match command.command.as_str() {
-        VERB => Capability::ReadState,
         crate::session_execute::SUBMIT
         | crate::session_execute::RESULT
         | crate::session_execute::CANCEL => Capability::Execute,
-        // An unknown verb is answered without any lease work at all; there is
-        // no capability that would make it exist.
-        _ => {
-            let _ = tokio::time::timeout(
-                ADMISSION,
-                connection
-                    .client()
-                    .respond(command, 10, "{\"error_code\":\"UNSUPPORTED\"}"),
-            )
-            .await;
-            return;
-        }
+        _ => Capability::ReadState,
     };
     if !tokio::time::timeout(
         ADMISSION,
@@ -228,7 +224,9 @@ pub(crate) async fn dispatch(
         refuse(connection, event).await;
         return;
     }
-    let response = if capability == Capability::Execute {
+    let response = if command.command != VERB && capability != Capability::Execute {
+        (10, "{\"error_code\":\"UNSUPPORTED\"}".to_owned())
+    } else if capability == Capability::Execute {
         crate::session_execute::dispatch(connection, hello, bound, event, principal).await
     } else {
         let request = (command.body.len() <= MAX_REQUEST)
