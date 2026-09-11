@@ -2447,6 +2447,7 @@ fn p4_a_task_environment_is_exactly_the_base_plus_its_overlay() {
         let environ = report["report"]["stdout"]["text"].as_str().unwrap();
         let names: std::collections::BTreeSet<&str> = environ
             .split('\0')
+            .map(str::trim)
             .filter(|entry| !entry.is_empty())
             .filter_map(|entry| entry.split('=').next())
             .collect();
@@ -2498,7 +2499,7 @@ fn p4_a_task_has_exactly_the_descriptors_it_was_given() {
             &f.bound,
             1,
             serde_json::json!({
-                "source": "print(join(sort(list_dir(\"/proc/self/fd\")), \",\"))",
+                "source": "print(join(sort(glob(\"/proc/self/fd/*\")), \",\"))",
             }),
         )
         .await
@@ -2507,7 +2508,9 @@ fn p4_a_task_has_exactly_the_descriptors_it_was_given() {
         let listed = report["report"]["stdout"]["text"].as_str().unwrap().trim();
         let mut open: Vec<i32> = listed
             .split(',')
-            .filter_map(|entry| entry.trim().parse().ok())
+            // glob returns whole paths; the descriptor is the final component.
+            .filter_map(|entry| entry.trim().rsplit('/').next())
+            .filter_map(|entry| entry.parse().ok())
             // The read of /proc/self/fd itself holds a descriptor; it is the
             // reader's own and not an inheritance.
             .collect();
