@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bevy",
  "cosmix-app-identity",
@@ -3496,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.54.0"
+version = "0.54.1"
 dependencies = [
  "accesskit",
  "ammonia",

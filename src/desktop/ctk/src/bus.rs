@@ -254,6 +254,28 @@ pub fn resolve_noded_url() -> String {
     }
 }
 
+/// The broker URL **only when this host is a configured mesh node** — i.e.
+/// `node.conf.mix` loads with a config. `None` on a foreign desktop (no
+/// config) or an unreadable config, where [`resolve_noded_url`] would fall back
+/// to loopback.
+///
+/// Apps gate their Bus app-control port on this: `Some` → install the port and
+/// take on the network-ARexx superpowers; `None` → run as a plain Wayland app
+/// with no broker dialling at all. An app must render and work standalone under
+/// any compositor; the Bus surface is earned by mesh membership, not assumed.
+pub fn configured_noded_url() -> Option<String> {
+    match cosmix_config::node::load_node_config() {
+        Ok(Some(config)) => Some(config.noded_url()),
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!(
+                "ctk: node.conf.mix unreadable ({error:#}); Bus app-control port disabled, running standalone"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Resource, Clone, Debug)]
 pub struct BusBridgeConfig {
     pub service_name: String,

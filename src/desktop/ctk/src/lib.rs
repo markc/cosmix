@@ -222,8 +222,8 @@ pub mod prelude {
 
     #[cfg(feature = "bus")]
     pub use crate::bus::{
-        provenance_from_build, resolve_noded_url, BusBridge, BusBridgeConfig, BusBridgeEvent,
-        BusBridgePlugin, BusConnectionState, BusMessage, BusReply, InboundRequest,
+        configured_noded_url, provenance_from_build, resolve_noded_url, BusBridge, BusBridgeConfig,
+        BusBridgeEvent, BusBridgePlugin, BusConnectionState, BusMessage, BusReply, InboundRequest,
     };
 
     #[cfg(feature = "bus")]

@@ -195,9 +195,9 @@ fn ctk_plugins() -> (
 /// an admitted, broker-attested mesh peer (network ARexx — any node quitting
 /// any app, gated by attestation, not anonymity). `app.quit` writes `AppExit`,
 /// so it takes term's normal window-close teardown path.
-fn app_port_plugins(identity: &AppIdentity) -> (BusBridgePlugin, AppPortPlugin) {
+fn app_port_plugins(identity: &AppIdentity, noded_url: String) -> (BusBridgePlugin, AppPortPlugin) {
     let service_name = format!("{}-{APP_ENGINE}-{}", identity.slug, std::process::id());
-    let mut bridge = BusBridgeConfig::new(service_name, resolve_noded_url());
+    let mut bridge = BusBridgeConfig::new(service_name, noded_url);
     // build_info!() must expand HERE (the app crate) so the registered
     // provenance carries term's version, not ctk's.
     bridge.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
@@ -274,8 +274,8 @@ fn main() {
         .unwrap_or(true);
     let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
     let bus = bus::start(terminal.clone(), cleanup.clone(), notify_rx);
-    App::new()
-        .insert_resource(settings)
+    let mut app = App::new();
+    app.insert_resource(settings)
         .insert_resource(Core(terminal.clone(), cleanup.clone()))
         .insert_resource(NotifyTx(notify_enabled.then_some(notify_tx)))
         .insert_resource(Painter(Mutex::new(painter)))
@@ -289,9 +289,20 @@ fn main() {
             ..default()
         }))
         .add_plugins((FeathersPlugins, CtkThemePlugin::default()))
-        .add_plugins(ctk_plugins())
-        .add_plugins(app_port_plugins(&identity))
-        .insert_resource(WinitSettings {
+        .add_plugins(ctk_plugins());
+    // Network-ARexx superpowers are earned by mesh membership, not assumed:
+    // install the Bus app-control port only on a configured mesh node
+    // (`node.conf.mix` present). On a foreign desktop term runs as a plain
+    // Wayland app — no port, no broker dialling at all.
+    match configured_noded_url() {
+        Some(noded_url) => {
+            app.add_plugins(app_port_plugins(&identity, noded_url));
+        }
+        None => {
+            eprintln!("term: no node.conf.mix — running standalone; Bus app-control port disabled");
+        }
+    }
+    app.insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_millis(16)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_millis(33)),
         })
