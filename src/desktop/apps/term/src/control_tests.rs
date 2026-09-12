@@ -1883,13 +1883,19 @@ fn unified_send_drives_term_execute_from_a_separate_driver_process() {
         // Built here rather than in Mix: constructing the target is the
         // CALLER's job in every existing fixture, and what is under test is the
         // send, not JSON assembly in a shell one-liner.
-        let body = json!({
-            "target": target,
-            "request_id": "1",
-            "prompt_generation": generation,
-            "source": "print(\"DRIVEN_BY_SEND\")",
-        })
-        .to_string();
+        // Split around the epoch so the DRIVER supplies it. term.execute is
+        // a mutation: it requires the request_epoch of the connection making
+        // it, which only the driver can know - it has to ask term.session over
+        // the same lane first. That two-step IS the drive protocol, so the
+        // fixture makes the script perform it rather than pre-baking a value
+        // no real driver could have.
+        let exec_prefix = format!(
+            "{{\"target\":{target},\"request_id\":\"1\",\"request_epoch\":\"",
+            target = serde_json::to_string(&target).unwrap()
+        );
+        let exec_suffix = format!(
+            "\",\"prompt_generation\":\"{generation}\",\"source\":\"print(\\\"DRIVEN_BY_SEND\\\")\"}}"
+        );
 
         // Discovery first, then the drive — both over plain `send`, both from
         // the driver, so the script proves it can find the name it addresses
@@ -1897,12 +1903,17 @@ fn unified_send_drives_term_execute_from_a_separate_driver_process() {
         let script = format!(
             "$list = send noded \"noded.list\"\n\
              print(\"DISCOVERY=\" + contains(data_encode($list), {name}))\n\
-             $r = send {name} \"term.execute\" body={body}\n\
+             $sess = send {name} \"term.session\" body={target}\n\
+             print(\"SESSION_RC=\" + $rc)\n\
+             print(\"SESSION_BODY=\" + data_encode($sess))\n\
+             $body = {prefix} + $sess.request_epoch + {suffix}\n\
+             $r = send {name} \"term.execute\" body=$body\n\
              print(\"RC=\" + $rc)\n\
-             print(\"STATUS=\" + $r.status)\n\
-             print(\"OPERATION=\" + $r.operation_id)\n",
+             print(\"REPLY=\" + data_encode($r))\n",
             name = serde_json::to_string(&service).unwrap(),
-            body = serde_json::to_string(&body).unwrap(),
+            target = serde_json::to_string(&json!({{"target": target}}).to_string()).unwrap(),
+            prefix = serde_json::to_string(&exec_prefix).unwrap(),
+            suffix = serde_json::to_string(&exec_suffix).unwrap(),
         );
 
         let driver = std::process::Command::new(super::production_e2e::current_mix())
@@ -1919,24 +1930,34 @@ fn unified_send_drives_term_execute_from_a_separate_driver_process() {
             out.contains("DISCOVERY=true"),
             "the driver could not find the term instance in noded.list\n{out}\n{err}"
         );
-        // The decisive line. Over the diagnostic lane this is FORBIDDEN; rc 0
-        // means the verified principal reached a protected verb.
+        // The decisive line, and it is term.session rather than term.execute:
+        // a PROTECTED verb answering rc 0 to a grantless separate process is
+        // precisely what the diagnostic lane refuses with FORBIDDEN. If the
+        // verified lane were not carrying the principal, this is where it ends.
         assert!(
-            out.contains("RC=0"),
-            "plain send did not reach term.execute — this is the VT5 gap\n{out}\n{err}"
+            out.contains("SESSION_RC=0"),
+            "plain send did not reach a protected verb — this is the VT5 gap\n{out}\n{err}"
         );
         assert!(
-            out.contains("STATUS=accepted"),
+            out.contains("RC=0"),
             "term did not admit the driver's submission\n{out}\n{err}"
+        );
+        assert!(
+            out.contains("\"status\": \"accepted\"") || out.contains("\"status\":\"accepted\""),
+            "the submission was not accepted\n{out}\n{err}"
         );
 
         // The work actually ran, read back through Term the way any caller
         // would: an accepted submission that never executes is not a proof.
-        let operation = out
+        let reply = out
             .lines()
-            .find_map(|line| line.strip_prefix("OPERATION="))
-            .expect("the driver printed an operation id")
-            .trim()
+            .find_map(|line| line.strip_prefix("REPLY="))
+            .expect("the driver printed its reply");
+        let reply: serde_json::Value =
+            serde_json::from_str(reply).expect("the reply is strict data");
+        let operation = reply["operation_id"]
+            .as_str()
+            .expect("an accepted submission carries an operation id")
             .to_string();
         let deadline = Instant::now() + Duration::from_secs(25);
         loop {
