@@ -1523,6 +1523,11 @@ fn check_syntax(source: &str, filename: &str) -> i32 {
 const MAIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 fn main() {
+    // Before native_session::start(), because that begins Bus dispatch and a
+    // shell.task.submit can arrive immediately. Every invocation mode serves
+    // the task verbs, so capturing this from the REPL alone would leave a
+    // `mix -c` session handing tasks an environment with no PATH at all.
+    session_task::capture_base_env();
     native_session::start();
     job_control::stage_entry();
     let handle = std::thread::Builder::new()
@@ -1531,6 +1536,10 @@ fn main() {
         .spawn(real_main)
         .expect("spawn mix evaluation thread");
     let code = handle.join().unwrap_or(101);
+    // Kill-on-drop: pdeathsig reaches each task LEADER when its supervisor
+    // thread goes, but nothing would reach the leader's own children. This is
+    // the only point every invocation mode passes through on the way out.
+    session_task::sweep();
     std::process::exit(code);
 }
 

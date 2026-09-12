@@ -21,18 +21,24 @@
 //! signal was sent. A cancel request is not proof a process stopped; the wait
 //! status is.
 //!
-//! The declared residual is the double-forked grandchild. `PR_SET_PDEATHSIG`
-//! binds the task LEADER to the supervising thread, so a shell that dies —
-//! including by SIGKILL, which no teardown hook can catch — takes the leader
-//! with it. A grandchild that left the group first survives, and the manual
-//! says so rather than implying a containment this does not have.
+//! Teardown has two mechanisms because neither covers the other's case.
+//! `PR_SET_PDEATHSIG` binds the task LEADER to the supervisor thread that
+//! forked it, which is the only thing that survives a shell SIGKILL — no
+//! teardown hook runs then. But pdeathsig signals the leader alone, so a normal
+//! shell exit would leave the leader's own children running; `sweep()` closes
+//! that by SIGKILLing every live task GROUP on the way out.
+//!
+//! The declared residual is therefore narrower than "any grandchild": a process
+//! that left the task's group by calling `setsid`/`setpgid` for itself is
+//! outside both mechanisms and survives. The manual says exactly that rather
+//! than implying a containment this does not have.
 
 use serde::Serialize;
-use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Concurrent tasks per shell. Beyond this, RESOURCE_LIMIT — a real limit
@@ -42,6 +48,11 @@ pub(crate) const TASKS: usize = 4;
 /// record inside one Term reply under the 256 KiB envelope, with headroom —
 /// which is what lets v1 ship without chunking machinery.
 pub(crate) const MAX_STREAM: usize = 64 * 1024;
+/// How much of the result pipe is kept. The writer caps a frame at `MAX_RESULT`
+/// encoded bytes, so this is that frame plus its length prefix plus enough
+/// slack to SEE an over-long frame rather than mistake a cut-off one for a
+/// complete read.
+const MAX_RESULT_CAPTURE: usize = MAX_STREAM + 1024;
 /// The declared grace between SIGTERM and SIGKILL, and also the deadline for
 /// draining the result pipe: a grandchild holding the write end open must not
 /// be able to wedge the supervisor.
@@ -79,7 +90,9 @@ const BASE_NAMES: &[&str] = &[
     "COSMIX_BROKER_ACCOUNT",
 ];
 
-/// Called once from REPL startup, before any user code can mutate environ.
+/// Called once from `main`, before Bus dispatch starts and therefore before any
+/// user code can mutate environ. Idempotent, so the REPL's own call is a no-op
+/// rather than a second, later snapshot.
 pub(crate) fn capture_base_env() {
     let _ = BASE_ENV.get_or_init(|| {
         let mut base: Vec<(String, String)> = BASE_NAMES
@@ -209,20 +222,22 @@ pub(crate) enum Outcome {
     Exited {
         code: i32,
     },
+    /// Something outside this supervisor ended the task. The supervisor's own
+    /// escalations never arrive here — they are reported as the POLICY that
+    /// chose them, with the signal named in `escalated_to`.
     Signalled {
         signal: i32,
-        /// True when this signal was the supervisor's own escalation, so a
-        /// caller can tell "the task was killed by policy" from "the task was
-        /// killed by something else".
-        escalated: bool,
     },
     /// The supervisor's deadline fired. `escalated_to` names how far the
-    /// ladder had to go.
+    /// ladder had to go; `wait` carries what the status actually said, so
+    /// naming the policy never costs the caller the underlying fact.
     Timeout {
         escalated_to: &'static str,
+        wait: WaitFacts,
     },
     Cancelled {
         escalated_to: &'static str,
+        wait: WaitFacts,
     },
     /// Waited and got no status we can interpret.
     Unknown {
@@ -230,10 +245,44 @@ pub(crate) enum Outcome {
     },
 }
 
+/// What `wait()` said, reported beside a policy outcome rather than instead of
+/// it. A task that was already exiting when the deadline fired has a real exit
+/// code, and discarding it would make the policy name the only evidence.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct WaitFacts {
+    pub signal: Option<i32>,
+    pub code: Option<i32>,
+    /// No status at all — the group was gone before the ladder could read one.
+    pub reaped: bool,
+}
+
+impl WaitFacts {
+    fn of(status: Option<std::process::ExitStatus>) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        match status {
+            None => Self {
+                signal: None,
+                code: None,
+                reaped: false,
+            },
+            Some(status) => Self {
+                signal: status.signal(),
+                code: status.code(),
+                reaped: true,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Stream {
     pub bytes: cosmix_lib_bus::native_session::DecimalU64,
     pub truncated: bool,
+    /// The drain deadline fired with the pipe still open: something the task
+    /// left behind outlived it and kept writing. Distinct from `truncated`,
+    /// which is about the cap, and load-bearing — it is the difference between
+    /// "this is all of it" and "this is all we waited for".
+    pub writer_survived: bool,
     pub text: String,
 }
 
@@ -251,6 +300,10 @@ pub(crate) enum TaskResult {
     /// mid-frame. Distinct from truncation, which is a complete frame saying
     /// the value was too big.
     ResultTorn,
+    /// The drain deadline fired while a survivor still held the write end, and
+    /// what had arrived was not yet a whole frame. Not the same event as a torn
+    /// frame: nobody was killed mid-write, we simply stopped waiting.
+    ResultAbandoned,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -267,7 +320,30 @@ pub(crate) struct TaskReport {
 
 enum Event {
     Exited(std::process::ExitStatus),
+    /// `wait()` itself failed. A distinct event, because fabricating a status
+    /// here would report a task we know nothing about as a clean exit 0.
+    WaitFailed(String),
     Cancel,
+}
+
+/// Every live task group, so shell teardown can end them.
+static LIVE_GROUPS: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+fn groups() -> std::sync::MutexGuard<'static, Vec<libc::pid_t>> {
+    LIVE_GROUPS.lock().unwrap_or_else(|held| held.into_inner())
+}
+
+/// SIGKILL every live task group. Called on the way out of the shell.
+///
+/// PDEATHSIG covers the LEADER, and only when the supervisor thread dies, so a
+/// healthy shell exiting normally would otherwise leave a task's own children
+/// running with nothing supervising them. Deliberately SIGKILL and deliberately
+/// not waited on: teardown is not the place to grant a grace a departing shell
+/// cannot supervise.
+pub(crate) fn sweep() {
+    for pid in std::mem::take(&mut *groups()) {
+        signal_group(pid, libc::SIGKILL);
+    }
 }
 
 /// Handle held by the surface so a cancel can reach a running supervisor.
@@ -293,7 +369,51 @@ pub(crate) fn spawn(
     settled: impl FnOnce(TaskReport) + Send + 'static,
 ) -> Result<Handle, String> {
     let started = Instant::now();
-    let (result_read, result_write) = pipe()?;
+    let (tx, rx) = mpsc::channel();
+    let cancel = tx.clone();
+    let cancelling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let supervised = cancelling.clone();
+    // The fork MUST happen on the supervisor thread. PR_SET_PDEATHSIG binds the
+    // leader to the THREAD that created it, so forking here — on the Bus
+    // dispatch thread — would tie every task's life to the pump instead: a
+    // broker outage or an identity rejection that ends the pump would have the
+    // kernel SIGKILL live tasks mid-timeout, reported as an external signal
+    // nobody sent. The caller still gets a synchronous accepted/refused answer;
+    // it waits for the spawn, not for the task.
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    std::thread::Builder::new()
+        .name("mix-task".into())
+        .spawn(move || supervise_task(spec, started, tx, rx, supervised, ready_tx, settled))
+        .map_err(|error| error.to_string())?;
+    ready_rx
+        .recv()
+        .map_err(|_| "the supervisor thread ended before it spawned the task".to_string())??;
+    Ok(Handle {
+        cancel,
+        started,
+        cancelling,
+    })
+}
+
+/// Fork, wait, drain and report — all on the one thread, which is what makes
+/// the pdeathsig binding above mean what its comment says.
+#[allow(clippy::too_many_arguments)]
+fn supervise_task(
+    spec: Spec,
+    started: Instant,
+    waiter_tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    cancelling: Arc<std::sync::atomic::AtomicBool>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+    settled: impl FnOnce(TaskReport) + Send + 'static,
+) {
+    let (result_read, result_write) = match pipe() {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     let mut command = match &spec.mode {
         Mode::Source(source) => {
             let mut command = Command::new(crate::cosmix_paths::cosmix_path(
@@ -367,7 +487,13 @@ pub(crate) fn spawn(
         });
     }
 
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return;
+        }
+    };
     // The parent's copy of the write end must close, or the read below never
     // sees EOF and the drain waits for a descriptor nobody will write to.
     drop(result_write);
@@ -375,59 +501,72 @@ pub(crate) fn spawn(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let (tx, rx) = mpsc::channel();
-    let cancel = tx.clone();
-    let cancelling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
+    // A live task exists from here on, so every remaining failure path must
+    // kill its group before refusing — a refusal that left a process running
+    // would be a lie the caller cannot even see.
+    let stop = match DrainStop::new() {
+        Ok(stop) => Arc::new(stop),
+        Err(error) => {
+            signal_group(pid, libc::SIGKILL);
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     // Drains run CONCURRENTLY with the wait, never before or after it. A 64 KiB
     // pipe buffer against a larger output is a deadlock, and a deadlock here
     // would be reported as a timeout — a wrong answer that looks like a
     // policy decision.
-    let out_drain = stdout.map(|s| drain(s, MAX_STREAM));
-    let err_drain = stderr.map(|s| drain(s, MAX_STREAM));
-    let result_drain = wants_result.then(|| drain_raw(result_read, MAX_STREAM * 2));
+    let out_drain = stdout.map(|s| drain_fd(s, MAX_STREAM, &stop));
+    let err_drain = stderr.map(|s| drain_fd(s, MAX_STREAM, &stop));
+    let result_drain = wants_result.then(|| drain_fd(result_read, MAX_RESULT_CAPTURE, &stop));
 
-    let waiter = tx;
-    std::thread::Builder::new()
+    if let Err(error) = std::thread::Builder::new()
         .name("mix-task-wait".into())
         .spawn(move || {
-            let status = child.wait();
-            let _ = waiter.send(match status {
+            let _ = waiter_tx.send(match child.wait() {
                 Ok(status) => Event::Exited(status),
-                Err(_) => Event::Exited(std::process::ExitStatus::default()),
+                Err(error) => Event::WaitFailed(error.to_string()),
             });
         })
-        .map_err(|error| error.to_string())?;
+    {
+        signal_group(pid, libc::SIGKILL);
+        let _ = ready.send(Err(error.to_string()));
+        return;
+    }
 
-    let supervised = cancelling.clone();
-    std::thread::Builder::new()
-        .name("mix-task".into())
-        .spawn(move || {
-            let (outcome, _) = supervise(&rx, pid, spec.timeout, &supervised);
-            let stdout = out_drain.map(join_stream).unwrap_or_else(empty_stream);
-            let stderr = err_drain.map(join_stream).unwrap_or_else(empty_stream);
-            let result = match result_drain {
-                None => TaskResult::NotApplicable,
-                Some(handle) => decode_frame(&handle.join().unwrap_or_default()),
-            };
-            settled(TaskReport {
-                version: 1,
-                outcome,
-                stdout,
-                stderr,
-                result,
-                duration_ms: cosmix_lib_bus::native_session::DecimalU64(
-                    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                ),
-            });
-        })
-        .map_err(|error| error.to_string())?;
+    groups().push(pid);
+    let _ = ready.send(Ok(()));
 
-    Ok(Handle {
-        cancel,
-        started,
-        cancelling,
-    })
+    let outcome = supervise(&rx, pid, spec.timeout, &cancelling);
+    groups().retain(|live| *live != pid);
+    // The outcome is settled, so nothing may wait on the task's leftovers any
+    // longer than the declared grace. This is what stops a backgrounded
+    // survivor holding the report open for the rest of the shell's life.
+    stop.release();
+    let stdout = out_drain.map(join_stream).unwrap_or_else(empty_stream);
+    let stderr = err_drain.map(join_stream).unwrap_or_else(empty_stream);
+    let result = match result_drain {
+        None => TaskResult::NotApplicable,
+        Some(handle) => {
+            let capture = handle.join().unwrap_or_default();
+            match (decode_frame(&capture.kept), capture.writer_survived) {
+                // A whole frame is a whole frame however the drain ended.
+                (TaskResult::Value { data }, _) => TaskResult::Value { data },
+                (_, true) => TaskResult::ResultAbandoned,
+                (other, false) => other,
+            }
+        }
+    };
+    settled(TaskReport {
+        version: 1,
+        outcome,
+        stdout,
+        stderr,
+        result,
+        duration_ms: cosmix_lib_bus::native_session::DecimalU64(
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        ),
+    });
 }
 
 /// The descriptor the child sees its result channel on. Above stderr, fixed so
@@ -441,37 +580,69 @@ fn supervise(
     pid: libc::pid_t,
     timeout: Duration,
     cancelling: &std::sync::atomic::AtomicBool,
-) -> (Outcome, bool) {
+) -> Outcome {
     let reason = match rx.recv_timeout(timeout) {
-        Ok(Event::Exited(status)) => return (natural(status, false), false),
+        Ok(Event::Exited(status)) => return natural(status),
+        Ok(Event::WaitFailed(detail)) => return Outcome::Unknown { detail },
         Ok(Event::Cancel) => Reason::Cancelled,
         Err(mpsc::RecvTimeoutError::Timeout) => Reason::Timeout,
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return (
-                Outcome::Unknown {
-                    detail: "the waiter thread ended without a status".into(),
-                },
-                false,
-            );
+            return Outcome::Unknown {
+                detail: "the waiter thread ended without a status".into(),
+            };
         }
     };
-    cancelling.store(true, std::sync::atomic::Ordering::Release);
+    // Only a cancel is a cancellation. The timeout path used to set this too,
+    // which made an uncancelled task report "cancelling" to anyone polling.
+    if matches!(reason, Reason::Cancelled) {
+        cancelling.store(true, std::sync::atomic::Ordering::Release);
+    }
+    // The task may have exited between the cancel being queued and this dequeue
+    // — or in the instant the deadline expired. A status that already exists is
+    // the truth: signalling first and reporting policy would throw away the
+    // exit code the contract promises comes from wait(), and would aim a killpg
+    // at a pid the kernel is free to have recycled.
+    if let Some(settled) = already_settled(rx) {
+        return settled;
+    }
     // Declared policy, in order: TERM to the GROUP, a stated grace, then KILL.
-    signal_group(pid, libc::SIGTERM);
-    if let Some(status) = settle_within(rx, GRACE) {
-        return (reason.into_outcome("sigterm", status), true);
+    if !signal_group(pid, libc::SIGTERM) {
+        // ESRCH: the group is already gone, so its status is on its way rather
+        // than something this ladder produced.
+        return match settle_within(rx, GRACE) {
+            Some(Ok(status)) => natural(status),
+            Some(Err(detail)) => Outcome::Unknown { detail },
+            None => Outcome::Unknown {
+                detail: "the task group was already gone and no status followed".into(),
+            },
+        };
+    }
+    match settle_within(rx, GRACE) {
+        Some(Ok(status)) => return reason.into_outcome("sigterm", Some(status)),
+        Some(Err(detail)) => return Outcome::Unknown { detail },
+        None => {}
     }
     signal_group(pid, libc::SIGKILL);
     // SIGKILL cannot be caught, so this wait is bounded in practice; the
     // deadline is belt-and-braces against an unkillable D-state.
     match settle_within(rx, GRACE) {
-        Some(status) => (reason.into_outcome("sigkill", status), true),
-        None => (
-            Outcome::Unknown {
-                detail: "the group did not reap after SIGKILL".into(),
-            },
-            true,
-        ),
+        Some(Ok(status)) => reason.into_outcome("sigkill", Some(status)),
+        Some(Err(detail)) => Outcome::Unknown { detail },
+        None => Outcome::Unknown {
+            detail: "the group did not reap after SIGKILL".into(),
+        },
+    }
+}
+
+/// A status already queued behind the event we just dequeued.
+fn already_settled(rx: &mpsc::Receiver<Event>) -> Option<Outcome> {
+    loop {
+        match rx.try_recv() {
+            Ok(Event::Exited(status)) => return Some(natural(status)),
+            Ok(Event::WaitFailed(detail)) => return Some(Outcome::Unknown { detail }),
+            Ok(Event::Cancel) => continue,
+            Err(_) => return None,
+        }
     }
 }
 
@@ -482,36 +653,43 @@ enum Reason {
 impl Reason {
     /// The outcome names the POLICY that ended the task, not the signal the
     /// policy happened to use — the signal is reported beside it as
-    /// `escalated_to`. Reporting a timeout as "signalled: SIGTERM" would make
-    /// a deliberate deadline indistinguishable from an external kill.
-    fn into_outcome(self, escalated_to: &'static str, _status: std::process::ExitStatus) -> Outcome {
+    /// `escalated_to`, and the wait status beside that. Reporting a timeout as
+    /// "signalled: SIGTERM" would make a deliberate deadline indistinguishable
+    /// from an external kill; dropping the status would make the policy name
+    /// the only surviving evidence.
+    fn into_outcome(
+        self,
+        escalated_to: &'static str,
+        status: Option<std::process::ExitStatus>,
+    ) -> Outcome {
+        let wait = WaitFacts::of(status);
         match self {
-            Self::Timeout => Outcome::Timeout { escalated_to },
-            Self::Cancelled => Outcome::Cancelled { escalated_to },
+            Self::Timeout => Outcome::Timeout { escalated_to, wait },
+            Self::Cancelled => Outcome::Cancelled { escalated_to, wait },
         }
     }
 }
 
 /// Drain any duplicate cancels while waiting for the real settlement.
-fn settle_within(
-    rx: &mpsc::Receiver<Event>,
-    budget: Duration,
-) -> Option<std::process::ExitStatus> {
+type Settlement = Result<std::process::ExitStatus, String>;
+
+fn settle_within(rx: &mpsc::Receiver<Event>, budget: Duration) -> Option<Settlement> {
     let deadline = Instant::now() + budget;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok(Event::Exited(status)) => return Some(status),
+            Ok(Event::Exited(status)) => return Some(Ok(status)),
+            Ok(Event::WaitFailed(detail)) => return Some(Err(detail)),
             Ok(Event::Cancel) => continue,
             Err(_) => return None,
         }
     }
 }
 
-fn natural(status: std::process::ExitStatus, escalated: bool) -> Outcome {
+fn natural(status: std::process::ExitStatus) -> Outcome {
     use std::os::unix::process::ExitStatusExt;
     if let Some(signal) = status.signal() {
-        Outcome::Signalled { signal, escalated }
+        Outcome::Signalled { signal }
     } else if let Some(code) = status.code() {
         Outcome::Exited { code }
     } else {
@@ -521,71 +699,177 @@ fn natural(status: std::process::ExitStatus, escalated: bool) -> Outcome {
     }
 }
 
-fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
+/// False means ESRCH — there is no such group, so there is nothing this signal
+/// could have done. The caller needs that answer: "I signalled it" and "it was
+/// already gone" lead to different reports.
+fn signal_group(pid: libc::pid_t, signal: libc::c_int) -> bool {
     // The GROUP, because the task is a session leader and its own children are
     // the reason a leader-only signal would leave work running.
     // SAFETY: a plain signal to a group this supervisor created.
-    unsafe {
-        libc::killpg(pid, signal);
-    }
+    unsafe { libc::killpg(pid, signal) == 0 }
 }
 
 // ---------------------------------------------------------------- capture
 
-type Drain = std::thread::JoinHandle<(Vec<u8>, usize)>;
-
-fn drain(mut source: impl Read + Send + 'static, cap: usize) -> Drain {
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut total = 0usize;
-        let mut chunk = [0u8; 8192];
-        loop {
-            match source.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    total += n;
-                    // Read past the cap rather than stopping: leaving bytes in
-                    // the pipe would block the writer, and a blocked writer
-                    // never exits, which the supervisor would report as a
-                    // timeout. Truncation is about what is KEPT.
-                    if kept.len() < cap {
-                        let room = cap - kept.len();
-                        kept.extend_from_slice(&chunk[..n.min(room)]);
-                    }
-                }
-            }
-        }
-        (kept, total)
-    })
+/// What a drain came back with, and how it ended.
+#[derive(Default)]
+struct Capture {
+    kept: Vec<u8>,
+    total: usize,
+    /// The deadline fired while the pipe was still open.
+    writer_survived: bool,
 }
 
-fn drain_raw(file: std::fs::File, cap: usize) -> std::thread::JoinHandle<Vec<u8>> {
+type Drain = std::thread::JoinHandle<Capture>;
+
+/// The one wake-up shared by all three drains.
+///
+/// An eventfd rather than a flag, because a drain must be able to block
+/// indefinitely on its pipe — a task can be silent for its whole timeout — and
+/// still be woken the moment the supervisor has an outcome. A flag would need a
+/// timer to notice it, which is the sleep-loop polling the no-poll law bans.
+struct DrainStop(OwnedFd);
+
+impl DrainStop {
+    fn new() -> Result<Self, String> {
+        // SAFETY: a fresh eventfd; the descriptor is owned from here.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: fd is fresh, valid and unowned elsewhere.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Start every drain's deadline. Level-triggered and never read, so a drain
+    /// that arrives late still sees it.
+    fn release(&self) {
+        let one: u64 = 1;
+        // SAFETY: an 8-byte write of a u64 to an owned eventfd, as its
+        // interface requires.
+        unsafe {
+            libc::write(self.0.as_raw_fd(), std::ptr::addr_of!(one).cast(), 8);
+        }
+    }
+}
+
+/// Read until EOF, or until GRACE after the supervisor releases — whichever
+/// comes first.
+///
+/// The deadline is the whole point. Without it a task that backgrounds a
+/// long-lived child (`sh -c "sleep 600 &"`) hands that child the inherited
+/// stdout, stderr and result descriptors; the task itself exits, the supervisor
+/// has its outcome, and the report still cannot be assembled because these
+/// reads would sit on descriptors the survivor holds open. The record would pin
+/// at "running" forever and its TASKS slot would never come back.
+fn drain_fd<S: AsRawFd + Send + 'static>(source: S, cap: usize, stop: &Arc<DrainStop>) -> Drain {
+    let stop = stop.clone();
     std::thread::spawn(move || {
-        let mut source = file;
-        let mut kept = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match source.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if kept.len() < cap {
-                        let room = cap - kept.len();
-                        kept.extend_from_slice(&chunk[..n.min(room)]);
-                    }
-                }
+        let fd = source.as_raw_fd();
+        // Non-blocking, so a readiness that evaporates cannot park this thread
+        // inside read() past its own deadline.
+        // SAFETY: fd is owned by `source` for the life of this thread.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
         }
-        kept
+        let mut capture = Capture::default();
+        let mut chunk = [0u8; 8192];
+        let mut deadline: Option<Instant> = None;
+        capture.writer_survived = loop {
+            let wait_ms = match deadline {
+                None => -1,
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break true;
+                    }
+                    left.as_millis().min(i32::MAX as u128) as i32
+                }
+            };
+            let mut fds = [
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    // Once the deadline is running the stop is permanently
+                    // readable, so watching it further would spin. poll(2)
+                    // ignores a negative descriptor.
+                    fd: if deadline.is_none() {
+                        stop.0.as_raw_fd()
+                    } else {
+                        -1
+                    },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: a well-formed two-entry array of owned descriptors.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait_ms) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break false;
+            }
+            if ready == 0 {
+                break true;
+            }
+            if fds[1].revents != 0 && deadline.is_none() {
+                deadline = Some(Instant::now() + GRACE);
+            }
+            if fds[0].revents == 0 {
+                continue;
+            }
+            // Empty the pipe on one readiness rather than paying a poll per
+            // 8 KiB of a chatty task.
+            let ended = loop {
+                // SAFETY: reading into a local buffer from an owned descriptor.
+                let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+                if n == 0 {
+                    break true;
+                }
+                if n < 0 {
+                    match std::io::Error::last_os_error().kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock => break false,
+                        _ => break true,
+                    }
+                }
+                let n = n as usize;
+                capture.total += n;
+                // Read past the cap rather than stopping: leaving bytes in the
+                // pipe would block the writer, and a blocked writer never
+                // exits, which the supervisor would report as a timeout.
+                // Truncation is about what is KEPT.
+                if capture.kept.len() < cap {
+                    let room = cap - capture.kept.len();
+                    capture.kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            };
+            if ended {
+                break false;
+            }
+        };
+        // Closing the read end here SIGPIPEs a survivor still writing, rather
+        // than leaving it blocked forever on a pipe nobody is reading.
+        drop(source);
+        capture
     })
 }
 
 fn join_stream(handle: Drain) -> Stream {
-    let (kept, total) = handle.join().unwrap_or_default();
-    let truncated = total > kept.len();
+    let capture = handle.join().unwrap_or_default();
+    let truncated = capture.total > capture.kept.len();
     Stream {
-        bytes: cosmix_lib_bus::native_session::DecimalU64(total as u64),
+        bytes: cosmix_lib_bus::native_session::DecimalU64(capture.total as u64),
         truncated,
-        text: String::from_utf8_lossy(&kept).into_owned(),
+        writer_survived: capture.writer_survived,
+        text: String::from_utf8_lossy(&capture.kept).into_owned(),
     }
 }
 
@@ -593,6 +877,7 @@ fn empty_stream() -> Stream {
     Stream {
         bytes: cosmix_lib_bus::native_session::DecimalU64(0),
         truncated: false,
+        writer_survived: false,
         text: String::new(),
     }
 }
