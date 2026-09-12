@@ -299,6 +299,7 @@ pub fn run_repl() -> i32 {
     let mut eval = Evaluator::new();
     eval.set_limits(crate::script_limits());
     eval.set_bus_handler(std::rc::Rc::new(crate::bus::MixBusHandler::new()));
+    eval.set_session_handler(crate::session_send::MixSessionHandler::capture());
     // Match REPL semantics inside `source`: a sourced file may mix
     // bareword shell commands with Mix code (this is the whole point
     // of a .mixrc). The handler only activates when the whole-file

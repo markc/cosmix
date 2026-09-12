@@ -1354,7 +1354,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
 }
 
 /// Convert a serde_json::Value to a Mix Value.
-fn json_to_value(val: &serde_json::Value) -> Value {
+pub(crate) fn json_to_value(val: &serde_json::Value) -> Value {
     match val {
         serde_json::Value::Null => Value::Nil,
         serde_json::Value::Bool(b) => Value::Bool(*b),

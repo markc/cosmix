@@ -37,6 +37,7 @@ mod repl;
 mod repl_editor;
 mod serve_runtime;
 mod result_fd;
+mod session_send;
 mod session_task;
 mod session_execute;
 mod session_state;
@@ -412,6 +413,7 @@ fn run_meta_subcommand(sub_args: &[String]) -> i32 {
     rt.block_on(async {
         let mut eval = Evaluator::new();
         eval.set_bus_handler(std::rc::Rc::new(bus::MixBusHandler::new()));
+        eval.set_session_handler(session_send::MixSessionHandler::capture());
         cosmix_mix::interrupt::init(eval.interrupt_flag());
         eval.load_prelude().await;
 
@@ -523,6 +525,7 @@ fn run_source(
         eval.set_limits(script_limits());
         apply_arity_mode(&mut eval);
         eval.set_bus_handler(std::rc::Rc::new(bus::MixBusHandler::new()));
+        eval.set_session_handler(session_send::MixSessionHandler::capture());
         // Make `source x` fall back to the REPL-style shell
         // classifier when `x` contains bareword shell lines (matches
         // .mixrc semantics). Pure-Mix files still hit the whole-file
@@ -635,6 +638,7 @@ fn run_command_line(
         eval.set_limits(script_limits());
         apply_arity_mode(&mut eval);
         eval.set_bus_handler(std::rc::Rc::new(bus::MixBusHandler::new()));
+        eval.set_session_handler(session_send::MixSessionHandler::capture());
         // Same per-line shell fallback the REPL/.mixrc rely on.
         eval.set_shell_handler(std::rc::Rc::new(shell_handler::ReplShellHandler::new()));
         cosmix_mix::interrupt::init(eval.interrupt_flag());
@@ -1241,6 +1245,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         eval.set_limits(script_limits());
         apply_arity_mode(&mut eval);
         eval.set_bus_handler(std::rc::Rc::new(bus::MixServeHandler::new(supervised.clone())));
+        eval.set_session_handler(session_send::MixSessionHandler::capture());
         // SPEC 18 WS4: install the runtime-reserved Ch07 L0+ surface
         // (HELP/INFO/QUIT + <svc>.props.{get,list,describe}). Consulted
         // pre-dispatch in run_event_pump, so an author `on` handler

@@ -280,7 +280,11 @@ pub(super) fn start() {
     // Term's real child-exit path owns revocation; abrupt exit also closes UDS.
 }
 
-fn options(
+/// Shared with `session_send`, deliberately. The credential resolution — an
+/// account NAME through `getpwnam_r`, never a uid inferred from the socket or
+/// the calling user — is the security-relevant half of this connection, and a
+/// second copy of it is a second thing to get wrong independently.
+pub(crate) fn options(
     account: String,
     endpoint: Option<std::path::PathBuf>,
 ) -> Result<UnixConnectOptions, &'static str> {
