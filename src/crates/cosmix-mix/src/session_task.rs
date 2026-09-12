@@ -703,25 +703,51 @@ fn supervise_task(
 /// binary was replaced under it runs source tasks with the INSTALLED build, not
 /// with its own image.
 fn interpreter() -> std::path::PathBuf {
+    interpreter_from(std::env::current_exe())
+}
+
+/// Split out from `interpreter` so the replaced-binary case can be tested.
+/// It cannot be reached otherwise: it needs a deploy to unlink a running
+/// image, and a fixture cannot ask `current_exe` for a different answer.
+fn interpreter_from(exe: std::io::Result<std::path::PathBuf>) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
     let installed =
         || crate::cosmix_paths::cosmix_path(crate::cosmix_paths::CosmixDir::Bin).join("mix");
-    match std::env::current_exe() {
-        Ok(path) => {
-            let unlinked = path
-                .as_os_str()
-                .as_encoded_bytes()
-                .ends_with(b" (deleted)");
-            // The suffix check is the one that names the condition; the
-            // is_file() is what catches any other way the path stopped being
-            // executable between then and now.
-            if unlinked || !path.is_file() {
-                installed()
-            } else {
-                path
-            }
-        }
-        Err(_) => installed(),
+    let Ok(path) = exe else {
+        eprintln!("mix: cannot read this process's own path; a source task will use the install");
+        return installed();
+    };
+    if let Some(stripped) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        // The replacement landed at EXACTLY this path — that is what the
+        // deploy did — so stripping the marker names the new binary, whatever
+        // shape the deploy took. Deriving an install path instead would be
+        // wrong twice over: with no checkout above it, the resolver answers
+        // `~/.local/bin` (or `/usr/local/bin` as root), not `/opt/cosmix/bin`,
+        // so on a canonical fleet host it names a file that does not exist —
+        // and on a developer's host it names their dev build, resurrecting the
+        // silently-wrong-interpreter hazard this whole function exists to kill.
+        //
+        // If the binary was deleted rather than replaced, this path does not
+        // exist and the spawn refuses NOT_FOUND. That is the honest answer:
+        // there is no interpreter to run the task.
+        let replaced = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(stripped));
+        eprintln!(
+            "mix: this shell's binary was replaced underneath it; a source task \
+             will run {}",
+            replaced.display()
+        );
+        return replaced;
     }
+    if path.is_file() {
+        return path;
+    }
+    // Last ditch: the path is neither marked nor resolvable, which is not a
+    // shape any deploy produces. Nothing better to offer than the install.
+    eprintln!(
+        "mix: {} is not a file; a source task will use the install",
+        path.display()
+    );
+    installed()
 }
 
 /// The descriptor the child sees its result channel on. Above stderr, fixed so
@@ -1342,6 +1368,33 @@ mod tests {
         // Text that already fits is returned whole and unflagged.
         let (text, trimmed) = fit_encoded("plain", MAX_STREAM_ENCODED);
         assert_eq!((text.as_str(), trimmed), ("plain", false));
+    }
+
+    /// A replaced binary resolves to the REPLACEMENT, not to a derived install.
+    #[test]
+    fn a_replaced_binary_runs_the_file_that_replaced_it() {
+        let deleted = std::path::PathBuf::from("/opt/cosmix/bin/mix (deleted)");
+        assert_eq!(
+            interpreter_from(Ok(deleted)),
+            std::path::PathBuf::from("/opt/cosmix/bin/mix"),
+            "the marker must be stripped, naming what the deploy wrote"
+        );
+        // The specific wrong answer this guards: a derived install path. With
+        // no checkout above the binary the resolver answers ~/.local/bin or
+        // /usr/local/bin, so on a canonical fleet host it names a file that is
+        // not there, and on a developer's host it names their dev build.
+        let derived =
+            crate::cosmix_paths::cosmix_path(crate::cosmix_paths::CosmixDir::Bin).join("mix");
+        assert_ne!(
+            interpreter_from(Ok(std::path::PathBuf::from("/opt/cosmix/bin/mix (deleted)"))),
+            derived,
+            "a replaced binary must not fall back to a derived install path"
+        );
+        // An ordinary running binary is used as-is: this file exists.
+        let real = std::path::PathBuf::from(file!());
+        if real.is_file() {
+            assert_eq!(interpreter_from(Ok(real.clone())), real);
+        }
     }
 
     /// A value over the reply budget is REPLACED, never cut.

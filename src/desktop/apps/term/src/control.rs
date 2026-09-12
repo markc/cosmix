@@ -1399,7 +1399,10 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         // uniform and detail-free; `relayed` already declines to attach an
         // empty body, and a denial carries none.
         other => match vocabulary(other) {
-            Some("FORBIDDEN" | "UNSUPPORTED") => Reply::error(vocabulary(other).expect("matched")),
+            // Denials stay uniform and detail-free: a refusal that says what it
+            // refused is a refusal that leaks. That rule predates this
+            // inversion and the inversion must not quietly widen it.
+            Some(denial @ ("FORBIDDEN" | "UNSUPPORTED")) => Reply::error(denial),
             Some(known) => relayed(known),
             // Outside the vocabulary, or never shaped like a refusal at all.
             // Flattening these to FORBIDDEN was wrong in both directions: it
@@ -1429,10 +1432,13 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
 /// Term's CLOSED error vocabulary, returning the `'static` token so a code can
 /// be relayed without an arm of its own.
 ///
-/// This list and `FailureCode` are the same set by construction —
-/// `every_failure_code_can_be_relayed` fails to COMPILE if a variant is added
-/// without a token here, which is the drift that put NOT_FOUND and
-/// INVALID_ARGUMENT in the unknown-outcome hole in the first place.
+/// This list and `FailureCode` are held to the same set by
+/// `every_failure_code_can_be_relayed`, whose exhaustive match fails to build
+/// THE TEST TARGET if a variant is added without a token here. That is a
+/// `cargo test` build, not a production one — so the guard catches the drift at
+/// the gate rather than at `cargo build`, which is where this suite runs
+/// anyway. It is the drift that put NOT_FOUND and INVALID_ARGUMENT in the
+/// unknown-outcome hole to begin with.
 fn vocabulary(code: &str) -> Option<&'static str> {
     const KNOWN: &[&str] = &[
         "INVALID_ARGUMENT",
@@ -1588,9 +1594,9 @@ mod vocabulary_tests {
     /// The relay map and Term's error enum must be the same set.
     ///
     /// The match below has no wildcard, so adding a `FailureCode` variant
-    /// without giving it a token here is a COMPILE error rather than a code
-    /// that silently reaches callers as UNKNOWN_OUTCOME. That silence is
-    /// exactly what happened to NOT_FOUND and INVALID_ARGUMENT.
+    /// without giving it a token here fails to compile THIS TEST — the gate
+    /// stops, rather than a code silently reaching callers as UNKNOWN_OUTCOME.
+    /// That silence is exactly what happened to NOT_FOUND and INVALID_ARGUMENT.
     #[test]
     fn every_failure_code_can_be_relayed() {
         fn token(code: &FailureCode) -> &'static str {
