@@ -3143,14 +3143,50 @@ fn a_registered_service_receives_deliveries_on_a_verified_host() {
     let broker = Broker::start();
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join("node.conf.mix");
+    // BOTH transports, because both are load-bearing here and for different
+    // reasons. The unix socket is what the send lane verifies over — without it
+    // the child falls back to anonymous and the fixture would assert nothing
+    // about a verified host. The port is what the SERVE connection needs, since
+    // receiving has always gone over a plain client and still does.
+    let port: u16 = broker
+        .url
+        .rsplit(\047:\047)
+        .next()
+        .and_then(|tail| tail.trim_end_matches("/ws").parse().ok())
+        .expect("the broker url carries a port");
     std::fs::write(
         &config,
         format!(
-            "noded: {{ unix_socket: {} }}\n",
+            "wg_ip: \"127.0.0.1\"\nnoded: {{ unix_socket: {}, port: {port} }}\n",
             serde_json::to_string(&broker.endpoint).unwrap()
         ),
     )
     .unwrap();
+
+    // The real account that owns the socket. Without it the credential
+    // resolution fails, the send lane quietly falls back to anonymous, and the
+    // test would pass or fail for reasons unrelated to what it claims to cover.
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 16384];
+    assert_eq!(
+        unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        },
+        0
+    );
+    assert!(!result.is_null());
+    let entry = unsafe { entry.assume_init() };
+    let account = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+        .to_str()
+        .unwrap()
+        .to_owned();
 
     // Registers, announces itself, then serves. The handler is what makes the
     // event pump run at all, which is the path that went deaf.
@@ -3165,6 +3201,7 @@ fn a_registered_service_receives_deliveries_on_a_verified_host() {
         .env_clear()
         .env("HOME", home.path())
         .env("COSMIX_NODE_CONFIG", &config)
+        .env("COSMIX_BROKER_ACCOUNT", &account)
         .env("MIX_STATS", "off")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
