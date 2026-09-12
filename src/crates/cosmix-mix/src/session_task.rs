@@ -488,10 +488,17 @@ fn supervise_task(
     };
     let mut command = match &spec.mode {
         Mode::Source(source) => {
-            let mut command = Command::new(crate::cosmix_paths::cosmix_path(
-                crate::cosmix_paths::CosmixDir::Bin,
-            )
-            .join("mix"));
+            // The interpreter that runs a source task is THIS one. Deriving a
+            // path from the install layout instead asks where a mix OUGHT to
+            // be, and gets NOT_FOUND the moment the shell is not running from
+            // `$COSMIX/bin` — a dev build, a test harness, a relocated tree —
+            // for a binary that is demonstrably running. Worse when the derived
+            // path does exist: the task would then be evaluated by a DIFFERENT
+            // build than the shell the caller is talking to, silently.
+            let interpreter = std::env::current_exe().unwrap_or_else(|_| {
+                crate::cosmix_paths::cosmix_path(crate::cosmix_paths::CosmixDir::Bin).join("mix")
+            });
+            let mut command = Command::new(interpreter);
             // Flags BEFORE -c: `-c` consumes the remainder as script argv, so
             // a trailing --result-fd would be an argument, not a flag.
             command.arg("--result-fd").arg(TASK_RESULT_FD.to_string());
