@@ -143,6 +143,26 @@ fn resolve_config(
     config::Settings { config, term }
 }
 
+/// The ctk plugins term runs on, in ONE place so a test can assert against the
+/// real set rather than a hand-copied list that drifts from it.
+///
+/// `ModalCapturePlugin` is here because the `keyboard` observer reads
+/// `Res<ModalCapture>` and nothing else installs the authority that owns it:
+/// `CtkWidgetsPlugin` does not, and only ctk's interaction and dnd services
+/// call `ensure_modal_capture_plugin`, neither of which term uses. Without it
+/// the resource never exists and the first focused key event fails the
+/// observer's parameter validation — a deterministic panic on any path that
+/// reaches a keystroke.
+///
+/// Installed as a plugin rather than Option-wrapped at the use site: a plugin
+/// inserts at build time, strictly before any schedule can run, so the observer
+/// cannot fire into a missing resource. Term has menus, menus capture, and the
+/// sole consumer is `capture.is_captured()` — treating absence as "nothing is
+/// captured" would be a guess that silently diverges the moment one does.
+fn ctk_plugins() -> (CtkWidgetsPlugin, MenuBarPlugin, ModalCapturePlugin) {
+    (CtkWidgetsPlugin, MenuBarPlugin, ModalCapturePlugin)
+}
+
 fn main() {
     session_fd::quarantine_inherited();
     let identity = AppIdentity {
@@ -223,12 +243,8 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins((
-            FeathersPlugins,
-            CtkThemePlugin::default(),
-            CtkWidgetsPlugin,
-            MenuBarPlugin,
-        ))
+        .add_plugins((FeathersPlugins, CtkThemePlugin::default()))
+        .add_plugins(ctk_plugins())
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_millis(16)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_millis(33)),

@@ -288,3 +288,47 @@ fn scheduled_refresh_survives_bus_mutations_between_update_and_post_update() {
     let removed = shared.lock().unwrap().shutdown();
     app.world().resource::<Core>().1.submit(removed);
 }
+
+/// Every resource term's observers read must exist before they can fire.
+///
+/// This is the regression guard for the startup panic: the `keyboard` observer
+/// reads `Res<ModalCapture>`, and nothing in term's plugin set installed the
+/// authority that owns it — `CtkWidgetsPlugin` does not, and only ctk's
+/// interaction and dnd services call `ensure_modal_capture_plugin`. So the
+/// resource never existed and the first focused key event failed the observer's
+/// parameter validation and panicked the app, deterministically, on any path
+/// that reaches a keystroke.
+///
+/// Asserted against the SAME plugin set `main` installs rather than a
+/// hand-listed one, so a future plugin change that drops the authority again
+/// reds this instead of shipping. Bevy's own error for this names neither the
+/// observer nor the resource without the debug feature, which is why a missing
+/// resource is worth catching here rather than in a panic message.
+#[test]
+fn observer_resources_exist_before_any_observer_can_fire() {
+    let mut app = App::new();
+    // The REAL set, via the same function main() uses. A hand-copied list
+    // here would pass forever regardless of what main actually installs,
+    // which is the difference between a guard and a tautology.
+    app.add_plugins((
+        MinimalPlugins,
+        bevy::asset::AssetPlugin::default(),
+        bevy::input::InputPlugin,
+    ));
+    app.add_plugins(crate::ctk_plugins());
+    // Plugin build is enough: a plugin inserts at build time, strictly before
+    // any schedule runs, which is the property that makes the fix sound.
+    assert!(
+        app.world().get_resource::<ctk::prelude::ModalCapture>().is_some(),
+        "ModalCapture is missing — the keyboard observer would panic on the \
+         first focused key event"
+    );
+    // InputFocus comes from CtkWidgetsPlugin; asserted alongside so the test
+    // covers the observer's resource set rather than one lucky member of it.
+    assert!(
+        app.world()
+            .get_resource::<bevy::input_focus::InputFocus>()
+            .is_some(),
+        "InputFocus is missing"
+    );
+}
