@@ -159,7 +159,7 @@ fn resolve_config(
 /// cannot fire into a missing resource. Term has menus, menus capture, and the
 /// sole consumer is `capture.is_captured()` — treating absence as "nothing is
 /// captured" would be a guess that silently diverges the moment one does.
-fn ctk_plugins() -> impl Plugins<'static> {
+fn ctk_plugins() -> (CtkWidgetsPlugin, MenuBarPlugin, ModalCapturePlugin) {
     (CtkWidgetsPlugin, MenuBarPlugin, ModalCapturePlugin)
 }
 
