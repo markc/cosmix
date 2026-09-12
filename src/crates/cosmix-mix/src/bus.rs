@@ -113,6 +113,9 @@ pub struct MixBusHandler {
     /// `Arc` inside `Connected` lets a caller hold the client across
     /// its `.await` without borrowing `self`.
     mesh: tokio::sync::Mutex<MeshState>,
+    /// A plain connection kept for the serve path; see [`serve_access`].
+    /// Only ever populated when the main lane is verified.
+    serve: tokio::sync::Mutex<Option<std::sync::Arc<Lane>>>,
     /// Incoming-message receiver, taken from the `NodedClient` on first
     /// `next_incoming` call and stored here so subsequent calls can re-await.
     ///
@@ -260,6 +263,7 @@ impl MixBusHandler {
     pub fn new() -> Self {
         MixBusHandler {
             mesh: tokio::sync::Mutex::new(MeshState::Unprobed),
+            serve: tokio::sync::Mutex::new(None),
             incoming: RefCell::new(None),
             incoming_closed: RefCell::new(false),
             incoming_broken: RefCell::new(false),
@@ -342,6 +346,44 @@ impl MixBusHandler {
             // forbidding it, the result is the old behaviour and not a lane
             // that claims to be verified.
             _ => None,
+        }
+    }
+
+    /// The connection the SERVE path uses: `register_as` and `next_incoming`.
+    ///
+    /// It is deliberately never the verified lane. A verified client has no
+    /// incoming receiver of its own — `from_verified_unix` routes trusted
+    /// deliveries to the VerifiedConnection's separate lane and leaves the
+    /// client's `incoming_rx` as `None` — so a script that registered a service
+    /// and then iterated `incoming` would read the stream as cleanly CLOSED and
+    /// receive nothing, forever, with `register_as` having succeeded. Silent,
+    /// and only on hosts that HAVE a verified socket, which is exactly where
+    /// the rest of this feature switches on.
+    ///
+    /// Receiving needs no principal, so nothing is lost by keeping it here.
+    /// This preserves today's serve behaviour byte for byte and honours the
+    /// memo's rule that the verified socket must never become a hard dependency
+    /// for something that does not need it.
+    async fn serve_access(&self) -> Result<std::sync::Arc<Lane>, MeshErr> {
+        let lane = self.noded_access().await?;
+        if let Lane::Anonymous(_) = &*lane {
+            return Ok(lane);
+        }
+        let mut serve = self.serve.lock().await;
+        if let Some(existing) = &*serve {
+            return Ok(existing.clone());
+        }
+        let url = crate::node_config::resolve_noded_url();
+        match cosmix_lib_client::NodedClient::connect_anonymous(&url).await {
+            Ok(client) => {
+                let arc = std::sync::Arc::new(Lane::Anonymous(client));
+                *serve = Some(arc.clone());
+                Ok(arc)
+            }
+            // The verified lane proved a broker is there, so failing to open a
+            // second plain connection to it is a LOST connection, not a bare
+            // host — and the serve paths raise on Lost rather than pretending.
+            Err(_) => Err(MeshErr::Lost),
         }
     }
 
@@ -684,7 +726,7 @@ impl BusHandler for MixBusHandler {
             // that has no broker behind it. The send/emit/etc. paths
             // remain the loud-failure surface for Lost.
             if self.incoming.borrow().is_none() {
-                let client = match self.noded_access().await {
+                let client = match self.serve_access().await {
                     Ok(c) => c,
                     Err(MeshErr::NeverPresent) | Err(MeshErr::Lost) => {
                         *self.incoming_closed.borrow_mut() = true;
@@ -756,7 +798,7 @@ impl BusHandler for MixBusHandler {
             // register must surface the failure, not pretend success.
             // So NeverPresent raises here, distinguishing this from
             // the send/emit silent-nil treatment.
-            let client = match self.noded_access().await {
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -966,6 +1008,7 @@ impl BusHandler for MixBusHandler {
             // self-recovers; a citizen calling bus_reconnect() is a
             // harmless trait-default no-op).
             *self.mesh.lock().await = MeshState::Unprobed;
+            *self.serve.lock().await = None;
             // Also clear the incoming-receiver state. Without this, a
             // `next_incoming` that hit `NeverPresent` (closing the
             // sticky `incoming_closed` flag) or a previously corrupted
