@@ -76,6 +76,15 @@ impl ResultFd {
         let mut frame = Vec::with_capacity(4 + bytes.len());
         frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         frame.extend_from_slice(bytes);
+        // Test hook: emit the declared length but only half the payload, which
+        // is what a writer killed mid-frame leaves behind. The supervisor's
+        // torn-frame path is otherwise unreachable from a fixture — this
+        // interpreter handles SIGTERM gracefully and writes a complete error
+        // frame, so no amount of signalling produces a partial one. Absent in
+        // every ordinary run, and it only ever REMOVES bytes.
+        if std::env::var_os("MIX_RESULT_TORN").is_some() {
+            frame.truncate(4 + bytes.len() / 2);
+        }
         // SAFETY: validated open above, and this is the sole owner from here.
         // Into a File so a partial write is retried rather than lost.
         let mut file = unsafe { std::fs::File::from_raw_fd(self.0) };

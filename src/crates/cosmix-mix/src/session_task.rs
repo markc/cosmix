@@ -1265,7 +1265,7 @@ mod tests {
     fn an_oversized_value_becomes_a_reference_not_a_fragment() {
         // A quote-heavy strict-data document: complete, well under the frame
         // cap in raw bytes, and far over the budget once escaped for the reply.
-        let quoted: Vec<String> = (0..4000).map(|i| format!("\"s{i}\"")).collect();
+        let quoted: Vec<String> = (0..9000).map(|i| format!("\"s{i}\"")).collect();
         let frame = format!("[{}]", quoted.join(","));
         assert!(
             serde_json::to_string(&frame).expect("encodes").len() > MAX_RESULT_ENCODED,

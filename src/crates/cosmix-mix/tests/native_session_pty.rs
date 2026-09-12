@@ -2744,29 +2744,32 @@ fn p4_termination_is_hard_and_the_outcome_names_the_policy() {
             );
         }
 
-        // DETERMINISTIC result_missing, because the branch above can be
-        // satisfied without ever reaching it. `sleep` blocks the interpreter's
-        // thread, so the graceful-shutdown arm that would write an error frame
-        // never gets to run: SIGTERM is not observed, the grace expires, and
-        // SIGKILL ends it with nothing written at all. Not a torn frame, not an
-        // empty value — no frame.
+        // DETERMINISTIC result_torn, through the test hook, because signals
+        // cannot produce one: this interpreter handles SIGTERM gracefully and
+        // writes a COMPLETE error frame, which is the previous case above. A
+        // half-written frame only happens when a writer dies mid-write, so the
+        // hook reproduces exactly that and nothing else.
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
             4,
             serde_json::json!({
-                "source": "print(\"ARMED\")\nsleep(60)\n1",
-                "timeout_ms": "3000",
+                "source": "41 + 1",
+                "env": [["MIX_RESULT_TORN", "1"]],
+                "timeout_ms": "20000",
             }),
         )
         .await
         .expect("admitted");
         let report = task_report(&mut f.parent, &f.bound, operation).await;
         let task = &report["report"];
-        assert_eq!(task["outcome"]["kind"], "timeout", "{task}");
+        // The TASK succeeded — this is the point. A frame the supervisor could
+        // not read must not be reported as the task having failed.
+        assert_eq!(task["outcome"]["kind"], "exited", "{task}");
+        assert_eq!(task["outcome"]["code"], 0, "{task}");
         assert_eq!(
-            task["result"]["kind"], "result_missing",
-            "a writer killed before it wrote must report result_missing: {task}"
+            task["result"]["kind"], "result_torn",
+            "a half-written frame must report result_torn: {task}"
         );
         teardown(f).await;
     });

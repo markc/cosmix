@@ -81,6 +81,7 @@ one comparison against a captured field.
 | `MIX_ADMIT_DELAY_MS` | the editor thread, before an admission claims its owner token | the queued-envelope window, so a fixture can make the admission owner give up while the envelope is still queued |
 | `MIX_RESERVE_HOLD_MS` | the admission owner, between reserve and commit | the reservation window, so a fixture can type into it |
 | `MIX_CLAIM_DELAY_MS` | the editor thread, AFTER an admission claims its token | the committed window, the only way to reach the branch where the owner's abandon loses and the outcome is genuinely undetermined |
+| `MIX_RESULT_TORN` | `--result-fd`, as it writes the frame | emits the declared length with half the payload — a writer killed mid-frame. Unreachable any other way: the interpreter handles SIGTERM gracefully and writes a COMPLETE error frame, so no amount of signalling produces a partial one. Set per task through the `env` overlay, never on the shell |
 
 They are not `#[cfg(test)]` because the PTY fixtures drive the real release
 binary, which is built without test cfg by construction — a hook compiled out of
