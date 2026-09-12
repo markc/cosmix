@@ -773,7 +773,21 @@ pub(crate) async fn dispatch(
         // so: a caller polling `shell.task.result` is doing the supported thing,
         // and would otherwise have to discover by silence that watching is not
         // implemented.
-        TASK_WATCH | TASK_LIST => refusal("UNSUPPORTED"),
+        // A DEFERRAL, and it says so. An arm answering exactly like the
+        // unknown-verb fallthrough is not a deferral at all — it is
+        // indistinguishable from a typo, to a caller and to a fixture, and
+        // deleting it would change nothing observable. The reason field is
+        // what makes "this verb exists and is not built yet" a fact the
+        // surface actually states.
+        TASK_WATCH | TASK_LIST => (
+            10,
+            serde_json::json!({
+                "error_code": "UNSUPPORTED",
+                "reason": "deferred",
+                "detail": "task results are poll-only in v1; use shell.task.result",
+            })
+            .to_string(),
+        ),
         _ => refusal("UNSUPPORTED"),
     }
 }
@@ -1225,6 +1239,13 @@ fn task_cancel(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u
         serde_json::json!({
             "version": 1,
             "operation_id": request.operation_id,
+            // `requested` can race a task that settles between the store read
+            // above and this reply. That is accepted rather than locked away:
+            // holding both locks across the cancel would not remove the race,
+            // only move it a few microseconds later, since the task can settle
+            // at any instant including after the reply is written. The reply is
+            // explicit that it reports an INTENT, and the wait status in the
+            // report is what is authoritative about what happened.
             "outcome": if settled { "already_settled" } else { "requested" },
             // The one HARD guarantee in the arc, and it is still not a claim
             // that the process has stopped YET — only that it will be made to.

@@ -91,3 +91,17 @@ at any interval length.
 
 `check-stage-d-gates.mix` sets neither; the fixtures that need them set them per
 child.
+
+## The gate battery
+
+Each gate builds the current-HEAD Mix itself and pins both the COUNT and the
+NAMES of what it runs, because libtest exits 0 when a filter matches nothing —
+a renamed fixture would otherwise leave a gate green having run nothing at all.
+Run them from the repository `src/` directory.
+
+| Gate | Covers |
+|---|---|
+| `check-production-e2e.mix` | p0i-01, the production Term→Mix binding |
+| `check-s4-gates.mix` | recipient enforcement (S4) |
+| `check-stage-d-gates.mix` | P0-J stage D: idle-prompt admission and per-evaluation cancellation, plus the Term `term.execute` forward |
+| `check-p4-gates.mix` | P4 isolated supervised tasks: the five shell fixtures and the Term `term.task.*` forward |

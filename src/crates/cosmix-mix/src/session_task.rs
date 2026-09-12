@@ -65,9 +65,20 @@ const MAX_RESULT_ENCODED: usize = 64 * 1024;
 const GRACE: Duration = Duration::from_secs(2);
 const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_ENV_VARS: usize = 64;
-const MAX_ENV_BYTES: usize = 16 * 1024;
 const MAX_ARGV: usize = 256;
-const MAX_ARG_BYTES: usize = 64 * 1024;
+/// Byte budgets for argv and the environment overlay.
+///
+/// Sized to the DISPATCH request cap, not to what exec could carry. A whole
+/// `shell.task.submit` body must fit 8192 bytes, so a 64 KiB argv limit was
+/// unreachable decoration: the advertised RESOURCE_LIMIT could never fire and
+/// the manual described a refusal no caller could provoke. These are under the
+/// dispatch cap on purpose, so the limit a caller reads about is the limit that
+/// actually answers.
+const MAX_ENV_BYTES: usize = 4096;
+const MAX_ARG_BYTES: usize = 4096;
+
+/// The child lost the fork/prctl race and has no supervisor.
+const ORPHANED_BEFORE_START: libc::c_int = 125;
 
 /// The environment a task starts from, snapshotted ONCE at shell startup.
 ///
@@ -187,8 +198,12 @@ impl Spec {
             }
         }
         // Checked here AND again by the spawn (the directory can vanish in
-        // between); this one exists so the common mistake is a clean refusal
-        // rather than a spawn failure the caller has to decode.
+        // between), so the same broken cwd can answer two ways by timing: a
+        // directory that is already gone is NOT_FOUND, one that disappears
+        // inside the race window is UNAVAILABLE/spawn_failed. Both are honest
+        // about what was observed and both are retryable; unifying them would
+        // mean either withholding this cheap, precise answer or claiming the
+        // spawn failure was a validation result.
         if !std::path::Path::new(&cwd).is_dir() {
             return Err("NOT_FOUND");
         }
@@ -469,7 +484,11 @@ fn supervise_task(
             // the prctl above, the signal has already been missed and this
             // child would outlive its supervisor forever.
             if libc::getppid() != parent {
-                libc::_exit(127);
+                // Deliberately NOT 127: that is the shell's "command not
+                // found", and this child found its command perfectly well.
+                // A distinctive code makes a lost race legible in the report
+                // instead of looking like a typo in the argv.
+                libc::_exit(ORPHANED_BEFORE_START);
             }
             // std resets signal HANDLERS across exec but not the MASK. An
             // inherited full mask would make the SIGTERM grace a no-op and turn

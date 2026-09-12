@@ -1692,3 +1692,149 @@ fn p0j_d_execute_forwards_to_the_pane_shell_and_refuses_at_the_edges() {
         assert_eq!(reply, (10, json!({"error_code":"FORBIDDEN"})), "{reply:?}");
     });
 }
+
+#[test]
+#[ignore = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit P4 gate only"]
+fn p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind() {
+    eprintln!("{REQUIRE_MIX}");
+    let fixture = Fixture::new(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let owner = verified(&fixture.broker).await;
+        let (parent, child) = fixture.records(&owner, 1).await;
+        let target = target(&parent, &child);
+        // A task does not need an idle prompt — that is the whole point of the
+        // mode — but waiting for one keeps this fixture's own timing stable.
+        let _ = idle_generation(owner.client(), &child).await;
+
+        let submission = json!({
+            "target": target, "request_id": "2",
+            "source": "40 + 2",
+            "cwd": "/tmp",
+            "timeout_ms": "20000",
+        });
+        let accepted = call(owner.client(), &parent.name, "term.task.submit", submission.clone()).await;
+        assert_eq!(accepted.0, 0, "{accepted:?}");
+        assert_eq!(accepted.1["status"], "accepted", "{accepted:?}");
+        assert_eq!(accepted.1["target"], json!(target), "{accepted:?}");
+        let operation = accepted.1["operation_id"].clone();
+        assert!(operation.is_string(), "{accepted:?}");
+
+        // The result family resolves the same operation through Term, and the
+        // typed value arrives over the result descriptor rather than as text.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let settled = loop {
+            let reply = call(
+                owner.client(),
+                &parent.name,
+                "term.task.result",
+                json!({"target":target,"operation_id":operation}),
+            )
+            .await;
+            assert_eq!(reply.0, 0, "{reply:?}");
+            if reply.1["state"] == "settled" {
+                break reply.1;
+            }
+            assert!(Instant::now() < deadline, "never settled: {reply:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(settled["report"]["outcome"]["kind"], "exited", "{settled}");
+        assert_eq!(settled["report"]["outcome"]["code"], 0, "{settled}");
+        assert!(
+            settled["report"]["result"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("42"),
+            "the typed result did not survive the forward: {settled}"
+        );
+
+        // BROKER-018 across BOTH hops for the task family too.
+        let replay = call(owner.client(), &parent.name, "term.task.submit", submission).await;
+        assert_eq!(replay, accepted, "a retry must replay, not re-run");
+
+        // KIND scoping. The forwarded-id map is deliberately NOT split by kind
+        // — that would let one caller request id mint two operations and both
+        // run — but ADDRESSING is, so a task operation is not reachable through
+        // the execute family and never resolves to somebody else's work.
+        let crossed = call(
+            owner.client(),
+            &parent.name,
+            "term.exec.result",
+            json!({"target":target,"operation_id":operation}),
+        )
+        .await;
+        assert_eq!(
+            crossed.1["error_code"], "UNKNOWN_OUTCOME",
+            "a task resolved through the execute family: {crossed:?}"
+        );
+        let crossed = call(
+            owner.client(),
+            &parent.name,
+            "term.exec.cancel",
+            json!({"target":target,"operation_id":operation}),
+        )
+        .await;
+        assert_eq!(
+            crossed.1["error_code"], "UNKNOWN_OUTCOME",
+            "a task was cancellable through the execute family: {crossed:?}"
+        );
+
+        // FOREIGN-ACTOR scoping, which is the property Term's ownership map
+        // exists for: a sibling that learns the operation number some other way
+        // still cannot address it, and the same caller request id does not
+        // collide at the child.
+        let sibling = verified(&fixture.broker).await;
+        let stolen = call(
+            sibling.client(),
+            &parent.name,
+            "term.task.result",
+            json!({"target":target,"operation_id":operation}),
+        )
+        .await;
+        assert_eq!(
+            stolen.1["error_code"], "UNKNOWN_OUTCOME",
+            "a sibling addressed another actor's task: {stolen:?}"
+        );
+        let other = call(
+            sibling.client(),
+            &parent.name,
+            "term.task.submit",
+            json!({"target":target,"request_id":"2","source":"1 + 1",
+                   "cwd":"/tmp","timeout_ms":"20000"}),
+        )
+        .await;
+        assert_eq!(other.0, 0, "{other:?}");
+        assert_ne!(
+            other.1["operation_id"], operation,
+            "two actors sharing a caller request id collapsed onto one task"
+        );
+        sibling.client().close().await;
+
+        // An id this shell never minted addresses nothing, and an unverified
+        // peer reaches none of the family.
+        let unknown = call(
+            owner.client(),
+            &parent.name,
+            "term.task.cancel",
+            json!({"target":target,"operation_id":"9999"}),
+        )
+        .await;
+        assert_eq!(unknown.1["error_code"], "UNKNOWN_OUTCOME", "{unknown:?}");
+        let tcp = NodedClient::connect_anonymous(&fixture.broker.url).await.unwrap();
+        for verb in ["term.task.submit", "term.task.result", "term.task.cancel"] {
+            forbidden(call(&tcp, &parent.name, verb, json!({"target":target})).await);
+        }
+
+        // A pane generation that is not this child's is not this child.
+        let mut wrong = target;
+        wrong.pane_generation = DecimalU64(wrong.pane_generation.0 + 1);
+        let reply = call(
+            owner.client(),
+            &parent.name,
+            "term.task.submit",
+            json!({"target":wrong,"request_id":"7","source":"1",
+                   "cwd":"/tmp","timeout_ms":"20000"}),
+        )
+        .await;
+        assert_eq!(reply, (10, json!({"error_code":"FORBIDDEN"})), "{reply:?}");
+    });
+}

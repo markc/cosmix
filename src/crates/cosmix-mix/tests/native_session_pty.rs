@@ -2501,6 +2501,16 @@ fn p4_a_task_inherits_only_what_it_was_given() {
         let extra: Vec<_> = names.difference(&allowed).collect();
         assert!(extra.is_empty(), "undeclared inheritance: {extra:?}");
         assert!(names.contains("P4_OVERLAY") && names.contains("TERM"), "{names:?}");
+        // PRESENCE, not just absence. A subset check passes happily when the
+        // base set shrinks, so dropping PATH from BASE_NAMES would leave every
+        // task unable to find a program and no fixture would notice. These four
+        // exist in any environment this suite can run in.
+        for required in ["HOME", "USER", "PATH", "LANG"] {
+            assert!(
+                names.contains(required),
+                "{required} is missing from the base environment: {names:?}"
+            );
+        }
         // The overlay WINS over the base on a collision.
         assert!(
             environ.contains("PATH=/p4/overridden"),
@@ -2533,6 +2543,32 @@ fn p4_a_task_inherits_only_what_it_was_given() {
             assert!(open.contains(&expected), "fd {expected} missing: {listed}");
         }
         assert!(open.len() <= 4, "a descriptor leaked into the task: {listed}");
+
+        // And in SOURCE mode the result channel must be PRESENT. Mix can list
+        // its own descriptors, so the positive half of the contract — fd 3 is
+        // the result channel, not an accident — is observable after all, even
+        // though the interpreter's own startup descriptors make the negative
+        // half unmeasurable here.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            4,
+            serde_json::json!({"source": "print(join(glob(\"/proc/self/fd/*\"), \" \"))"}),
+        )
+        .await
+        .expect("admitted");
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        let listed = report["report"]["stdout"]["text"].as_str().unwrap();
+        let open: std::collections::BTreeSet<&str> = listed
+            .split_whitespace()
+            .filter_map(|path| path.rsplit('/').next())
+            .collect();
+        for expected in ["0", "1", "2", "3"] {
+            assert!(
+                open.contains(expected),
+                "fd {expected} missing from a source task: {listed}"
+            );
+        }
 
         // stdin is /dev/null, not the pane: a reader sees EOF at once.
         let operation = submit_task(
@@ -2625,6 +2661,72 @@ fn p4_termination_is_hard_and_the_outcome_names_the_policy() {
         .await
         .expect("an idempotent cancel");
         assert_eq!(late["outcome"], "already_settled", "{late}");
+
+        // SOURCE mode, which is where the interesting failure was: the
+        // interpreter catches SIGTERM for its own graceful shutdown, so a
+        // cancelled task could write a SUCCESSFUL frame and exit 0 — making a
+        // killed evaluation indistinguishable from one that returned nil.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            3,
+            serde_json::json!({
+                "source": "print(\"RUNNING\")\nsleep(30)\n1",
+                "timeout_ms": "20000",
+            }),
+        )
+        .await
+        .expect("admitted");
+        // Observe `cancelling` positively: between the request and the wait
+        // status there is a real state, and a caller polling through it must
+        // see something other than "running".
+        let mut seen_cancelling = false;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.task.cancel",
+            operation_request(&f.bound, operation),
+        )
+        .await
+        .expect("a live task resolves");
+        for _ in 0..20 {
+            let state = execute_call(
+                &mut f.parent,
+                &f.bound,
+                "shell.task.result",
+                operation_request(&f.bound, operation),
+            )
+            .await
+            .expect("a known task always has a state");
+            if state["state"] == "cancelling" {
+                seen_cancelling = true;
+            }
+            if state["state"] == "settled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        let task = &report["report"];
+        assert_eq!(task["outcome"]["kind"], "cancelled", "{task}");
+        assert!(seen_cancelling, "the cancelling state was never observable");
+        // The frame must NOT claim success. Either the interpreter got far
+        // enough to write an interrupted-by-signal error, or it was killed
+        // before writing at all — never {ok:true}.
+        let result = &task["result"];
+        if result["kind"] == "value" {
+            let data = result["data"].as_str().unwrap_or_default();
+            assert!(
+                data.contains("\"ok\":false") || data.contains("\"ok\": false"),
+                "a cancelled source task reported success: {data}"
+            );
+        } else {
+            assert!(
+                result["kind"] == "result_missing" || result["kind"] == "result_torn",
+                "unexpected result for a cancelled source task: {result}"
+            );
+        }
         teardown(f).await;
     });
 }
@@ -2660,6 +2762,61 @@ fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
         );
         assert!(task["stdout"]["text"].as_str().unwrap().len() <= 64 * 1024);
         assert_eq!(task["outcome"]["code"], 0, "{task}");
+
+        // stderr has its own budget, and a NUL-heavy stream is the case the
+        // raw-byte caps got wrong: one byte to capture, six to encode. The cap
+        // that matters is the one the reply pays.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            3,
+            serde_json::json!({
+                "argv": ["sh", "-c", "head -c 200000 /dev/zero >&2; echo done"],
+                "timeout_ms": "20000",
+            }),
+        )
+        .await
+        .expect("admitted");
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        let task = &report["report"];
+        assert_eq!(task["stderr"]["truncated"], true, "{task}");
+        assert_eq!(counter(&task["stderr"]["bytes"]), 200_000, "{task}");
+        let encoded = serde_json::to_string(&task["stderr"]["text"]).expect("encodes");
+        assert!(
+            encoded.len() <= 64 * 1024,
+            "stderr costs {} encoded bytes, over its budget",
+            encoded.len()
+        );
+        // The whole settled reply has to fit one Term reply, which is the
+        // property the per-field budgets exist to produce.
+        assert!(
+            serde_json::to_string(task).expect("encodes").len() < 256 * 1024,
+            "the settled report does not fit a single reply"
+        );
+
+        // A result larger than the frame cap comes back as a truncated
+        // REFERENCE — the caller learns a value existed and why it is absent,
+        // rather than the frame being cut and read as a killed writer.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            4,
+            serde_json::json!({
+                "source": "repeat(\"x\", 200000)",
+                "timeout_ms": "20000",
+            }),
+        )
+        .await
+        .expect("admitted");
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        let result = &report["report"]["result"];
+        assert_eq!(result["kind"], "value", "{result}");
+        let data = result["data"].as_str().unwrap();
+        assert!(
+            data.contains("truncated"),
+            "an oversized value must report itself truncated: {data}"
+        );
+        assert_eq!(report["report"]["outcome"]["code"], 0, "{report}");
 
         // A cwd that does not exist is refused BEFORE any spawn, and the
         // request id is untouched — so the same id may simply be retried.
@@ -2725,7 +2882,10 @@ fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
             .await;
         }
 
-        // The deferrals answer UNSUPPORTED explicitly, not like a typo.
+        // The deferrals answer UNSUPPORTED explicitly, and — the part that
+        // makes this fixture mean anything — DIFFERENTLY from a verb that does
+        // not exist. Asserting only the code passed with the deferral arms
+        // deleted, because an unknown verb is refused the same way.
         for verb in ["shell.task.watch", "shell.task.list"] {
             let error = execute_call(
                 &mut f.parent,
@@ -2736,7 +2896,137 @@ fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
             .await
             .unwrap_err();
             assert!(error.contains("UNSUPPORTED"), "{verb}: {error}");
+            assert!(
+                error.contains("deferred"),
+                "{verb} is a deferral and must say so: {error}"
+            );
         }
+        let typo = execute_call(
+            &mut f.parent,
+            &f.bound,
+            "shell.task.wtach",
+            operation_request(&f.bound, 1),
+        )
+        .await
+        .unwrap_err();
+        assert!(typo.contains("UNSUPPORTED"), "{typo}");
+        assert!(
+            !typo.contains("deferred"),
+            "an unknown verb must not look like a deferral: {typo}"
+        );
         teardown(f).await;
+    });
+}
+
+/// What a task LEAVES BEHIND must not be able to hold the shell hostage.
+#[test]
+fn p4_a_survivor_cannot_wedge_the_supervisor() {
+    let _fixture = fixture_guard();
+    runtime().block_on(async {
+        let mut f = stage_d_fixture("owned").await;
+
+        // The wedge, exactly: `sh` backgrounds a long sleeper and exits. The
+        // sleeper inherited stdout, stderr and — in source mode — the result
+        // descriptor, so reading any of them to EOF waits for the SLEEPER, not
+        // the task. Unbounded, this pinned the record at "running" for ten
+        // minutes and never gave back its TASKS slot.
+        let started = Instant::now();
+        let mut survivors = Vec::new();
+        for id in 1..=4u64 {
+            survivors.push(
+                submit_task(
+                    &mut f.parent,
+                    &f.bound,
+                    id,
+                    serde_json::json!({
+                        "argv": ["sh", "-c", "sleep 600 & echo SPAWNED"],
+                        "timeout_ms": "10000",
+                    }),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("task {id} should start: {e}")),
+            );
+        }
+        for operation in &survivors {
+            let report = task_report(&mut f.parent, &f.bound, *operation).await;
+            let task = &report["report"];
+            // The task itself exited cleanly and promptly; that is the answer,
+            // and it does not wait on what the task left running.
+            assert_eq!(task["outcome"]["kind"], "exited", "{task}");
+            assert_eq!(task["outcome"]["code"], 0, "{task}");
+            assert!(
+                task["stdout"]["text"].as_str().unwrap().contains("SPAWNED"),
+                "{task}"
+            );
+            // And the report is HONEST that it stopped listening rather than
+            // presenting a bounded read as the whole of the output.
+            assert_eq!(
+                task["stdout"]["writer_survived"], true,
+                "a held-open pipe must be reported, not hidden: {task}"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "four survivors took {:?} — the drains are not bounded",
+            started.elapsed()
+        );
+
+        // The TASKS slots came BACK. Four wedged supervisors used to mean the
+        // shell refused every later task for the rest of its life.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            9,
+            serde_json::json!({"source": "40 + 2"}),
+        )
+        .await
+        .expect("the concurrency slots must be released by a settled task");
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        assert!(
+            report["report"]["result"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("42"),
+            "{report}"
+        );
+
+        // Kill-on-drop: the shell leaves, and what its tasks left running goes
+        // with it. PDEATHSIG reaches the leader; only the sweep reaches the
+        // group, which is where a backgrounded grandchild lives.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            10,
+            serde_json::json!({
+                "argv": ["sh", "-c", "sleep 913 & echo $! ; sleep 913"],
+                "timeout_ms": "60000",
+            }),
+        )
+        .await
+        .expect("admitted");
+        let _ = operation;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let shell = f.child.pid();
+        let group_alive = |pid: i32| {
+            std::path::Path::new(&format!("/proc/{pid}")).exists()
+        };
+        assert!(group_alive(shell), "the shell should still be up");
+        f.child.exit();
+        let gone = Instant::now() + Duration::from_secs(15);
+        while group_alive(shell) && Instant::now() < gone {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The sleepers are in the task's process group, which the sweep
+        // SIGKILLs on the way out; nothing is left for `ps` to find.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leftovers = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 913"])
+            .output()
+            .expect("pgrep runs");
+        assert!(
+            String::from_utf8_lossy(&leftovers.stdout).trim().is_empty(),
+            "a task's children outlived the shell: {}",
+            String::from_utf8_lossy(&leftovers.stdout)
+        );
     });
 }
