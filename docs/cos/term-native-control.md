@@ -141,9 +141,21 @@ is neither.
 
 Term relays the `source`/`argv` union exactly as sent and never picks a side, so
 both-or-neither reaches the child's own refusal rather than being resolved at
-the hop. The full task contract — the enumerated environment, the termination
-ladder, the caps and the advertised deferrals — is in the Mix manual under
-"Isolated supervised tasks" (`mix man cli`).
+the hop. Absent fields are OMITTED rather than relayed as JSON `null`: a null is
+a present field of the wrong type, so it earns a malformed-body complaint about
+Term's own framing instead of the child's honest answer about the caller's
+request.
+
+Non-retention has one addition for tasks. A refusal that is about the child's
+LOAD rather than the request — `RESOURCE_LIMIT` at the concurrency cap, or
+`UNAVAILABLE` when the machine could not start the work — settles nothing, so
+Term relays it without recording it. The documented remedy for both is to back
+off and retry the same submission, and a retry only reaches the child's own
+dedupe if Term did not answer from a record first.
+
+The full task contract — the enumerated environment, the termination ladder, the
+caps and the advertised deferrals — is in the Mix manual under "Isolated
+supervised tasks" (`mix man cli`).
 
 ## Live properties
 

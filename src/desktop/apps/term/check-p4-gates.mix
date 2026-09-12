@@ -30,7 +30,7 @@ $shell_expected = length($shell_fixtures)
 -- it was not. That fixture forwards term.execute, which exercises none of the
 -- task body builder, the kind-scoped addressing or the task capability rows.
 $term_fixtures = [
-  "control_tests::p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind"
+  "native_session::enforcement_tests::p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind"
 ]
 $term_expected = length($term_fixtures)
 

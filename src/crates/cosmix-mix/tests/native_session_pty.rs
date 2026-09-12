@@ -2503,9 +2503,11 @@ fn p4_a_task_inherits_only_what_it_was_given() {
         assert!(names.contains("P4_OVERLAY") && names.contains("TERM"), "{names:?}");
         // PRESENCE, not just absence. A subset check passes happily when the
         // base set shrinks, so dropping PATH from BASE_NAMES would leave every
-        // task unable to find a program and no fixture would notice. These four
-        // exist in any environment this suite can run in.
-        for required in ["HOME", "USER", "PATH", "LANG"] {
+        // task unable to find a program and no fixture would notice. Only names
+        // the shell itself reliably has: LANG is absent on a headless build
+        // worker, and asserting it would make this a test of the environment
+        // rather than of the base set.
+        for required in ["HOME", "USER", "PATH"] {
             assert!(
                 names.contains(required),
                 "{required} is missing from the base environment: {names:?}"
@@ -2823,13 +2825,13 @@ fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
         let error = submit_task(
             &mut f.parent,
             &f.bound,
-            2,
+            5,
             serde_json::json!({"source": "1", "cwd": "/nonexistent/p4"}),
         )
         .await
         .unwrap_err();
         assert!(error.contains("NOT_FOUND"), "{error}");
-        let operation = submit_task(&mut f.parent, &f.bound, 2, serde_json::json!({"source": "1"}))
+        let operation = submit_task(&mut f.parent, &f.bound, 5, serde_json::json!({"source": "1"}))
             .await
             .expect("a refused task must not burn its request id");
         task_report(&mut f.parent, &f.bound, operation).await;

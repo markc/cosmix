@@ -731,6 +731,19 @@ fn natural(status: std::process::ExitStatus) -> Outcome {
 /// False means ESRCH — there is no such group, so there is nothing this signal
 /// could have done. The caller needs that answer: "I signalled it" and "it was
 /// already gone" lead to different reports.
+///
+/// DECLARED RESIDUAL: pid recycling. Between the waiter reaping the leader and
+/// this call, the kernel is free to hand that pid to someone else, and a killpg
+/// would then reach a group this supervisor never created. The window is what
+/// is left after `already_settled` drains a queued status first, so it is the
+/// microseconds between the reap and the send, and it needs the kernel to wrap
+/// its whole pid space in that time. The blast radius is bounded by the leader
+/// having been a session leader of its own: the recycled pid is only a group
+/// LEADER if the new process also called setsid, and it is the same uid either
+/// way. Closing it completely means holding the status un-reaped until the
+/// supervisor consents (waitid with WNOWAIT), which is worth doing if this ever
+/// stops being theoretical — it is recorded here rather than left for the next
+/// reader to rediscover.
 fn signal_group(pid: libc::pid_t, signal: libc::c_int) -> bool {
     // The GROUP, because the task is a session leader and its own children are
     // the reason a leader-only signal would leave work running.
