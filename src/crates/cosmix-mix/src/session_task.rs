@@ -488,17 +488,7 @@ fn supervise_task(
     };
     let mut command = match &spec.mode {
         Mode::Source(source) => {
-            // The interpreter that runs a source task is THIS one. Deriving a
-            // path from the install layout instead asks where a mix OUGHT to
-            // be, and gets NOT_FOUND the moment the shell is not running from
-            // `$COSMIX/bin` — a dev build, a test harness, a relocated tree —
-            // for a binary that is demonstrably running. Worse when the derived
-            // path does exist: the task would then be evaluated by a DIFFERENT
-            // build than the shell the caller is talking to, silently.
-            let interpreter = std::env::current_exe().unwrap_or_else(|_| {
-                crate::cosmix_paths::cosmix_path(crate::cosmix_paths::CosmixDir::Bin).join("mix")
-            });
-            let mut command = Command::new(interpreter);
+            let mut command = Command::new(interpreter());
             // Flags BEFORE -c: `-c` consumes the remainder as script argv, so
             // a trailing --result-fd would be an argument, not a flag.
             command.arg("--result-fd").arg(TASK_RESULT_FD.to_string());
@@ -690,6 +680,48 @@ fn supervise_task(
             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         ),
     });
+}
+
+/// Which `mix` evaluates a source task.
+///
+/// THIS one, normally: the interpreter a caller is talking to should be the one
+/// that runs its task. Deriving a path from the install layout instead asks
+/// where a mix OUGHT to be, which fails for any shell not running from
+/// `$COSMIX/bin` — a dev build, a test harness, a relocated tree — with
+/// NOT_FOUND for a binary that is demonstrably running. Where the derived path
+/// happens to exist it is worse than a refusal: the task is evaluated by a
+/// DIFFERENT build than the shell, silently.
+///
+/// But `current_exe` reads `/proc/self/exe`, which names the ORIGINAL inode and
+/// is suffixed " (deleted)" once that inode is unlinked. A mesh deploy replaces
+/// `/opt/cosmix/bin/mix` under long-lived shells, and BOTH shapes of replace do
+/// unlink it — measured, not assumed: `rm`-then-write and an atomic
+/// rename-over each produce `…/mix (deleted)`, with the on-disk inode differing
+/// from the running one. Re-exec'ing that path would fail, or worse resolve to
+/// something else entirely. So a marked or unresolvable answer falls back to
+/// the installed path, and the stated limit is narrow and true: a shell whose
+/// binary was replaced under it runs source tasks with the INSTALLED build, not
+/// with its own image.
+fn interpreter() -> std::path::PathBuf {
+    let installed =
+        || crate::cosmix_paths::cosmix_path(crate::cosmix_paths::CosmixDir::Bin).join("mix");
+    match std::env::current_exe() {
+        Ok(path) => {
+            let unlinked = path
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b" (deleted)");
+            // The suffix check is the one that names the condition; the
+            // is_file() is what catches any other way the path stopped being
+            // executable between then and now.
+            if unlinked || !path.is_file() {
+                installed()
+            } else {
+                path
+            }
+        }
+        Err(_) => installed(),
+    }
 }
 
 /// The descriptor the child sees its result channel on. Above stderr, fixed so

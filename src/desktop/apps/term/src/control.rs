@@ -1389,6 +1389,12 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         // caller WHICH thing was missing. Its absence here is why a perfectly
         // clear child refusal was reaching callers as "unknown outcome".
         "NOT_FOUND" => relayed("NOT_FOUND"),
+        // The child read the request and found it malformed — both sides spell
+        // this the same way, and it was missing here for the same reason
+        // NOT_FOUND was: the map grew from the execute family's codes and never
+        // caught up with the task family's. Reporting a settled schema refusal
+        // as UNKNOWN_OUTCOME tells a caller its bad request MIGHT have run.
+        "INVALID_ARGUMENT" => relayed("INVALID_ARGUMENT"),
         "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
         "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
