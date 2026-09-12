@@ -1706,8 +1706,24 @@ fn p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind() {
         // mode — but waiting for one keeps this fixture's own timing stable.
         let _ = idle_generation(owner.client(), &child).await;
 
+        // The epoch is taken explicitly rather than left to the helper's cache.
+        // A mutation whose epoch does not match the connection is refused
+        // UNKNOWN_OUTCOME, which is indistinguishable from the child refusing —
+        // so the fixture proves it had a real one before blaming the far end.
+        let session = call(
+            owner.client(),
+            &parent.name,
+            "term.session",
+            json!({"target": target}),
+        )
+        .await;
+        assert_eq!(session.0, 0, "{session:?}");
+        let epoch = session.1["request_epoch"].clone();
+        assert!(epoch.is_string(), "no request_epoch to submit with: {session:?}");
+
         let submission = json!({
             "target": target, "request_id": "2",
+            "request_epoch": epoch,
             "source": "40 + 2",
             "cwd": "/tmp",
             "timeout_ms": "20000",
