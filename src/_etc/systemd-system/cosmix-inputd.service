@@ -1,0 +1,59 @@
+# /usr/lib/systemd/system/cosmix-inputd.service
+# Cosmix input verb broker (cosmix-inputd) — the AmigaOS input.device successor.
+# Registers the "inputd" Bus service; serves input.* (query/bind/unbind/mode).
+#
+# SINGLE POINT OF FAILURE when grabbing: if the daemon dies while holding
+# EVIOCGRAB the keyboard is dead until restart, so Restart=always + a short
+# RestartSec is the primary mitigation (plan target: recover < 2s). The shipped
+# ExecStart is the SAFE service-only form (no keyboard); add `--grab <device>`
+# (or `--observe <device>`) only after the supervised bring-up proves the grab +
+# recovery path on the host.
+#
+# Runs as root: reading keyboard event nodes and writing /dev/uinput need it
+# (kbd nodes carry no uaccess ACL for the seat user). Hardened, but PrivateDevices
+# is OFF and the input + uinput devices are explicitly allowed — the daemon's
+# whole job is those devices.
+
+[Unit]
+Description=Cosmix input verb broker (cosmix-inputd)
+Documentation=file:%h/.ctl/_plan/2026-09-12-cosmix-inputd-plan.md
+After=cosmix-noded.service
+Wants=cosmix-noded.service
+
+[Service]
+Type=simple
+# SAFE default: service-only, no keyboard. Post-supervision, append the device:
+#   ExecStart=/opt/cosmix/bin/cosmix-inputd --grab /dev/input/by-id/<kbd>-event-kbd
+ExecStart=/opt/cosmix/bin/cosmix-inputd
+Restart=always
+RestartSec=500ms
+# Reach noded's socket at the shared runtime path.
+Environment=COSMIX_RUN=/run/cosmix
+Environment=RUST_LOG=cosmix_inputd=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-inputd
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+
+# --- Hardening (device access preserved: this daemon owns input + uinput) ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+# The daemon's raison d'être — do NOT set PrivateDevices=yes.
+DeviceAllow=char-input rw
+DeviceAllow=/dev/uinput rw
+# uinput must be loadable/openable; input event nodes live under /dev/input.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
