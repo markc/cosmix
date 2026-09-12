@@ -1911,7 +1911,7 @@ fn unified_send_drives_term_execute_from_a_separate_driver_process() {
              print(\"RC=\" + $rc)\n\
              print(\"REPLY=\" + data_encode($r))\n",
             name = serde_json::to_string(&service).unwrap(),
-            target = serde_json::to_string(&json!({{"target": target}}).to_string()).unwrap(),
+            target = serde_json::to_string(&json!({ "target": target }).to_string()).unwrap(),
             prefix = serde_json::to_string(&exec_prefix).unwrap(),
             suffix = serde_json::to_string(&exec_suffix).unwrap(),
         );
