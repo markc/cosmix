@@ -1257,8 +1257,19 @@ impl Control {
             // admitted. The caller's route forward is `term.exec.result`, or a
             // byte-identical retry that re-forwards to the child's dedupe —
             // which is only possible because this is not recorded.
-            Err(_) if sequence.is_some() => (Reply::error("UNKNOWN_OUTCOME"), false),
-            Err(_) => (Reply::error("DISCONNECTED"), false),
+            //
+            // The REASON is logged because it cannot be relayed: the caller is
+            // told "unknown", which is all Term honestly knows about its
+            // request, but an operator holding the logs should not have to
+            // guess whether the child was slow, gone, or never asked.
+            Err(error) if sequence.is_some() => {
+                tracing::warn!(%verb, %shell_verb, %error, "child call failed; reporting unknown outcome");
+                (Reply::error("UNKNOWN_OUTCOME"), false)
+            }
+            Err(error) => {
+                tracing::warn!(%verb, %shell_verb, %error, "child call failed");
+                (Reply::error("DISCONNECTED"), false)
+            }
         };
         if reply.body.len() > 256 * 1024 {
             reply = Reply::error(if sequence.is_some() {
@@ -1382,8 +1393,19 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         // decision Term never made, and for a transient it tells the caller to
         // stop when it should retry. An unrecognised answer to a mutation is an
         // unknown outcome; to a read, a transport-shaped failure.
-        _ if mutation => Reply::error("UNKNOWN_OUTCOME"),
-        _ => Reply::error("DISCONNECTED"),
+        //
+        // Logged with the BODY, because this arm is where a new child code, or
+        // an answer that was never a refusal at all, disappears without trace.
+        // The caller is told "unknown" — which is true — but that is no reason
+        // for the operator to be told nothing.
+        _ if mutation => {
+            tracing::warn!(%body, "unrecognised child answer; reporting unknown outcome");
+            Reply::error("UNKNOWN_OUTCOME")
+        }
+        _ => {
+            tracing::warn!(%body, "unrecognised child answer");
+            Reply::error("DISCONNECTED")
+        }
     }
 }
 
