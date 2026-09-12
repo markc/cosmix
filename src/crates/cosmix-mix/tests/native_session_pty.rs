@@ -2332,6 +2332,12 @@ async fn task_report(
     }
 }
 
+/// Request ids must ASCEND within a fixture. The shell retires anything below
+/// its high-water mark, so inserting a case with a lower id than one already
+/// used makes the LATER submission fail with UNKNOWN_OUTCOME — a confusing way
+/// to discover you edited in the wrong place. A refused submission does not
+/// advance the mark, which is why the deliberately-invalid ids can sit out of
+/// line.
 async fn submit_task(
     parent: &mut Parent,
     record: &SessionRecord,
@@ -2576,7 +2582,7 @@ fn p4_a_task_inherits_only_what_it_was_given() {
         let operation = submit_task(
             &mut f.parent,
             &f.bound,
-            3,
+            5,
             serde_json::json!({"argv": ["sh", "-c", "cat; echo DRAINED"]}),
         )
         .await
