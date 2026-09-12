@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-tower"
-version = "0.5.2"
+version = "0.5.3"
 description = "CosMix Tower — the native CTK mesh node atlas"
 edition = "2021"
 rust-version = "1.95"

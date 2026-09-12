@@ -8,6 +8,13 @@ patched Smithay/wgpu) and is built with `setup.mix --desktop`.
 This page is the orientation. The compositor's protocol coverage has its own
 page: [cosmix-comp](cosmix-comp.md).
 
+FileMgr, Studio, Tower, Interact GUI and bg-showcase install their Bus
+app-control bridge only when `node.conf.mix` loads successfully. Without that
+configuration they retain their local app setup and print one standalone
+notice to stderr. FileMgr, Studio and Tower also accept `--noded-url`; an
+explicit URL takes precedence and enables the port even without node
+configuration. Other broker clients are unaffected by this app-control gate.
+
 The initial [desktop Bus capability provider](desktop-bus.md) adds session
 discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
 It serves registered local callers and explicitly granted mesh clipboard

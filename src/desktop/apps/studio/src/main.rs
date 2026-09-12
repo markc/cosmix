@@ -83,12 +83,12 @@ fn autoplay(
 
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let noded_url = app_port::parse_noded_url(&args)
+    let noded_url: Option<String> = app_port::parse_noded_url(&args)
         .unwrap_or_else(|error| {
             eprintln!("studio: {error}");
             std::process::exit(2);
         })
-        .unwrap_or_else(ctk::prelude::resolve_noded_url);
+        .or_else(ctk::prelude::configured_noded_url);
     let source = parse_source(&args).unwrap_or_else(|error| {
         eprintln!("studio: {error}");
         std::process::exit(2);
@@ -364,7 +364,7 @@ fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
 fn add_runtime_plugins(
     app: &mut App,
     theme_dir: Option<PathBuf>,
-    noded_url: String,
+    noded_url: Option<String>,
     transport: Box<dyn MixerTransport>,
 ) {
     app.add_plugins((
@@ -380,8 +380,13 @@ fn add_runtime_plugins(
         settings::SettingsPlugin,
         views::ViewsPlugin,
         MusicdMixerPlugin::with_transport(transport),
-        app_port::StudioAppPortPlugin::new(noded_url),
     ));
+    match noded_url {
+        Some(url) => {
+            app.add_plugins(app_port::StudioAppPortPlugin::new(url));
+        }
+        None => eprintln!("studio: no node.conf.mix — running standalone; Bus app-control port disabled"),
+    }
 }
 
 #[derive(Resource, Clone, Copy)]
@@ -830,7 +835,7 @@ mod startup_tests {
         add_runtime_plugins(
             &mut app,
             None,
-            "ws://127.0.0.1:1/studio-schedule-test".to_owned(),
+            Some("ws://127.0.0.1:1/studio-schedule-test".to_owned()),
             Box::new(HeadlessTransport),
         );
         app.finish();

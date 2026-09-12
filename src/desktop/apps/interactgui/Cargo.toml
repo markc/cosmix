@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-interactgui"
-version = "0.1.1"
+version = "0.1.2"
 description = "Interact GUI — the native CTK presenter for interactd dialogs"
 edition = "2021"
 rust-version = "1.95"

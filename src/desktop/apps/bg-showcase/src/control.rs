@@ -18,6 +18,7 @@ pub fn configure(app: &mut App) {
         Update,
         (boids::bus::service, service)
             .chain()
+            .run_if(resource_exists::<BusBridge>)
             .before(super::reconcile),
     );
 }

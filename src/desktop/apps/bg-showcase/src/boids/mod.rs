@@ -77,7 +77,7 @@ pub fn run() -> AppExit {
         .add_systems(
             Update,
             (
-                bus::service,
+                bus::service.run_if(resource_exists::<ctk::bus::BusBridge>),
                 update_palette,
                 reconcile,
                 occlusion::reconcile,

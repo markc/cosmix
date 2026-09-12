@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-bg-showcase"
-version = "0.2.2"
+version = "0.2.3"
 description = "Native Wayland Bevy 3D background exploration"
 edition = "2024"
 rust-version = "1.95"

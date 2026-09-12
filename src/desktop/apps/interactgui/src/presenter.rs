@@ -60,6 +60,16 @@ impl Plugin for PresenterPlugin {
                 (
                     PresenterSystems::BusIngress,
                     PresenterSystems::Drive,
+                    PresenterSystems::ResultDrive,
+                    PresenterSystems::Exit,
+                )
+                    .run_if(bevy::prelude::resource_exists::<BusBridge>),
+            )
+            .configure_sets(
+                Update,
+                (
+                    PresenterSystems::BusIngress,
+                    PresenterSystems::Drive,
                     InteractionSystems,
                     FileRequesterSystems,
                     PresenterSystems::CollectResults,

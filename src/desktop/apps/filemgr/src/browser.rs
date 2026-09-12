@@ -49,12 +49,12 @@ use ctk::theme::{ctk_color, tokens};
 pub fn run() {
     warm_export_label_fonts();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let noded_url = app_port::parse_noded_url(&args)
+    let noded_url: Option<String> = app_port::parse_noded_url(&args)
         .unwrap_or_else(|error| {
             eprintln!("filemgr: {error}");
             std::process::exit(2);
         })
-        .unwrap_or_else(ctk::prelude::resolve_noded_url);
+        .or_else(ctk::prelude::configured_noded_url);
     let dirs = crate::config::app_dirs();
     let asset_root = prepare_data_root(&dirs).unwrap_or_else(|error| {
         eprintln!("filemgr: {error}");
@@ -97,7 +97,7 @@ pub fn run() {
 ///
 /// Keeping this composition shared with the headless startup regression test
 /// makes Bevy validate the same cross-plugin schedule graph used by the binary.
-fn add_runtime_plugins(app: &mut App, theme_dir: Option<PathBuf>, noded_url: String) {
+fn add_runtime_plugins(app: &mut App, theme_dir: Option<PathBuf>, noded_url: Option<String>) {
     app.add_plugins((
         CtkThemePlugin::new(theme_dir),
         DcsAppShellPlugin,
@@ -108,8 +108,13 @@ fn add_runtime_plugins(app: &mut App, theme_dir: Option<PathBuf>, noded_url: Str
         OsDndPlugin,
         action::FileMgrActionPlugin,
         BrowserPlugin,
-        app_port::FileMgrAppPortPlugin::new(noded_url),
     ));
+    match noded_url {
+        Some(url) => {
+            app.add_plugins(app_port::FileMgrAppPortPlugin::new(url));
+        }
+        None => eprintln!("filemgr: no node.conf.mix — running standalone; Bus app-control port disabled"),
+    }
 }
 
 #[derive(Resource)]
@@ -5520,7 +5525,7 @@ mod tests {
         add_runtime_plugins(
             &mut app,
             None,
-            "ws://127.0.0.1:1/filemgr-schedule-test".to_owned(),
+            Some("ws://127.0.0.1:1/filemgr-schedule-test".to_owned()),
         );
         app.finish();
         app.cleanup();

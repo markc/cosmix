@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use cosmix_shell_host::scene::{SceneControl, SceneMetrics, SceneUpdateDeadline, SceneWake};
 use ctk::bus::{
     BusBridge, BusBridgeConfig, BusBridgeEvent, BusBridgePlugin, BusConnectionState, BusWorkerWake,
-    resolve_noded_url,
+    configured_noded_url,
 };
 use serde_json::json;
 use std::{
@@ -132,7 +132,16 @@ pub fn configure(app: &mut App) {
 pub struct OtherRequests(pub Vec<ctk::bus::InboundRequest>);
 
 pub fn configure_named(app: &mut App, service: &str) {
-    let mut config = BusBridgeConfig::new(service, resolve_noded_url());
+    app.world_mut().resource_mut::<SceneControl>().paused = true;
+    app.init_resource::<SceneGeometry>()
+        .init_resource::<OtherRequests>()
+        .init_resource::<SceneBus>()
+        .init_resource::<ScenePointer>();
+    let Some(url) = configured_noded_url() else {
+        eprintln!("bg-showcase: no node.conf.mix — running standalone; Bus app-control port disabled");
+        return;
+    };
+    let mut config = BusBridgeConfig::new(service, url);
     config.provenance = ctk::bus::provenance_from_build(cosmix_buildinfo::build_info!());
     config.worker_wake = Some(BusWorkerWake::new(
         app.world().resource::<SceneWake>().callback(),
@@ -149,12 +158,7 @@ pub fn configure_named(app: &mut App, service: &str) {
     config.event_capacity = 32;
     config.message_capacity = 64;
     config.max_messages_per_frame = 64;
-    app.world_mut().resource_mut::<SceneControl>().paused = true;
-    app.init_resource::<SceneGeometry>()
-        .init_resource::<OtherRequests>()
-        .init_resource::<SceneBus>()
-        .init_resource::<ScenePointer>()
-        .add_plugins(BusBridgePlugin::new(config));
+    app.add_plugins(BusBridgePlugin::new(config));
 }
 
 #[allow(clippy::too_many_arguments)]

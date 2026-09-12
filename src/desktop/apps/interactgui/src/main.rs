@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use cosmix_app_identity::AppIdentity;
 use cosmix_interaction_schema::TOPIC_INTERACT_PROPS_CHANGED;
 use ctk::prelude::{
-    apply_theme, provenance_from_build, resolve_app_theme, resolve_noded_url, BusBridgeConfig,
+    apply_theme, configured_noded_url, provenance_from_build, resolve_app_theme, BusBridgeConfig,
     BusBridgePlugin, AppPortPlugin, CtkThemePlugin, FileRequesterPlugin, InteractionPlugin,
     ThemeState, THEME_CHANGED_TOPIC,
 };
@@ -20,38 +20,42 @@ pub(crate) const IDENTITY: AppIdentity = AppIdentity {
 pub(crate) const BUS_SERVICE_NAME: &str = "interact-gui";
 
 fn main() {
-    let noded_url = resolve_noded_url();
-    let mut bridge = BusBridgeConfig::new(BUS_SERVICE_NAME, noded_url);
-    bridge.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
-    bridge.subscriptions = vec![
-        TOPIC_INTERACT_PROPS_CHANGED.to_string(),
-        THEME_CHANGED_TOPIC.to_string(),
-    ];
-    bridge.latest_topics = vec![];
-    bridge.observation = false;
-
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: IDENTITY.display_name.into(),
-                name: Some(IDENTITY.app_id()),
-                resolution: (760, 420).into(),
-                resizable: true,
-                ..default()
-            }),
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: IDENTITY.display_name.into(),
+            name: Some(IDENTITY.app_id()),
+            resolution: (760, 420).into(),
+            resizable: true,
             ..default()
-        }))
-        .add_plugins((
-            FeathersPlugins,
-            CtkThemePlugin::default(),
-            InteractionPlugin,
-            FileRequesterPlugin,
-            BusBridgePlugin::new(bridge),
-            AppPortPlugin::new(IDENTITY.display_name, IDENTITY.slug),
-            presenter::PresenterPlugin,
-        ))
-        .add_systems(Startup, setup)
-        .run();
+        }),
+        ..default()
+    }))
+    .add_plugins((
+        FeathersPlugins,
+        CtkThemePlugin::default(),
+        InteractionPlugin,
+        FileRequesterPlugin,
+        presenter::PresenterPlugin,
+    ));
+    match configured_noded_url() {
+        Some(url) => {
+            let mut bridge = BusBridgeConfig::new(BUS_SERVICE_NAME, url);
+            bridge.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
+            bridge.subscriptions = vec![
+                TOPIC_INTERACT_PROPS_CHANGED.to_string(),
+                THEME_CHANGED_TOPIC.to_string(),
+            ];
+            bridge.latest_topics = vec![];
+            bridge.observation = false;
+            app.add_plugins((
+                BusBridgePlugin::new(bridge),
+                AppPortPlugin::new(IDENTITY.display_name, IDENTITY.slug),
+            ));
+        }
+        None => eprintln!("interactgui: no node.conf.mix — running standalone; Bus app-control port disabled"),
+    }
+    app.add_systems(Startup, setup).run();
 }
 
 fn setup(mut commands: Commands, mut theme: ResMut<UiTheme>, mut theme_state: ResMut<ThemeState>) {
