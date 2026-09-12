@@ -58,13 +58,6 @@ pub(crate) enum Lane {
     Anonymous(cosmix_lib_client::NodedClient),
 }
 
-impl Lane {
-    /// True when this lane carries kernel-supplied peer credentials.
-    pub(crate) fn is_verified(&self) -> bool {
-        matches!(self, Lane::Verified(_))
-    }
-}
-
 impl std::ops::Deref for Lane {
     type Target = cosmix_lib_client::NodedClient;
     fn deref(&self) -> &Self::Target {
@@ -1481,6 +1474,19 @@ fn headers_reply_to_result(rc: u8, body: String, error_header: Option<String>) -
         } else {
             serde_json::from_str(&body).ok()
         };
+        // A STRUCTURED refusal is handed back whole. These carry `error_code`
+        // and often `reason`/`retry_requires`, and branching on them is the
+        // entire job of a driver; reducing one to prose leaves the caller
+        // parsing English to decide whether to retry.
+        //
+        // Deliberately narrow: only a body that parses AND names an
+        // `error_code` takes this path. A peer that answers an error as plain
+        // text, or as JSON of some other shape, still produces exactly the
+        // string it produced before — so no existing caller's `$result`
+        // changes unless the peer was already speaking the structured dialect.
+        if let Some(object) = parsed.as_ref().filter(|v| v.get("error_code").is_some()) {
+            return (i32::from(rc), json_to_value(object));
+        }
         let from_body = parsed
             .as_ref()
             .and_then(|v| v.get("message").or_else(|| v.get("error")))
@@ -1694,6 +1700,46 @@ mod tests {
         // Empty body → the response `error` header carries the token.
         let (rc, v) = headers_reply_to_result(10, String::new(), Some("from_header".to_string()));
         assert_eq!((rc, v), (10, Value::String("from_header".to_string())));
+    }
+
+    #[test]
+    fn headers_reply_app_error_keeps_a_structured_refusal_whole() {
+        // A refusal that names an error_code comes back as a MAP, so a driver
+        // can branch on it. This is the case the verified lane makes
+        // reachable: term answers FORBIDDEN/STALE_GENERATION/CONFLICT with
+        // fields a caller must act on differently.
+        let (rc, v) = headers_reply_to_result(
+            10,
+            r#"{"error_code":"STALE_GENERATION","reason":"prompt_moved"}"#.to_string(),
+            None,
+        );
+        assert_eq!(rc, 10);
+        let Value::Map(fields) = &v else {
+            panic!("a structured refusal must stay field-accessible, got {v:?}")
+        };
+        assert_eq!(
+            fields.get("error_code"),
+            Some(&Value::String("STALE_GENERATION".to_string()))
+        );
+        assert_eq!(
+            fields.get("reason"),
+            Some(&Value::String("prompt_moved".to_string()))
+        );
+    }
+
+    #[test]
+    fn headers_reply_app_error_without_a_code_is_unchanged() {
+        // The no-regression boundary, asserted rather than assumed. Only a
+        // body naming error_code takes the new path; JSON of another shape and
+        // plain prose both produce exactly the string they produced before.
+        assert_eq!(
+            headers_reply_to_result(10, r#"{"detail":"no code here"}"#.to_string(), None),
+            (10, Value::String(r#"{"detail":"no code here"}"#.to_string()))
+        );
+        assert_eq!(
+            headers_reply_to_result(10, "plain prose".to_string(), None),
+            (10, Value::String("plain prose".to_string()))
+        );
     }
 
     #[test]
