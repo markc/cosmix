@@ -1760,13 +1760,19 @@ mod tests {
 
     /// The absent-socket path must cost nothing.
     ///
-    /// Every mix that sends now tries the verified lane first, and most of
-    /// the fleet is headless with no local broker at all. If that attempt paid
-    /// the connect timeout, every first send on every headless host would
-    /// stall five seconds - a worse regression than the feature is a gain. A
-    /// path that does not exist fails at the stat, so this is fast by
-    /// construction; the assertion is here because "by construction" is how
-    /// the slow version would also have been described.
+    /// Every mix that sends now tries the verified lane first, and most of the
+    /// fleet is headless with no local broker at all. If that attempt paid the
+    /// connect timeout, every first send on every headless host would stall
+    /// five seconds — a worse regression than the feature is a gain.
+    ///
+    /// SCOPE, stated because the first version of this comment overclaimed:
+    /// this covers the EXPLICIT-endpoint path, where a configured socket path
+    /// does not exist and the stat fails immediately. The no-config route is
+    /// different — with neither `endpoint` nor `configured_endpoint` set, the
+    /// client runs its own discovery, and that is fast because a loopback
+    /// connection is REFUSED instantly, not because of a stat. Both are fast;
+    /// only the first is asserted here, and saying so is cheaper than a reader
+    /// later trusting a guarantee this test does not make.
     #[tokio::test(flavor = "current_thread")]
     async fn an_absent_verified_socket_falls_back_immediately() {
         let mut options = cosmix_lib_client::UnixConnectOptions::new(
