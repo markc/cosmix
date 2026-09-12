@@ -912,7 +912,15 @@ impl BusHandler for MixBusHandler {
             // raise-on-NeverPresent rationale as register_as: a script
             // that asks the broker to do something it cannot pretend
             // succeeded.
-            let client = match self.noded_access().await {
+            //
+            // serve_access, NOT noded_access: a subscription is
+            // connection-scoped, and its topic deliveries surface only
+            // through `next_incoming`, which reads the serve lane. Binding
+            // it to the verified send lane (whose client has no incoming
+            // receiver) would register the interest on a connection the
+            // pump never reads — silently deaf on verified-socket hosts,
+            // the same defect the serve fix closed for register_as.
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -953,7 +961,11 @@ impl BusHandler for MixBusHandler {
         name: &'a str,
     ) -> Pin<Box<dyn Future<Output = MixResult<()>> + 'a>> {
         Box::pin(async move {
-            let client = match self.noded_access().await {
+            // serve_access, for the same reason as subscribe_topic: the
+            // unsubscribe must reach the SAME connection the subscription
+            // was bound to (the serve lane), or it targets a subscription
+            // that connection never held.
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -1012,7 +1024,14 @@ impl BusHandler for MixBusHandler {
             // unreachable in practice (we wouldn't have received an
             // event to reply to). Treat it as a loud error if it
             // somehow happens, alongside the Lost case.
-            let client = match self.noded_access().await {
+            //
+            // serve_access, NOT noded_access: the request being answered
+            // arrived through `next_incoming` on the serve lane, so its
+            // response must go back out on that same connection — the
+            // broker correlates a reply on the channel the request came
+            // in on. Replying over the verified send lane would answer on
+            // a connection the request never touched.
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
