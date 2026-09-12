@@ -3121,3 +3121,98 @@ fn p4_a_survivor_cannot_wedge_the_supervisor() {
         );
     });
 }
+
+/// A registered service must RECEIVE, on a host that has a verified socket.
+///
+/// This is the case the verified-lane upgrade silently broke. A verified
+/// `NodedClient` carries no incoming receiver of its own — trusted deliveries
+/// go to the VerifiedConnection's separate lane — so routing the serve path
+/// onto it made `incoming` read as a cleanly CLOSED stream. `noded_register`
+/// still succeeded, being plain RPC, and the script then waited forever for
+/// deliveries that could never arrive. Silent, and only on hosts WITH a
+/// verified socket, which is precisely where the feature switches on.
+///
+/// The harness supplies a real verified socket, so the child's own send lane
+/// goes verified here — the fixture is worthless on a host where it would not.
+/// Against the pre-fix code this test hangs to its deadline and fails; that is
+/// the falsification check, and it is why the assertion is on a DELIVERY
+/// received rather than on the registration succeeding.
+#[test]
+fn a_registered_service_receives_deliveries_on_a_verified_host() {
+    let _fixture = fixture_guard();
+    let broker = Broker::start();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("node.conf.mix");
+    std::fs::write(
+        &config,
+        format!(
+            "noded: {{ unix_socket: {} }}\n",
+            serde_json::to_string(&broker.endpoint).unwrap()
+        ),
+    )
+    .unwrap();
+
+    // Registers, announces itself, then serves. The handler is what makes the
+    // event pump run at all, which is the path that went deaf.
+    let script = "noded_register(\"serveprobe\")\n\
+                  print(\"REGISTERED\")\n\
+                  on \"probe.ping\" do\n\
+                    print(\"DELIVERED\")\n\
+                  end\n";
+    let mut child = std::process::Command::new(current_mix())
+        .arg("-c")
+        .arg(script)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("COSMIX_NODE_CONFIG", &config)
+        .env("MIX_STATS", "off")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the serving child starts");
+
+    let stdout = child.stdout.take().expect("piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    let mut registered = false;
+    let mut delivered = false;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    runtime().block_on(async {
+        let sender = observer(&broker).await;
+        while Instant::now() < deadline && !delivered {
+            while let Ok(line) = rx.try_recv() {
+                if line.contains("REGISTERED") {
+                    registered = true;
+                }
+                if line.contains("DELIVERED") {
+                    delivered = true;
+                }
+            }
+            if registered && !delivered {
+                // Fire repeatedly: registration is announced before the pump is
+                // necessarily listening, and one lost delivery would look
+                // exactly like the bug this guards.
+                let _ = sender
+                    .client()
+                    .call("serveprobe", "probe.ping", serde_json::json!({}))
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(registered, "the child never registered its service");
+    assert!(
+        delivered,
+        "a registered service received NO delivery on a verified-socket host — \
+         the serve path is on a connection with no incoming lane"
+    );
+}
