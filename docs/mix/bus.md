@@ -142,6 +142,51 @@ connection), `-2` a per-send `timeout=` budget exceeded, `-3` Bus unavailable (n
 broker was ever present, a bare host). See [timeout](#per-send-timeout) and
 [no broker](#no-broker-graceful-degradation).
 
+**A structured refusal keeps its body.** When a peer answers `rc >= 10` with a
+JSON object naming an `error_code`, `$result` is that object — field-accessible,
+so `$result.error_code` and whatever else it carries (`reason`,
+`retry_requires`) are readable. Branching on those is the whole point of a
+refusal; flattened to prose it leaves a script parsing English to decide whether
+to retry. This is narrow on purpose: a peer that answers an error as plain text,
+or as JSON of some other shape, still produces exactly the string it always did.
+Only a body naming `error_code` takes the structured path. (0.87.0)
+
+## `send` and the verified session lane
+
+A locally registered service can be addressed two ways, and only one of them
+carries an identity. A TCP connection is known by a name the caller asserts
+about itself, which is not an authority — which is why a session-enrolled
+service's protected verbs answer `FORBIDDEN` over it. A Unix connection to the
+local broker carries peer credentials the KERNEL supplies, so the broker learns
+who is calling without having to be told.
+
+`send` now prefers that verified lane, with no change to how you write it:
+
+```mix
+$list = send noded "noded.list"          -- find the instance
+$r = send $name "term.session" body=$b   -- a protected verb, admitted
+```
+
+This grants no new authority. Any same-uid process can already open this
+connection — the pane shell and every test harness do — and a local
+`DefaultOpen` service admits the resulting session-less ambient principal for a
+matching uid/node/broker epoch. What was missing was a way for a SCRIPT to use
+it. (0.87.0)
+
+**The fallback is not an error path.** Where no verified lane is available — a
+headless host with no local broker socket, a broker running under another
+account, a genuinely remote target — `send` falls back to exactly the path it
+used before and behaves exactly as it did. The attempt costs nothing when the
+socket is absent: a path that does not exist fails at the stat, not at a
+timeout. The lane is chosen once per connection, so a script can never end up
+with some sends authenticated and others not.
+
+**Discovery.** `noded.list` projects by uid: a caller that owns a record gets
+its full `ServiceInfo` including the session details, while everyone else gets
+the bare name. A driver over the verified lane is same-uid by construction, so
+one `send noded "noded.list"` is enough to find a service's per-instance name
+and address it.
+
 ---
 
 ## `emit` — fire-and-forget

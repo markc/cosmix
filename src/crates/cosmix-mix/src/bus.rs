@@ -25,14 +25,92 @@ enum MeshState {
     /// *subsequent* `mix` invocations) unless the script explicitly
     /// calls `bus_reconnect()`.
     NeverPresent,
-    /// Probe succeeded; this is the live broker client. Bus forms
+    /// Probe succeeded; this is the live broker lane. Bus forms
     /// call through normally.
-    Connected(std::sync::Arc<cosmix_lib_client::NodedClient>),
+    Connected(std::sync::Arc<Lane>),
     /// The cached `Connected` handle failed a call (noded restart,
     /// broker gone). Bus forms raise `mesh unavailable: …` until the
     /// script explicitly calls `bus_reconnect()` to reset to
     /// `Unprobed`.
     Lost,
+}
+
+/// How this process reaches the local broker.
+///
+/// The two lanes differ in ONE respect that matters: what the broker knows
+/// about the caller. A TCP connection carries a name the caller asserts about
+/// itself, which is not an authority — which is why a session-enrolled
+/// service's protected verbs answer FORBIDDEN over it. A Unix connection
+/// carries peer credentials the KERNEL supplies, so the broker learns who is
+/// calling without being told, and the same `send` reaches those verbs.
+///
+/// Verified is preferred and unverified is the fallback, never the reverse: a
+/// host with no local broker socket, or a genuinely remote target, must keep
+/// working exactly as before. The lane is chosen once per connection, so a
+/// script cannot end up with some sends authenticated and others not.
+///
+/// `Deref` to the client is what lets every existing call site stay as it was.
+/// The verified connection must be OWNED here rather than unwrapped: its
+/// client borrows from it, and dropping the connection to keep only the client
+/// would close the socket underneath.
+pub(crate) enum Lane {
+    Verified(cosmix_lib_client::VerifiedConnection),
+    Anonymous(cosmix_lib_client::NodedClient),
+}
+
+/// Which connection the serve path should use.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ServeChoice {
+    /// The main lane is already plain; serving over it is today's behaviour.
+    ReuseMain,
+    /// The main lane is verified and therefore has no incoming receiver of its
+    /// own, so serving needs a connection that does.
+    OpenDedicated,
+}
+
+/// What a lane IS, separated from what it holds.
+///
+/// The discriminant exists so the decision below can be tested: a `Lane` owns a
+/// live connection and cannot be constructed in a unit test, while the choice
+/// that regressed depends only on which kind of lane it is.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum LaneKind {
+    Anonymous,
+    Verified,
+}
+
+impl Lane {
+    pub(crate) fn kind(&self) -> LaneKind {
+        match self {
+            Lane::Anonymous(_) => LaneKind::Anonymous,
+            Lane::Verified(_) => LaneKind::Verified,
+        }
+    }
+}
+
+/// The decision `serve_access` makes, as a pure function.
+///
+/// Split out so it can be tested without a broker, an environment, or a
+/// delivery. The regression this guards is precise: serving must never ride the
+/// verified lane, because a verified client is built with no incoming receiver
+/// and the stream then reads as cleanly CLOSED — registration succeeds and
+/// deliveries silently never arrive. A future change that routes serve back
+/// onto the verified connection turns this red, which is the whole point.
+pub(crate) fn serve_lane_for(main: LaneKind) -> ServeChoice {
+    match main {
+        LaneKind::Anonymous => ServeChoice::ReuseMain,
+        LaneKind::Verified => ServeChoice::OpenDedicated,
+    }
+}
+
+impl std::ops::Deref for Lane {
+    type Target = cosmix_lib_client::NodedClient;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Lane::Verified(connection) => connection.client(),
+            Lane::Anonymous(client) => client,
+        }
+    }
 }
 
 /// Outcome of [`MixBusHandler::noded_access`]: either a live broker
@@ -80,6 +158,9 @@ pub struct MixBusHandler {
     /// `Arc` inside `Connected` lets a caller hold the client across
     /// its `.await` without borrowing `self`.
     mesh: tokio::sync::Mutex<MeshState>,
+    /// A plain connection kept for the serve path; see [`serve_access`].
+    /// Only ever populated when the main lane is verified.
+    serve: tokio::sync::Mutex<Option<std::sync::Arc<Lane>>>,
     /// Incoming-message receiver, taken from the `NodedClient` on first
     /// `next_incoming` call and stored here so subsequent calls can re-await.
     ///
@@ -227,6 +308,7 @@ impl MixBusHandler {
     pub fn new() -> Self {
         MixBusHandler {
             mesh: tokio::sync::Mutex::new(MeshState::Unprobed),
+            serve: tokio::sync::Mutex::new(None),
             incoming: RefCell::new(None),
             incoming_closed: RefCell::new(false),
             incoming_broken: RefCell::new(false),
@@ -262,9 +344,95 @@ impl MixBusHandler {
     /// Holds the mutex across the probe so concurrent first-callers do
     /// not race a thundering herd of connects; the evaluator is
     /// current-thread so this serialization is effectively free.
-    async fn noded_access(
-        &self,
-    ) -> Result<std::sync::Arc<cosmix_lib_client::NodedClient>, MeshErr> {
+    /// Open the verified Unix lane, or `None` if this host cannot offer one.
+    ///
+    /// Ambient and grantless: no service name, no provenance — a driver
+    /// registers nothing. That yields a session-less broker principal, which is
+    /// exactly what a local DefaultOpen service admits for a matching
+    /// uid/node/broker_epoch. It is not new authority; any same-uid process can
+    /// already open this connection, and the pane shell and every test harness
+    /// do. What was missing was a script being able to.
+    ///
+    /// Every failure is silent-and-fall-back by design. The one thing this must
+    /// never do is report an unverified lane as a verified one.
+    async fn connect_verified(url: &str) -> Option<cosmix_lib_client::VerifiedConnection> {
+        let account =
+            std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
+        let (endpoint, _) = crate::node_config::NativeEnvironment::capture()
+            .resolve()
+            .ok()?;
+        // The resident's own resolver, so a driver and a pane shell on one node
+        // cannot disagree about which account owns the socket.
+        let options = crate::native_session::options(account, endpoint).ok()?;
+        Self::connect_verified_with(url, &options).await
+    }
+
+    /// Split from the config resolution above so the ABSENT-SOCKET path is
+    /// testable, which matters more than it looks: every mix that sends now
+    /// tries this first, so a headless host — no local broker at all, the
+    /// common fleet case — must pay nothing for the attempt. A stat of a path
+    /// that is not there returns immediately; the timeout below is only for a
+    /// socket that EXISTS and does not answer.
+    async fn connect_verified_with(
+        url: &str,
+        options: &cosmix_lib_client::UnixConnectOptions,
+    ) -> Option<cosmix_lib_client::VerifiedConnection> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cosmix_lib_client::NodedClient::connect_unix("", url, options, None),
+        )
+        .await
+        {
+            Ok(Ok(cosmix_lib_client::UnixConnectOutcome::VerifiedUnix(connection))) => {
+                Some(connection)
+            }
+            // `require_native_session` forbids this arm; it stays a refusal
+            // rather than an `unreachable!()` so that if the option ever stops
+            // forbidding it, the result is the old behaviour and not a lane
+            // that claims to be verified.
+            _ => None,
+        }
+    }
+
+    /// The connection the SERVE path uses: `register_as` and `next_incoming`.
+    ///
+    /// It is deliberately never the verified lane. A verified client has no
+    /// incoming receiver of its own — `from_verified_unix` routes trusted
+    /// deliveries to the VerifiedConnection's separate lane and leaves the
+    /// client's `incoming_rx` as `None` — so a script that registered a service
+    /// and then iterated `incoming` would read the stream as cleanly CLOSED and
+    /// receive nothing, forever, with `register_as` having succeeded. Silent,
+    /// and only on hosts that HAVE a verified socket, which is exactly where
+    /// the rest of this feature switches on.
+    ///
+    /// Receiving needs no principal, so nothing is lost by keeping it here.
+    /// This preserves today's serve behaviour byte for byte and honours the
+    /// memo's rule that the verified socket must never become a hard dependency
+    /// for something that does not need it.
+    async fn serve_access(&self) -> Result<std::sync::Arc<Lane>, MeshErr> {
+        let lane = self.noded_access().await?;
+        if serve_lane_for(lane.kind()) == ServeChoice::ReuseMain {
+            return Ok(lane);
+        }
+        let mut serve = self.serve.lock().await;
+        if let Some(existing) = &*serve {
+            return Ok(existing.clone());
+        }
+        let url = crate::node_config::resolve_noded_url();
+        match cosmix_lib_client::NodedClient::connect_anonymous(&url).await {
+            Ok(client) => {
+                let arc = std::sync::Arc::new(Lane::Anonymous(client));
+                *serve = Some(arc.clone());
+                Ok(arc)
+            }
+            // The verified lane proved a broker is there, so failing to open a
+            // second plain connection to it is a LOST connection, not a bare
+            // host — and the serve paths raise on Lost rather than pretending.
+            Err(_) => Err(MeshErr::Lost),
+        }
+    }
+
+    async fn noded_access(&self) -> Result<std::sync::Arc<Lane>, MeshErr> {
         let mut state = self.mesh.lock().await;
         match &*state {
             MeshState::Connected(c) => Ok(c.clone()),
@@ -272,9 +440,24 @@ impl MixBusHandler {
             MeshState::Lost => Err(MeshErr::Lost),
             MeshState::Unprobed => {
                 let url = crate::node_config::resolve_noded_url();
+                // Verified FIRST. This is what makes a plain `send` reach a
+                // local service's protected verbs: the lane carries peer
+                // credentials, so the broker has a principal it did not have to
+                // be told. Nothing about the surface changes — the script still
+                // writes `send <target> <verb>`.
+                //
+                // It is deliberately not an error when this fails. A host with
+                // no local broker socket, a broker running as another account,
+                // a cross-node target — all of those are ordinary, and all of
+                // them must keep working exactly as they did.
+                if let Some(connection) = Self::connect_verified(&url).await {
+                    let arc = std::sync::Arc::new(Lane::Verified(connection));
+                    *state = MeshState::Connected(arc.clone());
+                    return Ok(arc);
+                }
                 match cosmix_lib_client::NodedClient::connect_anonymous(&url).await {
                     Ok(client) => {
-                        let arc = std::sync::Arc::new(client);
+                        let arc = std::sync::Arc::new(Lane::Anonymous(client));
                         *state = MeshState::Connected(arc.clone());
                         Ok(arc)
                     }
@@ -308,7 +491,7 @@ impl MixBusHandler {
     /// connection generation.
     async fn mark_lost_if_current(
         &self,
-        expected: &std::sync::Arc<cosmix_lib_client::NodedClient>,
+        expected: &std::sync::Arc<Lane>,
     ) {
         let mut state = self.mesh.lock().await;
         if let MeshState::Connected(current) = &*state
@@ -588,7 +771,7 @@ impl BusHandler for MixBusHandler {
             // that has no broker behind it. The send/emit/etc. paths
             // remain the loud-failure surface for Lost.
             if self.incoming.borrow().is_none() {
-                let client = match self.noded_access().await {
+                let client = match self.serve_access().await {
                     Ok(c) => c,
                     Err(MeshErr::NeverPresent) | Err(MeshErr::Lost) => {
                         *self.incoming_closed.borrow_mut() = true;
@@ -660,7 +843,7 @@ impl BusHandler for MixBusHandler {
             // register must surface the failure, not pretend success.
             // So NeverPresent raises here, distinguishing this from
             // the send/emit silent-nil treatment.
-            let client = match self.noded_access().await {
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -729,7 +912,15 @@ impl BusHandler for MixBusHandler {
             // raise-on-NeverPresent rationale as register_as: a script
             // that asks the broker to do something it cannot pretend
             // succeeded.
-            let client = match self.noded_access().await {
+            //
+            // serve_access, NOT noded_access: a subscription is
+            // connection-scoped, and its topic deliveries surface only
+            // through `next_incoming`, which reads the serve lane. Binding
+            // it to the verified send lane (whose client has no incoming
+            // receiver) would register the interest on a connection the
+            // pump never reads — silently deaf on verified-socket hosts,
+            // the same defect the serve fix closed for register_as.
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -770,7 +961,11 @@ impl BusHandler for MixBusHandler {
         name: &'a str,
     ) -> Pin<Box<dyn Future<Output = MixResult<()>> + 'a>> {
         Box::pin(async move {
-            let client = match self.noded_access().await {
+            // serve_access, for the same reason as subscribe_topic: the
+            // unsubscribe must reach the SAME connection the subscription
+            // was bound to (the serve lane), or it targets a subscription
+            // that connection never held.
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -829,7 +1024,14 @@ impl BusHandler for MixBusHandler {
             // unreachable in practice (we wouldn't have received an
             // event to reply to). Treat it as a loud error if it
             // somehow happens, alongside the Lost case.
-            let client = match self.noded_access().await {
+            //
+            // serve_access, NOT noded_access: the request being answered
+            // arrived through `next_incoming` on the serve lane, so its
+            // response must go back out on that same connection — the
+            // broker correlates a reply on the channel the request came
+            // in on. Replying over the verified send lane would answer on
+            // a connection the request never touched.
+            let client = match self.serve_access().await {
                 Ok(c) => c,
                 Err(MeshErr::NeverPresent) => {
                     return Err(mesh_unavailable(
@@ -870,6 +1072,7 @@ impl BusHandler for MixBusHandler {
             // self-recovers; a citizen calling bus_reconnect() is a
             // harmless trait-default no-op).
             *self.mesh.lock().await = MeshState::Unprobed;
+            *self.serve.lock().await = None;
             // Also clear the incoming-receiver state. Without this, a
             // `next_incoming` that hit `NeverPresent` (closing the
             // sticky `incoming_closed` flag) or a previously corrupted
@@ -1354,7 +1557,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
 }
 
 /// Convert a serde_json::Value to a Mix Value.
-fn json_to_value(val: &serde_json::Value) -> Value {
+pub(crate) fn json_to_value(val: &serde_json::Value) -> Value {
     match val {
         serde_json::Value::Null => Value::Nil,
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -1391,6 +1594,19 @@ fn headers_reply_to_result(rc: u8, body: String, error_header: Option<String>) -
         } else {
             serde_json::from_str(&body).ok()
         };
+        // A STRUCTURED refusal is handed back whole. These carry `error_code`
+        // and often `reason`/`retry_requires`, and branching on them is the
+        // entire job of a driver; reducing one to prose leaves the caller
+        // parsing English to decide whether to retry.
+        //
+        // Deliberately narrow: only a body that parses AND names an
+        // `error_code` takes this path. A peer that answers an error as plain
+        // text, or as JSON of some other shape, still produces exactly the
+        // string it produced before — so no existing caller's `$result`
+        // changes unless the peer was already speaking the structured dialect.
+        if let Some(object) = parsed.as_ref().filter(|v| v.get("error_code").is_some()) {
+            return (i32::from(rc), json_to_value(object));
+        }
         let from_body = parsed
             .as_ref()
             .and_then(|v| v.get("message").or_else(|| v.get("error")))
@@ -1604,6 +1820,115 @@ mod tests {
         // Empty body → the response `error` header carries the token.
         let (rc, v) = headers_reply_to_result(10, String::new(), Some("from_header".to_string()));
         assert_eq!((rc, v), (10, Value::String("from_header".to_string())));
+    }
+
+    /// Serving must never ride the verified lane.
+    ///
+    /// This is the regression guard for the defect that shipped and was caught
+    /// in review: a verified client is built with no incoming receiver, so
+    /// `next_incoming` read its stream as cleanly CLOSED. `register_as`
+    /// succeeded — it is plain RPC — and the script then waited forever for
+    /// deliveries that could never arrive. Silent, and only on hosts that HAVE
+    /// a verified socket, which is exactly where the feature switches on.
+    ///
+    /// Deliberately a decision test rather than a delivery test. The delivery
+    /// end to end needs the serve surface a `mix --serve` script actually uses,
+    /// which is a separate piece of work; what regressed here is WHICH
+    /// connection serves, and that is a total function of the lane kind.
+    #[test]
+    fn serving_never_rides_the_verified_lane() {
+        assert_eq!(
+            serve_lane_for(LaneKind::Verified),
+            ServeChoice::OpenDedicated,
+            "a verified lane has no incoming receiver; serving over it goes deaf"
+        );
+        // And the other direction matters just as much: when the main lane is
+        // already plain, serving reuses it, which is today's behaviour byte for
+        // byte. Opening a second connection there would be a change nobody
+        // asked for.
+        assert_eq!(
+            serve_lane_for(LaneKind::Anonymous),
+            ServeChoice::ReuseMain,
+            "a plain main lane must keep serving exactly as it always did"
+        );
+    }
+
+    /// The absent-socket path must cost nothing.
+    ///
+    /// Every mix that sends now tries the verified lane first, and most of the
+    /// fleet is headless with no local broker at all. If that attempt paid the
+    /// connect timeout, every first send on every headless host would stall
+    /// five seconds — a worse regression than the feature is a gain.
+    ///
+    /// SCOPE, stated because the first version of this comment overclaimed:
+    /// this covers the EXPLICIT-endpoint path, where a configured socket path
+    /// does not exist and the stat fails immediately. The no-config route is
+    /// different — with neither `endpoint` nor `configured_endpoint` set, the
+    /// client runs its own discovery, and that is fast because a loopback
+    /// connection is REFUSED instantly, not because of a stat. Both are fast;
+    /// only the first is asserted here, and saying so is cheaper than a reader
+    /// later trusting a guarantee this test does not make.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_absent_verified_socket_falls_back_immediately() {
+        let mut options = cosmix_lib_client::UnixConnectOptions::new(
+            cosmix_lib_client::BrokerAccount {
+                // SAFETY: process credential reads have no preconditions.
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+            },
+        );
+        options.endpoint = Some(std::path::PathBuf::from(
+            "/nonexistent/cosmix/definitely-not-a-socket",
+        ));
+        options.require_native_session = true;
+        let started = std::time::Instant::now();
+        let outcome = MixBusHandler::connect_verified_with("ws://127.0.0.1:1/ws", &options).await;
+        let elapsed = started.elapsed();
+        assert!(outcome.is_none(), "a missing socket is not a verified lane");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the absent-socket fallback took {elapsed:?}; it must not pay the connect timeout"
+        );
+    }
+
+    #[test]
+    fn headers_reply_app_error_keeps_a_structured_refusal_whole() {
+        // A refusal that names an error_code comes back as a MAP, so a driver
+        // can branch on it. This is the case the verified lane makes
+        // reachable: term answers FORBIDDEN/STALE_GENERATION/CONFLICT with
+        // fields a caller must act on differently.
+        let (rc, v) = headers_reply_to_result(
+            10,
+            r#"{"error_code":"STALE_GENERATION","reason":"prompt_moved"}"#.to_string(),
+            None,
+        );
+        assert_eq!(rc, 10);
+        let Value::Map(fields) = &v else {
+            panic!("a structured refusal must stay field-accessible, got {v:?}")
+        };
+        assert_eq!(
+            fields.get("error_code"),
+            Some(&Value::String("STALE_GENERATION".to_string()))
+        );
+        assert_eq!(
+            fields.get("reason"),
+            Some(&Value::String("prompt_moved".to_string()))
+        );
+    }
+
+    #[test]
+    fn headers_reply_app_error_without_a_code_is_unchanged() {
+        // The no-regression boundary, asserted rather than assumed. Only a
+        // body naming error_code takes the new path; JSON of another shape and
+        // plain prose both produce exactly the string they produced before.
+        assert_eq!(
+            headers_reply_to_result(10, r#"{"detail":"no code here"}"#.to_string(), None),
+            (10, Value::String(r#"{"detail":"no code here"}"#.to_string()))
+        );
+        assert_eq!(
+            headers_reply_to_result(10, "plain prose".to_string(), None),
+            (10, Value::String("plain prose".to_string()))
+        );
     }
 
     #[test]

@@ -1854,3 +1854,153 @@ fn p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind() {
         assert_eq!(reply, (10, json!({"error_code":"FORBIDDEN"})), "{reply:?}");
     });
 }
+
+/// The arc's real proof: a SEPARATE mix process, driving term with plain
+/// `send`, reaching a protected verb end to end.
+///
+/// This is the VT5 shape. The driver is not the pane shell and holds no grant;
+/// it is an ordinary script that happens to run as the same uid. Before the
+/// unified lane it could only reach the diagnostic `term` name, which answers
+/// FORBIDDEN to every control — the gap the demo hit. Now the same `send`
+/// carries kernel-supplied peer credentials and term admits it.
+///
+/// The pane shell's normal operation is asserted ALONGSIDE, not assumed: the
+/// shell holds a registered PaneShell session while the driver's sends open a
+/// second, ambient one, and this is the only place that pairing is exercised
+/// live rather than argued.
+#[test]
+#[ignore = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit gate only"]
+fn unified_send_drives_term_execute_from_a_separate_driver_process() {
+    eprintln!("{REQUIRE_MIX}");
+    let fixture = Fixture::new(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let owner = verified(&fixture.broker).await;
+        let (parent, child) = fixture.records(&owner, 1).await;
+        let target = target(&parent, &child);
+        let generation = idle_generation(owner.client(), &child).await;
+        let service = parent.name.clone();
+
+        // Built here rather than in Mix: constructing the target is the
+        // CALLER's job in every existing fixture, and what is under test is the
+        // send, not JSON assembly in a shell one-liner.
+        // Split around the epoch so the DRIVER supplies it. term.execute is
+        // a mutation: it requires the request_epoch of the connection making
+        // it, which only the driver can know - it has to ask term.session over
+        // the same lane first. That two-step IS the drive protocol, so the
+        // fixture makes the script perform it rather than pre-baking a value
+        // no real driver could have.
+        let exec_prefix = format!(
+            "{{\"target\":{target},\"request_id\":\"1\",\"request_epoch\":\"",
+            target = serde_json::to_string(&target).unwrap()
+        );
+        let exec_suffix = format!(
+            "\",\"prompt_generation\":\"{generation}\",\"source\":\"print(\\\"DRIVEN_BY_SEND\\\")\"}}"
+        );
+
+        // Discovery first, then the drive — both over plain `send`, both from
+        // the driver, so the script proves it can find the name it addresses
+        // rather than being handed a name it could not have learned.
+        let script = format!(
+            "$list = send noded \"noded.list\"\n\
+             print(\"DISCOVERY=\" + contains(data_encode($list), {name}))\n\
+             $sess = send {name} \"term.session\" body={target}\n\
+             print(\"SESSION_RC=\" + $rc)\n\
+             print(\"SESSION_BODY=\" + data_encode($sess))\n\
+             $body = {prefix} + $sess.request_epoch + {suffix}\n\
+             $r = send {name} \"term.execute\" body=$body\n\
+             print(\"RC=\" + $rc)\n\
+             print(\"REPLY=\" + data_encode($r))\n\
+             $ask = {askpre} + $r.operation_id + \"\\\"}}\"\n\
+             for $i in range(0, 60)\n\
+               $res = send {name} \"term.exec.result\" body=$ask\n\
+               if $res.state == \"finished\" then\n\
+                 print(\"FINAL=\" + data_encode($res))\n\
+                 break\n\
+               end\n\
+               sleep(0.25)\n\
+             end\n",
+            name = serde_json::to_string(&service).unwrap(),
+            target = serde_json::to_string(&json!({ "target": target }).to_string()).unwrap(),
+            prefix = serde_json::to_string(&exec_prefix).unwrap(),
+            suffix = serde_json::to_string(&exec_suffix).unwrap(),
+            askpre = serde_json::to_string(&format!(
+                "{{\"target\":{target},\"operation_id\":\"",
+                target = serde_json::to_string(&target).unwrap()
+            ))
+            .unwrap(),
+        );
+
+        let driver = std::process::Command::new(super::production_e2e::current_mix())
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .envs(fixture.environment.iter().cloned())
+            .output()
+            .expect("the driver process runs");
+        let out = String::from_utf8_lossy(&driver.stdout).into_owned();
+        let err = String::from_utf8_lossy(&driver.stderr).into_owned();
+
+        assert!(
+            out.contains("DISCOVERY=true"),
+            "the driver could not find the term instance in noded.list\n{out}\n{err}"
+        );
+        // The decisive line, and it is term.session rather than term.execute:
+        // a PROTECTED verb answering rc 0 to a grantless separate process is
+        // precisely what the diagnostic lane refuses with FORBIDDEN. If the
+        // verified lane were not carrying the principal, this is where it ends.
+        assert!(
+            out.contains("SESSION_RC=0"),
+            "plain send did not reach a protected verb — this is the VT5 gap\n{out}\n{err}"
+        );
+        assert!(
+            out.contains("RC=0"),
+            "term did not admit the driver's submission\n{out}\n{err}"
+        );
+        assert!(
+            out.contains("\"status\": \"accepted\"") || out.contains("\"status\":\"accepted\""),
+            "the submission was not accepted\n{out}\n{err}"
+        );
+
+        // The work actually ran — read back BY THE DRIVER, which is the only
+        // actor that can. An operation is scoped to the identity that minted
+        // it, so the fixture is structurally unable to ask about the
+        // driver's work: this connection gets UNKNOWN_OUTCOME, correctly. That
+        // is the P4 foreign-actor scoping doing its job, and it means the
+        // poll belongs in the driver's own script.
+        let finished = out
+            .lines()
+            .find_map(|line| line.strip_prefix("FINAL="))
+            .unwrap_or_else(|| panic!("the driver never saw its work finish\n{out}\n{err}"));
+        let finished: serde_json::Value =
+            serde_json::from_str(finished).expect("the result is strict data");
+        assert_eq!(finished["state"], "finished", "{finished}");
+        assert_eq!(finished["result"]["outcome"], "completed", "{finished}");
+
+        // The PANE SHELL is still itself. Its registered session survived the
+        // driver's separate ambient connection — two verified connections from
+        // two processes, neither conflated — and it still answers as the shell
+        // that ran the work.
+        let (parent_after, child_after) = fixture.records(&owner, 1).await;
+        assert_eq!(child_after.record_id, child.record_id, "the pane shell was replaced");
+        assert_eq!(child_after.state, BindingState::Attached, "the pane shell lost its binding");
+        assert_eq!(parent_after.instance_id, parent.instance_id);
+        let snapshot = call(
+            owner.client(),
+            &parent.name,
+            "term.snapshot",
+            json!({"target": target, "contents": true}),
+        )
+        .await;
+        assert_eq!(snapshot.0, 0, "{snapshot:?}");
+        let screen: String = snapshot.1["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\0')
+            .collect();
+        assert!(
+            screen.contains("DRIVEN_BY_SEND"),
+            "the driven work never reached the pane: {screen}"
+        );
+    });
+}
