@@ -1,0 +1,98 @@
+-- Hard gate: the sovereign `send` lane actually reaches a protected verb.
+--
+-- Sibling of check-p4-gates.mix and pinned the same two ways. libtest exits 0
+-- when its filter matches nothing, so a renamed fixture would leave this
+-- passing while running zero tests; the COUNT catches that, and every NAME is
+-- pinned because a prefix filter would happily run a different set of the same
+-- size.
+--
+-- What it protects, in one line: a grantless separate process, using nothing
+-- but plain `send`, can discover a term instance and drive it. Before the
+-- unified lane that same send reached only the diagnostic `term` name, which
+-- answers FORBIDDEN to every control — the gap the VT5 demo hit.
+--
+-- Run from the repository src/ directory, like its siblings.
+
+$term_fixtures = [
+  "native_session::enforcement_tests::unified_send_drives_term_execute_from_a_separate_driver_process"
+]
+$term_expected = length($term_fixtures)
+
+$root = cwd()
+if not exists($root + "/desktop/apps/term/src/control.rs") then
+  print("GATE BLOCKED: run from the repository src/ directory")
+  exit(2)
+end
+
+-- The fixture refuses an installed or stale binary: it compares the Mix build's
+-- git sha against HEAD and requires a clean checkout. Build it here so the gate
+-- cannot be satisfied by whatever is lying in target/. RUSTC_WRAPPER disabled
+-- as in every sibling gate: a caching layer must never decide whether a gate
+-- runs at all.
+print("building the current-HEAD Mix the fixture requires ...")
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 3000, env: {"RUSTC_WRAPPER": ""}})
+if $build["exit_code"] != 0 then
+  print($build["stderr"])
+  print("GATE BLOCKED: could not build cosmix-mix; an unbuilt binary is not a pass")
+  exit(2)
+end
+$binary = $root + "/target/release/mix"
+if not exists($binary) then
+  print("GATE BLOCKED: " + $binary + " missing after a successful build")
+  exit(2)
+end
+
+-- COMPILE FIRST, separately. A test binary that does not build reports no
+-- result at all, and a gate that greps for failures in that output concludes
+-- there were none. This arc lost two cycles to exactly that, once on each side
+-- of the review, so the gate asks the question directly.
+print("compiling the Term test binary ...")
+$norun = run_argv(
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--no-run"],
+  {timeout: 3000, env: {"RUSTC_WRAPPER": ""}}
+)
+if $norun["exit_code"] != 0 then
+  print($norun["stderr"])
+  print("GATE BLOCKED: the Term test binary does not compile; no result from it means anything")
+  exit(2)
+end
+
+print("running " + $term_expected + " sovereign-send fixture ...")
+$argv = concat(
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  $term_fixtures
+)
+$run = run_argv($argv, {
+  timeout: 3000,
+  env: {COSMIX_E2E_MIX_BIN: $binary, "RUSTC_WRAPPER": ""}
+})
+print($run["stdout"])
+if $run["exit_code"] != 0 then
+  -- The failure section, not a stream tail: libtest puts the panic in the
+  -- test's captured stdout, so a gate that dumps stderr shows compile warnings
+  -- and hides the one line that says what broke.
+  print("---- the failing fixture's own output ----")
+  print($run["stderr"])
+  print("GATE FAIL: the sovereign-send fixture did not pass")
+  exit(1)
+end
+
+$want = "test result: ok. " + $term_expected + " passed"
+if not contains($run["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  print("A zero-match filter, a renamed fixture or a deleted one all exit 0;")
+  print("the count is what tells them apart from a real run.")
+  exit(1)
+end
+for $fixture in $term_fixtures
+  if not contains($run["stdout"], $fixture) then
+    print("GATE FAIL: " + $fixture + " did not run")
+    exit(1)
+  end
+end
+
+print("GATE PASS: " + $term_expected + " sovereign-send fixture ran and passed")
+print("NOT covered here: the send rc-band and structured-refusal unit tests are")
+print("in the cosmix-mix bus suite, and the no-regression bar for existing send")
+print("callers is the serial workspace battery, not this gate.")
+exit(0)

@@ -549,6 +549,42 @@ transport failure (a broker was there but the send failed — lost or broken
 connection), <code>-2</code> a per-send <code>timeout=</code> budget exceeded, <code>-3</code> Bus unavailable (no
 broker was ever present, a bare host). See <a href="/mix/bus#per-send-timeout">timeout</a> and
 <a href="/mix/bus#no-broker-graceful-degradation">no broker</a>.</p>
+<p><strong>A structured refusal keeps its body.</strong> When a peer answers <code>rc &gt;= 10</code> with a
+JSON object naming an <code>error_code</code>, <code>$result</code> is that object — field-accessible,
+so <code>$result.error_code</code> and whatever else it carries (<code>reason</code>,
+<code>retry_requires</code>) are readable. Branching on those is the whole point of a
+refusal; flattened to prose it leaves a script parsing English to decide whether
+to retry. This is narrow on purpose: a peer that answers an error as plain text,
+or as JSON of some other shape, still produces exactly the string it always did.
+Only a body naming <code>error_code</code> takes the structured path. (0.87.0)</p>
+<h2 id="send-and-the-verified-session-lane"><code>send</code> and the verified session lane</h2>
+<p>A locally registered service can be addressed two ways, and only one of them
+carries an identity. A TCP connection is known by a name the caller asserts
+about itself, which is not an authority — which is why a session-enrolled
+service's protected verbs answer <code>FORBIDDEN</code> over it. A Unix connection to the
+local broker carries peer credentials the KERNEL supplies, so the broker learns
+who is calling without having to be told.</p>
+<p><code>send</code> now prefers that verified lane, with no change to how you write it:</p>
+<pre><code class="language-mix">$list = send noded "noded.list"          -- find the instance
+$r = send $name "term.session" body=$b   -- a protected verb, admitted
+</code></pre>
+<p>This grants no new authority. Any same-uid process can already open this
+connection — the pane shell and every test harness do — and a local
+<code>DefaultOpen</code> service admits the resulting session-less ambient principal for a
+matching uid/node/broker epoch. What was missing was a way for a SCRIPT to use
+it. (0.87.0)</p>
+<p><strong>The fallback is not an error path.</strong> Where no verified lane is available — a
+headless host with no local broker socket, a broker running under another
+account, a genuinely remote target — <code>send</code> falls back to exactly the path it
+used before and behaves exactly as it did. The attempt costs nothing when the
+socket is absent: a path that does not exist fails at the stat, not at a
+timeout. The lane is chosen once per connection, so a script can never end up
+with some sends authenticated and others not.</p>
+<p><strong>Discovery.</strong> <code>noded.list</code> projects by uid: a caller that owns a record gets
+its full <code>ServiceInfo</code> including the session details, while everyone else gets
+the bare name. A driver over the verified lane is same-uid by construction, so
+one <code>send noded "noded.list"</code> is enough to find a service's per-instance name
+and address it.</p>
 <hr />
 <h2 id="emit--fire-and-forget"><code>emit</code> — fire-and-forget</h2>
 <p><code>emit &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches and returns immediately. No
