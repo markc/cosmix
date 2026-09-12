@@ -1909,11 +1909,25 @@ fn unified_send_drives_term_execute_from_a_separate_driver_process() {
              $body = {prefix} + $sess.request_epoch + {suffix}\n\
              $r = send {name} \"term.execute\" body=$body\n\
              print(\"RC=\" + $rc)\n\
-             print(\"REPLY=\" + data_encode($r))\n",
+             print(\"REPLY=\" + data_encode($r))\n\
+             $ask = {askpre} + $r.operation_id + \"\\\"}}\"\n\
+             for $i in range(0, 60)\n\
+               $res = send {name} \"term.exec.result\" body=$ask\n\
+               if $res.state == \"finished\" then\n\
+                 print(\"FINAL=\" + data_encode($res))\n\
+                 break\n\
+               end\n\
+               sleep(0.25)\n\
+             end\n",
             name = serde_json::to_string(&service).unwrap(),
             target = serde_json::to_string(&json!({ "target": target }).to_string()).unwrap(),
             prefix = serde_json::to_string(&exec_prefix).unwrap(),
             suffix = serde_json::to_string(&exec_suffix).unwrap(),
+            askpre = serde_json::to_string(&format!(
+                "{{\"target\":{target},\"operation_id\":\"",
+                target = serde_json::to_string(&target).unwrap()
+            ))
+            .unwrap(),
         );
 
         let driver = std::process::Command::new(super::production_e2e::current_mix())
@@ -1947,35 +1961,20 @@ fn unified_send_drives_term_execute_from_a_separate_driver_process() {
             "the submission was not accepted\n{out}\n{err}"
         );
 
-        // The work actually ran, read back through Term the way any caller
-        // would: an accepted submission that never executes is not a proof.
-        let reply = out
+        // The work actually ran — read back BY THE DRIVER, which is the only
+        // actor that can. An operation is scoped to the identity that minted
+        // it, so the fixture is structurally unable to ask about the
+        // driver's work: this connection gets UNKNOWN_OUTCOME, correctly. That
+        // is the P4 foreign-actor scoping doing its job, and it means the
+        // poll belongs in the driver's own script.
+        let finished = out
             .lines()
-            .find_map(|line| line.strip_prefix("REPLY="))
-            .expect("the driver printed its reply");
-        let reply: serde_json::Value =
-            serde_json::from_str(reply).expect("the reply is strict data");
-        let operation = reply["operation_id"]
-            .as_str()
-            .expect("an accepted submission carries an operation id")
-            .to_string();
-        let deadline = Instant::now() + Duration::from_secs(25);
-        loop {
-            let reply = call(
-                owner.client(),
-                &parent.name,
-                "term.exec.result",
-                json!({"target": target, "operation_id": operation}),
-            )
-            .await;
-            assert_eq!(reply.0, 0, "{reply:?}");
-            if reply.1["state"] == "finished" {
-                assert_eq!(reply.1["result"]["outcome"], "completed", "{}", reply.1);
-                break;
-            }
-            assert!(Instant::now() < deadline, "never finished: {reply:?}");
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+            .find_map(|line| line.strip_prefix("FINAL="))
+            .unwrap_or_else(|| panic!("the driver never saw its work finish\n{out}\n{err}"));
+        let finished: serde_json::Value =
+            serde_json::from_str(finished).expect("the result is strict data");
+        assert_eq!(finished["state"], "finished", "{finished}");
+        assert_eq!(finished["result"]["outcome"], "completed", "{finished}");
 
         // The PANE SHELL is still itself. Its registered session survived the
         // driver's separate ambient connection — two verified connections from
