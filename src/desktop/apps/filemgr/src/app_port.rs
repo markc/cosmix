@@ -1,6 +1,6 @@
 //! FileMgr's Bus app port and direct desktop-theme verb.
 
-use bevy::app::{App, AppExit, Plugin, Update};
+use bevy::app::{App, Plugin, Update};
 use bevy::ecs::message::MessageWriter;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::In;
@@ -42,7 +42,8 @@ impl Plugin for FileMgrAppPortPlugin {
             ActionPortPlugin,
         ))
         .register_app_verb(THEME_SET_VERB, theme_set_verb)
-        .register_app_verb("app.quit", app_quit_verb)
+        // app.quit is now a built-in owned by AppPortPlugin (mesh-reachable);
+        // no per-app registration.
         .configure_sets(
             Update,
             (ActionProduce, AppPortSystems, ActionRoute, ActionApply).chain(),
@@ -54,19 +55,6 @@ impl Plugin for FileMgrAppPortPlugin {
             );
         }
     }
-}
-
-fn app_quit_verb(
-    In(_request): In<AppPortRequest>,
-    mut exit: MessageWriter<AppExit>,
-) -> AppPortReply {
-    // Phase 2 accepts only in-process DnD deliveries, so no completion
-    // observer survives this process. Do not synthesize an AppExit failure for
-    // a worker that could still report its real result; the external bridge
-    // phase must add explicit shutdown accounting before accepting deliveries
-    // owned outside the process.
-    exit.write(AppExit::Success);
-    (0, "{\"quitting\":true}".to_string())
 }
 
 fn theme_set_verb(

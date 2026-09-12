@@ -3,7 +3,7 @@
 # See desktop/APPS.md.
 [package]
 name = "cosmix-studio"
-version = "0.4.5"
+version = "0.4.6"
 description = "CosMix Studio — the single-process CTK mixer (board + musicd DSP fused), the interaction testbed line"
 edition = "2021"
 rust-version = "1.95"

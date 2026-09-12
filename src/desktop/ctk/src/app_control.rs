@@ -53,8 +53,9 @@
 
 use std::collections::HashMap;
 
-use bevy::app::{App, Plugin, Update};
+use bevy::app::{App, AppExit, Plugin, Update};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::message::MessageWriter;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Has};
 use bevy::ecs::resource::Resource;
@@ -120,6 +121,57 @@ fn is_bus_service_name(value: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+/// Authorize a caller for a **mesh-reachable** app verb: a local caller (per
+/// [`authorize_local_caller`]) OR an admitted, broker-attested mesh peer. This
+/// is the network-ARexx path — any app on any mesh node driving this one — with
+/// the guard rail kept: attestation, never anonymity.
+///
+/// The mesh branch mirrors the shipping boids `wallpaper.props.set` gate. It
+/// refuses wire-asserted identity (`source_peer`/`permissions`/`signed_ident` —
+/// a client cannot vouch for itself), requires the broker-stamped
+/// `broker_origin: mesh`, and demands the recipient noded's own attestation:
+/// `broker_peer` + `broker_service`, with the canonical `from == "bridge-<peer>"`.
+/// noded stamps that pair only for a Verified, admission-passed, non-revoked
+/// direct bridge, so "authorized" means "an admitted mesh peer", never "anyone
+/// who reached the socket".
+pub fn authorize_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
+    if authorize_local_caller(request).is_ok() {
+        return Ok(());
+    }
+    // A wire-asserted identity is never trusted on the mesh branch either.
+    if request.headers.keys().any(|key| {
+        ["source_peer", "permissions", "signed_ident"]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+    }) {
+        return Err(LocalCallerError::RemoteIdentityUnavailable);
+    }
+    let header = |name: &str| {
+        let mut values = request
+            .headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str());
+        let value = values.next();
+        // A duplicated broker header is ambiguous — refuse rather than guess.
+        if values.next().is_some() { None } else { value }
+    };
+    if header("broker_origin") != Some("mesh") {
+        return Err(LocalCallerError::RemoteIdentityUnavailable);
+    }
+    match (header("broker_peer"), header("broker_service")) {
+        (Some(peer), Some(service))
+            if !peer.is_empty()
+                && request.from == format!("bridge-{peer}")
+                && is_bus_service_name(&request.from)
+                && is_bus_service_name(service) =>
+        {
+            Ok(())
+        }
+        _ => Err(LocalCallerError::UnregisteredCaller),
+    }
 }
 
 // `ControlMeta` is attached by feature-independent spawners (the mixer board
@@ -194,6 +246,7 @@ impl AppPortAppExt for App {
             command, "app.describe",
             "app.describe is owned by AppPortPlugin"
         );
+        assert_ne!(command, "app.quit", "app.quit is owned by AppPortPlugin");
         self.init_resource::<AppVerbRegistry>();
         assert!(
             !self
@@ -219,6 +272,11 @@ pub struct AppControlInfo {
     /// The view this app serves (`mixer`, `wave`, `pianoroll`, …) — the
     /// role a caller discovers it by, orthogonal to the engine drawing it.
     pub view: String,
+    /// App version string for `app.describe` (the machine-readable "About").
+    /// Empty when the app did not supply one via [`AppPortPlugin::about`].
+    pub version: String,
+    /// One-line human description for `app.describe`. Empty when unset.
+    pub description: String,
 }
 
 /// `BusWidget::id → Entity` for every registered control.
@@ -252,6 +310,8 @@ pub struct AppPortSystems;
 pub struct AppPortPlugin {
     pub title: String,
     pub view: String,
+    pub version: String,
+    pub description: String,
 }
 
 impl AppPortPlugin {
@@ -259,7 +319,18 @@ impl AppPortPlugin {
         Self {
             title: title.into(),
             view: view.into(),
+            version: String::new(),
+            description: String::new(),
         }
+    }
+
+    /// Supply the version and one-line description surfaced by `app.describe`
+    /// (the machine-readable "About"). Optional: unset leaves both empty, and
+    /// existing callers of [`AppPortPlugin::new`] keep their current behaviour.
+    pub fn about(mut self, version: impl Into<String>, description: impl Into<String>) -> Self {
+        self.version = version.into();
+        self.description = description.into();
+        self
     }
 }
 
@@ -268,6 +339,8 @@ impl Plugin for AppPortPlugin {
         app.insert_resource(AppControlInfo {
             title: self.title.clone(),
             view: self.view.clone(),
+            version: self.version.clone(),
+            description: self.description.clone(),
         })
         .init_resource::<AppVerbRegistry>();
         let describe = app.world_mut().register_system(describe_app);
@@ -277,6 +350,18 @@ impl Plugin for AppPortPlugin {
             .by_command
             .insert("app.describe".into(), describe);
         assert!(replaced.is_none(), "app.describe registered twice");
+        // Generic, cross-app lifecycle verb: every app that installs the port
+        // is quittable over the Bus by the same name. Gated but mesh-reachable
+        // (see `mesh_accepting_verb`): a local caller OR an admitted,
+        // broker-attested mesh peer may drive it — the network-ARexx default of
+        // any node driving any app, never a human gate, never anonymous.
+        let quit = app.world_mut().register_system(quit_app);
+        let replaced = app
+            .world_mut()
+            .resource_mut::<AppVerbRegistry>()
+            .by_command
+            .insert("app.quit".into(), quit);
+        assert!(replaced.is_none(), "app.quit registered twice");
         app.add_systems(Update, route_app_port.in_set(AppPortSystems));
     }
 }
@@ -497,6 +582,15 @@ fn dispatch_gate_skips(command: &str) -> bool {
     )
 }
 
+/// Verbs an admitted mesh peer may drive, not only a local caller. The generic
+/// app-lifecycle surface: quitting an app is a legitimate network-ARexx
+/// operation across the mesh, gated by broker attestation
+/// ([`authorize_caller`]), not confined to the owning node. App-specific named
+/// verbs are NOT listed here — they stay local-only unless deliberately added.
+fn mesh_accepting_verb(command: &str) -> bool {
+    command == "app.quit"
+}
+
 pub(crate) fn dispatch_app_request(
     world: &mut World,
     app_name: &str,
@@ -504,7 +598,15 @@ pub(crate) fn dispatch_app_request(
 ) -> AppPortReply {
     let command = request.command.clone();
     if !dispatch_gate_skips(&command) {
-        if let Err(error) = authorize_local_caller(&request) {
+        // Mesh-reachable verbs (the generic app-lifecycle surface, e.g.
+        // app.quit) admit an attested mesh peer as well as a local caller; every
+        // other named verb stays local-only. See [`authorize_caller`].
+        let decision = if mesh_accepting_verb(&command) {
+            authorize_caller(&request)
+        } else {
+            authorize_local_caller(&request)
+        };
+        if let Err(error) = decision {
             return error_reply(match error {
                 LocalCallerError::UnregisteredCaller => {
                     "app verbs require a registered same-node caller"
@@ -567,11 +669,25 @@ fn describe_app(
             // these fields are the authoritative decomposition.
             "view": info.view,
             "engine": APP_ENGINE,
+            // The "About" fields: version + one-line description. Empty when
+            // the app did not call `AppPortPlugin::about`.
+            "version": info.version,
+            "description": info.description,
             "controls": registry.as_deref().map_or(0, ControlRegistry::len),
             "verbs": verb_names,
         })
         .to_string(),
     )
+}
+
+/// Generic `app.quit`: request a clean shutdown by writing [`AppExit`]. Every
+/// app that installs [`AppPortPlugin`] answers this identically, so an agent
+/// quits any app by the one name without app-specific knowledge.
+fn quit_app(In(_): In<AppPortRequest>, mut exit: MessageWriter<AppExit>) -> AppPortReply {
+    exit.write(AppExit::Success);
+    // Keep the reply the per-app handlers shipped (`{"quitting":true}`) so a
+    // caller that checked that field is unaffected by the hoist to a built-in.
+    (0, json!({ "quitting": true }).to_string())
 }
 
 fn handle_widget_request(
@@ -925,9 +1041,28 @@ mod tests {
         let (bridge, _peer) = crate::bus::test_bridge("studio-bevy-42");
         app.insert_resource(bridge)
             .init_resource::<TestVerbCalls>()
+            // The built-in app.quit handler writes AppExit; register the queue so
+            // it dispatches (a real Bevy app has it from DefaultPlugins).
+            .add_message::<AppExit>()
             .add_plugins(AppPortPlugin::new("Studio", "studio"))
             .register_app_verb("app.test", test_verb);
         app
+    }
+
+    /// Build a request that looks like an attested, admitted mesh peer: the
+    /// broker-stamped `broker_origin: mesh`, the recipient noded's attestation
+    /// (`broker_peer` + `broker_service`), and the canonical bridge `from`.
+    fn attested_mesh(command: &str, peer: &str, service: &str) -> InboundRequest {
+        let mut request = request(command, &[]);
+        request.from = format!("bridge-{peer}");
+        request
+            .headers
+            .insert("broker_origin".into(), "mesh".into());
+        request.headers.insert("broker_peer".into(), peer.into());
+        request
+            .headers
+            .insert("broker_service".into(), service.into());
+        request
     }
 
     #[test]
@@ -972,6 +1107,46 @@ mod tests {
         let (rc, body) = call(&mut app, &anonymous);
         assert_eq!(rc, 0, "read-only discovery keeps its open contract");
         assert_eq!(body["contract"], APP_CONTROL_CONTRACT);
+    }
+
+    #[test]
+    fn app_quit_is_mesh_reachable_only_when_attested() {
+        // The generic lifecycle verb is network-ARexx: an admitted mesh peer may
+        // quit the app, but only with the recipient noded's attestation — never
+        // an anonymous or self-asserted remote caller, and only for app.quit
+        // (app-specific named verbs stay local-only).
+        let mut app = gated_test_app();
+
+        // Local caller: allowed, as before.
+        let (rc, _) = call(&mut app, &request("app.quit", &[]));
+        assert_eq!(rc, 0, "a local caller may quit");
+
+        // Attested, admitted mesh peer: allowed — this is the cross-node path.
+        let (rc, _) = call(&mut app, &attested_mesh("app.quit", "alpha", "agent"));
+        assert_eq!(rc, 0, "an attested mesh peer may quit the app");
+
+        // Mesh origin WITHOUT the broker's attestation: refused.
+        let mut bare = request("app.quit", &[]);
+        bare.headers.insert("broker_origin".into(), "mesh".into());
+        let (rc, _) = call(&mut app, &bare);
+        assert_eq!(rc, 10, "mesh origin without attestation is refused");
+
+        // Attestation present but `from` is not the canonical bridge: refused
+        // (a registered mesh service cannot borrow another peer's identity).
+        let mut wrong_from = attested_mesh("app.quit", "alpha", "agent");
+        wrong_from.from = "bridge-beta".into();
+        let (rc, _) = call(&mut app, &wrong_from);
+        assert_eq!(rc, 10, "broker_peer must match the bridge from");
+
+        // Wire-asserted identity on the mesh branch: never trusted.
+        let mut spoof = attested_mesh("app.quit", "alpha", "agent");
+        spoof.headers.insert("signed_ident".into(), "mesh:evil".into());
+        let (rc, _) = call(&mut app, &spoof);
+        assert_eq!(rc, 10, "a self-asserted identity is refused");
+
+        // An app-specific named verb is NOT mesh-reachable even when attested.
+        let (rc, _) = call(&mut app, &attested_mesh("app.test", "alpha", "agent"));
+        assert_eq!(rc, 10, "only app.quit opts into the mesh, not every verb");
     }
 
     #[test]

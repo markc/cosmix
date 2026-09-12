@@ -182,6 +182,32 @@ fn ctk_plugins() -> (
     )
 }
 
+/// The ctk app-control port term serves **beside** its verified native-session
+/// lane: the generic `app.describe` / `app.quit` surface every ctk app shares
+/// (so an agent quits or introspects any app by one name).
+///
+/// Deliberately a *separate* transport from the verified lane, not a merge:
+/// that lane is pane-target-scoped with kernel-attested (SO_PEERCRED) admission,
+/// per-capability grants and epoch gates — the right home for the high-stakes
+/// pane verbs (execute/type/layout), which stay node-local. App-global
+/// lifecycle/discovery verbs don't fit that per-pane model, so they ride the
+/// port. `app.describe` is open discovery; `app.quit` accepts a local caller OR
+/// an admitted, broker-attested mesh peer (network ARexx — any node quitting
+/// any app, gated by attestation, not anonymity). `app.quit` writes `AppExit`,
+/// so it takes term's normal window-close teardown path.
+fn app_port_plugins(identity: &AppIdentity) -> (BusBridgePlugin, AppPortPlugin) {
+    let service_name = format!("{}-{APP_ENGINE}-{}", identity.slug, std::process::id());
+    let mut bridge = BusBridgeConfig::new(service_name, resolve_noded_url());
+    // build_info!() must expand HERE (the app crate) so the registered
+    // provenance carries term's version, not ctk's.
+    bridge.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
+    (
+        BusBridgePlugin::new(bridge),
+        AppPortPlugin::new(identity.display_name, identity.slug)
+            .about(env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_DESCRIPTION")),
+    )
+}
+
 fn main() {
     session_fd::quarantine_inherited();
     let identity = AppIdentity {
@@ -264,6 +290,7 @@ fn main() {
         }))
         .add_plugins((FeathersPlugins, CtkThemePlugin::default()))
         .add_plugins(ctk_plugins())
+        .add_plugins(app_port_plugins(&identity))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_millis(16)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_millis(33)),

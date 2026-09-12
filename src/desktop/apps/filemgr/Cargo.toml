@@ -3,7 +3,7 @@
 # See desktop/APPS.md.
 [package]
 name = "cosmix-filemgr"
-version = "0.9.5"
+version = "0.9.6"
 description = "CosMix FileMgr — a native CTK twin-pane file manager"
 edition = "2021"
 rust-version = "1.95"

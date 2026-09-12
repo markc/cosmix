@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-filemgr"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "bevy",
  "chrono",
@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-studio"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3199,10 +3199,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "bevy",
  "cosmix-app-identity",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
@@ -3495,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "accesskit",
  "ammonia",

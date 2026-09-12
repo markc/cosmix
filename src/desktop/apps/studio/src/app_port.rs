@@ -3,7 +3,7 @@
 //! is installed. Picker-opening actions remain metadata-marked interactive and
 //! direct callers to their explicit-path verb instead of opening local UI.
 
-use bevy::app::{App, AppExit, Plugin, Update};
+use bevy::app::{App, Plugin, Update};
 use bevy::ecs::message::MessageWriter;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::In;
@@ -63,9 +63,9 @@ impl Plugin for StudioAppPortPlugin {
         app.register_app_verb(TRANSPORT_PAUSE_VERB, transport_pause_verb);
         app.register_app_verb(TRANSPORT_STATE_VERB, transport_state_verb);
         app.register_app_verb(THEME_SET_VERB, theme_set_verb);
-        // App lifecycle: quit the process gracefully (vs killing it from
-        // outside). Distinct from app.transport.stop (which halts playback).
-        app.register_app_verb("app.quit", app_quit_verb);
+        // App lifecycle: app.quit is now a built-in owned by AppPortPlugin
+        // (mesh-reachable, same AppExit::Success), so no per-app registration.
+        // Distinct from app.transport.stop (which halts playback).
         if let Err(missing) = validate_action_direct_verbs(app) {
             panic!(
                 "Studio action metadata advertises unregistered direct Bus verbs: {}",
@@ -80,17 +80,6 @@ impl Plugin for StudioAppPortPlugin {
             (ActionProduce, AppPortSystems, ActionRoute, ActionApply).chain(),
         );
     }
-}
-
-/// `app.quit`: request a graceful Bevy shutdown — the same clean exit the
-/// window-close triggers, but driven over Bus. rc=0 acks the request; the
-/// process winds down its RT thread + bridge on the next update.
-fn app_quit_verb(
-    In(_request): In<AppPortRequest>,
-    mut exit: MessageWriter<AppExit>,
-) -> AppPortReply {
-    exit.write(AppExit::Success);
-    (0, "{\"quitting\":true}".to_string())
 }
 
 fn theme_set_verb(

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -16,9 +16,16 @@ component = "term"
 display = "CosMix Term"
 engine = "bevy"
 
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "ui_bevy_render", "bevy_feathers", "accesskit_unix"] }
-ctk = { path = "../../ctk" }
+# `bus` carries the ctk app-control port (AppPortPlugin: app.describe / app.quit)
+# term serves beside its verified native-session lane, for generic same-node
+# app lifecycle control that every ctk app shares.
+ctk = { path = "../../ctk", features = ["bus"] }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
 serde = { version = "1", features = ["derive"] }
