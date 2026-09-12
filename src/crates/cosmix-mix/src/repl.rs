@@ -102,6 +102,11 @@ fn exec_restart(eval: &mut Evaluator, rl: &mut Editor, history_path: &std::path:
         .to_string_lossy()
         .into_owned();
     eprintln!("Restarting Mix...");
+    // A restart REPLACES this process, so main()'s exit sweep never runs and
+    // pdeathsig never fires — the image lives on under the same pid. Without
+    // this, every task group the shell was supervising would be inherited by a
+    // shell that has no record of it and cannot report or cancel it.
+    crate::session_task::sweep();
     crate::native_session::before_exec_restart();
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(&mix_bin).exec();

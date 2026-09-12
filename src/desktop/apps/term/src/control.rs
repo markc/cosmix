@@ -93,6 +93,10 @@ enum FailureCode {
     Expired,
     Cancelled,
     UnknownOutcome,
+    /// The child could not start the work for the machine's reasons — EMFILE,
+    /// ENOMEM, a directory that vanished. Transient and the caller's to retry,
+    /// which is why it is its own code rather than a flavour of FORBIDDEN.
+    Unavailable,
 }
 #[derive(Serialize)]
 struct Failure {
@@ -128,6 +132,7 @@ impl Reply {
             "EXPIRED" => FailureCode::Expired,
             "CANCELLED" => FailureCode::Cancelled,
             "UNKNOWN_OUTCOME" => FailureCode::UnknownOutcome,
+            "UNAVAILABLE" => FailureCode::Unavailable,
             // A token this table does not know is a typo on the author's side,
             // not a caller's doing, and a request path must not panic over
             // one. Fail closed with the uniform denial and make it loud in a
@@ -1331,16 +1336,6 @@ impl Control {
     }
 }
 
-/// The dedupe digest covers the request bytes as sent, deliberately: this
-/// recipient does not canonicalise, so two encodings of the same object are two
-/// different payloads. A retry MUST replay the body byte for byte, and the
-/// refusal says so rather than leaving a caller to guess why its "identical"
-/// retry conflicted.
-/// Translate the pane shell's refusal into Term's vocabulary. The child speaks
-/// almost the same one; the two that differ are spelled differently for the
-/// same meaning, and anything unrecognised is reported as an unknown outcome
-/// rather than being flattened into a denial that would read as a policy
-/// decision Term never made.
 /// The child's own error code, if its answer was shaped like a refusal at all.
 fn refusal_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
@@ -1350,6 +1345,11 @@ fn refusal_code(body: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Translate the pane shell's refusal into Term's vocabulary. The child speaks
+/// almost the same one; the two that differ are spelled differently for the
+/// same meaning, and anything unrecognised is reported as an unknown outcome
+/// rather than being flattened into a denial that would read as a policy
+/// decision Term never made.
 fn shell_refusal(body: &str, mutation: bool) -> Reply {
     #[derive(Deserialize)]
     struct Refusal {
@@ -1399,6 +1399,11 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
     }
 }
 
+/// The dedupe digest covers the request bytes as sent, deliberately: this
+/// recipient does not canonicalise, so two encodings of the same object are two
+/// different payloads. A retry MUST replay the body byte for byte, and the
+/// refusal says so rather than leaving a caller to guess why its "identical"
+/// retry conflicted.
 fn mismatch() -> Value {
     json!({"reason":"request_mismatch","retry_requires":"byte_identical_body"})
 }

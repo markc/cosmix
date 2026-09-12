@@ -21,17 +21,23 @@
 //! signal was sent. A cancel request is not proof a process stopped; the wait
 //! status is.
 //!
-//! Teardown has two mechanisms because neither covers the other's case.
+//! Teardown has three mechanisms because none covers the others' cases.
 //! `PR_SET_PDEATHSIG` binds the task LEADER to the supervisor thread that
 //! forked it, which is the only thing that survives a shell SIGKILL — no
-//! teardown hook runs then. But pdeathsig signals the leader alone, so a normal
-//! shell exit would leave the leader's own children running; `sweep()` closes
-//! that by SIGKILLing every live task GROUP on the way out.
+//! teardown hook runs then. At SETTLEMENT the supervisor SIGKILLs the whole
+//! group one last time, which is what reaches a child the task backgrounded and
+//! pdeathsig cannot see. And `sweep()` SIGKILLs every still-running task group
+//! when the shell exits by any ordinary route.
 //!
-//! The declared residual is therefore narrower than "any grandchild": a process
-//! that left the task's group by calling `setsid`/`setpgid` for itself is
-//! outside both mechanisms and survives. The manual says exactly that rather
-//! than implying a containment this does not have.
+//! The settlement kill is only possible because the leader is not reaped until
+//! after it: a process group exists while any member does, including a zombie,
+//! so holding the leader un-reaped (`waitid` with `WNOWAIT`) is what keeps the
+//! group addressable long enough to clear it.
+//!
+//! The declared residual is therefore exactly one case: a process that leaves
+//! the task's group by calling `setsid`/`setpgid` for ITSELF. That is a
+//! deliberate act of daemonisation, and the manual says so rather than implying
+//! a containment this does not have.
 
 use serde::Serialize;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -533,6 +539,8 @@ fn supervise_task(
         Ok(stop) => Arc::new(stop),
         Err(error) => {
             signal_group(pid, libc::SIGKILL);
+            // Reap, or the refusal leaves a zombie nothing will ever collect.
+            let _ = child.wait();
             let _ = ready.send(Err(error));
             return;
         }
@@ -541,20 +549,42 @@ fn supervise_task(
     // pipe buffer against a larger output is a deadlock, and a deadlock here
     // would be reported as a timeout — a wrong answer that looks like a
     // policy decision.
-    let out_drain = stdout.map(|s| drain_fd(s, MAX_STREAM, &stop));
-    let err_drain = stderr.map(|s| drain_fd(s, MAX_STREAM, &stop));
-    let result_drain = wants_result.then(|| drain_fd(result_read, MAX_RESULT_CAPTURE, &stop));
+    let drains = (|| -> std::io::Result<(Option<Drain>, Option<Drain>, Option<Drain>)> {
+        Ok((
+            stdout.map(|s| drain_fd(s, MAX_STREAM, &stop)).transpose()?,
+            stderr.map(|s| drain_fd(s, MAX_STREAM, &stop)).transpose()?,
+            wants_result
+                .then(|| drain_fd(result_read, MAX_RESULT_CAPTURE, &stop))
+                .transpose()?,
+        ))
+    })();
+    let (out_drain, err_drain, result_drain) = match drains {
+        Ok(drains) => drains,
+        Err(error) => {
+            signal_group(pid, libc::SIGKILL);
+            let _ = child.wait();
+            let _ = ready.send(Err(error.to_string()));
+            return;
+        }
+    };
 
+    // The waiter OBSERVES the status without reaping it (WNOWAIT), so the
+    // leader stays a zombie until this thread says otherwise. That zombie is
+    // what keeps the process GROUP alive: a pgid exists while any member does,
+    // including a dead one nobody has collected. Reaping here instead — which
+    // is what `child.wait()` did — retired the pgid the instant the leader
+    // died, so a plain backgrounded child (`sh -c "sleep 600 &"`, still in the
+    // group) escaped pdeathsig (its parent was gone) AND the exit sweep (the
+    // pid was deregistered), which is exactly the containment the manual
+    // claimed and did not have.
     if let Err(error) = std::thread::Builder::new()
         .name("mix-task-wait".into())
         .spawn(move || {
-            let _ = waiter_tx.send(match child.wait() {
-                Ok(status) => Event::Exited(status),
-                Err(error) => Event::WaitFailed(error.to_string()),
-            });
+            let _ = waiter_tx.send(observe(pid));
         })
     {
         signal_group(pid, libc::SIGKILL);
+        let _ = child.wait();
         let _ = ready.send(Err(error.to_string()));
         return;
     }
@@ -563,7 +593,6 @@ fn supervise_task(
     let _ = ready.send(Ok(()));
 
     let outcome = supervise(&rx, pid, spec.timeout, &cancelling);
-    groups().retain(|live| *live != pid);
     // The outcome is settled, so nothing may wait on the task's leftovers any
     // longer than the declared grace. This is what stops a backgrounded
     // survivor holding the report open for the rest of the shell's life.
@@ -579,13 +608,26 @@ fn supervise_task(
                 // own encoded budget still applies: the frame is already
                 // escaped once, and carrying it in the reply escapes it again.
                 (TaskResult::Value { data }, _) => TaskResult::Value {
-                    data: fit_encoded(&data, MAX_RESULT_ENCODED).0,
+                    data: within_budget(data),
                 },
                 (_, true) => TaskResult::ResultAbandoned,
                 (other, false) => other,
             }
         }
     };
+    // Containment, at the last moment it can still be done. The leader is a
+    // zombie and the pgid is therefore still valid, so this reaches every
+    // member the task left behind — the backgrounded child that pdeathsig
+    // cannot see. Only AFTER it does the leader get reaped and the group
+    // deregistered, which is also what makes every killpg in this file
+    // recycle-safe: the pid it names cannot be reissued while we hold it.
+    signal_group(pid, libc::SIGKILL);
+    // SAFETY: reaping a child of this process, once, after the final signal.
+    unsafe {
+        let mut ignored: libc::c_int = 0;
+        libc::waitpid(pid, &mut ignored, 0);
+    }
+    groups().retain(|live| *live != pid);
     settled(TaskReport {
         version: 1,
         outcome,
@@ -715,6 +757,48 @@ fn settle_within(rx: &mpsc::Receiver<Event>, budget: Duration) -> Option<Settlem
     }
 }
 
+/// Wait for the leader to exit and read its status WITHOUT collecting it.
+///
+/// `WNOWAIT` is the whole point: the status is readable and the leader stays a
+/// zombie, so its process group keeps existing until the supervisor has
+/// finished with it. Everything that makes the group signallable at settlement
+/// — and every killpg in this file safe against pid recycling — rests on that.
+fn observe(pid: libc::pid_t) -> Event {
+    // SAFETY: waitid on a child of this process, into a zeroed siginfo_t.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        loop {
+            let waited = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+            if waited == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Event::WaitFailed(error.to_string());
+        }
+        // Rebuild the wait-status word the rest of this file speaks in. The
+        // shifts are the inverse of WEXITSTATUS/WTERMSIG, which is the only
+        // reason this is arithmetic rather than a library call.
+        let status = info.si_status();
+        let raw = match info.si_code {
+            libc::CLD_EXITED => (status & 0xff) << 8,
+            libc::CLD_DUMPED => (status & 0x7f) | 0x80,
+            // CLD_KILLED, and anything else that can end a process.
+            _ => status & 0x7f,
+        };
+        Event::Exited(
+            <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(raw),
+        )
+    }
+}
+
 fn natural(status: std::process::ExitStatus) -> Outcome {
     use std::os::unix::process::ExitStatusExt;
     if let Some(signal) = status.signal() {
@@ -732,18 +816,11 @@ fn natural(status: std::process::ExitStatus) -> Outcome {
 /// could have done. The caller needs that answer: "I signalled it" and "it was
 /// already gone" lead to different reports.
 ///
-/// DECLARED RESIDUAL: pid recycling. Between the waiter reaping the leader and
-/// this call, the kernel is free to hand that pid to someone else, and a killpg
-/// would then reach a group this supervisor never created. The window is what
-/// is left after `already_settled` drains a queued status first, so it is the
-/// microseconds between the reap and the send, and it needs the kernel to wrap
-/// its whole pid space in that time. The blast radius is bounded by the leader
-/// having been a session leader of its own: the recycled pid is only a group
-/// LEADER if the new process also called setsid, and it is the same uid either
-/// way. Closing it completely means holding the status un-reaped until the
-/// supervisor consents (waitid with WNOWAIT), which is worth doing if this ever
-/// stops being theoretical — it is recorded here rather than left for the next
-/// reader to rediscover.
+/// There is no pid-recycle window here, and that is bought rather than assumed:
+/// the waiter observes the leader's status with `WNOWAIT` and nothing reaps it
+/// until `supervise_task` has sent its last signal, so the pid this names is
+/// held by a zombie of ours at every call site and cannot have been reissued to
+/// anyone else.
 fn signal_group(pid: libc::pid_t, signal: libc::c_int) -> bool {
     // The GROUP, because the task is a session leader and its own children are
     // the reason a leader-only signal would leave work running.
@@ -804,9 +881,16 @@ impl DrainStop {
 /// has its outcome, and the report still cannot be assembled because these
 /// reads would sit on descriptors the survivor holds open. The record would pin
 /// at "running" forever and its TASKS slot would never come back.
-fn drain_fd<S: AsRawFd + Send + 'static>(source: S, cap: usize, stop: &Arc<DrainStop>) -> Drain {
+fn drain_fd<S: AsRawFd + Send + 'static>(
+    source: S,
+    cap: usize,
+    stop: &Arc<DrainStop>,
+) -> std::io::Result<Drain> {
     let stop = stop.clone();
-    std::thread::spawn(move || {
+    // Builder, not the bare spawn: thread exhaustion is a condition this
+    // supervisor can report, and panicking the caller over it would take down a
+    // healthy shell because one task could not get a thread.
+    std::thread::Builder::new().name("mix-task-drain".into()).spawn(move || {
         let fd = source.as_raw_fd();
         // Non-blocking, so a readiness that evaporates cannot park this thread
         // inside read() past its own deadline.
@@ -868,8 +952,14 @@ fn drain_fd<S: AsRawFd + Send + 'static>(source: S, cap: usize, stop: &Arc<Drain
                 continue;
             }
             // Empty the pipe on one readiness rather than paying a poll per
-            // 8 KiB of a chatty task.
+            // 8 KiB of a chatty task — but not past the deadline. A survivor
+            // writing continuously always leaves more to read, so without this
+            // check the inner loop never returns to the outer one and GRACE
+            // becomes unbounded for exactly the case it exists to bound.
             let ended = loop {
+                if deadline.is_some_and(|at| at <= Instant::now()) {
+                    break false;
+                }
                 // SAFETY: reading into a local buffer from an owned descriptor.
                 let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
                 if n == 0 {
@@ -939,6 +1029,30 @@ fn encoded_cost(ch: char) -> usize {
         c if (c as u32) < 0x20 => 6,
         c => c.len_utf8(),
     }
+}
+
+/// A complete frame's value, kept whole or replaced WHOLESALE by a reference.
+///
+/// Never cut. The frame's payload is strict data, and a strict-data document
+/// sliced at an arbitrary character is not a smaller document — it is an
+/// unparseable fragment that still presents itself as the value. The writer
+/// already faced this and answered it the same way, so the shape a caller sees
+/// for "too big" is the same whichever side decided it.
+///
+/// This is a real case, not a theoretical one: a list of a few thousand short
+/// strings encodes to ~36 KiB inside a complete 50 KiB frame whose JSON cost is
+/// ~79 KiB, and trimming that to the budget cuts ~13 KiB off the end, mid-token.
+fn within_budget(data: String) -> String {
+    let (fitted, trimmed) = fit_encoded(&data, MAX_RESULT_ENCODED);
+    if !trimmed {
+        return fitted;
+    }
+    serde_json::json!({
+        "ok": true,
+        "truncated": true,
+        "bytes": data.len().to_string(),
+    })
+    .to_string()
 }
 
 /// Truncate on a character boundary so the ENCODED form fits `budget`.
@@ -1144,6 +1258,32 @@ mod tests {
         // Text that already fits is returned whole and unflagged.
         let (text, trimmed) = fit_encoded("plain", MAX_STREAM_ENCODED);
         assert_eq!((text.as_str(), trimmed), ("plain", false));
+    }
+
+    /// A value over the reply budget is REPLACED, never cut.
+    #[test]
+    fn an_oversized_value_becomes_a_reference_not_a_fragment() {
+        // A quote-heavy strict-data document: complete, well under the frame
+        // cap in raw bytes, and far over the budget once escaped for the reply.
+        let quoted: Vec<String> = (0..4000).map(|i| format!("\"s{i}\"")).collect();
+        let frame = format!("[{}]", quoted.join(","));
+        assert!(
+            serde_json::to_string(&frame).expect("encodes").len() > MAX_RESULT_ENCODED,
+            "the fixture's own premise: this must exceed the budget"
+        );
+        let out = within_budget(frame.clone());
+        // The failure this guards is a cut string: parseable input, unparseable
+        // output, and nothing in the report saying so.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("a reference is always parseable");
+        assert_eq!(parsed["truncated"], true, "{out}");
+        assert_eq!(parsed["bytes"], frame.len().to_string(), "{out}");
+        assert!(
+            !out.starts_with('['),
+            "the value was cut down rather than replaced: {out}"
+        );
+        // And a value that fits is passed through untouched.
+        assert_eq!(within_budget("[1,2,3]".into()), "[1,2,3]");
     }
 
     /// The arithmetic the 256 KiB reply envelope depends on, done for real

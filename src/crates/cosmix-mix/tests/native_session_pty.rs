@@ -2625,6 +2625,14 @@ fn p4_termination_is_hard_and_the_outcome_names_the_policy() {
         let task = &report["report"];
         assert_eq!(task["outcome"]["kind"], "timeout", "{task}");
         assert_eq!(task["outcome"]["escalated_to"], "sigterm", "{task}");
+        // The policy NAMES the outcome, but the wait status is carried beside
+        // it rather than replaced by it — a caller must still be able to see
+        // what the kernel actually reported.
+        assert_eq!(task["outcome"]["wait"]["reaped"], true, "{task}");
+        assert_eq!(
+            task["outcome"]["wait"]["signal"], 15,
+            "the wait facts must survive the policy name: {task}"
+        );
 
         // A child that IGNORES SIGTERM is killed, and the report says how far
         // the ladder had to go — read from wait(), not from the signal call.
@@ -2735,6 +2743,31 @@ fn p4_termination_is_hard_and_the_outcome_names_the_policy() {
                 "unexpected result for a cancelled source task: {result}"
             );
         }
+
+        // DETERMINISTIC result_missing, because the branch above can be
+        // satisfied without ever reaching it. `sleep` blocks the interpreter's
+        // thread, so the graceful-shutdown arm that would write an error frame
+        // never gets to run: SIGTERM is not observed, the grace expires, and
+        // SIGKILL ends it with nothing written at all. Not a torn frame, not an
+        // empty value — no frame.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            4,
+            serde_json::json!({
+                "source": "print(\"ARMED\")\nsleep(60)\n1",
+                "timeout_ms": "3000",
+            }),
+        )
+        .await
+        .expect("admitted");
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        let task = &report["report"];
+        assert_eq!(task["outcome"]["kind"], "timeout", "{task}");
+        assert_eq!(
+            task["result"]["kind"], "result_missing",
+            "a writer killed before it wrote must report result_missing: {task}"
+        );
         teardown(f).await;
     });
 }
@@ -2825,6 +2858,39 @@ fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
             "an oversized value must report itself truncated: {data}"
         );
         assert_eq!(report["report"]["outcome"]["code"], 0, "{report}");
+
+        // The quote-heavy case, which is where a raw-byte view and an encoded
+        // view diverge most: a few thousand short strings produce a COMPLETE
+        // frame — the writer's own cap is satisfied — whose JSON cost is far
+        // over the reply budget. The settle path must hand back a reference,
+        // never a data string cut mid-token, which would be unparseable and
+        // would not say so.
+        let operation = submit_task(
+            &mut f.parent,
+            &f.bound,
+            6,
+            serde_json::json!({
+                "source": "$out = []\nfor $i in range(0, 7000)\n  push($out, \"s\" + $i)\nend\n$out\n",
+                "timeout_ms": "20000",
+            }),
+        )
+        .await
+        .expect("admitted");
+        let report = task_report(&mut f.parent, &f.bound, operation).await;
+        let result = &report["report"]["result"];
+        assert_eq!(result["kind"], "value", "{result}");
+        let data = result["data"].as_str().unwrap();
+        assert_eq!(
+            report["report"]["outcome"]["code"], 0,
+            "the task itself succeeded: {report}"
+        );
+        // Whatever comes back must PARSE. That is the property a cut string
+        // breaks, and asserting it directly is what makes this fixture able to
+        // fail rather than merely observe.
+        let parsed: serde_json::Value = serde_json::from_str(data)
+            .unwrap_or_else(|e| panic!("the result data must be parseable ({e}): {data}"));
+        assert_eq!(parsed["truncated"], true, "{data}");
+        assert!(parsed["bytes"].is_string(), "{data}");
 
         // A cwd that does not exist is refused BEFORE any spawn, and the
         // request id is untouched — so the same id may simply be retried.
@@ -2973,6 +3039,20 @@ fn p4_a_survivor_cannot_wedge_the_supervisor() {
                 "a held-open pipe must be reported, not hidden: {task}"
             );
         }
+        // And the survivors are DEAD, not merely stopped waiting for. The
+        // settlement kill reaches the whole group while the un-reaped leader
+        // still pins it, which is the only thing that can catch a child the
+        // task backgrounded: pdeathsig cannot see it, and by shell exit it
+        // would long since have been orphaned.
+        let leftovers = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 600"])
+            .output()
+            .expect("pgrep runs");
+        assert!(
+            String::from_utf8_lossy(&leftovers.stdout).trim().is_empty(),
+            "a settled task left its backgrounded children alive: {}",
+            String::from_utf8_lossy(&leftovers.stdout)
+        );
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "four survivors took {:?} — the drains are not bounded",

@@ -29,6 +29,10 @@ use std::os::fd::{FromRawFd, RawFd};
 /// reported as truncated rather than split: chunked delivery is a named
 /// deferral, and silently sending half a value would be worse than either.
 pub const MAX_RESULT: usize = 64 * 1024;
+/// How much of an over-long error message survives in the reference frame.
+/// Small enough that the reference itself cannot approach the cap after
+/// escaping, large enough to carry the sentence that names the failure.
+const ERROR_HEAD: usize = 2048;
 
 /// Validated at startup, before any user code runs. Holding the number rather
 /// than the `File` keeps the descriptor un-owned until the moment of writing,
@@ -108,11 +112,26 @@ impl Payload {
     }
 
     /// The truncated-reference frame, which is small by construction.
+    ///
+    /// An ERROR keeps as much of its message as still fits. A value's encoding
+    /// is all-or-nothing — half a strict-data document is not a document — but
+    /// an error message is prose, and the first sentence of "why it failed" is
+    /// usually the whole answer. Dropping it entirely because it was slightly
+    /// too long is the one case where truncating tells the caller MORE.
     fn oversized(&self, bytes: usize) -> String {
         let mut map = cosmix_mix::IndexMap::new();
         map.insert("ok".into(), Value::Bool(matches!(self, Self::Value(_))));
         map.insert("truncated".into(), Value::Bool(true));
         map.insert("bytes".into(), Value::String(bytes.to_string()));
+        if let Self::Error(message) = self {
+            let mut head = message.clone();
+            let mut end = ERROR_HEAD.min(head.len());
+            while !head.is_char_boundary(end) {
+                end -= 1;
+            }
+            head.truncate(end);
+            map.insert("error".into(), Value::String(head));
+        }
         Value::Map(std::rc::Rc::new(map))
             .to_mix_data_string()
             .unwrap_or_default()

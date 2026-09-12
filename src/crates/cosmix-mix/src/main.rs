@@ -1660,11 +1660,26 @@ fn real_main() -> i32 {
                 // `-c` is the only mode that produces a value to frame. Without
                 // one the flag would be accepted and then quietly ignored,
                 // which is the same silent-no-result failure the validation
-                // below exists to prevent — so refuse it here too. Flags come
-                // before `-c` (it consumes the remainder), so a `-c` anywhere
-                // after this point is the mode that will run.
-                if !args[i..].iter().any(|arg| arg == "-c") {
-                    eprintln!("mix: --result-fd is only meaningful with -c");
+                // below exists to prevent — so refuse it here too.
+                //
+                // It must match how the loop below actually PARSES, not merely
+                // whether the token appears: `-c` takes the next argument as
+                // its source, so a trailing `-c` with nothing after it — or one
+                // that a script path has already consumed as an argument — is
+                // not a `-c` mode at all. Searching for the token alone
+                // accepted `mix --result-fd 3 script.mix -c` and then ran the
+                // script, silently framing nothing.
+                let has_code_mode = args[i + 1..]
+                    .iter()
+                    .position(|arg| arg == "-c")
+                    .is_some_and(|at| {
+                        // Every token before it must be a flag; the first
+                        // non-flag is a script path, and the mode is settled.
+                        args[i + 1..][..at].iter().all(|arg| arg.starts_with('-'))
+                            && args[i + 1..].len() > at + 1
+                    });
+                if !has_code_mode {
+                    eprintln!("mix: --result-fd is only meaningful with -c <source>");
                     return 2;
                 }
                 // Refuse at startup, before any user code runs. A task promised

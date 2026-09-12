@@ -884,8 +884,11 @@ as a containment the implementation does not have.
 `umask` and rlimits are inherited and are the operator's bound; the shell's own
 bounds are the concurrency cap (four), the timeout, and 4 KiB each for `argv`
 and the `env` overlay — sized to what the 8 KiB dispatch request can actually
-carry, so the `RESOURCE_LIMIT` this page advertises is one a caller can really
-provoke.
+carry, so each is a limit a caller can really provoke rather than decoration.
+The two answer differently on purpose: an over-budget `env` overlay is
+`RESOURCE_LIMIT`, because the overlay is a quantity of state the shell declines
+to carry, while an over-budget `argv` is `INVALID_ARGUMENT`, because the command
+line itself is malformed for this surface.
 
 A spawn that fails for the machine's reasons (EMFILE, ENOMEM, a `cwd` that
 disappeared between validation and the fork) is `UNAVAILABLE`, not

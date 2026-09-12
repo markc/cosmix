@@ -98,6 +98,11 @@ $term = run_argv($argv, {
 })
 print($term["stdout"])
 if $term["exit_code"] != 0 then
+  -- Cargo puts the compile log on stderr and libtest puts the PANIC there too,
+  -- so a tail of it shows warnings and cuts off the one line that says what
+  -- failed. Print the failure section explicitly: a gate that can say something
+  -- broke but not what is half a gate.
+  print("---- the failing fixture's own output ----")
   print($term["stderr"])
   print("GATE FAIL: the P4 Term fixture did not pass")
   exit(1)
