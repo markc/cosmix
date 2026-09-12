@@ -851,27 +851,52 @@ cancellation and reads `running` is not left wondering whether its request
 arrived.
 
 Streams are captured separately and exactly; this is the mode the manual points
-to when interactive attribution is only best-effort. Each is capped at 64 KiB
-with the REAL byte count and a `truncated` flag reported, and truncation never
-turns a successful task into a failed one.
+to when interactive attribution is only best-effort. Each is capped at 64 KiB of
+ENCODED text — what the reply actually costs, not what was read, because a NUL
+costs one byte to capture and six to encode — with the REAL byte count and a
+`truncated` flag reported, and truncation never turns a successful task into a
+failed one.
+
+A task's descendants can outlive it holding the inherited pipes open. Once the
+supervisor has its outcome the drains get the same two-second grace and then
+stop, and the stream reports `writer_survived: true`: the report says it stopped
+listening rather than presenting a bounded read as the whole of the output.
+Nothing waits on a process nobody is supervising, so a task that backgrounds a
+ten-minute sleeper still settles at once and gives back its concurrency slot.
 
 In `source` mode the value travels a dedicated descriptor rather than stdout —
 see `--result-fd` below — so a task that prints and a task that returns are not
 competing for one stream. `argv` mode has no interpreter value and says
 `not_applicable` rather than presenting an absent one as a failure.
 
-**Declared limits.** A task's lifetime is bounded by the shell's: supervision
-dies with the supervisor. `PR_SET_PDEATHSIG` binds the task leader to the
-supervising thread, so even a SIGKILL of the shell — which no teardown hook can
-catch — takes the leader with it. A grandchild that double-forked out of the
-group first survives that, and this is the declared orphan case rather than a
-containment claim the implementation cannot make. `umask` and rlimits are
-inherited and are the operator's bound; the shell's own bounds are the
-concurrency cap (four) and the timeout.
+**Declared limits.** A task's lifetime is bounded by the shell's, through two
+mechanisms because neither covers the other's case. `PR_SET_PDEATHSIG` binds the
+task LEADER to the supervisor thread that forked it, which is what survives a
+SIGKILL of the shell — no teardown hook runs then. But pdeathsig reaches the
+leader alone, so a normal exit would leave the leader's own children running;
+the shell therefore SIGKILLs every live task GROUP on its way out.
+
+The declared residual is narrower than "any grandchild": a process that leaves
+the task's group by calling `setsid` or `setpgid` for itself is outside both
+mechanisms and survives. That is the orphan case, stated rather than dressed up
+as a containment the implementation does not have.
+
+`umask` and rlimits are inherited and are the operator's bound; the shell's own
+bounds are the concurrency cap (four), the timeout, and 4 KiB each for `argv`
+and the `env` overlay — sized to what the 8 KiB dispatch request can actually
+carry, so the `RESOURCE_LIMIT` this page advertises is one a caller can really
+provoke.
+
+A spawn that fails for the machine's reasons (EMFILE, ENOMEM, a `cwd` that
+disappeared between validation and the fork) is `UNAVAILABLE`, not
+`INVALID_ARGUMENT`: the request was well-formed and retrying it is the right
+move. Its request id stays unspent either way.
 
 **Advertised deferrals**, refused explicitly rather than left to look like
-typos: `shell.task.watch` and `shell.task.list` answer `UNSUPPORTED` (v1 is
-poll-only, through `shell.task.result`); there is no stdin feeding; there is no
+typos: `shell.task.watch` and `shell.task.list` answer `UNSUPPORTED` with
+`reason: "deferred"` — a bare code would be word-for-word what an unknown verb
+gets back, which is not an advertisement of anything (v1 is poll-only, through
+`shell.task.result`); there is no stdin feeding; there is no
 reply chunking (the 64 KiB caps stand in for it); and a task has no Bus identity
 of its own — it is supervised state inspectable through the owning shell, not a
 mesh citizen.
@@ -886,15 +911,32 @@ loudly, because a task promised a structured result that silently produced none
 is the failure with no symptom.
 
 The flag must precede `-c`, which consumes the rest of the line as script
-arguments. Text streams are untouched: `-c` has never echoed its final value to
-stdout, so stdout stays the program's own output and the value travels the
-descriptor.
+arguments, and it is refused outright without one: `-c` is the only mode that
+produces a value to frame, so accepting the flag anywhere else would promise a
+result that never arrives. Text streams are untouched: `-c` has never echoed its
+final value to stdout, so stdout stays the program's own output and the value
+travels the descriptor.
 
-The length prefix is what makes three situations distinguishable that an
-unframed stream collapses into one: nothing written at all (`result_missing`),
-a declared length the payload does not satisfy because the writer was killed
-mid-frame (`result_torn`), and a complete frame whose value reports that it was
-larger than the 64 KiB cap.
+The whole frame is capped at 64 KiB, not just the value inside it. The value is
+encoded once and then escaped again as it goes into the frame, so capping only
+the inner encoding let a quote-heavy value produce a frame too large to read —
+which the reader then saw as a writer killed mid-write. An oversized value comes
+back as a truncated reference instead: the caller learns a value existed, and
+how big it was.
+
+An evaluation stopped by a signal writes an ERROR frame naming the signal and
+exits non-zero. It has to: the interpreter catches SIGTERM for its own graceful
+shutdown, and a supervisor ends a task with exactly that signal — so without
+this, a cancelled task and one that genuinely returned nil produced identical
+successful frames. (A plain `mix -c` with no result descriptor still exits 0 on
+Ctrl-C; scripts depend on it, and that is not the case this rule is about.)
+
+The length prefix is what makes four situations distinguishable that an unframed
+stream collapses into one: nothing written at all (`result_missing`), a declared
+length the payload does not satisfy because the writer was killed mid-frame
+(`result_torn`), a partial frame the supervisor stopped waiting for because a
+survivor still held the pipe (`result_abandoned`), and a complete frame whose
+value reports that it was larger than the cap.
 
 #### Cancellation, and what it is actually worth
 
