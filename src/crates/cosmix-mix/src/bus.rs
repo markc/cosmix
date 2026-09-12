@@ -25,14 +25,54 @@ enum MeshState {
     /// *subsequent* `mix` invocations) unless the script explicitly
     /// calls `bus_reconnect()`.
     NeverPresent,
-    /// Probe succeeded; this is the live broker client. Bus forms
+    /// Probe succeeded; this is the live broker lane. Bus forms
     /// call through normally.
-    Connected(std::sync::Arc<cosmix_lib_client::NodedClient>),
+    Connected(std::sync::Arc<Lane>),
     /// The cached `Connected` handle failed a call (noded restart,
     /// broker gone). Bus forms raise `mesh unavailable: …` until the
     /// script explicitly calls `bus_reconnect()` to reset to
     /// `Unprobed`.
     Lost,
+}
+
+/// How this process reaches the local broker.
+///
+/// The two lanes differ in ONE respect that matters: what the broker knows
+/// about the caller. A TCP connection carries a name the caller asserts about
+/// itself, which is not an authority — which is why a session-enrolled
+/// service's protected verbs answer FORBIDDEN over it. A Unix connection
+/// carries peer credentials the KERNEL supplies, so the broker learns who is
+/// calling without being told, and the same `send` reaches those verbs.
+///
+/// Verified is preferred and unverified is the fallback, never the reverse: a
+/// host with no local broker socket, or a genuinely remote target, must keep
+/// working exactly as before. The lane is chosen once per connection, so a
+/// script cannot end up with some sends authenticated and others not.
+///
+/// `Deref` to the client is what lets every existing call site stay as it was.
+/// The verified connection must be OWNED here rather than unwrapped: its
+/// client borrows from it, and dropping the connection to keep only the client
+/// would close the socket underneath.
+pub(crate) enum Lane {
+    Verified(cosmix_lib_client::VerifiedConnection),
+    Anonymous(cosmix_lib_client::NodedClient),
+}
+
+impl Lane {
+    /// True when this lane carries kernel-supplied peer credentials.
+    pub(crate) fn is_verified(&self) -> bool {
+        matches!(self, Lane::Verified(_))
+    }
+}
+
+impl std::ops::Deref for Lane {
+    type Target = cosmix_lib_client::NodedClient;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Lane::Verified(connection) => connection.client(),
+            Lane::Anonymous(client) => client,
+        }
+    }
 }
 
 /// Outcome of [`MixBusHandler::noded_access`]: either a live broker
@@ -262,9 +302,44 @@ impl MixBusHandler {
     /// Holds the mutex across the probe so concurrent first-callers do
     /// not race a thundering herd of connects; the evaluator is
     /// current-thread so this serialization is effectively free.
-    async fn noded_access(
-        &self,
-    ) -> Result<std::sync::Arc<cosmix_lib_client::NodedClient>, MeshErr> {
+    /// Open the verified Unix lane, or `None` if this host cannot offer one.
+    ///
+    /// Ambient and grantless: no service name, no provenance — a driver
+    /// registers nothing. That yields a session-less broker principal, which is
+    /// exactly what a local DefaultOpen service admits for a matching
+    /// uid/node/broker_epoch. It is not new authority; any same-uid process can
+    /// already open this connection, and the pane shell and every test harness
+    /// do. What was missing was a script being able to.
+    ///
+    /// Every failure is silent-and-fall-back by design. The one thing this must
+    /// never do is report an unverified lane as a verified one.
+    async fn connect_verified(url: &str) -> Option<cosmix_lib_client::VerifiedConnection> {
+        let account =
+            std::env::var("COSMIX_BROKER_ACCOUNT").unwrap_or_else(|_| "cosmix-noded".into());
+        let (endpoint, _) = crate::node_config::NativeEnvironment::capture()
+            .resolve()
+            .ok()?;
+        // The resident's own resolver, so a driver and a pane shell on one node
+        // cannot disagree about which account owns the socket.
+        let options = crate::native_session::options(account, endpoint).ok()?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cosmix_lib_client::NodedClient::connect_unix("", url, &options, None),
+        )
+        .await
+        {
+            Ok(Ok(cosmix_lib_client::UnixConnectOutcome::VerifiedUnix(connection))) => {
+                Some(connection)
+            }
+            // `require_native_session` forbids this arm; it stays a refusal
+            // rather than an `unreachable!()` so that if the option ever stops
+            // forbidding it, the result is the old behaviour and not a lane
+            // that claims to be verified.
+            _ => None,
+        }
+    }
+
+    async fn noded_access(&self) -> Result<std::sync::Arc<Lane>, MeshErr> {
         let mut state = self.mesh.lock().await;
         match &*state {
             MeshState::Connected(c) => Ok(c.clone()),
@@ -272,9 +347,24 @@ impl MixBusHandler {
             MeshState::Lost => Err(MeshErr::Lost),
             MeshState::Unprobed => {
                 let url = crate::node_config::resolve_noded_url();
+                // Verified FIRST. This is what makes a plain `send` reach a
+                // local service's protected verbs: the lane carries peer
+                // credentials, so the broker has a principal it did not have to
+                // be told. Nothing about the surface changes — the script still
+                // writes `send <target> <verb>`.
+                //
+                // It is deliberately not an error when this fails. A host with
+                // no local broker socket, a broker running as another account,
+                // a cross-node target — all of those are ordinary, and all of
+                // them must keep working exactly as they did.
+                if let Some(connection) = Self::connect_verified(&url).await {
+                    let arc = std::sync::Arc::new(Lane::Verified(connection));
+                    *state = MeshState::Connected(arc.clone());
+                    return Ok(arc);
+                }
                 match cosmix_lib_client::NodedClient::connect_anonymous(&url).await {
                     Ok(client) => {
-                        let arc = std::sync::Arc::new(client);
+                        let arc = std::sync::Arc::new(Lane::Anonymous(client));
                         *state = MeshState::Connected(arc.clone());
                         Ok(arc)
                     }
@@ -308,7 +398,7 @@ impl MixBusHandler {
     /// connection generation.
     async fn mark_lost_if_current(
         &self,
-        expected: &std::sync::Arc<cosmix_lib_client::NodedClient>,
+        expected: &std::sync::Arc<Lane>,
     ) {
         let mut state = self.mesh.lock().await;
         if let MeshState::Connected(current) = &*state

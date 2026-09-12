@@ -1529,40 +1529,6 @@ pub trait JmapHandler {
 /// [`JmapFuture`]).
 pub type BusCallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-/// [`SessionFuture`] — `!Send`, single-thread runtime.
-pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
-
-/// The host-injected channel backing `session_send(service, verb[, body])` —
-/// a send over the node's VERIFIED native-session lane.
-///
-/// Deliberately separate from [`BusHandler`]. `send` reaches a peer over the
-/// mesh lane, where a service is known by a self-asserted name; the protected
-/// verbs of a local session-enrolled service are unreachable that way by
-/// design, and answer FORBIDDEN. This handler opens an ambient verified Unix
-/// connection to the LOCAL noded — SO_PEERCRED gives the broker a principal it
-/// did not have to be told — so the same script can address those verbs.
-///
-/// It grants NO new authority. Any same-uid process on the node can already
-/// open exactly this connection; the pane shell and the test harnesses do. All
-/// this does is make the sanctioned path scriptable.
-///
-/// Contract: `send(service, verb, body)` returns `(rc, reply)` under the same
-/// banded `$rc` rules as [`BusHandler::send`] — `0` delivered, `1..9` a
-/// delivered warning band with the peer's exact rc, `>= 10` a peer refusal
-/// whose BODY is the reply. `Err` carrying a structured `SESSION_UNVERIFIED`
-/// is propagated as a raise, not folded into a band: a verified lane that
-/// could not be established is the one failure a caller must not be able to
-/// mistake for a refusal, because the alternative is sending unauthenticated.
-/// Any other `Err` is a transport failure and lands in the negative band.
-pub trait SessionHandler {
-    fn send<'a>(
-        &'a self,
-        service: &'a str,
-        verb: &'a str,
-        body: &'a str,
-    ) -> SessionFuture<'a, MixResult<(i32, Value)>>;
-}
-
 /// The host-injected channel backing the `bus_call(verb, args)` builtin —
 /// a *scoped, mediated, DELEGATED* Bus control-plane call, injected via
 /// [`Evaluator::set_bus_call_handler`].
@@ -2784,7 +2750,6 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "reply",
     "quit",
     "publish",
-    "session_send",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -2960,10 +2925,6 @@ pub(crate) struct EvaluatorGlobals {
     /// broker for an admin route). Same `Rc` clone-out-before-await
     /// discipline as `jmap_handler`.
     bus_call_handler: Option<Rc<dyn BusCallHandler>>,
-    /// Backs `session_send`; see [`SessionHandler`]. Absent in an embedder
-    /// that has no node to address, which the builtin reports rather than
-    /// pretending the send was made.
-    session_handler: Option<Rc<dyn SessionHandler>>,
     /// Per-line shell fallback used only by `exec_source` when the
     /// whole-file Mix parse fails. `None` for daemon/serve modes and
     /// pure library use; `Some` for the REPL and `run_source` so that
@@ -3110,7 +3071,6 @@ impl EvaluatorGlobals {
             db_handler: None,
             jmap_handler: None,
             bus_call_handler: None,
-            session_handler: None,
             shell_handler: None,
             serve_runtime: None,
             capability_policy: None,
@@ -3690,10 +3650,6 @@ impl Evaluator {
     /// raises a catchable "bus_call not available" error; the capability
     /// gate (`CapabilityClass::Bus`) still applies independently, so a
     /// policy can deny delegated Bus even when a handler is present.
-    pub fn set_session_handler(&mut self, handler: Rc<dyn SessionHandler>) {
-        self.globals.borrow_mut().session_handler = Some(handler);
-    }
-
     pub fn set_bus_call_handler(&mut self, handler: Rc<dyn BusCallHandler>) {
         self.globals.borrow_mut().bus_call_handler = Some(handler);
     }
@@ -10975,11 +10931,6 @@ impl Evaluator {
                         return self.exec_publish(eval_args).await;
                     }
 
-                    if name == "session_send" {
-                        self.check_capability(name)?; // Knob A — CapabilityClass::Bus
-                        return self.exec_session_send(eval_args).await;
-                    }
-
                     // HOF (eval) builtins — checked before pure builtins
                     // so a HOF entry can shadow a same-named pure stub
                     // during migration. In practice HOF names (sort_by,
@@ -13189,120 +13140,6 @@ impl Evaluator {
 
             Ok(result)
         })
-    }
-
-    /// `session_send(service, verb[, body])` — a send over the verified lane.
-    ///
-    /// The bands are `send`'s, deliberately: a driver that already reads `$rc`
-    /// should not have to learn a second convention because the transport
-    /// underneath is a Unix socket rather than the mesh. The ONE difference is
-    /// that an unestablishable verified lane raises instead of banding, and
-    /// that difference is the point of the builtin — a caller must not be able
-    /// to read "I could not authenticate" as "the peer said no", because the
-    /// two invite opposite responses.
-    async fn exec_session_send(&mut self, args: Vec<Value>) -> MixResult<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(self.coded_err(
-                "ARITY_MISMATCH",
-                format!(
-                    "session_send: expected (service, verb[, body]), got {} argument(s)",
-                    args.len()
-                ),
-            ));
-        }
-        let service = match &args[0] {
-            Value::String(s) if !s.trim().is_empty() => s.clone(),
-            Value::String(_) => {
-                return Err(self.coded_err(
-                    "INVALID_ARGUMENT",
-                    "session_send: service name must not be empty".to_string(),
-                ));
-            }
-            other => {
-                return Err(self.coded_err(
-                    "TYPE_MISMATCH",
-                    format!(
-                        "session_send: service must be a string, got {}",
-                        other.type_name()
-                    ),
-                ));
-            }
-        };
-        let verb = match &args[1] {
-            Value::String(s) if !s.trim().is_empty() => s.clone(),
-            Value::String(_) => {
-                return Err(self.coded_err(
-                    "INVALID_ARGUMENT",
-                    "session_send: verb must not be empty".to_string(),
-                ));
-            }
-            other => {
-                return Err(self.coded_err(
-                    "TYPE_MISMATCH",
-                    format!(
-                        "session_send: verb must be a string, got {}",
-                        other.type_name()
-                    ),
-                ));
-            }
-        };
-        // A STRING, not a map: the body is relayed to the peer byte for byte.
-        // Encoding a Mix map here would make the builtin the author of a wire
-        // shape it cannot validate, and every protected verb on this lane
-        // already specifies its own body exactly.
-        let body = match args.get(2) {
-            None | Some(Value::Nil) => "{}".to_string(),
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => {
-                return Err(self.coded_err(
-                    "TYPE_MISMATCH",
-                    format!(
-                        "session_send: body must be a JSON string, got {} — encode it \
-                         with json_encode() if you are building it as a map",
-                        other.type_name()
-                    ),
-                ));
-            }
-        };
-
-        let handler = { self.globals.borrow().session_handler.clone() };
-        let Some(handler) = handler else {
-            // Not a raise: an embedder with no node is the same class of
-            // condition as a broker-less host is for `send`, and it reports it
-            // the same way rather than killing the script.
-            self.scope
-                .update_or_set("rc", Value::Number(RC_UNAVAILABLE as f64));
-            self.scope.update_or_set(
-                "result",
-                Value::String(
-                    "verified session lane not available (no session handler registered)"
-                        .to_string(),
-                ),
-            );
-            return Ok(Value::Nil);
-        };
-
-        let fut = handler.send(&service, &verb, &body);
-        let outcome = self.await_with_class_c_yield(fut).await?;
-        match outcome {
-            Ok((rc, result)) => {
-                self.check_collection_size(&result)?;
-                self.scope.update_or_set("rc", Value::Number(rc as f64));
-                self.scope.update_or_set("result", result.clone());
-                Ok(result)
-            }
-            // The one error that must not become a band. Everything else is a
-            // transport failure and reads as one.
-            Err(MixError::Structured(info)) if info.code == "SESSION_UNVERIFIED" => Err(self
-                .snapshot_builtin_error("session_send", MixError::Structured(info))),
-            Err(error) => {
-                self.scope
-                    .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
-                self.scope
-                    .update_or_set("result", Value::String(error.to_string()));
-                Ok(Value::Nil)
-            }
-        }
     }
 
     /// Execute a send command: evaluate args, call Bus handler, set $rc and $result.
