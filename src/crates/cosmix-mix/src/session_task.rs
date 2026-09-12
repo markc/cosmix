@@ -53,6 +53,12 @@ pub(crate) const MAX_STREAM: usize = 64 * 1024;
 /// slack to SEE an over-long frame rather than mistake a cut-off one for a
 /// complete read.
 const MAX_RESULT_CAPTURE: usize = MAX_STREAM + 1024;
+/// Per-field budgets measured in ENCODED bytes — what the reply actually costs
+/// — rather than in raw captured bytes, which is what the caps used to count.
+/// Three of these plus the envelope is what must fit one 256 KiB Term reply;
+/// `a_worst_case_report_fits_one_reply` does that arithmetic for real.
+const MAX_STREAM_ENCODED: usize = 64 * 1024;
+const MAX_RESULT_ENCODED: usize = 64 * 1024;
 /// The declared grace between SIGTERM and SIGKILL, and also the deadline for
 /// draining the result pipe: a grandchild holding the write end open must not
 /// be able to wedge the supervisor.
@@ -550,8 +556,12 @@ fn supervise_task(
         Some(handle) => {
             let capture = handle.join().unwrap_or_default();
             match (decode_frame(&capture.kept), capture.writer_survived) {
-                // A whole frame is a whole frame however the drain ended.
-                (TaskResult::Value { data }, _) => TaskResult::Value { data },
+                // A whole frame is a whole frame however the drain ended. Its
+                // own encoded budget still applies: the frame is already
+                // escaped once, and carrying it in the reply escapes it again.
+                (TaskResult::Value { data }, _) => TaskResult::Value {
+                    data: fit_encoded(&data, MAX_RESULT_ENCODED).0,
+                },
                 (_, true) => TaskResult::ResultAbandoned,
                 (other, false) => other,
             }
@@ -864,12 +874,13 @@ fn drain_fd<S: AsRawFd + Send + 'static>(source: S, cap: usize, stop: &Arc<Drain
 
 fn join_stream(handle: Drain) -> Stream {
     let capture = handle.join().unwrap_or_default();
-    let truncated = capture.total > capture.kept.len();
+    let lossy = String::from_utf8_lossy(&capture.kept);
+    let (text, trimmed) = fit_encoded(&lossy, MAX_STREAM_ENCODED);
     Stream {
         bytes: cosmix_lib_bus::native_session::DecimalU64(capture.total as u64),
-        truncated,
+        truncated: trimmed || capture.total > capture.kept.len(),
         writer_survived: capture.writer_survived,
-        text: String::from_utf8_lossy(&capture.kept).into_owned(),
+        text,
     }
 }
 
@@ -880,6 +891,36 @@ fn empty_stream() -> Stream {
         writer_survived: false,
         text: String::new(),
     }
+}
+
+/// What one character costs once JSON has escaped it.
+///
+/// This is the arithmetic the raw caps got wrong. `serde_json` turns a NUL into
+/// the six bytes ` `, and `from_utf8_lossy` has already turned each invalid
+/// byte into a three-byte replacement character — so a 64 KiB cap counted in RAW
+/// bytes admits a 384 KiB field, and three of those overflow the 256 KiB reply
+/// the surface can actually deliver.
+fn encoded_cost(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' => 2,
+        // The rest of C0 has no short form: \u00XX.
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Truncate on a character boundary so the ENCODED form fits `budget`.
+fn fit_encoded(text: &str, budget: usize) -> (String, bool) {
+    // The quotes serde will add around it.
+    let mut used = 2usize;
+    for (index, ch) in text.char_indices() {
+        let cost = encoded_cost(ch);
+        if used + cost > budget {
+            return (text[..index].to_owned(), true);
+        }
+        used += cost;
+    }
+    (text.to_owned(), false)
 }
 
 /// Three outcomes the length prefix makes distinguishable, and which an
@@ -1050,5 +1091,59 @@ mod tests {
             decode_frame(&whole),
             TaskResult::Value { ref data } if data == "hi"
         ));
+    }
+
+    /// The caps must bound what the reply COSTS, not what was read.
+    #[test]
+    fn the_budget_counts_escaped_bytes() {
+        // A NUL is one raw byte and six encoded ones. Budgeting raw was how a
+        // 64 KiB cap admitted a 384 KiB field.
+        let (text, trimmed) = fit_encoded(&"\0".repeat(MAX_STREAM), MAX_STREAM_ENCODED);
+        assert!(trimmed, "a NUL-filled capture must be trimmed");
+        assert!(
+            serde_json::to_string(&text).expect("a string encodes").len() <= MAX_STREAM_ENCODED,
+            "encoded {} exceeds the budget",
+            serde_json::to_string(&text).expect("a string encodes").len()
+        );
+        // Truncation is on a character boundary, not a byte one.
+        let (text, trimmed) = fit_encoded(&"é".repeat(MAX_STREAM), 1024);
+        assert!(trimmed);
+        assert!(text.chars().all(|c| c == 'é'));
+        // Text that already fits is returned whole and unflagged.
+        let (text, trimmed) = fit_encoded("plain", MAX_STREAM_ENCODED);
+        assert_eq!((text.as_str(), trimmed), ("plain", false));
+    }
+
+    /// The arithmetic the 256 KiB reply envelope depends on, done for real
+    /// rather than asserted in a comment.
+    #[test]
+    fn a_worst_case_report_fits_one_reply() {
+        let worst = |budget| fit_encoded(&"\0".repeat(MAX_STREAM * 8), budget).0;
+        let stream = || Stream {
+            bytes: cosmix_lib_bus::native_session::DecimalU64(u64::MAX),
+            truncated: true,
+            writer_survived: true,
+            text: worst(MAX_STREAM_ENCODED),
+        };
+        let report = TaskReport {
+            version: 1,
+            outcome: Outcome::Unknown {
+                detail: "x".repeat(512),
+            },
+            stdout: stream(),
+            stderr: stream(),
+            result: TaskResult::Value {
+                data: worst(MAX_RESULT_ENCODED),
+            },
+            duration_ms: cosmix_lib_bus::native_session::DecimalU64(u64::MAX),
+        };
+        let encoded = serde_json::to_string(&report).expect("the report encodes");
+        // Term's per-reply cap, with the operation envelope still to come.
+        const TERM_REPLY: usize = 256 * 1024;
+        assert!(
+            encoded.len() < TERM_REPLY - 16 * 1024,
+            "worst-case report is {} bytes, too close to the {TERM_REPLY} reply cap",
+            encoded.len()
+        );
     }
 }

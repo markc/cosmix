@@ -914,10 +914,16 @@ struct TaskSubmit {
     source: Option<String>,
     #[serde(default)]
     argv: Option<Vec<String>>,
-    cwd: String,
+    /// Optional to PARSE, required to run. Absent is a caller's omission, and
+    /// it earns INVALID_ARGUMENT — a statement about the request — rather than
+    /// INVALID_REQUEST, which says the body itself was unreadable and sends
+    /// the caller looking for a JSON fault that is not there.
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     env: Vec<(String, String)>,
-    timeout_ms: DecimalU64,
+    #[serde(default)]
+    timeout_ms: Option<DecimalU64>,
 }
 
 #[derive(Serialize)]
@@ -1006,12 +1012,18 @@ fn task_submit(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u
         }
         Known::Fresh => {}
     }
+    // Both are contract, not convenience: a task that is not told where to run
+    // or when to stop is under-specified, and guessing either would be the
+    // implicit-context this mode exists to remove.
+    let (Some(cwd), Some(timeout_ms)) = (request.cwd, request.timeout_ms) else {
+        return refusal("INVALID_ARGUMENT");
+    };
     let spec = match crate::session_task::Spec::validate(
         request.source,
         request.argv,
-        request.cwd,
+        cwd,
         request.env,
-        request.timeout_ms.0,
+        timeout_ms.0,
     ) {
         Ok(spec) => spec,
         Err(code) => return refusal(code),
@@ -1039,10 +1051,13 @@ fn task_submit(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u
             return refusal("RESOURCE_LIMIT");
         }
     }
-    // Registry VOCABULARY only. A task's cancellation is killpg with
-    // escalation; ACTIVE, the shared interrupt flag and the SIGINT latch are
-    // evaluation machinery and are not touched here.
-    cosmix_mix::cancel::publish(operation);
+    // Deliberately NOT published into the evaluation cancel registry. A task's
+    // cancellation is killpg with escalation, reached through its Handle; the
+    // registry would only ever hold an entry nothing reads. It also has no
+    // settle path for one — the entry would stay unfinished for the shell's
+    // life, growing REGISTRY past its retention bound, making every later
+    // publish pay a longer scan, and falsifying the registry's own invariant
+    // that unfinished means "running or in flight".
     match crate::session_task::spawn(spec, move |report| {
         task_settled(operation, report);
     }) {
@@ -1069,14 +1084,18 @@ fn task_submit(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u
         Err(error) => {
             // Nothing started, so the id stays free — the same discipline the
             // admission path uses for a pre-claim refusal.
-            let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-            store.forget(operation);
-            drop(store);
-            cosmix_mix::cancel::forget(operation);
+            store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget(operation);
             (
                 10,
+                // NOT invalid-argument: the request was well-formed and the
+                // failure is the machine's (EMFILE, ENOMEM, a vanished cwd).
+                // Blaming the caller would send them off editing a request
+                // that was never the problem.
                 serde_json::json!({
-                    "error_code": "INVALID_ARGUMENT",
+                    "error_code": "UNAVAILABLE",
                     "reason": "spawn_failed",
                     "detail": error,
                 })

@@ -210,38 +210,42 @@ pub(crate) fn build_runtime() -> tokio::runtime::Runtime {
     }
 }
 
-/// Wait for SIGTERM (systemd stop) or Ctrl-C, whichever fires first.
+/// Wait for SIGTERM (systemd stop) or Ctrl-C, whichever fires first, and return
+/// which one it was.
+///
+/// The number is load-bearing for `--result-fd`: a task supervisor ends its
+/// child with SIGTERM, and the result frame has to say so rather than present a
+/// killed evaluation as a successful nil.
 ///
 /// Inlined here so mix has no dependency on the cos-side
 /// `cosmix-lib-daemon` crate; behaviour-parity with that crate's
 /// `shutdown_signal()`.
-async fn shutdown_signal() {
+async fn shutdown_signal() -> i32 {
     let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
-    {
-        // Registration failure leaves Ctrl-C as the available graceful path;
-        // do not bypass the evaluator's final stats flush.
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = ctrl_c => {}
-                    _ = sigterm.recv() => {}
-                }
-            }
-            Err(e) => {
-                eprintln!("mix: failed to register SIGTERM handler: {}", e);
-                let _ = ctrl_c.await;
-            }
+    // Registration failure leaves Ctrl-C as the available graceful path;
+    // do not bypass the evaluator's final stats flush.
+    let signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => tokio::select! {
+            _ = ctrl_c => libc::SIGINT,
+            _ = sigterm.recv() => libc::SIGTERM,
+        },
+        Err(e) => {
+            eprintln!("mix: failed to register SIGTERM handler: {}", e);
+            let _ = ctrl_c.await;
+            libc::SIGINT
         }
-    }
+    };
 
     #[cfg(not(unix))]
-    {
+    let signal = {
         ctrl_c.await.ok();
-    }
+        libc::SIGINT
+    };
 
-    tracing::info!("shutdown signal received");
+    tracing::info!(signal, "shutdown signal received");
+    signal
 }
 
 fn print_help() {
@@ -756,21 +760,30 @@ fn run_command_line(
                 // being suppressed here — the property the task contract wants
                 // (stdout is the program's text, the value travels the fd)
                 // already held, and this preserves it rather than creating it.
-                let res: Result<Value, cosmix_mix::error::MixError> = tokio::select! {
+                // Err(signal) is the shutdown arm. It has to stay distinguishable
+                // all the way to the frame: a task's supervisor ends it with
+                // SIGTERM, so folding that into `Ok(Value::Nil)` wrote a
+                // SUCCESSFUL result for a killed evaluation — a cancelled task
+                // and a task that genuinely returned nil became the same report.
+                let res: Result<Result<Value, cosmix_mix::error::MixError>, i32> = tokio::select! {
                     biased;
-                    _ = shutdown_signal() => Ok(Value::Nil),
+                    signal = shutdown_signal() => Err(signal),
                     r = async {
                         let value = eval.execute(&stmts).await?;
                         if eval.handler_count() > 0 {
                             eval.run_event_pump().await?;
                         }
                         Ok(value)
-                    } => r,
+                    } => Ok(r),
                 };
+                let framed = result_fd.is_some();
                 if let Some(result_fd) = result_fd {
                     let payload = match &res {
-                        Ok(value) => crate::result_fd::Payload::Value(value.clone()),
-                        Err(error) => crate::result_fd::Payload::Error(format!("{error}")),
+                        Err(signal) => crate::result_fd::Payload::Error(format!(
+                            "interrupted by signal {signal} before the evaluation finished"
+                        )),
+                        Ok(Ok(value)) => crate::result_fd::Payload::Value(value.clone()),
+                        Ok(Err(error)) => crate::result_fd::Payload::Error(format!("{error}")),
                     };
                     if let Err(error) = result_fd.write(&payload) {
                         // Loud, because a missing frame is reported by the
@@ -780,11 +793,22 @@ fn run_command_line(
                     }
                 }
                 match res {
-                    Ok(_) => 0,
-                    Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
+                    // Only the framed caller's exit code changes. A plain
+                    // `mix -c` stopped by Ctrl-C or systemd has always been a
+                    // clean 0 and scripts depend on it; a task's shell is the
+                    // one that must not exit 0 after being killed.
+                    Err(signal) => {
+                        if framed {
+                            128 + signal
+                        } else {
+                            0
+                        }
+                    }
+                    Ok(Ok(_)) => 0,
+                    Ok(Err(cosmix_mix::error::MixError::ExitRequest { code })) => code,
                     // Match run_source: a Ctrl-C interrupt is a clean exit.
-                    Err(e) if format!("{e}").contains("interrupted") => 0,
-                    Err(e) => {
+                    Ok(Err(e)) if format!("{e}").contains("interrupted") => 0,
+                    Ok(Err(e)) => {
                         print_uncaught(&e);
                         1
                     }
@@ -1633,6 +1657,16 @@ fn real_main() -> i32 {
                     eprintln!("mix: --result-fd requires a descriptor number");
                     return 2;
                 };
+                // `-c` is the only mode that produces a value to frame. Without
+                // one the flag would be accepted and then quietly ignored,
+                // which is the same silent-no-result failure the validation
+                // below exists to prevent — so refuse it here too. Flags come
+                // before `-c` (it consumes the remainder), so a `-c` anywhere
+                // after this point is the mode that will run.
+                if !args[i..].iter().any(|arg| arg == "-c") {
+                    eprintln!("mix: --result-fd is only meaningful with -c");
+                    return 2;
+                }
                 // Refuse at startup, before any user code runs. A task promised
                 // a structured result that silently produced none is the
                 // failure with no symptom.

@@ -1155,10 +1155,19 @@ impl Control {
                     "version": 1,
                     "target": child_target,
                     "request_id": DecimalU64(forwarded),
-                    "cwd": request.cwd,
                     "env": request.env,
-                    "timeout_ms": request.timeout_ms,
                 });
+                // Absent fields are OMITTED, never sent as null. A relayed null
+                // is a present field of the wrong type, so the child answers
+                // INVALID_REQUEST — a malformed-body complaint — where it
+                // should be applying its own default or answering
+                // INVALID_ARGUMENT about a value the caller actually chose.
+                if let Some(cwd) = &request.cwd {
+                    body["cwd"] = json!(cwd);
+                }
+                if let Some(timeout_ms) = request.timeout_ms {
+                    body["timeout_ms"] = json!(timeout_ms);
+                }
                 // The discriminated union is relayed as the caller sent it;
                 // Term does not choose a side, so "both" and "neither" reach
                 // the child's own refusal rather than being resolved here.
@@ -1234,7 +1243,19 @@ impl Control {
             // The child's refusal is ITS answer about ITS prompt. Term relays
             // it rather than replacing it with a guess, because BUSY and
             // STALE_GENERATION tell the caller two different things to do next.
-            Ok(Err(error)) => (shell_refusal(&error.to_string(), sequence.is_some()), true),
+            Ok(Err(error)) => {
+                let body = error.to_string();
+                // A refusal about the child's own LOAD settles nothing about
+                // this request. Retaining one replays "too many tasks" for that
+                // id forever, while the documented move for both codes is to
+                // back off and retry the same submission — which only reaches
+                // the child's dedupe if Term did not record the refusal.
+                let transient = matches!(
+                    refusal_code(&body).as_deref(),
+                    Some("RESOURCE_LIMIT" | "UNAVAILABLE")
+                );
+                (shell_refusal(&body, sequence.is_some()), !transient)
+            }
             // A submission whose answer never arrived may or may not have been
             // admitted. The caller's route forward is `term.exec.result`, or a
             // byte-identical retry that re-forwards to the child's dedupe —
@@ -1320,6 +1341,15 @@ impl Control {
 /// same meaning, and anything unrecognised is reported as an unknown outcome
 /// rather than being flattened into a denial that would read as a policy
 /// decision Term never made.
+/// The child's own error code, if its answer was shaped like a refusal at all.
+fn refusal_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error_code")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn shell_refusal(body: &str, mutation: bool) -> Reply {
     #[derive(Deserialize)]
     struct Refusal {
@@ -1350,6 +1380,10 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         "STALE_GENERATION" => relayed("STALE_GENERATION"),
         "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
         "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
+        // The machine could not start the work (EMFILE, ENOMEM, a cwd that
+        // vanished). Transient and the caller's to retry, so it keeps its own
+        // name rather than becoming an unknown outcome.
+        "UNAVAILABLE" => relayed("UNAVAILABLE"),
         "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
         "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),

@@ -94,6 +94,31 @@ impl Payload {
     /// encoding `data_parse` reads back, so a caller is not handed a bespoke
     /// format it has to learn.
     fn encode(&self) -> String {
+        let frame = self.encode_body();
+        if frame.len() <= MAX_RESULT {
+            return frame;
+        }
+        // The inner cap bounds the VALUE's encoding; this bounds the FRAME.
+        // Putting that encoding inside the outer map escapes it a second time,
+        // so a value that passed the inner cap can still produce a frame larger
+        // than the supervisor is willing to read — and a frame cut off by the
+        // supervisor's cap decodes as "the writer was killed mid-write", which
+        // is a lie about a process that exited cleanly.
+        self.oversized(frame.len())
+    }
+
+    /// The truncated-reference frame, which is small by construction.
+    fn oversized(&self, bytes: usize) -> String {
+        let mut map = cosmix_mix::IndexMap::new();
+        map.insert("ok".into(), Value::Bool(matches!(self, Self::Value(_))));
+        map.insert("truncated".into(), Value::Bool(true));
+        map.insert("bytes".into(), Value::String(bytes.to_string()));
+        Value::Map(std::rc::Rc::new(map))
+            .to_mix_data_string()
+            .unwrap_or_default()
+    }
+
+    fn encode_body(&self) -> String {
         let mut map = cosmix_mix::IndexMap::new();
         match self {
             Self::Value(value) => {
