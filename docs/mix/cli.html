@@ -1078,6 +1078,123 @@ crosses to the Bus thread:</p>
 <p><code>outcome</code> is the execution's verdict and <code>value.truncated</code> is a property of how
 much of the answer fitted. They are independent: a command that succeeded and
 returned more than 16 KiB still succeeded.</p>
+<h3 id="isolated-supervised-tasks-p4">Isolated supervised tasks (P4)</h3>
+<p><code>shell.task.submit</code> / <code>shell.task.result</code> / <code>shell.task.cancel</code> are the SECOND
+execution mode, and almost everything above does not apply to them. An
+evaluation runs inside the shell; a task is a separate process. It therefore
+has no prompt to be admitted at — <strong>BUSY is never a task refusal</strong>, and a task
+submitted while the human is mid-line runs anyway. That independence is the
+point of the mode.</p>
+<p>A submission carries exactly one of <code>source</code> (Mix text) or <code>argv</code> (program and
+arguments, never a shell string); both or neither is <code>INVALID_ARGUMENT</code>. <code>cwd</code>
+is required and must exist. <code>timeout_ms</code> is required, non-zero and capped at ten
+minutes. There is no stdin in v1: the task gets <code>/dev/null</code>, and a
+stdin-feeding task is a named future field rather than a silent absence.</p>
+<p><strong>The environment is enumerated, not inherited.</strong> A task starts from exactly:</p>
+<pre><code>HOME  USER  PATH  LANG  TERM=dumb
+COSMIX  COSMIX_SRC  COSMIX_BIN  COSMIX_ETC
+COSMIX_NODE_CONFIG  COSMIX_BROKER_ACCOUNT
+</code></pre>
+<p>plus the caller's <code>env</code> overlay, which WINS on a name collision. Those values
+are snapshotted when the shell STARTS, so a task sees the shell's startup PATH
+and not whatever the shell has since set. Nothing else crosses: a variable the
+shell sets at runtime does not reach a task, and the fixtures assert that as
+whole-set equality rather than by spot-checking names.</p>
+<p><strong>Termination is hard here, and it is the only hard guarantee in the surface.</strong>
+Cancel or timeout sends SIGTERM to the task's process GROUP, waits two seconds,
+then sends SIGKILL. The reported outcome is read from <code>wait()</code>, never from the
+fact that a signal was sent — a cancel request is still not proof a process
+stopped, but the wait status is. The outcome names the POLICY that ended the
+task (<code>timeout</code>, <code>cancelled</code>) with the signal beside it as <code>escalated_to</code>, so a
+deliberate deadline is never presented as an indistinguishable external kill.</p>
+<p>Between a cancel being accepted and <code>wait()</code> settling, <code>shell.task.result</code>
+reports <code>state: "cancelling"</code> — a real state, so a caller that asked for
+cancellation and reads <code>running</code> is not left wondering whether its request
+arrived.</p>
+<p>Streams are captured separately and exactly; this is the mode the manual points
+to when interactive attribution is only best-effort. Each is capped at 64 KiB of
+ENCODED text — what the reply actually costs, not what was read, because a NUL
+costs one byte to capture and six to encode — with the REAL byte count and a
+<code>truncated</code> flag reported, and truncation never turns a successful task into a
+failed one.</p>
+<p>A task's descendants can outlive it holding the inherited pipes open. Once the
+supervisor has its outcome the drains get the same two-second grace and then
+stop, and the stream reports <code>writer_survived: true</code>: the report says it stopped
+listening rather than presenting a bounded read as the whole of the output.
+Nothing waits on a process nobody is supervising, so a task that backgrounds a
+ten-minute sleeper still settles at once and gives back its concurrency slot.</p>
+<p>In <code>source</code> mode the value travels a dedicated descriptor rather than stdout —
+see <code>--result-fd</code> below — so a task that prints and a task that returns are not
+competing for one stream. <code>argv</code> mode has no interpreter value and says
+<code>not_applicable</code> rather than presenting an absent one as a failure.</p>
+<p><strong>Declared limits.</strong> A task's lifetime is bounded by the shell's, through two
+mechanisms because neither covers the other's case. <code>PR_SET_PDEATHSIG</code> binds the
+task LEADER to the supervisor thread that forked it, which is what survives a
+SIGKILL of the shell — no teardown hook runs then. But pdeathsig reaches the
+leader alone, so a normal exit would leave the leader's own children running;
+the shell therefore SIGKILLs every live task GROUP on its way out.</p>
+<p>The declared residual is narrower than "any grandchild": a process that leaves
+the task's group by calling <code>setsid</code> or <code>setpgid</code> for itself is outside both
+mechanisms and survives. That is the orphan case, stated rather than dressed up
+as a containment the implementation does not have.</p>
+<p><code>umask</code> and rlimits are inherited and are the operator's bound; the shell's own
+bounds are the concurrency cap (four), the timeout, and 4 KiB each for <code>argv</code>
+and the <code>env</code> overlay — sized to what the 8 KiB dispatch request can actually
+carry, so each is a limit a caller can really provoke rather than decoration.
+The two answer differently on purpose: an over-budget <code>env</code> overlay is
+<code>RESOURCE_LIMIT</code>, because the overlay is a quantity of state the shell declines
+to carry, while an over-budget <code>argv</code> is <code>INVALID_ARGUMENT</code>, because the command
+line itself is malformed for this surface.</p>
+<p>A spawn that fails is never <code>INVALID_ARGUMENT</code> — the request was well-formed,
+and the failure happened after validation accepted it. Which code it does get is
+decided by errno, because the two halves call for different responses. A program
+that is not there, or a <code>cwd</code> that stopped being a directory between validation
+and the fork, is <code>NOT_FOUND</code>: the caller named it and can correct it, and it is
+deliberately the same code validation gives for a missing <code>cwd</code>, so one mistake
+does not change its name depending on how fast the filesystem moved. Everything
+else — out of descriptors, out of memory, out of processes — is <code>RESOURCE_LIMIT</code>
+with <code>reason: "spawn_failed"</code>, which is the transient class: back off and retry.
+Either way the request id stays unspent, and the error set stays closed, so a
+caller can still switch on it exhaustively.</p>
+<p><strong>Advertised deferrals</strong>, refused explicitly rather than left to look like
+typos: <code>shell.task.watch</code> and <code>shell.task.list</code> answer <code>UNSUPPORTED</code> with
+<code>reason: "deferred"</code> — a bare code would be word-for-word what an unknown verb
+gets back, which is not an advertisement of anything (v1 is poll-only, through
+<code>shell.task.result</code>); there is no stdin feeding; there is no
+reply chunking (the 64 KiB caps stand in for it); and a task has no Bus identity
+of its own — it is supervised state inspectable through the owning shell, not a
+mesh citizen.</p>
+<h4 id="mix---result-fd-n"><code>mix --result-fd N</code></h4>
+<p><code>mix --result-fd N -c &lt;source&gt;</code> writes the final expression value, encoded by
+the interpreter's own strict-data serializer, to descriptor <code>N</code> as a
+big-endian u32 length followed by exactly that many bytes. <code>N</code> must be above
+stderr and must already be open; both are checked at startup and refused
+loudly, because a task promised a structured result that silently produced none
+is the failure with no symptom.</p>
+<p>The flag must precede <code>-c</code>, which consumes the rest of the line as script
+arguments, and it is refused outright without one: <code>-c</code> is the only mode that
+produces a value to frame, so accepting the flag anywhere else would promise a
+result that never arrives. Text streams are untouched: <code>-c</code> has never echoed its
+final value to stdout, so stdout stays the program's own output and the value
+travels the descriptor.</p>
+<p>The whole frame is capped at 64 KiB, not just the value inside it. The value is
+encoded once and then escaped again as it goes into the frame, so capping only
+the inner encoding let a quote-heavy value produce a frame too large to read —
+which the reader then saw as a writer killed mid-write. An oversized value comes
+back as a truncated reference instead: the caller learns a value existed, and
+how big it was.</p>
+<p>An evaluation stopped by a signal writes an ERROR frame naming the signal and
+exits non-zero. It has to: the interpreter catches SIGTERM for its own graceful
+shutdown, and a supervisor ends a task with exactly that signal — so without
+this, a cancelled task and one that genuinely returned nil produced identical
+successful frames. (A plain <code>mix -c</code> with no result descriptor still exits 0 on
+Ctrl-C; scripts depend on it, and that is not the case this rule is about.)</p>
+<p>The length prefix is what makes four situations distinguishable that an unframed
+stream collapses into one: nothing written at all (<code>result_missing</code>), a declared
+length the payload does not satisfy because the writer was killed mid-frame
+(<code>result_torn</code>), a partial frame the supervisor stopped waiting for because a
+survivor still held the pipe (<code>result_abandoned</code>), and a complete frame whose
+value reports that it was larger than the cap.</p>
 <h4 id="cancellation-and-what-it-is-actually-worth">Cancellation, and what it is actually worth</h4>
 <p><code>shell.execute.cancel</code> resolves one immutable evaluation identity. A request for
 an evaluation that has already finished says so and signals nothing, so a

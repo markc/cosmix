@@ -86,7 +86,11 @@ impl Default for Capabilities {
                 "UNSUPPORTED"
             },
             input: "UNSUPPORTED",
-            isolated_task: "UNSUPPORTED",
+            // Unlike evaluation submit, this does NOT depend on the editor:
+            // a task is a separate process and does not touch the prompt, so
+            // it is available on the rustyline path and while the shell is
+            // busy. That independence is the mode's entire purpose.
+            isolated_task: "supervised-process; poll-only (no watch/list)",
             events: "UNSUPPORTED",
         }
     }
@@ -211,7 +215,17 @@ pub(crate) async fn dispatch(
     let capability = match command.command.as_str() {
         crate::session_execute::SUBMIT
         | crate::session_execute::RESULT
-        | crate::session_execute::CANCEL => Capability::Execute,
+        | crate::session_execute::CANCEL
+        // Tasks are the same authority: an isolated task is still this
+        // principal causing this shell to run code, and the isolation is about
+        // the process, not about who may ask for one.
+        | crate::session_execute::TASK_SUBMIT
+        | crate::session_execute::TASK_RESULT
+        | crate::session_execute::TASK_CANCEL
+        // The advertised deferrals are gated too, so their UNSUPPORTED is only
+        // visible to a caller that could otherwise have used them.
+        | crate::session_execute::TASK_WATCH
+        | crate::session_execute::TASK_LIST => Capability::Execute,
         _ => Capability::ReadState,
     };
     if !tokio::time::timeout(

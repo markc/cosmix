@@ -1,0 +1,119 @@
+-- Hard gate: the P4 isolated-task fixtures actually RUN.
+--
+-- Sibling of check-stage-d-gates.mix, and pinned the same two ways. libtest
+-- exits 0 when its filter matches nothing, so a renamed module, a moved file or
+-- a mistyped filter would otherwise leave this passing while running zero
+-- fixtures; the COUNT catches that. And a prefix filter would happily run some
+-- other set of the same size, so every NAME is pinned too.
+--
+-- What these fixtures are for, in one line each: a task inherits nothing it was
+-- not given; its termination is hard rather than cooperative; its outcome comes
+-- from wait() and not from having sent a signal; what it LEAVES BEHIND cannot
+-- hold the shell hostage; and its bounds and deferrals are stated rather than
+-- silent. The Term half proves the same surface survives the forward, with
+-- addressing scoped by actor AND by kind.
+--
+-- Run from the repository src/ directory, like its siblings.
+
+$shell_prefix = "p4_"
+$shell_fixtures = [
+  "p4_a_survivor_cannot_wedge_the_supervisor",
+  "p4_a_task_inherits_only_what_it_was_given",
+  "p4_both_modes_report_accurately_and_the_surfaces_stay_separate",
+  "p4_bounds_are_reported_and_refusals_leave_no_trace",
+  "p4_termination_is_hard_and_the_outcome_names_the_policy"
+]
+$shell_expected = length($shell_fixtures)
+
+-- The Term half. Full path so a module rename cannot be absorbed by a prefix.
+-- This gate used to CLAIM the Term forward was covered by the stage-D fixture;
+-- it was not. That fixture forwards term.execute, which exercises none of the
+-- task body builder, the kind-scoped addressing or the task capability rows.
+$term_fixtures = [
+  "native_session::enforcement_tests::p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind"
+]
+$term_expected = length($term_fixtures)
+
+$root = cwd()
+if not exists($root + "/desktop/apps/term/src/control.rs") then
+  print("GATE BLOCKED: run from the repository src/ directory")
+  exit(2)
+end
+
+-- The PTY fixtures refuse an installed or stale binary: they compare the Mix
+-- build's git sha against HEAD and require a clean checkout. Build it here so
+-- the gate cannot be satisfied by whatever happens to be lying in target/.
+-- RUSTC_WRAPPER disabled as in every sibling gate: a caching layer must never
+-- be able to decide whether a gate runs at all.
+print("building the current-HEAD Mix the fixtures require ...")
+$build = run_argv(["cargo", "build", "--release", "-p", "cosmix-mix"], {timeout: 3000, env: {"RUSTC_WRAPPER": ""}})
+if $build["exit_code"] != 0 then
+  print($build["stderr"])
+  print("GATE BLOCKED: could not build cosmix-mix; an unbuilt binary is not a pass")
+  exit(2)
+end
+
+print("running " + $shell_expected + " P4 task fixtures ...")
+$run = run_argv(
+  ["cargo", "test", "-p", "cosmix-mix", "--test", "native_session_pty", $shell_prefix, "--", "--test-threads=1"],
+  {timeout: 3000, env: {"RUSTC_WRAPPER": ""}}
+)
+print($run["stdout"])
+if $run["exit_code"] != 0 then
+  print($run["stderr"])
+  print("GATE FAIL: the P4 task suite did not pass")
+  exit(1)
+end
+
+$want = "test result: ok. " + $shell_expected + " passed"
+if not contains($run["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  print("A zero-match filter, a renamed module or a deleted fixture all exit 0;")
+  print("the count is what tells them apart from a real run.")
+  exit(1)
+end
+
+-- The count alone would accept a set of the same size that is not this set.
+for $fixture in $shell_fixtures
+  if not contains($run["stdout"], $fixture) then
+    print("GATE FAIL: " + $fixture + " did not run")
+    exit(1)
+  end
+end
+
+-- Half two: the Term forward, which is #[ignore]'d and needs the built binary.
+$binary = $root + "/target/release/mix"
+if not exists($binary) then
+  print("GATE BLOCKED: " + $binary + " missing after a successful build")
+  exit(2)
+end
+print("running " + $term_expected + " P4 Term fixture ...")
+$argv = concat(
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  $term_fixtures
+)
+$term = run_argv($argv, {
+  timeout: 3000,
+  env: {COSMIX_E2E_MIX_BIN: $binary, "RUSTC_WRAPPER": ""}
+})
+print($term["stdout"])
+if $term["exit_code"] != 0 then
+  -- Cargo puts the compile log on stderr and libtest puts the PANIC there too,
+  -- so a tail of it shows warnings and cuts off the one line that says what
+  -- failed. Print the failure section explicitly: a gate that can say something
+  -- broke but not what is half a gate.
+  print("---- the failing fixture's own output ----")
+  print($term["stderr"])
+  print("GATE FAIL: the P4 Term fixture did not pass")
+  exit(1)
+end
+$want = "test result: ok. " + $term_expected + " passed"
+if not contains($term["stdout"], $want) then
+  print("GATE FAIL: expected '" + $want + "'")
+  exit(1)
+end
+
+print("GATE PASS: " + $shell_expected + " P4 shell fixtures and " + $term_expected + " Term fixture ran and passed")
+print("NOT covered here: the S4 recipient-enforcement suite is check-s4-gates.mix,")
+print("and p0i-01 belongs to check-production-e2e.mix.")
+exit(0)

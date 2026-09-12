@@ -61,6 +61,9 @@ fallback for mutations.
 | `term.execute` | `execute` | `source`, `prompt_generation`, mutation ID/epoch; forwarded to the pane shell's own admission surface |
 | `term.exec.result` | `execute` | `operation_id`: the forwarded execution's state and, once it has one, its result |
 | `term.exec.cancel` | `execute` | `operation_id`: cancel that execution; cooperative, and the reply says what actually happened |
+| `term.task.submit` | `execute` | `source` XOR `argv`, `cwd`, `env`, `timeout_ms`, mutation ID/epoch; forwarded to the pane shell's isolated-task surface |
+| `term.task.result` | `execute` | `operation_id`: the task's state (`running`, `cancelling`, `settled`) and, once settled, its outcome, streams and structured result |
+| `term.task.cancel` | `execute` | `operation_id`: SIGTERM to the task group, 2s grace, then SIGKILL — the one HARD termination in the surface |
 | `term.operation` | `read_state` | `operation_id`: retrieve the caller's retained operation outcome |
 
 Layout requests supply `affected`, an array of additional explicit targets,
@@ -116,6 +119,43 @@ supplied field, which would let one agent announce itself as another — and the
 child renders it through the same allowlist escape as the source, as
 `<originator> via Term …`. The "via" is load-bearing: the child authenticated
 Term, not the name Term relayed.
+
+## Isolated tasks
+
+`term.task.*` mirrors `term.exec.*` mechanically — same capability, same epoch
+rule, same forwarded-id mapping, same retry discipline, same non-retention of
+local placeholders — and forwards to the child, which owns every decision about
+whether a task may run. Term adds no task state machinery of its own.
+
+Two differences are deliberate. The forwarded-id map stays keyed
+`(identity, sequence)` and is NOT split by family: splitting it would let one
+caller request ID mint a fresh forwarded ID on each surface and BOTH execute.
+Family scoping applies to ADDRESSING only, so `term.exec.result` cannot read a
+task operation and `term.task.result` cannot read an evaluation — each refuses
+a foreign ID exactly as it refuses an unknown one.
+
+And a task submission carries no principal label. A task never renders into the
+pane, so there is no announcement for one to appear in; the visible-echo rule
+is about interactive submissions in an attached human pane, and an isolated task
+is neither.
+
+Term relays the `source`/`argv` union exactly as sent and never picks a side, so
+both-or-neither reaches the child's own refusal rather than being resolved at
+the hop. Absent fields are OMITTED rather than relayed as JSON `null`: a null is
+a present field of the wrong type, so it earns a malformed-body complaint about
+Term's own framing instead of the child's honest answer about the caller's
+request.
+
+Non-retention has one addition for tasks. A refusal that is about the child's
+LOAD rather than the request — `RESOURCE_LIMIT` at the concurrency cap, or
+`UNAVAILABLE` when the machine could not start the work — settles nothing, so
+Term relays it without recording it. The documented remedy for both is to back
+off and retry the same submission, and a retry only reaches the child's own
+dedupe if Term did not answer from a record first.
+
+The full task contract — the enumerated environment, the termination ladder, the
+caps and the advertised deferrals — is in the Mix manual under "Isolated
+supervised tasks" (`mix man cli`).
 
 ## Live properties
 

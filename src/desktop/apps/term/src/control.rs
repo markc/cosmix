@@ -60,6 +60,16 @@ struct Request {
     source: Option<String>,
     #[serde(default)]
     prompt_generation: Option<DecimalU64>,
+    /// Task family. Relayed as sent — Term never resolves the source/argv
+    /// union, so both-or-neither reaches the child's own refusal.
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    timeout_ms: Option<DecimalU64>,
 }
 
 #[derive(Clone)]
@@ -235,7 +245,28 @@ struct State {
     /// without it a sibling agent that guesses an operation id reads another
     /// agent's result — up to 16 KiB of whatever that shell printed — or
     /// cancels its evaluation.
-    operations: HashMap<u64, String>,
+    operations: HashMap<u64, (String, Family)>,
+}
+
+/// Which surface an operation belongs to.
+///
+/// Scopes ADDRESSING only. The forwarded-id map is deliberately NOT split by
+/// this: one caller request id must map to one forwarded id across both
+/// surfaces, or the same id could mint a fresh operation on each and both would
+/// execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Family {
+    Execute,
+    Task,
+}
+impl Family {
+    fn of(verb: &str) -> Self {
+        if verb.starts_with("term.task.") {
+            Self::Task
+        } else {
+            Self::Execute
+        }
+    }
 }
 
 /// What Term already knows about a caller request it is being asked to forward.
@@ -639,7 +670,12 @@ impl Control {
         // those locks are taken.
         if matches!(
             verb,
-            "term.execute" | "term.exec.result" | "term.exec.cancel"
+            "term.execute"
+                | "term.exec.result"
+                | "term.exec.cancel"
+                | "term.task.submit"
+                | "term.task.result"
+                | "term.task.cancel"
         ) {
             return self
                 .forward_execute(connection, actor, verb, &request, &identity, digest)
@@ -949,7 +985,7 @@ impl Control {
     }
 
     /// Bind a child-minted operation id to the actor that caused it.
-    fn claim_operation(&self, identity: &str, operation: u64) {
+    fn claim_operation(&self, identity: &str, operation: u64, family: Family) {
         let mut state = self.state.lock().unwrap();
         // Bounded with the history it belongs to; an id whose mapping is gone
         // answers like an unknown one, which is a refusal and never a leak.
@@ -958,17 +994,17 @@ impl Control {
         {
             state.operations.remove(&victim);
         }
-        state.operations.insert(operation, identity.to_owned());
+        state.operations.insert(operation, (identity.to_owned(), family));
     }
     /// Whether `identity` may address `operation` at all. An unmapped id is
     /// treated as somebody else's, not as public.
-    fn owns_operation(&self, identity: &str, operation: u64) -> bool {
+    fn owns_operation(&self, identity: &str, operation: u64, family: Family) -> bool {
         self.state
             .lock()
             .unwrap()
             .operations
             .get(&operation)
-            .is_some_and(|owner| owner == identity)
+            .is_some_and(|(owner, owned_family)| owner == identity && *owned_family == family)
     }
 
     /// Retain a completed mutation's outcome so a retry replays it.
@@ -1084,22 +1120,84 @@ impl Control {
                     Some(sequence),
                 )
             }
+            // A task submission mirrors the evaluation one mechanically: same
+            // epoch rule, same forwarded-id mapping, same retry discipline.
+            // What it does NOT carry is `on_behalf_of` — a task never renders
+            // into the pane, so there is no announcement for a principal to
+            // appear in, and sending the field would be refused by the child's
+            // `deny_unknown_fields`.
+            "term.task.submit" => {
+                let Some(sequence) = request.request_id.map(|id| id.0).filter(|id| *id > 0) else {
+                    return Reply::error("INVALID_ARGUMENT");
+                };
+                match request.request_epoch {
+                    None => return Reply::error("INVALID_ARGUMENT"),
+                    Some(epoch) if epoch != actor.connection_id => {
+                        return Reply::error("UNKNOWN_OUTCOME");
+                    }
+                    Some(_) => {}
+                }
+                // The SAME forwarded map as evaluations, keyed (identity,
+                // sequence) and not split by kind: splitting it would let one
+                // caller request id mint a fresh forwarded id on each surface
+                // and BOTH execute.
+                let forwarded = match self.forwarded_id(identity, sequence, digest) {
+                    Forward::Conflict => return Reply::refuse("CONFLICT", Some(mismatch())),
+                    Forward::Retry(id) => id,
+                    Forward::Fresh(id) => {
+                        if let Err(reply) = self.reserve_request_id(identity, sequence, digest) {
+                            return reply;
+                        }
+                        id
+                    }
+                };
+                let mut body = json!({
+                    "version": 1,
+                    "target": child_target,
+                    "request_id": DecimalU64(forwarded),
+                    "env": request.env,
+                });
+                // Absent fields are OMITTED, never sent as null. A relayed null
+                // is a present field of the wrong type, so the child answers
+                // INVALID_REQUEST — a malformed-body complaint — where it
+                // should be applying its own default or answering
+                // INVALID_ARGUMENT about a value the caller actually chose.
+                if let Some(cwd) = &request.cwd {
+                    body["cwd"] = json!(cwd);
+                }
+                if let Some(timeout_ms) = request.timeout_ms {
+                    body["timeout_ms"] = json!(timeout_ms);
+                }
+                // The discriminated union is relayed as the caller sent it;
+                // Term does not choose a side, so "both" and "neither" reach
+                // the child's own refusal rather than being resolved here.
+                if let Some(source) = &request.source {
+                    body["source"] = json!(source);
+                }
+                if let Some(argv) = &request.argv {
+                    body["argv"] = json!(argv);
+                }
+                ("shell.task.submit", body, Some(sequence))
+            }
             // Reading a result and cancelling are idempotent against one
-            // immutable evaluation identity, so neither spends a request id.
+            // immutable identity, so neither spends a request id.
             _ => {
                 let Some(operation) = request.operation_id else {
                     return Reply::error("INVALID_ARGUMENT");
                 };
-                // Scoped to the actor that submitted it, and refused exactly
-                // like an id that does not exist — so the surface cannot be
-                // used to discover which operation numbers are live.
-                if !self.owns_operation(identity, operation.0) {
+                let family = Family::of(verb);
+                // Scoped to the actor that submitted it AND to the family it
+                // belongs to, refused exactly like an id that does not exist —
+                // so neither surface can read the other's operations, and
+                // neither can be used to discover which numbers are live.
+                if !self.owns_operation(identity, operation.0, family) {
                     return Reply::error("UNKNOWN_OUTCOME");
                 }
-                let shell_verb = if verb == "term.exec.cancel" {
-                    "shell.execute.cancel"
-                } else {
-                    "shell.execute.result"
+                let shell_verb = match verb {
+                    "term.exec.cancel" => "shell.execute.cancel",
+                    "term.task.cancel" => "shell.task.cancel",
+                    "term.task.result" => "shell.task.result",
+                    _ => "shell.execute.result",
                 };
                 (
                     shell_verb,
@@ -1134,7 +1232,7 @@ impl Control {
                     .as_str()
                     .and_then(|id| id.parse::<u64>().ok())
                 {
-                    self.claim_operation(identity, operation);
+                    self.claim_operation(identity, operation, Family::of(verb));
                 }
                 value["target"] = json!(request.target);
                 if let Some(sequence) = sequence {
@@ -1145,13 +1243,33 @@ impl Control {
             // The child's refusal is ITS answer about ITS prompt. Term relays
             // it rather than replacing it with a guess, because BUSY and
             // STALE_GENERATION tell the caller two different things to do next.
-            Ok(Err(error)) => (shell_refusal(&error.to_string(), sequence.is_some()), true),
+            Ok(Err(error)) => {
+                let body = error.to_string();
+                // A refusal about the child's own LOAD settles nothing about
+                // this request. Retaining one replays "too many tasks" for that
+                // id forever, while the documented move for both codes is to
+                // back off and retry the same submission — which only reaches
+                // the child's dedupe if Term did not record the refusal.
+                let transient = matches!(refusal_code(&body).as_deref(), Some("RESOURCE_LIMIT"));
+                (shell_refusal(&body, sequence.is_some()), !transient)
+            }
             // A submission whose answer never arrived may or may not have been
             // admitted. The caller's route forward is `term.exec.result`, or a
             // byte-identical retry that re-forwards to the child's dedupe —
             // which is only possible because this is not recorded.
-            Err(_) if sequence.is_some() => (Reply::error("UNKNOWN_OUTCOME"), false),
-            Err(_) => (Reply::error("DISCONNECTED"), false),
+            //
+            // The REASON is logged because it cannot be relayed: the caller is
+            // told "unknown", which is all Term honestly knows about its
+            // request, but an operator holding the logs should not have to
+            // guess whether the child was slow, gone, or never asked.
+            Err(error) if sequence.is_some() => {
+                eprintln!("term control: {verb} -> {shell_verb} child call failed ({error}); reporting unknown outcome");
+                (Reply::error("UNKNOWN_OUTCOME"), false)
+            }
+            Err(error) => {
+                eprintln!("term control: {verb} -> {shell_verb} child call failed ({error})");
+                (Reply::error("DISCONNECTED"), false)
+            }
         };
         if reply.body.len() > 256 * 1024 {
             reply = Reply::error(if sequence.is_some() {
@@ -1221,11 +1339,15 @@ impl Control {
     }
 }
 
-/// The dedupe digest covers the request bytes as sent, deliberately: this
-/// recipient does not canonicalise, so two encodings of the same object are two
-/// different payloads. A retry MUST replay the body byte for byte, and the
-/// refusal says so rather than leaving a caller to guess why its "identical"
-/// retry conflicted.
+/// The child's own error code, if its answer was shaped like a refusal at all.
+fn refusal_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error_code")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Translate the pane shell's refusal into Term's vocabulary. The child speaks
 /// almost the same one; the two that differ are spelled differently for the
 /// same meaning, and anything unrecognised is reported as an unknown outcome
@@ -1257,25 +1379,89 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         }
     };
     match code.as_str() {
-        "BUSY" => relayed("BUSY"),
-        "STALE_GENERATION" => relayed("STALE_GENERATION"),
-        "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
-        "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
-        "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
-        "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
+        // THREE deliberate exceptions, and nothing else is enumerated here.
+        //
+        // The map used to list the codes it would relay, which meant every
+        // code the child learned to send had to be added to it — and any that
+        // was not reached callers as UNKNOWN_OUTCOME, the one answer that says
+        // "your request may have run". NOT_FOUND and INVALID_ARGUMENT both sat
+        // in that hole. Enumerating the EXCEPTIONS instead makes the default
+        // relay: a new child code arrives with its own name, not as a mystery.
+        //
+        // Two spellings genuinely differ between the surfaces.
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
         // A settled denial: the child looked at the request and said no.
         "REFUSED" => Reply::error("FORBIDDEN"),
-        // Everything else is a shape Term does not recognise. Flattening those
-        // to FORBIDDEN was wrong in both directions: it reads as a policy
-        // decision Term never made, and for a transient it tells the caller to
-        // stop when it should retry. An unrecognised answer to a mutation is an
-        // unknown outcome; to a read, a transport-shaped failure.
-        _ if mutation => Reply::error("UNKNOWN_OUTCOME"),
-        _ => Reply::error("DISCONNECTED"),
+        // And a conflict carries TERM's retry contract — byte-identical body —
+        // which is Term's rule to state, not the child's.
+        "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
+        // Everything in the vocabulary relays under its own name. Denials stay
+        // uniform and detail-free; `relayed` already declines to attach an
+        // empty body, and a denial carries none.
+        other => match vocabulary(other) {
+            // Denials stay uniform and detail-free: a refusal that says what it
+            // refused is a refusal that leaks. That rule predates this
+            // inversion and the inversion must not quietly widen it.
+            Some(denial @ ("FORBIDDEN" | "UNSUPPORTED")) => Reply::error(denial),
+            Some(known) => relayed(known),
+            // Outside the vocabulary, or never shaped like a refusal at all.
+            // Flattening these to FORBIDDEN was wrong in both directions: it
+            // reads as a policy decision Term never made, and for a transient
+            // it tells the caller to stop when it should retry. An
+            // unrecognised answer to a mutation is an unknown outcome; to a
+            // read, a transport-shaped failure.
+            //
+            // Logged with the BODY, because this arm is where an answer that
+            // was never a refusal disappears without trace. The caller is told
+            // "unknown" — which is true — but that is no reason for the
+            // operator to be told nothing.
+            None if mutation => {
+                eprintln!(
+                    "term control: unrecognised child answer, reporting unknown outcome: {body}"
+                );
+                Reply::error("UNKNOWN_OUTCOME")
+            }
+            None => {
+                eprintln!("term control: unrecognised child answer: {body}");
+                Reply::error("DISCONNECTED")
+            }
+        },
     }
 }
 
+/// Term's CLOSED error vocabulary, returning the `'static` token so a code can
+/// be relayed without an arm of its own.
+///
+/// This list and `FailureCode` are held to the same set by
+/// `every_failure_code_can_be_relayed`, whose exhaustive match fails to build
+/// THE TEST TARGET if a variant is added without a token here. That is a
+/// `cargo test` build, not a production one — so the guard catches the drift at
+/// the gate rather than at `cargo build`, which is where this suite runs
+/// anyway. It is the drift that put NOT_FOUND and INVALID_ARGUMENT in the
+/// unknown-outcome hole to begin with.
+fn vocabulary(code: &str) -> Option<&'static str> {
+    const KNOWN: &[&str] = &[
+        "INVALID_ARGUMENT",
+        "NOT_FOUND",
+        "STALE_GENERATION",
+        "CONFLICT",
+        "BUSY",
+        "FORBIDDEN",
+        "UNSUPPORTED",
+        "RESOURCE_LIMIT",
+        "DISCONNECTED",
+        "EXPIRED",
+        "CANCELLED",
+        "UNKNOWN_OUTCOME",
+    ];
+    KNOWN.iter().copied().find(|known| *known == code)
+}
+
+/// The dedupe digest covers the request bytes as sent, deliberately: this
+/// recipient does not canonicalise, so two encodings of the same object are two
+/// different payloads. A retry MUST replay the body byte for byte, and the
+/// refusal says so rather than leaving a caller to guess why its "identical"
+/// retry conflicted.
 fn mismatch() -> Value {
     json!({"reason":"request_mismatch","retry_requires":"byte_identical_body"})
 }
@@ -1323,6 +1509,9 @@ pub(crate) fn capability_of(verb: &str, contents: bool) -> Option<Capability> {
         // One capability for the whole execute family. Asking what an execution
         // did is asking about an execution.
         "term.execute" | "term.exec.result" | "term.exec.cancel" => Capability::Execute,
+        // Same authority: an isolated task is still this principal causing
+        // this shell to run code. The isolation is about the process.
+        "term.task.submit" | "term.task.result" | "term.task.cancel" => Capability::Execute,
         _ => return None,
     })
 }
@@ -1395,5 +1584,71 @@ pub fn allows(
                 && s.pane_generation == Some(target.pane_generation)
                 && s.capabilities.contains(&capability)
         }
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+
+    /// The relay map and Term's error enum must be the same set.
+    ///
+    /// The match below has no wildcard, so adding a `FailureCode` variant
+    /// without giving it a token here fails to compile THIS TEST — the gate
+    /// stops, rather than a code silently reaching callers as UNKNOWN_OUTCOME.
+    /// That silence is exactly what happened to NOT_FOUND and INVALID_ARGUMENT.
+    #[test]
+    fn every_failure_code_can_be_relayed() {
+        fn token(code: &FailureCode) -> &'static str {
+            match code {
+                FailureCode::InvalidArgument => "INVALID_ARGUMENT",
+                FailureCode::NotFound => "NOT_FOUND",
+                FailureCode::StaleGeneration => "STALE_GENERATION",
+                FailureCode::Conflict => "CONFLICT",
+                FailureCode::Busy => "BUSY",
+                FailureCode::Forbidden => "FORBIDDEN",
+                FailureCode::Unsupported => "UNSUPPORTED",
+                FailureCode::ResourceLimit => "RESOURCE_LIMIT",
+                FailureCode::Disconnected => "DISCONNECTED",
+                FailureCode::Expired => "EXPIRED",
+                FailureCode::Cancelled => "CANCELLED",
+                FailureCode::UnknownOutcome => "UNKNOWN_OUTCOME",
+            }
+        }
+        for code in [
+            FailureCode::InvalidArgument,
+            FailureCode::NotFound,
+            FailureCode::StaleGeneration,
+            FailureCode::Conflict,
+            FailureCode::Busy,
+            FailureCode::Forbidden,
+            FailureCode::Unsupported,
+            FailureCode::ResourceLimit,
+            FailureCode::Disconnected,
+            FailureCode::Expired,
+            FailureCode::Cancelled,
+            FailureCode::UnknownOutcome,
+        ] {
+            let token = token(&code);
+            assert_eq!(vocabulary(token), Some(token), "{token} is not relayable");
+            // And the token is the wire spelling the enum itself serialises to,
+            // so the two halves cannot disagree about what a code is called.
+            let body = Reply::error(vocabulary(token).expect("in vocabulary")).body;
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).expect("a refusal body")["error_code"],
+                json!(token)
+            );
+        }
+    }
+
+    /// A child code Term has never heard of must NOT relay.
+    #[test]
+    fn an_unknown_code_is_not_in_the_vocabulary() {
+        assert_eq!(vocabulary("TEAPOT"), None);
+        assert_eq!(vocabulary(""), None);
+        // Spelling differences are handled as explicit exceptions, not by the
+        // vocabulary: these are the child's words, not Term's.
+        assert_eq!(vocabulary("INVALID_REQUEST"), None);
+        assert_eq!(vocabulary("REFUSED"), None);
     }
 }

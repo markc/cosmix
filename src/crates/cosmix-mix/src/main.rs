@@ -36,6 +36,8 @@ mod node_config;
 mod repl;
 mod repl_editor;
 mod serve_runtime;
+mod result_fd;
+mod session_task;
 mod session_execute;
 mod session_state;
 mod session_status;
@@ -208,38 +210,42 @@ pub(crate) fn build_runtime() -> tokio::runtime::Runtime {
     }
 }
 
-/// Wait for SIGTERM (systemd stop) or Ctrl-C, whichever fires first.
+/// Wait for SIGTERM (systemd stop) or Ctrl-C, whichever fires first, and return
+/// which one it was.
+///
+/// The number is load-bearing for `--result-fd`: a task supervisor ends its
+/// child with SIGTERM, and the result frame has to say so rather than present a
+/// killed evaluation as a successful nil.
 ///
 /// Inlined here so mix has no dependency on the cos-side
 /// `cosmix-lib-daemon` crate; behaviour-parity with that crate's
 /// `shutdown_signal()`.
-async fn shutdown_signal() {
+async fn shutdown_signal() -> i32 {
     let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
-    {
-        // Registration failure leaves Ctrl-C as the available graceful path;
-        // do not bypass the evaluator's final stats flush.
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = ctrl_c => {}
-                    _ = sigterm.recv() => {}
-                }
-            }
-            Err(e) => {
-                eprintln!("mix: failed to register SIGTERM handler: {}", e);
-                let _ = ctrl_c.await;
-            }
+    // Registration failure leaves Ctrl-C as the available graceful path;
+    // do not bypass the evaluator's final stats flush.
+    let signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => tokio::select! {
+            _ = ctrl_c => libc::SIGINT,
+            _ = sigterm.recv() => libc::SIGTERM,
+        },
+        Err(e) => {
+            eprintln!("mix: failed to register SIGTERM handler: {}", e);
+            let _ = ctrl_c.await;
+            libc::SIGINT
         }
-    }
+    };
 
     #[cfg(not(unix))]
-    {
+    let signal = {
         ctrl_c.await.ok();
-    }
+        libc::SIGINT
+    };
 
-    tracing::info!("shutdown signal received");
+    tracing::info!(signal, "shutdown signal received");
+    signal
 }
 
 fn print_help() {
@@ -611,7 +617,13 @@ fn run_source(
 /// - A leading `time` is a MODIFIER, resolved before both (see
 ///   `shell::strip_time_prefix`), so `ssh host 'time shwho'` times the command
 ///   instead of hunting PATH for a `time` binary that does not exist.
-fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelude: bool) -> i32 {
+fn run_command_line(
+    code: &str,
+    load_rc: bool,
+    script_args: &[String],
+    no_prelude: bool,
+    result_fd: Option<crate::result_fd::ResultFd>,
+) -> i32 {
     cosmix_mix::set_script_argv(script_args.to_vec());
     // `-c`/stdin has no file, so its frames carry `file: None`; store under
     // `None` to match, enabling the offending-line footer for `-c` too.
@@ -743,23 +755,60 @@ fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelud
                 // Race execution (+ the event pump, for any `on` handlers)
                 // against Ctrl-C, exactly as run_source does, so a `-c` body
                 // that registers handlers can still be interrupted.
-                let res: Result<(), cosmix_mix::error::MixError> = tokio::select! {
+                // The VALUE is kept, not discarded, when a result fd is
+                // present. `-c` has never echoed it to stdout, so nothing is
+                // being suppressed here — the property the task contract wants
+                // (stdout is the program's text, the value travels the fd)
+                // already held, and this preserves it rather than creating it.
+                // Err(signal) is the shutdown arm. It has to stay distinguishable
+                // all the way to the frame: a task's supervisor ends it with
+                // SIGTERM, so folding that into `Ok(Value::Nil)` wrote a
+                // SUCCESSFUL result for a killed evaluation — a cancelled task
+                // and a task that genuinely returned nil became the same report.
+                let res: Result<Result<Value, cosmix_mix::error::MixError>, i32> = tokio::select! {
                     biased;
-                    _ = shutdown_signal() => Ok(()),
+                    signal = shutdown_signal() => Err(signal),
                     r = async {
-                        eval.execute(&stmts).await?;
+                        let value = eval.execute(&stmts).await?;
                         if eval.handler_count() > 0 {
                             eval.run_event_pump().await?;
                         }
-                        Ok(())
-                    } => r,
+                        Ok(value)
+                    } => Ok(r),
                 };
+                let framed = result_fd.is_some();
+                if let Some(result_fd) = result_fd {
+                    let payload = match &res {
+                        Err(signal) => crate::result_fd::Payload::Error(format!(
+                            "interrupted by signal {signal} before the evaluation finished"
+                        )),
+                        Ok(Ok(value)) => crate::result_fd::Payload::Value(value.clone()),
+                        Ok(Err(error)) => crate::result_fd::Payload::Error(format!("{error}")),
+                    };
+                    if let Err(error) = result_fd.write(&payload) {
+                        // Loud, because a missing frame is reported by the
+                        // supervisor as `result_missing` and the operator would
+                        // otherwise have no way to learn why.
+                        eprintln!("mix: --result-fd: could not write the result frame: {error}");
+                    }
+                }
                 match res {
-                    Ok(_) => 0,
-                    Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
+                    // Only the framed caller's exit code changes. A plain
+                    // `mix -c` stopped by Ctrl-C or systemd has always been a
+                    // clean 0 and scripts depend on it; a task's shell is the
+                    // one that must not exit 0 after being killed.
+                    Err(signal) => {
+                        if framed {
+                            128 + signal
+                        } else {
+                            0
+                        }
+                    }
+                    Ok(Ok(_)) => 0,
+                    Ok(Err(cosmix_mix::error::MixError::ExitRequest { code })) => code,
                     // Match run_source: a Ctrl-C interrupt is a clean exit.
-                    Err(e) if format!("{e}").contains("interrupted") => 0,
-                    Err(e) => {
+                    Ok(Err(e)) if format!("{e}").contains("interrupted") => 0,
+                    Ok(Err(e)) => {
                         print_uncaught(&e);
                         1
                     }
@@ -1498,6 +1547,11 @@ fn check_syntax(source: &str, filename: &str) -> i32 {
 const MAIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 fn main() {
+    // Before native_session::start(), because that begins Bus dispatch and a
+    // shell.task.submit can arrive immediately. Every invocation mode serves
+    // the task verbs, so capturing this from the REPL alone would leave a
+    // `mix -c` session handing tasks an environment with no PATH at all.
+    session_task::capture_base_env();
     native_session::start();
     job_control::stage_entry();
     let handle = std::thread::Builder::new()
@@ -1506,6 +1560,10 @@ fn main() {
         .spawn(real_main)
         .expect("spawn mix evaluation thread");
     let code = handle.join().unwrap_or(101);
+    // Kill-on-drop: pdeathsig reaches each task LEADER when its supervisor
+    // thread goes, but nothing would reach the leader's own children. This is
+    // the only point every invocation mode passes through on the way out.
+    session_task::sweep();
     std::process::exit(code);
 }
 
@@ -1523,6 +1581,7 @@ fn real_main() -> i32 {
     let mut i = 1;
     let mut no_prelude = false;
     let mut interactive_rc = false;
+    let mut result_fd: Option<crate::result_fd::ResultFd> = None;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
@@ -1589,7 +1648,52 @@ fn real_main() -> i32 {
                 }
                 let code = &args[i];
                 let script_args: Vec<String> = args[i + 1..].to_vec();
-                return run_command_line(code, interactive_rc, &script_args, no_prelude);
+                return run_command_line(code, interactive_rc, &script_args, no_prelude, result_fd);
+            }
+            "--result-fd" => {
+                i += 1;
+                let raw = args.get(i).and_then(|value| value.parse::<i32>().ok());
+                let Some(raw) = raw else {
+                    eprintln!("mix: --result-fd requires a descriptor number");
+                    return 2;
+                };
+                // `-c` is the only mode that produces a value to frame. Without
+                // one the flag would be accepted and then quietly ignored,
+                // which is the same silent-no-result failure the validation
+                // below exists to prevent — so refuse it here too.
+                //
+                // It must match how the loop below actually PARSES, not merely
+                // whether the token appears: `-c` takes the next argument as
+                // its source, so a trailing `-c` with nothing after it — or one
+                // that a script path has already consumed as an argument — is
+                // not a `-c` mode at all. Searching for the token alone
+                // accepted `mix --result-fd 3 script.mix -c` and then ran the
+                // script, silently framing nothing.
+                let has_code_mode = args[i + 1..]
+                    .iter()
+                    .position(|arg| arg == "-c")
+                    .is_some_and(|at| {
+                        // Every token before it must be a flag; the first
+                        // non-flag is a script path, and the mode is settled.
+                        args[i + 1..][..at].iter().all(|arg| arg.starts_with('-'))
+                            && args[i + 1..].len() > at + 1
+                    });
+                if !has_code_mode {
+                    eprintln!("mix: --result-fd is only meaningful with -c <source>");
+                    return 2;
+                }
+                // Refuse at startup, before any user code runs. A task promised
+                // a structured result that silently produced none is the
+                // failure with no symptom.
+                match crate::result_fd::ResultFd::validate(raw) {
+                    Ok(validated) => result_fd = Some(validated),
+                    Err(error) => {
+                        eprintln!("mix: {error}");
+                        return 2;
+                    }
+                }
+                i += 1;
+                continue;
             }
             "--no-prelude" => {
                 no_prelude = true;

@@ -102,6 +102,11 @@ fn exec_restart(eval: &mut Evaluator, rl: &mut Editor, history_path: &std::path:
         .to_string_lossy()
         .into_owned();
     eprintln!("Restarting Mix...");
+    // A restart REPLACES this process, so main()'s exit sweep never runs and
+    // pdeathsig never fires — the image lives on under the same pid. Without
+    // this, every task group the shell was supervising would be inherited by a
+    // shell that has no record of it and cannot report or cancel it.
+    crate::session_task::sweep();
     crate::native_session::before_exec_restart();
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(&mix_bin).exec();
@@ -211,6 +216,11 @@ pub fn run_repl() -> i32 {
         crate::session_state::observe_directory();
     }
     meta::init_start_time();
+    // Snapshot the task base environment BEFORE the prelude, .mixrc or any
+    // user code can mutate environ. A task must inherit only what it was
+    // given, and that is only checkable if the base was captured before
+    // anything could add to it.
+    crate::session_task::capture_base_env();
 
     // Acquire foreground ownership before any terminal repair: a nested
     // background shell must stop via SIGTTIN before touching parent termios.
