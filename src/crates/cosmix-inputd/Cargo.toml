@@ -1,0 +1,28 @@
+[package]
+name = "cosmix-inputd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The input verb broker daemon (AmigaOS input.device successor): serves the input.* Bus service on `inputd` over the cosmix-input-core resolver, with an observe-only evdev reader. The EVIOCGRAB interception + uinput re-emission path is opt-in and gated behind a supervised run (dead-keyboard risk)."
+
+[[bin]]
+name = "cosmix-inputd"
+path = "src/main.rs"
+
+[dependencies]
+cosmix-input-core = { path = "../cosmix-input-core" }
+cosmix-input-schema = { path = "../cosmix-input-schema" }
+cosmix-actions = { path = "../cosmix-actions" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
