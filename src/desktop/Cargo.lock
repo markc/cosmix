@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bg-showcase"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bevy",
  "cosmix-bg-boing",
@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-filemgr"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "bevy",
  "chrono",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-interactgui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "cosmix-app-identity",
@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-studio"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3202,6 +3202,7 @@ name = "cosmix-term"
 version = "0.7.1"
 dependencies = [
  "bevy",
+ "cosmix-actions",
  "cosmix-app-identity",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
@@ -3223,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-tower"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "accesskit",
  "bevy",

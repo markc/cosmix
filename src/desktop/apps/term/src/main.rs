@@ -28,6 +28,7 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     winit::{EventLoopProxyWrapper, UpdateMode, WinitSettings, WinitUserEvent},
 };
+use cosmix_actions::{ActionId, Binding, Keymap};
 use cosmix_app_identity::AppIdentity;
 use ctk::prelude::*;
 use std::{
@@ -274,8 +275,28 @@ fn main() {
         .unwrap_or(true);
     let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
     let bus = bus::start(terminal.clone(), cleanup.clone(), notify_rx);
+    // Display-only hints for CTK's accelerator column; keyboard() dispatches keys.
+    let keymap = Keymap {
+        defaults: [
+            ("tab.new", "Ctrl+Shift+T"),
+            ("tab.close", "Ctrl+Shift+W"),
+            ("app.quit", "Ctrl+Shift+Q"),
+            ("help.about", "F1"),
+        ]
+        .into_iter()
+        .map(|(id, chord)| Binding {
+            action: ActionId::from_static(id),
+            chord: chord.parse().expect("terminal menu chord must be valid"),
+            scope: Default::default(),
+            repeat: Default::default(),
+            allow_in_editable: false,
+        })
+        .collect(),
+        ..Default::default()
+    };
     let mut app = App::new();
     app.insert_resource(settings)
+        .insert_resource(MenuKeymap::new(1, keymap))
         .insert_resource(Core(terminal.clone(), cleanup.clone()))
         .insert_resource(NotifyTx(notify_enabled.then_some(notify_tx)))
         .insert_resource(Painter(Mutex::new(painter)))
@@ -344,25 +365,18 @@ fn setup(
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
     commands.spawn(Camera2d);
-    // Each item carries its keyboard accelerator in the label. CTK's dedicated
-    // accelerator column needs the `actions` feature (not enabled for term), so
-    // the chord is appended to the label text, left-padded for a rough column.
-    // The same ids drive the menu, the keyboard shortcuts, and the ABP verbs.
-    let item = |id: &'static str, name: &str, accel: &str| {
-        MenuItemDef::with_dynamic_label(id, format!("{name:<11}{accel}"))
-    };
     let menus = [
         MenuDef {
             label: "File".into(),
             items: vec![
-                item("tab.new", "New Tab", "Ctrl+Shift+T"),
-                item("tab.close", "Close Tab", "Ctrl+Shift+W"),
-                item("app.quit", "Quit", "Ctrl+Shift+Q"),
+                MenuItemDef::new("tab.new", "New Tab"),
+                MenuItemDef::new("tab.close", "Close Tab"),
+                MenuItemDef::new("app.quit", "Quit"),
             ],
         },
         MenuDef {
             label: "Help".into(),
-            items: vec![item("help.about", "About", "F1")],
+            items: vec![MenuItemDef::new("help.about", "About")],
         },
     ];
     let menu_ids = menus
