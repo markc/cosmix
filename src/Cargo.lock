@@ -1167,6 +1167,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-input-core"
+version = "0.1.0"
+dependencies = [
+ "cosmix-actions",
+ "cosmix-input-schema",
+]
+
+[[package]]
 name = "cosmix-input-schema"
 version = "0.1.0"
 dependencies = [

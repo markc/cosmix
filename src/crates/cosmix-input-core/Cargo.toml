@@ -1,0 +1,14 @@
+[package]
+name = "cosmix-input-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless deterministic core for cosmix-inputd: physical-layer keymap resolution (side-specific, pre-xkb), transparent-mode, rebind admission with generation minting, and press/repeat/release coalescing with release-swallowing. No evdev, no Bus, no clock — pure and unit-testable."
+
+[lib]
+name = "cosmix_input_core"
+
+[dependencies]
+cosmix-input-schema = { path = "../cosmix-input-schema" }
+cosmix-actions = { path = "../cosmix-actions" }
