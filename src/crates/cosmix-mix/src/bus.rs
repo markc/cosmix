@@ -315,9 +315,22 @@ impl MixBusHandler {
         // The resident's own resolver, so a driver and a pane shell on one node
         // cannot disagree about which account owns the socket.
         let options = crate::native_session::options(account, endpoint).ok()?;
+        Self::connect_verified_with(url, &options).await
+    }
+
+    /// Split from the config resolution above so the ABSENT-SOCKET path is
+    /// testable, which matters more than it looks: every mix that sends now
+    /// tries this first, so a headless host — no local broker at all, the
+    /// common fleet case — must pay nothing for the attempt. A stat of a path
+    /// that is not there returns immediately; the timeout below is only for a
+    /// socket that EXISTS and does not answer.
+    async fn connect_verified_with(
+        url: &str,
+        options: &cosmix_lib_client::UnixConnectOptions,
+    ) -> Option<cosmix_lib_client::VerifiedConnection> {
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            cosmix_lib_client::NodedClient::connect_unix("", url, &options, None),
+            cosmix_lib_client::NodedClient::connect_unix("", url, options, None),
         )
         .await
         {
@@ -1700,6 +1713,38 @@ mod tests {
         // Empty body → the response `error` header carries the token.
         let (rc, v) = headers_reply_to_result(10, String::new(), Some("from_header".to_string()));
         assert_eq!((rc, v), (10, Value::String("from_header".to_string())));
+    }
+
+    /// The absent-socket path must cost nothing.
+    ///
+    /// Every mix that sends now tries the verified lane first, and most of
+    /// the fleet is headless with no local broker at all. If that attempt paid
+    /// the connect timeout, every first send on every headless host would
+    /// stall five seconds - a worse regression than the feature is a gain. A
+    /// path that does not exist fails at the stat, so this is fast by
+    /// construction; the assertion is here because "by construction" is how
+    /// the slow version would also have been described.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_absent_verified_socket_falls_back_immediately() {
+        let mut options = cosmix_lib_client::UnixConnectOptions::new(
+            cosmix_lib_client::BrokerAccount {
+                // SAFETY: process credential reads have no preconditions.
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+            },
+        );
+        options.endpoint = Some(std::path::PathBuf::from(
+            "/nonexistent/cosmix/definitely-not-a-socket",
+        ));
+        options.require_native_session = true;
+        let started = std::time::Instant::now();
+        let outcome = MixBusHandler::connect_verified_with("ws://127.0.0.1:1/ws", &options).await;
+        let elapsed = started.elapsed();
+        assert!(outcome.is_none(), "a missing socket is not a verified lane");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the absent-socket fallback took {elapsed:?}; it must not pay the connect timeout"
+        );
     }
 
     #[test]
