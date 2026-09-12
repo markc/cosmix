@@ -307,13 +307,15 @@ fn scheduled_refresh_survives_bus_mutations_between_update_and_post_update() {
 #[test]
 fn observer_resources_exist_before_any_observer_can_fire() {
     let mut app = App::new();
+    // The REAL set, via the same function main() uses. A hand-copied list
+    // here would pass forever regardless of what main actually installs,
+    // which is the difference between a guard and a tautology.
     app.add_plugins((
         MinimalPlugins,
         bevy::asset::AssetPlugin::default(),
         bevy::input::InputPlugin,
-        ctk::prelude::CtkWidgetsPlugin,
-        ctk::prelude::ModalCapturePlugin,
     ));
+    app.add_plugins(crate::ctk_plugins());
     // Plugin build is enough: a plugin inserts at build time, strictly before
     // any schedule runs, which is the property that makes the fix sound.
     assert!(
