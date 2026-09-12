@@ -20,6 +20,12 @@ fn fixture_with_native(native: Option<native_session::NativeSession>) -> Option<
     ))
     .init_resource::<Modifiers>()
     .init_resource::<ModalCapture>()
+    // `keyboard` writes an InteractionRequest (Help->About on F1), so the
+    // message must be registered or the observer fails parameter validation.
+    // Production installs it via InteractionPlugin in `ctk_plugins`; the
+    // layout_tests guard asserts THAT. Here we register just the message so the
+    // keyboard behaviour under test can run.
+    .add_message::<InteractionRequest>()
     .add_observer(keyboard)
     .add_systems(
         PreUpdate,

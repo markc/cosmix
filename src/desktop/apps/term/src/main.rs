@@ -159,8 +159,27 @@ fn resolve_config(
 /// cannot fire into a missing resource. Term has menus, menus capture, and the
 /// sole consumer is `capture.is_captured()` — treating absence as "nothing is
 /// captured" would be a guess that silently diverges the moment one does.
-fn ctk_plugins() -> (CtkWidgetsPlugin, MenuBarPlugin, ModalCapturePlugin) {
-    (CtkWidgetsPlugin, MenuBarPlugin, ModalCapturePlugin)
+///
+/// `InteractionPlugin` registers the `InteractionRequest` message queue and the
+/// modal presenter the Help->About dialog rides. `menu_action` writes an
+/// `InteractionRequest` through `MessageWriter`, which panics its host system on
+/// parameter validation if the message was never registered — so this belongs in
+/// the same build-time set as `ModalCapturePlugin`, for the same reason.
+fn ctk_plugins() -> (
+    CtkWidgetsPlugin,
+    MenuBarPlugin,
+    ModalCapturePlugin,
+    ctk::interaction::InteractionPlugin,
+) {
+    // Fully-qualified: `InteractionPlugin` is ambiguous — bevy_picking exports
+    // one too, and the bare name resolves arbitrarily between the two globs.
+    // Term wants ctk's modal presenter, not the picking plugin.
+    (
+        CtkWidgetsPlugin,
+        MenuBarPlugin,
+        ModalCapturePlugin,
+        ctk::interaction::InteractionPlugin,
+    )
 }
 
 fn main() {
@@ -287,18 +306,25 @@ fn setup(
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
     commands.spawn(Camera2d);
+    // Each item carries its keyboard accelerator in the label. CTK's dedicated
+    // accelerator column needs the `actions` feature (not enabled for term), so
+    // the chord is appended to the label text, left-padded for a rough column.
+    // The same ids drive the menu, the keyboard shortcuts, and the ABP verbs.
+    let item = |id: &'static str, name: &str, accel: &str| {
+        MenuItemDef::with_dynamic_label(id, format!("{name:<11}{accel}"))
+    };
     let menus = [
         MenuDef {
             label: "File".into(),
             items: vec![
-                MenuItemDef::new("tab.new", "New Tab"),
-                MenuItemDef::new("tab.close", "Close Tab"),
-                MenuItemDef::new("app.quit", "Quit"),
+                item("tab.new", "New Tab", "Ctrl+Shift+T"),
+                item("tab.close", "Close Tab", "Ctrl+Shift+W"),
+                item("app.quit", "Quit", "Ctrl+Shift+Q"),
             ],
         },
         MenuDef {
             label: "Help".into(),
-            items: vec![MenuItemDef::new("help.about", "About")],
+            items: vec![item("help.about", "About", "F1")],
         },
     ];
     let menu_ids = menus
@@ -314,6 +340,10 @@ fn setup(
                 flex_basis: px(0),
                 min_height: px(0),
                 overflow: Overflow::clip(),
+                // Match the server-side window's rounded bottom corners so the
+                // black content clips to the curve instead of poking a square
+                // nub past the frame. Bevy's clip respects the border radius.
+                border_radius: BorderRadius::bottom(px(9.0)),
                 ..default()
             },
             BackgroundColor(Color::BLACK),
@@ -395,14 +425,15 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
         commands.entity(view.tab_bar).add_child(button);
         view.tab_buttons.push(button);
     }
-    let button = ctk::button::spawn_button(&mut commands, ButtonDef::text("+"));
+    let button =
+        ctk::button::spawn_button(&mut commands, ButtonDef::text("+").size(ButtonSize::Sm));
     commands.entity(button).observe(
         |_: On<bevy::ui_widgets::Activate>,
          core: Res<Core>,
          view: Res<View>,
          mut focus: ResMut<InputFocus>| {
             core.0.lock().unwrap().user_activity();
-            menu_action("tab.new", &core);
+            tab_action("tab.new", &core);
             focus.set(view.terminal, FocusCause::Pressed);
         },
     );
@@ -466,21 +497,54 @@ fn menu_focus(mut view: ResMut<View>, nodes: Query<&Node>, mut focus: ResMut<Inp
         );
     }
 }
-fn on_menu(event: On<MenuActivated>, core: Res<Core>) {
-    menu_action(event.id, &core);
+fn on_menu(
+    event: On<MenuActivated>,
+    core: Res<Core>,
+    mut about: MessageWriter<InteractionRequest>,
+) {
+    menu_action(event.id, &core, &mut about);
 }
 fn record_focus_activity(mut events: MessageReader<bevy::window::WindowFocused>, core: Res<Core>) {
     if events.read().any(|event| event.focused) {
         core.0.lock().unwrap().user_activity();
     }
 }
-fn menu_action(id: &str, core: &Core) {
+/// Body of the Help->About dialog. A verb tour rather than a blurb: the point of
+/// term is that a pane is a Bus citizen an agent can drive, so the About says so.
+const ABOUT_BODY: &str = "\
+CosMix Term is a Wayland terminal whose panes are first-class citizens on the \
+Cosmix Agent Bus.
+
+Every pane registers over the verified native-session lane, so an AI agent — or a \
+plain `mix` script with no agent at all — can drive it remotely: run an expression \
+and read back the typed value (term.execute), submit an isolated supervised task \
+(term.task.submit), read the rendered screen (term.snapshot), and reshape the \
+layout (term.pane.split, term.tab.new). No human at the keyboard required.
+
+Capabilities: execute · input · manage_layout · read_contents · read_state · terminate
+
+Part of Cosmix — an agent-operable computing substrate.
+https://github.com/markc/cosmix";
+
+fn menu_action(id: &str, core: &Core, about: &mut MessageWriter<InteractionRequest>) {
+    if id == "help.about" {
+        core.0.lock().unwrap().user_activity();
+        about.write(InteractionRequest::text_view(
+            "About CosMix Term",
+            format!("Terminal · version {}", env!("CARGO_PKG_VERSION")),
+            ABOUT_BODY,
+        ));
+        return;
+    }
+    tab_action(id, core);
+}
+
+/// The menu actions that mutate tabs, split out so the direct callers (the `+`
+/// button, the Ctrl+T/Ctrl+W shortcuts) can invoke them without a
+/// `MessageWriter` in scope. Only `help.about` needs the writer.
+fn tab_action(id: &str, core: &Core) {
     core.0.lock().unwrap().user_activity();
     match id {
-        "help.about" => println!(
-            "CosMix Term · component=term · version={}",
-            env!("CARGO_PKG_VERSION")
-        ),
         "tab.new" => {
             if let Err(e) = core.0.lock().unwrap().open() {
                 eprintln!("new tab: {e}");
@@ -510,6 +574,7 @@ fn keyboard(
     mut nodes: Query<&mut Node>,
     mut focus: ResMut<InputFocus>,
     capture: Res<ModalCapture>,
+    mut about: MessageWriter<InteractionRequest>,
 ) {
     modifiers.update(event.input.key_code, event.input.state);
     if event.input.state != ButtonState::Pressed {
@@ -522,6 +587,24 @@ fn keyboard(
         .dropdowns
         .iter()
         .position(|(e, _)| nodes.get(*e).is_ok_and(|n| n.display != Display::None));
+    // Help->About: PLAIN F1 (the Help convention), matching the menu item. No
+    // modifier, so it sits outside the Ctrl block below; requiring no modifiers
+    // keeps Ctrl+F1 etc. unmapped (they still bubble). Guarded by no-menu-open
+    // and not-captured. Routed through menu_action so the menu and this key
+    // share one path.
+    if open.is_none()
+        && !capture.is_captured()
+        && event.input.key_code == KeyCode::F1
+        && !ctrl
+        && !shift
+        && !modifiers.alt_or_super()
+    {
+        if !event.input.repeat {
+            menu_action("help.about", &core, &mut about);
+        }
+        event.propagate(false);
+        return;
+    }
     if open.is_none()
         && terminal_focused(&view, event.focused_entity)
         && !capture.is_captured()
@@ -531,13 +614,19 @@ fn keyboard(
         let handled = match event.input.key_code {
             KeyCode::KeyT if shift => {
                 if !event.input.repeat {
-                    menu_action("tab.new", &core);
+                    tab_action("tab.new", &core);
                 }
                 true
             }
             KeyCode::KeyW if shift => {
                 if !event.input.repeat {
-                    menu_action("tab.close", &core);
+                    tab_action("tab.close", &core);
+                }
+                true
+            }
+            KeyCode::KeyQ if shift => {
+                if !event.input.repeat {
+                    tab_action("app.quit", &core);
                 }
                 true
             }
@@ -620,7 +709,7 @@ fn keyboard(
                 if event.input.key_code == KeyCode::Enter
                     && let Some((_, id)) = view.dropdowns[index].1.get(view.menu_item)
                 {
-                    menu_action(id, &core);
+                    menu_action(id, &core, &mut about);
                 }
                 if let Ok(mut node) = nodes.get_mut(view.dropdowns[index].0) {
                     node.display = Display::None;

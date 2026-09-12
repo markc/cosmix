@@ -331,4 +331,15 @@ fn observer_resources_exist_before_any_observer_can_fire() {
             .is_some(),
         "InputFocus is missing"
     );
+    // The Help->About handler writes an InteractionRequest through a
+    // MessageWriter, which fails its host system's parameter validation if the
+    // message was never registered. InteractionPlugin's add_message installs the
+    // queue; assert it here so dropping that plugin reds the guard rather than
+    // panicking a user who opens the menu.
+    assert!(
+        app.world()
+            .get_resource::<bevy::ecs::message::Messages<ctk::prelude::InteractionRequest>>()
+            .is_some(),
+        "InteractionRequest queue is missing — Help->About would panic on activation"
+    );
 }
