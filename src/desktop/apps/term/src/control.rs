@@ -1263,11 +1263,11 @@ impl Control {
             // request, but an operator holding the logs should not have to
             // guess whether the child was slow, gone, or never asked.
             Err(error) if sequence.is_some() => {
-                tracing::warn!(%verb, %shell_verb, %error, "child call failed; reporting unknown outcome");
+                eprintln!("term control: {verb} -> {shell_verb} child call failed ({error}); reporting unknown outcome");
                 (Reply::error("UNKNOWN_OUTCOME"), false)
             }
             Err(error) => {
-                tracing::warn!(%verb, %shell_verb, %error, "child call failed");
+                eprintln!("term control: {verb} -> {shell_verb} child call failed ({error})");
                 (Reply::error("DISCONNECTED"), false)
             }
         };
@@ -1399,11 +1399,11 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         // The caller is told "unknown" — which is true — but that is no reason
         // for the operator to be told nothing.
         _ if mutation => {
-            tracing::warn!(%body, "unrecognised child answer; reporting unknown outcome");
+            eprintln!("term control: unrecognised child answer, reporting unknown outcome: {body}");
             Reply::error("UNKNOWN_OUTCOME")
         }
         _ => {
-            tracing::warn!(%body, "unrecognised child answer");
+            eprintln!("term control: unrecognised child answer: {body}");
             Reply::error("DISCONNECTED")
         }
     }
