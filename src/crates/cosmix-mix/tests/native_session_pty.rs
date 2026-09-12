@@ -3184,7 +3184,9 @@ fn a_registered_service_receives_deliveries_on_a_verified_host() {
     let mut delivered = false;
     let deadline = Instant::now() + Duration::from_secs(25);
     runtime().block_on(async {
-        let sender = observer(&broker).await;
+        // A plain anonymous caller, which is what most senders to a registered
+        // service are. Nothing about the delivery under test needs a principal.
+        let sender = NodedClient::connect_anonymous(&broker.url).await.unwrap();
         while Instant::now() < deadline && !delivered {
             while let Ok(line) = rx.try_recv() {
                 if line.contains("REGISTERED") {
@@ -3199,7 +3201,6 @@ fn a_registered_service_receives_deliveries_on_a_verified_host() {
                 // necessarily listening, and one lost delivery would look
                 // exactly like the bug this guards.
                 let _ = sender
-                    .client()
                     .call("serveprobe", "probe.ping", serde_json::json!({}))
                     .await;
             }
