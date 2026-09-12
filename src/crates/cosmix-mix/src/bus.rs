@@ -58,6 +58,51 @@ pub(crate) enum Lane {
     Anonymous(cosmix_lib_client::NodedClient),
 }
 
+/// Which connection the serve path should use.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ServeChoice {
+    /// The main lane is already plain; serving over it is today's behaviour.
+    ReuseMain,
+    /// The main lane is verified and therefore has no incoming receiver of its
+    /// own, so serving needs a connection that does.
+    OpenDedicated,
+}
+
+/// What a lane IS, separated from what it holds.
+///
+/// The discriminant exists so the decision below can be tested: a `Lane` owns a
+/// live connection and cannot be constructed in a unit test, while the choice
+/// that regressed depends only on which kind of lane it is.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum LaneKind {
+    Anonymous,
+    Verified,
+}
+
+impl Lane {
+    pub(crate) fn kind(&self) -> LaneKind {
+        match self {
+            Lane::Anonymous(_) => LaneKind::Anonymous,
+            Lane::Verified(_) => LaneKind::Verified,
+        }
+    }
+}
+
+/// The decision `serve_access` makes, as a pure function.
+///
+/// Split out so it can be tested without a broker, an environment, or a
+/// delivery. The regression this guards is precise: serving must never ride the
+/// verified lane, because a verified client is built with no incoming receiver
+/// and the stream then reads as cleanly CLOSED — registration succeeds and
+/// deliveries silently never arrive. A future change that routes serve back
+/// onto the verified connection turns this red, which is the whole point.
+pub(crate) fn serve_lane_for(main: LaneKind) -> ServeChoice {
+    match main {
+        LaneKind::Anonymous => ServeChoice::ReuseMain,
+        LaneKind::Verified => ServeChoice::OpenDedicated,
+    }
+}
+
 impl std::ops::Deref for Lane {
     type Target = cosmix_lib_client::NodedClient;
     fn deref(&self) -> &Self::Target {
@@ -366,7 +411,7 @@ impl MixBusHandler {
     /// for something that does not need it.
     async fn serve_access(&self) -> Result<std::sync::Arc<Lane>, MeshErr> {
         let lane = self.noded_access().await?;
-        if let Lane::Anonymous(_) = &*lane {
+        if serve_lane_for(lane.kind()) == ServeChoice::ReuseMain {
             return Ok(lane);
         }
         let mut serve = self.serve.lock().await;
@@ -1756,6 +1801,37 @@ mod tests {
         // Empty body → the response `error` header carries the token.
         let (rc, v) = headers_reply_to_result(10, String::new(), Some("from_header".to_string()));
         assert_eq!((rc, v), (10, Value::String("from_header".to_string())));
+    }
+
+    /// Serving must never ride the verified lane.
+    ///
+    /// This is the regression guard for the defect that shipped and was caught
+    /// in review: a verified client is built with no incoming receiver, so
+    /// `next_incoming` read its stream as cleanly CLOSED. `register_as`
+    /// succeeded — it is plain RPC — and the script then waited forever for
+    /// deliveries that could never arrive. Silent, and only on hosts that HAVE
+    /// a verified socket, which is exactly where the feature switches on.
+    ///
+    /// Deliberately a decision test rather than a delivery test. The delivery
+    /// end to end needs the serve surface a `mix --serve` script actually uses,
+    /// which is a separate piece of work; what regressed here is WHICH
+    /// connection serves, and that is a total function of the lane kind.
+    #[test]
+    fn serving_never_rides_the_verified_lane() {
+        assert_eq!(
+            serve_lane_for(LaneKind::Verified),
+            ServeChoice::OpenDedicated,
+            "a verified lane has no incoming receiver; serving over it goes deaf"
+        );
+        // And the other direction matters just as much: when the main lane is
+        // already plain, serving reuses it, which is today's behaviour byte for
+        // byte. Opening a second connection there would be a change nobody
+        // asked for.
+        assert_eq!(
+            serve_lane_for(LaneKind::Anonymous),
+            ServeChoice::ReuseMain,
+            "a plain main lane must keep serving exactly as it always did"
+        );
     }
 
     /// The absent-socket path must cost nothing.
