@@ -1,0 +1,17 @@
+[package]
+name = "cosmix-input-schema"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "input.* wire contract for cosmix-inputd — the AmigaOS input.device successor. Headless serde DTOs: keymap.v1 (the cosmix-actions semantic layer plus a side-specific physical layer xkb cannot express), the input.* verb vocabulary, and the bind/event records. Pure Rust; reuses cosmix-actions for the one binding vocabulary."
+
+[lib]
+name = "cosmix_input_schema"
+
+[dependencies]
+serde = { workspace = true }
+cosmix-actions = { path = "../cosmix-actions" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
