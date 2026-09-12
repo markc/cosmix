@@ -13191,22 +13191,6 @@ impl Evaluator {
         })
     }
 
-    /// Execute a send command: evaluate args, call Bus handler, set $rc and $result.
-    /// `publish(topic, body[, opts])` — see the FunctionCall special arm.
-    ///
-    /// Contract (documented in bus.md):
-    /// - `topic`: non-empty string, no newline/CR (frame-injection guard).
-    ///   It is both the noded `name=` and, by default, the inner frame's
-    ///   `command:` header (what subscribers' `on` matches).
-    /// - `body`: the payload STRING (or nil → empty). Maps/lists are
-    ///   refused with a pointer at json_encode — no hidden encoding.
-    /// - `opts` map: `retain` (bool or "true"/"false", default false),
-    ///   `command` (override the inner frame header — the fleet publishes
-    ///   `svc.corner.entered` with inner command `corner.entered`),
-    ///   `headers` (map of extra frame header lines; keys must not
-    ///   contain `:`/newline, values must not contain newline).
-    /// - `$rc`/`$result` set exactly like `send`; the rc is returned, so
-    ///   `if publish(..) != 0` reads naturally.
     /// `session_send(service, verb[, body])` — a send over the verified lane.
     ///
     /// The bands are `send`'s, deliberately: a driver that already reads `$rc`
@@ -13321,6 +13305,22 @@ impl Evaluator {
         }
     }
 
+    /// Execute a send command: evaluate args, call Bus handler, set $rc and $result.
+    /// `publish(topic, body[, opts])` — see the FunctionCall special arm.
+    ///
+    /// Contract (documented in bus.md):
+    /// - `topic`: non-empty string, no newline/CR (frame-injection guard).
+    ///   It is both the noded `name=` and, by default, the inner frame's
+    ///   `command:` header (what subscribers' `on` matches).
+    /// - `body`: the payload STRING (or nil → empty). Maps/lists are
+    ///   refused with a pointer at json_encode — no hidden encoding.
+    /// - `opts` map: `retain` (bool or "true"/"false", default false),
+    ///   `command` (override the inner frame header — the fleet publishes
+    ///   `svc.corner.entered` with inner command `corner.entered`),
+    ///   `headers` (map of extra frame header lines; keys must not
+    ///   contain `:`/newline, values must not contain newline).
+    /// - `$rc`/`$result` set exactly like `send`; the rc is returned, so
+    ///   `if publish(..) != 0` reads naturally.
     async fn exec_publish(&mut self, args: Vec<Value>) -> MixResult<Value> {
         let topic = match args.first() {
             Some(Value::String(s)) if !s.is_empty() => s.clone(),
