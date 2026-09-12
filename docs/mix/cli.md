@@ -890,10 +890,17 @@ The two answer differently on purpose: an over-budget `env` overlay is
 to carry, while an over-budget `argv` is `INVALID_ARGUMENT`, because the command
 line itself is malformed for this surface.
 
-A spawn that fails for the machine's reasons (EMFILE, ENOMEM, a `cwd` that
-disappeared between validation and the fork) is `UNAVAILABLE`, not
-`INVALID_ARGUMENT`: the request was well-formed and retrying it is the right
-move. Its request id stays unspent either way.
+A spawn that fails is never `INVALID_ARGUMENT` — the request was well-formed,
+and the failure happened after validation accepted it. Which code it does get is
+decided by errno, because the two halves call for different responses. A program
+that is not there, or a `cwd` that stopped being a directory between validation
+and the fork, is `NOT_FOUND`: the caller named it and can correct it, and it is
+deliberately the same code validation gives for a missing `cwd`, so one mistake
+does not change its name depending on how fast the filesystem moved. Everything
+else — out of descriptors, out of memory, out of processes — is `RESOURCE_LIMIT`
+with `reason: "spawn_failed"`, which is the transient class: back off and retry.
+Either way the request id stays unspent, and the error set stays closed, so a
+caller can still switch on it exhaustively.
 
 **Advertised deferrals**, refused explicitly rather than left to look like
 typos: `shell.task.watch` and `shell.task.list` answer `UNSUPPORTED` with

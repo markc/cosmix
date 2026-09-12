@@ -1145,10 +1145,17 @@ The two answer differently on purpose: an over-budget <code>env</code> overlay i
 <code>RESOURCE_LIMIT</code>, because the overlay is a quantity of state the shell declines
 to carry, while an over-budget <code>argv</code> is <code>INVALID_ARGUMENT</code>, because the command
 line itself is malformed for this surface.</p>
-<p>A spawn that fails for the machine's reasons (EMFILE, ENOMEM, a <code>cwd</code> that
-disappeared between validation and the fork) is <code>UNAVAILABLE</code>, not
-<code>INVALID_ARGUMENT</code>: the request was well-formed and retrying it is the right
-move. Its request id stays unspent either way.</p>
+<p>A spawn that fails is never <code>INVALID_ARGUMENT</code> — the request was well-formed,
+and the failure happened after validation accepted it. Which code it does get is
+decided by errno, because the two halves call for different responses. A program
+that is not there, or a <code>cwd</code> that stopped being a directory between validation
+and the fork, is <code>NOT_FOUND</code>: the caller named it and can correct it, and it is
+deliberately the same code validation gives for a missing <code>cwd</code>, so one mistake
+does not change its name depending on how fast the filesystem moved. Everything
+else — out of descriptors, out of memory, out of processes — is <code>RESOURCE_LIMIT</code>
+with <code>reason: "spawn_failed"</code>, which is the transient class: back off and retry.
+Either way the request id stays unspent, and the error set stays closed, so a
+caller can still switch on it exhaustively.</p>
 <p><strong>Advertised deferrals</strong>, refused explicitly rather than left to look like
 typos: <code>shell.task.watch</code> and <code>shell.task.list</code> answer <code>UNSUPPORTED</code> with
 <code>reason: "deferred"</code> — a bare code would be word-for-word what an unknown verb

@@ -93,10 +93,6 @@ enum FailureCode {
     Expired,
     Cancelled,
     UnknownOutcome,
-    /// The child could not start the work for the machine's reasons — EMFILE,
-    /// ENOMEM, a directory that vanished. Transient and the caller's to retry,
-    /// which is why it is its own code rather than a flavour of FORBIDDEN.
-    Unavailable,
 }
 #[derive(Serialize)]
 struct Failure {
@@ -132,7 +128,6 @@ impl Reply {
             "EXPIRED" => FailureCode::Expired,
             "CANCELLED" => FailureCode::Cancelled,
             "UNKNOWN_OUTCOME" => FailureCode::UnknownOutcome,
-            "UNAVAILABLE" => FailureCode::Unavailable,
             // A token this table does not know is a typo on the author's side,
             // not a caller's doing, and a request path must not panic over
             // one. Fail closed with the uniform denial and make it loud in a
@@ -1255,10 +1250,7 @@ impl Control {
                 // id forever, while the documented move for both codes is to
                 // back off and retry the same submission — which only reaches
                 // the child's dedupe if Term did not record the refusal.
-                let transient = matches!(
-                    refusal_code(&body).as_deref(),
-                    Some("RESOURCE_LIMIT" | "UNAVAILABLE")
-                );
+                let transient = matches!(refusal_code(&body).as_deref(), Some("RESOURCE_LIMIT"));
                 (shell_refusal(&body, sequence.is_some()), !transient)
             }
             // A submission whose answer never arrived may or may not have been
@@ -1380,10 +1372,6 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         "STALE_GENERATION" => relayed("STALE_GENERATION"),
         "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
         "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
-        // The machine could not start the work (EMFILE, ENOMEM, a cwd that
-        // vanished). Transient and the caller's to retry, so it keeps its own
-        // name rather than becoming an unknown outcome.
-        "UNAVAILABLE" => relayed("UNAVAILABLE"),
         "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
         "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),

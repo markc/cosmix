@@ -1104,14 +1104,15 @@ fn task_submit(bound: &SessionRecord, actor: &BrokerPrincipal, body: &str) -> (u
                 .forget(operation);
             (
                 10,
-                // NOT invalid-argument: the request was well-formed and the
-                // failure is the machine's (EMFILE, ENOMEM, a vanished cwd).
-                // Blaming the caller would send them off editing a request
-                // that was never the problem.
+                // The code is chosen by errno, not flattened: NOT_FOUND when
+                // the caller named something that is not there, RESOURCE_LIMIT
+                // when the box ran out of something. Never INVALID_ARGUMENT —
+                // the request was well formed either way — and never a new
+                // token, because the error set callers switch on is closed.
                 serde_json::json!({
-                    "error_code": "UNAVAILABLE",
+                    "error_code": error.code,
                     "reason": "spawn_failed",
-                    "detail": error,
+                    "detail": error.detail,
                 })
                 .to_string(),
             )

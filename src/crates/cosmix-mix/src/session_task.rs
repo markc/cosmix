@@ -86,6 +86,50 @@ const MAX_ARG_BYTES: usize = 4096;
 /// The child lost the fork/prctl race and has no supervisor.
 const ORPHANED_BEFORE_START: libc::c_int = 125;
 
+/// Why a spawn failed, in the surface's OWN vocabulary.
+///
+/// The error set callers switch on is closed, so a spawn failure has to land on
+/// a code that already exists rather than earning a new one. Which code is not
+/// cosmetic: it tells a caller whether to fix the request or to wait and retry.
+pub(crate) struct SpawnFailed {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl SpawnFailed {
+    /// Split on errno, because the two halves need different answers.
+    ///
+    /// A program that is not there, or a directory that stopped being one
+    /// between validation and the fork, is something the CALLER named and can
+    /// correct — NOT_FOUND, the same answer validation gives for a missing cwd,
+    /// so the same mistake does not change its name depending on how quickly
+    /// the filesystem moved. Everything else here is the box running out of
+    /// something (descriptors, memory, processes): RESOURCE_LIMIT, which is
+    /// already the transient class Term declines to retain, so a retry reaches
+    /// the child instead of replaying the refusal forever.
+    fn of(error: &std::io::Error) -> Self {
+        let code = match error.raw_os_error() {
+            Some(libc::ENOENT | libc::EACCES | libc::ENOTDIR | libc::ELOOP | libc::ENAMETOOLONG) => {
+                "NOT_FOUND"
+            }
+            _ => "RESOURCE_LIMIT",
+        };
+        Self {
+            code,
+            detail: error.to_string(),
+        }
+    }
+
+    /// Failures of this supervisor's own machinery — a descriptor it could not
+    /// make, a thread it could not start. Never the caller's request.
+    fn resources(detail: String) -> Self {
+        Self {
+            code: "RESOURCE_LIMIT",
+            detail,
+        }
+    }
+}
+
 /// The environment a task starts from, snapshotted ONCE at shell startup.
 ///
 /// Enumerated, never a glob and never the shell's live variables: a task must
@@ -204,12 +248,11 @@ impl Spec {
             }
         }
         // Checked here AND again by the spawn (the directory can vanish in
-        // between), so the same broken cwd can answer two ways by timing: a
-        // directory that is already gone is NOT_FOUND, one that disappears
-        // inside the race window is UNAVAILABLE/spawn_failed. Both are honest
-        // about what was observed and both are retryable; unifying them would
-        // mean either withholding this cheap, precise answer or claiming the
-        // spawn failure was a validation result.
+        // between). Both answer NOT_FOUND: the spawn failure is classified by
+        // errno, and ENOENT/ENOTDIR land on the same code this returns, so a
+        // caller sees one name for one mistake however fast the filesystem
+        // moved underneath it. This check exists to make the common case cheap
+        // and precise, not to give it a different answer.
         if !std::path::Path::new(&cwd).is_dir() {
             return Err("NOT_FOUND");
         }
@@ -394,7 +437,7 @@ impl Handle {
 pub(crate) fn spawn(
     spec: Spec,
     settled: impl FnOnce(TaskReport) + Send + 'static,
-) -> Result<Handle, String> {
+) -> Result<Handle, SpawnFailed> {
     let started = Instant::now();
     let (tx, rx) = mpsc::channel();
     let cancel = tx.clone();
@@ -407,14 +450,16 @@ pub(crate) fn spawn(
     // kernel SIGKILL live tasks mid-timeout, reported as an external signal
     // nobody sent. The caller still gets a synchronous accepted/refused answer;
     // it waits for the spawn, not for the task.
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SpawnFailed>>(1);
     std::thread::Builder::new()
         .name("mix-task".into())
         .spawn(move || supervise_task(spec, started, tx, rx, supervised, ready_tx, settled))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| SpawnFailed::resources(error.to_string()))?;
     ready_rx
         .recv()
-        .map_err(|_| "the supervisor thread ended before it spawned the task".to_string())??;
+        .map_err(|_| {
+            SpawnFailed::resources("the supervisor thread ended before it spawned the task".into())
+        })??;
     Ok(Handle {
         cancel,
         started,
@@ -431,13 +476,13 @@ fn supervise_task(
     waiter_tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     cancelling: Arc<std::sync::atomic::AtomicBool>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), SpawnFailed>>,
     settled: impl FnOnce(TaskReport) + Send + 'static,
 ) {
     let (result_read, result_write) = match pipe() {
         Ok(pair) => pair,
         Err(error) => {
-            let _ = ready.send(Err(error));
+            let _ = ready.send(Err(SpawnFailed::resources(error)));
             return;
         }
     };
@@ -521,7 +566,7 @@ fn supervise_task(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = ready.send(Err(error.to_string()));
+            let _ = ready.send(Err(SpawnFailed::of(&error)));
             return;
         }
     };
@@ -541,7 +586,7 @@ fn supervise_task(
             signal_group(pid, libc::SIGKILL);
             // Reap, or the refusal leaves a zombie nothing will ever collect.
             let _ = child.wait();
-            let _ = ready.send(Err(error));
+            let _ = ready.send(Err(SpawnFailed::resources(error)));
             return;
         }
     };
@@ -563,7 +608,7 @@ fn supervise_task(
         Err(error) => {
             signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
-            let _ = ready.send(Err(error.to_string()));
+            let _ = ready.send(Err(SpawnFailed::resources(error.to_string())));
             return;
         }
     };
@@ -585,7 +630,7 @@ fn supervise_task(
     {
         signal_group(pid, libc::SIGKILL);
         let _ = child.wait();
-        let _ = ready.send(Err(error.to_string()));
+        let _ = ready.send(Err(SpawnFailed::resources(error.to_string())));
         return;
     }
 

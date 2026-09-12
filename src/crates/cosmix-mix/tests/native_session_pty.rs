@@ -2900,13 +2900,13 @@ fn p4_bounds_are_reported_and_refusals_leave_no_trace() {
         let error = submit_task(
             &mut f.parent,
             &f.bound,
-            5,
+            7,
             serde_json::json!({"source": "1", "cwd": "/nonexistent/p4"}),
         )
         .await
         .unwrap_err();
         assert!(error.contains("NOT_FOUND"), "{error}");
-        let operation = submit_task(&mut f.parent, &f.bound, 5, serde_json::json!({"source": "1"}))
+        let operation = submit_task(&mut f.parent, &f.bound, 7, serde_json::json!({"source": "1"}))
             .await
             .expect("a refused task must not burn its request id");
         task_report(&mut f.parent, &f.bound, operation).await;
