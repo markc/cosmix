@@ -1379,46 +1379,76 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         }
     };
     match code.as_str() {
-        "BUSY" => relayed("BUSY"),
-        "STALE_GENERATION" => relayed("STALE_GENERATION"),
-        "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
-        "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
-        // The child named something the caller gave it that is not there: a
-        // `cwd` that does not exist, a program that cannot be found. Relayed
-        // with its details, because `reason` and `detail` are what tell the
-        // caller WHICH thing was missing. Its absence here is why a perfectly
-        // clear child refusal was reaching callers as "unknown outcome".
-        "NOT_FOUND" => relayed("NOT_FOUND"),
-        // The child read the request and found it malformed — both sides spell
-        // this the same way, and it was missing here for the same reason
-        // NOT_FOUND was: the map grew from the execute family's codes and never
-        // caught up with the task family's. Reporting a settled schema refusal
-        // as UNKNOWN_OUTCOME tells a caller its bad request MIGHT have run.
-        "INVALID_ARGUMENT" => relayed("INVALID_ARGUMENT"),
-        "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
-        "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
+        // THREE deliberate exceptions, and nothing else is enumerated here.
+        //
+        // The map used to list the codes it would relay, which meant every
+        // code the child learned to send had to be added to it — and any that
+        // was not reached callers as UNKNOWN_OUTCOME, the one answer that says
+        // "your request may have run". NOT_FOUND and INVALID_ARGUMENT both sat
+        // in that hole. Enumerating the EXCEPTIONS instead makes the default
+        // relay: a new child code arrives with its own name, not as a mystery.
+        //
+        // Two spellings genuinely differ between the surfaces.
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
         // A settled denial: the child looked at the request and said no.
         "REFUSED" => Reply::error("FORBIDDEN"),
-        // Everything else is a shape Term does not recognise. Flattening those
-        // to FORBIDDEN was wrong in both directions: it reads as a policy
-        // decision Term never made, and for a transient it tells the caller to
-        // stop when it should retry. An unrecognised answer to a mutation is an
-        // unknown outcome; to a read, a transport-shaped failure.
-        //
-        // Logged with the BODY, because this arm is where a new child code, or
-        // an answer that was never a refusal at all, disappears without trace.
-        // The caller is told "unknown" — which is true — but that is no reason
-        // for the operator to be told nothing.
-        _ if mutation => {
-            eprintln!("term control: unrecognised child answer, reporting unknown outcome: {body}");
-            Reply::error("UNKNOWN_OUTCOME")
-        }
-        _ => {
-            eprintln!("term control: unrecognised child answer: {body}");
-            Reply::error("DISCONNECTED")
-        }
+        // And a conflict carries TERM's retry contract — byte-identical body —
+        // which is Term's rule to state, not the child's.
+        "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
+        // Everything in the vocabulary relays under its own name. Denials stay
+        // uniform and detail-free; `relayed` already declines to attach an
+        // empty body, and a denial carries none.
+        other => match vocabulary(other) {
+            Some("FORBIDDEN" | "UNSUPPORTED") => Reply::error(vocabulary(other).expect("matched")),
+            Some(known) => relayed(known),
+            // Outside the vocabulary, or never shaped like a refusal at all.
+            // Flattening these to FORBIDDEN was wrong in both directions: it
+            // reads as a policy decision Term never made, and for a transient
+            // it tells the caller to stop when it should retry. An
+            // unrecognised answer to a mutation is an unknown outcome; to a
+            // read, a transport-shaped failure.
+            //
+            // Logged with the BODY, because this arm is where an answer that
+            // was never a refusal disappears without trace. The caller is told
+            // "unknown" — which is true — but that is no reason for the
+            // operator to be told nothing.
+            None if mutation => {
+                eprintln!(
+                    "term control: unrecognised child answer, reporting unknown outcome: {body}"
+                );
+                Reply::error("UNKNOWN_OUTCOME")
+            }
+            None => {
+                eprintln!("term control: unrecognised child answer: {body}");
+                Reply::error("DISCONNECTED")
+            }
+        },
     }
+}
+
+/// Term's CLOSED error vocabulary, returning the `'static` token so a code can
+/// be relayed without an arm of its own.
+///
+/// This list and `FailureCode` are the same set by construction —
+/// `every_failure_code_can_be_relayed` fails to COMPILE if a variant is added
+/// without a token here, which is the drift that put NOT_FOUND and
+/// INVALID_ARGUMENT in the unknown-outcome hole in the first place.
+fn vocabulary(code: &str) -> Option<&'static str> {
+    const KNOWN: &[&str] = &[
+        "INVALID_ARGUMENT",
+        "NOT_FOUND",
+        "STALE_GENERATION",
+        "CONFLICT",
+        "BUSY",
+        "FORBIDDEN",
+        "UNSUPPORTED",
+        "RESOURCE_LIMIT",
+        "DISCONNECTED",
+        "EXPIRED",
+        "CANCELLED",
+        "UNKNOWN_OUTCOME",
+    ];
+    KNOWN.iter().copied().find(|known| *known == code)
 }
 
 /// The dedupe digest covers the request bytes as sent, deliberately: this
@@ -1548,5 +1578,71 @@ pub fn allows(
                 && s.pane_generation == Some(target.pane_generation)
                 && s.capabilities.contains(&capability)
         }
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+
+    /// The relay map and Term's error enum must be the same set.
+    ///
+    /// The match below has no wildcard, so adding a `FailureCode` variant
+    /// without giving it a token here is a COMPILE error rather than a code
+    /// that silently reaches callers as UNKNOWN_OUTCOME. That silence is
+    /// exactly what happened to NOT_FOUND and INVALID_ARGUMENT.
+    #[test]
+    fn every_failure_code_can_be_relayed() {
+        fn token(code: &FailureCode) -> &'static str {
+            match code {
+                FailureCode::InvalidArgument => "INVALID_ARGUMENT",
+                FailureCode::NotFound => "NOT_FOUND",
+                FailureCode::StaleGeneration => "STALE_GENERATION",
+                FailureCode::Conflict => "CONFLICT",
+                FailureCode::Busy => "BUSY",
+                FailureCode::Forbidden => "FORBIDDEN",
+                FailureCode::Unsupported => "UNSUPPORTED",
+                FailureCode::ResourceLimit => "RESOURCE_LIMIT",
+                FailureCode::Disconnected => "DISCONNECTED",
+                FailureCode::Expired => "EXPIRED",
+                FailureCode::Cancelled => "CANCELLED",
+                FailureCode::UnknownOutcome => "UNKNOWN_OUTCOME",
+            }
+        }
+        for code in [
+            FailureCode::InvalidArgument,
+            FailureCode::NotFound,
+            FailureCode::StaleGeneration,
+            FailureCode::Conflict,
+            FailureCode::Busy,
+            FailureCode::Forbidden,
+            FailureCode::Unsupported,
+            FailureCode::ResourceLimit,
+            FailureCode::Disconnected,
+            FailureCode::Expired,
+            FailureCode::Cancelled,
+            FailureCode::UnknownOutcome,
+        ] {
+            let token = token(&code);
+            assert_eq!(vocabulary(token), Some(token), "{token} is not relayable");
+            // And the token is the wire spelling the enum itself serialises to,
+            // so the two halves cannot disagree about what a code is called.
+            let body = Reply::error(vocabulary(token).expect("in vocabulary")).body;
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).expect("a refusal body")["error_code"],
+                json!(token)
+            );
+        }
+    }
+
+    /// A child code Term has never heard of must NOT relay.
+    #[test]
+    fn an_unknown_code_is_not_in_the_vocabulary() {
+        assert_eq!(vocabulary("TEAPOT"), None);
+        assert_eq!(vocabulary(""), None);
+        // Spelling differences are handled as explicit exceptions, not by the
+        // vocabulary: these are the child's words, not Term's.
+        assert_eq!(vocabulary("INVALID_REQUEST"), None);
+        assert_eq!(vocabulary("REFUSED"), None);
     }
 }
