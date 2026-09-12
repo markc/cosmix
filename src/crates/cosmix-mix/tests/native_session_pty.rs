@@ -3150,7 +3150,7 @@ fn a_registered_service_receives_deliveries_on_a_verified_host() {
     // receiving has always gone over a plain client and still does.
     let port: u16 = broker
         .url
-        .rsplit(\047:\047)
+        .rsplit(':')
         .next()
         .and_then(|tail| tail.trim_end_matches("/ws").parse().ok())
         .expect("the broker url carries a port");
@@ -3245,12 +3245,21 @@ fn a_registered_service_receives_deliveries_on_a_verified_host() {
         }
     });
     let _ = child.kill();
-    let _ = child.wait();
+    let output = child.wait_with_output().ok();
+    // The child's stderr is where the answer to a failure lives — which lane it
+    // took, whether the handler ever fired, what the broker said. Discarding it
+    // made an earlier failure of this fixture unattributable from the outside.
+    let diagnostics = output
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
 
-    assert!(registered, "the child never registered its service");
+    assert!(
+        registered,
+        "the child never registered its service\nchild stderr:\n{diagnostics}"
+    );
     assert!(
         delivered,
         "a registered service received NO delivery on a verified-socket host — \
-         the serve path is on a connection with no incoming lane"
+         the serve path is on a connection with no incoming lane\nchild stderr:\n{diagnostics}"
     );
 }
