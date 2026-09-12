@@ -1383,6 +1383,12 @@ fn shell_refusal(body: &str, mutation: bool) -> Reply {
         "STALE_GENERATION" => relayed("STALE_GENERATION"),
         "UNSUPPORTED" => Reply::error("UNSUPPORTED"),
         "RESOURCE_LIMIT" => Reply::error("RESOURCE_LIMIT"),
+        // The child named something the caller gave it that is not there: a
+        // `cwd` that does not exist, a program that cannot be found. Relayed
+        // with its details, because `reason` and `detail` are what tell the
+        // caller WHICH thing was missing. Its absence here is why a perfectly
+        // clear child refusal was reaching callers as "unknown outcome".
+        "NOT_FOUND" => relayed("NOT_FOUND"),
         "CONFLICT" => Reply::refuse("CONFLICT", Some(mismatch())),
         "UNKNOWN_OUTCOME" => relayed("UNKNOWN_OUTCOME"),
         "INVALID_REQUEST" => Reply::error("INVALID_ARGUMENT"),
