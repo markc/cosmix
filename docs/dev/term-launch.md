@@ -18,3 +18,8 @@ does not hold up the verb loop. On shutdown, queued and in-flight notifications
 share a two-second drain budget, followed by bounded client close. Delivery is
 best effort. `TERM_NOTIFY=0` disables these notifications. Dedupe keys identify
 individual panes and do not coalesce exits from different panes.
+
+The File and Help menus show shortcuts in CTK's native right-aligned
+accelerator column: New Tab (`Ctrl+Shift+T`), Close Tab (`Ctrl+Shift+W`),
+Quit (`Ctrl+Shift+Q`) and About (`F1`). The `MenuKeymap` supplies display hints;
+Term's keyboard handler and `MenuActivated` observer dispatch the actions.
