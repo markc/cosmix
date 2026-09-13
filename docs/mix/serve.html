@@ -856,8 +856,8 @@ evaluator, not the substrate: keep a reloadable citizen's init idempotent,
 and do irreversible work in a handler, not at top level.</li>
 <li>The <code>rc:0</code> reply races the swap by design: a follow-up sent immediately
 queues at the broker and is answered by whichever evaluator holds the
-pump. Fire <code>RELOAD</code>, then re-probe <code>HELP</code>/<code>INFO</code> to observe the new
-surface.</li>
+pump. To observe which generation went live, poll <code>lifecycle.generation</code>
+(above) — not <code>HELP</code>/<code>INFO</code>, which cannot tell a swap from a revert.</li>
 <li>Topic subscriptions made by the old top-level persist on the shared
 connection; a re-subscribing new top-level may duplicate delivery
 (v1 limitation — avoid reloading citizens that <code>subscribe</code>, or make

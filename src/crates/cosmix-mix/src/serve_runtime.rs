@@ -949,6 +949,21 @@ mod tests {
         // The pre-swap runtime, still sharing the identity, also sees the
         // bumped generation — there is one process-wide counter.
         assert_eq!(gen0.snapshot_generation_for_test(), 1);
+
+        // And through the actual props SNAPSHOT (not just the test
+        // accessors): a regression that reset the start inside snapshot()
+        // while leaving the identity field intact must still be caught
+        // (opus arm-B round-2 test-seam residual). generation and
+        // started_at both come off the live PropTree output.
+        let snap = serde_json::to_string(&gen1.snapshot()).unwrap();
+        let v: Json = serde_json::from_str(&snap).unwrap();
+        let lc = &v["lifecycle"];
+        assert_eq!(lc["generation"], 1, "props snapshot reports the bumped generation");
+        assert_eq!(
+            lc["started_at"].as_str().unwrap(),
+            started,
+            "props snapshot reports the stable process start"
+        );
     }
 
     #[test]

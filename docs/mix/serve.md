@@ -529,8 +529,8 @@ bad edit can do is a logged revert. Things to know:
   and do irreversible work in a handler, not at top level.
 - The `rc:0` reply races the swap by design: a follow-up sent immediately
   queues at the broker and is answered by whichever evaluator holds the
-  pump. Fire `RELOAD`, then re-probe `HELP`/`INFO` to observe the new
-  surface.
+  pump. To observe which generation went live, poll `lifecycle.generation`
+  (above) — not `HELP`/`INFO`, which cannot tell a swap from a revert.
 - Topic subscriptions made by the old top-level persist on the shared
   connection; a re-subscribing new top-level may duplicate delivery
   (v1 limitation — avoid reloading citizens that `subscribe`, or make
