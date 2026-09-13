@@ -71,6 +71,14 @@ elif $request.operation == "clear" then
   $reply = rpc($request.target, "desktop.clipboard.clear", $body)
   if $reply.instance != $destination.instance or type($reply.removed) != "number" then raise("DESKTOP_PROTOCOL", "invalid clear response") end
   print(json_encode({operation:"clear", removed:$reply.removed}))
+elif $request.operation == "menu" then
+  $reply = rpc($request.target, "desktop.clipboard.menu", {instance:$destination.instance})
+  if $reply.instance != $destination.instance or $reply.menu != true then raise("DESKTOP_PROTOCOL", "menu not accepted") end
+  print(json_encode({operation:"menu", accepted:true}))
+elif $request.operation == "rotate" then
+  $reply = rpc($request.target, "desktop.clipboard.rotate", {instance:$destination.instance})
+  if $reply.instance != $destination.instance or $reply.rotated == nil then raise("DESKTOP_PROTOCOL", "invalid rotate response") end
+  print(json_encode({operation:"rotate", rotated:$reply.rotated, id:$reply.id}))
 elif $request.operation == "pause" then
   $reply = rpc($request.target, "desktop.clipboard.pause", {instance:$destination.instance, on:$request.on})
   if $reply.instance != $destination.instance or type($reply.paused) != "bool" then raise("DESKTOP_PROTOCOL", "invalid pause response") end

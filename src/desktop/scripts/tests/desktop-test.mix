@@ -83,7 +83,7 @@ try
   end
   check($d.prepare($ctx,"desktop.capabilities",$headers,{},400001).rc == 10,"oversize envelope")
   $caps = $d.prepare($ctx,"desktop.capabilities",$headers,{},2).body
-  check(len($caps.verbs) == 10 and contains($caps.verbs,"desktop.clipboard.pick"),"capabilities verb list incomplete")
+  check(len($caps.verbs) == 12 and contains($caps.verbs,"desktop.clipboard.pick") and contains($caps.verbs,"desktop.clipboard.rotate") and contains($caps.verbs,"desktop.clipboard.menu"),"capabilities verb list incomplete")
   check($caps.clipboard.history.persistence == "ok" and $caps.clipboard.history.topic == "desktop.clipboard.changed","history capabilities block wrong")
   check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:"old"},2).rc == 12,"stale instance accepted")
   check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:$ctx.instance,path:"/etc/passwd"},2).rc == 10,"injected field accepted")
@@ -193,6 +193,30 @@ try
   $done = $d.finish($ctx,$plan,{ok:true})
   check($done.body.accepted == true and $done.context == nil,"front pick mutated state")
   check($d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:99},2).rc == 14,"pick missing entry not 14")
+
+  -- ── History: rotate (the clipboard ring) + menu ───────────────────────
+  $menu = $d.prepare($ctx,"desktop.clipboard.menu",$headers,{instance:$ctx.instance},2)
+  check($menu.rc == 0 and $menu.body.menu == true and $menu.context == nil,"menu verb failed")
+  -- A fresh ring of two, so rotate semantics are exact and isolated.
+  $ring = {session:"test",instance:"instance-one",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true",
+    history:$d.history_state({path:$tmp .. "/ring.json"}, "test")}
+  for each $word in ["ring-a","ring-b"]
+    $plan = $d.prepare($ring,"desktop.clipboard.capture",$headers,{text:$word},2)
+    $ring = ctx_of($plan, $ring)
+  end
+  check(len($ring.history.entries) == 2 and $ring.history.entries[0].text == "ring-b","ring setup wrong")
+  $old_front = $ring.history.entries[0].id
+  $rot = $d.prepare($ring,"desktop.clipboard.rotate",$headers,{instance:$ring.instance},2)
+  check($rot.action == "clipboard_rotate" and $rot.options.stdin == "ring-a","rotate plan targets wrong entry")
+  $done = $d.finish($ring,$rot,{ok:true})
+  check($done.body.rotated == true and $done.context != nil,"rotate finish failed")
+  $ring = $done.context
+  check($ring.history.entries[0].text == "ring-a" and $ring.history.entries[1].id == $old_front,"rotate did not move front to back")
+  -- Single entry: rotate is a no-op, not an error.
+  $plan = $d.prepare($ring,"desktop.clipboard.clear",$headers,{instance:$ring.instance,id:$ring.history.entries[1].id},2)
+  $ring = ctx_of($plan, $ring)
+  $rot = $d.prepare($ring,"desktop.clipboard.rotate",$headers,{instance:$ring.instance},2)
+  check($rot.rc == 0 and $rot.body.rotated == false and $rot.context == nil,"rotate on single entry not a no-op")
 
   -- ── History: clear ────────────────────────────────────────────────────
   $plan = $d.prepare($ctx,"desktop.clipboard.clear",$headers,{instance:$ctx.instance,id:3},2)

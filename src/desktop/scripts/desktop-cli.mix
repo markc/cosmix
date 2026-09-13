@@ -33,6 +33,10 @@ elif len($a) == 4 and $a[0] == "rpick" then
   $request = {operation:"rpick", source:$a[1], target:$a[2], id:id_arg($a[3])}
 elif len($a) == 2 and $a[0] == "clear" then
   $request = {operation:"clear", target:$a[1]}
+elif len($a) == 2 and $a[0] == "menu" then
+  $request = {operation:"menu", target:$a[1]}
+elif len($a) == 2 and $a[0] == "rotate" then
+  $request = {operation:"rotate", target:$a[1]}
 elif len($a) == 3 and $a[0] == "clear" then
   $request = {operation:"clear", target:$a[1], id:id_arg($a[2])}
 elif len($a) == 3 and $a[0] == "pause" then

@@ -54,6 +54,16 @@ on desktop.clipboard.pick desc "make a history entry the live selection"
   if $r.context != nil then $session_context = $r.context end
   reply($r.rc, json_encode($r.body))
 end
+on desktop.clipboard.rotate desc "clipboard ring: next entry becomes the selection"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.clipboard.menu desc "toggle the picker panel (menu event on the topic)"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
 on desktop.clipboard.clear desc "delete one history entry (id) or all history"
   $r = respond($event)
   if $r.context != nil then $session_context = $r.context end

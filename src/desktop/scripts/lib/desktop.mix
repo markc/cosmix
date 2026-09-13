@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.3.1. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.2. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 
@@ -250,6 +250,11 @@ fn history_publish($ctx, $action, $id)
   end
 end
 
+fn history_publish_action($ctx, $action)
+  -- A control event (menu toggle): same topic, no revision semantics.
+  history_publish($ctx, $action, nil)
+end
+
 fn history_find($h, $text)
   for each $i in range(0, len($h.entries) - 1)
     if $h.entries[$i].text == $text then return $i end
@@ -400,13 +405,13 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.1", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.2", session:$ctx.session,
       instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
       clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8", history:history_capabilities($ctx)},
       open:{configured:is_executable($ctx.opener), schemes:["http","https"]},
-      verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause","desktop.open"]}}
+      verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.rotate","desktop.clipboard.menu","desktop.clipboard.clear","desktop.clipboard.pause","desktop.open"]}}
   end
   if $verb == "desktop.clipboard.capture" then
     -- The watcher path: a registered local citizen submits observed text.
@@ -426,6 +431,8 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   elif $verb == "desktop.clipboard.entry" then $expected = ["instance","id"]
   elif $verb == "desktop.clipboard.pick" then $expected = ["instance","id"]
   elif $verb == "desktop.clipboard.pause" then $expected = ["instance","on"]
+  elif $verb == "desktop.clipboard.rotate" then $expected = ["instance"]
+  elif $verb == "desktop.clipboard.menu" then $expected = ["instance"]
   elif $verb != "desktop.clipboard.read" and $verb != "desktop.clipboard.history" and $verb != "desktop.clipboard.clear" then
     return error("UNKNOWN_COMMAND", 10)
   end
@@ -510,6 +517,26 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
       argv:[$ctx.copy,"--type","text/plain;charset=utf-8"],
       options:{timeout:5, stdin:$entry.text, stdout:"null", stderr:"null"}}
   end
+  if $verb == "desktop.clipboard.rotate" then
+    -- The clipboard ring: front goes to the back, the next entry becomes the
+    -- live selection. One keypress cycles through history with no GUI.
+    $h = $ctx.history
+    if len($h.entries) < 2 then
+      return {rc:0, body:{instance:$ctx.instance, rotated:false, total:len($h.entries)}}
+    end
+    if $ctx.copy == nil or $ctx.wayland == "" or $ctx.runtime == "" then
+      return error("CLIPBOARD_UNAVAILABLE", 11)
+    end
+    return {action:"clipboard_rotate",
+      argv:[$ctx.copy,"--type","text/plain;charset=utf-8"],
+      options:{timeout:5, stdin:$h.entries[1].text, stdout:"null", stderr:"null"}}
+  end
+  if $verb == "desktop.clipboard.menu" then
+    -- Keybind surface: publish a menu event; the picker panel toggles on it.
+    -- No state change, no revision bump.
+    history_publish_action($ctx, "menu")
+    return {rc:0, body:{instance:$ctx.instance, menu:true}}
+  end
   if $verb == "desktop.open" then
     if type($body.url) != "string" or byte_length($body.url) > 8192 or not re_match($body.url, "^https?://[^/?#[:space:][:cntrl:]]+([/?#][^[:space:][:cntrl:]]*)?$") then
       return error("INVALID_HTTP_URL", 10)
@@ -562,6 +589,18 @@ fn finish($ctx, $plan, $result)
       return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, bytes:$entry.bytes, persisted:$persisted}, context:$ctx}
     end
     return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, bytes:$h.entries[0].bytes, persisted:($h.degraded == "" and not $h.save_failed)}}
+  end
+  if $plan.action == "clipboard_rotate" then
+    -- Helper succeeded: front entry to the back; the new front is now live.
+    $h = $ctx.history
+    $front = $h.entries[0]
+    $h.entries = concat(list_remove($h.entries, 0), [$front])
+    $h.used = history_used($h.entries)
+    $h.revision = $h.revision + 1
+    $ctx.history = $h
+    $persisted = history_save($h)
+    history_publish($ctx, "pick", $h.entries[0].id)
+    return {rc:0, body:{instance:$ctx.instance, rotated:true, id:$h.entries[0].id, persisted:$persisted}, context:$ctx}
   end
   if $plan.action == "write" then
     return {rc:0, body:{instance:$ctx.instance, accepted:true, bytes:$plan.bytes}}
