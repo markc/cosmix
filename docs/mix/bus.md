@@ -368,8 +368,9 @@ ghost:      false
 
 ## `on … end` — receiving messages (handlers)
 
-`on <command> [desc "doc-string"] [async] … end` registers a **handler** that
-fires when a matching Bus message arrives. The handler body uses newline- or
+`on <command> [desc "doc-string"] [async] … end` (`desc` and `async` compose
+in either order) registers a **handler** that fires when a matching Bus
+message arrives. The handler body uses newline- or
 `;`-separated statements closed by `end` — **no `do` keyword**. The
 `<command>` matches the *inner command* of the inbound message (the verb the
 publisher sent), **not** the topic/target name — check the publisher to know

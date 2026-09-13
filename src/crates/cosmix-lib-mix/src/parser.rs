@@ -1476,7 +1476,8 @@ impl Parser {
         })
     }
 
-    /// Parse: `on command.name [async] ... done`
+    /// Parse: `on command.name [desc "doc"] [async] ... end` (trailer in
+    /// either order)
     ///
     /// Registers a handler body to fire when a matching Bus message arrives.
     /// Command name parsing mirrors `parse_send_args` — a bare identifier
@@ -1532,6 +1533,13 @@ impl Parser {
                     let Some(text) = self.peek_next_static_string() else {
                         break; // not `desc "<literal>"` — leave for the body
                     };
+                    // An empty/whitespace doc is refused the loud way: not
+                    // consumed, so the pair falls through and hits the
+                    // ordinary adjacent-expression parse error — better than
+                    // HELP rendering a blank description.
+                    if text.trim().is_empty() {
+                        break;
+                    }
                     doc = Some(text);
                     self.advance(); // desc
                     self.advance(); // the string

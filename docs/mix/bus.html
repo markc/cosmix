@@ -720,8 +720,9 @@ reachability.</p>
 </blockquote>
 <hr />
 <h2 id="on--end--receiving-messages-handlers"><code>on … end</code> — receiving messages (handlers)</h2>
-<p><code>on &lt;command&gt; [desc "doc-string"] [async] … end</code> registers a <strong>handler</strong> that
-fires when a matching Bus message arrives. The handler body uses newline- or
+<p><code>on &lt;command&gt; [desc "doc-string"] [async] … end</code> (<code>desc</code> and <code>async</code> compose
+in either order) registers a <strong>handler</strong> that fires when a matching Bus
+message arrives. The handler body uses newline- or
 <code>;</code>-separated statements closed by <code>end</code> — <strong>no <code>do</code> keyword</strong>. The
 <code>&lt;command&gt;</code> matches the <em>inner command</em> of the inbound message (the verb the
 publisher sent), <strong>not</strong> the topic/target name — check the publisher to know

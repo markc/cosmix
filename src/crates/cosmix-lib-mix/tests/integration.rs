@@ -1382,6 +1382,145 @@ done
     assert!(!eval.is_dispatching());
 }
 
+/// The pump passes handler doc-strings to `handle_reserved` for HELP — and
+/// ONLY for HELP: every other command gets an empty slice (the doc scan is
+/// off the hot path). This is the middle of the doc-string chain that the
+/// parser test and the `help_body` test do not reach; without it, flipping
+/// the pump's `ev.command == "HELP"` literal to `"help"` passes every gate
+/// in both crates (the opus arm-B falsification, 2026-09-13).
+#[tokio::test(flavor = "current_thread")]
+async fn event_pump_passes_handler_docs_to_reserved_help_only() {
+    use cosmix_mix::error::MixResult;
+    use cosmix_mix::evaluator::{BusHandler, ReservedOutcome, ServeRuntime};
+    use cosmix_mix::value::Value;
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use tokio::sync::mpsc;
+
+    struct ChannelHandler {
+        rx: RefCell<Option<mpsc::UnboundedReceiver<IncomingEvent>>>,
+    }
+    impl BusHandler for ChannelHandler {
+        fn send<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value)>> + 'a>> {
+            Box::pin(async move { Ok((0, Value::Nil)) })
+        }
+        fn emit<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = MixResult<()>> + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+        fn port_exists<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = MixResult<bool>> + 'a>> {
+            Box::pin(async move { Ok(false) })
+        }
+        fn next_incoming<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Option<IncomingEvent>> + 'a>> {
+            Box::pin(async move {
+                let mut rx = self.rx.borrow_mut().take()?;
+                let result = rx.recv().await;
+                *self.rx.borrow_mut() = Some(rx);
+                result
+            })
+        }
+    }
+
+    /// One recorded call: the command plus the handler_commands slice, owned.
+    type RecordedCall = (String, Vec<(String, Option<String>)>);
+    /// Records the (command, handler_commands) slice of every call.
+    struct CapturingRuntime {
+        calls: RefCell<Vec<RecordedCall>>,
+    }
+    impl ServeRuntime for CapturingRuntime {
+        fn handle_reserved(
+            &self,
+            command: &str,
+            _args_header: Option<&str>,
+            _req_body: &str,
+            handler_commands: &[(&str, Option<&str>)],
+        ) -> Option<ReservedOutcome> {
+            self.calls.borrow_mut().push((
+                command.to_string(),
+                handler_commands
+                    .iter()
+                    .map(|(c, d)| (c.to_string(), d.map(str::to_string)))
+                    .collect(),
+            ));
+            match command {
+                "HELP" => Some(ReservedOutcome {
+                    rc: 0,
+                    body: "[]".to_string(),
+                    quit: false,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    let source = r#"
+on doc.verb desc "A documented verb"
+  reply("ok")
+end
+on plain.verb
+  reply("ok")
+end
+"#;
+    let mut eval = Evaluator::new();
+    let (tx, rx) = mpsc::unbounded_channel::<IncomingEvent>();
+    eval.set_bus_handler(Rc::new(ChannelHandler {
+        rx: RefCell::new(Some(rx)),
+    }));
+    let runtime = Rc::new(CapturingRuntime {
+        calls: RefCell::new(Vec::new()),
+    });
+    eval.set_serve_runtime(runtime.clone());
+
+    let stmts = Parser::new(Lexer::new(source).tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    eval.execute(&stmts).await.unwrap();
+
+    tx.send(mk_event("HELP", "", &[])).unwrap();
+    tx.send(mk_event("plain.verb", "", &[])).unwrap();
+    drop(tx);
+    eval.run_event_pump().await.unwrap();
+
+    let calls = runtime.calls.borrow();
+    let help = calls
+        .iter()
+        .find(|(c, _)| c == "HELP")
+        .expect("HELP reached handle_reserved");
+    let mut got = help.1.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("doc.verb".to_string(), Some("A documented verb".to_string())),
+            ("plain.verb".to_string(), None),
+        ],
+        "HELP must receive every command with its doc-string"
+    );
+    let other = calls
+        .iter()
+        .find(|(c, _)| c == "plain.verb")
+        .expect("non-HELP command consults handle_reserved too");
+    assert!(
+        other.1.is_empty(),
+        "non-HELP commands must get the empty (hot-path) slice"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_event_pump_respects_interrupt_flag() {
     // Ctrl-C path: pump checks `self.globals.interrupted` at the top

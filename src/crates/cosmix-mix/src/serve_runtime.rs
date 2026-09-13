@@ -151,17 +151,18 @@ impl MixServeRuntime {
             .copied()
             .filter(|(c, _)| !self.is_reserved(c))
             .collect();
-        // Sort by command, documented entries first, so if a caller ever
-        // passes duplicate commands the dedup keeps a documented one rather
-        // than letting an undocumented duplicate shadow it. (The evaluator
-        // already passes one entry per command; this is belt-and-braces.)
-        authored.sort_unstable_by_key(|(c, doc)| (*c, doc.is_none()));
+        // Sort by command, documented entries first (doc included in the key
+        // so even two differently-documented duplicates order
+        // deterministically under the unstable sort), then dedup: a
+        // documented entry wins over an undocumented duplicate. (The
+        // evaluator already passes one entry per command; belt-and-braces.)
+        authored.sort_unstable_by_key(|(c, doc)| (*c, doc.is_none(), *doc));
         authored.dedup_by_key(|(c, _)| *c);
         for (c, doc) in authored {
             cmds.push(json!({
                 "name": c,
-                // The handler's own doc-string (`on <cmd> "…"`) when the
-                // author wrote one — a citizen self-describes at the
+                // The handler's own doc-string (`on <cmd> desc "…"`) when
+                // the author wrote one — a citizen self-describes at the
                 // handler site; GUIs and agents read the same text.
                 "description": doc.unwrap_or("Author-defined handler"),
                 "args": [],
@@ -339,6 +340,12 @@ impl ServeRuntime for MixServeRuntime {
         handler_commands: &[(&str, Option<&str>)],
     ) -> Option<ReservedOutcome> {
         // L0 — bare Ch02 universals (routed by `to:`, never prefixed).
+        // The "HELP" literal MUST stay in lock-step with the pump's
+        // `ev.command == "HELP"` gate in cosmix-lib-mix evaluator.rs
+        // (run_event_pump), which populates `handler_commands` for exactly
+        // this arm and passes an empty slice otherwise. Adding an alias or
+        // case-fold here without matching that gate makes HELP replies
+        // silently lose every author command.
         match command {
             "HELP" => {
                 return Some(ReservedOutcome {

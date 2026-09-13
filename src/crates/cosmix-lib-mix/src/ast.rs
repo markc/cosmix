@@ -351,11 +351,13 @@ pub enum StmtKind {
     /// registration order.
     On {
         command: String,
-        /// Optional doc-string: `on <cmd> "what this verb does"`. Static
-        /// metadata captured at parse time; the serve runtime surfaces it as
-        /// the verb's `description` in the `HELP` reply, so a citizen's
-        /// self-description is authored at the handler site (GUIs and agents
-        /// read the same text). `None` ⇒ HELP shows the generic placeholder.
+        /// Optional doc-string: `on <cmd> desc "what this verb does"` (the
+        /// explicit `desc` marker — a bare trailing string is a body
+        /// statement, never a doc). Static metadata captured at parse time;
+        /// the serve runtime surfaces it as the verb's `description` in the
+        /// `HELP` reply, so a citizen's self-description is authored at the
+        /// handler site (GUIs and agents read the same text). `None` ⇒ HELP
+        /// shows the generic placeholder.
         doc: Option<String>,
         /// SPEC 18 Phase 2: `on <cmd> async` declares a Class C handler whose
         /// invocations may interleave across `send.await`. Plain handlers

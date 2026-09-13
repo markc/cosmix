@@ -1411,7 +1411,7 @@ pub(crate) struct HandlerEntry {
     /// The handler body. `Arc<Vec<Stmt>>` lets dispatch clone a handle
     /// to the body without copying the AST.
     body: Arc<Vec<Stmt>>,
-    /// The handler's doc-string (`on <cmd> "…"`), surfaced by the serve
+    /// The handler's doc-string (`on <cmd> desc "…"`), surfaced by the serve
     /// runtime as the verb's HELP `description`. With multiple handlers on
     /// one command, the first documented one wins.
     doc: Option<String>,
@@ -1932,9 +1932,11 @@ pub trait ServeRuntime {
     ///   `req_body`), mirroring the indexd reference dispatch.
     /// - `req_body` — the inbound request body.
     /// - `handler_commands` — the citizen's registered `on` command set as
-    ///   `(command, doc)` pairs, surfaced by `HELP`/`INFO` as the
-    ///   author-defined command list; `doc` is the handler's doc-string
-    ///   (`on <cmd> "…"`) when the author wrote one.
+    ///   `(command, doc)` pairs; `doc` is the handler's doc-string
+    ///   (`on <cmd> desc "…"`) when the author wrote one. **Populated only
+    ///   when `command == "HELP"`** (its sole consumer); every other call
+    ///   receives an empty slice — the doc scan stays off the hot path. An
+    ///   implementation must not read it for any other verb.
     fn handle_reserved(
         &self,
         command: &str,
@@ -4419,7 +4421,14 @@ impl Evaluator {
                         if let Some(rt) = g.serve_runtime.as_ref() {
                             // Only HELP reads this list, so skip the doc scan
                             // (and the per-command tuples) on the hot path of
-                            // every other inbound message.
+                            // every other inbound message. The "HELP" literal
+                            // MUST stay in lock-step with the HELP match arm
+                            // in MixServeRuntime::handle_reserved
+                            // (cosmix-mix/src/serve_runtime.rs) — if that
+                            // side ever gains an alias/case-fold, this gate
+                            // must match, or HELP replies silently lose every
+                            // author command. Locked by the integration test
+                            // event_pump_passes_handler_docs_to_reserved_help_only.
                             let handler_cmds: Vec<(&str, Option<&str>)> =
                                 if ev.command == "HELP" {
                                     g.handlers
