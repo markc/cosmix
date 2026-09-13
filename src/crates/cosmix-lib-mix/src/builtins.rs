@@ -299,7 +299,7 @@ builtin_table! {
     ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
     ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool}))}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
-    ("spawn", CapabilityClass::Process,           "system",  "Start background process via /bin/sh -c, return PID. Every argument must be a STRING and none is coerced — a non-string raises TYPE_MISMATCH rather than being stringified into a doomed sh command (spawn returns a PID, not a result map, so a misrun child would otherwise fail invisibly). There is no argv form: use run_argv for an argv list in the foreground (strict since v0.52.0)", contract!((cmd: string, stdout?: string, stderr?: string) -> number; effects[shell]; failure[raises])),
+    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal, so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
     ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
@@ -3589,13 +3589,6 @@ fn spawn_string_arg(what: &str, v: &Value) -> MixResult<String> {
             format!("spawn: {what} contains a NUL byte"),
         )),
         Value::String(s) => Ok(s.clone()),
-        Value::List(_) if what == "cmd" => Err(MixError::structured(
-            "TYPE_MISMATCH",
-            "spawn: cmd must be a shell command string, got list — spawn runs \
-             `sh -c` and has no argv form; build the string with shell_quote(), \
-             or use run_argv/run_argv_must for an argv list in the foreground"
-                .to_string(),
-        )),
         other => Err(MixError::structured(
             "TYPE_MISMATCH",
             format!(
@@ -3615,6 +3608,15 @@ fn spawn_string_arg(what: &str, v: &Value) -> MixResult<String> {
 ///   to merge them into a single combined log (like bash `&>file`).
 fn builtin_spawn(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("spawn", &args, 1)?;
+    // Two forms, dispatched on the first argument:
+    //   spawn(cmd_string[, stdout][, stderr])  — the /bin/sh -c shell form
+    //   spawn(argv_list[, opts])               — no shell, run_argv-parity
+    // A List first arg selects the argv form; a String selects the shell
+    // form; anything else falls through to the shell form's string check,
+    // which raises TYPE_MISMATCH exactly as before.
+    if matches!(args[0], Value::List(_)) {
+        return builtin_spawn_argv(args);
+    }
     let cmd = spawn_string_arg("cmd", &args[0])?;
 
     let mut command = std::process::Command::new("sh");
@@ -3675,6 +3677,331 @@ fn builtin_spawn(args: Vec<Value>) -> MixResult<Option<Value>> {
         msg: format!("spawn failed: {}", e),
     })?;
     Ok(Some(Value::Number(child.id() as f64)))
+}
+
+/// The argv form: `spawn(argv[, {detach, cwd, env, clear_env, stdout, stderr}])`
+/// → pid. No shell — argv is a list of strings run directly (run_argv's
+/// no-shell contract, but fire-and-forget: spawn owns nothing after it
+/// returns). This is the launcher/daemon slot the TODO-mix entry named.
+///
+/// - `detach: true` puts the child in a NEW SESSION (`setsid`): no
+///   controlling terminal and its own session, so a terminal hangup or the
+///   caller exiting does not take it down (session separation, not
+///   immortality — a cgroup teardown or explicit signal still reaches it).
+/// - `cwd`/`env`/`clear_env` mirror run_argv exactly.
+/// - `stdout`/`stderr` reuse run_argv's routing, restricted to what makes
+///   sense for a process whose output nobody waits on: `"null"` (default),
+///   `"inherit"`, or a `{file, append?, mode?}` map — and `stderr: "stdout"`
+///   to merge. `"capture"` is refused: capturing means waiting, which is
+///   run_argv's job.
+fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
+    let caller = "spawn";
+    if args.len() > 2 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("spawn(argv[, opts]) takes at most 2 arguments, got {}", args.len()),
+        });
+    }
+    // argv: a non-empty list of strings, none coerced (same discipline as
+    // run_argv and the shell form's string args).
+    let Value::List(items) = &args[0] else {
+        unreachable!("dispatched here only for a List first arg");
+    };
+    if items.is_empty() {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            "spawn: argv list must not be empty".to_string(),
+        ));
+    }
+    let mut argv: Vec<String> = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        match it {
+            Value::String(s) => {
+                if s.contains('\0') {
+                    return Err(MixError::structured(
+                        "TYPE_MISMATCH",
+                        format!("spawn: argv[{i}] contains a NUL byte"),
+                    ));
+                }
+                argv.push(s.clone());
+            }
+            other => {
+                return Err(MixError::structured(
+                    "TYPE_MISMATCH",
+                    format!(
+                        "spawn: argv[{i}] must be a string, got {} (argv is never coerced)",
+                        other.type_name()
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Options.
+    let mut detach = false;
+    let mut cwd: Option<String> = None;
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut clear_env = false;
+    let mut stdout = RunArgvOutput::Null;
+    let mut stderr = RunArgvStderr::Null;
+    if let Some(opts) = args.get(1) {
+        let Value::Map(map) = opts else {
+            return Err(opt_invalid(
+                caller,
+                format!("second argument must be an options map, got {}", opts.type_name()),
+            ));
+        };
+        for (key, val) in map.iter() {
+            match key.as_str() {
+                "detach" => {
+                    detach = match val {
+                        Value::Bool(b) => *b,
+                        other => {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("detach must be a bool, got {}", other.type_name()),
+                            ));
+                        }
+                    };
+                }
+                "cwd" => {
+                    cwd = match val {
+                        Value::String(s) => {
+                            // Reject a NUL early (OPTION_INVALID), before any
+                            // output file is opened — otherwise a NUL cwd
+                            // truncates a good stdout log on its way to a late
+                            // Command::spawn failure (codex arm MAJOR-7).
+                            if s.contains('\0') {
+                                return Err(opt_invalid(
+                                    caller,
+                                    "cwd contains a NUL byte",
+                                ));
+                            }
+                            Some(s.clone())
+                        }
+                        Value::Nil => None,
+                        other => {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("cwd must be a string or nil, got {}", other.type_name()),
+                            ));
+                        }
+                    };
+                }
+                "env" => {
+                    let Value::Map(em) = val else {
+                        return Err(opt_invalid(
+                            caller,
+                            format!("env must be a map, got {}", val.type_name()),
+                        ));
+                    };
+                    for (ek, ev) in em.iter() {
+                        if !run_argv_env_key_ok(ek) {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("env key {ek:?} must match [A-Za-z_][A-Za-z0-9_]*"),
+                            ));
+                        }
+                        let sval = match ev {
+                            Value::String(s) => s.clone(),
+                            Value::Number(_) | Value::Bool(_) => ev.to_mix_string(),
+                            other => {
+                                return Err(opt_invalid(
+                                    caller,
+                                    format!(
+                                        "env value for '{ek}' must be a string, number, or bool, got {}",
+                                        other.type_name()
+                                    ),
+                                ));
+                            }
+                        };
+                        if sval.contains('\0') {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("env value for '{ek}' contains a NUL byte"),
+                            ));
+                        }
+                        env.push((ek.clone(), sval));
+                    }
+                }
+                "clear_env" => {
+                    clear_env = match val {
+                        Value::Bool(b) => *b,
+                        other => {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("clear_env must be a bool, got {}", other.type_name()),
+                            ));
+                        }
+                    };
+                }
+                "stdout" => {
+                    stdout = match parse_stdout_route(caller, val)? {
+                        RunArgvOutput::Capture => {
+                            return Err(opt_invalid(
+                                caller,
+                                "stdout cannot be \"capture\": spawn is fire-and-forget \
+                                 (capture means waiting — use run_argv)",
+                            ));
+                        }
+                        other => other,
+                    };
+                }
+                "stderr" => {
+                    stderr = match parse_stderr_route(caller, val)? {
+                        RunArgvStderr::Capture => {
+                            return Err(opt_invalid(
+                                caller,
+                                "stderr cannot be \"capture\": spawn is fire-and-forget \
+                                 (capture means waiting — use run_argv)",
+                            ));
+                        }
+                        other => other,
+                    };
+                }
+                other => {
+                    return Err(opt_invalid(
+                        caller,
+                        format!(
+                            "unknown option '{}' (supported: detach, cwd, env, clear_env, stdout, stderr)",
+                            sanitize_for_diag(other)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]).stdin(std::process::Stdio::null());
+    if let Some(dir) = &cwd {
+        command.current_dir(dir);
+    }
+    if clear_env {
+        command.env_clear();
+    }
+    for (k, v) in &env {
+        command.env(k, v);
+    }
+    // Open output routes BEFORE spawning; a file-open failure means the
+    // child is never started (like run_argv's PROCESS_STDIO). stderr:stdout
+    // clones the stdout handle.
+    let stdout_file = spawn_open_output(&stdout)?;
+    match &stdout {
+        RunArgvOutput::Null => {
+            command.stdout(std::process::Stdio::null());
+        }
+        RunArgvOutput::Inherit => {}
+        RunArgvOutput::File(_) => {
+            command.stdout(stdout_file.as_ref().unwrap().try_clone().map_err(|e| {
+                MixError::RuntimeError { span: None, msg: format!("spawn: cloning stdout fd: {e}") }
+            })?);
+        }
+        RunArgvOutput::Capture => unreachable!("rejected above"),
+    }
+    match &stderr {
+        RunArgvStderr::Null => {
+            command.stderr(std::process::Stdio::null());
+        }
+        RunArgvStderr::Inherit => {}
+        RunArgvStderr::Stdout => match &stdout {
+            RunArgvOutput::File(_) => {
+                command.stderr(stdout_file.as_ref().unwrap().try_clone().map_err(|e| {
+                    MixError::RuntimeError { span: None, msg: format!("spawn: cloning fd for stderr:stdout: {e}") }
+                })?);
+            }
+            RunArgvOutput::Null => {
+                command.stderr(std::process::Stdio::null());
+            }
+            // stderr follows stdout's destination. For inherited stdout that
+            // is the PARENT's fd 1 — and leaving the child's stderr unset
+            // would inherit parent fd 2 instead (a different destination), so
+            // `2>&1` would silently NOT hold. Duplicate parent fd 1 into the
+            // child's stderr to honour the merge (codex arm MAJOR-1).
+            RunArgvOutput::Inherit => {
+                use std::os::unix::io::{FromRawFd, OwnedFd};
+                // Duplicate parent fd 1 with F_DUPFD_CLOEXEC (not plain
+                // dup(1), which clears FD_CLOEXEC): this transient fd must
+                // NOT leak past exec into this or any concurrently-spawned
+                // child, or it would hold the destination open unexpectedly.
+                // Command dup2's it onto the child's fd 2 before exec, so
+                // close-on-exec on our copy is exactly right. Min fd 3 keeps
+                // it clear of the std stream numbers.
+                // SAFETY: fcntl returns a fresh owned fd (or -1); the
+                // success is wrapped in OwnedFd, closed once by the Stdio.
+                let dup = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3) };
+                if dup < 0 {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "spawn: dup(stdout) for stderr:\"stdout\": {}",
+                            std::io::Error::last_os_error()
+                        ),
+                    });
+                }
+                let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+                command.stderr(std::process::Stdio::from(owned));
+            }
+            RunArgvOutput::Capture => unreachable!("rejected above"),
+        },
+        RunArgvStderr::File(f) => {
+            let file = spawn_create_file(f)?;
+            command.stderr(file);
+        }
+        RunArgvStderr::Capture => unreachable!("rejected above"),
+    }
+
+    #[cfg(unix)]
+    if detach {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is a thin, async-signal-safe syscall wrapper —
+        // no allocation, no locks, no global state — safe in the post-fork
+        // pre-exec window. A new session gives the child no controlling
+        // terminal and its own session, so a terminal hangup or the caller
+        // exiting does not take it down. (This is session separation, not
+        // immortality: a service cgroup teardown or an explicit signal to
+        // the child still reaches it.)
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = command.spawn().map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("spawn failed: {e}"),
+    })?;
+    Ok(Some(Value::Number(child.id() as f64)))
+}
+
+/// Open a stdout route's file (if it is a file route) once, so a stderr:stdout
+/// merge can clone the same handle. `None` for null/inherit.
+fn spawn_open_output(out: &RunArgvOutput) -> MixResult<Option<std::fs::File>> {
+    match out {
+        RunArgvOutput::File(f) => Ok(Some(spawn_create_file(f)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Open a `{file, append, mode}` route for spawn, honouring append and the
+/// creation mode (0o600 default via the parser).
+fn spawn_create_file(f: &RunArgvFile) -> MixResult<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).mode(f.mode);
+    if f.append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    opts.open(&f.path).map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("spawn: opening {:?}: {e}", f.path),
+    })
 }
 
 /// kill(pid, [signal]) — send signal to process. Default signal: 15 (SIGTERM).

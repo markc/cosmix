@@ -1,13 +1,16 @@
-//! spawn() takes strings and coerces nothing (0.52.0).
+//! spawn() argument discipline: the shell form coerces nothing (0.52.0), and
+//! the argv form (0.89.0) runs a list directly with no shell.
 //!
-//! The bug this pins: `spawn(["touch", $p])` stringified the list to its
-//! display form and handed `[touch, /path]` to `sh -c`, which died with
-//! "command not found" — while spawn returned a healthy-looking PID, because
-//! it does not wait and has no result map to carry the failure. The caller had
-//! no signal whatsoever. So the assertions below are paired: the call must
-//! RAISE, *and* the side effect the caller asked for must not have happened.
-//! Asserting only the raise would still pass if a future spawn silently
-//! swallowed the argv and did nothing.
+//! History this pins: originally `spawn(["touch", $p])` stringified the list
+//! and handed `[touch, /path]` to `sh -c`, which died "command not found"
+//! while spawn returned a healthy-looking PID (it does not wait). 0.52.0 made
+//! that a hard TYPE_MISMATCH. 0.89.0 gave the list a real meaning — the argv
+//! form, `spawn(argv[, opts])`, running the vector directly (no shell, so no
+//! word-splitting or glob surprises) with optional detach/cwd/env/stdio. The
+//! string form is unchanged. The argv assertions are paired the same way the
+//! old raise-assertions were: the call must SUCCEED *and* its side effect must
+//! actually land, so a future spawn that swallowed the argv silently would
+//! still fail the test.
 
 #![cfg(unix)]
 
@@ -65,31 +68,145 @@ fn wait_for(path: &std::path::Path) -> bool {
     false
 }
 
+/// Wait for a file to contain `needle` (trimmed) — for children whose output
+/// lands after the file is created (a redirect opens the file before the
+/// command writes it), so an existence-only wait can race.
+fn wait_for_contents(path: &std::path::Path, needle: &str) -> bool {
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if s.trim() == needle {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
 #[tokio::test]
-async fn argv_list_as_cmd_raises_and_runs_nothing() {
-    let w = witness("list");
-    let src = format!("spawn([\"touch\", \"{}\"])\n", w.display());
-
-    let err = run_err(&src).await;
-    let msg = err.to_string();
-    assert!(
-        msg.contains("cmd must be a shell command string"),
-        "error must say what is wrong with the argument, got: {msg}"
-    );
-    assert!(
-        msg.contains("run_argv"),
-        "error must name the argv-capable runner, got: {msg}"
-    );
-
-    // The load-bearing half: the child must never have run. Give a would-be
-    // child the same grace the happy path gets, so this cannot pass merely by
-    // racing it.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(
-        !w.exists(),
-        "spawn raised but still ran something: {} exists",
+async fn argv_list_runs_without_a_shell() {
+    // The behaviour 0.89.0 introduced (and the inverse of what this test
+    // pinned before): a list first arg is the argv form and RUNS directly.
+    let w = witness("argv");
+    let src = format!(
+        "$p = spawn([\"touch\", \"{}\"])\nprint($p > 0)\n",
         w.display()
     );
+    let out = run(&src).await.expect("argv form must run");
+    assert_eq!(out.trim(), "true", "argv spawn returns a positive PID");
+    assert!(
+        wait_for(&w),
+        "argv form must actually run the command: {} missing",
+        w.display()
+    );
+    let _ = std::fs::remove_file(&w);
+}
+
+#[tokio::test]
+async fn argv_no_shell_means_no_word_splitting() {
+    // The point of an argv form: an argument with spaces is ONE argument, not
+    // split by a shell. `touch "a b"` under sh -c would make two files; the
+    // argv form makes exactly one, literally named "a b".
+    let dir = witness("nosplit");
+    std::fs::create_dir(&dir).unwrap();
+    let target = dir.join("a b");
+    let src = format!(
+        "spawn([\"touch\", \"{}\"])\n",
+        target.display()
+    );
+    run(&src).await.expect("argv spawn");
+    assert!(wait_for(&target), "the single spaced-name file must exist");
+    // Exactly one entry, and it is the spaced name — no "a" and "b" split.
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+    assert_eq!(entries.len(), 1, "no word-splitting: exactly one file");
+    assert_eq!(entries[0].file_name().to_string_lossy(), "a b");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn argv_detach_puts_the_child_in_a_new_session() {
+    // detach:true → setsid → the child leads its own session (SID == PID),
+    // detached from the caller's controlling terminal. Read it back via
+    // /proc so the assertion is about the real kernel state.
+    let out = run("$p = spawn([\"sleep\", \"30\"], {detach: true})\nprint($p)\n")
+        .await
+        .expect("detached argv spawn");
+    let pid: i32 = out.trim().parse().expect("a numeric pid");
+    // getsid(pid) via /proc/<pid>/stat field 6 (sid). Give the child a beat.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("child alive");
+    // stat fields after the (comm) paren group: state ppid pgrp session ...
+    let after = stat.rsplit(')').next().unwrap();
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // fields[0]=state, [1]=ppid, [2]=pgrp, [3]=session
+    let sid: i32 = fields[3].parse().unwrap();
+    assert_eq!(sid, pid, "detach:true must make the child a session leader");
+    unsafe { libc::kill(pid, libc::SIGKILL); }
+}
+
+#[tokio::test]
+async fn argv_env_reaches_the_child() {
+    let w = witness("env");
+    let src = format!(
+        "spawn([\"sh\", \"-c\", \"echo $MARKER > {}\"], {{env: {{MARKER: \"reached\"}}}})\n",
+        w.display()
+    );
+    run(&src).await.expect("argv spawn with env");
+    // Wait for the CONTENT, not just the file: the redirect creates the file
+    // before `echo` writes it, so an existence-only check can race.
+    assert!(
+        wait_for_contents(&w, "reached"),
+        "child must run and write the env value: {:?}",
+        std::fs::read_to_string(&w)
+    );
+    let _ = std::fs::remove_file(&w);
+}
+
+#[tokio::test]
+async fn argv_cwd_nul_is_refused_before_opening_the_log() {
+    // A NUL in cwd must be OPTION_INVALID at validation, before the stdout
+    // log is opened — so a good log is never truncated on the way to a late
+    // failure (the run_argv parity codex flagged).
+    let w = witness("cwdnul");
+    std::fs::write(&w, b"PRECIOUS").unwrap();
+    let src = format!(
+        "spawn([\"true\"], {{cwd: \"/tmp/x\\u{{0}}y\", stdout: {{file: \"{}\"}}}})\n",
+        w.display()
+    );
+    let err = run_err(&src).await;
+    assert!(err.to_string().contains("cwd contains a NUL"), "got: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&w).unwrap(),
+        "PRECIOUS",
+        "the stdout log must not have been opened, let alone truncated"
+    );
+    let _ = std::fs::remove_file(&w);
+}
+
+#[tokio::test]
+async fn argv_capture_is_refused() {
+    // Capturing means waiting; spawn is fire-and-forget. Both streams refuse
+    // "capture" with OPTION_INVALID before spawning.
+    for stream in ["stdout", "stderr"] {
+        let err = run_err(&format!("spawn([\"true\"], {{{stream}: \"capture\"}})\n")).await;
+        let msg = err.to_string();
+        assert!(msg.contains("cannot be \"capture\""), "got: {msg}");
+        assert!(msg.contains("run_argv"), "should point at run_argv: {msg}");
+    }
+}
+
+#[tokio::test]
+async fn argv_unknown_option_and_empty_and_nonstring_element_are_refused() {
+    let err = run_err("spawn([\"true\"], {bogus: 1})\n").await;
+    assert!(err.to_string().contains("unknown option 'bogus'"), "got: {err}");
+
+    let err = run_err("spawn([])\n").await;
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+
+    let err = run_err("spawn([\"echo\", 42])\n").await;
+    let msg = err.to_string();
+    assert!(msg.contains("argv[1] must be a string"), "got: {msg}");
+    assert!(msg.contains("never coerced"), "got: {msg}");
 }
 
 #[tokio::test]

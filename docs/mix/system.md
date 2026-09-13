@@ -631,9 +631,13 @@ executable path, no PATH needed ([remote](remote.md)).
 
 ## Background processes — spawn, kill, process_alive
 
-`spawn(cmd[, stdout_path[, stderr_path]])` starts a background process via
-`/bin/sh -c` with stdin from `/dev/null` and returns its **PID** as a number. It
-does not wait. Stdio routing by arity:
+`spawn` starts a background process and returns its **PID** as a number. It does
+not wait, reap, or supervise — it owns nothing after it returns (that is
+`run_argv`'s / a supervisor's job). It has **two forms**, chosen by the first
+argument's type.
+
+**Shell form — `spawn(cmd[, stdout_path[, stderr_path]])`**, a string command
+run via `/bin/sh -c` with stdin from `/dev/null`. Stdio routing by arity:
 
 - 1 arg — both stdout and stderr → `/dev/null`
 - 2 args — stdout → file (truncated), stderr → `/dev/null`
@@ -648,45 +652,57 @@ print(run("cat /tmp/spawn.log"))
 logged-line
 ```
 
-**All three arguments are strings, and none of them is coerced** (strict since
-v0.52.0). This is the loud-validation rule the opts maps have always had,
-reaching the one runner that had missed it — and `spawn` needs it most, because
-it is the only runner with nowhere to put a failure. It returns a **PID, not a
-result map**, and it does not wait, so a child that dies on the very first line
-is indistinguishable from one that worked. Until 0.52.0 a non-string was
-stringified into its display form and handed to `sh` anyway:
+All three shell-form arguments are strings and **none is coerced** (strict since
+v0.52.0) — `spawn` needs loud validation most, because it is the only runner
+with nowhere to put a failure: it returns a **PID, not a result map**, so a child
+that dies on its first line looks exactly like one that worked. A non-string
+raises `TYPE_MISMATCH` at argument validation, before any stdio file is opened
+(so a NUL in `stderr_path` can no longer truncate the `stdout_path` file on the
+way to failing).
 
-```text
-spawn(["touch", $p])   -- 0.51.0: returns a healthy PID; sh dies with
-                       --   `sh: line 1: [touch,: command not found`
-                       --   and nothing anywhere reports it
-                       -- 0.52.0: raises TYPE_MISMATCH
+**Argv form — `spawn(argv[, {detach, cwd, env, clear_env, stdout, stderr}])`**
+(v0.89.0), a **list** of strings run **directly, with no shell** — so no
+word-splitting, glob expansion, or quoting surprises. This is the launcher /
+daemon slot: the job that used to force `run("setsid app &")` through `sh`.
+
+```mix
+spawn(["cosmix-term", "--profile", "work"])           -- argv, no shell
+spawn(["mydaemon"], {detach: true})                   -- new session (setsid),
+                                                      --   survives the caller,
+                                                      --   drops the terminal
+spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
+                   stdout: {file: "/var/log/worker.log", append: true}})
 ```
 
-There is **no argv form of `spawn`** — it is `sh -c` by definition. Build the
-command string with [`shell_quote`](#shell_quote), or use `run_argv` /
-`run_argv_must` when you want an argv list and can accept a foreground child:
+- `detach: true` → the child is put in a **new session** (`setsid`): it has no
+  controlling terminal and its own session, so a terminal hangup or the caller
+  exiting does not take it down — the daemon shape, stronger than the shell
+  form's `&`. (Session separation, not immortality: a service-cgroup teardown
+  or an explicit signal still reaches it.) Default `false` (a plain child in
+  the caller's session).
+- `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)
+  (clear-then-layer: `{clear_env: true, env: {…}}` starts from empty).
+- `stdout` / `stderr` reuse `run_argv`'s routing, minus capture: `"null"`
+  (default), `"inherit"`, or a `{file, append?, mode?}` map — and
+  `stderr: "stdout"` to merge. **`"capture"` is refused**: capturing means
+  waiting, which is `run_argv`'s job. A file-open failure means the child is
+  **not** spawned.
+- argv must be a non-empty list of strings, none coerced; a non-string element
+  or an empty list raises `TYPE_MISMATCH`.
 
 ```text
-spawn(["touch", "/tmp/x"])     -> TYPE_MISMATCH: spawn: cmd must be a shell command
-                                  string, got list — spawn runs `sh -c` and has no
-                                  argv form; build the string with shell_quote(), or
-                                  use run_argv/run_argv_must for an argv list in the
-                                  foreground
-spawn("true", ["a"])           -> TYPE_MISMATCH: spawn: stdout_path must be a string,
-                                  got list (no coercion — encode explicitly)
-spawn(7)                       -> TYPE_MISMATCH: spawn: cmd must be a string, got
-                                  number (no coercion — encode explicitly)
+spawn(["true"], {stdout: "capture"})  -> OPTION_INVALID: stdout cannot be "capture"
+spawn(["echo", 42])                   -> TYPE_MISMATCH: argv[1] must be a string
+spawn(7)                              -> TYPE_MISMATCH: cmd must be a string
 ```
 
-A NUL byte in any of the three raises too — as `TYPE_MISMATCH`, at argument
-validation. It was never *accepted*: `std`'s `Command::spawn` and `File::create`
-both reject an interior NUL, so 0.51.0 raised `spawn failed: nul byte found in
-provided data`. What changes is when and as what. The check now runs before any
-stdio file is opened, so a NUL in `stderr_path` can no longer truncate the
-`stdout_path` file on its way to failing, and the error arrives in the same
-`TYPE_MISMATCH` shape as every other bad argument instead of as a late
-`RUNTIME_ERROR` from std.
+A NUL byte in any string argument is rejected at validation, before any stdio
+file is opened. The error *code* follows where the argument is validated: the
+shell form's positional command and path args, and the argv form's argv
+elements, are `TYPE_MISMATCH`; the argv form's option values — `cwd`, `env`,
+and a file route's `{file: …}` path — are `OPTION_INVALID`. `std` would reject a
+NUL at spawn anyway, but catching it early keeps a late failure from truncating
+a good log on the way down.
 
 `kill(pid[, signal])` sends `signal` (default `15` = SIGTERM) and returns a bool
 (`true` if the syscall succeeded). **Both arguments are whole numbers and

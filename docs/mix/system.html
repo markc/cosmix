@@ -965,9 +965,12 @@ context where a bare <code>mix</code> <em>does</em> resolve is as the ssh comman
 (<code>ssh host 'mix status'</code>) — the login-shell mix self-resolves via its own
 executable path, no PATH needed (<a href="/mix/remote">remote</a>).</p>
 <h2 id="background-processes--spawn-kill-process_alive">Background processes — spawn, kill, process_alive</h2>
-<p><code>spawn(cmd[, stdout_path[, stderr_path]])</code> starts a background process via
-<code>/bin/sh -c</code> with stdin from <code>/dev/null</code> and returns its <strong>PID</strong> as a number. It
-does not wait. Stdio routing by arity:</p>
+<p><code>spawn</code> starts a background process and returns its <strong>PID</strong> as a number. It does
+not wait, reap, or supervise — it owns nothing after it returns (that is
+<code>run_argv</code>'s / a supervisor's job). It has <strong>two forms</strong>, chosen by the first
+argument's type.</p>
+<p><strong>Shell form — <code>spawn(cmd[, stdout_path[, stderr_path]])</code></strong>, a string command
+run via <code>/bin/sh -c</code> with stdin from <code>/dev/null</code>. Stdio routing by arity:</p>
 <ul>
 <li>1 arg — both stdout and stderr → <code>/dev/null</code></li>
 <li>2 args — stdout → file (truncated), stderr → <code>/dev/null</code></li>
@@ -979,38 +982,52 @@ print(run("cat /tmp/spawn.log"))
 </code></pre>
 <pre><code class="language-text">logged-line
 </code></pre>
-<p><strong>All three arguments are strings, and none of them is coerced</strong> (strict since
-v0.52.0). This is the loud-validation rule the opts maps have always had,
-reaching the one runner that had missed it — and <code>spawn</code> needs it most, because
-it is the only runner with nowhere to put a failure. It returns a <strong>PID, not a
-result map</strong>, and it does not wait, so a child that dies on the very first line
-is indistinguishable from one that worked. Until 0.52.0 a non-string was
-stringified into its display form and handed to <code>sh</code> anyway:</p>
-<pre><code class="language-text">spawn(["touch", $p])   -- 0.51.0: returns a healthy PID; sh dies with
-                       --   `sh: line 1: [touch,: command not found`
-                       --   and nothing anywhere reports it
-                       -- 0.52.0: raises TYPE_MISMATCH
+<p>All three shell-form arguments are strings and <strong>none is coerced</strong> (strict since
+v0.52.0) — <code>spawn</code> needs loud validation most, because it is the only runner
+with nowhere to put a failure: it returns a <strong>PID, not a result map</strong>, so a child
+that dies on its first line looks exactly like one that worked. A non-string
+raises <code>TYPE_MISMATCH</code> at argument validation, before any stdio file is opened
+(so a NUL in <code>stderr_path</code> can no longer truncate the <code>stdout_path</code> file on the
+way to failing).</p>
+<p><strong>Argv form — <code>spawn(argv[, {detach, cwd, env, clear_env, stdout, stderr}])</code></strong>
+(v0.89.0), a <strong>list</strong> of strings run <strong>directly, with no shell</strong> — so no
+word-splitting, glob expansion, or quoting surprises. This is the launcher /
+daemon slot: the job that used to force <code>run("setsid app &amp;")</code> through <code>sh</code>.</p>
+<pre><code class="language-mix">spawn(["cosmix-term", "--profile", "work"])           -- argv, no shell
+spawn(["mydaemon"], {detach: true})                   -- new session (setsid),
+                                                      --   survives the caller,
+                                                      --   drops the terminal
+spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
+                   stdout: {file: "/var/log/worker.log", append: true}})
 </code></pre>
-<p>There is <strong>no argv form of <code>spawn</code></strong> — it is <code>sh -c</code> by definition. Build the
-command string with <a href="/mix/system#shell_quote"><code>shell_quote</code></a>, or use <code>run_argv</code> /
-<code>run_argv_must</code> when you want an argv list and can accept a foreground child:</p>
-<pre><code class="language-text">spawn(["touch", "/tmp/x"])     -&gt; TYPE_MISMATCH: spawn: cmd must be a shell command
-                                  string, got list — spawn runs `sh -c` and has no
-                                  argv form; build the string with shell_quote(), or
-                                  use run_argv/run_argv_must for an argv list in the
-                                  foreground
-spawn("true", ["a"])           -&gt; TYPE_MISMATCH: spawn: stdout_path must be a string,
-                                  got list (no coercion — encode explicitly)
-spawn(7)                       -&gt; TYPE_MISMATCH: spawn: cmd must be a string, got
-                                  number (no coercion — encode explicitly)
+<ul>
+<li><code>detach: true</code> → the child is put in a <strong>new session</strong> (<code>setsid</code>): it has no
+controlling terminal and its own session, so a terminal hangup or the caller
+exiting does not take it down — the daemon shape, stronger than the shell
+form's <code>&amp;</code>. (Session separation, not immortality: a service-cgroup teardown
+or an explicit signal still reaches it.) Default <code>false</code> (a plain child in
+the caller's session).</li>
+<li><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
+(clear-then-layer: <code>{clear_env: true, env: {…}}</code> starts from empty).</li>
+<li><code>stdout</code> / <code>stderr</code> reuse <code>run_argv</code>'s routing, minus capture: <code>"null"</code>
+(default), <code>"inherit"</code>, or a <code>{file, append?, mode?}</code> map — and
+<code>stderr: "stdout"</code> to merge. <strong><code>"capture"</code> is refused</strong>: capturing means
+waiting, which is <code>run_argv</code>'s job. A file-open failure means the child is
+<strong>not</strong> spawned.</li>
+<li>argv must be a non-empty list of strings, none coerced; a non-string element
+or an empty list raises <code>TYPE_MISMATCH</code>.</li>
+</ul>
+<pre><code class="language-text">spawn(["true"], {stdout: "capture"})  -&gt; OPTION_INVALID: stdout cannot be "capture"
+spawn(["echo", 42])                   -&gt; TYPE_MISMATCH: argv[1] must be a string
+spawn(7)                              -&gt; TYPE_MISMATCH: cmd must be a string
 </code></pre>
-<p>A NUL byte in any of the three raises too — as <code>TYPE_MISMATCH</code>, at argument
-validation. It was never <em>accepted</em>: <code>std</code>'s <code>Command::spawn</code> and <code>File::create</code>
-both reject an interior NUL, so 0.51.0 raised <code>spawn failed: nul byte found in provided data</code>. What changes is when and as what. The check now runs before any
-stdio file is opened, so a NUL in <code>stderr_path</code> can no longer truncate the
-<code>stdout_path</code> file on its way to failing, and the error arrives in the same
-<code>TYPE_MISMATCH</code> shape as every other bad argument instead of as a late
-<code>RUNTIME_ERROR</code> from std.</p>
+<p>A NUL byte in any string argument is rejected at validation, before any stdio
+file is opened. The error <em>code</em> follows where the argument is validated: the
+shell form's positional command and path args, and the argv form's argv
+elements, are <code>TYPE_MISMATCH</code>; the argv form's option values — <code>cwd</code>, <code>env</code>,
+and a file route's <code>{file: …}</code> path — are <code>OPTION_INVALID</code>. <code>std</code> would reject a
+NUL at spawn anyway, but catching it early keeps a late failure from truncating
+a good log on the way down.</p>
 <p><code>kill(pid[, signal])</code> sends <code>signal</code> (default <code>15</code> = SIGTERM) and returns a bool
 (<code>true</code> if the syscall succeeded). <strong>Both arguments are whole numbers and
 neither is coerced</strong> (strict since v0.52.0) — the same rule as <code>spawn</code>, and for
