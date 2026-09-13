@@ -83,6 +83,20 @@ fn wait_for_contents(path: &std::path::Path, needle: &str) -> bool {
     false
 }
 
+/// Like `wait_for_contents` but a substring match (the file may hold more
+/// than the needle, e.g. appended content).
+fn wait_for_contents_containing(path: &std::path::Path, needle: &str) -> bool {
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if s.contains(needle) {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
 #[tokio::test]
 async fn argv_list_runs_without_a_shell() {
     // The behaviour 0.89.0 introduced (and the inverse of what this test
@@ -179,6 +193,80 @@ async fn argv_cwd_nul_is_refused_before_opening_the_log() {
         std::fs::read_to_string(&w).unwrap(),
         "PRECIOUS",
         "the stdout log must not have been opened, let alone truncated"
+    );
+    let _ = std::fs::remove_file(&w);
+}
+
+#[tokio::test]
+async fn argv_stderr_stdout_merges_into_the_file() {
+    // The load-bearing MAJOR the codex arm took two rounds to get right:
+    // stderr:"stdout" must actually merge. To a file route it clones the
+    // stdout handle; both the child's stdout AND stderr must land in the
+    // one file. (The inherit-merge path is the fd-dup case, exercised live;
+    // this pins the file-clone path in CI.)
+    let w = witness("merge");
+    let src = format!(
+        "spawn([\"sh\", \"-c\", \"echo OUT; echo ERR 1>&2\"], \
+         {{stdout: {{file: \"{}\"}}, stderr: \"stdout\"}})\n",
+        w.display()
+    );
+    run(&src).await.expect("argv spawn with merge");
+    // Wait until both lines have landed.
+    let mut got = String::new();
+    for _ in 0..100 {
+        got = std::fs::read_to_string(&w).unwrap_or_default();
+        if got.contains("OUT") && got.contains("ERR") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got.contains("OUT"), "stdout must land in the file: {got:?}");
+    assert!(got.contains("ERR"), "merged stderr must land in the SAME file: {got:?}");
+    let _ = std::fs::remove_file(&w);
+}
+
+#[tokio::test]
+async fn argv_stdout_append_preserves_existing_content() {
+    let w = witness("append");
+    std::fs::write(&w, "PRIOR\n").unwrap();
+    let src = format!(
+        "spawn([\"sh\", \"-c\", \"echo ADDED\"], \
+         {{stdout: {{file: \"{}\", append: true}}}})\n",
+        w.display()
+    );
+    run(&src).await.expect("argv spawn append");
+    assert!(
+        wait_for_contents_containing(&w, "ADDED"),
+        "append must have added the new line"
+    );
+    let final_content = std::fs::read_to_string(&w).unwrap();
+    assert!(
+        final_content.contains("PRIOR") && final_content.contains("ADDED"),
+        "append must PRESERVE the prior content: {final_content:?}"
+    );
+    let _ = std::fs::remove_file(&w);
+}
+
+#[tokio::test]
+async fn argv_clear_env_starts_from_empty() {
+    // clear_env:true drops the inherited environment before layering `env`.
+    // With clear_env and no PATH, a bare `env` builtin lookup via sh would
+    // fail — so use an absolute interpreter and print the whole environment,
+    // asserting only our layered var is present and an inherited one is not.
+    let w = witness("clearenv");
+    let src = format!(
+        "spawn([\"/bin/sh\", \"-c\", \"echo m=$MARKER h=$HOME > {}\"], \
+         {{clear_env: true, env: {{MARKER: \"only\"}}}})\n",
+        w.display()
+    );
+    run(&src).await.expect("argv spawn clear_env");
+    assert!(wait_for_contents_containing(&w, "m=only"), "layered var must be set");
+    let content = std::fs::read_to_string(&w).unwrap();
+    // With HOME cleared, `h=$HOME` expands to `h=` at the end of the line.
+    assert_eq!(
+        content.trim(),
+        "m=only h=",
+        "clear_env must drop the inherited HOME and keep only the layered MARKER"
     );
     let _ = std::fs::remove_file(&w);
 }

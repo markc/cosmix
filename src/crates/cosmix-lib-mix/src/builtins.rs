@@ -3799,7 +3799,10 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
                         if !run_argv_env_key_ok(ek) {
                             return Err(opt_invalid(
                                 caller,
-                                format!("env key {ek:?} must match [A-Za-z_][A-Za-z0-9_]*"),
+                                format!(
+                                    "env key '{}' must match [A-Za-z_][A-Za-z0-9_]*",
+                                    sanitize_for_diag(ek)
+                                ),
                             ));
                         }
                         let sval = match ev {
@@ -3989,19 +3992,45 @@ fn spawn_open_output(out: &RunArgvOutput) -> MixResult<Option<std::fs::File>> {
 
 /// Open a `{file, append, mode}` route for spawn, honouring append and the
 /// creation mode (0o600 default via the parser).
+///
+/// Opened `O_NONBLOCK` so a route pointing at a **readerless FIFO or a
+/// blocking device** fails fast (ENXIO) instead of hanging `open()` — and
+/// with it the whole interpreter thread, the control surface. spawn has no
+/// deadline machinery (run_argv opens off-thread against one; spawn is
+/// fire-and-forget), so fail-fast is the right shape here — a hung control
+/// surface is the worse outcome. `O_CLOEXEC` is set explicitly (std sets it
+/// too) so the transient fd cannot leak past exec. `O_NONBLOCK` is then
+/// CLEARED on the returned fd: it existed only to bound our own `open()`; a
+/// child writing to a live FIFO must block normally, not `EAGAIN`-drop
+/// (a no-op on a regular file, where writes never block regardless).
 fn spawn_create_file(f: &RunArgvFile) -> MixResult<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).mode(f.mode);
+    opts.write(true)
+        .create(true)
+        .mode(f.mode)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     if f.append {
         opts.append(true);
     } else {
         opts.truncate(true);
     }
-    opts.open(&f.path).map_err(|e| MixError::RuntimeError {
+    let file = opts.open(&f.path).map_err(|e| MixError::RuntimeError {
         span: None,
         msg: format!("spawn: opening {:?}: {e}", f.path),
-    })
+    })?;
+    // Restore blocking mode for the child (see the doc comment). Best-effort:
+    // a failure here leaves O_NONBLOCK set, which only affects a live-FIFO
+    // target, never a regular file.
+    unsafe {
+        let fd = file.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    Ok(file)
 }
 
 /// kill(pid, [signal]) — send signal to process. Default signal: 15 (SIGTERM).
