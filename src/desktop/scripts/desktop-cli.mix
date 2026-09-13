@@ -43,7 +43,7 @@ elif len($a) == 3 and $a[0] == "pause" then
   if not contains(["on","off"], $a[2]) then raise("DESKTOP_ARGS", "pause TARGET on|off") end
   $request = {operation:"pause", target:$a[1], on:$a[2] == "on"}
 else
-  raise("DESKTOP_ARGS", "capabilities TARGET | copy SOURCE TARGET | open TARGET URL | history TARGET [QUERY] | entry TARGET ID | pick TARGET ID | rpick SOURCE TARGET ID | clear TARGET [ID] | pause TARGET on|off")
+  raise("DESKTOP_ARGS", "capabilities TARGET | copy SOURCE TARGET | open TARGET URL | history TARGET [QUERY] | entry TARGET ID | pick TARGET ID | rpick SOURCE TARGET ID | rotate TARGET | menu TARGET | clear TARGET [ID] | pause TARGET on|off")
 end
 -- A one-shot registered citizen avoids anonymous calls and deregisters on quit.
 $worker = env("DESKTOP_REQUEST_WORKER")
