@@ -122,6 +122,8 @@ try
   check($bad.rc == 10,"capture with nil text accepted")
   $bad = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:json_parse("\"\\u0000\"")},2)
   check($bad.rc == 10,"capture with NUL accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:""},2)
+  check($bad.rc == 10,"capture of empty text accepted")
   $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"first entry"},2)
   check($plan.rc == 0 and $plan.body.stored == true and $plan.body.id == 1 and $plan.body.persisted == true,"first capture failed")
   check(exists($tmp .. "/history.json"),"history file not created")
@@ -191,7 +193,7 @@ try
   check($ctx.history.entries[0].id == 2,"pick did not move entry to front")
   $plan = $d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:2},2)
   $done = $d.finish($ctx,$plan,{ok:true})
-  check($done.body.accepted == true and $done.context == nil,"front pick mutated state")
+  check($done.body.accepted == true and $done.body.moved == false and $done.context == nil,"front pick mutated state")
   check($d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:99},2).rc == 14,"pick missing entry not 14")
 
   -- ── History: rotate (the clipboard ring) + menu ───────────────────────
@@ -212,9 +214,15 @@ try
   check($done.body.rotated == true and $done.context != nil,"rotate finish failed")
   $ring = $done.context
   check($ring.history.entries[0].text == "ring-a" and $ring.history.entries[1].id == $old_front,"rotate did not move front to back")
+  -- Entry cleared while the helper ran: accepted, selection set, nothing
+  -- moved (the finish re-finds by id, never the prepare-time index).
+  $vanish_id = $ring.history.entries[1].id
+  $plan = $d.prepare($ring,"desktop.clipboard.pick",$headers,{instance:$ring.instance,id:$vanish_id},2)
+  $clr = $d.prepare($ring,"desktop.clipboard.clear",$headers,{instance:$ring.instance,id:$vanish_id},2)
+  $ring = ctx_of($clr, $ring)
+  $done = $d.finish($ring,$plan,{ok:true})
+  check($done.body.accepted == true and $done.body.moved == false and $done.context == nil,"cleared-mid-helper pick moved something")
   -- Single entry: rotate is a no-op, not an error.
-  $plan = $d.prepare($ring,"desktop.clipboard.clear",$headers,{instance:$ring.instance,id:$ring.history.entries[1].id},2)
-  $ring = ctx_of($plan, $ring)
   $rot = $d.prepare($ring,"desktop.clipboard.rotate",$headers,{instance:$ring.instance},2)
   check($rot.rc == 0 and $rot.body.rotated == false and $rot.context == nil,"rotate on single entry not a no-op")
 
@@ -279,6 +287,13 @@ try
     entries:[{id:3, text:"newest-fat", bytes:10, at:3.0},{id:2, text:"mid-fat", bytes:7, at:2.0},{id:1, text:"old-fat", bytes:7, at:1.0}]}))
   $fat = $d.history_state({path:$tmp .. "/fat.json", budget_bytes:65536, depth:2}, "test")
   check($fat.degraded == "" and len($fat.entries) == 2 and $fat.entries[0].id == 3 and $fat.entries[1].id == 2,"budget/depth trim kept wrong entries")
+  check($fat.skipped == 1 and $fat.revision == 1,"limits-drop not counted (skipped/revision)")
+  -- Quarantine retention: repeated corruption keeps at most two copies.
+  for each $n in range(1,4)
+    write_file($tmp .. "/dup.json", "{bad json number " .. to_string($n))
+    $_q = $d.history_state({path:$tmp .. "/dup.json"}, "test")
+  end
+  check(len(glob($tmp .. "/dup.json.corrupt-*")) <= 2,"quarantine copies accumulated beyond two")
   -- Save-failure propagation: with the state dir read-only, a capture still
   -- commits in memory, reports persisted:false, and capabilities says
   -- write-error; restoring the dir heals it.

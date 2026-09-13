@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.3.3. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.4. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 
@@ -80,10 +80,41 @@ end
 fn history_quarantine($path, $h, $reason)
   -- Move a corrupt store aside and start empty. A quarantine that fails
   -- leaves degraded mode set: the file is never overwritten from a bad read.
+  -- Quarantine copies retain real clipboard content (0600), so only the two
+  -- newest are kept — repeated corruption must not accumulate stale secrets.
   try
     rename($path, $path .. ".corrupt-" .. slice(replace(uuid(),"-",""),0,8))
   catch $err
     $h.degraded = "quarantine-failed"
+  end
+  $copies = glob($path .. ".corrupt-*")
+  if len($copies) > 2 then
+    $keep = []
+    for each $n in range(1, 2)
+      $newest = nil
+      $newest_mtime = -1
+      for each $c in $copies
+        if not contains($keep, $c) then
+          try
+            $m = stat($c).mtime
+            if $m > $newest_mtime then
+              $newest_mtime = $m
+              $newest = $c
+            end
+          catch $err
+          end
+        end
+      end
+      if $newest != nil then $keep = concat($keep, [$newest]) end
+    end
+    for each $c in $copies
+      if not contains($keep, $c) then
+        try
+          remove($c)
+        catch $err
+        end
+      end
+    end
   end
   $h.entries = []
   $h.next_id = 1
@@ -171,6 +202,13 @@ fn history_load($h)
   $h.revision = $parsed.revision
   $h.paused = $parsed.paused
   $h.used = history_used($h.entries)
+  -- A limits change that drops entries is a committed mutation, not a
+  -- silent vanishing: count the drops and bump revision once.
+  $dropped = len($parsed.entries) - len($kept)
+  if $dropped > 0 then
+    $h.skipped = $h.skipped + $dropped
+    $h.revision = $h.revision + 1
+  end
   return $h
 end
 
@@ -245,11 +283,6 @@ fn history_persist($h)
     $h.save_failed = true
     return {h:$h, persisted:false}
   end
-end
-
-fn history_save($h)
-  -- Boolean-outcome wrapper for callers that don't need the flag-bearing map.
-  return history_persist($h).persisted
 end
 
 fn history_publish($ctx, $action, $id)
@@ -418,7 +451,7 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.3", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.4", session:$ctx.session,
       instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
@@ -428,9 +461,14 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   end
   if $verb == "desktop.clipboard.capture" then
     -- The watcher path: a registered local citizen submits observed text.
-    -- No instance fence — the watcher cannot know the live instance UUID.
+    -- No instance fence: the fence is a staleness guard for caller-held
+    -- handles, not a trust boundary (any local caller can read the live
+    -- instance from desktop.capabilities anyway) — and the watcher, a
+    -- per-event one-shot, would have to fetch it for every selection.
     if not keys_are($body, ["text"]) then return error("INVALID_REQUEST", 10) end
-    if type($body.text) != "string" or contains($body.text, $_nul) then return error("INVALID_CLIPBOARD_TEXT", 10) end
+    -- Empty text is refused: the watcher never emits it (a data selection
+    -- always has bytes), so it can only be a direct caller's mistake.
+    if type($body.text) != "string" or len($body.text) == 0 or contains($body.text, $_nul) then return error("INVALID_CLIPBOARD_TEXT", 10) end
     $outcome = history_capture($ctx, $body.text)
     $body_out = merge_maps({instance:$ctx.instance}, $outcome.body)
     if $outcome.context != nil then
@@ -589,8 +627,17 @@ fn finish($ctx, $plan, $result)
   if $plan.action == "clipboard_pick" then
     -- The helper succeeded: commit the move-to-front now. Wayland and disk
     -- are not one transaction; persisted:false reports a partial commit.
+    -- The entry is re-found BY ID, never via the prepare-time index: plain
+    -- handlers are serialised today, but if pick ever goes async a capture
+    -- landing during the helper window would shift the ring and move the
+    -- wrong entry.
     $h = $ctx.history
-    $idx = $plan.entry_index
+    $idx = history_find_id($h, $plan.entry_id)
+    if $idx == nil then
+      -- The entry was cleared while the helper ran. The selection IS set;
+      -- there is simply nothing to move.
+      return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, moved:false, persisted:true}}
+    end
     if $idx != 0 then
       $entry = $h.entries[$idx]
       $h.entries = concat([$entry], list_remove($h.entries, $idx))
@@ -599,9 +646,9 @@ fn finish($ctx, $plan, $result)
       $save = history_persist($h)
       $ctx.history = $save.h
       history_publish($ctx, "pick", $entry.id)
-      return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, bytes:$entry.bytes, persisted:$save.persisted}, context:$ctx}
+      return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, moved:true, bytes:$entry.bytes, persisted:$save.persisted}, context:$ctx}
     end
-    return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, bytes:$h.entries[0].bytes, persisted:($h.degraded == "" and not $h.save_failed)}}
+    return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, moved:false, bytes:$h.entries[0].bytes, persisted:($h.degraded == "" and not $h.save_failed)}}
   end
   if $plan.action == "clipboard_rotate" then
     -- Helper succeeded: front entry to the back; the new front is now live.
