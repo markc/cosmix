@@ -227,10 +227,16 @@ async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVer
     if service.is_empty() {
         return;
     }
-    let body = fired
-        .args
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({}));
+    // Belt-and-braces: whatever path admitted the row (bind, file load, a
+    // future replace_physical caller), a non-map must never reach the wire.
+    let body = match fired.args.clone() {
+        Some(args) if args.is_object() => args,
+        Some(_) => {
+            eprintln!("cosmix-inputd: fire {}: non-object args dropped", fired.verb);
+            serde_json::json!({})
+        }
+        None => serde_json::json!({}),
+    };
     if let Err(error) = client.send(service, &fired.verb, body).await {
         eprintln!("cosmix-inputd: fire {} -> {service}: {error}", fired.verb);
     }

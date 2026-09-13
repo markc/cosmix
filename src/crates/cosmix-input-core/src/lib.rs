@@ -64,12 +64,19 @@ pub enum BindError {
     InvalidAction,
     /// `args` must be a JSON object (a verb's body is a map), or absent.
     InvalidArgs,
+    /// `args` serialized beyond [`MAX_ARGS_BYTES`].
+    ArgsTooLarge,
     /// The keymap already holds this many physical rows (capacity cap).
     AtCapacity,
 }
 
 /// The maximum number of physical rows, a flood/exhaustion backstop.
 pub const MAX_PHYSICAL_ROWS: usize = 512;
+
+/// The maximum serialized size of one binding's `args` — the row-count cap
+/// bounds rows, this bounds each row's payload (persisted to the keymap file
+/// and re-serialized on every fire, auto-repeat included).
+pub const MAX_ARGS_BYTES: usize = 4096;
 
 /// The headless resolver: owns the keymap, the mode, and the rebind generation.
 #[derive(Clone, Debug)]
@@ -168,11 +175,16 @@ impl Resolver {
             return Err(BindError::InvalidAction);
         }
         // Args ride as the fired verb's body, and a body is a map: refuse
-        // anything but a JSON object so every handler sees a uniform shape.
-        if let Some(args) = &binding.args
-            && !args.is_object()
-        {
-            return Err(BindError::InvalidArgs);
+        // anything but a JSON object so every handler sees a uniform shape,
+        // and cap the payload (persisted + re-serialized on every fire).
+        if let Some(args) = &binding.args {
+            if !args.is_object() {
+                return Err(BindError::InvalidArgs);
+            }
+            let size = serde_json::to_string(args).map(|s| s.len()).unwrap_or(usize::MAX);
+            if size > MAX_ARGS_BYTES {
+                return Err(BindError::ArgsTooLarge);
+            }
         }
         let existing = self
             .keymap
@@ -421,6 +433,23 @@ mod tests {
         assert_eq!(release.verb, None);
         assert_eq!(release.args, None, "no verb, no args");
         assert!(release.swallow);
+    }
+
+    #[test]
+    fn oversized_args_are_refused() {
+        let mut r = resolver();
+        let err = r.bind_physical(PhysicalBinding {
+            stroke: PhysicalStroke {
+                code: KEY_F5,
+                modifiers: SideModifiers::NONE,
+            },
+            action: ActionId::from_static("launch.run"),
+            args: Some(serde_json::json!({"command": "x".repeat(MAX_ARGS_BYTES)})),
+            scope: BindingScope::default(),
+            repeat: RepeatPolicy::Ignore,
+            passthrough: false,
+        });
+        assert_eq!(err, Err(BindError::ArgsTooLarge));
     }
 
     #[test]

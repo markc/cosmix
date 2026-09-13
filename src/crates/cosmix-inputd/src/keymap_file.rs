@@ -20,12 +20,19 @@ struct PersistedKeymap {
     physical: Vec<PhysicalBinding>,
 }
 
-/// Resolve the keymap path: `$COSMIX_INPUTD_KEYMAP`, else
-/// `$XDG_CONFIG_HOME/cosmix/inputd/keymap.json`, else
-/// `$HOME/.config/cosmix/inputd/keymap.json`.
+/// Resolve the keymap path: `$COSMIX_INPUTD_KEYMAP`, else (running as root)
+/// `/var/lib/cosmix/inputd/keymap.json` — the same path the systemd unit's
+/// StateDirectory grants, so a manual bring-up run and the service agree on
+/// where state lives — else `$XDG_CONFIG_HOME`/`$HOME/.config` for a non-root
+/// run. The daemon normally runs as root (evdev + uinput), and a root
+/// daemon's `$HOME` is both wrong for state and unwritable under the unit's
+/// ProtectHome (the silent-persistence-failure bug of 2026-09-13).
 pub fn default_path() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("COSMIX_INPUTD_KEYMAP") {
         return Some(PathBuf::from(explicit));
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return Some(PathBuf::from("/var/lib/cosmix/inputd/keymap.json"));
     }
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -40,13 +47,19 @@ pub fn load(path: &Path) -> Option<Vec<PhysicalBinding>> {
         .map_err(|error| eprintln!("cosmix-inputd: keymap {} unreadable: {error}", path.display()))
         .ok()?;
     // This path bypasses `bind_physical`'s admission checks, so enforce the
-    // args invariant here too: a fired body is a map. A hand-edited non-object
-    // is dropped to None (the row still binds) rather than shipped to handlers.
+    // args invariants here too: a fired body is a map, and it is bounded. A
+    // hand-edited violation is dropped to None (the row still binds) rather
+    // than shipped to handlers.
     let mut physical = parsed.physical;
     for row in &mut physical {
-        if row.args.as_ref().is_some_and(|args| !args.is_object()) {
+        let bad = row.args.as_ref().is_some_and(|args| {
+            !args.is_object()
+                || serde_json::to_string(args).map(|s| s.len()).unwrap_or(usize::MAX)
+                    > cosmix_input_core::MAX_ARGS_BYTES
+        });
+        if bad {
             eprintln!(
-                "cosmix-inputd: keymap {}: row {:?} has non-object args; ignoring them",
+                "cosmix-inputd: keymap {}: row {:?} has non-object or oversized args; ignoring them",
                 path.display(),
                 row.action.as_str()
             );
