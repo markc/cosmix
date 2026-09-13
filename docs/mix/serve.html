@@ -594,8 +594,10 @@ The runtime surfaces it verbatim as that verb's <code>description</code> in the 
 reply, so GUIs, discovery tools, and agents all read the text the author
 wrote where the handler lives — no separately-maintained manifest. Handlers
 without one show the generic <code>Author-defined handler</code>.</p>
-<p><code>desc</code> is a contextual marker (like <code>async</code>), consumed only when a <strong>static</strong>
-string literal follows it. The doc is static metadata that never evaluates:
+<p><code>desc</code> is a contextual marker (like <code>async</code>), consumed only when a
+<strong>non-empty static</strong> string literal follows it — an empty or whitespace-only
+<code>desc ""</code> is refused with a parse error rather than rendering a blank HELP
+description. The doc is static metadata that never evaluates:
 in double quotes only <code>${…}</code> interpolates, so a bare <code>$var</code> inside a doc
 stays literal text, and <code>desc "${var}"</code> is a parse error (as that adjacent
 pair always was). A body statement that merely <em>uses</em> the name <code>desc</code> (on

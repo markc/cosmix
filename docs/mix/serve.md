@@ -199,8 +199,10 @@ reply, so GUIs, discovery tools, and agents all read the text the author
 wrote where the handler lives — no separately-maintained manifest. Handlers
 without one show the generic `Author-defined handler`.
 
-`desc` is a contextual marker (like `async`), consumed only when a **static**
-string literal follows it. The doc is static metadata that never evaluates:
+`desc` is a contextual marker (like `async`), consumed only when a
+**non-empty static** string literal follows it — an empty or whitespace-only
+`desc ""` is refused with a parse error rather than rendering a blank HELP
+description. The doc is static metadata that never evaluates:
 in double quotes only `${…}` interpolates, so a bare `$var` inside a doc
 stays literal text, and `desc "${var}"` is a parse error (as that adjacent
 pair always was). A body statement that merely *uses* the name `desc` (on

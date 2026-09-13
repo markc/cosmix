@@ -3088,6 +3088,19 @@ fn parse_on_doc_string() {
     let (_, doc, _, body_len) = on_parts(parse_one("on foo\n  desc\n  print \"hi\"\ndone\n"));
     assert_eq!(doc, None);
     assert_eq!(body_len, 2);
+    // An EMPTY (or whitespace-only) doc is refused loudly: not consumed, so
+    // the pair hits the adjacent-expression parse error rather than HELP
+    // rendering a blank description. (Arm-B round 2: this break was a parser
+    // behaviour change with no lockdown.)
+    for src in ["on foo desc \"\"\ndone\n", "on foo desc \"   \"\ndone\n"] {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let mut p = Parser::new(tokens, src);
+        assert!(
+            p.parse_program().is_err(),
+            "empty/whitespace desc must be a loud parse error: {src:?}"
+        );
+    }
+
     // …and same-line `desc` followed by a DYNAMIC string is a PARSE ERROR —
     // docs are static metadata, so the pair is not consumed, and two
     // adjacent expressions without a separator have always been rejected.
