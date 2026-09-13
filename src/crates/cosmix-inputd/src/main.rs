@@ -45,9 +45,15 @@ struct Args {
     #[arg(long, value_name = "DEVICE")]
     grab: Option<String>,
 
-    /// Safety valve for --grab: auto-release the grab and exit after this many
-    /// seconds. Omit to grab indefinitely (production). Use a small value for the
-    /// first supervised bring-up so a wedged grab self-heals.
+    /// Like --grab, but locate the device by its Name in /proc/bus/input/devices
+    /// (e.g. "keyd virtual keyboard") instead of a fixed path — the eventN can
+    /// shift across keyd/boot restarts, so a systemd unit should use this.
+    #[arg(long, value_name = "NAME", conflicts_with = "grab")]
+    grab_name: Option<String>,
+
+    /// Safety valve for --grab/--grab-name: auto-release the grab and exit after
+    /// this many seconds. Omit to grab indefinitely (production). Use a small
+    /// value for the first supervised bring-up so a wedged grab self-heals.
     #[arg(long, value_name = "SECONDS")]
     grab_timeout: Option<u64>,
 
@@ -94,9 +100,26 @@ fn main() -> anyhow::Result<()> {
     // original sender alive means the receiver never closes even without a reader.
     let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<reader::FiredVerb>();
 
+    // Resolve --grab-name to a concrete device path (stable across keyd/boot
+    // restarts); --grab takes a path directly. clap enforces they're exclusive.
+    let grab_device: Option<String> = match (&args.grab, &args.grab_name) {
+        (Some(path), _) => Some(path.clone()),
+        (None, Some(name)) => match resolve_device_by_name(name) {
+            Ok(path) => {
+                eprintln!("cosmix-inputd: --grab-name {name:?} resolved to {path}");
+                Some(path)
+            }
+            Err(error) => {
+                eprintln!("cosmix-inputd: {error}");
+                std::process::exit(1);
+            }
+        },
+        (None, None) => None,
+    };
+
     // The evdev reader (if requested) runs on its own blocking thread; the Bus
     // service runs on the tokio runtime below. The two share the resolver.
-    if let Some(device) = args.grab.clone() {
+    if let Some(device) = grab_device {
         let shared = Arc::clone(&resolver);
         let tx = fire_tx.clone();
         let timeout = args.grab_timeout.map(Duration::from_secs);
@@ -208,4 +231,34 @@ async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVer
     {
         eprintln!("cosmix-inputd: fire {} -> {service}: {error}", fired.verb);
     }
+}
+
+/// Find a keyboard event node by its device Name in /proc/bus/input/devices, so a
+/// unit can target e.g. "keyd virtual keyboard" without hardcoding an eventN
+/// (which shifts when keyd restarts or across boots). Returns the first matching
+/// `/dev/input/eventN`. Blocks are separated by blank lines; each carries an
+/// `N: Name="..."` and an `H: Handlers=... eventN ...`.
+fn resolve_device_by_name(name: &str) -> anyhow::Result<String> {
+    let text = std::fs::read_to_string("/proc/bus/input/devices")?;
+    for block in text.split("\n\n") {
+        let name_matches = block.lines().any(|line| {
+            line.strip_prefix("N: Name=")
+                .map(|rest| rest.trim().trim_matches('"') == name)
+                .unwrap_or(false)
+        });
+        if !name_matches {
+            continue;
+        }
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("H: Handlers=") {
+                if let Some(node) = rest.split_whitespace().find(|tok| {
+                    tok.strip_prefix("event")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                }) {
+                    return Ok(format!("/dev/input/{node}"));
+                }
+            }
+        }
+    }
+    anyhow::bail!("no input device named {name:?} in /proc/bus/input/devices");
 }
