@@ -451,6 +451,14 @@ script with <strong>one</strong> <code>on &lt;cmd&gt; … end</code> handler is 
 long-lived, addressable Mix process that <em>is</em> a service. The full normative
 contract is <strong>SPEC 18</strong> (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.</p>
+<h2 id="first-substrate">First, "substrate"</h2>
+<p><strong>The substrate is Cosmix itself</strong> — the agent-operable computing environment,
+not any one app on it: the message Bus (the broker <code>cosmix-noded</code>), the services
+running on it, and the WireGuard mesh that joins nodes into one fabric. The word
+is chosen over "OS" or "desktop" on purpose — it is meant to be <em>legible,
+modifiable, and reconstructible</em> by an AI agent, the ground the system is built
+on rather than a feature bolted onto one. <strong>Citizens (below) are the live
+services the substrate is made of.</strong></p>
 <h2 id="what-citizen-means-in-cosmix">What "citizen" means in Cosmix</h2>
 <p>A <strong>citizen</strong> is a process that is a first-class, named member of the Cosmix
 substrate — not a throwaway script but a resident participant on the Bus. A plain

@@ -11,6 +11,16 @@ long-lived, addressable Mix process that *is* a service. The full normative
 contract is **SPEC 18** (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.
 
+## First, "substrate"
+
+**The substrate is Cosmix itself** — the agent-operable computing environment,
+not any one app on it: the message Bus (the broker `cosmix-noded`), the services
+running on it, and the WireGuard mesh that joins nodes into one fabric. The word
+is chosen over "OS" or "desktop" on purpose — it is meant to be *legible,
+modifiable, and reconstructible* by an AI agent, the ground the system is built
+on rather than a feature bolted onto one. **Citizens (below) are the live
+services the substrate is made of.**
+
 ## What "citizen" means in Cosmix
 
 A **citizen** is a process that is a first-class, named member of the Cosmix
