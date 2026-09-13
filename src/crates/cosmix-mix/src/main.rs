@@ -1447,6 +1447,13 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // synth replies BEFORE it drops — the connection is live,
                     // so a stranded caller gets a terminal reply, not silence.
                     let drained = eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                    // Flush the retiring generation's usage stats before it
+                    // drops — otherwise a reloaded citizen discards every
+                    // bucket since the last reload (only the FINAL evaluator
+                    // is flushed at exit).
+                    if let Some(stats) = eval.take_stats() {
+                        stats_io::flush_batch(stats);
+                    }
                     eval = new_eval;
                     // Bump the shared identity ONLY here, once the swap has
                     // committed — so a caller polling lifecycle.generation
