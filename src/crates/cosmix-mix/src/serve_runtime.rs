@@ -32,6 +32,53 @@ use cosmix_mix::evaluator::{ReservedOutcome, ServeRuntime};
 use cosmix_props::{PropDescribe, PropPath, PropTree, PropType, PropValue, tree::build_snapshot};
 use serde_json::{Value as Json, json};
 
+/// Identity that persists across hot-reloads — the citizen's *process*, not
+/// its current generation's evaluator. Shared by `Rc` between the serve
+/// driver and every generation's [`MixServeRuntime`], so that after a
+/// `RELOAD` swap:
+///
+/// - `lifecycle.uptime_s` / `started_at` still report the PROCESS start (a
+///   reloaded citizen is NOT indistinguishable from crash+restart — the very
+///   observable a monitor reads to answer "did it crash?");
+/// - `lifecycle.generation` (0 at boot, +1 per committed swap) and
+///   `lifecycle.script_loaded_at` let a caller CONFIRM a reload actually took
+///   — `INFO`/`HELP` cannot, since the version is the mix version and a
+///   body-only handler edit changes neither.
+pub struct ReloadIdentity {
+    started_at: Instant,
+    started_wall: String,
+    generation: std::cell::Cell<u64>,
+    script_loaded_at: std::cell::RefCell<String>,
+}
+
+impl ReloadIdentity {
+    /// A fresh process identity at generation 0.
+    pub fn new() -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            started_at: Instant::now(),
+            started_wall: now.clone(),
+            generation: std::cell::Cell::new(0),
+            script_loaded_at: std::cell::RefCell::new(now),
+        }
+    }
+
+    /// Called by the serve driver AFTER a swap has committed (never on a
+    /// refused or reverted reload): bump the generation and stamp the new
+    /// load time. This is the only mutation point, so a caller polling
+    /// `lifecycle.generation` sees it advance exactly once per live swap.
+    pub fn committed_reload(&self) {
+        self.generation.set(self.generation.get() + 1);
+        *self.script_loaded_at.borrow_mut() = chrono::Utc::now().to_rfc3339();
+    }
+}
+
+impl Default for ReloadIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The Mix serve-mode runtime surface (SPEC 18 WS4). Implements both
 /// [`ServeRuntime`] (the pre-dispatch reserved-verb chokepoint the
 /// evaluator consults) and [`PropTree`] (the lifecycle property model
@@ -40,13 +87,10 @@ pub struct MixServeRuntime {
     /// Bus service name — the `<svc>` prefix for `<svc>.props.*` and
     /// the `INFO.name`.
     service_name: String,
-    /// Monotonic process start, for the live `lifecycle.uptime_s` leaf
-    /// (recomputed every `props.get`, never cached).
-    started_at: Instant,
-    /// Wall-clock start as an RFC 3339 string, for
-    /// `lifecycle.started_at` (captured once; matches the indexd
-    /// reference's chrono-formatted timestamp).
-    started_wall: String,
+    /// Process identity, shared across every generation (see
+    /// [`ReloadIdentity`]) so uptime/started_at survive a reload and the
+    /// generation counter confirms a swap.
+    identity: std::rc::Rc<ReloadIdentity>,
     /// Precomputed `<svc>.props.` prefix (avoids per-request format!).
     props_prefix: String,
     /// Isolated handler faults recorded via
@@ -88,8 +132,7 @@ impl MixServeRuntime {
         let props_prefix = format!("{service_name}.props.");
         Self {
             service_name,
-            started_at: Instant::now(),
-            started_wall: chrono::Utc::now().to_rfc3339(),
+            identity: std::rc::Rc::new(ReloadIdentity::new()),
             props_prefix,
             handler_faults: std::cell::Cell::new(0),
             last_fault: std::cell::RefCell::new(None),
@@ -97,14 +140,18 @@ impl MixServeRuntime {
         }
     }
 
-    /// Same, with the serve script's path so `RELOAD` can pre-validate
-    /// the new source. The serve entrypoint uses this; `new` remains for
+    /// Same, with the serve script's path (so `RELOAD` can pre-validate the
+    /// new source) and the shared process identity (so uptime/generation
+    /// persist across reloads). The serve entrypoint uses this and passes
+    /// the SAME `identity` into every generation; `new` remains for
     /// embedders/tests with no script file (their `RELOAD` answers rc:10).
     pub fn with_script_path(
         service_name: impl Into<String>,
         script_path: impl Into<std::path::PathBuf>,
+        identity: std::rc::Rc<ReloadIdentity>,
     ) -> Self {
         let mut rt = Self::new(service_name);
+        rt.identity = identity;
         rt.script_path = Some(script_path.into());
         rt
     }
@@ -160,8 +207,18 @@ impl MixServeRuntime {
         }
     }
 
-    /// The seven lifecycle leaf paths, in stable declaration order.
-    fn leaf_paths() -> [&'static str; 7] {
+    #[cfg(test)]
+    fn snapshot_generation_for_test(&self) -> u64 {
+        self.identity.generation.get()
+    }
+
+    #[cfg(test)]
+    fn snapshot_started_at_for_test(&self) -> String {
+        self.identity.started_wall.clone()
+    }
+
+    /// The lifecycle leaf paths, in stable declaration order.
+    fn leaf_paths() -> [&'static str; 9] {
         [
             "lifecycle.started_at",
             "lifecycle.uptime_s",
@@ -170,6 +227,8 @@ impl MixServeRuntime {
             "lifecycle.props_level",
             "lifecycle.handler_faults",
             "lifecycle.last_fault",
+            "lifecycle.generation",
+            "lifecycle.script_loaded_at",
         ]
     }
 
@@ -295,7 +354,7 @@ impl PropTree for MixServeRuntime {
     fn snapshot(&self) -> PropValue {
         // uptime_s is live: recomputed from the monotonic clock on
         // every snapshot (props.get), never a stale cached field.
-        let uptime_s = self.started_at.elapsed().as_secs();
+        let uptime_s = self.identity.started_at.elapsed().as_secs();
         // 0.63.0 — isolated handler faults degrade health instead of
         // hiding: a citizen that swallowed a raise used to look exactly
         // like a healthy one (the blind-but-healthy failure shape).
@@ -306,10 +365,12 @@ impl PropTree for MixServeRuntime {
             HEALTH_OK
         };
         let last_fault = self.last_fault.borrow().clone().unwrap_or_default();
+        let generation = self.identity.generation.get();
+        let script_loaded_at = self.identity.script_loaded_at.borrow().clone();
         build_snapshot([
             (
                 PropPath::new("lifecycle.started_at").unwrap(),
-                PropValue::from(self.started_wall.clone()),
+                PropValue::from(self.identity.started_wall.clone()),
             ),
             (
                 PropPath::new("lifecycle.uptime_s").unwrap(),
@@ -334,6 +395,14 @@ impl PropTree for MixServeRuntime {
             (
                 PropPath::new("lifecycle.last_fault").unwrap(),
                 PropValue::from(last_fault),
+            ),
+            (
+                PropPath::new("lifecycle.generation").unwrap(),
+                PropValue::from(generation),
+            ),
+            (
+                PropPath::new("lifecycle.script_loaded_at").unwrap(),
+                PropValue::from(script_loaded_at),
             ),
         ])
     }
@@ -385,9 +454,28 @@ impl PropTree for MixServeRuntime {
                     path.clone(),
                     String,
                     "Summary of the most recent isolated handler fault \
-                     (empty when none).",
+                     (empty when none). Reset per generation on a hot-reload.",
                 )
                 .with_transient(true),
+            ),
+            "lifecycle.generation" => Some(
+                PropDescribe::leaf(
+                    path.clone(),
+                    Number,
+                    "Hot-reload generation: 0 at boot, +1 per committed \
+                     RELOAD swap. Poll this to confirm a reload took \
+                     (INFO/HELP cannot — the version is the mix version).",
+                )
+                .with_transient(true),
+            ),
+            "lifecycle.script_loaded_at" => Some(
+                PropDescribe::leaf(
+                    path.clone(),
+                    String,
+                    "RFC 3339 timestamp the CURRENT generation's script was \
+                     loaded (process start for generation 0).",
+                )
+                .with_format("rfc3339"),
             ),
             _ => None,
         }
@@ -412,6 +500,7 @@ impl ServeRuntime for MixServeRuntime {
         args_header: Option<&str>,
         req_body: &str,
         handler_commands: &[(&str, Option<&str>)],
+        correlated: bool,
     ) -> Option<ReservedOutcome> {
         // L0 — bare Ch02 universals (routed by `to:`, never prefixed).
         // The "HELP" literal MUST stay in lock-step with the pump's
@@ -452,8 +541,20 @@ impl ServeRuntime for MixServeRuntime {
                 // Hot-reload (load-beside-swap): pre-validate the re-read
                 // source here; the swap itself happens in the serve driver
                 // after the pump breaks. A parse failure answers rc:10 and
-                // the running citizen is untouched.
-                return Some(self.reload_outcome());
+                // the running citizen is untouched. An UNCORRELATED delivery
+                // (a stray `emit RELOAD`) is consumed-and-dropped by the pump
+                // regardless, so skip the read+parse entirely rather than
+                // spend it on the pump thread for a reply that can't be sent.
+                return Some(if correlated {
+                    self.reload_outcome()
+                } else {
+                    ReservedOutcome {
+                        rc: 0,
+                        body: "{}".to_string(),
+                        quit: false,
+                        reload: false,
+                    }
+                });
             }
             _ => {}
         }
@@ -505,6 +606,7 @@ mod tests {
                     ("statecache.get", Some("Fetch a cached value")),
                     ("alpha.cmd", None),
                 ],
+                true,
             )
             .expect("HELP is reserved");
         assert_eq!(out.rc, 0);
@@ -543,10 +645,37 @@ mod tests {
     #[test]
     fn reload_without_script_path_answers_rc10() {
         let r = rt(); // MixServeRuntime::new — no script path
-        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        let out = r.handle_reserved("RELOAD", None, "", &[], true).expect("reserved");
         assert_eq!(out.rc, 10);
         assert!(!out.reload, "no path → the pump must NOT break");
         assert!(!out.quit);
+    }
+
+    #[test]
+    fn uncorrelated_reload_skips_the_parse() {
+        // A stray `emit RELOAD` (correlated=false) is consumed-and-dropped
+        // by the pump, so the runtime must NOT pay a script read+parse for
+        // it — the expensive work stays behind the correlation gate (codex
+        // + opus MINOR-3). Point the path at a file that does NOT exist: a
+        // correlated call would rc:10 (it tried to read); an uncorrelated
+        // call returns rc:0 reload:false WITHOUT touching the path.
+        let missing = std::env::temp_dir().join("mix-reload-nonexistent-xyz.mix");
+        let _ = std::fs::remove_file(&missing);
+        let r = MixServeRuntime::with_script_path(
+            "demo",
+            &missing,
+            std::rc::Rc::new(ReloadIdentity::new()),
+        );
+        let out = r
+            .handle_reserved("RELOAD", None, "", &[], false)
+            .expect("reserved");
+        assert_eq!(out.rc, 0, "uncorrelated RELOAD is consumed, not errored");
+        assert!(!out.reload, "and it never asks the pump to swap");
+        // Correlated, same missing path → it DID try to read → rc:10.
+        let out = r
+            .handle_reserved("RELOAD", None, "", &[], true)
+            .expect("reserved");
+        assert_eq!(out.rc, 10, "correlated RELOAD reads the path and reports the miss");
     }
 
     #[test]
@@ -556,8 +685,12 @@ mod tests {
 
         // Valid source → rc:0 + reload flag (the pump breaks, driver swaps).
         std::fs::write(&path, "on demo.ping\n  reply(\"pong\")\nend\n").unwrap();
-        let r = MixServeRuntime::with_script_path("demo", &path);
-        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        let r = MixServeRuntime::with_script_path(
+            "demo",
+            &path,
+            std::rc::Rc::new(ReloadIdentity::new()),
+        );
+        let out = r.handle_reserved("RELOAD", None, "", &[], true).expect("reserved");
         assert_eq!(out.rc, 0, "valid source must be accepted: {}", out.body);
         assert!(out.reload, "valid source must ask the pump to break");
         assert!(!out.quit);
@@ -565,7 +698,7 @@ mod tests {
         // Broken source → rc:10, NO reload flag: the running citizen is
         // untouched — the whole point of pre-validation.
         std::fs::write(&path, "on demo.ping\n  reply(\n").unwrap();
-        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        let out = r.handle_reserved("RELOAD", None, "", &[], true).expect("reserved");
         assert_eq!(out.rc, 10);
         assert!(!out.reload, "a parse failure must NOT break the pump");
         assert!(
@@ -576,7 +709,7 @@ mod tests {
 
         // Missing file → rc:10, no flag.
         std::fs::remove_file(&path).unwrap();
-        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        let out = r.handle_reserved("RELOAD", None, "", &[], true).expect("reserved");
         assert_eq!(out.rc, 10);
         assert!(!out.reload);
     }
@@ -584,7 +717,7 @@ mod tests {
     #[test]
     fn info_is_exactly_the_spec02_triple() {
         let r = rt();
-        let out = r.handle_reserved("INFO", None, "", &[]).unwrap();
+        let out = r.handle_reserved("INFO", None, "", &[], true).unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
         let obj = v.as_object().unwrap();
         let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
@@ -597,7 +730,7 @@ mod tests {
     #[test]
     fn quit_replies_rc0_and_signals_shutdown() {
         let r = rt();
-        let out = r.handle_reserved("QUIT", None, "", &[]).unwrap();
+        let out = r.handle_reserved("QUIT", None, "", &[], true).unwrap();
         assert_eq!(out.rc, 0);
         assert!(out.quit, "QUIT must signal the graceful shutdown path");
     }
@@ -606,7 +739,7 @@ mod tests {
     fn props_get_root_is_the_lifecycle_tree() {
         let r = rt();
         let out = r
-            .handle_reserved("statecache.props.get", None, "", &[])
+            .handle_reserved("statecache.props.get", None, "", &[], true)
             .unwrap();
         assert_eq!(out.rc, 0);
         let v: Json = serde_json::from_str(&out.body).unwrap();
@@ -629,7 +762,7 @@ mod tests {
         r.record_handler_fault("handler fault: play.note[0]: boom");
         r.record_handler_fault("handler fault: play.note[0]: boom again");
         let out = r
-            .handle_reserved("statecache.props.get", None, "", &[])
+            .handle_reserved("statecache.props.get", None, "", &[], true)
             .unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
         let lc = &v["lifecycle"];
@@ -658,6 +791,7 @@ mod tests {
                 Some(r#"{"path":"lifecycle.props_level"}"#),
                 "",
                 &[],
+                true,
             )
             .unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
@@ -673,6 +807,7 @@ mod tests {
                 None,
                 r#"{"path":"lifecycle.mode"}"#,
                 &[],
+                true,
             )
             .unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
@@ -692,6 +827,7 @@ mod tests {
                 Some("42"),
                 r#"{"path":"lifecycle.mode"}"#,
                 &[],
+                true,
             )
             .unwrap();
         assert_eq!(out.rc, 0);
@@ -718,6 +854,7 @@ mod tests {
                     ("statecache.props.watch", None),
                     ("alpha.cmd", None),
                 ],
+                true,
             )
             .unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
@@ -757,10 +894,10 @@ mod tests {
     }
 
     #[test]
-    fn props_list_enumerates_the_seven_leaves() {
+    fn props_list_enumerates_the_lifecycle_leaves() {
         let r = rt();
         let out = r
-            .handle_reserved("statecache.props.list", None, "", &[])
+            .handle_reserved("statecache.props.list", None, "", &[], true)
             .unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
         let mut paths: Vec<&str> = v
@@ -773,15 +910,45 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "lifecycle.generation",
                 "lifecycle.handler_faults",
                 "lifecycle.health",
                 "lifecycle.last_fault",
                 "lifecycle.mode",
                 "lifecycle.props_level",
+                "lifecycle.script_loaded_at",
                 "lifecycle.started_at",
                 "lifecycle.uptime_s",
             ]
         );
+    }
+
+    #[test]
+    fn generation_and_process_start_persist_across_a_committed_reload() {
+        // The MAJOR the opus arm caught: a reloaded citizen must NOT look
+        // like crash+restart, and a caller must be able to confirm a swap.
+        // The identity is shared across generations; committed_reload() is
+        // the driver's post-swap bump.
+        let identity = std::rc::Rc::new(ReloadIdentity::new());
+        let gen0 = MixServeRuntime::with_script_path("demo", "/x.mix", identity.clone());
+        let started = gen0.snapshot_started_at_for_test();
+
+        // Generation 0: counter 0.
+        assert_eq!(gen0.snapshot_generation_for_test(), 0);
+
+        // A committed swap builds a NEW runtime sharing the identity, then
+        // the driver bumps.
+        let gen1 = MixServeRuntime::with_script_path("demo", "/x.mix", identity.clone());
+        identity.committed_reload();
+        assert_eq!(gen1.snapshot_generation_for_test(), 1, "generation advances on commit");
+        assert_eq!(
+            gen1.snapshot_started_at_for_test(),
+            started,
+            "process start is stable across the reload (not crash+restart)"
+        );
+        // The pre-swap runtime, still sharing the identity, also sees the
+        // bumped generation — there is one process-wide counter.
+        assert_eq!(gen0.snapshot_generation_for_test(), 1);
     }
 
     #[test]
@@ -793,6 +960,7 @@ mod tests {
                 Some(r#"{"path":"lifecycle.uptime_s"}"#),
                 "",
                 &[],
+                true,
             )
             .unwrap();
         let v: Json = serde_json::from_str(&out.body).unwrap();
@@ -804,15 +972,15 @@ mod tests {
     fn non_reserved_command_falls_through_to_author() {
         let r = rt();
         // A domain command is the author's — not reserved.
-        assert!(r.handle_reserved("statecache.get", None, "", &[]).is_none());
+        assert!(r.handle_reserved("statecache.get", None, "", &[], true).is_none());
         // props.watch (L2) / props.set (SPEC 12) are out of WS4 scope:
         // not reserved, so the author may (not) implement them.
         assert!(
-            r.handle_reserved("statecache.props.watch", None, "", &[])
+            r.handle_reserved("statecache.props.watch", None, "", &[], true)
                 .is_none()
         );
         assert!(
-            r.handle_reserved("statecache.props.set", None, "", &[])
+            r.handle_reserved("statecache.props.set", None, "", &[], true)
                 .is_none()
         );
     }
@@ -824,7 +992,7 @@ mod tests {
         // reserved surface (it would never be routed here anyway, but
         // the matcher must not claim it).
         assert!(
-            r.handle_reserved("other.props.get", None, "", &[])
+            r.handle_reserved("other.props.get", None, "", &[], true)
                 .is_none()
         );
     }

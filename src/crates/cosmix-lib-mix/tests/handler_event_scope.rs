@@ -162,6 +162,7 @@ impl ServeRuntime for RecordingRuntime {
         _args_header: Option<&str>,
         _req_body: &str,
         _handler_commands: &[(&str, Option<&str>)],
+        _correlated: bool,
     ) -> Option<ReservedOutcome> {
         None
     }

@@ -353,7 +353,7 @@ that never fires.
 | `HELP` | L0 | `[{name, description, args}]` — reserved verbs first, then the author's commands (sorted, deduped; `description` is the handler's doc-string when one was written) |
 | `INFO` | L0 | the `{name, version, description}` triple |
 | `QUIT` | L0 | replies `rc:0`, then triggers the §3.5 graceful shutdown |
-| `RELOAD` | L0 | hot-reload (mix ≥ 0.88.0): re-parses the script; `rc:0 {reloading: true}` and the citizen swaps to the new source, or `rc:10 {error}` and it is untouched — see below |
+| `RELOAD` | L0 | hot-reload (mix ≥ 0.88.0): re-parses the script; `rc:0 {reloading: true}` = accepted and parsed (the swap then commits, or reverts if the new init fails at runtime — poll `lifecycle.generation` to confirm), or `rc:10 {error}` and the citizen is untouched — see below |
 | `<svc>.props.get` | L1 | a lifecycle property snapshot (root, or an optional `path=`) |
 | `<svc>.props.list` | L1 | all defined property paths |
 | `<svc>.props.describe` | L1 | the schema entry for a path |
@@ -511,7 +511,22 @@ bad edit can do is a logged revert. Things to know:
   citizen whose init `chdir`s still reloads its own file.
 - **`rc:0` means "accepted and parsed", not "this exact revision is now
   serving"** — a runtime failure in the new init reverts, having already
-  acknowledged. Re-probe `INFO`/`HELP` to confirm what went live.
+  acknowledged. **`INFO`/`HELP` cannot confirm a swap** (the version is the
+  mix version, and a body-only handler edit changes neither). Poll
+  **`<svc>.props.get lifecycle.generation`**: it starts at 0 and advances by
+  exactly one per committed swap, with `lifecycle.script_loaded_at` stamping
+  when the live generation loaded. `lifecycle.uptime_s`/`started_at` keep
+  reporting the PROCESS, so a reloaded citizen is not mistaken for a
+  crash+restart.
+- **The not-yet-committed generation serves live traffic during its init.**
+  A top-level `sleep()` dispatches events, so a new init body that runs
+  before it commits (or before it fails) can already answer requests — a
+  revert un-registers its handlers and cancels its async tasks, but it
+  cannot un-answer a request the rejected code already replied to, nor undo
+  its substrate side effects (props writes, `subscribe`, file writes,
+  spawned externals). "Resumes with state intact" is a guarantee about the
+  evaluator, not the substrate: keep a reloadable citizen's init idempotent,
+  and do irreversible work in a handler, not at top level.
 - The `rc:0` reply races the swap by design: a follow-up sent immediately
   queues at the broker and is answered by whichever evaluator holds the
   pump. Fire `RELOAD`, then re-probe `HELP`/`INFO` to observe the new

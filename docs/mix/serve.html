@@ -719,7 +719,7 @@ that never fires.</p>
 <tr><td><code>HELP</code></td><td>L0</td><td><code>[{name, description, args}]</code> — reserved verbs first, then the author's commands (sorted, deduped; <code>description</code> is the handler's doc-string when one was written)</td></tr>
 <tr><td><code>INFO</code></td><td>L0</td><td>the <code>{name, version, description}</code> triple</td></tr>
 <tr><td><code>QUIT</code></td><td>L0</td><td>replies <code>rc:0</code>, then triggers the §3.5 graceful shutdown</td></tr>
-<tr><td><code>RELOAD</code></td><td>L0</td><td>hot-reload (mix ≥ 0.88.0): re-parses the script; <code>rc:0 {reloading: true}</code> and the citizen swaps to the new source, or <code>rc:10 {error}</code> and it is untouched — see below</td></tr>
+<tr><td><code>RELOAD</code></td><td>L0</td><td>hot-reload (mix ≥ 0.88.0): re-parses the script; <code>rc:0 {reloading: true}</code> = accepted and parsed (the swap then commits, or reverts if the new init fails at runtime — poll <code>lifecycle.generation</code> to confirm), or <code>rc:10 {error}</code> and the citizen is untouched — see below</td></tr>
 <tr><td><code>&lt;svc&gt;.props.get</code></td><td>L1</td><td>a lifecycle property snapshot (root, or an optional <code>path=</code>)</td></tr>
 <tr><td><code>&lt;svc&gt;.props.list</code></td><td>L1</td><td>all defined property paths</td></tr>
 <tr><td><code>&lt;svc&gt;.props.describe</code></td><td>L1</td><td>the schema entry for a path</td></tr>
@@ -838,7 +838,22 @@ before the old generation resumes.</li>
 citizen whose init <code>chdir</code>s still reloads its own file.</li>
 <li><strong><code>rc:0</code> means "accepted and parsed", not "this exact revision is now
 serving"</strong> — a runtime failure in the new init reverts, having already
-acknowledged. Re-probe <code>INFO</code>/<code>HELP</code> to confirm what went live.</li>
+acknowledged. <strong><code>INFO</code>/<code>HELP</code> cannot confirm a swap</strong> (the version is the
+mix version, and a body-only handler edit changes neither). Poll
+<strong><code>&lt;svc&gt;.props.get lifecycle.generation</code></strong>: it starts at 0 and advances by
+exactly one per committed swap, with <code>lifecycle.script_loaded_at</code> stamping
+when the live generation loaded. <code>lifecycle.uptime_s</code>/<code>started_at</code> keep
+reporting the PROCESS, so a reloaded citizen is not mistaken for a
+crash+restart.</li>
+<li><strong>The not-yet-committed generation serves live traffic during its init.</strong>
+A top-level <code>sleep()</code> dispatches events, so a new init body that runs
+before it commits (or before it fails) can already answer requests — a
+revert un-registers its handlers and cancels its async tasks, but it
+cannot un-answer a request the rejected code already replied to, nor undo
+its substrate side effects (props writes, <code>subscribe</code>, file writes,
+spawned externals). "Resumes with state intact" is a guarantee about the
+evaluator, not the substrate: keep a reloadable citizen's init idempotent,
+and do irreversible work in a handler, not at top level.</li>
 <li>The <code>rc:0</code> reply races the swap by design: a follow-up sent immediately
 queues at the broker and is answered by whichever evaluator holds the
 pump. Fire <code>RELOAD</code>, then re-probe <code>HELP</code>/<code>INFO</code> to observe the new

@@ -1937,12 +1937,19 @@ pub trait ServeRuntime {
     ///   when `command == "HELP"`** (its sole consumer); every other call
     ///   receives an empty slice — the doc scan stays off the hot path. An
     ///   implementation must not read it for any other verb.
+    /// - `correlated` — whether this delivery is a `type=request` (a reply
+    ///   is possible). An implementation may skip expensive work for an
+    ///   uncorrelated delivery that will be consumed-and-dropped anyway
+    ///   (RELOAD skips its script re-read+parse), but MUST still return
+    ///   `Some(_)` for a reserved verb so it is never handed to an author
+    ///   handler.
     fn handle_reserved(
         &self,
         command: &str,
         args_header: Option<&str>,
         req_body: &str,
         handler_commands: &[(&str, Option<&str>)],
+        correlated: bool,
     ) -> Option<ReservedOutcome>;
 
     /// Record an isolated handler fault (error or panic) so the citizen's
@@ -4438,6 +4445,17 @@ impl Evaluator {
                     // the call is sound. The Rc-typed storage is for
                     // C.5/C.7 symmetry, not because this path crosses
                     // a yield point.
+                    // Correlation is computed BEFORE servicing so a reserved
+                    // verb whose work is expensive (RELOAD re-reads + parses
+                    // the script) can skip it for an uncorrelated delivery —
+                    // a stray `emit RELOAD` is consumed and dropped, never a
+                    // parse on the pump thread (the same availability concern
+                    // the QUIT drop below documents).
+                    let is_request = ev
+                        .headers
+                        .get("type")
+                        .map(|t| t == "request")
+                        .unwrap_or(false);
                     let reserved = {
                         let g = self.globals.borrow();
                         if let Some(rt) = g.serve_runtime.as_ref() {
@@ -4471,6 +4489,7 @@ impl Evaluator {
                                 ev.headers.get("args").map(|s| s.as_str()),
                                 &ev.body,
                                 &handler_cmds,
+                                is_request,
                             )
                         } else {
                             None
@@ -4492,11 +4511,6 @@ impl Evaluator {
                         // reserved).
                         let from = ev.headers.get("from").cloned().unwrap_or_default();
                         let id = ev.headers.get("id").cloned();
-                        let is_request = ev
-                            .headers
-                            .get("type")
-                            .map(|t| t == "request")
-                            .unwrap_or(false);
                         if is_request {
                             // WS3-C.5 clone-out: the Ref is dropped at end
                             // of the `let` statement, well before the

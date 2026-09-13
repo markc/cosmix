@@ -1262,8 +1262,12 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         // and its pump would exit immediately. Built once, cloned into every
         // evaluator.
         let bus_handler = std::rc::Rc::new(bus::MixServeHandler::new(supervised.clone()));
+        // Process identity, shared across every generation so uptime/started_at
+        // survive a reload and lifecycle.generation confirms a swap took.
+        let identity = std::rc::Rc::new(serve_runtime::ReloadIdentity::new());
         async fn build_serve_eval(
             bus_handler: &std::rc::Rc<bus::MixServeHandler>,
+            identity: &std::rc::Rc<serve_runtime::ReloadIdentity>,
             service_name: &str,
             script_path: &str,
             no_prelude: bool,
@@ -1273,7 +1277,11 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             apply_arity_mode(&mut eval);
             eval.set_bus_handler(bus_handler.clone());
             eval.set_serve_runtime(std::rc::Rc::new(
-                serve_runtime::MixServeRuntime::with_script_path(service_name, script_path),
+                serve_runtime::MixServeRuntime::with_script_path(
+                    service_name,
+                    script_path,
+                    identity.clone(),
+                ),
             ));
             repl::register_ai_extensions(&mut eval);
             if !no_prelude {
@@ -1294,7 +1302,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             eval
         }
 
-        let mut eval = build_serve_eval(&bus_handler, service_name, script_path, no_prelude).await;
+        let mut eval = build_serve_eval(&bus_handler, &identity, service_name, script_path, no_prelude).await;
         cosmix_mix::interrupt::init(eval.interrupt_flag());
 
         // Serve mode ALWAYS enters the pump after the init body — it is
@@ -1335,7 +1343,9 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         // Grace for draining a generation's in-flight Class C work at a swap
         // point (not process shutdown; the connection lives on).
         let reload_drain = std::time::Duration::from_secs(2);
-        let mut stmts = stmts;
+        // `stmts` is the FIRST generation's init body, executed once on entry;
+        // a reload executes its own `new_stmts` inline in the reload branch,
+        // so this is never re-executed after iteration one.
         let mut needs_exec = true;
         let outcome = loop {
             let do_exec = needs_exec;
@@ -1405,7 +1415,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                 }
             };
             let mut new_eval =
-                build_serve_eval(&bus_handler, service_name, script_path, no_prelude).await;
+                build_serve_eval(&bus_handler, &identity, service_name, script_path, no_prelude).await;
             // interrupt::init is once-only, bound to the FIRST evaluator's
             // flag — share that flag so the evaluator-internal interrupt path
             // keeps working after any number of reloads.
@@ -1423,9 +1433,10 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             let exec_res = tokio::select! {
                 biased;
                 _ = &mut shutdown => {
+                    let drained = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     tracing::info!(service = %service_name,
-                        "serve: SIGTERM/Ctrl-C during reload init; cancelling replacement, shutting down");
-                    let _ = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                        aborted = drained.aborted, synth_sent = drained.synth_sent,
+                        "serve: SIGTERM/Ctrl-C during reload init; cancelled replacement, shutting down");
                     break ServeOutcome::Interrupted;
                 }
                 r = new_eval.execute(&new_stmts) => r,
@@ -1435,12 +1446,18 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // Old evaluator's in-flight Class C work is drained with
                     // synth replies BEFORE it drops — the connection is live,
                     // so a stranded caller gets a terminal reply, not silence.
-                    let _ = eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                    let drained = eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     eval = new_eval;
-                    stmts = new_stmts;
+                    // Bump the shared identity ONLY here, once the swap has
+                    // committed — so a caller polling lifecycle.generation
+                    // sees it advance exactly once per live swap, never on a
+                    // refused or reverted reload.
+                    identity.committed_reload();
                     tracing::info!(
                         service = %service_name,
                         handler_count = eval.handler_count(),
+                        aborted = drained.aborted,
+                        synth_sent = drained.synth_sent,
                         "serve: hot-reload complete; new script live"
                     );
                 }
@@ -1448,8 +1465,9 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // Cancel any Class C tasks the failed init admitted, so
                     // the discarded evaluator leaves nothing replying behind
                     // the resumed old one.
-                    let _ = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                    let drained = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     tracing::error!(service = %service_name, error = %format!("{e}"),
+                        aborted = drained.aborted, synth_sent = drained.synth_sent,
                         "serve: reload REVERTED — new init body failed; old script resumes with state intact");
                 }
             }
