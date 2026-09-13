@@ -56,6 +56,11 @@ pub struct MixServeRuntime {
     handler_faults: std::cell::Cell<u64>,
     /// Summary of the most recent fault, for `lifecycle.last_fault`.
     last_fault: std::cell::RefCell<Option<String>>,
+    /// The serve script's path, for the `RELOAD` pre-validation (re-read
+    /// and parse before the pump is asked to break). `None` — test
+    /// runtimes, embedders without a script file — makes `RELOAD` answer
+    /// rc:10.
+    script_path: Option<std::path::PathBuf>,
 }
 
 /// Operating-mode value for `lifecycle.mode`. A Phase-1 serve citizen
@@ -88,6 +93,70 @@ impl MixServeRuntime {
             props_prefix,
             handler_faults: std::cell::Cell::new(0),
             last_fault: std::cell::RefCell::new(None),
+            script_path: None,
+        }
+    }
+
+    /// Same, with the serve script's path so `RELOAD` can pre-validate
+    /// the new source. The serve entrypoint uses this; `new` remains for
+    /// embedders/tests with no script file (their `RELOAD` answers rc:10).
+    pub fn with_script_path(
+        service_name: impl Into<String>,
+        script_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let mut rt = Self::new(service_name);
+        rt.script_path = Some(script_path.into());
+        rt
+    }
+
+    /// Service a `RELOAD`: re-read and PARSE the script. A parse failure
+    /// answers rc:10 and leaves the running citizen untouched; success
+    /// answers rc:0 and asks the pump to break with `reload` so the serve
+    /// driver runs the load-beside-swap (execution of the new top-level —
+    /// and the revert-on-failure — happen there, where the old evaluator
+    /// is still alive).
+    fn reload_outcome(&self) -> ReservedOutcome {
+        let Some(path) = self.script_path.as_deref() else {
+            return ReservedOutcome {
+                rc: 10,
+                body: json!({"error": "this runtime has no script to reload"}).to_string(),
+                quit: false,
+                reload: false,
+            };
+        };
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                return ReservedOutcome {
+                    rc: 10,
+                    body: json!({"error": format!("cannot read {}: {e}", path.display())})
+                        .to_string(),
+                    quit: false,
+                    reload: false,
+                };
+            }
+        };
+        let parse = cosmix_mix::lexer::Lexer::new(&source)
+            .tokenize()
+            .and_then(|tokens| cosmix_mix::parser::Parser::new(tokens, &source).parse_program());
+        match parse {
+            Ok(_) => ReservedOutcome {
+                rc: 0,
+                body: json!({"ok": true, "reloading": true, "script": path.display().to_string()})
+                    .to_string(),
+                quit: false,
+                reload: true,
+            },
+            Err(e) => ReservedOutcome {
+                rc: 10,
+                body: json!({
+                    "error": format!("reload refused, new source does not parse: {e}"),
+                    "script": path.display().to_string(),
+                })
+                .to_string(),
+                quit: false,
+                reload: false,
+            },
         }
     }
 
@@ -124,6 +193,11 @@ impl MixServeRuntime {
             json!({
                 "name": "QUIT",
                 "description": "Graceful shutdown: deregister, then exit 0 (SPEC 18 §3.5)",
+                "args": [],
+            }),
+            json!({
+                "name": "RELOAD",
+                "description": "Hot-reload the serve script (load-beside-swap): parse the re-read source, swap on success, keep running on failure — the citizen never leaves the Bus",
                 "args": [],
             }),
             json!({
@@ -210,7 +284,7 @@ impl MixServeRuntime {
     /// deliberately NOT reserved: an author may implement them, so they
     /// must remain advertisable in HELP and must fall through here.
     fn is_reserved(&self, command: &str) -> bool {
-        matches!(command, "HELP" | "INFO" | "QUIT")
+        matches!(command, "HELP" | "INFO" | "QUIT" | "RELOAD")
             || command
                 .strip_prefix(&self.props_prefix)
                 .is_some_and(|s| matches!(s, "get" | "list" | "describe"))
@@ -352,6 +426,7 @@ impl ServeRuntime for MixServeRuntime {
                     rc: 0,
                     body: self.help_body(handler_commands),
                     quit: false,
+                    reload: false,
                 });
             }
             "INFO" => {
@@ -359,6 +434,7 @@ impl ServeRuntime for MixServeRuntime {
                     rc: 0,
                     body: self.info_body(),
                     quit: false,
+                    reload: false,
                 });
             }
             "QUIT" => {
@@ -369,7 +445,15 @@ impl ServeRuntime for MixServeRuntime {
                     rc: 0,
                     body: "{}".to_string(),
                     quit: true,
+                    reload: false,
                 });
+            }
+            "RELOAD" => {
+                // Hot-reload (load-beside-swap): pre-validate the re-read
+                // source here; the swap itself happens in the serve driver
+                // after the pump breaks. A parse failure answers rc:10 and
+                // the running citizen is untouched.
+                return Some(self.reload_outcome());
             }
             _ => {}
         }
@@ -396,6 +480,7 @@ impl ServeRuntime for MixServeRuntime {
             rc: resp.rc.clamp(0, 255) as u8,
             body: resp.body,
             quit: false,
+            reload: false,
         })
     }
 }
@@ -429,18 +514,19 @@ mod tests {
         let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
         // Reserved verbs first, fixed order.
         assert_eq!(
-            &names[..6],
+            &names[..7],
             &[
                 "HELP",
                 "INFO",
                 "QUIT",
+                "RELOAD",
                 "statecache.props.get",
                 "statecache.props.list",
                 "statecache.props.describe",
             ]
         );
         // Author commands appended, sorted+deduped.
-        assert_eq!(&names[6..], &["alpha.cmd", "statecache.get"]);
+        assert_eq!(&names[7..], &["alpha.cmd", "statecache.get"]);
         // A doc-string surfaces as the verb's description; an undocumented
         // handler keeps the generic placeholder.
         let desc_of = |name: &str| {
@@ -452,6 +538,47 @@ mod tests {
         };
         assert_eq!(desc_of("statecache.get"), "Fetch a cached value");
         assert_eq!(desc_of("alpha.cmd"), "Author-defined handler");
+    }
+
+    #[test]
+    fn reload_without_script_path_answers_rc10() {
+        let r = rt(); // MixServeRuntime::new — no script path
+        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        assert_eq!(out.rc, 10);
+        assert!(!out.reload, "no path → the pump must NOT break");
+        assert!(!out.quit);
+    }
+
+    #[test]
+    fn reload_prevalidates_parse_and_sets_the_flag_only_on_success() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mix-reload-test-{}.mix", std::process::id()));
+
+        // Valid source → rc:0 + reload flag (the pump breaks, driver swaps).
+        std::fs::write(&path, "on demo.ping\n  reply(\"pong\")\nend\n").unwrap();
+        let r = MixServeRuntime::with_script_path("demo", &path);
+        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        assert_eq!(out.rc, 0, "valid source must be accepted: {}", out.body);
+        assert!(out.reload, "valid source must ask the pump to break");
+        assert!(!out.quit);
+
+        // Broken source → rc:10, NO reload flag: the running citizen is
+        // untouched — the whole point of pre-validation.
+        std::fs::write(&path, "on demo.ping\n  reply(\n").unwrap();
+        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        assert_eq!(out.rc, 10);
+        assert!(!out.reload, "a parse failure must NOT break the pump");
+        assert!(
+            out.body.contains("does not parse"),
+            "the refusal names the reason: {}",
+            out.body
+        );
+
+        // Missing file → rc:10, no flag.
+        std::fs::remove_file(&path).unwrap();
+        let out = r.handle_reserved("RELOAD", None, "", &[]).expect("reserved");
+        assert_eq!(out.rc, 10);
+        assert!(!out.reload);
     }
 
     #[test]
@@ -586,6 +713,7 @@ mod tests {
                 &[
                     ("HELP", None),
                     ("QUIT", None),
+                    ("RELOAD", None),
                     ("statecache.props.get", None),
                     ("statecache.props.watch", None),
                     ("alpha.cmd", None),
@@ -601,11 +729,12 @@ mod tests {
             .collect();
         // Reserved prefix unchanged.
         assert_eq!(
-            &names[..6],
+            &names[..7],
             &[
                 "HELP",
                 "INFO",
                 "QUIT",
+                "RELOAD",
                 "statecache.props.get",
                 "statecache.props.list",
                 "statecache.props.describe",
@@ -613,7 +742,7 @@ mod tests {
         );
         // Authored HELP/QUIT/props.get are reserved → filtered out.
         // props.watch (L2, NOT reserved) and alpha.cmd survive.
-        assert_eq!(&names[6..], &["alpha.cmd", "statecache.props.watch"]);
+        assert_eq!(&names[7..], &["alpha.cmd", "statecache.props.watch"]);
         // HELP/QUIT/props.get appear exactly once (the reserved entry),
         // never duplicated by an authored shadow.
         assert_eq!(names.iter().filter(|n| **n == "HELP").count(), 1);

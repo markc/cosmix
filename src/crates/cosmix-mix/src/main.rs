@@ -1237,34 +1237,55 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         };
         tracing::info!(service = %service_name, "serve: connected and registered");
 
-        let mut eval = Evaluator::new();
-        eval.set_limits(script_limits());
-        apply_arity_mode(&mut eval);
-        eval.set_bus_handler(std::rc::Rc::new(bus::MixServeHandler::new(supervised.clone())));
-        // SPEC 18 WS4: install the runtime-reserved Ch07 L0+ surface
-        // (HELP/INFO/QUIT + <svc>.props.{get,list,describe}). Consulted
-        // pre-dispatch in run_event_pump, so an author `on` handler
-        // naming a reserved verb cannot shadow it (DECIDED §7-Q4).
-        eval.set_serve_runtime(std::rc::Rc::new(serve_runtime::MixServeRuntime::new(
-            service_name,
-        )));
-        cosmix_mix::interrupt::init(eval.interrupt_flag());
-        repl::register_ai_extensions(&mut eval);
-        if !no_prelude {
-            eval.load_prelude().await;
-        }
-        if stats_io::stats_enabled() {
-            eval.attach_stats(UsageStats::for_execution(StatsContext::new(
-                ExecutionMode::Serve,
-                Some(Path::new(script_path)),
-            )));
-            if let Some(mut stats) = eval.stats_mut() {
-                stats.increment_commands();
+        // Evaluator construction, shared by first boot and every hot-reload
+        // (SPEC 18 RELOAD, `_plan/2026-09-13-mix-citizen-hot-reload.md`):
+        // identical wiring, so a reloaded citizen is indistinguishable from
+        // a freshly started one — same runtime-reserved Ch07 L0+ surface
+        // (HELP/INFO/QUIT/RELOAD + <svc>.props.{get,list,describe},
+        // consulted pre-dispatch so an author `on` handler naming a
+        // reserved verb cannot shadow it, DECIDED §7-Q4), same prelude,
+        // limits, stats. The SupervisedClient is shared — the broker
+        // connection and registration outlive any single evaluator.
+        // The bus handler owns the single incoming-message receiver (taken
+        // once from the supervised client), so it MUST be shared across
+        // reloads — a fresh handler would find the receiver already taken
+        // and its pump would exit immediately. Built once, cloned into every
+        // evaluator.
+        let bus_handler = std::rc::Rc::new(bus::MixServeHandler::new(supervised.clone()));
+        async fn build_serve_eval(
+            bus_handler: &std::rc::Rc<bus::MixServeHandler>,
+            service_name: &str,
+            script_path: &str,
+            no_prelude: bool,
+        ) -> Evaluator {
+            let mut eval = Evaluator::new();
+            eval.set_limits(script_limits());
+            apply_arity_mode(&mut eval);
+            eval.set_bus_handler(bus_handler.clone());
+            eval.set_serve_runtime(std::rc::Rc::new(
+                serve_runtime::MixServeRuntime::with_script_path(service_name, script_path),
+            ));
+            repl::register_ai_extensions(&mut eval);
+            if !no_prelude {
+                eval.load_prelude().await;
             }
+            if stats_io::stats_enabled() {
+                eval.attach_stats(UsageStats::for_execution(StatsContext::new(
+                    ExecutionMode::Serve,
+                    Some(Path::new(script_path)),
+                )));
+                if let Some(mut stats) = eval.stats_mut() {
+                    stats.increment_commands();
+                }
+            }
+            eval.set_global("0", Value::String(script_path.to_string()));
+            // `include` resolves relative to the serve script's directory.
+            eval.set_file(script_path);
+            eval
         }
-        eval.set_global("0", Value::String(script_path.to_string()));
-        // `include` resolves relative to the serve script's directory.
-        eval.set_file(script_path);
+
+        let mut eval = build_serve_eval(&bus_handler, service_name, script_path, no_prelude).await;
+        cosmix_mix::interrupt::init(eval.interrupt_flag());
 
         // Serve mode ALWAYS enters the pump after the init body — it is
         // a resident daemon, not a script with an optional event tail.
@@ -1286,36 +1307,110 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         // still live — see `allow_synth_replies` derivation below).
         // Class S chains never spawn — they run inline on the pump
         // future and finish/cancel with it.
-        let outcome = tokio::select! {
-            biased;
-            _ = shutdown_signal() => {
-                tracing::info!(
-                    service = %service_name,
-                    "serve: SIGTERM/Ctrl-C received; graceful shutdown (SPEC 18 §3.5)"
-                );
-                ServeOutcome::Interrupted
+        // The pump runs inside a loop so a reserved `RELOAD` (a clean pump
+        // end with the reload flag set) can hot-swap the evaluator without
+        // ever leaving this function — the broker connection, registration,
+        // and signal wiring all survive. Load-beside-swap: the OLD
+        // evaluator stays alive until the new script's top-level has
+        // executed successfully; any failure resumes the old one, state
+        // intact. Every other pump end falls through to the shutdown path
+        // exactly as before.
+        let mut stmts = stmts;
+        let mut needs_exec = true;
+        let outcome = loop {
+            let do_exec = needs_exec;
+            needs_exec = false;
+            let iter_outcome = tokio::select! {
+                biased;
+                _ = shutdown_signal() => {
+                    tracing::info!(
+                        service = %service_name,
+                        "serve: SIGTERM/Ctrl-C received; graceful shutdown (SPEC 18 §3.5)"
+                    );
+                    ServeOutcome::Interrupted
+                }
+                res = async {
+                    if do_exec {
+                        eval.execute(&stmts).await?;
+                    }
+                    eval.run_event_pump().await?;
+                    Ok::<_, cosmix_mix::error::MixError>(())
+                } => match res {
+                    Ok(()) => ServeOutcome::PumpEnded,
+                    Err(cosmix_mix::error::MixError::ExitRequest { code }) => {
+                        ServeOutcome::ExitRequested(code)
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.contains("interrupted") {
+                            ServeOutcome::Interrupted
+                        } else {
+                            tracing::error!(
+                                service = %service_name,
+                                error = %msg,
+                                "serve: script error"
+                            );
+                            ServeOutcome::Error
+                        }
+                    }
+                }
+            };
+
+            if !(matches!(iter_outcome, ServeOutcome::PumpEnded) && eval.take_reload_request()) {
+                break iter_outcome;
             }
-            res = async {
-                eval.execute(&stmts).await?;
-                eval.run_event_pump().await?;
-                Ok::<_, cosmix_mix::error::MixError>(())
-            } => match res {
-                Ok(()) => ServeOutcome::PumpEnded,
-                Err(cosmix_mix::error::MixError::ExitRequest { code }) => {
-                    ServeOutcome::ExitRequested(code)
+
+            // ── hot-reload (SPEC 18 RELOAD) ─────────────────────────────
+            // The runtime already parse-validated and replied rc:0; a race
+            // (file changed since) or a runtime failure in the new init
+            // body reverts to the old evaluator — loudly, never silently.
+            tracing::info!(service = %service_name, "serve: RELOAD accepted; building replacement evaluator");
+            let new_source = match std::fs::read_to_string(script_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(service = %service_name, error = %e,
+                        "serve: reload REVERTED — script re-read failed; old script resumes");
+                    continue;
+                }
+            };
+            let new_stmts = match cosmix_mix::lexer::Lexer::new(&new_source)
+                .tokenize()
+                .and_then(|t| cosmix_mix::parser::Parser::new(t, &new_source).parse_program())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(service = %service_name, error = %format!("{e}"),
+                        "serve: reload REVERTED — source no longer parses (changed since validation?); old script resumes");
+                    continue;
+                }
+            };
+            let mut new_eval =
+                build_serve_eval(&bus_handler, service_name, script_path, no_prelude).await;
+            // interrupt::init is once-only, bound to the FIRST evaluator's
+            // flag — share that flag so Ctrl-C/SIGTERM keep working after
+            // any number of reloads.
+            new_eval.set_interrupt_flag(eval.interrupt_flag());
+            match new_eval.execute(&new_stmts).await {
+                Ok(_) => {
+                    // Old evaluator's in-flight Class C work gets the same
+                    // drain discipline as shutdown before it drops.
+                    let _ = eval
+                        .drain_class_c_for_shutdown(
+                            std::time::Duration::from_secs(2),
+                            false,
+                        )
+                        .await;
+                    eval = new_eval;
+                    stmts = new_stmts;
+                    tracing::info!(
+                        service = %service_name,
+                        handler_count = eval.handler_count(),
+                        "serve: hot-reload complete; new script live"
+                    );
                 }
                 Err(e) => {
-                    let msg = format!("{e}");
-                    if msg.contains("interrupted") {
-                        ServeOutcome::Interrupted
-                    } else {
-                        tracing::error!(
-                            service = %service_name,
-                            error = %msg,
-                            "serve: script error"
-                        );
-                        ServeOutcome::Error
-                    }
+                    tracing::error!(service = %service_name, error = %format!("{e}"),
+                        "serve: reload REVERTED — new init body failed; old script resumes with state intact");
                 }
             }
         };

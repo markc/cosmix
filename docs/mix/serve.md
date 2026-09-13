@@ -353,6 +353,7 @@ that never fires.
 | `HELP` | L0 | `[{name, description, args}]` — reserved verbs first, then the author's commands (sorted, deduped; `description` is the handler's doc-string when one was written) |
 | `INFO` | L0 | the `{name, version, description}` triple |
 | `QUIT` | L0 | replies `rc:0`, then triggers the §3.5 graceful shutdown |
+| `RELOAD` | L0 | hot-reload (mix ≥ 0.88.0): re-parses the script; `rc:0 {reloading: true}` and the citizen swaps to the new source, or `rc:10 {error}` and it is untouched — see below |
 | `<svc>.props.get` | L1 | a lifecycle property snapshot (root, or an optional `path=`) |
 | `<svc>.props.list` | L1 | all defined property paths |
 | `<svc>.props.describe` | L1 | the schema entry for a path |
@@ -473,6 +474,42 @@ Note `binary: cosmix-mix` — the citizen is named `statecache`, but its provena
 points at the `mix` runtime that hosts it.
 
 ---
+
+## Hot-reload — `RELOAD` (load-beside-swap)
+
+`send <svc> RELOAD` (mix ≥ 0.88.0) asks a citizen to re-read its own script
+and swap to it **without ever leaving the Bus** — the broker connection and
+service registration survive; only the evaluator (handlers + globals) is
+replaced. The contract is load-beside-swap, in Quickshell's sense:
+
+1. The runtime **re-reads and parses** the script first. A parse failure
+   answers `rc:10 {error}` and the running citizen is completely untouched —
+   a broken edit is a refused reload, never a dead service.
+2. On a clean parse it answers `rc:0 {reloading: true}`, then builds a
+   **fresh evaluator beside the running one** (same wiring: prelude, limits,
+   reserved-verb surface) and executes the new top-level.
+3. New top-level succeeds → the new evaluator takes over the pump; the old
+   one is drained (in-flight async handlers get the shutdown discipline) and
+   dropped. It **fails at runtime** → the failure is logged loudly and the
+   OLD evaluator resumes, its state intact.
+
+This is what makes it safe for an agent to edit a live citizen: the worst a
+bad edit can do is a logged revert. Things to know:
+
+- **State does not carry over.** The new top-level re-initializes its
+  globals. State that must survive a reload belongs in the substrate
+  (props, statecache) — that is the persistent-state model, not process
+  memory.
+- The `rc:0` reply races the swap by design: a follow-up sent immediately
+  queues at the broker and is answered by whichever evaluator holds the
+  pump. Fire `RELOAD`, then re-probe `HELP`/`INFO` to observe the new
+  surface.
+- Topic subscriptions made by the old top-level persist on the shared
+  connection; a re-subscribing new top-level may duplicate delivery
+  (v1 limitation — avoid reloading citizens that `subscribe`, or make
+  subscription idempotent on the handler side).
+- Like every reserved verb, an author `on RELOAD` handler is unreachable
+  and filtered from `HELP`.
 
 ## Supervision, reconnect, and shutdown
 

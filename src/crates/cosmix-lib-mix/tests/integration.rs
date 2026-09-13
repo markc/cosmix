@@ -1462,6 +1462,13 @@ async fn event_pump_passes_handler_docs_to_reserved_help_only() {
                     rc: 0,
                     body: "[]".to_string(),
                     quit: false,
+                    reload: false,
+                }),
+                "RELOAD" => Some(ReservedOutcome {
+                    rc: 0,
+                    body: "{}".to_string(),
+                    quit: false,
+                    reload: true,
                 }),
                 _ => None,
             }
@@ -1519,6 +1526,97 @@ end
         other.1.is_empty(),
         "non-HELP commands must get the empty (hot-path) slice"
     );
+    // The pump completed without a reload — the flag must read false.
+    assert!(!eval.take_reload_request());
+}
+
+/// A reserved outcome with `reload: true` breaks the pump cleanly and
+/// sets the one-shot reload flag the serve driver reads — the pump half
+/// of the SPEC 18 hot-reload contract. Same channel-driven harness as
+/// the docs test above.
+#[tokio::test(flavor = "current_thread")]
+async fn event_pump_breaks_with_reload_flag_on_reload_outcome() {
+    use cosmix_mix::error::MixResult;
+    use cosmix_mix::evaluator::{BusHandler, ReservedOutcome, ServeRuntime};
+    use cosmix_mix::value::Value;
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use tokio::sync::mpsc;
+
+    struct ChannelHandler {
+        rx: RefCell<Option<mpsc::UnboundedReceiver<IncomingEvent>>>,
+    }
+    impl BusHandler for ChannelHandler {
+        fn send<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value)>> + 'a>> {
+            Box::pin(async move { Ok((0, Value::Nil)) })
+        }
+        fn emit<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = MixResult<()>> + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+        fn port_exists<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = MixResult<bool>> + 'a>> {
+            Box::pin(async move { Ok(false) })
+        }
+        fn next_incoming<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Option<IncomingEvent>> + 'a>> {
+            Box::pin(async move {
+                let mut rx = self.rx.borrow_mut().take()?;
+                let result = rx.recv().await;
+                *self.rx.borrow_mut() = Some(rx);
+                result
+            })
+        }
+    }
+    struct ReloadRuntime;
+    impl ServeRuntime for ReloadRuntime {
+        fn handle_reserved(
+            &self,
+            command: &str,
+            _: Option<&str>,
+            _: &str,
+            _: &[(&str, Option<&str>)],
+        ) -> Option<ReservedOutcome> {
+            (command == "RELOAD").then(|| ReservedOutcome {
+                rc: 0,
+                body: "{}".to_string(),
+                quit: false,
+                reload: true,
+            })
+        }
+    }
+
+    let mut eval = Evaluator::new();
+    let (tx, rx) = mpsc::unbounded_channel::<IncomingEvent>();
+    eval.set_bus_handler(Rc::new(ChannelHandler {
+        rx: RefCell::new(Some(rx)),
+    }));
+    eval.set_serve_runtime(Rc::new(ReloadRuntime));
+
+    // A correlated RELOAD request breaks the pump even with the channel
+    // still open (proving it broke on the reload, not on transport close).
+    tx.send(mk_event("RELOAD", "", &[("type", "request"), ("from", "t"), ("id", "1")]))
+        .unwrap();
+    eval.run_event_pump().await.unwrap();
+    assert!(
+        eval.take_reload_request(),
+        "a serviced RELOAD must set the one-shot reload flag"
+    );
+    assert!(!eval.take_reload_request(), "the flag is consumed on read");
+    drop(tx);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1965,6 +1965,13 @@ pub struct ReservedOutcome {
     /// (SPEC 18 §3.5 — *not* a no-op; WS5 wires the deregister-before-
     /// exit sequence onto this same break).
     pub quit: bool,
+    /// `RELOAD` was serviced (and the runtime pre-validated the new
+    /// source): after the reply is transmitted the pump MUST break with
+    /// the reload flag set so the serve driver can run the
+    /// load-beside-swap — build a fresh evaluator from the re-read
+    /// script, swap on success, resume THIS evaluator on failure. Like
+    /// `quit`, honored only for a correlated request.
+    pub reload: bool,
 }
 
 /// Shared buffer for capturing evaluator output.
@@ -3003,6 +3010,11 @@ pub(crate) struct EvaluatorGlobals {
     /// pump through `quit_notify`; the pump then resumes normal ExitRequest
     /// propagation at its top-level boundary.
     exit_requested: Option<i32>,
+    /// Set when the pump broke because a reserved `RELOAD` was serviced
+    /// (SPEC 18 hot-reload): the serve driver reads it via
+    /// [`Evaluator::take_reload_request`] to distinguish a reload break from
+    /// a QUIT/transport-closed pump end, then runs the load-beside-swap.
+    reload_requested: bool,
     trace: bool,
     stats: Option<Box<UsageStats>>,
     /// Event handler registry for the `on` statement. Maps Bus command names
@@ -3088,6 +3100,7 @@ impl EvaluatorGlobals {
             quit_requested: Arc::new(AtomicBool::new(false)),
             quit_notify: Arc::new(tokio::sync::Notify::new()),
             exit_requested: None,
+            reload_requested: false,
             trace: false,
             stats: None,
             handlers: HashMap::new(),
@@ -3813,6 +3826,15 @@ impl Evaluator {
         self.globals.borrow_mut().limits = limits;
     }
 
+    /// Did the last `run_event_pump` return because a reserved `RELOAD`
+    /// was serviced? Consumes the flag. The serve driver calls this after
+    /// a clean pump return to distinguish "hot-reload requested" from
+    /// "QUIT / transport closed", then runs the load-beside-swap
+    /// (SPEC 18 hot-reload; `_plan/2026-09-13-mix-citizen-hot-reload.md`).
+    pub fn take_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.globals.borrow_mut().reload_requested)
+    }
+
     /// Total number of registered event handlers across all commands.
     ///
     /// Used by the script runner to decide whether to enter an auto-pump
@@ -4521,6 +4543,15 @@ impl Evaluator {
                                 // availability footgun inside the WG trust
                                 // domain.
                                 break "quit";
+                            }
+                            if outcome.reload {
+                                // SPEC 18 hot-reload: the rc:0 reply is
+                                // transmitted; break with the reload flag
+                                // set so the serve driver runs the
+                                // load-beside-swap. Correlation-gated for
+                                // the same reason as QUIT.
+                                self.globals.borrow_mut().reload_requested = true;
+                                break "reload";
                             }
                         } else {
                             tracing::warn!(

@@ -719,6 +719,7 @@ that never fires.</p>
 <tr><td><code>HELP</code></td><td>L0</td><td><code>[{name, description, args}]</code> — reserved verbs first, then the author's commands (sorted, deduped; <code>description</code> is the handler's doc-string when one was written)</td></tr>
 <tr><td><code>INFO</code></td><td>L0</td><td>the <code>{name, version, description}</code> triple</td></tr>
 <tr><td><code>QUIT</code></td><td>L0</td><td>replies <code>rc:0</code>, then triggers the §3.5 graceful shutdown</td></tr>
+<tr><td><code>RELOAD</code></td><td>L0</td><td>hot-reload (mix ≥ 0.88.0): re-parses the script; <code>rc:0 {reloading: true}</code> and the citizen swaps to the new source, or <code>rc:10 {error}</code> and it is untouched — see below</td></tr>
 <tr><td><code>&lt;svc&gt;.props.get</code></td><td>L1</td><td>a lifecycle property snapshot (root, or an optional <code>path=</code>)</td></tr>
 <tr><td><code>&lt;svc&gt;.props.list</code></td><td>L1</td><td>all defined property paths</td></tr>
 <tr><td><code>&lt;svc&gt;.props.describe</code></td><td>L1</td><td>the schema entry for a path</td></tr>
@@ -802,6 +803,41 @@ end
 <p>Note <code>binary: cosmix-mix</code> — the citizen is named <code>statecache</code>, but its provenance
 points at the <code>mix</code> runtime that hosts it.</p>
 <hr />
+<h2 id="hot-reload--reload-load-beside-swap">Hot-reload — <code>RELOAD</code> (load-beside-swap)</h2>
+<p><code>send &lt;svc&gt; RELOAD</code> (mix ≥ 0.88.0) asks a citizen to re-read its own script
+and swap to it <strong>without ever leaving the Bus</strong> — the broker connection and
+service registration survive; only the evaluator (handlers + globals) is
+replaced. The contract is load-beside-swap, in Quickshell's sense:</p>
+<ol>
+<li>The runtime <strong>re-reads and parses</strong> the script first. A parse failure
+answers <code>rc:10 {error}</code> and the running citizen is completely untouched —
+a broken edit is a refused reload, never a dead service.</li>
+<li>On a clean parse it answers <code>rc:0 {reloading: true}</code>, then builds a
+<strong>fresh evaluator beside the running one</strong> (same wiring: prelude, limits,
+reserved-verb surface) and executes the new top-level.</li>
+<li>New top-level succeeds → the new evaluator takes over the pump; the old
+one is drained (in-flight async handlers get the shutdown discipline) and
+dropped. It <strong>fails at runtime</strong> → the failure is logged loudly and the
+OLD evaluator resumes, its state intact.</li>
+</ol>
+<p>This is what makes it safe for an agent to edit a live citizen: the worst a
+bad edit can do is a logged revert. Things to know:</p>
+<ul>
+<li><strong>State does not carry over.</strong> The new top-level re-initializes its
+globals. State that must survive a reload belongs in the substrate
+(props, statecache) — that is the persistent-state model, not process
+memory.</li>
+<li>The <code>rc:0</code> reply races the swap by design: a follow-up sent immediately
+queues at the broker and is answered by whichever evaluator holds the
+pump. Fire <code>RELOAD</code>, then re-probe <code>HELP</code>/<code>INFO</code> to observe the new
+surface.</li>
+<li>Topic subscriptions made by the old top-level persist on the shared
+connection; a re-subscribing new top-level may duplicate delivery
+(v1 limitation — avoid reloading citizens that <code>subscribe</code>, or make
+subscription idempotent on the handler side).</li>
+<li>Like every reserved verb, an author <code>on RELOAD</code> handler is unreachable
+and filtered from <code>HELP</code>.</li>
+</ul>
 <h2 id="supervision-reconnect-and-shutdown">Supervision, reconnect, and shutdown</h2>
 <p>Serve mode wraps the pump in a supervised client, so the citizen behaves like a
 proper daemon across broker churn:</p>
