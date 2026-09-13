@@ -1411,6 +1411,10 @@ pub(crate) struct HandlerEntry {
     /// The handler body. `Arc<Vec<Stmt>>` lets dispatch clone a handle
     /// to the body without copying the AST.
     body: Arc<Vec<Stmt>>,
+    /// The handler's doc-string (`on <cmd> "…"`), surfaced by the serve
+    /// runtime as the verb's HELP `description`. With multiple handlers on
+    /// one command, the first documented one wins.
+    doc: Option<String>,
     /// Captured at parse time from `StmtKind::On { is_async, .. }`.
     /// `true` means the source declared `on <cmd> async` (Class C);
     /// `false` is a plain `on <cmd>` (Class S).
@@ -1927,14 +1931,16 @@ pub trait ServeRuntime {
     ///   `props.describe` read `path` from it (falling back to
     ///   `req_body`), mirroring the indexd reference dispatch.
     /// - `req_body` — the inbound request body.
-    /// - `handler_commands` — the citizen's registered `on` command set,
-    ///   surfaced by `HELP`/`INFO` as the author-defined command list.
+    /// - `handler_commands` — the citizen's registered `on` command set as
+    ///   `(command, doc)` pairs, surfaced by `HELP`/`INFO` as the
+    ///   author-defined command list; `doc` is the handler's doc-string
+    ///   (`on <cmd> "…"`) when the author wrote one.
     fn handle_reserved(
         &self,
         command: &str,
         args_header: Option<&str>,
         req_body: &str,
-        handler_commands: &[&str],
+        handler_commands: &[(&str, Option<&str>)],
     ) -> Option<ReservedOutcome>;
 
     /// Record an isolated handler fault (error or panic) so the citizen's
@@ -4411,8 +4417,24 @@ impl Evaluator {
                     let reserved = {
                         let g = self.globals.borrow();
                         if let Some(rt) = g.serve_runtime.as_ref() {
-                            let handler_cmds: Vec<&str> =
-                                g.handlers.keys().map(|s| s.as_str()).collect();
+                            // Only HELP reads this list, so skip the doc scan
+                            // (and the per-command tuples) on the hot path of
+                            // every other inbound message.
+                            let handler_cmds: Vec<(&str, Option<&str>)> =
+                                if ev.command == "HELP" {
+                                    g.handlers
+                                        .iter()
+                                        .map(|(cmd, entries)| {
+                                            // First documented handler wins.
+                                            let doc = entries
+                                                .iter()
+                                                .find_map(|e| e.doc.as_deref());
+                                            (cmd.as_str(), doc)
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
                             rt.handle_reserved(
                                 &ev.command,
                                 ev.headers.get("args").map(|s| s.as_str()),
@@ -7662,6 +7684,7 @@ impl Evaluator {
 
                 StmtKind::On {
                     command,
+                    doc,
                     is_async,
                     body,
                 } => {
@@ -7698,6 +7721,7 @@ impl Evaluator {
                     }
                     let entry = HandlerEntry {
                         body: Arc::new(body.clone()),
+                        doc: doc.clone(),
                         is_async: *is_async,
                     };
                     if entry.is_async {
@@ -14688,6 +14712,7 @@ mod chain_class_tests {
     fn entry(is_async: bool) -> HandlerEntry {
         HandlerEntry {
             body: Arc::new(Vec::new()),
+            doc: None,
             is_async,
         }
     }

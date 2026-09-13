@@ -181,7 +181,7 @@ name or topic — so a request `send statecache statecache.get` fires
 citizen:
 
 ```mix
-on statecache.get               -- a request: read state back to the caller
+on statecache.get desc "Read the cached value back to the caller"
   reply($value)                 -- rc defaults to 0
 end
 
@@ -189,6 +189,25 @@ on config.current               -- a topic delivery: update state, no reply
   $value = $event.body
 end
 ```
+
+### Doc-strings — a citizen self-describes at the handler site
+
+`on <cmd> desc "what this verb does" [async]` (mix ≥ 0.87.1; `desc` and
+`async` compose in either order) attaches a **doc-string** to the handler.
+The runtime surfaces it verbatim as that verb's `description` in the `HELP`
+reply, so GUIs, discovery tools, and agents all read the text the author
+wrote where the handler lives — no separately-maintained manifest. Handlers
+without one show the generic `Author-defined handler`.
+
+`desc` is a contextual marker (like `async`), consumed only when a **static**
+string literal follows it. The doc is static metadata that never evaluates:
+in double quotes only `${…}` interpolates, so a bare `$var` inside a doc
+stays literal text, and `desc "${var}"` is a parse error (as that adjacent
+pair always was). A body statement that merely *uses* the name `desc` (on
+its own line) is untouched. With multiple handlers registered on one
+command, the first documented one wins. An older mix **rejects** a
+doc-annotated script at parse time — loudly, not with a silent misparse — so
+deploy the runtime before the scripts.
 
 ### `reply()` answers a request
 
@@ -329,7 +348,7 @@ that never fires.
 
 | Verb | Level | What it returns |
 |---|---|---|
-| `HELP` | L0 | `[{name, description, args}]` — reserved verbs first, then the author's commands (sorted, deduped) |
+| `HELP` | L0 | `[{name, description, args}]` — reserved verbs first, then the author's commands (sorted, deduped; `description` is the handler's doc-string when one was written) |
 | `INFO` | L0 | the `{name, version, description}` triple |
 | `QUIT` | L0 | replies `rc:0`, then triggers the §3.5 graceful shutdown |
 | `<svc>.props.get` | L1 | a lifecycle property snapshot (root, or an optional `path=`) |

@@ -579,7 +579,7 @@ name or topic — so a request <code>send statecache statecache.get</code> fires
 <code>on statecache.get</code>. The full grammar (the <code>$event</code> map, <code>reply(...)</code>,
 <code>async</code>/Class C, <code>subscribe</code>) is in <a href="/mix/bus">Bus messaging</a>; the essentials for a
 citizen:</p>
-<pre><code class="language-mix">on statecache.get               -- a request: read state back to the caller
+<pre><code class="language-mix">on statecache.get desc "Read the cached value back to the caller"
   reply($value)                 -- rc defaults to 0
 end
 
@@ -587,6 +587,22 @@ on config.current               -- a topic delivery: update state, no reply
   $value = $event.body
 end
 </code></pre>
+<h3 id="doc-strings--a-citizen-self-describes-at-the-handler-site">Doc-strings — a citizen self-describes at the handler site</h3>
+<p><code>on &lt;cmd&gt; desc "what this verb does" [async]</code> (mix ≥ 0.87.1; <code>desc</code> and
+<code>async</code> compose in either order) attaches a <strong>doc-string</strong> to the handler.
+The runtime surfaces it verbatim as that verb's <code>description</code> in the <code>HELP</code>
+reply, so GUIs, discovery tools, and agents all read the text the author
+wrote where the handler lives — no separately-maintained manifest. Handlers
+without one show the generic <code>Author-defined handler</code>.</p>
+<p><code>desc</code> is a contextual marker (like <code>async</code>), consumed only when a <strong>static</strong>
+string literal follows it. The doc is static metadata that never evaluates:
+in double quotes only <code>${…}</code> interpolates, so a bare <code>$var</code> inside a doc
+stays literal text, and <code>desc "${var}"</code> is a parse error (as that adjacent
+pair always was). A body statement that merely <em>uses</em> the name <code>desc</code> (on
+its own line) is untouched. With multiple handlers registered on one
+command, the first documented one wins. An older mix <strong>rejects</strong> a
+doc-annotated script at parse time — loudly, not with a silent misparse — so
+deploy the runtime before the scripts.</p>
 <h3 id="reply-answers-a-request"><code>reply()</code> answers a request</h3>
 <p><code>reply(body)</code> or <code>reply(rc, body)</code> answers the in-flight request. A non-zero <code>rc</code>
 (<code>0..=255</code>) is an <strong>application error</strong> carried to the caller's <code>$rc</code>/<code>$result</code> —
@@ -698,7 +714,7 @@ tailored reply; the runtime boundary is the backstop for anything you don't catc
 unreachable — and is filtered out of <code>HELP</code> rather than advertised as a shadow
 that never fires.</p>
 <table><thead><tr><th>Verb</th><th>Level</th><th>What it returns</th></tr></thead><tbody>
-<tr><td><code>HELP</code></td><td>L0</td><td><code>[{name, description, args}]</code> — reserved verbs first, then the author's commands (sorted, deduped)</td></tr>
+<tr><td><code>HELP</code></td><td>L0</td><td><code>[{name, description, args}]</code> — reserved verbs first, then the author's commands (sorted, deduped; <code>description</code> is the handler's doc-string when one was written)</td></tr>
 <tr><td><code>INFO</code></td><td>L0</td><td>the <code>{name, version, description}</code> triple</td></tr>
 <tr><td><code>QUIT</code></td><td>L0</td><td>replies <code>rc:0</code>, then triggers the §3.5 graceful shutdown</td></tr>
 <tr><td><code>&lt;svc&gt;.props.get</code></td><td>L1</td><td>a lifecycle property snapshot (root, or an optional <code>path=</code>)</td></tr>

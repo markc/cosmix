@@ -368,14 +368,17 @@ ghost:      false
 
 ## `on … end` — receiving messages (handlers)
 
-`on <command> [async] … end` registers a **handler** that fires when a matching
-Bus message arrives. The handler body uses newline- or `;`-separated statements closed by
-`end` — **no `do` keyword**. The `<command>` matches the *inner command* of the
-inbound message (the verb the publisher sent), **not** the topic/target name —
-check the publisher to know what to match.
+`on <command> [desc "doc-string"] [async] … end` registers a **handler** that
+fires when a matching Bus message arrives. The handler body uses newline- or
+`;`-separated statements closed by `end` — **no `do` keyword**. The
+`<command>` matches the *inner command* of the inbound message (the verb the
+publisher sent), **not** the topic/target name — check the publisher to know
+what to match. The optional `desc "…"` doc-string (mix ≥ 0.87.1) is static
+metadata: a serve citizen surfaces it as the verb's `description` in its
+`HELP` reply — see [Serve citizens](serve.md).
 
 ```mix
-on order.created
+on order.created desc "Acknowledge a new order"
   print("got an order: " .. $event.body)
   reply("ack")
 end

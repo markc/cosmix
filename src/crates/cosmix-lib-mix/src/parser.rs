@@ -1505,14 +1505,39 @@ impl Parser {
             break;
         }
 
-        // Optional `async` modifier (contextual identifier, not a keyword).
-        // SPEC 18 §10.3 / Ch04: per-handler classification of yield behaviour.
-        // Mix represents barewords as `Token::String(_)`; matching by string
-        // value here keeps `async` a contextual modifier rather than a global
-        // reserved word so existing scripts/vars named `async` are unaffected.
-        let is_async = matches!(self.peek(), Token::String(name) if name == "async");
-        if is_async {
-            self.advance();
+        // Optional trailer, in either order: a `desc "…"` doc-string and/or
+        // the `async` modifier (SPEC 18 §10.3 Class C). Both are contextual
+        // barewords matched by string value — no new global reserved words.
+        //
+        // Doc-string: `on launch.run desc "Run a command"`. Captured as
+        // static handler metadata; the serve runtime surfaces it as the
+        // verb's HELP `description`. The explicit `desc` marker exists
+        // because barewords and plain quoted strings both lex as
+        // `Token::String`, so a bare trailing string is AMBIGUOUS with a
+        // same-line body statement (`on foo refresh; done` is a body that
+        // calls `refresh`) — a marker-less doc would silently re-mean such
+        // programs. `desc` is consumed ONLY when a static string literal
+        // follows it; any other shape (a function named desc, an
+        // interpolated string) falls through as body, exactly the pre-doc
+        // parse.
+        let mut doc: Option<String> = None;
+        let mut is_async = false;
+        loop {
+            match self.peek() {
+                Token::String(name) if name == "async" && !is_async => {
+                    self.advance();
+                    is_async = true;
+                }
+                Token::String(name) if name == "desc" && doc.is_none() => {
+                    let Some(text) = self.peek_next_static_string() else {
+                        break; // not `desc "<literal>"` — leave for the body
+                    };
+                    doc = Some(text);
+                    self.advance(); // desc
+                    self.advance(); // the string
+                }
+                _ => break,
+            }
         }
 
         self.skip_statement_separators();
@@ -1522,9 +1547,32 @@ impl Parser {
 
         Ok(StmtKind::On {
             command,
+            doc,
             is_async,
             body,
         })
+    }
+
+    /// The token after the current one, as a STATIC string literal — a plain
+    /// `Token::String` or a `Token::InterpString` whose parts are all
+    /// literal. `None` for anything dynamic (`$var`, `${…}`, `~`-expansion,
+    /// command substitution): a doc-string is static metadata that never
+    /// evaluates.
+    fn peek_next_static_string(&self) -> Option<String> {
+        match self.tokens.get(self.pos + 1).map(|t| &t.token) {
+            Some(Token::String(s)) => Some(s.clone()),
+            Some(Token::InterpString(parts)) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        StringPart::Literal(s) => out.push_str(s),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
     }
 
     /// Parse send in expression position: `$result = send "target" command ...`

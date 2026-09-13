@@ -2760,6 +2760,7 @@ fn parse_on_async_modifier() {
             command,
             is_async,
             body,
+            ..
         },
         ..
     } = stmt
@@ -2777,6 +2778,7 @@ fn parse_on_async_modifier() {
             command,
             is_async,
             body,
+            ..
         },
         ..
     } = stmt
@@ -2845,6 +2847,7 @@ fn parse_on_async_modifier() {
             command,
             is_async,
             body,
+            ..
         },
         ..
     } = stmt
@@ -2861,6 +2864,109 @@ fn parse_on_async_modifier() {
         2,
         "body should be two statements: bareword `async` + `print`"
     );
+}
+
+/// `on <cmd> desc "doc"` — the handler doc-string, surfaced by the serve
+/// runtime as the verb's HELP description. `desc` is an explicit contextual
+/// marker (like `async`) BECAUSE a bare trailing string is ambiguous with a
+/// same-line body statement — `on foo refresh; done` is a body that calls
+/// `refresh`, and a marker-less doc syntax would silently re-mean it (the
+/// codex cold review's BLOCKER). Covers: capture, both orders with `async`,
+/// absence, and the no-silent-re-meaning lockdowns.
+#[test]
+fn parse_on_doc_string() {
+    use cosmix_mix::ast::{Stmt, StmtKind};
+
+    fn parse_one(src: &str) -> Stmt {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let mut p = Parser::new(tokens, src);
+        let stmts = p.parse_program().expect("parse");
+        assert_eq!(stmts.len(), 1, "expected single stmt, got {}", stmts.len());
+        stmts.into_iter().next().unwrap()
+    }
+    fn on_parts(stmt: Stmt) -> (String, Option<String>, bool, usize) {
+        let Stmt {
+            kind: StmtKind::On {
+                command,
+                doc,
+                is_async,
+                body,
+            },
+            ..
+        } = stmt
+        else {
+            panic!("expected On stmt");
+        };
+        (command, doc, is_async, body.len())
+    }
+
+    // Double-quoted doc.
+    let (cmd, doc, is_async, _) = on_parts(parse_one(
+        "on launch.run desc \"Run a command\"\n  print \"hi\"\ndone\n",
+    ));
+    assert_eq!(cmd, "launch.run");
+    assert_eq!(doc.as_deref(), Some("Run a command"));
+    assert!(!is_async);
+
+    // Single-quoted doc, and a QUOTED (multi-dot) command name before it.
+    let (cmd, doc, _, _) = on_parts(parse_one(
+        "on \"desktop.workspace.next\" desc 'Switch desktop'\n  print \"hi\"\ndone\n",
+    ));
+    assert_eq!(cmd, "desktop.workspace.next");
+    assert_eq!(doc.as_deref(), Some("Switch desktop"));
+
+    // desc + async, both orders.
+    let (_, doc, is_async, _) =
+        on_parts(parse_one("on foo desc \"docs\" async\n  print \"hi\"\ndone\n"));
+    assert_eq!(doc.as_deref(), Some("docs"));
+    assert!(is_async);
+    let (_, doc, is_async, _) =
+        on_parts(parse_one("on foo async desc \"docs\"\n  print \"hi\"\ndone\n"));
+    assert_eq!(doc.as_deref(), Some("docs"));
+    assert!(is_async);
+
+    // No doc: None, exactly the pre-doc shape.
+    let (_, doc, _, _) = on_parts(parse_one("on foo\n  print \"hi\"\ndone\n"));
+    assert_eq!(doc, None);
+
+    // ── No-silent-re-meaning lockdowns ────────────────────────────────────
+    // A bare trailing string is a BODY statement, never a doc (the exact
+    // shape the marker-less design broke): `refresh` stays executable.
+    let (_, doc, _, body_len) = on_parts(parse_one("on foo refresh; done\n"));
+    assert_eq!(doc, None, "bare same-line string must stay a body statement");
+    assert_eq!(body_len, 1);
+    let (_, doc, _, body_len) = on_parts(parse_one("on foo \"refresh\"; done\n"));
+    assert_eq!(doc, None, "quoted same-line string must stay a body statement");
+    assert_eq!(body_len, 1);
+
+    // Same-line call body: untouched.
+    let (_, doc, _, body_len) = on_parts(parse_one("on foo print(\"hi\")\ndone\n"));
+    assert_eq!(doc, None);
+    assert_eq!(body_len, 1);
+
+    // `desc` NOT followed by a static string is not consumed — a function
+    // named desc keeps working as a body statement.
+    let (_, doc, _, body_len) = on_parts(parse_one("on foo\n  desc\n  print \"hi\"\ndone\n"));
+    assert_eq!(doc, None);
+    assert_eq!(body_len, 2);
+    // …and same-line `desc` followed by a DYNAMIC string is a PARSE ERROR —
+    // docs are static metadata, so the pair is not consumed, and two
+    // adjacent expressions without a separator have always been rejected.
+    // Preserving pre-doc behaviour here means preserving the error (the
+    // codex round-2 catch: asserting a successful parse was wrong).
+    let src = "on foo desc \"${dyn}\"\ndone\n";
+    let tokens = Lexer::new(src).tokenize().expect("lex");
+    let mut p = Parser::new(tokens, src);
+    assert!(
+        p.parse_program().is_err(),
+        "dynamic string after desc must stay the pre-doc parse error"
+    );
+
+    // Docs are static: bare `$var` in double quotes is literal (only
+    // `${…}` interpolates), so it is a legal doc and keeps the `$` raw.
+    let (_, doc, _, _) =
+        on_parts(parse_one("on foo desc \"keeps $var raw\"\n  print \"hi\"\ndone\n"));
+    assert_eq!(doc.as_deref(), Some("keeps $var raw"));
 }
 
 /// SPEC 18 Phase 2 WS2: the WS1 parse-time `is_async` flag is

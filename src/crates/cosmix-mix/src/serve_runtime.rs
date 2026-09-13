@@ -108,7 +108,7 @@ impl MixServeRuntime {
     /// order) followed by the citizen's author commands (sorted, so the
     /// payload is byte-deterministic for a given handler set). SPEC 02
     /// §3 shape: `[{name, description, args}]`.
-    fn help_body(&self, handler_commands: &[&str]) -> String {
+    fn help_body(&self, handler_commands: &[(&str, Option<&str>)]) -> String {
         let svc = &self.service_name;
         let mut cmds = vec![
             json!({
@@ -146,17 +146,24 @@ impl MixServeRuntime {
         // it is intercepted pre-dispatch and unreachable, so advertising
         // it would publish a duplicate name with a misleading
         // "author-defined" description for a handler that never fires.
-        let mut authored: Vec<&str> = handler_commands
+        let mut authored: Vec<(&str, Option<&str>)> = handler_commands
             .iter()
             .copied()
-            .filter(|c| !self.is_reserved(c))
+            .filter(|(c, _)| !self.is_reserved(c))
             .collect();
-        authored.sort_unstable();
-        authored.dedup();
-        for c in authored {
+        // Sort by command, documented entries first, so if a caller ever
+        // passes duplicate commands the dedup keeps a documented one rather
+        // than letting an undocumented duplicate shadow it. (The evaluator
+        // already passes one entry per command; this is belt-and-braces.)
+        authored.sort_unstable_by_key(|(c, doc)| (*c, doc.is_none()));
+        authored.dedup_by_key(|(c, _)| *c);
+        for (c, doc) in authored {
             cmds.push(json!({
                 "name": c,
-                "description": "Author-defined handler",
+                // The handler's own doc-string (`on <cmd> "…"`) when the
+                // author wrote one — a citizen self-describes at the
+                // handler site; GUIs and agents read the same text.
+                "description": doc.unwrap_or("Author-defined handler"),
                 "args": [],
             }));
         }
@@ -329,7 +336,7 @@ impl ServeRuntime for MixServeRuntime {
         command: &str,
         args_header: Option<&str>,
         req_body: &str,
-        handler_commands: &[&str],
+        handler_commands: &[(&str, Option<&str>)],
     ) -> Option<ReservedOutcome> {
         // L0 — bare Ch02 universals (routed by `to:`, never prefixed).
         match command {
@@ -398,7 +405,15 @@ mod tests {
     fn help_lists_reserved_verbs_then_sorted_author_commands() {
         let r = rt();
         let out = r
-            .handle_reserved("HELP", None, "", &["statecache.get", "alpha.cmd"])
+            .handle_reserved(
+                "HELP",
+                None,
+                "",
+                &[
+                    ("statecache.get", Some("Fetch a cached value")),
+                    ("alpha.cmd", None),
+                ],
+            )
             .expect("HELP is reserved");
         assert_eq!(out.rc, 0);
         assert!(!out.quit);
@@ -419,6 +434,17 @@ mod tests {
         );
         // Author commands appended, sorted+deduped.
         assert_eq!(&names[6..], &["alpha.cmd", "statecache.get"]);
+        // A doc-string surfaces as the verb's description; an undocumented
+        // handler keeps the generic placeholder.
+        let desc_of = |name: &str| {
+            arr.iter()
+                .find(|e| e["name"] == name)
+                .and_then(|e| e["description"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(desc_of("statecache.get"), "Fetch a cached value");
+        assert_eq!(desc_of("alpha.cmd"), "Author-defined handler");
     }
 
     #[test]
@@ -551,11 +577,11 @@ mod tests {
                 None,
                 "",
                 &[
-                    "HELP",
-                    "QUIT",
-                    "statecache.props.get",
-                    "statecache.props.watch",
-                    "alpha.cmd",
+                    ("HELP", None),
+                    ("QUIT", None),
+                    ("statecache.props.get", None),
+                    ("statecache.props.watch", None),
+                    ("alpha.cmd", None),
                 ],
             )
             .unwrap();

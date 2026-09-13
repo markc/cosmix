@@ -720,12 +720,15 @@ reachability.</p>
 </blockquote>
 <hr />
 <h2 id="on--end--receiving-messages-handlers"><code>on … end</code> — receiving messages (handlers)</h2>
-<p><code>on &lt;command&gt; [async] … end</code> registers a <strong>handler</strong> that fires when a matching
-Bus message arrives. The handler body uses newline- or <code>;</code>-separated statements closed by
-<code>end</code> — <strong>no <code>do</code> keyword</strong>. The <code>&lt;command&gt;</code> matches the <em>inner command</em> of the
-inbound message (the verb the publisher sent), <strong>not</strong> the topic/target name —
-check the publisher to know what to match.</p>
-<pre><code class="language-mix">on order.created
+<p><code>on &lt;command&gt; [desc "doc-string"] [async] … end</code> registers a <strong>handler</strong> that
+fires when a matching Bus message arrives. The handler body uses newline- or
+<code>;</code>-separated statements closed by <code>end</code> — <strong>no <code>do</code> keyword</strong>. The
+<code>&lt;command&gt;</code> matches the <em>inner command</em> of the inbound message (the verb the
+publisher sent), <strong>not</strong> the topic/target name — check the publisher to know
+what to match. The optional <code>desc "…"</code> doc-string (mix ≥ 0.87.1) is static
+metadata: a serve citizen surfaces it as the verb's <code>description</code> in its
+<code>HELP</code> reply — see <a href="/mix/serve">Serve citizens</a>.</p>
+<pre><code class="language-mix">on order.created desc "Acknowledge a new order"
   print("got an order: " .. $event.body)
   reply("ack")
 end

@@ -161,7 +161,7 @@ impl ServeRuntime for RecordingRuntime {
         _command: &str,
         _args_header: Option<&str>,
         _req_body: &str,
-        _handler_commands: &[&str],
+        _handler_commands: &[(&str, Option<&str>)],
     ) -> Option<ReservedOutcome> {
         None
     }
