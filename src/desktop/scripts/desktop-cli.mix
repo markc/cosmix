@@ -9,8 +9,13 @@ $a = args()
 $request = {}
 fn id_arg($raw)
   -- A malformed id must fail the call, never degrade to clear-all/pick-nil.
+  -- Integer SPELLING is checked before conversion: a float that rounds to an
+  -- integer (1.0000000000000001) must not slip through to_number+floor.
+  if not re_match($raw, "^[0-9]+$") then
+    raise("DESKTOP_ARGS", "id must be a positive integer, got: " .. $raw)
+  end
   $id = to_number($raw)
-  if $id == nil or $id != floor($id) or $id < 1 then
+  if $id == nil or $id < 1 then
     raise("DESKTOP_ARGS", "id must be a positive integer, got: " .. $raw)
   end
   return $id

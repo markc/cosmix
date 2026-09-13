@@ -131,6 +131,10 @@ try
   $typo = cli(["clear","desktop-one","oops"])
   check(not $typo.ok,"malformed clear id accepted")
   check(json_parse(cli(["history","desktop-one"]).stdout).total == 1,"malformed clear wiped history")
+  -- A float that rounds to an integer is equally rejected (no to_number+floor).
+  $fraction = cli(["clear","desktop-one","1.0000000000000001"])
+  check(not $fraction.ok,"fraction id accepted")
+  check(json_parse(cli(["history","desktop-one"]).stdout).total == 1,"fraction clear wiped history")
   -- Cross-session pick (the mesh picker-merge flow, both arms on this broker):
   -- a remote history entry becomes the local selection; text stays Bus-side.
   $watch2 = notify("data","desktop-two","remote origin text")

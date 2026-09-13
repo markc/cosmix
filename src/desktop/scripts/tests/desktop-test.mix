@@ -269,6 +269,35 @@ try
   -- Entry id bounds.
   check($d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:0},2).rc == 10,"entry id 0 accepted")
   check($d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:-3},2).rc == 10,"negative entry id accepted")
+  -- Duplicate ids in a store are structural corruption: quarantined.
+  write_file($tmp .. "/dup.json", json_encode({schema_version:1, next_id:9, revision:0, skipped:0, paused:false,
+    entries:[{id:2, text:"dup", bytes:3, at:1.0},{id:2, text:"dup", bytes:3, at:1.0}]}))
+  $dupes = $d.history_state({path:$tmp .. "/dup.json"}, "test")
+  check($dupes.degraded == "" and len($dupes.entries) == 0,"duplicate ids not quarantined")
+  -- Budget trim on load: a budget too small for every entry keeps the newest.
+  write_file($tmp .. "/fat.json", json_encode({schema_version:1, next_id:4, revision:0, skipped:0, paused:false,
+    entries:[{id:3, text:"newest-fat", bytes:10, at:3.0},{id:2, text:"mid-fat", bytes:7, at:2.0},{id:1, text:"old-fat", bytes:7, at:1.0}]}))
+  $fat = $d.history_state({path:$tmp .. "/fat.json", budget_bytes:65536, depth:2}, "test")
+  check($fat.degraded == "" and len($fat.entries) == 2 and $fat.entries[0].id == 3 and $fat.entries[1].id == 2,"budget/depth trim kept wrong entries")
+  -- Save-failure propagation: with the state dir read-only, a capture still
+  -- commits in memory, reports persisted:false, and capabilities says
+  -- write-error; restoring the dir heals it.
+  $ro_ctx = {session:"ro",instance:"instance-ro",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true",
+    history:$d.history_state({path:$tmp .. "/ro/h.json"}, "ro")}
+  chmod($tmp .. "/ro", 0o500)
+  $plan = $d.prepare($ro_ctx,"desktop.clipboard.capture",$headers,{text:"read-only capture"},2)
+  check($plan.rc == 0 and $plan.body.stored == true and $plan.body.persisted == false,"read-only save not reported as failed")
+  $ro_ctx = ctx_of($plan, $ro_ctx)
+  $ro_caps = $d.prepare($ro_ctx,"desktop.capabilities",$headers,{},2).body
+  check($ro_caps.clipboard.history.persistence == "write-error","capabilities missed write-error")
+  $plan = $d.prepare($ro_ctx,"desktop.clipboard.capture",$headers,{text:"read-only capture"},2)
+  check($plan.body.reason == "duplicate","memory state lost despite failed save")
+  chmod($tmp .. "/ro", 0o755)
+  $plan = $d.prepare($ro_ctx,"desktop.clipboard.capture",$headers,{text:"heals after chmod"},2)
+  check($plan.body.persisted == true,"write-error did not heal")
+  $ro_ctx = ctx_of($plan, $ro_ctx)
+  $ro_caps = $d.prepare($ro_ctx,"desktop.capabilities",$headers,{},2).body
+  check($ro_caps.clipboard.history.persistence == "ok","write-error flag did not clear")
   $reloaded = $d.history_state({path:$tmp .. "/history.json"}, "test")
   check($reloaded.degraded == "" and $reloaded.paused == false and $reloaded.next_id == $ctx.history.next_id and $reloaded.skipped == $ctx.history.skipped and len($reloaded.entries) == len($ctx.history.entries),"reload lost state")
   write_file($tmp .. "/history.json", "{not json")

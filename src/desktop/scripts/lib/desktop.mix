@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.3.2. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.3. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 
@@ -218,25 +218,38 @@ fn history_state($cfg, $session)
   return history_load($h)
 end
 
-fn history_save($h)
-  if $h.degraded != "" then return false end
+fn history_persist($h)
+  -- Save and return the updated history (the save_failed flag must survive
+  -- into the caller's context — fn args are by value). Only a temp file THIS
+  -- call created is ever removed: a name collision with a pre-existing file
+  -- fails write_new without giving us ownership of it.
+  if $h.degraded != "" then return {h:$h, persisted:false} end
   $payload = {schema_version:1, next_id:$h.next_id, revision:$h.revision,
     skipped:$h.skipped, paused:$h.paused, entries:$h.entries}
   $tmpf = $h.path .. ".tmp-" .. slice(replace(uuid(),"-",""),0,8)
+  $created = false
   try
     write_new($tmpf, json_encode($payload), "0600")
+    $created = true
     rename($tmpf, $h.path)
     $h.save_failed = false
-    return true
+    return {h:$h, persisted:true}
   catch $err
-    -- The temp file holds clipboard content: never leave it behind.
-    try
-      remove($tmpf)
-    catch $err2
+    if $created then
+      -- Our own half-written temp file holds clipboard content: remove it.
+      try
+        remove($tmpf)
+      catch $err2
+      end
     end
     $h.save_failed = true
-    return false
+    return {h:$h, persisted:false}
   end
+end
+
+fn history_save($h)
+  -- Boolean-outcome wrapper for callers that don't need the flag-bearing map.
+  return history_persist($h).persisted
 end
 
 fn history_publish($ctx, $action, $id)
@@ -280,10 +293,10 @@ fn history_capture($ctx, $text)
     -- Never stored, never truncated: the skip is counted, not remembered.
     $h.skipped = $h.skipped + 1
     $h.revision = $h.revision + 1
-    $ctx.history = $h
-    $persisted = history_save($h)
+    $save = history_persist($h)
+    $ctx.history = $save.h
     history_publish($ctx, "skip", nil)
-    return {context:$ctx, body:{stored:false, reason:"oversize", bytes:$bytes, skipped:$h.skipped, persisted:$persisted}}
+    return {context:$ctx, body:{stored:false, reason:"oversize", bytes:$bytes, skipped:$h.skipped, persisted:$save.persisted}}
   end
   $idx = history_find($h, $text)
   if $idx != nil then
@@ -296,10 +309,10 @@ fn history_capture($ctx, $text)
     $h.entries = concat([$entry], list_remove($h.entries, $idx))
     $h.used = history_used($h.entries)
     $h.revision = $h.revision + 1
-    $ctx.history = $h
-    $persisted = history_save($h)
+    $save = history_persist($h)
+    $ctx.history = $save.h
     history_publish($ctx, "capture", $entry.id)
-    return {context:$ctx, body:{stored:true, id:$entry.id, duplicate:true, persisted:$persisted}}
+    return {context:$ctx, body:{stored:true, id:$entry.id, duplicate:true, persisted:$save.persisted}}
   end
   $entry = {id:$h.next_id, text:$text, bytes:$bytes, at:time()}
   $h.next_id = $h.next_id + 1
@@ -309,10 +322,10 @@ fn history_capture($ctx, $text)
   end
   $h.used = history_used($h.entries)
   $h.revision = $h.revision + 1
-  $ctx.history = $h
-  $persisted = history_save($h)
+  $save = history_persist($h)
+  $ctx.history = $save.h
   history_publish($ctx, "capture", $entry.id)
-  return {context:$ctx, body:{stored:true, id:$entry.id, persisted:$persisted}}
+  return {context:$ctx, body:{stored:true, id:$entry.id, persisted:$save.persisted}}
 end
 
 fn history_preview($text)
@@ -405,7 +418,7 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.2", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.3", session:$ctx.session,
       instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
@@ -476,20 +489,20 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
       $h.entries = list_remove($h.entries, $idx)
       $h.used = history_used($h.entries)
       $h.revision = $h.revision + 1
-      $ctx.history = $h
-      $persisted = history_save($h)
+      $save = history_persist($h)
+      $ctx.history = $save.h
       history_publish($ctx, "clear", $body.id)
-      return {rc:0, body:{instance:$ctx.instance, removed:1, persisted:$persisted}, context:$ctx}
+      return {rc:0, body:{instance:$ctx.instance, removed:1, persisted:$save.persisted}, context:$ctx}
     end
     $removed = len($h.entries)
     if $removed > 0 then
       $h.entries = []
       $h.used = 0
       $h.revision = $h.revision + 1
-      $ctx.history = $h
-      $persisted = history_save($h)
+      $save = history_persist($h)
+      $ctx.history = $save.h
       history_publish($ctx, "clear", nil)
-      return {rc:0, body:{instance:$ctx.instance, removed:$removed, persisted:$persisted}, context:$ctx}
+      return {rc:0, body:{instance:$ctx.instance, removed:$removed, persisted:$save.persisted}, context:$ctx}
     end
     return {rc:0, body:{instance:$ctx.instance, removed:0, persisted:($h.degraded == "" and not $h.save_failed)}}
   end
@@ -500,9 +513,9 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
       return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:($h.degraded == "" and not $h.save_failed)}}
     end
     $h.paused = $body.on
-    $ctx.history = $h
-    $persisted = history_save($h)
-    return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:$persisted}, context:$ctx}
+    $save = history_persist($h)
+    $ctx.history = $save.h
+    return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:$save.persisted}, context:$ctx}
   end
   if $verb == "desktop.clipboard.pick" then
     if not is_int($body.id) or $body.id < 1 then return error("INVALID_REQUEST", 10) end
@@ -583,10 +596,10 @@ fn finish($ctx, $plan, $result)
       $h.entries = concat([$entry], list_remove($h.entries, $idx))
       $h.used = history_used($h.entries)
       $h.revision = $h.revision + 1
-      $ctx.history = $h
-      $persisted = history_save($h)
+      $save = history_persist($h)
+      $ctx.history = $save.h
       history_publish($ctx, "pick", $entry.id)
-      return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, bytes:$entry.bytes, persisted:$persisted}, context:$ctx}
+      return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, bytes:$entry.bytes, persisted:$save.persisted}, context:$ctx}
     end
     return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, bytes:$h.entries[0].bytes, persisted:($h.degraded == "" and not $h.save_failed)}}
   end
@@ -597,10 +610,10 @@ fn finish($ctx, $plan, $result)
     $h.entries = concat(list_remove($h.entries, 0), [$front])
     $h.used = history_used($h.entries)
     $h.revision = $h.revision + 1
-    $ctx.history = $h
-    $persisted = history_save($h)
+    $save = history_persist($h)
+    $ctx.history = $save.h
     history_publish($ctx, "pick", $h.entries[0].id)
-    return {rc:0, body:{instance:$ctx.instance, rotated:true, id:$h.entries[0].id, persisted:$persisted}, context:$ctx}
+    return {rc:0, body:{instance:$ctx.instance, rotated:true, id:$h.entries[0].id, persisted:$save.persisted}, context:$ctx}
   end
   if $plan.action == "write" then
     return {rc:0, body:{instance:$ctx.instance, accepted:true, bytes:$plan.bytes}}
