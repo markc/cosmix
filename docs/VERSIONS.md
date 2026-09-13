@@ -27,8 +27,8 @@ CosMix Agent Bus — protocol family
 | crate | version |
 |---|---|
 | `cosmix-lib-buildinfo` | 0.2.0 |
-| `cosmix-lib-bus` | 0.3.2 |
-| `cosmix-lib-client` | 0.4.2 |
+| `cosmix-lib-bus` | 0.3.5 |
+| `cosmix-lib-client` | 0.6.1 |
 | `cosmix-lib-log` | 0.3.0 |
 | `cosmix-lib-props-core` | 0.3.1 |
 
@@ -38,8 +38,8 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.83.2 |
-| `cosmix-mix` | 0.83.2 |
+| `cosmix-lib-mix` | 0.86.0 |
+| `cosmix-mix` | 0.87.2 |
 | `mix-bench` | 0.1.0 |
 
 ## cos
@@ -55,11 +55,14 @@ CoS — substrate libraries and daemon family
 | `cosmix-dnsd` | 0.3.0 |
 | `cosmix-filesd` | 0.8.0 |
 | `cosmix-indexd` | 0.9.0 |
+| `cosmix-input-core` | 0.1.2 |
+| `cosmix-input-schema` | 0.1.1 |
+| `cosmix-inputd` | 0.2.3 |
 | `cosmix-interactd` | 0.5.0 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
 | `cosmix-lib-agent` | 0.1.0 |
-| `cosmix-lib-config` | 0.8.0 |
+| `cosmix-lib-config` | 0.8.3 |
 | `cosmix-lib-daemon` | 0.7.0 |
 | `cosmix-lib-davproto` | 0.1.2 |
 | `cosmix-lib-dns` | 0.3.0 |
@@ -69,7 +72,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-lib-mesh` | 0.6.0 |
 | `cosmix-lib-mesh-trust` | 0.10.0 |
 | `cosmix-lib-node-id` | 0.2.0 |
-| `cosmix-lib-props-store` | 0.3.0 |
+| `cosmix-lib-props-store` | 0.4.0 |
 | `cosmix-lib-skills` | 0.1.0 |
 | `cosmix-lib-wg` | 0.2.0 |
 | `cosmix-maild` | 0.8.1 |
@@ -83,7 +86,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-mixer-schema` | 0.5.0 |
 | `cosmix-mprisd` | 0.1.1 |
 | `cosmix-musicd` | 0.25.0 |
-| `cosmix-noded` | 0.16.0 |
+| `cosmix-noded` | 0.16.8 |
 | `cosmix-nspawnd` | 0.2.0 |
 | `cosmix-powerd` | 0.1.0 |
 | `cosmix-song` | 0.2.0 |
@@ -97,31 +100,32 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | crate | version |
 |---|---|
 | `cosmix-bg-boing` | 0.1.0 |
-| `cosmix-bg-showcase` | 0.2.2 |
+| `cosmix-bg-showcase` | 0.2.3 |
 | `cosmix-capture` | 0.1.2 |
 | `cosmix-comp` | 0.51.1 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
-| `cosmix-filemgr` | 0.9.5 |
+| `cosmix-filemgr` | 0.9.7 |
 | `cosmix-flock` | 0.1.0 |
 | `cosmix-imeprobe` | 0.1.0 |
-| `cosmix-interactgui` | 0.1.1 |
+| `cosmix-interactgui` | 0.1.2 |
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
 | `cosmix-quoin` | 0.11.0 |
 | `cosmix-shell` | 0.8.6 |
 | `cosmix-shell-host` | 0.6.5 |
-| `cosmix-studio` | 0.4.5 |
-| `cosmix-term` | 0.3.1 |
-| `cosmix-tower` | 0.5.2 |
+| `cosmix-studio` | 0.4.7 |
+| `cosmix-term` | 0.8.0 |
+| `cosmix-tower` | 0.5.3 |
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
 | `cosmix-wallpaper` | 0.2.0 |
 | `cosmix-wgpu-dmabuf` | 0.14.0 |
 | `cosmix-wl-dnd` | 0.4.2 |
-| `ctk` | 0.53.0 |
+| `ctk` | 0.54.1 |
 | `spike-wl-dnd` | 0.1.0 |
+| `term-native-test-broker` | 0.0.0 |
 
 ---
 
-49 crates in `$COSMIX/src` and 25 in the separate `$COSMIX/src/desktop` workspace.
+52 crates in `$COSMIX/src` and 26 in the separate `$COSMIX/src/desktop` workspace.
