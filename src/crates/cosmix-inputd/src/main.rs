@@ -219,16 +219,19 @@ async fn serve_bus(
 
 /// Deliver a resolved verb fire-and-forget. The target service is the verb's
 /// first dot-segment (`desktop.workspace.next` -> `desktop`); a placeholder verb
-/// with no handler (e.g. `user.f09`) simply no-routes, which is fine.
+/// with no handler (e.g. `user.f09`) simply no-routes, which is fine. A binding
+/// with `args` sends them as the body — the ARexx model: a message is a verb
+/// plus arguments.
 async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVerb) {
     let service = fired.verb.split('.').next().unwrap_or("");
     if service.is_empty() {
         return;
     }
-    if let Err(error) = client
-        .send(service, &fired.verb, serde_json::json!({}))
-        .await
-    {
+    let body = fired
+        .args
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Err(error) = client.send(service, &fired.verb, body).await {
         eprintln!("cosmix-inputd: fire {} -> {service}: {error}", fired.verb);
     }
 }
@@ -250,13 +253,13 @@ fn resolve_device_by_name(name: &str) -> anyhow::Result<String> {
             continue;
         }
         for line in block.lines() {
-            if let Some(rest) = line.strip_prefix("H: Handlers=") {
-                if let Some(node) = rest.split_whitespace().find(|tok| {
+            if let Some(rest) = line.strip_prefix("H: Handlers=")
+                && let Some(node) = rest.split_whitespace().find(|tok| {
                     tok.strip_prefix("event")
                         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                }) {
-                    return Ok(format!("/dev/input/{node}"));
-                }
+                })
+            {
+                return Ok(format!("/dev/input/{node}"));
             }
         }
     }

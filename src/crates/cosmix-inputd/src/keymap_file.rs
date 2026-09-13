@@ -39,7 +39,21 @@ pub fn load(path: &Path) -> Option<Vec<PhysicalBinding>> {
     let parsed: PersistedKeymap = serde_json::from_str(&text)
         .map_err(|error| eprintln!("cosmix-inputd: keymap {} unreadable: {error}", path.display()))
         .ok()?;
-    Some(parsed.physical)
+    // This path bypasses `bind_physical`'s admission checks, so enforce the
+    // args invariant here too: a fired body is a map. A hand-edited non-object
+    // is dropped to None (the row still binds) rather than shipped to handlers.
+    let mut physical = parsed.physical;
+    for row in &mut physical {
+        if row.args.as_ref().is_some_and(|args| !args.is_object()) {
+            eprintln!(
+                "cosmix-inputd: keymap {}: row {:?} has non-object args; ignoring them",
+                path.display(),
+                row.action.as_str()
+            );
+            row.args = None;
+        }
+    }
+    Some(physical)
 }
 
 /// Persist physical rows durably: write a temp file next to the target, fsync,

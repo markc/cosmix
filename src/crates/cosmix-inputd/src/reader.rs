@@ -58,8 +58,11 @@ const BUS_USB: u16 = 0x03;
 
 /// A verb the grab reader resolved and wants fired on the Bus. Sent from the
 /// (blocking) reader thread to the tokio side, which owns the Bus client.
+#[derive(Clone)]
 pub struct FiredVerb {
     pub verb: String,
+    /// The binding's arguments, sent as the verb's body (`None` = empty body).
+    pub args: Option<serde_json::Value>,
 }
 
 /// Observe-only: read, resolve, report. Never grabs, never fires. Blocks until
@@ -204,22 +207,28 @@ pub fn run_grab(
         match value {
             // Press: resolve press AND repeat under the current modifiers in one
             // lock, fire the press verb (if any), and latch both the swallow
-            // decision and the repeat verb for this key's later edges.
+            // decision and the repeat fire for this key's later edges.
             1 => {
-                let (swallow, press_verb, repeat_verb) = {
+                let (swallow, press_fire, repeat_fire) = {
                     let resolver = resolver.lock().expect("resolver poisoned");
                     let press = resolver.resolve(code, mods, Edge::Press);
                     let repeat = resolver.resolve(code, mods, Edge::Repeat);
                     (
                         press.swallow,
-                        press.verb.map(|v| v.as_str().to_string()),
-                        repeat.verb.map(|v| v.as_str().to_string()),
+                        press.verb.map(|v| FiredVerb {
+                            verb: v.as_str().to_string(),
+                            args: press.args.clone(),
+                        }),
+                        repeat.verb.map(|v| FiredVerb {
+                            verb: v.as_str().to_string(),
+                            args: repeat.args.clone(),
+                        }),
                     )
                 };
-                if let Some(verb) = press_verb {
-                    let _ = fire_tx.send(FiredVerb { verb });
+                if let Some(fire) = press_fire {
+                    let _ = fire_tx.send(fire);
                 }
-                held.insert(code, HeldKey { swallowed: swallow, repeat_verb });
+                held.insert(code, HeldKey { swallowed: swallow, repeat_fire });
                 if !swallow {
                     uinput.emit(&buffer)?;
                 }
@@ -230,8 +239,8 @@ pub fn run_grab(
             // cannot fire a different action than the press.
             2 => match held.get(&code) {
                 Some(h) if h.swallowed => {
-                    if let Some(verb) = h.repeat_verb.as_ref() {
-                        let _ = fire_tx.send(FiredVerb { verb: verb.clone() });
+                    if let Some(fire) = h.repeat_fire.as_ref() {
+                        let _ = fire_tx.send(fire.clone());
                     }
                     // swallowed on press → swallow the repeat too (no re-emit)
                 }
@@ -259,9 +268,9 @@ pub fn run_grab(
 struct HeldKey {
     /// Whether the press was swallowed — the release/repeat follow this.
     swallowed: bool,
-    /// The verb to fire on an allowed repeat (None if the binding does not
-    /// repeat), captured at press time so a mid-hold rebind can't change it.
-    repeat_verb: Option<String>,
+    /// The fire (verb + args) for an allowed repeat (None if the binding does
+    /// not repeat), captured at press time so a mid-hold rebind can't change it.
+    repeat_fire: Option<FiredVerb>,
 }
 
 /// A minimal uinput virtual keyboard: EV_SYN + EV_KEY with every key code

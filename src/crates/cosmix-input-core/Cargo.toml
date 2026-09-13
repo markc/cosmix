@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-input-core"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,3 +12,4 @@ name = "cosmix_input_core"
 [dependencies]
 cosmix-input-schema = { path = "../cosmix-input-schema" }
 cosmix-actions = { path = "../cosmix-actions" }
+serde_json = { workspace = true }

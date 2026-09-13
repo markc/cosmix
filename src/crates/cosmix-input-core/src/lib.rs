@@ -41,6 +41,9 @@ pub enum Edge {
 pub struct Resolution {
     /// The Bus verb to fire, if any (only on a firing edge of a bound row).
     pub verb: Option<ActionId>,
+    /// The binding's arguments, delivered as the fired verb's body. Present
+    /// only when `verb` is (an args-less binding fires with an empty body).
+    pub args: Option<serde_json::Value>,
     /// When true, do NOT re-emit the original event through uinput.
     pub swallow: bool,
 }
@@ -49,6 +52,7 @@ impl Resolution {
     /// Re-emit the original event; fire nothing.
     const PASS: Self = Self {
         verb: None,
+        args: None,
         swallow: false,
     };
 }
@@ -58,6 +62,8 @@ impl Resolution {
 pub enum BindError {
     /// The action id is outside the shared grammar.
     InvalidAction,
+    /// `args` must be a JSON object (a verb's body is a map), or absent.
+    InvalidArgs,
     /// The keymap already holds this many physical rows (capacity cap).
     AtCapacity,
 }
@@ -132,12 +138,14 @@ impl Resolver {
         // A bound row swallows every edge (release-swallowing) and fires the
         // verb on the press, and on a repeat only when the policy allows it.
         let verb = match edge {
-            Edge::Press => Some(binding.action.clone()),
-            Edge::Repeat if binding.repeat == RepeatPolicy::Allow => Some(binding.action.clone()),
+            Edge::Press => Some(binding.action),
+            Edge::Repeat if binding.repeat == RepeatPolicy::Allow => Some(binding.action),
             Edge::Repeat | Edge::Release => None,
         };
+        let args = verb.as_ref().and_then(|_| binding.args.clone());
         Resolution {
             verb,
+            args,
             swallow: true,
         }
     }
@@ -158,6 +166,13 @@ impl Resolver {
     pub fn bind_physical(&mut self, binding: PhysicalBinding) -> Result<u64, BindError> {
         if !action_is_valid(&binding.action) {
             return Err(BindError::InvalidAction);
+        }
+        // Args ride as the fired verb's body, and a body is a map: refuse
+        // anything but a JSON object so every handler sees a uniform shape.
+        if let Some(args) = &binding.args
+            && !args.is_object()
+        {
+            return Err(BindError::InvalidArgs);
         }
         let existing = self
             .keymap
@@ -225,6 +240,7 @@ pub fn default_keymap() -> InputKeymap {
                 modifiers: SideModifiers::NONE,
             },
             action: user_fkey_action(index + 1),
+            args: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Ignore,
             passthrough: false,
@@ -240,6 +256,7 @@ pub fn default_keymap() -> InputKeymap {
             },
             // A passthrough row carries an inert marker action; nothing fires it.
             action: ActionId::from_static("input.passthrough"),
+            args: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Ignore,
             passthrough: true,
@@ -259,6 +276,7 @@ fn right_ctrl_arrow(code: u16, verb: &'static str) -> PhysicalBinding {
             modifiers: SideModifiers::RIGHT_CTRL,
         },
         action: ActionId::from_static(verb),
+        args: None,
         scope: BindingScope::default(),
         // Workspace navigation is incremental — allow auto-repeat.
         repeat: RepeatPolicy::Allow,
@@ -368,6 +386,7 @@ mod tests {
                     modifiers: SideModifiers::NONE,
                 },
                 action: ActionId::from_static("term.snapshot"),
+                args: None,
                 scope: BindingScope::default(),
                 repeat: RepeatPolicy::Ignore,
                 passthrough: false,
@@ -376,6 +395,49 @@ mod tests {
         assert!(g > gen0, "a rebind bumps the generation");
         let out = r.resolve(KEY_F5, SideModifiers::NONE, Edge::Press);
         assert_eq!(out.verb.as_ref().map(|a| a.as_str()), Some("term.snapshot"));
+    }
+
+    #[test]
+    fn bound_args_ride_the_firing_edges_only() {
+        let mut r = resolver();
+        r.bind_physical(PhysicalBinding {
+            stroke: PhysicalStroke {
+                code: KEY_F5,
+                modifiers: SideModifiers::NONE,
+            },
+            action: ActionId::from_static("launch.run"),
+            args: Some(serde_json::json!({"command": "kcalc"})),
+            scope: BindingScope::default(),
+            repeat: RepeatPolicy::Allow,
+            passthrough: false,
+        })
+        .expect("valid rebind");
+        let press = r.resolve(KEY_F5, SideModifiers::NONE, Edge::Press);
+        assert_eq!(press.verb.as_ref().map(|a| a.as_str()), Some("launch.run"));
+        assert_eq!(press.args, Some(serde_json::json!({"command": "kcalc"})));
+        let repeat = r.resolve(KEY_F5, SideModifiers::NONE, Edge::Repeat);
+        assert_eq!(repeat.args, press.args, "an allowed repeat carries the args too");
+        let release = r.resolve(KEY_F5, SideModifiers::NONE, Edge::Release);
+        assert_eq!(release.verb, None);
+        assert_eq!(release.args, None, "no verb, no args");
+        assert!(release.swallow);
+    }
+
+    #[test]
+    fn non_object_args_are_refused() {
+        let mut r = resolver();
+        let err = r.bind_physical(PhysicalBinding {
+            stroke: PhysicalStroke {
+                code: KEY_F5,
+                modifiers: SideModifiers::NONE,
+            },
+            action: ActionId::from_static("launch.run"),
+            args: Some(serde_json::json!("kcalc")),
+            scope: BindingScope::default(),
+            repeat: RepeatPolicy::Ignore,
+            passthrough: false,
+        });
+        assert_eq!(err, Err(BindError::InvalidArgs), "a body is a map, not a bare value");
     }
 
     #[test]

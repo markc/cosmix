@@ -1168,15 +1168,16 @@ dependencies = [
 
 [[package]]
 name = "cosmix-input-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmix-actions",
  "cosmix-input-schema",
+ "serde_json",
 ]
 
 [[package]]
 name = "cosmix-input-schema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmix-actions",
  "serde",
@@ -1185,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-inputd"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1196,6 +1197,7 @@ dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

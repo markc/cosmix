@@ -117,6 +117,12 @@ pub struct PhysicalBinding {
     pub stroke: PhysicalStroke,
     /// The Bus verb fired on press — the same id-space as the semantic layer.
     pub action: ActionId,
+    /// Optional arguments delivered as the fired verb's body — an ARexx message
+    /// is a verb PLUS arguments, and so is a binding. Must be a JSON object
+    /// (enforced at bind time) so every fired body is a map; `None` fires the
+    /// verb with an empty body, exactly as before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
     /// Focus/global scope, reused from the semantic vocabulary.
     #[serde(default)]
     pub scope: BindingScope,
@@ -266,6 +272,29 @@ mod tests {
                 modifiers: SideModifiers::RIGHT_CTRL,
             },
             action: ActionId::from_static("desktop.workspace.next"),
+            args: None,
+            scope: BindingScope::default(),
+            repeat: RepeatPolicy::default(),
+            passthrough: false,
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        // `args: None` must not appear on the wire — pre-args readers and
+        // keymap files see exactly the old shape.
+        assert!(!json.contains("args"), "None args serialized: {json}");
+        let back: PhysicalBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(binding, back);
+    }
+
+    #[test]
+    fn binding_args_round_trip_and_default_to_none() {
+        // A parameterized binding: F7 -> launch.run {"command":"kcalc"}.
+        let binding = PhysicalBinding {
+            stroke: PhysicalStroke {
+                code: 65,
+                modifiers: SideModifiers::NONE,
+            },
+            action: ActionId::from_static("launch.run"),
+            args: Some(serde_json::json!({"command": "kcalc"})),
             scope: BindingScope::default(),
             repeat: RepeatPolicy::default(),
             passthrough: false,
@@ -273,6 +302,10 @@ mod tests {
         let json = serde_json::to_string(&binding).expect("serialize");
         let back: PhysicalBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(binding, back);
+        // A pre-args wire body (no `args` key) deserializes to None.
+        let old = r#"{"stroke":{"code":65},"action":"launch.run"}"#;
+        let parsed: PhysicalBinding = serde_json::from_str(old).expect("old shape");
+        assert_eq!(parsed.args, None);
     }
 
     #[test]
@@ -283,6 +316,7 @@ mod tests {
                 modifiers: SideModifiers::NONE,
             },
             action: ActionId::from_static("user.f05"),
+            args: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::default(),
             passthrough: false,

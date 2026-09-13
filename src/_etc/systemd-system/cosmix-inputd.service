@@ -30,6 +30,15 @@ RestartSec=500ms
 # Reach noded's socket at the shared runtime path.
 Environment=COSMIX_RUN=/run/cosmix
 Environment=RUST_LOG=cosmix_inputd=info
+# Keymap persistence: daemon state lives in /var/lib, NOT the invoking user's
+# home — ProtectHome below makes $HOME unwritable, which silently broke every
+# rebind's write-through until 2026-09-13. StateDirectory both creates the dir
+# and grants it through ProtectSystem=strict. No automatic migration from the
+# old $HOME-derived path: in-service rebinds never reached it (ProtectHome),
+# though a MANUAL daemon run could have persisted custom rows there — if you
+# had one, copy its keymap.json to the path below before restarting.
+StateDirectory=cosmix/inputd
+Environment=COSMIX_INPUTD_KEYMAP=/var/lib/cosmix/inputd/keymap.json
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cosmix-inputd
