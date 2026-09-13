@@ -850,6 +850,68 @@ resident <code>--serve</code> daemon is what requires the broker to be up.</p>
 <tr><td>Provenance</td><td><code>binary: cosmix-mix</code> + <code>mix</code> version, visible in <code>noded.list</code></td></tr>
 <tr><td>Normative spec</td><td>SPEC 18 (Mix Citizen Runtime)</td></tr>
 </tbody></table>
+<h2 id="citizens-as-adapters--bridging-the-bus-to-anything">Citizens as adapters — bridging the Bus to anything</h2>
+<p>A citizen's <code>on</code> handlers don't have to <em>implement</em> a service — they can
+<strong>translate</strong>. An adapter citizen speaks the Bus on one side and some foreign
+control surface on the other, and its whole job is to map between them. This is
+the AmigaOS ARexx model in full: ARexx let a script receive a message on an
+application's port and turn it into whatever that application understood; a Mix
+citizen receives a Bus verb and turns it into a D-Bus call, a shell command, an
+HTTP request, or a <code>send</code> to another node.</p>
+<p>The shape is tiny. A KDE Plasma workspace adapter, in full:</p>
+<pre><code class="language-mix">-- desktop-workspace.mix — run: mix --serve desktop-workspace.mix --name desktop
+fn kwin(m)
+  -- qdbus6 is an external tool, not a builtin — shelling out is correct.
+  return trim(run("qdbus6 org.kde.KWin /KWin org.kde.KWin." .. m))
+end
+
+-- Multi-segment verbs must be QUOTED in `on` (a bare handler verb takes one dot).
+on "desktop.workspace.next"
+  kwin("nextDesktop")
+  reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
+end
+
+on "desktop.workspace.prev"
+  kwin("previousDesktop")
+  reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
+end
+</code></pre>
+<p>Now <code>send desktop desktop.workspace.next</code> from <strong>any</strong> process on the node
+switches the desktop. The Bus verb is the request; <code>run("qdbus6 …")</code> is the
+translation. Why this is more than a convenience:</p>
+<ul>
+<li><strong>The verb is the stable interface; the adapter is swappable.</strong> Everything
+upstream — a keybinding, an agent, another citizen — only knows the verb
+<code>desktop.workspace.next</code>. <em>How</em> it is carried out is hidden behind the adapter.
+Swap the host desktop for a compositor that answers the verb natively and the
+adapter simply retires — nothing upstream changes. The vocabulary is portable;
+the adapter absorbs the host difference.</li>
+<li><strong>It bridges to any host.</strong> The same shape wraps GNOME's D-Bus, a media player,
+<code>notify-send</code>, a REST endpoint, <code>systemctl</code>, or the tools on another mesh node.
+The Bus presents one clean verb vocabulary; a small Mix adapter per host
+translates it into that host's native language.</li>
+<li><strong>The whole glue layer is editable Mix, not compiled daemons.</strong> Because an
+adapter is a <code>--serve</code> script, you write one in minutes, <code>mix --check</code> it
+offline, and reload it without rebuilding or restarting anything else. Reserve
+compiled code for the performance- or kernel-adjacent core; make the adapters,
+launchers, and per-key actions Mix.</li>
+</ul>
+<p>Two idioms complete the pattern:</p>
+<ul>
+<li><strong>Launch things</strong> with <code>spawn(cmd)</code> (detached, via <code>/bin/sh -c</code>, returns a PID)
+or <code>run_argv(argv)</code> (foreground, an argv list). An app launcher is barely a
+file: <code>on "launch.editor" spawn("my-editor") end</code>. Run such a citizen in the
+<strong>user's</strong> session — GUI programs need the caller's <code>WAYLAND_DISPLAY</code> /
+<code>DBUS_SESSION_BUS_ADDRESS</code>, so never launch them from a root daemon; a
+root daemon should <code>send</code> the verb and let a session citizen do the launching.</li>
+<li><strong>Fan out</strong> with topics: a citizen can <code>subscribe</code> to an event topic and
+translate each delivery, so one publisher drives many adapters without knowing
+any of them — the ARexx broadcast, mesh-wide.</li>
+</ul>
+<p>The result: the Bus becomes a universal remote for the machine — and for the
+mesh — with the translation layer written in the same small language you script
+everything else in. A verb in; a real-world effect out; the bridge is a handful
+of lines of Mix.</p>
 <h2 id="see-also">See also</h2>
 <ul>
 <li><a href="/mix/bus">Bus messaging</a> — <code>send</code> / <code>emit</code> / <code>address</code> / <code>on</code> / <code>reply</code>, topic pub/sub, <code>$result</code>/<code>$rc</code>, the no-broker state machine, <code>async</code>/Class C</li>

@@ -535,6 +535,74 @@ resident `--serve` daemon is what requires the broker to be up.
 | Provenance | `binary: cosmix-mix` + `mix` version, visible in `noded.list` |
 | Normative spec | SPEC 18 (Mix Citizen Runtime) |
 
+## Citizens as adapters — bridging the Bus to anything
+
+A citizen's `on` handlers don't have to *implement* a service — they can
+**translate**. An adapter citizen speaks the Bus on one side and some foreign
+control surface on the other, and its whole job is to map between them. This is
+the AmigaOS ARexx model in full: ARexx let a script receive a message on an
+application's port and turn it into whatever that application understood; a Mix
+citizen receives a Bus verb and turns it into a D-Bus call, a shell command, an
+HTTP request, or a `send` to another node.
+
+The shape is tiny. A KDE Plasma workspace adapter, in full:
+
+```mix
+-- desktop-workspace.mix — run: mix --serve desktop-workspace.mix --name desktop
+fn kwin(m)
+  -- qdbus6 is an external tool, not a builtin — shelling out is correct.
+  return trim(run("qdbus6 org.kde.KWin /KWin org.kde.KWin." .. m))
+end
+
+-- Multi-segment verbs must be QUOTED in `on` (a bare handler verb takes one dot).
+on "desktop.workspace.next"
+  kwin("nextDesktop")
+  reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
+end
+
+on "desktop.workspace.prev"
+  kwin("previousDesktop")
+  reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
+end
+```
+
+Now `send desktop desktop.workspace.next` from **any** process on the node
+switches the desktop. The Bus verb is the request; `run("qdbus6 …")` is the
+translation. Why this is more than a convenience:
+
+- **The verb is the stable interface; the adapter is swappable.** Everything
+  upstream — a keybinding, an agent, another citizen — only knows the verb
+  `desktop.workspace.next`. *How* it is carried out is hidden behind the adapter.
+  Swap the host desktop for a compositor that answers the verb natively and the
+  adapter simply retires — nothing upstream changes. The vocabulary is portable;
+  the adapter absorbs the host difference.
+- **It bridges to any host.** The same shape wraps GNOME's D-Bus, a media player,
+  `notify-send`, a REST endpoint, `systemctl`, or the tools on another mesh node.
+  The Bus presents one clean verb vocabulary; a small Mix adapter per host
+  translates it into that host's native language.
+- **The whole glue layer is editable Mix, not compiled daemons.** Because an
+  adapter is a `--serve` script, you write one in minutes, `mix --check` it
+  offline, and reload it without rebuilding or restarting anything else. Reserve
+  compiled code for the performance- or kernel-adjacent core; make the adapters,
+  launchers, and per-key actions Mix.
+
+Two idioms complete the pattern:
+
+- **Launch things** with `spawn(cmd)` (detached, via `/bin/sh -c`, returns a PID)
+  or `run_argv(argv)` (foreground, an argv list). An app launcher is barely a
+  file: `on "launch.editor" spawn("my-editor") end`. Run such a citizen in the
+  **user's** session — GUI programs need the caller's `WAYLAND_DISPLAY` /
+  `DBUS_SESSION_BUS_ADDRESS`, so never launch them from a root daemon; a
+  root daemon should `send` the verb and let a session citizen do the launching.
+- **Fan out** with topics: a citizen can `subscribe` to an event topic and
+  translate each delivery, so one publisher drives many adapters without knowing
+  any of them — the ARexx broadcast, mesh-wide.
+
+The result: the Bus becomes a universal remote for the machine — and for the
+mesh — with the translation layer written in the same small language you script
+everything else in. A verb in; a real-world effect out; the bridge is a handful
+of lines of Mix.
+
 ## See also
 
 - [Bus messaging](bus.md) — `send` / `emit` / `address` / `on` / `reply`, topic pub/sub, `$result`/`$rc`, the no-broker state machine, `async`/Class C
