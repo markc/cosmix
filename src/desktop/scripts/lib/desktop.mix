@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.3.0. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.1. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 
@@ -335,8 +335,18 @@ fn session_config($config)
   for each $node in $mesh_nodes
     if type($node) != "string" or not re_match($node,"^[a-z][a-z0-9-]{0,23}$") then raise("DESKTOP_CONFIG","invalid mesh node") end
   end
+  -- History read grants are an explicit SUBSET of the clipboard transfer
+  -- grants: a node may read this session's history only where it may already
+  -- read its selection, and only by being named twice.
+  $mesh_history = $config.mesh_history_nodes
+  if $mesh_history == nil then $mesh_history = [] end
+  if type($mesh_history) != "list" or len($mesh_history) > 32 then raise("DESKTOP_CONFIG","invalid mesh history grants") end
+  for each $node in $mesh_history
+    if type($node) != "string" or not re_match($node,"^[a-z][a-z0-9-]{0,23}$") then raise("DESKTOP_CONFIG","invalid mesh history node") end
+    if not contains($mesh_nodes, $node) then raise("DESKTOP_CONFIG","mesh history grant without clipboard grant: " .. $node) end
+  end
   return {session:$config.session, instance:uuid(), max_bytes:65536,
-    mesh_nodes:$mesh_nodes,
+    mesh_nodes:$mesh_nodes, mesh_history_nodes:$mesh_history,
     wayland:env("WAYLAND_DISPLAY"), runtime:env("XDG_RUNTIME_DIR"),
     copy:which("wl-copy"), paste:which("wl-paste"), opener:$opener,
     history:history_state($config.history, $config.session)}
@@ -350,8 +360,19 @@ fn caller_allowed($ctx,$verb,$headers)
   if $headers.broker_origin == "local" then
     return type($headers.from) == "string" and re_match($headers.from,"^[a-z][a-z0-9-]{1,30}$")
   end
-  if $headers.broker_origin != "mesh" or not contains(["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"],$verb) then return false end
-  if type($ctx.mesh_nodes) != "list" or type($headers.broker_peer) != "string" or not contains($ctx.mesh_nodes,$headers.broker_peer) then return false end
+  if $headers.broker_origin != "mesh" then return false end
+  -- Transfer verbs ride the clipboard grants; history reads (previews and
+  -- entry fetch for pick-remote) ride the explicit history subset. Nothing
+  -- else is ever mesh-addressable.
+  $grants = []
+  if contains(["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"],$verb) then
+    $grants = $ctx.mesh_nodes
+  elif contains(["desktop.clipboard.history","desktop.clipboard.entry"],$verb) then
+    $grants = $ctx.mesh_history_nodes
+  else
+    return false
+  end
+  if type($grants) != "list" or type($headers.broker_peer) != "string" or not contains($grants,$headers.broker_peer) then return false end
   return $headers.from == "bridge-" .. $headers.broker_peer and type($headers.broker_service) == "string" and re_match($headers.broker_service,"^[a-z][a-z0-9-]{1,30}$")
 end
 
@@ -379,8 +400,10 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.0", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.1", session:$ctx.session,
       instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
+      -- history_mesh: granted peers may read history previews and entries.
+      history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
       clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8", history:history_capabilities($ctx)},
       open:{configured:is_executable($ctx.opener), schemes:["http","https"]},
       verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause","desktop.open"]}}

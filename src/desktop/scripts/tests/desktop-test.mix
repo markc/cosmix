@@ -43,6 +43,25 @@ try
   for each $verb in ["desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause"]
     check(not $d.caller_allowed($granted,$verb,$mesh),"history verb granted to mesh caller")
   end
+  -- An explicit mesh history grant (a subset of the transfer grants) opens
+  -- exactly history + entry reads — never a mutating verb.
+  $hist_granted = $d.session_config({session:"test",opener:"/usr/bin/true",mesh_clipboard_nodes:["alpha"],mesh_history_nodes:["alpha"]})
+  check($d.caller_allowed($hist_granted,"desktop.clipboard.history",$mesh),"history grant denied history read")
+  check($d.caller_allowed($hist_granted,"desktop.clipboard.entry",$mesh),"history grant denied entry read")
+  -- (write/read stay allowed for this peer via the TRANSFER grant — the
+  -- reviewed 0.2.0 push/pull feature; the loop above covers it.)
+  for each $verb in ["desktop.clipboard.capture","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause"]
+    check(not $d.caller_allowed($hist_granted,$verb,$mesh),"history grant leaked a history-mutating verb")
+  end
+  $hist_wrong_peer = {broker_origin:"mesh",from:"bridge-beta",broker_peer:"beta",broker_service:"desktopctl"}
+  check(not $d.caller_allowed($hist_granted,"desktop.clipboard.history",$hist_wrong_peer),"history grant honoured wrong peer")
+  $subset_raised = false
+  try
+    $_ = $d.session_config({session:"test",opener:"/usr/bin/true",mesh_clipboard_nodes:["alpha"],mesh_history_nodes:["beta"]})
+  catch $err
+    $subset_raised = true
+  end
+  check($subset_raised,"history grant without clipboard grant accepted")
   for each $target in ["desktop-host","desktop-host.alpha.bus","desktop-desk.beta.bus"]
     check($d.target_ok($target),"native target rejected")
   end

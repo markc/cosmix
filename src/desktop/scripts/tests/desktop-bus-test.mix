@@ -131,6 +131,15 @@ try
   $typo = cli(["clear","desktop-one","oops"])
   check(not $typo.ok,"malformed clear id accepted")
   check(json_parse(cli(["history","desktop-one"]).stdout).total == 1,"malformed clear wiped history")
+  -- Cross-session pick (the mesh picker-merge flow, both arms on this broker):
+  -- a remote history entry becomes the local selection; text stays Bus-side.
+  $watch2 = notify("data","desktop-two","remote origin text")
+  check($watch2.ok,"cross-session capture failed")
+  $rlist = json_parse(cli(["history","desktop-two"]).stdout)
+  check($rlist.total == 1,"remote history missing")
+  $rpick = cli(["rpick","desktop-two","desktop-one",to_string($rlist.entries[0].id)])
+  check($rpick.ok and json_parse($rpick.stdout).accepted == true,"rpick failed")
+  check(read_file($tmp .. "/one/clipboard") == "remote origin text","rpick did not set local selection")
   -- Provider restart: new instance UUID, history survives from disk.
   $_stop = run_argv_must(["systemctl","--user","stop",$broker .. "-one.service"])
   sleep(0.3)

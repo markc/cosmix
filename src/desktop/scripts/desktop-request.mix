@@ -48,6 +48,19 @@ elif $request.operation == "entry" then
   $reply = rpc($request.target, "desktop.clipboard.entry", {instance:$destination.instance, id:$request.id})
   if $reply.instance != $destination.instance or type($reply.text) != "string" then raise("DESKTOP_PROTOCOL", "invalid entry response") end
   print(json_encode({id:$reply.id, bytes:$reply.bytes, mime:$reply.mime}))
+elif $request.operation == "rpick" then
+  -- Pick from a (possibly remote) session's history into the local target's
+  -- live selection: entry text travels Bus-to-Bus, never stdout.
+  if not target_ok($request.source) or $request.source == $request.target then raise("DESKTOP_ARGS", "distinct source and target required") end
+  $source = rpc($request.source, "desktop.capabilities", {})
+  if $source.api_version != 1 or type($source.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported source capability response") end
+  $entry = rpc($request.source, "desktop.clipboard.entry", {instance:$source.instance, id:$request.id})
+  if $entry.instance != $source.instance or $entry.id != $request.id or type($entry.text) != "string" or byte_length($entry.text) > 65536 then
+    raise("DESKTOP_PROTOCOL", "invalid entry response")
+  end
+  $reply = rpc($request.target, "desktop.clipboard.write", {instance:$destination.instance, text:$entry.text})
+  if $reply.instance != $destination.instance or $reply.accepted != true then raise("DESKTOP_PROTOCOL", "write not accepted") end
+  print(json_encode({operation:"rpick", accepted:true, bytes:byte_length($entry.text)}))
 elif $request.operation == "pick" then
   $reply = rpc($request.target, "desktop.clipboard.pick", {instance:$destination.instance, id:$request.id})
   if $reply.instance != $destination.instance or $reply.accepted != true then raise("DESKTOP_PROTOCOL", "pick not accepted") end
