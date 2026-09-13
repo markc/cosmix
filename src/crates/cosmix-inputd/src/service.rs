@@ -6,6 +6,7 @@
 //! (the broker stamps `broker_origin: local`); remote mesh rebinds behind a
 //! mesh-trust capability are a P3 refinement. Reads (`query`) are open.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use cosmix_client::IncomingCommand;
@@ -13,18 +14,36 @@ use cosmix_input_core::Resolver;
 use cosmix_input_schema::{BindingRow, InputMode, PhysicalStroke, verbs};
 use serde_json::{Value, json};
 
+use crate::keymap_file;
+
 /// The resolver shared between the Bus service and the (optional) evdev reader.
 pub type Shared = Arc<Mutex<Resolver>>;
 
 /// Dispatch one `input.*` command to `(rc, json body)`. `rc` 0 = ok, 10 = error.
-pub fn dispatch(resolver: &Shared, cmd: &IncomingCommand) -> (u8, String) {
+/// After a mutation the keymap is persisted to `keymap_path` (if set) so a
+/// rebind is remembered across restarts.
+pub fn dispatch(
+    resolver: &Shared,
+    keymap_path: Option<&Path>,
+    cmd: &IncomingCommand,
+) -> (u8, String) {
     match cmd.command.as_str() {
         verbs::QUERY => query(resolver),
-        verbs::BIND => guard_local(cmd, || bind(resolver, &cmd.body)),
-        verbs::UNBIND => guard_local(cmd, || unbind(resolver, &cmd.body)),
+        verbs::BIND => guard_local(cmd, || bind(resolver, keymap_path, &cmd.body)),
+        verbs::UNBIND => guard_local(cmd, || unbind(resolver, keymap_path, &cmd.body)),
         verbs::MODE => guard_local(cmd, || mode(resolver, &cmd.body)),
-        verbs::RELOAD => guard_local(cmd, || reload(resolver)),
+        verbs::RELOAD => guard_local(cmd, || reload(resolver, keymap_path)),
         other => error(&format!("unknown input verb: {other}")),
+    }
+}
+
+/// Persist the current physical rows to the keymap file, logging on failure. A
+/// save failure does not fail the verb — the in-memory rebind still took.
+fn persist(resolver: &Shared, keymap_path: Option<&Path>) {
+    let Some(path) = keymap_path else { return };
+    let rows = resolver.lock().expect("resolver poisoned").physical_rows().to_vec();
+    if let Err(error) = keymap_file::save(path, &rows) {
+        eprintln!("cosmix-inputd: keymap save to {} failed: {error}", path.display());
     }
 }
 
@@ -54,7 +73,7 @@ fn query(resolver: &Shared) -> (u8, String) {
     (0, body.to_string())
 }
 
-fn bind(resolver: &Shared, body: &str) -> (u8, String) {
+fn bind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, String) {
     let row: BindingRow = match serde_json::from_str(body) {
         Ok(row) => row,
         Err(err) => return error(&format!("invalid binding row: {err}")),
@@ -65,22 +84,31 @@ fn bind(resolver: &Shared, body: &str) -> (u8, String) {
             return error("semantic (keysym) rows are not yet resolved; use a physical row");
         }
     };
-    let mut resolver = resolver.lock().expect("resolver poisoned");
-    match resolver.bind_physical(binding) {
-        Ok(generation) => (0, json!({ "ok": true, "generation": generation }).to_string()),
+    let result = resolver.lock().expect("resolver poisoned").bind_physical(binding);
+    match result {
+        Ok(generation) => {
+            persist(resolver, keymap_path);
+            (0, json!({ "ok": true, "generation": generation }).to_string())
+        }
         Err(err) => error(&format!("rebind refused: {err:?}")),
     }
 }
 
-fn unbind(resolver: &Shared, body: &str) -> (u8, String) {
+fn unbind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, String) {
     let stroke: PhysicalStroke = match serde_json::from_str(body) {
         Ok(stroke) => stroke,
         Err(err) => return error(&format!("invalid stroke: {err}")),
     };
-    let mut resolver = resolver.lock().expect("resolver poisoned");
-    match resolver.unbind_physical(&stroke) {
-        Some(generation) => (0, json!({ "ok": true, "generation": generation }).to_string()),
-        None => (0, json!({ "ok": true, "generation": resolver.generation(), "removed": false }).to_string()),
+    let removed = resolver.lock().expect("resolver poisoned").unbind_physical(&stroke);
+    match removed {
+        Some(generation) => {
+            persist(resolver, keymap_path);
+            (0, json!({ "ok": true, "generation": generation }).to_string())
+        }
+        None => {
+            let generation = resolver.lock().expect("resolver poisoned").generation();
+            (0, json!({ "ok": true, "generation": generation, "removed": false }).to_string())
+        }
     }
 }
 
@@ -109,16 +137,18 @@ fn mode(resolver: &Shared, body: &str) -> (u8, String) {
     (0, json!({ "mode": next, "generation": generation }).to_string())
 }
 
-fn reload(resolver: &Shared) -> (u8, String) {
-    // Write-through + file reload land with the .mix persistence (P3). For now a
-    // reload is a no-op ack over the in-memory keymap so the verb contract is
-    // stable for callers.
-    let resolver = resolver.lock().expect("resolver poisoned");
-    (
-        0,
-        json!({ "ok": true, "generation": resolver.generation(), "note": "in-memory keymap; file persistence is P3" })
-            .to_string(),
-    )
+fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
+    let Some(path) = keymap_path else {
+        let generation = resolver.lock().expect("resolver poisoned").generation();
+        return (0, json!({ "ok": true, "generation": generation, "note": "no keymap file configured" }).to_string());
+    };
+    match keymap_file::load(path) {
+        Some(rows) => {
+            let generation = resolver.lock().expect("resolver poisoned").replace_physical(rows);
+            (0, json!({ "ok": true, "generation": generation }).to_string())
+        }
+        None => error(&format!("keymap file {} could not be read", path.display())),
+    }
 }
 
 fn error(message: &str) -> (u8, String) {

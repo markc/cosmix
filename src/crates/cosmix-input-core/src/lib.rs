@@ -177,6 +177,14 @@ impl Resolver {
         Ok(self.generation)
     }
 
+    /// Replace all physical rows (a keymap file reload). Keeps the current mode;
+    /// bumps the generation so callers see the change.
+    pub fn replace_physical(&mut self, rows: Vec<PhysicalBinding>) -> u64 {
+        self.keymap.physical = rows;
+        self.generation += 1;
+        self.generation
+    }
+
     /// Remove the physical row on a stroke, if any. Returns the new generation
     /// when a row was removed.
     pub fn unbind_physical(&mut self, stroke: &PhysicalStroke) -> Option<u64> {
