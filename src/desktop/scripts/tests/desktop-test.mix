@@ -1,71 +1,211 @@
 -- Deterministic production validation/response tests; no clipboard or browser.
 $d = require("../lib/desktop.mix")
-$ctx = {session:"test",instance:"instance-one",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true"}
+$tmp = trim(run_argv_must(["mktemp","-d","/tmp/cosmix-desktop-lib-test.XXXXXXXX"]))
+export XDG_STATE_HOME = $tmp
 $headers = {broker_origin:"local",from:"desktopctl-test"}
 fn check($condition, $message)
   if not $condition then raise("DESKTOP_TEST", $message) end
 end
-$configured = $d.session_config({session:"test",opener:"/usr/bin/true"})
-check(type($configured) == "map" and $configured.session == "test" and type($configured.instance) == "string","session configuration failed")
-$granted = $d.session_config({session:"test",opener:"/usr/bin/true",mesh_clipboard_nodes:["alpha"]})
-$mesh = {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha",broker_service:"desktopctl"}
-for each $verb in ["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"]
-  check($d.caller_allowed($granted,$verb,$mesh),"granted direct mesh caller denied")
-  check(not $d.caller_allowed($configured,$verb,$mesh),"default mesh grant")
-  for each $bad in [{broker_origin:"mesh",from:"bridge-alpha"},
-    {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha"},
-    {broker_origin:"mesh",from:"bridge-beta",broker_peer:"beta",broker_service:"desktopctl"},
-    {broker_origin:"mesh",from:"bridge-beta",broker_peer:"alpha",broker_service:"desktopctl"},
-    {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha",broker_service:"nested.alpha.bus"}]
-    check(not $d.caller_allowed($granted,$verb,$bad),"unverified mesh caller granted")
+fn ctx_of($plan, $ctx)
+  return $plan.context == nil ? $ctx : $plan.context
+end
+try
+  $configured = $d.session_config({session:"test",opener:"/usr/bin/true"})
+  check(type($configured) == "map" and $configured.session == "test" and type($configured.instance) == "string","session configuration failed")
+  check(starts_with($configured.history.path, $tmp),"history default path escaped the test state root")
+  check($configured.history.depth == 100 and $configured.history.cap_bytes == 65536 and $configured.history.budget_bytes == 4194304,"history defaults wrong")
+  for each $bad in [{depth:0},{depth:1001},{cap_bytes:0},{cap_bytes:65537},{budget_bytes:65535},{budget_bytes:67108865},{path:"relative"}]
+    $raised = false
+    try
+      $_ = $d.history_state($bad, "test")
+    catch $err
+      $raised = true
+    end
+    check($raised,"history config bound accepted: " .. json_encode($bad))
+  end
+  $ctx = {session:"test",instance:"instance-one",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true",
+    history:$d.history_state({path:$tmp .. "/history.json"}, "test")}
+  $granted = $d.session_config({session:"test",opener:"/usr/bin/true",mesh_clipboard_nodes:["alpha"]})
+  $mesh = {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha",broker_service:"desktopctl"}
+  for each $verb in ["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"]
+    check($d.caller_allowed($granted,$verb,$mesh),"granted direct mesh caller denied")
+    check(not $d.caller_allowed($configured,$verb,$mesh),"default mesh grant")
+    for each $bad in [{broker_origin:"mesh",from:"bridge-alpha"},
+      {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha"},
+      {broker_origin:"mesh",from:"bridge-beta",broker_peer:"beta",broker_service:"desktopctl"},
+      {broker_origin:"mesh",from:"bridge-beta",broker_peer:"alpha",broker_service:"desktopctl"},
+      {broker_origin:"mesh",from:"bridge-alpha",broker_peer:"alpha",broker_service:"nested.alpha.bus"}]
+      check(not $d.caller_allowed($granted,$verb,$bad),"unverified mesh caller granted")
+    end
+  end
+  check(not $d.caller_allowed($granted,"desktop.open",$mesh),"clipboard grant allowed remote open")
+  -- The history verbs are local-only: a granted mesh caller is refused each one.
+  for each $verb in ["desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause"]
+    check(not $d.caller_allowed($granted,$verb,$mesh),"history verb granted to mesh caller")
+  end
+  for each $target in ["desktop-host","desktop-host.alpha.bus","desktop-desk.beta.bus"]
+    check($d.target_ok($target),"native target rejected")
+  end
+  for each $target in ["desktop@alpha","desktop.alpha.other.bus","desktop.alpha.bus@elsewhere","a","desktop.alpha.bus/path"]
+    check(not $d.target_ok($target),"non-native target accepted")
+  end
+  for each $i in range(1,100)
+    $name = $d.client_name()
+    check(byte_length($name) <= 31 and re_match($name,"^[a-z][a-z0-9-]{1,30}$"),"client name rejected by current noded")
+  end
+  for each $verb in ["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.open","desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause"]
+    for each $bad in [{},{from:"desktopctl-test"},{broker_origin:"mesh",from:"desktopctl-test"},{broker_origin:"local"},{broker_origin:"local",from:"fake.remote.bus"}]
+      check($d.prepare($ctx,$verb,$bad,{},2).rc == 13,"untrusted caller accepted")
+    end
+  end
+  check($d.prepare($ctx,"desktop.capabilities",$headers,{},2).body.instance == $ctx.instance,"missing instance")
+  for each $bad in [nil,[],"text",{unknown:true}]
+    check($d.prepare($ctx,"desktop.capabilities",$headers,$bad,2).rc == 10,"invalid capability request")
+  end
+  check($d.prepare($ctx,"desktop.capabilities",$headers,{},400001).rc == 10,"oversize envelope")
+  $caps = $d.prepare($ctx,"desktop.capabilities",$headers,{},2).body
+  check(len($caps.verbs) == 10 and contains($caps.verbs,"desktop.clipboard.pick"),"capabilities verb list incomplete")
+  check($caps.clipboard.history.persistence == "ok" and $caps.clipboard.history.topic == "desktop.clipboard.changed","history capabilities block wrong")
+  check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:"old"},2).rc == 12,"stale instance accepted")
+  check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:$ctx.instance,path:"/etc/passwd"},2).rc == 10,"injected field accepted")
+  for each $text in ["", "  café\n\n", repeat("é",32768)]
+    $plan = $d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100)
+    check($plan.action == "write" and $plan.options.stdin == $text,"text modified")
+    check(len($plan.argv) == 3 and $plan.options.stdout == "null" and $plan.options.stderr == "null","text leaked to argv/output")
+  end
+  for each $text in [repeat("é",32769),json_parse("\"\\u0000\""),{},42]
+    check($d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100).rc == 10,"invalid text accepted")
+  end
+  for each $url in ["https://example.org/a?x=1&y=2", "http://localhost:1234/callback", "https://example.org/$(literal)"]
+    $plan = $d.prepare($ctx,"desktop.open",$headers,{instance:$ctx.instance,url:$url},100)
+    check($plan.action == "open" and deep_eq($plan.argv,[$ctx.opener,$url]),"URL argv not preserved")
+  end
+  for each $url in ["file:///tmp/a","javascript:alert(1)","--help","https://","https:///oops","https://x/\n",repeat("x",8193),nil]
+    check($d.prepare($ctx,"desktop.open",$headers,{instance:$ctx.instance,url:$url},100).rc == 10,"unsafe URL accepted")
+  end
+  $plan = {action:"read"}
+  $result = {ok:true,stdout:"  café\n\n",stdout_truncated:false,utf8_lossy:false}
+  check($d.finish($ctx,$plan,$result).body.text == $result.stdout,"read whitespace lost")
+  $result.stdout_truncated = true
+  check($d.finish($ctx,$plan,$result).rc == 10,"truncated clipboard accepted")
+  $result.stdout_truncated = false
+  $result.utf8_lossy = true
+  check($d.finish($ctx,$plan,$result).rc == 10,"lossy clipboard accepted")
+  check($d.finish($ctx,{action:"open"},{ok:false,timed_out:true}).body.error == "ACTION_OUTCOME_UNKNOWN","ambiguous timeout called success")
+  check($d.finish($ctx,{action:"write"},{ok:false,timed_out:false}).rc == 11,"failed write called success")
+
+  -- ── History: capture, dedupe, caps, pause ────────────────────────────
+  $bad = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{},2)
+  check($bad.rc == 10,"capture without text accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"a",extra:1},2)
+  check($bad.rc == 10,"capture with extra field accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:nil},2)
+  check($bad.rc == 10,"capture with nil text accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:json_parse("\"\\u0000\"")},2)
+  check($bad.rc == 10,"capture with NUL accepted")
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"first entry"},2)
+  check($plan.rc == 0 and $plan.body.stored == true and $plan.body.id == 1 and $plan.body.persisted == true,"first capture failed")
+  check(exists($tmp .. "/history.json"),"history file not created")
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"first entry"},2)
+  check($plan.body.stored == false and $plan.body.reason == "duplicate" and $plan.context == nil,"front duplicate was not a no-op")
+  $ctx = ctx_of($plan, $ctx)
+  $rev_after_dup = $ctx.history.revision
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"second entry"},2)
+  check($plan.body.stored == true and $plan.body.id == 2,"second capture failed")
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"first entry"},2)
+  check($plan.body.stored == true and $plan.body.duplicate == true and $plan.body.id == 1,"global dedupe move-to-front failed")
+  $ctx = ctx_of($plan, $ctx)
+  check($ctx.history.entries[0].id == 1 and $ctx.history.entries[1].id == 2 and len($ctx.history.entries) == 2,"dedupe kept a stale copy")
+  check($ctx.history.revision == $rev_after_dup + 2,"dedupe move did not bump revision")
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:repeat("x",65600)},70000)
+  check($plan.body.stored == false and $plan.body.reason == "oversize" and $plan.body.skipped == 1,"oversize capture not counted as skipped")
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.pause",$headers,{instance:$ctx.instance,on:true},2)
+  check($plan.body.paused == true,"pause not acknowledged")
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"while paused"},2)
+  check($plan.body.stored == false and $plan.body.reason == "paused" and $plan.context == nil,"paused capture stored")
+  $plan = $d.prepare($ctx,"desktop.clipboard.pause",$headers,{instance:$ctx.instance,on:false},2)
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"multi\nline\ttext"},2)
+  check($plan.body.stored == true,"capture after resume failed")
+  $ctx = ctx_of($plan, $ctx)
+
+  -- ── History: listing, filtering, entry fetch ──────────────────────────
+  $bad = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:"old"},2)
+  check($bad.rc == 12,"history stale instance accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance,q:nil},2)
+  check($bad.rc == 10,"explicit nil q accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance,limit:0},2)
+  check($bad.rc == 10,"limit 0 accepted")
+  $bad = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance,offset:-1},2)
+  check($bad.rc == 10,"negative offset accepted")
+  $list = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance},2).body
+  check($list.total == 3 and len($list.entries) == 3,"history listing count wrong")
+  check($list.entries[0].id == 3 and $list.entries[0].preview == "multi⏎line␉text","preview normalisation wrong")
+  check($list.entries[1].id == 1,"newest-first order wrong")
+  $filtered = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance,q:"second"},2).body
+  check($filtered.total == 1 and $filtered.entries[0].id == 2,"server-side filter wrong")
+  $paged = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance,offset:1,limit:1},2).body
+  check($paged.total == 3 and len($paged.entries) == 1 and $paged.entries[0].id == 1,"pagination wrong")
+  for each $row in $list.entries
+    check($d.keys_are($row, ["id","bytes","at","preview"]),"history listing entry carries extra fields")
+  end
+  $one = $d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:2},2).body
+  check($one.text == "second entry" and $one.mime == "text/plain;charset=utf-8","entry fetch wrong")
+  check($d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:99},2).rc == 14,"missing entry not 14")
+  check($d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:"2"},2).rc == 10,"string id accepted")
+
+  -- ── History: pick (helper first, commit in finish) ────────────────────
+  $plan = $d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:2},2)
+  check($plan.action == "clipboard_pick" and $plan.entry_index == 2 and $plan.argv[0] == $ctx.copy,"pick plan wrong")
+  check($plan.options.stdin == "second entry","pick stdin not the entry text")
+  $bad_finish = $d.finish($ctx,$plan,{ok:false,timed_out:true})
+  check($bad_finish.rc == 20,"pick timeout called success")
+  $bad_finish = $d.finish($ctx,$plan,{ok:false,timed_out:false})
+  check($bad_finish.rc == 11,"pick failure called success")
+  $done = $d.finish($ctx,$plan,{ok:true})
+  check($done.body.accepted == true and $done.body.id == 2 and $done.context != nil,"pick finish wrong")
+  $ctx = $done.context
+  check($ctx.history.entries[0].id == 2,"pick did not move entry to front")
+  $plan = $d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:2},2)
+  $done = $d.finish($ctx,$plan,{ok:true})
+  check($done.body.accepted == true and $done.context == nil,"front pick mutated state")
+  check($d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:99},2).rc == 14,"pick missing entry not 14")
+
+  -- ── History: clear ────────────────────────────────────────────────────
+  $plan = $d.prepare($ctx,"desktop.clipboard.clear",$headers,{instance:$ctx.instance,id:3},2)
+  check($plan.body.removed == 1 and $plan.context != nil,"clear one failed")
+  $ctx = ctx_of($plan, $ctx)
+  check(len($ctx.history.entries) == 2 and $ctx.history.next_id == 4,"clear left wrong state or reset ids")
+  $plan = $d.prepare($ctx,"desktop.clipboard.clear",$headers,{instance:$ctx.instance,id:99},2)
+  check($plan.rc == 14,"clear missing entry not 14")
+  $plan = $d.prepare($ctx,"desktop.clipboard.clear",$headers,{instance:$ctx.instance},2)
+  check($plan.body.removed == 2 and $plan.context != nil,"clear all failed")
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.clear",$headers,{instance:$ctx.instance},2)
+  check($plan.body.removed == 0 and $plan.context == nil,"clear on empty mutated")
+
+  -- ── Persistence: reload, quarantine, newer schema ─────────────────────
+  $reloaded = $d.history_state({path:$tmp .. "/history.json"}, "test")
+  check($reloaded.degraded == "" and $reloaded.paused == false and $reloaded.next_id == 4 and $reloaded.skipped == 1,"reload lost state")
+  write_file($tmp .. "/history.json", "{not json")
+  $quarantined = $d.history_state({path:$tmp .. "/history.json"}, "test")
+  check($quarantined.degraded == "" and len($quarantined.entries) == 0,"corrupt history not quarantined")
+  check(len(glob($tmp .. "/history.json.corrupt-*")) > 0,"quarantine copy missing")
+  write_file($tmp .. "/history.json", json_encode({schema_version:2, next_id:9, revision:0, skipped:0, paused:false, entries:[]}))
+  $newer = $d.history_state({path:$tmp .. "/history.json"}, "test")
+  check($newer.degraded == "schema-newer","newer schema not preserved")
+  check(json_parse(read_file($tmp .. "/history.json")).schema_version == 2,"newer schema overwritten")
+  write_file($tmp .. "/history.json", json_encode({schema_version:1, next_id:1, revision:0, skipped:0, paused:false,
+    entries:[{id:5, text:"bad order", bytes:9, at:1.0},{id:7, text:"worse", bytes:5, at:1.0}]}))
+  $badorder = $d.history_state({path:$tmp .. "/history.json"}, "test")
+  check($badorder.degraded == "" and len($badorder.entries) == 0,"non-descending ids not quarantined")
+  print("PASS desktop caller gates, schema, session identity, text limits, argv, redaction, outcome checks, history capture/dedupe/caps/pause, listing/filter/pagination, entry/pick/clear, persistence and quarantine")
+finally
+  if starts_with($tmp,"/tmp/cosmix-desktop-lib-test.") then
+    $_remove = run_argv_must(["rm","-rf","--",$tmp])
   end
 end
-check(not $d.caller_allowed($granted,"desktop.open",$mesh),"clipboard grant allowed remote open")
-for each $target in ["desktop-host","desktop-host.alpha.bus","desktop-desk.beta.bus"]
-  check($d.target_ok($target),"native target rejected")
-end
-for each $target in ["desktop@alpha","desktop.alpha.other.bus","desktop.alpha.bus@elsewhere","a","desktop.alpha.bus/path"]
-  check(not $d.target_ok($target),"non-native target accepted")
-end
-for each $i in range(1,100)
-  $name = $d.client_name()
-  check(byte_length($name) <= 31 and re_match($name,"^[a-z][a-z0-9-]{1,30}$"),"client name rejected by current noded")
-end
-for each $verb in ["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.open"]
-  for each $bad in [{},{from:"desktopctl-test"},{broker_origin:"mesh",from:"desktopctl-test"},{broker_origin:"local"},{broker_origin:"local",from:"fake.remote.bus"}]
-    check($d.prepare($ctx,$verb,$bad,{},2).rc == 13,"untrusted caller accepted")
-  end
-end
-check($d.prepare($ctx,"desktop.capabilities",$headers,{},2).body.instance == $ctx.instance,"missing instance")
-for each $bad in [nil,[],"text",{unknown:true}]
-  check($d.prepare($ctx,"desktop.capabilities",$headers,$bad,2).rc == 10,"invalid capability request")
-end
-check($d.prepare($ctx,"desktop.capabilities",$headers,{},400001).rc == 10,"oversize envelope")
-check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:"old"},2).rc == 12,"stale instance accepted")
-check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:$ctx.instance,path:"/etc/passwd"},2).rc == 10,"injected field accepted")
-for each $text in ["", "  café\n\n", repeat("é",32768)]
-  $plan = $d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100)
-  check($plan.action == "write" and $plan.options.stdin == $text,"text modified")
-  check(len($plan.argv) == 3 and $plan.options.stdout == "null" and $plan.options.stderr == "null","text leaked to argv/output")
-end
-for each $text in [repeat("é",32769),json_parse("\"\\u0000\""),{},42]
-  check($d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100).rc == 10,"invalid text accepted")
-end
-for each $url in ["https://example.org/a?x=1&y=2", "http://localhost:1234/callback", "https://example.org/$(literal)"]
-  $plan = $d.prepare($ctx,"desktop.open",$headers,{instance:$ctx.instance,url:$url},100)
-  check($plan.action == "open" and deep_eq($plan.argv,[$ctx.opener,$url]),"URL argv not preserved")
-end
-for each $url in ["file:///tmp/a","javascript:alert(1)","--help","https://","https:///oops","https://x/\n",repeat("x",8193),nil]
-  check($d.prepare($ctx,"desktop.open",$headers,{instance:$ctx.instance,url:$url},100).rc == 10,"unsafe URL accepted")
-end
-$plan = {action:"read"}
-$result = {ok:true,stdout:"  café\n\n",stdout_truncated:false,utf8_lossy:false}
-check($d.finish($ctx,$plan,$result).body.text == $result.stdout,"read whitespace lost")
-$result.stdout_truncated = true
-check($d.finish($ctx,$plan,$result).rc == 10,"truncated clipboard accepted")
-$result.stdout_truncated = false
-$result.utf8_lossy = true
-check($d.finish($ctx,$plan,$result).rc == 10,"lossy clipboard accepted")
-check($d.finish($ctx,{action:"open"},{ok:false,timed_out:true}).body.error == "ACTION_OUTCOME_UNKNOWN","ambiguous timeout called success")
-check($d.finish($ctx,{action:"write"},{ok:false,timed_out:false}).rc == 11,"failed write called success")
-print("PASS desktop caller gates, schema, session identity, text limits, argv, redaction and outcome checks")

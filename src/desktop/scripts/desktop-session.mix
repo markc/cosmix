@@ -5,26 +5,67 @@ $config_path = env("DESKTOP_SESSION_CONFIG")
 if $config_path == "" then raise("DESKTOP_CONFIG", "DESKTOP_SESSION_CONFIG is required") end
 $session_context = $desktop.session_config(load_data($config_path))
 
-fn respond()
+fn respond($event)
+  -- Returns {rc, body, context?}; each handler rebinds $session_context from
+  -- it so committed history mutations survive across events (plain handlers
+  -- are serialised, so there is no interleaving to guard against).
   $plan = $desktop.prepare($session_context, $event.command, $event.headers, $event.args, byte_length($event.body))
   if $plan.action == nil then
-    reply($plan.rc, json_encode($plan.body))
-  else
-    $result = run_argv($plan.argv, $plan.options)
-    $response = $desktop.finish($session_context, $plan, $result)
-    reply($response.rc, json_encode($response.body))
+    return {rc:$plan.rc, body:$plan.body, context:$plan.context}
   end
+  $result = run_argv($plan.argv, $plan.options)
+  $finish_ctx = $plan.context == nil ? $session_context : $plan.context
+  $response = $desktop.finish($finish_ctx, $plan, $result)
+  return {rc:$response.rc, body:$response.body, context:$response.context}
 end
 
-on desktop.capabilities
-  respond()
+on desktop.capabilities desc "report this session's instance, limits and verbs"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
 end
-on desktop.clipboard.read
-  respond()
+on desktop.clipboard.read desc "return the session selection as UTF-8 text"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
 end
-on desktop.clipboard.write
-  respond()
+on desktop.clipboard.write desc "replace the session selection with UTF-8 text"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
 end
-on desktop.open
-  respond()
+on desktop.clipboard.capture desc "record observed clipboard text into history (watcher path)"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.clipboard.history desc "list history entries (previews, optional server-side filter)"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.clipboard.entry desc "return one history entry's full text"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.clipboard.pick desc "make a history entry the live selection"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.clipboard.clear desc "delete one history entry (id) or all history"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.clipboard.pause desc "suspend or resume history capture"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
+end
+on desktop.open desc "open an HTTP(S) URL with the configured opener"
+  $r = respond($event)
+  if $r.context != nil then $session_context = $r.context end
+  reply($r.rc, json_encode($r.body))
 end

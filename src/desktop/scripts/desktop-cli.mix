@@ -1,5 +1,7 @@
 -- Explicit Bus operations. Clipboard content is never printed or stored here.
 -- usage: mix desktop-cli.mix capabilities TARGET | copy SOURCE TARGET | open TARGET URL
+--        mix desktop-cli.mix history TARGET [QUERY] | entry TARGET ID
+--        mix desktop-cli.mix pick TARGET ID | clear TARGET [ID] | pause TARGET on|off
 $a = args()
 $request = {}
 if len($a) == 2 and $a[0] == "capabilities" then
@@ -8,8 +10,21 @@ elif len($a) == 3 and $a[0] == "copy" then
   $request = {operation:"copy", source:$a[1], target:$a[2]}
 elif len($a) == 3 and $a[0] == "open" then
   $request = {operation:"open", target:$a[1], url:$a[2]}
+elif len($a) >= 2 and $a[0] == "history" then
+  $request = {operation:"history", target:$a[1]}
+  if len($a) == 3 then $request.q = $a[2] end
+elif len($a) == 3 and $a[0] == "entry" then
+  $request = {operation:"entry", target:$a[1], id:to_number($a[2])}
+elif len($a) == 3 and $a[0] == "pick" then
+  $request = {operation:"pick", target:$a[1], id:to_number($a[2])}
+elif len($a) >= 2 and $a[0] == "clear" then
+  $request = {operation:"clear", target:$a[1]}
+  if len($a) == 3 then $request.id = to_number($a[2]) end
+elif len($a) == 3 and $a[0] == "pause" then
+  if not contains(["on","off"], $a[2]) then raise("DESKTOP_ARGS", "pause TARGET on|off") end
+  $request = {operation:"pause", target:$a[1], on:$a[2] == "on"}
 else
-  raise("DESKTOP_ARGS", "capabilities TARGET | copy SOURCE TARGET | open TARGET URL")
+  raise("DESKTOP_ARGS", "capabilities TARGET | copy SOURCE TARGET | open TARGET URL | history TARGET [QUERY] | entry TARGET ID | pick TARGET ID | clear TARGET [ID] | pause TARGET on|off")
 end
 -- A one-shot registered citizen avoids anonymous calls and deregisters on quit.
 $worker = env("DESKTOP_REQUEST_WORKER")

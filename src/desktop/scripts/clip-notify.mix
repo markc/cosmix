@@ -1,0 +1,33 @@
+-- clip-notify — the wl-paste --watch child. Runs per selection change with
+-- the selection bytes on stdin and CLIPBOARD_STATE in the environment
+-- (data / nil / clear / sensitive per wl-clipboard(1)).
+--
+-- It deliberately has NO Bus identity: it never talks to the Bus itself. It
+-- reads the bytes and launches the registered one-shot deliverer
+-- (clip-watch.mix) with the text on THAT child's stdin. Clipboard text never
+-- appears in any argv or environment variable.
+--
+-- Capture happens only for CLIPBOARD_STATE=data: nil/clear carry nothing, and
+-- sensitive selections (password managers, wl-copy --sensitive) are honoured
+-- by never being submitted to history at all.
+$state = env("CLIPBOARD_STATE")
+if $state != "data" then exit(0) end
+$target = env("DESKTOP_WATCH_TARGET")
+if $target == "" then exit(2) end
+$bytes = read_stdin_bytes(65537)
+if len($bytes) > 65536 then exit(3) end
+try
+  $text = bytes_to_string($bytes)
+catch $err
+  -- Not valid UTF-8 text/plain; not history material.
+  exit(4)
+end
+$mix = "/proc/" .. to_string(pid()) .. "/exe"
+$worker = env("DESKTOP_WATCH_WORKER")
+if $worker == "" then $worker = "/opt/cosmix/share/desktop/clip-watch.mix" end
+-- Per-event unique registration name: concurrent selection changes spawn
+-- concurrent children, and a fixed name would collide at registration.
+$name = "clipwatch-" .. slice(replace(uuid(),"-",""),0,12)
+$result = run_argv([$mix,"--serve",$worker,"--name",$name],
+  {timeout:10, env:{DESKTOP_WATCH_TARGET:$target}, stdin:$text, stdout:"null", stderr:"null"})
+exit($result.ok ? 0 : 5)

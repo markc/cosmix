@@ -1,6 +1,7 @@
--- Desktop Bus capability provider v0.2.0. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.0. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
+
 fn error($code, $status)
   return {rc:$status, body:{error:$code}}
 end
@@ -9,6 +10,291 @@ fn client_name()
   -- 80 random bits, within noded's 31-character service-name limit.
   return "desktopctl-" .. slice(replace(uuid(),"-",""),0,20)
 end
+
+fn is_int($v)
+  return type($v) == "number" and $v == floor($v)
+end
+
+fn keys_are($body, $expected)
+  if type($body) != "map" or len(keys($body)) != len($expected) then return false end
+  for each $key in keys($body)
+    if not contains($expected, $key) then return false end
+  end
+  return true
+end
+
+fn keys_subset($body, $required, $optional)
+  -- Exact-set membership like keys_are, but with optional keys; an explicitly
+  -- nil-valued key is rejected so absent and present-but-nil stay distinct.
+  if type($body) != "map" then return false end
+  for each $key in keys($body)
+    if not contains($required, $key) and not contains($optional, $key) then return false end
+    if $body[$key] == nil then return false end
+  end
+  for each $key in $required
+    if not contains(keys($body), $key) then return false end
+  end
+  return true
+end
+
+fn list_remove($list, $idx)
+  $out = []
+  for each $i in range(0, len($list) - 1)
+    if $i != $idx then $out = concat($out, [$list[$i]]) end
+  end
+  return $out
+end
+
+fn list_page($list, $offset, $limit)
+  $out = []
+  for each $i in range(0, len($list) - 1)
+    if $i >= $offset and len($out) < $limit then $out = concat($out, [$list[$i]]) end
+  end
+  return $out
+end
+
+fn merge_maps($a, $b)
+  $out = {}
+  for each $key in keys($a)
+    $out[$key] = $a[$key]
+  end
+  for each $key in keys($b)
+    $out[$key] = $b[$key]
+  end
+  return $out
+end
+
+-- ── Clipboard history state ─────────────────────────────────────────────
+-- One history per session provider, persisted as JSON under $XDG_STATE_HOME
+-- (fallback ~/.local/state). Atomic replacement via write_new + rename; no
+-- fsync builtin exists yet, so persistence is atomic, not power-loss durable.
+
+fn history_used($entries)
+  $total = 0
+  for each $entry in $entries
+    $total = $total + $entry.bytes
+  end
+  return $total
+end
+
+fn history_quarantine($path, $h, $reason)
+  -- Move a corrupt store aside and start empty. A quarantine that fails
+  -- leaves degraded mode set: the file is never overwritten from a bad read.
+  try
+    rename($path, $path .. ".corrupt-" .. slice(replace(uuid(),"-",""),0,8))
+  catch $err
+    $h.degraded = "quarantine-failed"
+  end
+  $h.entries = []
+  $h.next_id = 1
+  $h.revision = 0
+  $h.skipped = 0
+  $h.used = 0
+  return $h
+end
+
+fn history_entries_valid($entries, $cap_bytes)
+  if type($entries) != "list" then return false end
+  $last_id = nil
+  for each $entry in $entries
+    if not keys_are($entry, ["id","text","bytes","at"]) then return false end
+    if not is_int($entry.id) or $entry.id < 1 then return false end
+    if type($entry.text) != "string" or contains($entry.text, $_nul) then return false end
+    if byte_length($entry.text) > $cap_bytes then return false end
+    if $entry.bytes != byte_length($entry.text) then return false end
+    if type($entry.at) != "number" then return false end
+    if $last_id != nil and $entry.id >= $last_id then return false end
+    $last_id = $entry.id
+  end
+  return true
+end
+
+fn history_load($h)
+  if not exists($h.path) then return $h end
+  try
+    $content = read_file($h.path)
+  catch $err
+    $h.degraded = "load-error"
+    return $h
+  end
+  try
+    $parsed = json_parse($content)
+  catch $err
+    return history_quarantine($h.path, $h, "parse")
+  end
+  if type($parsed) != "map" or not is_int($parsed.schema_version) then
+    return history_quarantine($h.path, $h, "schema")
+  end
+  if $parsed.schema_version > 1 then
+    -- A newer schema is preserved untouched, never overwritten.
+    $h.degraded = "schema-newer"
+    return $h
+  end
+  if not is_int($parsed.next_id) or $parsed.next_id < 1 then
+    return history_quarantine($h.path, $h, "next-id")
+  end
+  if not is_int($parsed.skipped) or $parsed.skipped < 0 then
+    return history_quarantine($h.path, $h, "skipped")
+  end
+  if not is_int($parsed.revision) or $parsed.revision < 0 then
+    return history_quarantine($h.path, $h, "revision")
+  end
+  if type($parsed.paused) != "bool" then
+    return history_quarantine($h.path, $h, "paused")
+  end
+  if not history_entries_valid($parsed.entries, $h.cap_bytes) then
+    return history_quarantine($h.path, $h, "entries")
+  end
+  if len($parsed.entries) > 0 and $parsed.next_id <= $parsed.entries[0].id then
+    return history_quarantine($h.path, $h, "next-id")
+  end
+  $h.entries = $parsed.entries
+  $h.next_id = $parsed.next_id
+  $h.skipped = $parsed.skipped
+  $h.revision = $parsed.revision
+  $h.paused = $parsed.paused
+  $h.used = history_used($h.entries)
+  return $h
+end
+
+fn history_state($cfg, $session)
+  -- Build (and lock, and load) the history store for one session provider.
+  if $cfg == nil then $cfg = {} end
+  if type($cfg) != "map" then raise("DESKTOP_CONFIG", "history must be a map") end
+  $depth = $cfg.depth == nil ? 100 : $cfg.depth
+  $cap_bytes = $cfg.cap_bytes == nil ? 65536 : $cfg.cap_bytes
+  $budget_bytes = $cfg.budget_bytes == nil ? 4194304 : $cfg.budget_bytes
+  if not is_int($depth) or $depth < 1 or $depth > 1000 then raise("DESKTOP_CONFIG", "history.depth must be 1..1000") end
+  if not is_int($cap_bytes) or $cap_bytes < 1 or $cap_bytes > 65536 then raise("DESKTOP_CONFIG", "history.cap_bytes must be 1..65536") end
+  if not is_int($budget_bytes) or $budget_bytes < 65536 or $budget_bytes > 67108864 then raise("DESKTOP_CONFIG", "history.budget_bytes must be 65536..67108864") end
+  if $budget_bytes < $cap_bytes then raise("DESKTOP_CONFIG", "history.budget_bytes must be >= cap_bytes") end
+  $root = env("XDG_STATE_HOME")
+  if $root == "" or not starts_with($root, "/") then
+    $root = env("HOME") .. "/.local/state"
+  end
+  $path = $cfg.path
+  if $path == nil then
+    $path = $root .. "/cosmix/clipboard/history-" .. $session .. ".json"
+  elif type($path) != "string" or not starts_with($path, "/") then
+    raise("DESKTOP_CONFIG", "history.path must be absolute")
+  end
+  $h = {path:$path, depth:$depth, cap_bytes:$cap_bytes, budget_bytes:$budget_bytes,
+    entries:[], next_id:1, revision:0, skipped:0, paused:false, used:0, degraded:""}
+  try
+    mkdir(re_replace($path, "/[^/]*$", ""), {parents:true})
+  catch $err
+    $h.degraded = "state-dir"
+    return $h
+  end
+  try
+    if not flock($path .. ".lock") then
+      -- Another live provider owns this store; serve in-memory only and
+      -- never read or write its file.
+      $h.degraded = "locked"
+      return $h
+    end
+  catch $err
+    $h.degraded = "lock-error"
+    return $h
+  end
+  return history_load($h)
+end
+
+fn history_save($h)
+  if $h.degraded != "" then return false end
+  $payload = {schema_version:1, next_id:$h.next_id, revision:$h.revision,
+    skipped:$h.skipped, paused:$h.paused, entries:$h.entries}
+  $tmpf = $h.path .. ".tmp-" .. slice(replace(uuid(),"-",""),0,8)
+  try
+    write_new($tmpf, json_encode($payload), "0600")
+    rename($tmpf, $h.path)
+    return true
+  catch $err
+    return false
+  end
+end
+
+fn history_publish($ctx, $action, $id)
+  -- Invalidation events carry no clipboard text; subscribers refetch.
+  try
+    $body = {instance:$ctx.instance, session:$ctx.session, revision:$ctx.history.revision, action:$action}
+    if $id != nil then $body.id = $id end
+    publish("desktop.clipboard.changed", json_encode($body))
+  catch $err
+    -- Best effort: a failed publish never fails the mutation.
+  end
+end
+
+fn history_find($h, $text)
+  for each $i in range(0, len($h.entries) - 1)
+    if $h.entries[$i].text == $text then return $i end
+  end
+  return nil
+end
+
+fn history_find_id($h, $id)
+  for each $i in range(0, len($h.entries) - 1)
+    if $h.entries[$i].id == $id then return $i end
+  end
+  return nil
+end
+
+fn history_capture($ctx, $text)
+  -- Returns {context?, body}; context present only when state committed.
+  $h = $ctx.history
+  if $h.paused then
+    return {body:{stored:false, reason:"paused"}}
+  end
+  $bytes = byte_length($text)
+  if $bytes > $h.cap_bytes then
+    -- Never stored, never truncated: the skip is counted, not remembered.
+    $h.skipped = $h.skipped + 1
+    $h.revision = $h.revision + 1
+    $ctx.history = $h
+    $persisted = history_save($h)
+    history_publish($ctx, "skip", nil)
+    return {context:$ctx, body:{stored:false, reason:"oversize", bytes:$bytes, skipped:$h.skipped, persisted:$persisted}}
+  end
+  $idx = history_find($h, $text)
+  if $idx != nil then
+    if $idx == 0 then
+      -- A re-copy of the newest entry (or the watcher echo of our own pick)
+      -- is a no-op: no revision bump, no write, no event.
+      return {body:{stored:false, reason:"duplicate", id:$h.entries[0].id}}
+    end
+    $entry = $h.entries[$idx]
+    $h.entries = concat([$entry], list_remove($h.entries, $idx))
+    $h.used = history_used($h.entries)
+    $h.revision = $h.revision + 1
+    $ctx.history = $h
+    $persisted = history_save($h)
+    history_publish($ctx, "capture", $entry.id)
+    return {context:$ctx, body:{stored:true, id:$entry.id, duplicate:true, persisted:$persisted}}
+  end
+  $entry = {id:$h.next_id, text:$text, bytes:$bytes, at:time()}
+  $h.next_id = $h.next_id + 1
+  $h.entries = concat([$entry], $h.entries)
+  while len($h.entries) > $h.depth or history_used($h.entries) > $h.budget_bytes
+    $h.entries = list_remove($h.entries, len($h.entries) - 1)
+  end
+  $h.used = history_used($h.entries)
+  $h.revision = $h.revision + 1
+  $ctx.history = $h
+  $persisted = history_save($h)
+  history_publish($ctx, "capture", $entry.id)
+  return {context:$ctx, body:{stored:true, id:$entry.id, persisted:$persisted}}
+end
+
+fn history_preview($text)
+  $p = slice($text, 0, 80)
+  $p = replace($p, "\r", "")
+  $p = replace($p, "\n", "⏎")
+  $p = replace($p, "\t", "␉")
+  if len($text) > 80 then $p = $p .. "…" end
+  return $p
+end
+
+-- ── Session configuration ───────────────────────────────────────────────
 
 fn session_config($config)
   if type($config) != "map" or type($config.session) != "string" or not re_match($config.session, "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$") then
@@ -27,7 +313,8 @@ fn session_config($config)
   return {session:$config.session, instance:uuid(), max_bytes:65536,
     mesh_nodes:$mesh_nodes,
     wayland:env("WAYLAND_DISPLAY"), runtime:env("XDG_RUNTIME_DIR"),
-    copy:which("wl-copy"), paste:which("wl-paste"), opener:$opener}
+    copy:which("wl-copy"), paste:which("wl-paste"), opener:$opener,
+    history:history_state($config.history, $config.session)}
 end
 
 fn target_ok($target)
@@ -43,12 +330,13 @@ fn caller_allowed($ctx,$verb,$headers)
   return $headers.from == "bridge-" .. $headers.broker_peer and type($headers.broker_service) == "string" and re_match($headers.broker_service,"^[a-z][a-z0-9-]{1,30}$")
 end
 
-fn keys_are($body, $expected)
-  if type($body) != "map" or len(keys($body)) != len($expected) then return false end
-  for each $key in keys($body)
-    if not contains($expected, $key) then return false end
-  end
-  return true
+fn history_capabilities($ctx)
+  $h = $ctx.history
+  return {depth:$h.depth, cap_bytes:$h.cap_bytes, budget_bytes:$h.budget_bytes,
+    used_bytes:$h.used, entries:len($h.entries), skipped:$h.skipped,
+    paused:$h.paused, revision:$h.revision,
+    persistence:($h.degraded == "" ? "ok" : $h.degraded),
+    topic:"desktop.clipboard.changed"}
 end
 
 fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
@@ -60,18 +348,114 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.2.0", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.0", session:$ctx.session,
       instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
-      clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8"},
+      clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8", history:history_capabilities($ctx)},
       open:{configured:is_executable($ctx.opener), schemes:["http","https"]},
-      verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.open"]}}
+      verbs:["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write","desktop.clipboard.capture","desktop.clipboard.history","desktop.clipboard.entry","desktop.clipboard.pick","desktop.clipboard.clear","desktop.clipboard.pause","desktop.open"]}}
+  end
+  if $verb == "desktop.clipboard.capture" then
+    -- The watcher path: a registered local citizen submits observed text.
+    -- No instance fence — the watcher cannot know the live instance UUID.
+    if not keys_are($body, ["text"]) then return error("INVALID_REQUEST", 10) end
+    if type($body.text) != "string" or contains($body.text, $_nul) then return error("INVALID_CLIPBOARD_TEXT", 10) end
+    $outcome = history_capture($ctx, $body.text)
+    $body_out = merge_maps({instance:$ctx.instance}, $outcome.body)
+    if $outcome.context != nil then
+      return {rc:0, body:$body_out, context:$outcome.context}
+    end
+    return {rc:0, body:$body_out}
   end
   $expected = ["instance"]
   if $verb == "desktop.clipboard.write" then $expected = ["instance","text"]
   elif $verb == "desktop.open" then $expected = ["instance","url"]
-  elif $verb != "desktop.clipboard.read" then return error("UNKNOWN_COMMAND", 10) end
-  if not keys_are($body, $expected) then return error("INVALID_REQUEST", 10) end
+  elif $verb == "desktop.clipboard.entry" then $expected = ["instance","id"]
+  elif $verb == "desktop.clipboard.pick" then $expected = ["instance","id"]
+  elif $verb == "desktop.clipboard.pause" then $expected = ["instance","on"]
+  elif $verb != "desktop.clipboard.read" and $verb != "desktop.clipboard.history" and $verb != "desktop.clipboard.clear" then
+    return error("UNKNOWN_COMMAND", 10)
+  end
+  if $verb != "desktop.clipboard.history" and $verb != "desktop.clipboard.clear" and not keys_are($body, $expected) then
+    return error("INVALID_REQUEST", 10)
+  end
+  if $verb == "desktop.clipboard.history" and not keys_subset($body, ["instance"], ["q","offset","limit"]) then return error("INVALID_REQUEST", 10) end
+  if $verb == "desktop.clipboard.clear" and not keys_subset($body, ["instance"], ["id"]) then return error("INVALID_REQUEST", 10) end
   if $body.instance != $ctx.instance then return error("STALE_SESSION", 12) end
+  if $verb == "desktop.clipboard.history" then
+    $q = $body.q == nil ? "" : $body.q
+    $offset = $body.offset == nil ? 0 : $body.offset
+    $limit = $body.limit == nil ? 20 : $body.limit
+    if type($q) != "string" or byte_length($q) > 256 then return error("INVALID_REQUEST", 10) end
+    if not is_int($offset) or $offset < 0 or $offset > 1000000 then return error("INVALID_REQUEST", 10) end
+    if not is_int($limit) or $limit < 1 or $limit > 100 then return error("INVALID_REQUEST", 10) end
+    $h = $ctx.history
+    $filtered = []
+    for each $entry in $h.entries
+      if $q == "" or contains($entry.text, $q) then $filtered = concat($filtered, [$entry]) end
+    end
+    $page = []
+    for each $entry in list_page($filtered, $offset, $limit)
+      $page = concat($page, [{id:$entry.id, bytes:$entry.bytes, at:$entry.at, preview:history_preview($entry.text)}])
+    end
+    return {rc:0, body:{instance:$ctx.instance, revision:$h.revision, total:len($filtered), offset:$offset, limit:$limit, entries:$page}}
+  end
+  if $verb == "desktop.clipboard.entry" then
+    if not is_int($body.id) or $body.id < 1 then return error("INVALID_REQUEST", 10) end
+    $idx = history_find_id($ctx.history, $body.id)
+    if $idx == nil then return error("ENTRY_NOT_FOUND", 14) end
+    $entry = $ctx.history.entries[$idx]
+    return {rc:0, body:{instance:$ctx.instance, id:$entry.id, text:$entry.text, bytes:$entry.bytes, mime:"text/plain;charset=utf-8"}}
+  end
+  if $verb == "desktop.clipboard.clear" then
+    $h = $ctx.history
+    if $body.id != nil then
+      if not is_int($body.id) or $body.id < 1 then return error("INVALID_REQUEST", 10) end
+      $idx = history_find_id($h, $body.id)
+      if $idx == nil then return error("ENTRY_NOT_FOUND", 14) end
+      $h.entries = list_remove($h.entries, $idx)
+      $h.used = history_used($h.entries)
+      $h.revision = $h.revision + 1
+      $ctx.history = $h
+      $persisted = history_save($h)
+      history_publish($ctx, "clear", $body.id)
+      return {rc:0, body:{instance:$ctx.instance, removed:1, persisted:$persisted}, context:$ctx}
+    end
+    $removed = len($h.entries)
+    if $removed > 0 then
+      $h.entries = []
+      $h.used = 0
+      $h.revision = $h.revision + 1
+      $ctx.history = $h
+      $persisted = history_save($h)
+      history_publish($ctx, "clear", nil)
+      return {rc:0, body:{instance:$ctx.instance, removed:$removed, persisted:$persisted}, context:$ctx}
+    end
+    return {rc:0, body:{instance:$ctx.instance, removed:0, persisted:true}}
+  end
+  if $verb == "desktop.clipboard.pause" then
+    if type($body.on) != "bool" then return error("INVALID_REQUEST", 10) end
+    $h = $ctx.history
+    if $h.paused == $body.on then
+      return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:true}}
+    end
+    $h.paused = $body.on
+    $ctx.history = $h
+    $persisted = history_save($h)
+    return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:$persisted}, context:$ctx}
+  end
+  if $verb == "desktop.clipboard.pick" then
+    if not is_int($body.id) or $body.id < 1 then return error("INVALID_REQUEST", 10) end
+    $idx = history_find_id($ctx.history, $body.id)
+    if $idx == nil then return error("ENTRY_NOT_FOUND", 14) end
+    if $ctx.copy == nil or $ctx.wayland == "" or $ctx.runtime == "" then
+      return error("CLIPBOARD_UNAVAILABLE", 11)
+    end
+    $entry = $ctx.history.entries[$idx]
+    -- The wl-copy helper runs first; the ring commit happens in finish().
+    return {action:"clipboard_pick", entry_id:$entry.id, entry_index:$idx,
+      argv:[$ctx.copy,"--type","text/plain;charset=utf-8"],
+      options:{timeout:5, stdin:$entry.text, stdout:"null", stderr:"null"}}
+  end
   if $verb == "desktop.open" then
     if type($body.url) != "string" or byte_length($body.url) > 8192 or not re_match($body.url, "^https?://[^/?#[:space:][:cntrl:]]+([/?#][^[:space:][:cntrl:]]*)?$") then
       return error("INVALID_HTTP_URL", 10)
@@ -107,6 +491,23 @@ fn finish($ctx, $plan, $result)
       return error("INVALID_CLIPBOARD_TEXT", 10)
     end
     return {rc:0, body:{instance:$ctx.instance, mime:"text/plain;charset=utf-8", text:$result.stdout, bytes:byte_length($result.stdout)}}
+  end
+  if $plan.action == "clipboard_pick" then
+    -- The helper succeeded: commit the move-to-front now. Wayland and disk
+    -- are not one transaction; persisted:false reports a partial commit.
+    $h = $ctx.history
+    $idx = $plan.entry_index
+    if $idx != 0 then
+      $entry = $h.entries[$idx]
+      $h.entries = concat([$entry], list_remove($h.entries, $idx))
+      $h.used = history_used($h.entries)
+      $h.revision = $h.revision + 1
+      $ctx.history = $h
+      $persisted = history_save($h)
+      history_publish($ctx, "pick", $entry.id)
+      return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, bytes:$entry.bytes, persisted:$persisted}, context:$ctx}
+    end
+    return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, bytes:$h.entries[0].bytes, persisted:true}}
   end
   if $plan.action == "write" then
     return {rc:0, body:{instance:$ctx.instance, accepted:true, bytes:$plan.bytes}}

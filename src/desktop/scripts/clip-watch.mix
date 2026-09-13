@@ -1,0 +1,9 @@
+-- clip-watch — one-shot registered deliverer for one observed selection.
+-- Launched by clip-notify.mix with the clipboard text on stdin. Registers a
+-- unique Bus identity (the provider only accepts registered local callers),
+-- submits one desktop.clipboard.capture, and quits. Never prints the text.
+$target = env("DESKTOP_WATCH_TARGET")
+if $target == "" then raise("WATCH_CONFIG", "DESKTOP_WATCH_TARGET is required") end
+$text = read_stdin()
+send $target "desktop.clipboard.capture" body=json_encode({text:$text}) timeout=8
+exit($rc == 0 ? 0 : 1)

@@ -23,7 +23,7 @@ if $request.operation == "capabilities" then
 elif $request.operation == "copy" then
   if not target_ok($request.source) or $request.source == $request.target then raise("DESKTOP_ARGS", "distinct source and target required") end
   $source = rpc($request.source, "desktop.capabilities", {})
-  if $source.api_version != 1 or type($source.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported source response") end
+  if $source.api_version != 1 or type($source.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported source capability response") end
   $clipboard = rpc($request.source, "desktop.clipboard.read", {instance:$source.instance})
   if $clipboard.instance != $source.instance or $clipboard.mime != "text/plain;charset=utf-8" or type($clipboard.text) != "string" or byte_length($clipboard.text) > 65536 then
     raise("DESKTOP_PROTOCOL", "invalid clipboard response")
@@ -35,6 +35,30 @@ elif $request.operation == "open" then
   $reply = rpc($request.target, "desktop.open", {instance:$destination.instance,url:$request.url})
   if $reply.instance != $destination.instance or $reply.accepted != true then raise("DESKTOP_PROTOCOL", "open not accepted") end
   print(json_encode({operation:"open",accepted:true}))
+elif $request.operation == "history" then
+  $body = {instance:$destination.instance}
+  if $request.q != nil then $body.q = $request.q end
+  $reply = rpc($request.target, "desktop.clipboard.history", $body)
+  if $reply.instance != $destination.instance or type($reply.entries) != "list" then raise("DESKTOP_PROTOCOL", "invalid history response") end
+  print(json_encode($reply))
+elif $request.operation == "entry" then
+  $reply = rpc($request.target, "desktop.clipboard.entry", {instance:$destination.instance, id:$request.id})
+  if $reply.instance != $destination.instance or type($reply.text) != "string" then raise("DESKTOP_PROTOCOL", "invalid entry response") end
+  print(json_encode({id:$reply.id, bytes:$reply.bytes, mime:$reply.mime}))
+elif $request.operation == "pick" then
+  $reply = rpc($request.target, "desktop.clipboard.pick", {instance:$destination.instance, id:$request.id})
+  if $reply.instance != $destination.instance or $reply.accepted != true then raise("DESKTOP_PROTOCOL", "pick not accepted") end
+  print(json_encode({operation:"pick", accepted:true, id:$reply.id, bytes:$reply.bytes}))
+elif $request.operation == "clear" then
+  $body = {instance:$destination.instance}
+  if $request.id != nil then $body.id = $request.id end
+  $reply = rpc($request.target, "desktop.clipboard.clear", $body)
+  if $reply.instance != $destination.instance or type($reply.removed) != "number" then raise("DESKTOP_PROTOCOL", "invalid clear response") end
+  print(json_encode({operation:"clear", removed:$reply.removed}))
+elif $request.operation == "pause" then
+  $reply = rpc($request.target, "desktop.clipboard.pause", {instance:$destination.instance, on:$request.on})
+  if $reply.instance != $destination.instance or type($reply.paused) != "bool" then raise("DESKTOP_PROTOCOL", "invalid pause response") end
+  print(json_encode({operation:"pause", paused:$reply.paused}))
 else
   raise("DESKTOP_ARGS", "unknown operation")
 end
