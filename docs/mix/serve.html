@@ -827,6 +827,18 @@ bad edit can do is a logged revert. Things to know:</p>
 globals. State that must survive a reload belongs in the substrate
 (props, statecache) — that is the persistent-state model, not process
 memory.</li>
+<li><strong>A request in flight across the swap gets a terminal reply, not
+silence.</strong> When the old generation is retired its pending requests are
+answered with a shutdown-flavoured reply (the connection is live, so the
+caller is never left hanging to its own timeout). SIGTERM/Ctrl-C during a
+reload's init still shuts the citizen down cleanly, and a new init body
+that fails after admitting traffic has its spawned handlers cancelled
+before the old generation resumes.</li>
+<li><strong>The script path is resolved to an absolute path at startup</strong>, so a
+citizen whose init <code>chdir</code>s still reloads its own file.</li>
+<li><strong><code>rc:0</code> means "accepted and parsed", not "this exact revision is now
+serving"</strong> — a runtime failure in the new init reverts, having already
+acknowledged. Re-probe <code>INFO</code>/<code>HELP</code> to confirm what went live.</li>
 <li>The <code>rc:0</code> reply races the swap by design: a follow-up sent immediately
 queues at the broker and is answered by whichever evaluator holds the
 pump. Fire <code>RELOAD</code>, then re-probe <code>HELP</code>/<code>INFO</code> to observe the new

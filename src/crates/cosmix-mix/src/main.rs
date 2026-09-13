@@ -1139,6 +1139,16 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
     // `run_serve` return flushes pending log writes.
     let _log = init_serve_tracing();
 
+    // Anchor the script path to an absolute one BEFORE any script code runs:
+    // a citizen's init body may `chdir`, and RELOAD re-reads this path — a
+    // relative path would then resolve against the changed directory and
+    // reload a different file (or none). Fall back to the given path if the
+    // file does not exist yet (the read below reports it).
+    let script_path_abs = std::fs::canonicalize(script_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| script_path.to_string());
+    let script_path = script_path_abs.as_str();
+
     let source = match fs::read_to_string(script_path) {
         Ok(s) => s,
         Err(e) => {
@@ -1315,6 +1325,16 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         // executed successfully; any failure resumes the old one, state
         // intact. Every other pump end falls through to the shutdown path
         // exactly as before.
+        // ONE shutdown future for the whole serve lifetime — pinned so it is
+        // never re-registered (a per-iteration re-register would leave a
+        // signal-delivery gap across a reload), and raced against BOTH the
+        // pump AND the reload's init body so a hanging/sleeping new script
+        // is still killable by SIGTERM/Ctrl-C (codex arm MAJOR-3).
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+        // Grace for draining a generation's in-flight Class C work at a swap
+        // point (not process shutdown; the connection lives on).
+        let reload_drain = std::time::Duration::from_secs(2);
         let mut stmts = stmts;
         let mut needs_exec = true;
         let outcome = loop {
@@ -1322,7 +1342,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             needs_exec = false;
             let iter_outcome = tokio::select! {
                 biased;
-                _ = shutdown_signal() => {
+                _ = &mut shutdown => {
                     tracing::info!(
                         service = %service_name,
                         "serve: SIGTERM/Ctrl-C received; graceful shutdown (SPEC 18 §3.5)"
@@ -1387,19 +1407,35 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             let mut new_eval =
                 build_serve_eval(&bus_handler, service_name, script_path, no_prelude).await;
             // interrupt::init is once-only, bound to the FIRST evaluator's
-            // flag — share that flag so Ctrl-C/SIGTERM keep working after
-            // any number of reloads.
+            // flag — share that flag so the evaluator-internal interrupt path
+            // keeps working after any number of reloads.
             new_eval.set_interrupt_flag(eval.interrupt_flag());
-            match new_eval.execute(&new_stmts).await {
+
+            // Execute the new init body RACED against shutdown: a new script
+            // whose top-level sleeps/hangs must still yield to SIGTERM. A
+            // top-level `sleep()` dispatches events, so the new (not-yet-
+            // committed) evaluator can spawn Class C tasks during init — on
+            // ANY exit from here that does not commit the swap, its tasks
+            // MUST be cancelled or they outlive the discarded evaluator and
+            // reply on the shared connection after the old one resumes
+            // (codex arm MAJOR-6). `reload_drain` with synth replies answers
+            // anyone who got in rather than stranding them (MAJOR-5).
+            let exec_res = tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    tracing::info!(service = %service_name,
+                        "serve: SIGTERM/Ctrl-C during reload init; cancelling replacement, shutting down");
+                    let _ = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                    break ServeOutcome::Interrupted;
+                }
+                r = new_eval.execute(&new_stmts) => r,
+            };
+            match exec_res {
                 Ok(_) => {
-                    // Old evaluator's in-flight Class C work gets the same
-                    // drain discipline as shutdown before it drops.
-                    let _ = eval
-                        .drain_class_c_for_shutdown(
-                            std::time::Duration::from_secs(2),
-                            false,
-                        )
-                        .await;
+                    // Old evaluator's in-flight Class C work is drained with
+                    // synth replies BEFORE it drops — the connection is live,
+                    // so a stranded caller gets a terminal reply, not silence.
+                    let _ = eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     eval = new_eval;
                     stmts = new_stmts;
                     tracing::info!(
@@ -1409,6 +1445,10 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     );
                 }
                 Err(e) => {
+                    // Cancel any Class C tasks the failed init admitted, so
+                    // the discarded evaluator leaves nothing replying behind
+                    // the resumed old one.
+                    let _ = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     tracing::error!(service = %service_name, error = %format!("{e}"),
                         "serve: reload REVERTED — new init body failed; old script resumes with state intact");
                 }
