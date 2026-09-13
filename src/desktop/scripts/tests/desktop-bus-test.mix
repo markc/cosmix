@@ -127,6 +127,10 @@ try
   $clear = cli(["clear","desktop-one",to_string($list.entries[0].id)])
   check($clear.ok and json_parse($clear.stdout).removed == 1,"clear one failed")
   check(json_parse(cli(["history","desktop-one"]).stdout).total == 1,"clear one left wrong count")
+  -- A malformed id must fail the call, never degrade to clear-all.
+  $typo = cli(["clear","desktop-one","oops"])
+  check(not $typo.ok,"malformed clear id accepted")
+  check(json_parse(cli(["history","desktop-one"]).stdout).total == 1,"malformed clear wiped history")
   -- Provider restart: new instance UUID, history survives from disk.
   $_stop = run_argv_must(["systemctl","--user","stop",$broker .. "-one.service"])
   sleep(0.3)

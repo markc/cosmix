@@ -16,6 +16,9 @@ end
 if type($request) != "map" or not target_ok($request.target) then
   raise("DESKTOP_ARGS", "target must be a local service or service.node.bus")
 end
+if $request.id != nil and (not $desktop.is_int($request.id) or $request.id < 1) then
+  raise("DESKTOP_ARGS", "id must be a positive integer")
+end
 $destination = rpc($request.target, "desktop.capabilities", {})
 if $destination.api_version != 1 or type($destination.instance) != "string" then raise("DESKTOP_PROTOCOL", "unsupported capability response") end
 if $request.operation == "capabilities" then

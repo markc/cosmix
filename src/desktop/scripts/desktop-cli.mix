@@ -1,25 +1,37 @@
--- Explicit Bus operations. Clipboard content is never printed or stored here.
+-- Explicit Bus operations. Entry output is metadata only; history output is
+-- previews (which for short entries are the full text) — the CLI never prints
+-- an entry body on its own initiative.
 -- usage: mix desktop-cli.mix capabilities TARGET | copy SOURCE TARGET | open TARGET URL
 --        mix desktop-cli.mix history TARGET [QUERY] | entry TARGET ID
 --        mix desktop-cli.mix pick TARGET ID | clear TARGET [ID] | pause TARGET on|off
 $a = args()
 $request = {}
+fn id_arg($raw)
+  -- A malformed id must fail the call, never degrade to clear-all/pick-nil.
+  $id = to_number($raw)
+  if $id == nil or $id != floor($id) or $id < 1 then
+    raise("DESKTOP_ARGS", "id must be a positive integer, got: " .. $raw)
+  end
+  return $id
+end
 if len($a) == 2 and $a[0] == "capabilities" then
   $request = {operation:"capabilities", target:$a[1]}
 elif len($a) == 3 and $a[0] == "copy" then
   $request = {operation:"copy", source:$a[1], target:$a[2]}
 elif len($a) == 3 and $a[0] == "open" then
   $request = {operation:"open", target:$a[1], url:$a[2]}
-elif len($a) >= 2 and $a[0] == "history" then
+elif len($a) == 2 and $a[0] == "history" then
   $request = {operation:"history", target:$a[1]}
-  if len($a) == 3 then $request.q = $a[2] end
+elif len($a) == 3 and $a[0] == "history" then
+  $request = {operation:"history", target:$a[1], q:$a[2]}
 elif len($a) == 3 and $a[0] == "entry" then
-  $request = {operation:"entry", target:$a[1], id:to_number($a[2])}
+  $request = {operation:"entry", target:$a[1], id:id_arg($a[2])}
 elif len($a) == 3 and $a[0] == "pick" then
-  $request = {operation:"pick", target:$a[1], id:to_number($a[2])}
-elif len($a) >= 2 and $a[0] == "clear" then
+  $request = {operation:"pick", target:$a[1], id:id_arg($a[2])}
+elif len($a) == 2 and $a[0] == "clear" then
   $request = {operation:"clear", target:$a[1]}
-  if len($a) == 3 then $request.id = to_number($a[2]) end
+elif len($a) == 3 and $a[0] == "clear" then
+  $request = {operation:"clear", target:$a[1], id:id_arg($a[2])}
 elif len($a) == 3 and $a[0] == "pause" then
   if not contains(["on","off"], $a[2]) then raise("DESKTOP_ARGS", "pause TARGET on|off") end
   $request = {operation:"pause", target:$a[1], on:$a[2] == "on"}

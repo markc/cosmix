@@ -93,18 +93,21 @@ fn history_quarantine($path, $h, $reason)
   return $h
 end
 
-fn history_entries_valid($entries, $cap_bytes)
+fn history_entries_valid($entries)
+  -- Structural validity only: ids are unique positive ints and fields are
+  -- well-typed. Array order (newest-first) is convention, NOT an invariant —
+  -- dedupe move-to-front and pick legitimately reorder entries, so a
+  -- reloaded store must not be quarantined for its order.
   if type($entries) != "list" then return false end
-  $last_id = nil
+  $ids = []
   for each $entry in $entries
     if not keys_are($entry, ["id","text","bytes","at"]) then return false end
     if not is_int($entry.id) or $entry.id < 1 then return false end
+    if contains($ids, $entry.id) then return false end
+    $ids = concat($ids, [$entry.id])
     if type($entry.text) != "string" or contains($entry.text, $_nul) then return false end
-    if byte_length($entry.text) > $cap_bytes then return false end
     if $entry.bytes != byte_length($entry.text) then return false end
     if type($entry.at) != "number" then return false end
-    if $last_id != nil and $entry.id >= $last_id then return false end
-    $last_id = $entry.id
   end
   return true
 end
@@ -142,13 +145,27 @@ fn history_load($h)
   if type($parsed.paused) != "bool" then
     return history_quarantine($h.path, $h, "paused")
   end
-  if not history_entries_valid($parsed.entries, $h.cap_bytes) then
+  if not history_entries_valid($parsed.entries) then
     return history_quarantine($h.path, $h, "entries")
   end
-  if len($parsed.entries) > 0 and $parsed.next_id <= $parsed.entries[0].id then
+  $max_id = 0
+  for each $entry in $parsed.entries
+    if $entry.id > $max_id then $max_id = $entry.id end
+  end
+  if $parsed.next_id <= $max_id then
     return history_quarantine($h.path, $h, "next-id")
   end
-  $h.entries = $parsed.entries
+  -- Apply CURRENT limits to stores written under looser ones: entries over
+  -- today's cap are dropped individually (a limits change, not corruption),
+  -- then the tail is trimmed to depth/budget.
+  $kept = []
+  for each $entry in $parsed.entries
+    if $entry.bytes <= $h.cap_bytes then $kept = concat($kept, [$entry]) end
+  end
+  while len($kept) > $h.depth or history_used($kept) > $h.budget_bytes
+    $kept = list_remove($kept, len($kept) - 1)
+  end
+  $h.entries = $kept
   $h.next_id = $parsed.next_id
   $h.skipped = $parsed.skipped
   $h.revision = $parsed.revision
@@ -179,7 +196,8 @@ fn history_state($cfg, $session)
     raise("DESKTOP_CONFIG", "history.path must be absolute")
   end
   $h = {path:$path, depth:$depth, cap_bytes:$cap_bytes, budget_bytes:$budget_bytes,
-    entries:[], next_id:1, revision:0, skipped:0, paused:false, used:0, degraded:""}
+    entries:[], next_id:1, revision:0, skipped:0, paused:false, used:0, degraded:"",
+    save_failed:false}
   try
     mkdir(re_replace($path, "/[^/]*$", ""), {parents:true})
   catch $err
@@ -208,8 +226,15 @@ fn history_save($h)
   try
     write_new($tmpf, json_encode($payload), "0600")
     rename($tmpf, $h.path)
+    $h.save_failed = false
     return true
   catch $err
+    -- The temp file holds clipboard content: never leave it behind.
+    try
+      remove($tmpf)
+    catch $err2
+    end
+    $h.save_failed = true
     return false
   end
 end
@@ -332,10 +357,16 @@ end
 
 fn history_capabilities($ctx)
   $h = $ctx.history
+  $persistence = "ok"
+  if $h.degraded != "" then
+    $persistence = $h.degraded
+  elif $h.save_failed then
+    $persistence = "write-error"
+  end
   return {depth:$h.depth, cap_bytes:$h.cap_bytes, budget_bytes:$h.budget_bytes,
     used_bytes:$h.used, entries:len($h.entries), skipped:$h.skipped,
     paused:$h.paused, revision:$h.revision,
-    persistence:($h.degraded == "" ? "ok" : $h.degraded),
+    persistence:$persistence,
     topic:"desktop.clipboard.changed"}
 end
 
@@ -430,13 +461,13 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
       history_publish($ctx, "clear", nil)
       return {rc:0, body:{instance:$ctx.instance, removed:$removed, persisted:$persisted}, context:$ctx}
     end
-    return {rc:0, body:{instance:$ctx.instance, removed:0, persisted:true}}
+    return {rc:0, body:{instance:$ctx.instance, removed:0, persisted:($h.degraded == "" and not $h.save_failed)}}
   end
   if $verb == "desktop.clipboard.pause" then
     if type($body.on) != "bool" then return error("INVALID_REQUEST", 10) end
     $h = $ctx.history
     if $h.paused == $body.on then
-      return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:true}}
+      return {rc:0, body:{instance:$ctx.instance, paused:$body.on, persisted:($h.degraded == "" and not $h.save_failed)}}
     end
     $h.paused = $body.on
     $ctx.history = $h
@@ -507,7 +538,7 @@ fn finish($ctx, $plan, $result)
       history_publish($ctx, "pick", $entry.id)
       return {rc:0, body:{instance:$ctx.instance, id:$entry.id, accepted:true, bytes:$entry.bytes, persisted:$persisted}, context:$ctx}
     end
-    return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, bytes:$h.entries[0].bytes, persisted:true}}
+    return {rc:0, body:{instance:$ctx.instance, id:$plan.entry_id, accepted:true, bytes:$h.entries[0].bytes, persisted:($h.degraded == "" and not $h.save_failed)}}
   end
   if $plan.action == "write" then
     return {rc:0, body:{instance:$ctx.instance, accepted:true, bytes:$plan.bytes}}

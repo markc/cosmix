@@ -189,8 +189,45 @@ try
   check($plan.body.removed == 0 and $plan.context == nil,"clear on empty mutated")
 
   -- ── Persistence: reload, quarantine, newer schema ─────────────────────
+  -- Reordered-but-valid stores (pick/dedupe move-to-front) must survive a
+  -- reload; array order is convention, not an invariant.
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"reorder-a"},2)
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"reorder-b"},2)
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.pick",$headers,{instance:$ctx.instance,id:$ctx.history.entries[1].id},2)
+  $done = $d.finish($ctx,$plan,{ok:true})
+  $ctx = $done.context
+  $order = $ctx.history.entries
+  $reordered = $d.history_state({path:$tmp .. "/history.json"}, "test")
+  check($reordered.degraded == "" and len($reordered.entries) == len($order),"reordered history quarantined on reload")
+  check(len($reordered.entries) >= 2 and $reordered.entries[0].id == $order[0].id and $reordered.entries[1].id == $order[1].id,"reload reordered entries")
+  -- Reduced limits on reload: drop over-cap entries and trim the tail, not quarantine.
+  $deep_ctx = {session:"deep",instance:"instance-deep",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true",
+    history:$d.history_state({path:$tmp .. "/deep.json", depth:10}, "deep")}
+  for each $word in ["d1","d2","d3","d4","d5"]
+    $plan = $d.prepare($deep_ctx,"desktop.clipboard.capture",$headers,{text:$word},2)
+    $deep_ctx = ctx_of($plan, $deep_ctx)
+  end
+  check(len($deep_ctx.history.entries) == 5,"deep setup wrong")
+  $trimmed = $d.history_state({path:$tmp .. "/deep.json", depth:3}, "deep")
+  check($trimmed.degraded == "" and len($trimmed.entries) == 3,"reduced depth did not trim on reload")
+  check($trimmed.entries[0].text == "d5" and $trimmed.entries[2].text == "d3","trim kept wrong end")
+  -- Clear then recapture: the recaptured text gets a FRESH id.
+  $before_id = $ctx.history.entries[0].id
+  $plan = $d.prepare($ctx,"desktop.clipboard.clear",$headers,{instance:$ctx.instance},2)
+  $ctx = ctx_of($plan, $ctx)
+  $plan = $d.prepare($ctx,"desktop.clipboard.capture",$headers,{text:"reorder-a"},2)
+  $ctx = ctx_of($plan, $ctx)
+  check($plan.body.stored == true and $plan.body.id != $before_id,"recapture after clear reused an id")
+  -- Pagination beyond the end reports the full total with an empty page.
+  $past = $d.prepare($ctx,"desktop.clipboard.history",$headers,{instance:$ctx.instance,offset:50,limit:10},2).body
+  check($past.total == len($ctx.history.entries) and len($past.entries) == 0,"offset beyond end wrong")
+  -- Entry id bounds.
+  check($d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:0},2).rc == 10,"entry id 0 accepted")
+  check($d.prepare($ctx,"desktop.clipboard.entry",$headers,{instance:$ctx.instance,id:-3},2).rc == 10,"negative entry id accepted")
   $reloaded = $d.history_state({path:$tmp .. "/history.json"}, "test")
-  check($reloaded.degraded == "" and $reloaded.paused == false and $reloaded.next_id == 4 and $reloaded.skipped == 1,"reload lost state")
+  check($reloaded.degraded == "" and $reloaded.paused == false and $reloaded.next_id == $ctx.history.next_id and $reloaded.skipped == $ctx.history.skipped and len($reloaded.entries) == len($ctx.history.entries),"reload lost state")
   write_file($tmp .. "/history.json", "{not json")
   $quarantined = $d.history_state({path:$tmp .. "/history.json"}, "test")
   check($quarantined.degraded == "" and len($quarantined.entries) == 0,"corrupt history not quarantined")
