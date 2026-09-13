@@ -451,6 +451,33 @@ script with <strong>one</strong> <code>on &lt;cmd&gt; … end</code> handler is 
 long-lived, addressable Mix process that <em>is</em> a service. The full normative
 contract is <strong>SPEC 18</strong> (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.</p>
+<h2 id="what-citizen-means-in-cosmix">What "citizen" means in Cosmix</h2>
+<p>A <strong>citizen</strong> is a process that is a first-class, named member of the Cosmix
+substrate — not a throwaway script but a resident participant on the Bus. A plain
+<code>mix script.mix</code> run is anonymous and one-shot: nothing can address it and it
+exits when the script ends. Turning it into a citizen (<code>mix --serve</code>) gives it a
+name, a lifetime, and a seat at the table — it becomes something the rest of the
+system, and the whole mesh, can talk to. Concretely, a citizen has:</p>
+<ul>
+<li><strong>Identity</strong> — a registered Bus service name others address it by (<code>send &lt;name&gt; …</code>). There is no anonymous citizen.</li>
+<li><strong>Addressability</strong> — any process, agent, or mesh node can reach it by that
+name, from this machine or across the WireGuard mesh.</li>
+<li><strong>Residency + supervision</strong> — it is long-lived and stays registered. A broker
+(<code>cosmix-noded</code>) restart is a transient drop it reconnects and re-registers
+through, not a death.</li>
+<li><strong>Participation</strong> — it receives verbs (<code>on</code>), <code>reply</code>s, <code>send</code>s, <code>emit</code>s, and
+<code>subscribe</code>s to topics: a full member of the message fabric, not just a caller.</li>
+<li><strong>A public surface it did not write</strong> — the runtime injects <code>HELP</code>, <code>INFO</code>,
+<code>QUIT</code>, and <code>&lt;svc&gt;.props.{get,list,describe}</code>, so every citizen is
+introspectable and controllable by the same verbs.</li>
+<li><strong>Trust</strong> — a citizen is a <em>full-capability, trusted</em> process (see
+<a href="/mix/capabilities">capabilities</a>), not a sandbox for untrusted code.</li>
+<li><strong>Provenance</strong> — its binary (<code>cosmix-mix</code>) and version show in <code>noded.list</code>, so
+a fleet of agents can see exactly what is running and where.</li>
+</ul>
+<p>In short: a citizen is the Cosmix substrate's unit of <strong>live, addressable,
+agent-operable service</strong>. The rest of this page is how you make one and how it
+behaves.</p>
 <blockquote>
 <p><strong>Most examples here need a live broker</strong> (<code>cosmix-noded</code>, from the
 <a href="https://github.com/markc/cosmix">cos repo</a>). Where one is running, the output

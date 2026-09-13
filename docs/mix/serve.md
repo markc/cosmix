@@ -11,6 +11,36 @@ long-lived, addressable Mix process that *is* a service. The full normative
 contract is **SPEC 18** (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.
 
+## What "citizen" means in Cosmix
+
+A **citizen** is a process that is a first-class, named member of the Cosmix
+substrate — not a throwaway script but a resident participant on the Bus. A plain
+`mix script.mix` run is anonymous and one-shot: nothing can address it and it
+exits when the script ends. Turning it into a citizen (`mix --serve`) gives it a
+name, a lifetime, and a seat at the table — it becomes something the rest of the
+system, and the whole mesh, can talk to. Concretely, a citizen has:
+
+- **Identity** — a registered Bus service name others address it by (`send
+  <name> …`). There is no anonymous citizen.
+- **Addressability** — any process, agent, or mesh node can reach it by that
+  name, from this machine or across the WireGuard mesh.
+- **Residency + supervision** — it is long-lived and stays registered. A broker
+  (`cosmix-noded`) restart is a transient drop it reconnects and re-registers
+  through, not a death.
+- **Participation** — it receives verbs (`on`), `reply`s, `send`s, `emit`s, and
+  `subscribe`s to topics: a full member of the message fabric, not just a caller.
+- **A public surface it did not write** — the runtime injects `HELP`, `INFO`,
+  `QUIT`, and `<svc>.props.{get,list,describe}`, so every citizen is
+  introspectable and controllable by the same verbs.
+- **Trust** — a citizen is a *full-capability, trusted* process (see
+  [capabilities](capabilities.md)), not a sandbox for untrusted code.
+- **Provenance** — its binary (`cosmix-mix`) and version show in `noded.list`, so
+  a fleet of agents can see exactly what is running and where.
+
+In short: a citizen is the Cosmix substrate's unit of **live, addressable,
+agent-operable service**. The rest of this page is how you make one and how it
+behaves.
+
 > **Most examples here need a live broker** (`cosmix-noded`, from the
 > [cos repo](https://github.com/markc/cosmix)). Where one is running, the output
 > shown is **real**, captured from a live `statecache` citizen on a dev node.
