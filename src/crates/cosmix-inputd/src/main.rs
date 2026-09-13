@@ -15,6 +15,7 @@ mod service;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use cosmix_input_core::{Resolver, default_keymap};
@@ -38,9 +39,17 @@ struct Args {
     #[arg(long, value_name = "DEVICE")]
     observe: Option<String>,
 
-    /// Reserved: EVIOCGRAB + uinput interception. Refuses for now (supervised P2).
+    /// EVIOCGRAB + uinput interception on this node (the supervised path): grab
+    /// the device, swallow bound strokes and fire their verbs, re-emit the rest.
+    /// Dead-keyboard-risk but recoverable — killing the process releases the grab.
     #[arg(long, value_name = "DEVICE")]
     grab: Option<String>,
+
+    /// Safety valve for --grab: auto-release the grab and exit after this many
+    /// seconds. Omit to grab indefinitely (production). Use a small value for the
+    /// first supervised bring-up so a wedged grab self-heals.
+    #[arg(long, value_name = "SECONDS")]
+    grab_timeout: Option<u64>,
 
     /// Keymap file to load and write rebinds through. Defaults to
     /// $COSMIX_INPUTD_KEYMAP or <config>/cosmix/inputd/keymap.json.
@@ -80,13 +89,25 @@ fn main() -> anyhow::Result<()> {
     };
     let resolver: Shared = Arc::new(Mutex::new(Resolver::new(keymap)));
 
+    // Grab mode fires resolved verbs; the reader (blocking thread) sends them to
+    // the tokio side (which owns the Bus client) over this channel. Keeping the
+    // original sender alive means the receiver never closes even without a reader.
+    let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<reader::FiredVerb>();
+
     // The evdev reader (if requested) runs on its own blocking thread; the Bus
     // service runs on the tokio runtime below. The two share the resolver.
     if let Some(device) = args.grab.clone() {
         let shared = Arc::clone(&resolver);
+        let tx = fire_tx.clone();
+        let timeout = args.grab_timeout.map(Duration::from_secs);
         std::thread::spawn(move || {
-            if let Err(error) = reader::run_grab(&device, shared) {
-                eprintln!("cosmix-inputd: grab reader: {error}");
+            // run_grab only returns on a device/uinput error (otherwise it loops
+            // until the watchdog exits the process). The grab is already released
+            // by fd-close here; exit so the daemon does not linger grab-less, and
+            // systemd (Restart=always) can re-establish it.
+            if let Err(error) = reader::run_grab(&device, shared, tx, timeout) {
+                eprintln!("cosmix-inputd: grab reader stopped: {error}");
+                std::process::exit(1);
             }
         });
     } else if let Some(device) = args.observe.clone() {
@@ -97,16 +118,23 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // Hold the sender open for the process lifetime so `fire_rx.recv()` parks
+    // rather than returning None when no grab reader is running.
+    let _fire_tx = fire_tx;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(resolver, keymap_path))
+    runtime.block_on(serve(resolver, keymap_path, fire_rx))
 }
 
 /// Reconnect loop: (re)register `inputd` with noded and serve `input.*` until the
 /// connection drops, then reconnect.
-async fn serve(resolver: Shared, keymap_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn serve(
+    resolver: Shared,
+    keymap_path: Option<PathBuf>,
+    mut fire_rx: tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
+) -> anyhow::Result<()> {
     let bi = cosmix_buildinfo::build_info!();
     let provenance = cosmix_bus::RegisterProvenance::from_parts(
         bi.pkg,
@@ -125,7 +153,7 @@ async fn serve(resolver: Shared, keymap_path: Option<PathBuf>) -> anyhow::Result
         {
             Ok(client) => {
                 eprintln!("cosmix-inputd: registered as '{SERVICE}'; serving input.*");
-                serve_bus(&client, &resolver, keymap_path.as_deref()).await;
+                serve_bus(&client, &resolver, keymap_path.as_deref(), &mut fire_rx).await;
                 eprintln!("cosmix-inputd: broker disconnected; reconnecting");
             }
             Err(error) => {
@@ -136,19 +164,48 @@ async fn serve(resolver: Shared, keymap_path: Option<PathBuf>) -> anyhow::Result
     }
 }
 
-/// Drain and answer inbound `input.*` commands until the connection closes.
+/// Drain and answer inbound `input.*` commands, and fire verbs the grab reader
+/// resolves, until the connection closes.
 async fn serve_bus(
     client: &cosmix_client::NodedClient,
     resolver: &Shared,
     keymap_path: Option<&std::path::Path>,
+    fire_rx: &mut tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
 ) {
     let Some(mut rx) = client.incoming_async().await else {
         return;
     };
-    while let Some(cmd) = rx.recv().await {
-        let (rc, body) = service::dispatch(resolver, keymap_path, &cmd);
-        let _ = client
-            .respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body)
-            .await;
+    loop {
+        tokio::select! {
+            maybe_cmd = rx.recv() => {
+                let Some(cmd) = maybe_cmd else { break };
+                let (rc, body) = service::dispatch(resolver, keymap_path, &cmd);
+                let _ = client
+                    .respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body)
+                    .await;
+            }
+            maybe_fired = fire_rx.recv() => {
+                // The sender is held open for the process lifetime, so this parks
+                // rather than yielding None; break defensively if it ever closes.
+                let Some(fired) = maybe_fired else { break };
+                fire_verb(client, &fired).await;
+            }
+        }
+    }
+}
+
+/// Deliver a resolved verb fire-and-forget. The target service is the verb's
+/// first dot-segment (`desktop.workspace.next` -> `desktop`); a placeholder verb
+/// with no handler (e.g. `user.f09`) simply no-routes, which is fine.
+async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVerb) {
+    let service = fired.verb.split('.').next().unwrap_or("");
+    if service.is_empty() {
+        return;
+    }
+    if let Err(error) = client
+        .send(service, &fired.verb, serde_json::json!({}))
+        .await
+    {
+        eprintln!("cosmix-inputd: fire {} -> {service}: {error}", fired.verb);
     }
 }
