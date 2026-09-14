@@ -56,6 +56,25 @@ const RC_CALLER_ERROR: u8 = 10;
 /// fragment, so this string is the single registration use of it.
 const BUS_SERVICE: &str = "dnsd";
 
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "dnsd.zone.snapshot",
+            &[],
+            "Return the configuration hash and served zone names",
+            true,
+        ),
+        VerbDescriptor::new(
+            "dnsd.stats",
+            &[],
+            "Return DNS response counters by rcode",
+            true,
+        ),
+    ]
+}
+
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -166,7 +185,7 @@ async fn connect_with_backoff(
         {
             Ok(c) => {
                 tracing::info!(service = BUS_SERVICE, "registered as Bus service");
-                return c;
+                return c.with_verbs(verb_manifest());
             }
             Err(e) => {
                 tracing::warn!(

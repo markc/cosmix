@@ -945,6 +945,7 @@ impl Actor {
             );
             return;
         };
+        connection.client().set_verbs(crate::control::verb_manifest());
         let public_key = HexBytes(self.key.verifying_key().to_bytes());
         let hello = match bounded(connection.session_hello()).await {
             Ok(hello) => hello,

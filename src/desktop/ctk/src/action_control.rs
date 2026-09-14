@@ -149,9 +149,33 @@ impl Plugin for ActionPortPlugin {
                     .in_set(crate::app_control::AppPortSystems)
                     .before(crate::app_control::route_app_port),
             )
-            .register_app_verb(ACTION_INVOKE_VERB, invoke_action)
-            .register_app_verb(ACTIONS_LIST_VERB, list_actions)
-            .register_app_verb(ACTIONS_DESCRIBE_VERB, describe_action);
+            .register_app_verb_described(
+                cosmix_bus::VerbDescriptor::new(
+                    ACTION_INVOKE_VERB,
+                    &["id", "args"],
+                    "Invoke a registered application action",
+                    false,
+                ),
+                invoke_action,
+            )
+            .register_app_verb_described(
+                cosmix_bus::VerbDescriptor::new(
+                    ACTIONS_LIST_VERB,
+                    &[],
+                    "List registered application actions",
+                    true,
+                ),
+                list_actions,
+            )
+            .register_app_verb_described(
+                cosmix_bus::VerbDescriptor::new(
+                    ACTIONS_DESCRIBE_VERB,
+                    &["id"],
+                    "Describe a registered action and its arguments",
+                    true,
+                ),
+                describe_action,
+            );
     }
 }
 
@@ -636,7 +660,7 @@ mod tests {
         assert_eq!(rc, 0);
         let verbs = describe["verbs"].as_array().unwrap();
         for verb in [ACTION_INVOKE_VERB, ACTIONS_LIST_VERB, ACTIONS_DESCRIBE_VERB] {
-            assert!(verbs.iter().any(|value| value == verb), "missing {verb}");
+            assert!(verbs.iter().any(|value| value["name"] == verb), "missing {verb}");
         }
     }
 

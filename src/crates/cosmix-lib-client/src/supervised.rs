@@ -271,6 +271,7 @@ pub struct SupervisedClient {
 /// must never wait out a rejection can opt into a terminal state with
 /// [`fatal_on_registration_rejection`](Self::fatal_on_registration_rejection).
 pub struct SupervisedConnectOptions {
+    verbs: Option<Vec<cosmix_bus::VerbDescriptor>>,
     service_name: String,
     noded_url: String,
     provenance: Option<cosmix_bus::RegisterProvenance>,
@@ -279,6 +280,18 @@ pub struct SupervisedConnectOptions {
 }
 
 impl SupervisedConnectOptions {
+    /// Answer HELP centrally on the initial connection and every reconnect.
+    pub fn with_verbs(mut self, verbs: Vec<cosmix_bus::VerbDescriptor>) -> Self {
+        self.verbs = Some(verbs);
+        self
+    }
+
+    /// Send the same process/build provenance on every registration.
+    pub fn with_provenance(mut self, provenance: cosmix_bus::RegisterProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+
     /// Treat any broker registration rejection (collision or admission) as
     /// terminal. Disabled by default for compatibility with existing citizens.
     pub fn fatal_on_registration_rejection(mut self, enabled: bool) -> Self {
@@ -313,6 +326,7 @@ impl SupervisedClient {
     /// Build a supervised connection with opt-in lifecycle policy.
     pub fn connect_options(service_name: &str, noded_url: &str) -> SupervisedConnectOptions {
         SupervisedConnectOptions {
+            verbs: None,
             service_name: service_name.to_string(),
             noded_url: noded_url.to_string(),
             provenance: None,
@@ -355,6 +369,7 @@ impl SupervisedClient {
         options: SupervisedConnectOptions,
     ) -> Result<SupervisedClient, SupervisedError> {
         let SupervisedConnectOptions {
+            verbs,
             service_name,
             noded_url,
             provenance,
@@ -372,6 +387,7 @@ impl SupervisedClient {
                 &noded_url,
                 provenance.clone(),
                 bounded_incoming_capacity,
+                verbs.clone(),
             )
             .await
             {
@@ -464,6 +480,7 @@ impl SupervisedClient {
             fatal_on_registration_rejection,
             bounded_incoming_capacity,
             first_rx,
+            verbs,
         }));
 
         Ok(SupervisedClient {
@@ -916,6 +933,7 @@ impl SupervisorOutgoing {
 }
 
 struct SupervisorCtx {
+    verbs: Option<Vec<cosmix_bus::VerbDescriptor>>,
     inner: Arc<RwLock<Arc<NodedClient>>>,
     state_tx: watch::Sender<ConnState>,
     state_publish: Arc<std::sync::Mutex<()>>,
@@ -1032,6 +1050,7 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                 &ctx.noded_url,
                 ctx.provenance.clone(),
                 ctx.bounded_incoming_capacity,
+                ctx.verbs.clone(),
             )
             .await
             {

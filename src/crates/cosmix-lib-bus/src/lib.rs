@@ -8,6 +8,44 @@ pub use service_info::{NodeInfo, RegisterProvenance, SCHEMA_VERSION, ServiceInfo
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// One entry in a SPEC 02 HELP reply. Metadata describes capabilities; it
+/// does not grant permission to invoke them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerbDescriptor {
+    pub name: String,
+    pub args: Vec<String>,
+    pub description: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl VerbDescriptor {
+    pub fn new(name: &str, args: &[&str], description: &str, read_only: bool) -> Self {
+        Self {
+            name: name.into(),
+            args: args.iter().map(|arg| (*arg).into()).collect(),
+            description: description.into(),
+            read_only,
+        }
+    }
+}
+
+#[cfg(test)]
+mod verb_descriptor_tests {
+    use super::VerbDescriptor;
+
+    #[test]
+    fn help_shape_is_additive_to_mix_descriptors() {
+        let old = serde_json::json!({"name":"status", "args":[], "description":"Read status"});
+        let descriptor: VerbDescriptor = serde_json::from_value(old).unwrap();
+        assert!(!descriptor.read_only);
+        assert_eq!(
+            serde_json::to_value(VerbDescriptor::new("status", &[], "Read status", true)).unwrap(),
+            serde_json::json!({"name":"status", "args":[], "description":"Read status", "read_only":true})
+        );
+    }
+}
+
 // ── RC codes (ARexx convention) ──
 
 pub const RC_SUCCESS: u8 = 0;

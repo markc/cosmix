@@ -213,8 +213,23 @@ type AppVerbSystem = SystemId<In<AppPortRequest>, AppPortReply>;
 /// Exact command → typed Bevy handler. Private so registration can enforce a
 /// single owner per verb and the router remains the sole response owner.
 #[derive(Resource, Default)]
-struct AppVerbRegistry {
+pub(crate) struct AppVerbRegistry {
     by_command: HashMap<String, AppVerbSystem>,
+    descriptors: HashMap<String, cosmix_bus::VerbDescriptor>,
+}
+
+impl AppVerbRegistry {
+    pub(crate) fn manifest(&self) -> Vec<cosmix_bus::VerbDescriptor> {
+        let mut verbs: Vec<_> = self.descriptors.values().cloned().collect();
+        verbs.push(cosmix_bus::VerbDescriptor::new(
+            "HELP",
+            &[],
+            "List all commands this service accepts",
+            true,
+        ));
+        verbs.sort_by(|a, b| a.name.cmp(&b.name));
+        verbs
+    }
 }
 
 #[cfg(feature = "actions")]
@@ -232,6 +247,12 @@ pub(crate) fn app_verb_registered(app: &App, command: &str) -> bool {
 /// construction rather than becoming order-dependent at runtime. The reusable
 /// action plugin owns the exact `action.invoke` and `actions.*` exceptions.
 pub trait AppPortAppExt {
+    fn register_app_verb_described<M>(
+        &mut self,
+        descriptor: cosmix_bus::VerbDescriptor,
+        handler: impl IntoSystem<In<AppPortRequest>, AppPortReply, M> + 'static,
+    ) -> &mut Self;
+
     fn register_app_verb<M>(
         &mut self,
         command: impl Into<String>,
@@ -246,6 +267,18 @@ impl AppPortAppExt for App {
         handler: impl IntoSystem<In<AppPortRequest>, AppPortReply, M> + 'static,
     ) -> &mut Self {
         let command = command.into();
+        self.register_app_verb_described(
+            cosmix_bus::VerbDescriptor::new(&command, &[], "Application command", false),
+            handler,
+        )
+    }
+
+    fn register_app_verb_described<M>(
+        &mut self,
+        descriptor: cosmix_bus::VerbDescriptor,
+        handler: impl IntoSystem<In<AppPortRequest>, AppPortReply, M> + 'static,
+    ) -> &mut Self {
+        let command = descriptor.name.clone();
         assert!(
             self.is_plugin_added::<AppPortPlugin>(),
             "register AppPortPlugin before app-port verbs"
@@ -269,6 +302,10 @@ impl AppPortAppExt for App {
             "duplicate app-port verb registration: {command}"
         );
         let system = self.world_mut().register_system(handler);
+        self.world_mut()
+            .resource_mut::<AppVerbRegistry>()
+            .descriptors
+            .insert(command.clone(), descriptor);
         self.world_mut()
             .resource_mut::<AppVerbRegistry>()
             .by_command
@@ -374,6 +411,20 @@ impl Plugin for AppPortPlugin {
             .by_command
             .insert("app.quit".into(), quit);
         assert!(replaced.is_none(), "app.quit registered twice");
+        for descriptor in [
+            cosmix_bus::VerbDescriptor::new(
+                "app.describe",
+                &[],
+                "Describe application identity, controls and verbs",
+                true,
+            ),
+            cosmix_bus::VerbDescriptor::new("app.quit", &[], "Quit the application cleanly", false),
+        ] {
+            app.world_mut()
+                .resource_mut::<AppVerbRegistry>()
+                .descriptors
+                .insert(descriptor.name.clone(), descriptor);
+        }
         app.add_systems(Update, route_app_port.in_set(AppPortSystems));
     }
 }
@@ -396,9 +447,33 @@ impl Plugin for WidgetControlPlugin {
                     .chain()
                     .before(AppPortSystems),
             )
-            .register_app_verb("app.controls.list", handle_widget_request)
-            .register_app_verb("app.controls.get", handle_widget_request)
-            .register_app_verb("app.controls.set", handle_widget_request);
+            .register_app_verb_described(
+                cosmix_bus::VerbDescriptor::new(
+                    "app.controls.list",
+                    &[],
+                    "List application controls",
+                    true,
+                ),
+                handle_widget_request,
+            )
+            .register_app_verb_described(
+                cosmix_bus::VerbDescriptor::new(
+                    "app.controls.get",
+                    &["id"],
+                    "Read a control value",
+                    true,
+                ),
+                handle_widget_request,
+            )
+            .register_app_verb_described(
+                cosmix_bus::VerbDescriptor::new(
+                    "app.controls.set",
+                    &["id", "value"],
+                    "Set a control value",
+                    false,
+                ),
+                handle_widget_request,
+            );
     }
 }
 
@@ -668,8 +743,7 @@ fn describe_app(
 ) -> AppPortReply {
     // The exact app.* verbs this port answers, sorted for a stable reply — an
     // agent discovers what it can DO here, not just that the app exists.
-    let mut verb_names: Vec<&str> = verbs.by_command.keys().map(String::as_str).collect();
-    verb_names.sort_unstable();
+    let descriptors = verbs.manifest();
     (
         0,
         json!({
@@ -686,7 +760,7 @@ fn describe_app(
             "version": info.version,
             "description": info.description,
             "controls": registry.as_deref().map_or(0, ControlRegistry::len),
-            "verbs": verb_names,
+            "verbs": descriptors,
         })
         .to_string(),
     )
@@ -1297,10 +1371,23 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["name"].as_str().unwrap())
             .collect();
         assert!(verbs.contains(&"app.describe"));
         assert!(verbs.contains(&"app.controls.set"));
+        assert_eq!(
+            describe["verbs"],
+            serde_json::to_value(app.world().resource::<AppVerbRegistry>().manifest()).unwrap()
+        );
+        let set = describe["verbs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|verb| verb["name"] == "app.controls.set")
+            .unwrap();
+        assert_eq!(set["args"], json!(["id", "value"]));
+        assert_eq!(set["read_only"], false);
+        assert_eq!(set["description"], "Set a control value");
 
         let (rc, list) = call(&mut app, &request("app.controls.list", &[]));
         assert_eq!(rc, 0);

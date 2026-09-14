@@ -20,6 +20,121 @@ const PER_ACTOR: usize = 1024;
 const TOTAL: usize = 4096;
 const ACTORS: usize = 256;
 
+/// Public command metadata; invocation still passes the recipient's policy
+/// and target/generation checks. Native identity is published after install.
+pub(crate) fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    let mut verbs = vec![VerbDescriptor::new(
+        "HELP",
+        &[],
+        "List all commands this service accepts",
+        true,
+    )];
+    for (name, args, description, read_only) in [
+        (
+            "term.session",
+            &[][..],
+            "Read session identity and pane binding diagnostics",
+            true,
+        ),
+        ("term.list", &[][..], "List terminal session state", true),
+        ("term.tabs", &[][..], "List tabs and their state", true),
+        ("term.panes", &[][..], "List panes and their state", true),
+        (
+            "term.snapshot",
+            &["contents"][..],
+            "Read pane screen metadata and optional contents",
+            true,
+        ),
+        (
+            "term.type",
+            &["text", "foreground_generation"][..],
+            "Send text to the target pane",
+            false,
+        ),
+        ("term.tab.new", &[][..], "Open and activate a tab", false),
+        ("term.tab.select", &[][..], "Select the target tab", false),
+        (
+            "term.tab.close",
+            &["affected"][..],
+            "Close the target tab",
+            false,
+        ),
+        (
+            "term.pane.split",
+            &["dir"][..],
+            "Split the target pane horizontally or vertically",
+            false,
+        ),
+        ("term.pane.select", &[][..], "Select the target pane", false),
+        ("term.pane.close", &[][..], "Close the target pane", false),
+        (
+            "term.operation",
+            &["operation_id"][..],
+            "Read a retained operation outcome",
+            true,
+        ),
+        (
+            "term.execute",
+            &["source", "prompt_generation"][..],
+            "Execute Mix source at the target shell prompt",
+            false,
+        ),
+        (
+            "term.exec.result",
+            &["operation_id"][..],
+            "Read an execution result",
+            true,
+        ),
+        (
+            "term.exec.cancel",
+            &["operation_id"][..],
+            "Cancel an execution",
+            false,
+        ),
+        (
+            "term.task.submit",
+            &["source", "argv", "cwd", "env", "timeout_ms"][..],
+            "Submit an isolated shell task",
+            false,
+        ),
+        (
+            "term.task.result",
+            &["operation_id"][..],
+            "Read an isolated task result",
+            true,
+        ),
+        (
+            "term.task.cancel",
+            &["operation_id"][..],
+            "Cancel an isolated task",
+            false,
+        ),
+        (
+            "term.props.get",
+            &["property", "contents"][..],
+            "Read pane state or contents through properties",
+            true,
+        ),
+        (
+            "term.props.set",
+            &["property", "value"][..],
+            "Select a pane or send input through properties",
+            false,
+        ),
+    ] {
+        let mut descriptor = VerbDescriptor::new(name, args, description, read_only);
+        descriptor.args.insert(0, "target".into());
+        if !read_only {
+            descriptor
+                .args
+                .extend(["request_id".into(), "request_epoch".into()]);
+        }
+        verbs.push(descriptor);
+    }
+    verbs
+}
+
 /// Same default-open posture as CTK app-control and desktop.mix.
 pub(crate) fn mesh_open() -> bool {
     std::env::var("COSMIX_MESH_OPEN").map_or(true, |value| value != "0")

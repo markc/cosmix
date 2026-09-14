@@ -2928,7 +2928,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-lib-bus"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "libc",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3224,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-tower"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.54.3"
+version = "0.54.4"
 dependencies = [
  "accesskit",
  "ammonia",

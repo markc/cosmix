@@ -278,6 +278,8 @@ pub fn configured_noded_url() -> Option<String> {
 
 #[derive(Resource, Clone, Debug)]
 pub struct BusBridgeConfig {
+    /// Optional HELP manifest for the exclusive app control connection.
+    pub verbs: Option<Vec<cosmix_bus::VerbDescriptor>>,
     pub service_name: String,
     pub noded_url: String,
     /// Immutable process/build identity sent on both registrations and every
@@ -303,6 +305,7 @@ pub struct BusBridgeConfig {
 impl BusBridgeConfig {
     pub fn new(service_name: impl Into<String>, noded_url: impl Into<String>) -> Self {
         Self {
+            verbs: None,
             service_name: service_name.into(),
             noded_url: noded_url.into(),
             provenance: process_provenance(),
@@ -1028,6 +1031,7 @@ impl Plugin for BusBridgePlugin {
 pub(crate) fn start_bridge(
     mut commands: Commands,
     config: Res<BusBridgeConfig>,
+    verbs: Option<Res<crate::app_control::AppVerbRegistry>>,
     #[cfg(feature = "theme")] event_loop_proxy: Option<Res<bevy::winit::EventLoopProxyWrapper>>,
 ) {
     let (request_tx, request_rx) = flume::bounded(config.outbound_capacity.max(1));
@@ -1044,7 +1048,10 @@ pub(crate) fn start_bridge(
     let latest_messages = Arc::new(Mutex::new(HashMap::new()));
     let semantic_inboxes = Arc::new(SemanticInboxes::default());
     let committed_generation = Arc::new(AtomicU64::new(1));
-    let worker_config = config.clone();
+    let mut worker_config = config.clone();
+    if let Some(verbs) = verbs {
+        worker_config.verbs = Some(verbs.manifest());
+    }
     let worker_latest = latest_messages.clone();
     let worker_semantic = semantic_inboxes.clone();
     let worker_generation = committed_generation.clone();
@@ -1236,9 +1243,15 @@ async fn worker_loop(params: WorkerLoopParams) {
     // WorkerRequest::Call is issued here and it carries NO subscriptions, so
     // RPC replies are never head-of-line-blocked behind telemetry publications.
     let control = Arc::new(
-        match connect_supervised_plane(&config.service_name, &config.noded_url, &config.provenance)
-            .await
-        {
+        match {
+            let mut options =
+                SupervisedClient::connect_options(&config.service_name, &config.noded_url)
+                    .with_provenance(config.provenance.clone());
+            if let Some(verbs) = &config.verbs {
+                options = options.with_verbs(verbs.clone());
+            }
+            options.connect().await
+        } {
             Ok(client) => client,
             Err(error) => {
                 let _ = events

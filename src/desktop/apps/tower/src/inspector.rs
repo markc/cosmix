@@ -51,8 +51,28 @@ pub(crate) struct AppDescription {
     pub pid: Option<u32>,
     #[serde(default)]
     pub controls: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "verbs_as_names")]
     pub verbs: Vec<String>,
+}
+
+/// Accept both the legacy `verbs: ["a","b"]` string array and the universal-HELP
+/// `verbs: [{"name","args","description","read_only"}]` descriptor array
+/// (app.describe now carries descriptors), keeping just the names Tower displays.
+fn verbs_as_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Vec<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|value| match value {
+            serde_json::Value::String(name) => Some(name),
+            serde_json::Value::Object(mut map) => map
+                .remove("name")
+                .and_then(|name| name.as_str().map(str::to_owned)),
+            _ => None,
+        })
+        .collect())
 }
 
 impl AppDescription {
