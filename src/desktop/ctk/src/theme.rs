@@ -34,7 +34,7 @@ use bevy::window::WindowFocused;
 use std::collections::HashSet;
 
 const AUTHORED_BODY_PX: f32 = 13.0;
-const DEFAULT_BODY_PX: f32 = 13.333;
+const DEFAULT_BODY_PX: f32 = 15.333;
 /// Bounds on the configured base size. Below the floor chrome is unreadable;
 /// above the ceiling a single mistyped digit (`13333` for `13.333`) would ask
 /// Bevy to rasterise glyph atlases thousands of pixels tall during startup.
@@ -187,6 +187,7 @@ pub enum TypographyProvenance {
     AppTheme,
     DirectApply,
     EmbeddedFallback,
+    Environment,
 }
 
 /// Whether CTK is using the requested family or a safe fallback.
@@ -222,14 +223,34 @@ pub struct CtkTypography {
     pub last_warning: Option<String>,
     observed_theme_revision: Option<u64>,
     warned_families: HashSet<String>,
+    environment_family: Option<String>,
+    environment_body_px: Option<f32>,
 }
 
 impl Default for CtkTypography {
     fn default() -> Self {
+        Self::with_environment(
+            std::env::var("COSMIX_UI_FONT").ok().as_deref(),
+            std::env::var("COSMIX_UI_FONT_PX").ok().as_deref(),
+        )
+    }
+}
+
+impl CtkTypography {
+    fn with_environment(family: Option<&str>, body_px: Option<&str>) -> Self {
+        let environment_family = family
+            .map(str::trim)
+            .filter(|family| !family.is_empty())
+            .map(str::to_owned);
+        let environment_body_px = body_px
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && (MIN_BODY_PX..=MAX_BODY_PX).contains(value));
         Self {
             effective_family: None,
-            requested_family: DEFAULT_FONT_FAMILY.to_string(),
-            body_px: AUTHORED_BODY_PX,
+            requested_family: environment_family
+                .clone()
+                .unwrap_or_else(|| DEFAULT_FONT_FAMILY.to_string()),
+            body_px: environment_body_px.unwrap_or(DEFAULT_BODY_PX),
             revision: 0,
             fallback: TypographyFallback::Embedded,
             family_provenance: TypographyProvenance::EmbeddedFallback,
@@ -237,6 +258,8 @@ impl Default for CtkTypography {
             last_warning: None,
             observed_theme_revision: None,
             warned_families: HashSet::new(),
+            environment_family,
+            environment_body_px,
         }
     }
 }
@@ -1084,6 +1107,11 @@ impl ThemeState {
 #[derive(Message, Clone, Debug)]
 pub struct ApplyTheme(pub ThemeSpec);
 
+/// Optional application chrome mode, retained across shared theme reloads.
+/// The selected scheme and typography still follow the theme cascade.
+#[derive(Resource)]
+pub struct CtkThemeMode(pub Mode);
+
 /// Apply one spec immediately and advance [`ThemeState`] when its colours,
 /// typography or identity changed. This function never mutates
 /// [`CtkThemeMetrics`].
@@ -1164,9 +1192,15 @@ fn configure_typography(
         typography.family_provenance,
         typography.body_px_provenance,
     );
-    let requested_family = state.typography.family.trim();
+    // Deployment overrides win over the theme cascade, including live reloads.
+    let requested_family = typography
+        .environment_family
+        .as_deref()
+        .unwrap_or(state.typography.family.trim());
     typography.requested_family = requested_family.to_string();
-    let requested_body_px = clamp_body_px(state.typography.body_px);
+    let requested_body_px = typography
+        .environment_body_px
+        .unwrap_or_else(|| clamp_body_px(state.typography.body_px));
 
     let resolved = font_cx
         .collection
@@ -1179,12 +1213,20 @@ fn configure_typography(
     // size would make the same theme file mean different things depending on
     // whether the family happened to resolve earlier in the process's life.
     typography.body_px = requested_body_px;
-    typography.body_px_provenance = state.typography_body_px_provenance;
+    typography.body_px_provenance = if typography.environment_body_px.is_some() {
+        TypographyProvenance::Environment
+    } else {
+        state.typography_body_px_provenance
+    };
 
     if resolved {
         typography.effective_family = Some(requested_family.to_string());
         typography.fallback = TypographyFallback::Requested;
-        typography.family_provenance = state.typography_family_provenance;
+        typography.family_provenance = if typography.environment_family.is_some() {
+            TypographyProvenance::Environment
+        } else {
+            state.typography_family_provenance
+        };
         typography.last_warning = None;
     } else {
         // Log once per family, but keep `last_warning` populated for any run
@@ -1530,12 +1572,20 @@ pub(crate) fn apply_theme_requests(
     mut requests: MessageReader<ApplyTheme>,
     mut theme: ResMut<UiTheme>,
     mut state: ResMut<ThemeState>,
+    mode: Option<Res<CtkThemeMode>>,
 ) {
     for request in requests.read() {
-        if state.matches(&request.0) {
+        let mut spec = request.0.clone();
+        if let Some(mode) = &mode {
+            if spec.mode != mode.0 {
+                spec.mode = mode.0;
+                spec.colors = ThemeSpec::from_scheme(spec.scheme, mode.0).colors;
+            }
+        }
+        if state.matches(&spec) {
             continue;
         }
-        apply_theme(&mut theme, &mut state, &request.0);
+        apply_theme(&mut theme, &mut state, &spec);
     }
 }
 
@@ -3190,13 +3240,73 @@ mod tests {
         assert_eq!(spec.scheme, Scheme::Ocean);
         assert_eq!(spec.mode, Mode::Light);
         assert_eq!(spec.typography.family, "Noto Sans");
-        assert_eq!(spec.typography.body_px, 13.333);
+        assert_eq!(spec.typography.body_px, 15.333);
         // surface is the web Ocean-light bg-primary: oklch(98% .008 220).
         assert_eq!(spec.colors.surface, ok(98., 0.008, 220.).color());
         // control.active is the web accent: oklch(50% .12 220).
         assert_eq!(spec.colors.control_active, ok(50., 0.12, 220.).color());
         assert_eq!(spec.metrics.fader_height, 250.0);
         assert_eq!(ThemeSpec::default().colors.thumb, spec.colors.thumb);
+    }
+
+    #[test]
+    fn typography_environment_ignores_empty_family_and_invalid_sizes() {
+        for value in ["", "bad", "NaN", "inf", "5.9", "96.1"] {
+            let typography = CtkTypography::with_environment(Some("  "), Some(value));
+            assert_eq!(typography.requested_family, DEFAULT_FONT_FAMILY);
+            assert_eq!(typography.body_px, DEFAULT_BODY_PX);
+            assert!(typography.environment_body_px.is_none());
+        }
+        for value in ["6", "17.5", "96"] {
+            let typography = CtkTypography::with_environment(Some(" Example Sans "), Some(value));
+            assert_eq!(typography.requested_family, "Example Sans");
+            assert_eq!(typography.body_px, value.parse::<f32>().unwrap());
+        }
+    }
+
+    #[test]
+    fn typography_environment_survives_theme_resolution_and_reload() {
+        let mut typography =
+            CtkTypography::with_environment(Some("CTK Missing Deployment Font 36d7"), Some("17.5"));
+        let mut font_cx = FontCx::default();
+        let mut state = ThemeState::default();
+        let mut theme = UiTheme::default();
+        for size in [12.0, 24.0] {
+            let mut spec = ThemeSpec::builtin();
+            spec.typography.body_px = size;
+            apply_theme(&mut theme, &mut state, &spec);
+            configure_typography(&state, &mut typography, &mut font_cx);
+            assert_eq!(
+                typography.requested_family,
+                "CTK Missing Deployment Font 36d7"
+            );
+            assert_eq!(typography.body_px, 17.5);
+            assert_eq!(
+                typography.body_px_provenance,
+                TypographyProvenance::Environment
+            );
+            assert_eq!(typography.fallback, TypographyFallback::Embedded);
+        }
+    }
+
+    #[test]
+    fn typography_and_scheme_survive_a_fixed_dark_mode_reload() {
+        let mut app = App::new();
+        app.add_plugins(CtkThemePlugin::default())
+            .insert_resource(CtkThemeMode(Mode::Dark));
+        let mut spec = ThemeSpec::from_scheme(Scheme::Ocean, Mode::Light);
+        spec.typography.body_px = 18.0;
+        spec.typography.family = "Example Sans".into();
+        app.world_mut().write_message(ApplyTheme(spec.clone()));
+        app.update();
+        let state = app.world().resource::<ThemeState>();
+        assert_eq!(state.mode, Mode::Dark);
+        assert_eq!(state.scheme, spec.scheme);
+        assert_eq!(state.typography, spec.typography);
+        let theme = app.world().resource::<UiTheme>();
+        let dark = ThemeSpec::from_scheme(spec.scheme, Mode::Dark);
+        assert_eq!(ctk_color(theme, &tokens::PANEL), dark.colors.panel);
+        assert_eq!(ctk_color(theme, &tokens::TEXT), dark.colors.text);
     }
 
     #[test]

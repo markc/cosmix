@@ -351,6 +351,11 @@ fn pane_subtree_is_stable_on_focus_and_repairs_late_bus_border() {
         .unwrap();
     app.update();
     let split_root = app.world().resource::<View>().pane_root.unwrap();
+    assert_eq!(
+        app.world().get::<Children>(split_root).unwrap().len(),
+        2,
+        "split slots butt together without a divider entity"
+    );
     assert_ne!(original_root, split_root);
     assert!(app.world().get_entity(original_root).is_err());
     assert_eq!(
@@ -375,6 +380,14 @@ fn pane_subtree_is_stable_on_focus_and_repairs_late_bus_border() {
     }
     app.update();
     assert_eq!(app.world().resource::<View>().pane_root, Some(split_root));
+    assert_eq!(
+        app.world().get::<Node>(first_container).unwrap().border,
+        UiRect::all(px(1))
+    );
+    assert_eq!(
+        app.world().get::<Node>(second_container).unwrap().border,
+        UiRect::ZERO
+    );
     assert_eq!(
         app.world()
             .get::<bevy::feathers::theme::ThemeBorderColor>(first_container)

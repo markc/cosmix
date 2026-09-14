@@ -326,6 +326,7 @@ fn main() {
             }),
             ..default()
         }))
+        .insert_resource(ctk::theme::CtkThemeMode(ctk::theme::Mode::Dark))
         .add_plugins((FeathersPlugins, CtkThemePlugin::default()))
         .add_plugins(ctk_plugins());
     // Network-ARexx superpowers are earned by mesh membership, not assumed:
@@ -386,7 +387,11 @@ fn setup(
     mut focus: ResMut<InputFocus>,
 ) {
     *theme = UiTheme(create_dark_theme());
-    apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
+    apply_theme(
+        &mut theme,
+        &mut theme_state,
+        &ThemeSpec::from_scheme(ctk::theme::Scheme::Ocean, ctk::theme::Mode::Dark),
+    );
     commands.spawn(Camera2d);
     let menus = [
         MenuDef {
@@ -516,7 +521,13 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
     view.tab_buttons.push(button);
 }
 
-fn bind_menu(mut view: ResMut<View>, children: Query<&Children>, nodes: Query<&Node>) {
+fn bind_menu(
+    mut commands: Commands,
+    mut view: ResMut<View>,
+    children: Query<&Children>,
+    nodes: Query<&Node>,
+    text: Query<(), With<Text>>,
+) {
     // CTK exposes no bar open-state API. Isolate its current public Node tree
     // adapter here: bar -> anchor -> absolute dropdown. Fail closed on drift.
     if let Ok(anchors) = children.get(view.menu) {
@@ -547,6 +558,14 @@ fn bind_menu(mut view: ResMut<View>, children: Query<&Children>, nodes: Query<&N
                             Vec::new()
                         };
                         view.dropdowns.push((entity, entries));
+                    } else if let Ok(labels) = children.get(entity) {
+                        // Menu titles stay white rather than inheriting the
+                        // selected palette's tinted ctk.text colour.
+                        for label in labels.iter().filter(|label| text.contains(*label)) {
+                            commands.entity(label)
+                                .remove::<bevy::feathers::theme::ThemeTextColor>()
+                                .insert(TextColor(Color::WHITE));
+                        }
                     }
                 }
             }
@@ -862,8 +881,9 @@ fn spawn_pane_tree(
     images: &mut Assets<Image>,
     tree: &panes::PaneTree,
     views: &mut Vec<PaneView>,
+    active: u64,
 ) -> Entity {
-    use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor};
+    use bevy::feathers::theme::ThemeBorderColor;
     use ctk::theme::tokens;
     match tree {
         panes::PaneTree::Leaf(pane) => {
@@ -898,7 +918,11 @@ fn spawn_pane_tree(
                         height: percent(100),
                         min_width: px(0),
                         min_height: px(0),
-                        border: UiRect::all(px(1)),
+                        border: if id == active {
+                            UiRect::all(px(1))
+                        } else {
+                            UiRect::ZERO
+                        },
                         overflow: Overflow::clip(),
                         border_radius: BorderRadius::bottom(px(8.0)),
                         ..default()
@@ -955,26 +979,8 @@ fn spawn_pane_tree(
                     ..default()
                 })
                 .id();
-            // A zero basis divides the space left AFTER the fixed divider.
-            // These weighted slots contain the recursively mirrored subtrees.
-            for (index, (tree, weight)) in [(first, *ratio), (second, 1.0 - ratio)]
-                .into_iter()
-                .enumerate()
-            {
-                if index == 1 {
-                    let divider = commands
-                        .spawn((
-                            Node {
-                                width: if vertical { px(3) } else { percent(100) },
-                                height: if vertical { percent(100) } else { px(3) },
-                                flex_shrink: 0.0,
-                                ..default()
-                            },
-                            ThemeBackgroundColor(tokens::BORDER),
-                        ))
-                        .id();
-                    commands.entity(root).add_child(divider);
-                }
+            // Weighted slots share the entire allocation, with no separator.
+            for (tree, weight) in [(first, *ratio), (second, 1.0 - ratio)] {
                 let slot = commands
                     .spawn(Node {
                         flex_basis: px(0),
@@ -987,7 +993,7 @@ fn spawn_pane_tree(
                         ..default()
                     })
                     .id();
-                let child = spawn_pane_tree(commands, images, tree, views);
+                let child = spawn_pane_tree(commands, images, tree, views, active);
                 commands.entity(slot).add_child(child);
                 commands.entity(root).add_child(slot);
             }
@@ -1002,7 +1008,7 @@ fn sync_panes(
     mut view: ResMut<View>,
     mut images: ResMut<Assets<Image>>,
     mut focus: ResMut<InputFocus>,
-    borders: Query<&bevy::feathers::theme::ThemeBorderColor>,
+    mut borders: Query<(&bevy::feathers::theme::ThemeBorderColor, &mut Node)>,
 ) {
     let tabs = core.0.lock().unwrap();
     if tabs.is_empty() {
@@ -1022,6 +1028,7 @@ fn sync_panes(
             &mut images,
             &tabs.active_tab().tree,
             &mut view.pane_views,
+            tabs.active_tab().active_pane,
         );
         commands.entity(view.centre).add_child(root);
         view.pane_root = Some(root);
@@ -1029,6 +1036,16 @@ fn sync_panes(
     }
     let active = tabs.active_tab().active_pane;
     for pane in &view.pane_views {
+        let width = if pane.id == active {
+            UiRect::all(px(1))
+        } else {
+            UiRect::ZERO
+        };
+        if let Ok((_, mut node)) = borders.get_mut(pane.container)
+            && node.border != width
+        {
+            node.border = width;
+        }
         let token = if pane.id == active {
             ctk::theme::tokens::CONTROL_ACTIVE
         } else {
@@ -1038,7 +1055,7 @@ fn sync_panes(
         // the installed border token, independently of the last drawn cursor.
         if !borders
             .get(pane.container)
-            .is_ok_and(|border| border.0 == token)
+            .is_ok_and(|(border, _)| border.0 == token)
         {
             commands
                 .entity(pane.container)
