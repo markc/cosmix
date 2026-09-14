@@ -3234,6 +3234,28 @@ fn admitted_delivery_peer(
     let crate::authority::Posture::Verified(accepted) = &authority.posture else {
         return None;
     };
+    // AGENTIC-FIRST mesh_open (Mark, 2026-09-14): attest any Verified WG mesh
+    // peer by resolving its source WG address to the signed-inventory ActiveBus
+    // member name, WITHOUT the Enforce-mode d2 admission proof. WG peering plus
+    // the signed inventory already bound the peer's identity to that address, so
+    // this is the "/24 + signed inventory is the trust boundary" posture: it
+    // stamps broker_peer/broker_service so the attested-mesh app path
+    // (broker_origin=mesh, from=bridge-<peer>) works and ABP flows freely
+    // between admitted peers. The d2-Enforce gate below is retained and used
+    // when mesh_open is off (re-armed per node once the mesh matures).
+    if state.mesh_open && !is_same_node_origin(source_ip, &state.bind) {
+        let peer = accepted.routing_view.iter().find_map(|member| match member {
+            crate::authority::RoutingMember::ActiveBus { name, mesh_ip, .. }
+                if *mesh_ip == source_ip =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })?;
+        return reload_revoke_detail(accepted.members_full.get(&peer), accepted.epoch)
+            .is_none()
+            .then_some(peer);
+    }
     let RegisterGate::Admit(peer) = register_gate_decision(
         source_ip,
         &state.bind,
