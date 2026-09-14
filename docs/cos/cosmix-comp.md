@@ -4,6 +4,40 @@
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.
 
+## KMS hardware cursor
+
+The `kms-live` build (with the default Bus, frame-capture and XWayland
+features) uses an optional DRM cursor plane. `native-quoin` is not required.
+The live atomic presenter enumerates ARGB8888 cursor planes compatible with
+the selected CRTC, checks their atomic properties, and queries the driver's
+cursor width/height caps (64×64 for older drivers without these caps).
+
+Cursor images use two transparent, pitch-aware ARGB dumb buffers. Image
+changes pass an atomic test-only check before a synchronous cursor-plane
+commit; hotspots, output scale, SHM source rectangles and transforms are
+applied to the uploaded image and placement. Motion commits change only
+`CRTC_X`/`CRTC_Y`, use `NONBLOCK`, and request no pageflip event. A busy motion
+commit is retried with the newest position on the next scene drain. These
+commits do not flip the primary plane or advance its scene revision.
+If a pending cursor commit makes the next primary commit busy, the presenter
+retries at bounded 2 ms intervals within its original deadline; it does not
+wait for a cursor pageflip event that was never requested.
+
+Once hardware projection succeeds, the software cursor entity is hidden.
+The transition renders once to remove its old pixels. Missing planes,
+allocation/admission/commit errors restore the software path and log the
+reason. Oversized or GPU-only DMA-BUF cursor images use software projection;
+a later supported image can use the plane again. Cursor resources are
+retired with the output and re-enumerated after resume; revoked generations
+cannot submit cursor updates. Capture retains its separate cursor snapshot.
+
+Offline tests cover cursor requests, pixel packing and scene fallback.
+Driver acceptance and motion smoothness still require a live session check:
+move the pointer over an animated wallpaper, change cursor shapes, drag a
+window, toggle panels, and exercise display sleep/wake. Check the hardware
+cursor log and frame trace; cursor motion alone should not create primary
+scene revisions or `comp_render` work after the scene settles.
+
 ## Optional F9 Bus action
 
 `--f9-bus <service> <verb>` arms an unmodified F9 press to send a native ABP

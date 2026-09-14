@@ -1,6 +1,6 @@
 mod atomic_present;
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-mod atomic_presentation;
+pub(crate) mod atomic_presentation;
 pub(crate) mod kms;
 pub(crate) mod kms_live;
 /// Present whenever the live session can exist, and under test so its policy is

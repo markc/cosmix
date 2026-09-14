@@ -1619,7 +1619,10 @@ impl LiveRenderEngine {
             bridge,
             cancellation,
         } = backend;
+        let cursor = super::atomic_presentation::cursor::HardwareCursorBridge::default();
+        app.insert_resource(cursor.clone());
         let ownership = LiveRenderPlatformOwnership(LiveAtomicOwnership {
+            cursor,
             targets: BTreeMap::new(),
             retained_buffers: BTreeMap::new(),
             fail_closed_ownership_islands: FailClosedAtomicOwnershipIslands::default(),
@@ -3290,6 +3293,7 @@ fn drop_live_ownership_fail_closed<T, E>(
 
 #[cfg(all(feature = "kms-live", not(test)))]
 struct LiveAtomicOwnership {
+    cursor: super::atomic_presentation::cursor::HardwareCursorBridge,
     targets: BTreeMap<OutputKey, LiveAtomicTarget>,
     retained_buffers: BTreeMap<OutputKey, RetainedAtomicBuffer>,
     fail_closed_ownership_islands: FailClosedAtomicOwnershipIslands,
@@ -3966,6 +3970,18 @@ impl LiveAtomicOwnership {
         // The TEST_ONLY probe has already proved this exact slot/request. Keep
         // the mutable binding explicit so no later refactor can omit it.
         debug_assert!(presenter.framebuffer(first_slot).is_some());
+        match pool.duplicate_drm_fd() {
+            Ok(fd) => self.cursor.install(
+                fd,
+                selection,
+                Arc::clone(&event_router),
+                Arc::clone(&self.cancellation),
+                self.target_generation,
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "cursor fd duplication failed; using software cursor")
+            }
+        }
         let state = Arc::new(Mutex::new(LiveAtomicTargetState {
             pool,
             presenter,
@@ -4123,6 +4139,7 @@ impl LiveAtomicOwnership {
         key: Option<&OutputKey>,
         retain_displayed_buffer: bool,
     ) -> Result<(), KmsRenderPlatformFailure> {
+        self.cursor.clear();
         if key.is_none() && retain_displayed_buffer {
             let active_keys = self.targets.keys().cloned().collect::<BTreeSet<_>>();
             self.reap_retained_buffers_except(

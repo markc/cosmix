@@ -34,6 +34,9 @@ use super::{
 
 const ATOMIC_PRESENT_TIMEOUT_CODE: &str = "kms-live-atomic-present-deadline-expired";
 
+#[path = "atomic_cursor.rs"]
+pub(crate) mod cursor;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AtomicPropertyIds {
     connector_crtc_id: u32,
@@ -723,12 +726,18 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                         );
                         return Ok(CommitWaitOutcome::Cancelled);
                     }
+                    // A cursor-only NONBLOCK commit deliberately emits no
+                    // pageflip event. Its completion can release EBUSY without
+                    // making the DRM fd readable. Poll short slices and retry,
+                    // retaining the original absolute presentation deadline.
+                    let retry_deadline =
+                        absolute_deadline.min(Instant::now() + Duration::from_millis(2));
                     match self
                         .io
                         .wait_ready(
                             self.selection.crtc_id,
                             self.cancellation.event.as_fd(),
-                            absolute_deadline,
+                            retry_deadline,
                         )
                         .map_err(|detail| {
                             AtomicCommitError::synthetic("atomic EBUSY wait", detail)
@@ -736,6 +745,9 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                         AtomicWaitReady::Deadline if self.cancellation.cancelled(generation) => {
                             return Ok(CommitWaitOutcome::Cancelled);
                         }
+                        AtomicWaitReady::Deadline
+                            if retry_deadline < absolute_deadline
+                                && Instant::now() < absolute_deadline => {}
                         AtomicWaitReady::Deadline => return Err(error),
                         AtomicWaitReady::Ready { drm, cancel } => {
                             if self.cancellation.cancelled(generation) {
@@ -2762,7 +2774,8 @@ mod tests {
         presenter
             .admission_probe(ScanoutSlotId(0), 7, deadline)
             .expect("bounded EBUSY retry succeeds");
-        assert_eq!(presenter.io.observed_deadlines, [deadline]);
+        assert_eq!(presenter.io.observed_deadlines.len(), 1);
+        assert!(presenter.io.observed_deadlines[0] < deadline);
         assert_eq!(presenter.io.commits.len(), 3);
     }
 
@@ -2808,7 +2821,7 @@ mod tests {
             .present(
                 ScanoutSlotId(0),
                 7,
-                PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                PresentDeadline::bounded(Instant::now()),
             )
             .expect_err("EBUSY persists through its bounded wait");
         assert_eq!(
@@ -2816,6 +2829,32 @@ mod tests {
             "kms-live-atomic-first-nonblocking-modeset-busy-deadline"
         );
         assert!(error.detail.contains(&format!("errno {}", libc::EBUSY)));
+    }
+
+    #[test]
+    fn primary_commit_retries_eventless_cursor_busy_without_losing_its_pageflip() {
+        let mut io = FakeAtomicIo::default();
+        io.commit_results
+            .extend([Err(commit_errno(libc::EBUSY)), Ok(())]);
+        io.waits.extend([
+            // Cursor commit completes without generating any DRM event.
+            AtomicWaitReady::Deadline,
+            AtomicWaitReady::Ready {
+                drm: true,
+                cancel: false,
+            },
+        ]);
+        io.events.push_back(vec![matching_flip(7)]);
+        let mut presenter = presenter(io);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            presenter.present(ScanoutSlotId(0), 7, PresentDeadline::bounded(deadline)),
+            Ok(PresentOutcome::Displayed)
+        );
+        assert_eq!(presenter.io.commits.len(), 2);
+        assert_eq!(presenter.io.observed_deadlines.len(), 2);
+        assert!(presenter.io.observed_deadlines[0] < deadline);
+        assert_eq!(presenter.io.observed_deadlines[1], deadline);
     }
 
     #[test]

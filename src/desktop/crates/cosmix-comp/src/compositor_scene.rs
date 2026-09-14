@@ -533,6 +533,7 @@ impl Default for ClientSamplingContractLog {
 
 #[derive(Resource)]
 struct CursorScene {
+    hardware_active: bool,
     mode: SceneCursorMode,
     position: CursorPositionSnapshot,
     selection: ProjectedCursorSelection,
@@ -551,6 +552,7 @@ pub(crate) struct NestedCursorOverlay {
 impl CursorScene {
     fn new(mode: SceneCursorMode) -> Self {
         Self {
+            hardware_active: false,
             mode,
             position: CursorPositionSnapshot::default(),
             selection: ProjectedCursorSelection::Default,
@@ -748,7 +750,6 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                 | ProtocolEvent::SurfaceRelayout { .. }
                 | ProtocolEvent::SurfaceUnmapped { .. }
                 | ProtocolEvent::SurfaceDestroyed { .. }
-                | ProtocolEvent::CursorUpdated { .. }
                 | ProtocolEvent::DmabufBufferDestroyed { .. }
                 | ProtocolEvent::DmabufCacheInvalidated
         ) {
@@ -848,6 +849,13 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
 }
 
 fn capture_cursor_snapshot(world: &World) -> Option<crate::capture::CaptureCursorSnapshot> {
+    cursor_pixel_snapshot(world, false)
+}
+
+fn cursor_pixel_snapshot(
+    world: &World,
+    stable_extent: bool,
+) -> Option<crate::capture::CaptureCursorSnapshot> {
     let cursor = world.resource::<CursorScene>();
     if !cursor.position.on_output {
         return None;
@@ -904,12 +912,31 @@ fn capture_cursor_snapshot(world: &World) -> Option<crate::capture::CaptureCurso
     let image = world.resource::<Assets<Image>>().get(&handle)?;
     let source = image.data.as_ref()?;
     let source_size = image.size();
-    let (x, y, width, height) = cursor_capture_geometry(
+    let (x, y, mut width, mut height) = cursor_capture_geometry(
         cursor.position,
         hotspot,
         logical_size,
         world.resource::<RendererOutputScale120>().0,
     )?;
+    if stable_extent {
+        // Fractional motion changes placement, never the cursor's raster size.
+        // Otherwise alternating ceil/floor edges would force FB uploads.
+        let (_, _, stable_width, stable_height) = cursor_capture_geometry(
+            CursorPositionSnapshot {
+                x: 0.0,
+                y: 0.0,
+                ..cursor.position
+            },
+            hotspot,
+            logical_size,
+            world.resource::<RendererOutputScale120>().0,
+        )?;
+        width = stable_width;
+        height = stable_height;
+        if width > 512 || height > 512 {
+            return None;
+        }
+    }
     let (raw_width, raw_height) = if surface_transform_swaps_axes(image_transform) {
         (height, width)
     } else {
@@ -1209,11 +1236,13 @@ fn sample_cursor_position(world: &mut World, position: CursorPositionSnapshot) {
     let old = capture_cursor_damage_bounds(world);
     let changed = world.resource::<CursorScene>().position != position;
     if changed {
-        mark_scene_changed(world);
         world.resource_mut::<CursorScene>().position = position;
     }
     refresh_cursor_entity(world);
     if changed {
+        if !world.resource::<CursorScene>().hardware_active {
+            mark_scene_changed(world);
+        }
         mark_cursor_regions(world, old, capture_cursor_damage_bounds(world));
     }
 }
@@ -1268,6 +1297,9 @@ fn apply_cursor_image(world: &mut World, image: CursorImage) {
         },
     }
     refresh_cursor_entity(world);
+    if !world.resource::<CursorScene>().hardware_active {
+        mark_scene_changed(world);
+    }
     mark_cursor_regions(world, old, capture_cursor_damage_bounds(world));
 }
 
@@ -1556,6 +1588,14 @@ fn set_client_image_linear(world: &mut World, image: &Handle<Image>) {
 }
 
 fn refresh_cursor_entity(world: &mut World) {
+    let hardware_active = project_hardware_cursor(world);
+    let was_active = world.resource::<CursorScene>().hardware_active;
+    if hardware_active != was_active {
+        world.resource_mut::<CursorScene>().hardware_active = hardware_active;
+        // One primary render removes/restores the software image. Subsequent
+        // hardware motion must not advance the primary scene watermark.
+        mark_scene_changed(world);
+    }
     let (mode, entity, selection, position) = {
         let cursor = world.resource::<CursorScene>();
         (
@@ -1569,6 +1609,10 @@ fn refresh_cursor_entity(world: &mut World) {
     let Some(entity) = entity else {
         return;
     };
+    if hardware_active {
+        set_cursor_component(world, entity, Visibility::Hidden);
+        return;
+    }
     if !position.on_output {
         if world.get_entity(entity).is_ok() {
             set_cursor_component(world, entity, Visibility::Hidden);
@@ -1707,6 +1751,43 @@ fn refresh_cursor_entity(world: &mut World) {
                     .is_none_or(ImportedDmabufImages::has_pending_render_work);
             replace_cursor_with_client_material(world, entity, material, transform, force_rebind);
         }
+    }
+}
+
+fn project_hardware_cursor(world: &World) -> bool {
+    #[cfg(any(feature = "kms-live", test))]
+    {
+        use crate::backend::atomic_presentation::cursor::HardwareCursorBridge;
+        let Some(bridge) = world.get_resource::<HardwareCursorBridge>() else {
+            return false;
+        };
+        let cursor = world.resource::<CursorScene>();
+        if cursor.mode != SceneCursorMode::SoftwareCursor {
+            return false;
+        }
+        if !cursor.position.on_output || cursor.selection == ProjectedCursorSelection::Hidden {
+            return bridge.update(None);
+        }
+        let snapshot = if cursor.client.as_ref().is_some_and(|client| {
+            cursor.selection == ProjectedCursorSelection::Surface
+                && client.buffer_kind == SurfaceBufferKind::Dmabuf
+        }) {
+            None
+        } else {
+            cursor_pixel_snapshot(world, true)
+        };
+        if snapshot.is_none() {
+            // GPU-only cursors retain their existing material path. Detach any
+            // previous hardware image before showing the software replacement.
+            bridge.update(None);
+            return false;
+        }
+        bridge.update(snapshot.as_ref())
+    }
+    #[cfg(not(any(feature = "kms-live", test)))]
+    {
+        let _ = world;
+        false
     }
 }
 
@@ -3462,6 +3543,127 @@ mod tests {
                 SceneCursorMode::SoftwareCursor,
             ));
         (app, sender)
+    }
+
+    #[test]
+    fn hardware_cursor_motion_skips_primary_revision_and_failure_restores_software() {
+        use crate::backend::atomic_presentation::cursor::HardwareCursorBridge;
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (mut app, _sender) = software_cursor_scene_app();
+        app.update();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let failed = Arc::new(AtomicBool::new(false));
+        let recorded = seen.clone();
+        let fail = failed.clone();
+        app.insert_resource(HardwareCursorBridge::for_test(move |image| {
+            if fail.load(Ordering::Relaxed) {
+                return Err("injected commit failure".into());
+            }
+            recorded.lock().unwrap().push(image.cloned());
+            Ok(true)
+        }));
+        let position = CursorPositionSnapshot {
+            x: 30.0,
+            y: 40.0,
+            on_output: true,
+            ..Default::default()
+        };
+        sample_cursor_position(app.world_mut(), position);
+        let entity = app.world().resource::<CursorScene>().entity.unwrap();
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+        let transform = *app.world().get::<Transform>(entity).unwrap();
+        let revision = *app.world().resource::<SceneContentRevision>();
+        for x in [31.0, 45.0, -2.0] {
+            sample_cursor_position(app.world_mut(), CursorPositionSnapshot { x, ..position });
+            assert_eq!(*app.world().resource::<SceneContentRevision>(), revision);
+            assert_eq!(*app.world().get::<Transform>(entity).unwrap(), transform);
+        }
+        apply_cursor_image(app.world_mut(), CursorImage::Named(NamedCursorShape::Text));
+        assert_eq!(*app.world().resource::<SceneContentRevision>(), revision);
+        let text = seen.lock().unwrap().last().unwrap().clone().unwrap();
+        assert_eq!(text.x, -9); // pointer -2 minus text hotspot 7
+        apply_cursor_image(app.world_mut(), CursorImage::Hidden);
+        assert!(seen.lock().unwrap().last().unwrap().is_none());
+        assert_eq!(*app.world().resource::<SceneContentRevision>(), revision);
+        apply_cursor_image(app.world_mut(), CursorImage::Default);
+        failed.store(true, Ordering::Relaxed);
+        sample_cursor_position(
+            app.world_mut(),
+            CursorPositionSnapshot {
+                x: 70.0,
+                ..position
+            },
+        );
+        assert!(!app.world().resource::<CursorScene>().hardware_active);
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Inherited)
+        );
+        assert_ne!(*app.world().resource::<SceneContentRevision>(), revision);
+        assert_ne!(*app.world().get::<Transform>(entity).unwrap(), transform);
+    }
+
+    #[test]
+    fn hardware_cursor_fractional_motion_keeps_identical_pixels() {
+        let (mut app, _sender) = software_cursor_scene_app();
+        app.update();
+        app.world_mut().resource_mut::<RendererOutputScale120>().0 = 150;
+        let mut previous: Option<crate::capture::CaptureCursorSnapshot> = None;
+        for x in [10.0, 10.25, 10.5, 11.0, -1.5] {
+            app.world_mut().resource_mut::<CursorScene>().position = CursorPositionSnapshot {
+                x,
+                y: 20.0,
+                on_output: true,
+                ..Default::default()
+            };
+            let snapshot = cursor_pixel_snapshot(app.world(), true).unwrap();
+            if let Some(old) = previous {
+                assert_eq!((snapshot.width, snapshot.height), (old.width, old.height));
+                assert_eq!(snapshot.rgba, old.rgba);
+            }
+            previous = Some(snapshot);
+        }
+    }
+
+    #[test]
+    fn hardware_cursor_protocol_motion_stays_quiet_through_render_demand_observers() {
+        use crate::backend::atomic_presentation::cursor::HardwareCursorBridge;
+        let (mut app, _sender) = software_cursor_scene_app();
+        crate::render_asset_demand::configure(&mut app);
+        crate::render_component_demand::configure(&mut app);
+        let bridge = HardwareCursorBridge::for_test(|_| Ok(true));
+        app.insert_resource(bridge.clone());
+        let position = CursorPositionSnapshot {
+            x: 20.0,
+            y: 30.0,
+            on_output: true,
+            ..Default::default()
+        };
+        app.world()
+            .resource::<ClientSceneFeed>()
+            .set_cursor_position_for_test(position);
+        for _ in 0..3 {
+            app.update();
+        }
+        let revision = *app.world().resource::<SceneContentRevision>();
+        for x in [21.0, 23.5, 29.0] {
+            app.world()
+                .resource::<ClientSceneFeed>()
+                .set_cursor_position_for_test(CursorPositionSnapshot { x, ..position });
+            app.update();
+            assert_eq!(*app.world().resource::<SceneContentRevision>(), revision);
+        }
+        // Output retirement removes the plane even without a new input event.
+        bridge.clear();
+        app.update();
+        assert!(!app.world().resource::<CursorScene>().hardware_active);
+        assert_ne!(*app.world().resource::<SceneContentRevision>(), revision);
     }
 
     struct RealProtocolScene {

@@ -445,6 +445,35 @@
 <p><code>cosmix-comp</code> is the Wayland compositor used by the Cosmix desktop. It can run
 nested inside an existing Wayland session with <code>cosmix-comp --nested</code>, or use
 the KMS backend on a system seat.</p>
+<h2 id="kms-hardware-cursor">KMS hardware cursor</h2>
+<p>The <code>kms-live</code> build (with the default Bus, frame-capture and XWayland
+features) uses an optional DRM cursor plane. <code>native-quoin</code> is not required.
+The live atomic presenter enumerates ARGB8888 cursor planes compatible with
+the selected CRTC, checks their atomic properties, and queries the driver's
+cursor width/height caps (64×64 for older drivers without these caps).</p>
+<p>Cursor images use two transparent, pitch-aware ARGB dumb buffers. Image
+changes pass an atomic test-only check before a synchronous cursor-plane
+commit; hotspots, output scale, SHM source rectangles and transforms are
+applied to the uploaded image and placement. Motion commits change only
+<code>CRTC_X</code>/<code>CRTC_Y</code>, use <code>NONBLOCK</code>, and request no pageflip event. A busy motion
+commit is retried with the newest position on the next scene drain. These
+commits do not flip the primary plane or advance its scene revision.
+If a pending cursor commit makes the next primary commit busy, the presenter
+retries at bounded 2 ms intervals within its original deadline; it does not
+wait for a cursor pageflip event that was never requested.</p>
+<p>Once hardware projection succeeds, the software cursor entity is hidden.
+The transition renders once to remove its old pixels. Missing planes,
+allocation/admission/commit errors restore the software path and log the
+reason. Oversized or GPU-only DMA-BUF cursor images use software projection;
+a later supported image can use the plane again. Cursor resources are
+retired with the output and re-enumerated after resume; revoked generations
+cannot submit cursor updates. Capture retains its separate cursor snapshot.</p>
+<p>Offline tests cover cursor requests, pixel packing and scene fallback.
+Driver acceptance and motion smoothness still require a live session check:
+move the pointer over an animated wallpaper, change cursor shapes, drag a
+window, toggle panels, and exercise display sleep/wake. Check the hardware
+cursor log and frame trace; cursor motion alone should not create primary
+scene revisions or <code>comp_render</code> work after the scene settles.</p>
 <h2 id="optional-f9-bus-action">Optional F9 Bus action</h2>
 <p><code>--f9-bus &lt;service&gt; &lt;verb&gt;</code> arms an unmodified F9 press to send a native ABP
 request with an empty argument object to a local Bus service. For example,
