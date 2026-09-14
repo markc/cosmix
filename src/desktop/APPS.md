@@ -63,6 +63,7 @@ updated; their use of `DcsAppShell` is not a template for new app furniture.
 | retired | `midiseq` | — | Superseded by `studio` 2026-07-24 (slug named the capability, not the destination). State roots under `cosmix/apps/midiseq` were migrated to `cosmix/apps/studio` as a one-time operator step; this slug is never reused. |
 | active | `tray` | CosMix Tray | Plasma StatusNotifierItem — launch apps, start/stop cosmix daemons, mesh health (kind: tray, engine: none) |
 | active | `tower` | CosMix Tower | Mesh mission control — verified node atlas, same-node citizen/daemon controls, live traffic animation, and persisted filters/layout |
+| active | `busviewer` | BusViewer | ABP service/verb browser and JSON caller; local services and mesh membership. Primary binary is `busviewer` (explicit naming exception). |
 | active | `mail` | CosMix Mail | Frontend mail reader and composer (Bevy + ctk); reads the `maild` domain, which stays the backend server. Not a reused retired slug: the archived Bus/`ui.*` disp-skia client of the same name was never registered here and was carved out to `_attic/bus-display/` on 2026-07-20. Landed 2026-07-31 as the widget vertical slice — fixture corpus, no JMAP transport yet. |
 | active | `quoin` | CosMix Quoin | Furniture-tier desktop shell: four edge panels; Bus service `shell` |
 | active | `media` | CosMix Media | Native CTK audio/video player; local MP3/MP4 playback and Bus service `media` |
