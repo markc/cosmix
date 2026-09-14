@@ -10,6 +10,8 @@ mod compositor_scene;
 mod decoration;
 mod decoration_scene;
 mod frame_trace;
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+mod readiness;
 #[cfg(feature = "native-quoin")]
 mod native_shell;
 #[cfg(feature = "frame-capture")]

@@ -4819,6 +4819,11 @@ impl SubmittedFrameTelemetry {
                 connector = key.connector_name,
                 "live KMS first frame submitted"
             );
+            // First presented frame == comp is usable. Signal systemd
+            // Type=notify readiness so the persistent boot-desktop unit orders
+            // dependants against first light, not against process start or the
+            // Wayland socket merely existing. No-op unless NOTIFY_SOCKET is set.
+            crate::readiness::notify_ready();
         }
         let interval = now.saturating_sub(self.interval_started_at);
         if interval >= Duration::from_secs(1) {
