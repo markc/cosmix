@@ -5737,6 +5737,19 @@ fn finish_service_cadence<M: LiveCoordinatorMailbox>(
     now: &mut impl FnMut() -> Duration,
     pulse: &mut impl FnMut() -> Result<(), KmsLiveError>,
 ) -> Result<Option<LiveSupervisionEnd>, KmsLiveError> {
+    // The idle pacing below runs before the submission check, so the busy
+    // vblank-aligned pulse depends on idle and submission being mutually
+    // exclusive: `SubmitWatchdog::observe_execution` only classifies
+    // `HealthyIdle` when `presented_revision == demand_revision` (nothing new
+    // rendered => no submission). If a future pump ever reported a submission
+    // alongside a HealthyIdle execution, this function would throttle a real
+    // presentation's callback through idle pacing instead of delivering it at
+    // vblank. Assert the invariant here so that regression fails a test rather
+    // than silently mispacing (compiles out in release; no runtime effect).
+    debug_assert!(
+        !(healthy_idle && submissions > 0),
+        "a HealthyIdle execution must carry no frame submissions"
+    );
     if healthy_idle {
         // Idle has no pageflip wait. Bound service/callback cadence through the
         // same interruptible coordinator mailbox used for renderer replies.
