@@ -16,6 +16,43 @@ use serde_json::{Value, json};
 
 use crate::keymap_file;
 
+pub fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "input.query",
+            &[],
+            "Read the keymap and input mode",
+            true,
+        ),
+        VerbDescriptor::new(
+            "input.bind",
+            &["body"],
+            "Bind a physical stroke from a BindingRow JSON body",
+            false,
+        ),
+        VerbDescriptor::new(
+            "input.unbind",
+            &["body"],
+            "Unbind a PhysicalStroke JSON body",
+            false,
+        ),
+        VerbDescriptor::new(
+            "input.mode",
+            &["mode"],
+            "Set or toggle the input mode",
+            false,
+        ),
+        VerbDescriptor::new(
+            "input.reload",
+            &[],
+            "Reload the keymap file",
+            false,
+        ),
+    ]
+}
+
 /// The resolver shared between the Bus service and the (optional) evdev reader.
 pub type Shared = Arc<Mutex<Resolver>>;
 

@@ -93,6 +93,7 @@ behaviour are documented on [cosmix-comp](cosmix-comp.md).
 
 ## See also
 
+- [BusViewer](busviewer.md) — browse ABP services and verbs, inspect mesh membership and call verbs with JSON
 - [cosmix-comp](cosmix-comp.md) — protocol globals, layer strata, session lock
 - [cosmix-wgpu-dmabuf](cosmix-wgpu-dmabuf.md) — Vulkan import roles and ownership contracts
 - [overview](overview.md) — the daemon family the desktop sits on

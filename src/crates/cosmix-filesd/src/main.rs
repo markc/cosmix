@@ -792,7 +792,7 @@ async fn run_bus_loop(
         {
             Ok(client) => {
                 backoff = Duration::from_secs(1);
-                let client = Arc::new(client);
+                let client = Arc::new(client.with_verbs(verb_manifest()));
                 // Canary: a synchronous probe proves the indexd source/metadata
                 // contract before we trust fire-and-forget background pushes (which
                 // ack before validating). Loud log on rejection.
@@ -1028,6 +1028,216 @@ async fn serve_fs(cfg: config::FsConfig) -> anyhow::Result<()> {
     }
 }
 
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "filesd.list",
+            &["limit", "offset"],
+            "List corpus documents",
+            true,
+        ),
+        VerbDescriptor::new("list", &["limit", "offset"], "Alias for filesd.list", true),
+        VerbDescriptor::new(
+            "filesd.read",
+            &["id", "path"],
+            "Read a corpus document",
+            true,
+        ),
+        VerbDescriptor::new("read", &["id", "path"], "Alias for filesd.read", true),
+        VerbDescriptor::new(
+            "filesd.search",
+            &["q", "query", "limit"],
+            "Search corpus documents",
+            true,
+        ),
+        VerbDescriptor::new(
+            "search",
+            &["q", "query", "limit"],
+            "Alias for filesd.search",
+            true,
+        ),
+        VerbDescriptor::new(
+            "filesd.changes",
+            &["since", "limit"],
+            "Read corpus changes",
+            true,
+        ),
+        VerbDescriptor::new(
+            "changes",
+            &["since", "limit"],
+            "Alias for filesd.changes",
+            true,
+        ),
+        VerbDescriptor::new(
+            "filesd.save",
+            &["path", "content"],
+            "Save a corpus document",
+            false,
+        ),
+        VerbDescriptor::new("save", &["path", "content"], "Alias for filesd.save", false),
+        VerbDescriptor::new(
+            "filesd.move",
+            &["from", "to"],
+            "Move a corpus document",
+            false,
+        ),
+        VerbDescriptor::new("move", &["from", "to"], "Alias for filesd.move", false),
+        VerbDescriptor::new(
+            "filesd.delete",
+            &["path"],
+            "Delete a corpus document",
+            false,
+        ),
+        VerbDescriptor::new("delete", &["path"], "Alias for filesd.delete", false),
+        VerbDescriptor::new("filesd.resync", &[], "Repush the corpus to indexd", false),
+        VerbDescriptor::new("resync", &[], "Alias for filesd.resync", false),
+        VerbDescriptor::new("filesd.props.get", &["path"], "Read properties", true),
+        VerbDescriptor::new("filesd.props.list", &[], "List properties", true),
+        VerbDescriptor::new(
+            "filesd.props.describe",
+            &["path"],
+            "Describe properties",
+            true,
+        ),
+    ]
+}
+
+fn fs_verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new("fs.places", &[], "List configured places", true),
+        VerbDescriptor::new("places", &[], "Alias for fs.places", true),
+        VerbDescriptor::new(
+            "fs.list",
+            &["path", "show_hidden", "sort", "dir"],
+            "List directory entries",
+            true,
+        ),
+        VerbDescriptor::new(
+            "list",
+            &["path", "show_hidden", "sort", "dir"],
+            "Alias for fs.list",
+            true,
+        ),
+        VerbDescriptor::new("fs.stat", &["path"], "Read file metadata", true),
+        VerbDescriptor::new("stat", &["path"], "Alias for fs.stat", true),
+        VerbDescriptor::new(
+            "fs.tree",
+            &["path", "max_depth", "max_nodes"],
+            "Read a directory tree",
+            true,
+        ),
+        VerbDescriptor::new(
+            "tree",
+            &["path", "max_depth", "max_nodes"],
+            "Alias for fs.tree",
+            true,
+        ),
+        VerbDescriptor::new("fs.read_blob", &["path", "max"], "Read file bytes", true),
+        VerbDescriptor::new(
+            "read_blob",
+            &["path", "max"],
+            "Alias for fs.read_blob",
+            true,
+        ),
+        VerbDescriptor::new(
+            "fs.search",
+            &["path", "query", "q", "recursive", "limit"],
+            "Search files",
+            true,
+        ),
+        VerbDescriptor::new(
+            "search",
+            &["path", "query", "q", "recursive", "limit"],
+            "Alias for fs.search",
+            true,
+        ),
+        VerbDescriptor::new(
+            "fs.mkdir",
+            &["path", "parents"],
+            "Create a directory",
+            false,
+        ),
+        VerbDescriptor::new("mkdir", &["path", "parents"], "Alias for fs.mkdir", false),
+        VerbDescriptor::new("fs.touch", &["path"], "Touch a file", false),
+        VerbDescriptor::new("touch", &["path"], "Alias for fs.touch", false),
+        VerbDescriptor::new(
+            "fs.write",
+            &["path", "content", "overwrite"],
+            "Write a file",
+            false,
+        ),
+        VerbDescriptor::new(
+            "write",
+            &["path", "content", "overwrite"],
+            "Alias for fs.write",
+            false,
+        ),
+        VerbDescriptor::new(
+            "fs.copy",
+            &["from", "to", "overwrite"],
+            "Copy a file",
+            false,
+        ),
+        VerbDescriptor::new(
+            "copy",
+            &["from", "to", "overwrite"],
+            "Alias for fs.copy",
+            false,
+        ),
+        VerbDescriptor::new(
+            "fs.move",
+            &["from", "to", "overwrite"],
+            "Move a file",
+            false,
+        ),
+        VerbDescriptor::new(
+            "move",
+            &["from", "to", "overwrite"],
+            "Alias for fs.move",
+            false,
+        ),
+        VerbDescriptor::new("fs.trash", &["path"], "Move a file to trash", false),
+        VerbDescriptor::new("trash", &["path"], "Alias for fs.trash", false),
+        VerbDescriptor::new("fs.trash.list", &[], "List trash entries", true),
+        VerbDescriptor::new("trash.list", &[], "Alias for fs.trash.list", true),
+        VerbDescriptor::new(
+            "fs.trash.restore",
+            &["token"],
+            "Restore a trash entry",
+            false,
+        ),
+        VerbDescriptor::new(
+            "trash.restore",
+            &["token"],
+            "Alias for fs.trash.restore",
+            false,
+        ),
+        VerbDescriptor::new("fs.trash.empty", &["confirm"], "Empty the trash", false),
+        VerbDescriptor::new(
+            "trash.empty",
+            &["confirm"],
+            "Alias for fs.trash.empty",
+            false,
+        ),
+        VerbDescriptor::new(
+            "fs.delete",
+            &["path", "recursive", "confirm"],
+            "Permanently delete a file",
+            false,
+        ),
+        VerbDescriptor::new(
+            "delete",
+            &["path", "recursive", "confirm"],
+            "Alias for fs.delete",
+            false,
+        ),
+    ]
+}
+
 async fn run_bus_loop_fs(
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
@@ -1049,7 +1259,7 @@ async fn run_bus_loop_fs(
         {
             Ok(client) => {
                 backoff = Duration::from_secs(1);
-                serve_bus_fs(Arc::new(client), &fs, &peers).await; // returns on disconnect
+                serve_bus_fs(Arc::new(client.with_verbs(fs_verb_manifest())), &fs, &peers).await; // returns on disconnect
             }
             Err(e) => eprintln!("cosmix-filesd: broker unavailable; retry in {backoff:?}: {e}"),
         }

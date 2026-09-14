@@ -104,7 +104,167 @@ struct RequestStatusRequest {
     operation_token: String,
 }
 
-pub async fn connect() -> Result<Arc<SupervisedClient>, String> {
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new("nspawnd.list", &[], "List executor containers", true),
+        VerbDescriptor::new(
+            "nspawnd.status",
+            &["name"],
+            "Read executor container status",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.start",
+            &[
+                "schema",
+                "name",
+                "generation",
+                "grant",
+                "request_id",
+                "operation_token",
+            ],
+            "Start an executor container",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.stop",
+            &[
+                "schema",
+                "name",
+                "generation",
+                "grant",
+                "request_id",
+                "operation_token",
+            ],
+            "Stop an executor container",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.request.status",
+            &["schema", "request_id", "name", "operation_token"],
+            "Read executor request status",
+            true,
+        ),
+    ]
+}
+
+fn controller_verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new("nspawnd.ct.list", &[], "List controller placements", true),
+        VerbDescriptor::new(
+            "nspawnd.ct.status",
+            &["name"],
+            "Read a controller placement",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.ct.start",
+            &[
+                "schema",
+                "name",
+                "if_version",
+                "request_id",
+                "operation_token",
+            ],
+            "Start a container placement from request JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.ct.stop",
+            &[
+                "schema",
+                "name",
+                "if_version",
+                "request_id",
+                "operation_token",
+            ],
+            "Stop a container placement from request JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.ct.adopt",
+            &[
+                "schema",
+                "name",
+                "owner",
+                "generation",
+                "if_version",
+                "request_id",
+                "operation_token",
+            ],
+            "Adopt a container placement from request JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.ct.report",
+            &[
+                "schema",
+                "name",
+                "node",
+                "generation",
+                "state",
+                "image_present",
+                "unit_active",
+                "executor_request_id",
+                "executor_op_id",
+                "executor_operation_state",
+                "executor_error_code",
+                "reported_at",
+                "operation_token",
+            ],
+            "Record an executor report",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.get",
+            &["namespace", "key"],
+            "Read properties",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.list",
+            &["namespace"],
+            "List properties",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.describe",
+            &["namespace"],
+            "Describe properties",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.watch",
+            &["namespace"],
+            "Watch property changes",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.audit.watch",
+            &["namespace"],
+            "Watch property audit events",
+            true,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.set",
+            &["namespace", "key", "body", "merge", "if_version"],
+            "Set a property record",
+            false,
+        ),
+        VerbDescriptor::new(
+            "nspawnd.props.delete",
+            &["namespace", "key", "if_version"],
+            "Delete a property record",
+            false,
+        ),
+    ]
+}
+
+pub async fn connect(controller: bool) -> Result<Arc<SupervisedClient>, String> {
     let build = cosmix_buildinfo::build_info!();
     let provenance = cosmix_bus::RegisterProvenance::from_parts(
         build.pkg,
@@ -114,11 +274,17 @@ pub async fn connect() -> Result<Arc<SupervisedClient>, String> {
         build.build_time,
         cosmix_buildinfo::now_rfc3339(),
     );
-    SupervisedClient::connect_supervised_with_provenance(
+    SupervisedClient::connect_options(
         BUS_SERVICE,
         &cosmix_config::client_helpers::resolve_noded_url(),
-        Some(provenance),
     )
+    .with_provenance(provenance)
+    .with_verbs(if controller {
+        controller_verb_manifest()
+    } else {
+        verb_manifest()
+    })
+    .connect()
     .await
     .map(Arc::new)
     .map_err(|error| format!("connecting supervised Bus client: {error}"))

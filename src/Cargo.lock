@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-filesd"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-indexd"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-inputd"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-interactd"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-maild"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-nspawnd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-webd"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "arc-swap",

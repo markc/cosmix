@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/desktop</title>
+    <title>CosMix — cos/busviewer</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,91 +441,44 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/desktop.md"><div class="prose"><h1 id="cosmix-desktop--the-desktop-surface">CosMix Desktop — the desktop surface</h1>
-<p>The CosMix desktop is a <strong>native Wayland compositor plus a family of Bevy
-applications</strong>, all Bus citizens. It lives in its own Cargo workspace at
-<code>$COSMIX/src/desktop/</code> (separate because it pins its own toolchain and vendors
-patched Smithay/wgpu) and is built with <code>setup.mix --desktop</code>.</p>
-<p>This page is the orientation. The compositor's protocol coverage has its own
-page: <a href="/cos/cosmix-comp">cosmix-comp</a>.</p>
-<p>FileMgr, Studio, Tower, Interact GUI and bg-showcase install their Bus
-app-control bridge only when <code>node.conf.mix</code> loads successfully. Without that
-configuration they retain their local app setup and print one standalone
-notice to stderr. FileMgr, Studio and Tower also accept <code>--noded-url</code>; an
-explicit URL takes precedence and enables the port even without node
-configuration. Other broker clients are unaffected by this app-control gate.</p>
-<p>The initial <a href="/cos/desktop-bus">desktop Bus capability provider</a> adds session
-discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
-It serves registered local callers and explicitly granted mesh clipboard
-callers through admitted noded connections.</p>
-<h2 id="what-it-is">What it is</h2>
-<table><thead><tr><th>Part</th><th>Crate</th><th>What it is</th></tr></thead><tbody>
-<tr><td>Compositor</td><td><code>cosmix-comp</code></td><td>Smithay protocol frontend with Bevy 0.19 / wgpu rendering. Runs nested inside an existing Wayland session (<code>--nested</code>) or on a KMS seat.</td></tr>
-<tr><td>Toolkit</td><td><code>ctk</code></td><td>Cosmix Tool Kit — the shared Bus-citizen Bevy widget toolkit every desktop app builds on (<code>bevy_ui</code> + <code>bevy_feathers</code>).</td></tr>
-<tr><td>Decorations</td><td><code>cosmix-deco</code></td><td>Server-side decoration theme engine: chrome styles, tokens, layout and hit-testing. Dependency-free.</td></tr>
-<tr><td>Design system</td><td><code>cosmix-design</code></td><td>Headless compiler and family-schema registry for the <code>.mix</code> design source — one styling contract for chrome and app widgets.</td></tr>
-<tr><td>Shell</td><td><code>cosmix-shell</code></td><td>Pure core and host seams for the Quoin desktop shell.</td></tr>
-<tr><td>GPU bridge</td><td><a href="/cos/cosmix-wgpu-dmabuf"><code>cosmix-wgpu-dmabuf</code></a></td><td>Role-specific DMA-BUF import for client textures, scan-out targets and screencopy destinations.</td></tr>
-<tr><td>Apps</td><td><code>apps/*</code></td><td>Studio (DAW / mixer), FileMgr, Mail, Tower (mesh mission control), Tray + trayd, Interact GUI (native presenter for <code>interactd</code> dialogs). Registry and identity rules in <code>src/desktop/APPS.md</code>.</td></tr>
-</tbody></table>
-<h2 id="how-it-hangs-together">How it hangs together</h2>
-<p>CosMix Term (<code>apps/term</code>) has a menu bar and tabs, with one Mix terminal pane
-per tab. It admits at most 32 terminals, including pending closes. Closing
-removes a tab immediately; one cleanup worker performs bounded terminal
-shutdown outside the shared tab lock. Closing the last tab exits the app.
-Tab listings use cached dimensions and process metadata, without copying grids.</p>
-<p>With the terminal focused, menus closed and no modal capture, Ctrl+Shift+T/W
-opens/closes a tab and Ctrl+PageUp/PageDown changes tabs. These shortcuts require
-exact modifiers and do not repeat. The basic shell encoder supports printable
-ASCII, Enter, Backspace, Tab, arrows, Escape, Home, End, Delete, PageUp/PageDown
-and Ctrl+A through Ctrl+Z. Modifier state follows keyboard event order and resets
-on keyboard focus loss. This is not kitty or modifyOtherKeys support. The
-<code>term.*</code> Bus surface remains diagnostic, pending authenticated per-instance
-identity (P0-I) and full ABP control (P3a).</p>
-<p><code>cosmix-comp</code> is one process with three planes and strict ownership:</p>
-<ul>
-<li><strong>Protocol</strong> — Smithay on calloop owns all authoritative state: surfaces,
-toplevels, focus, buffers, explicit sync, the DRM/KMS session, libinput,
-decorations and canvas geometry.</li>
-<li><strong>Render</strong> — Bevy / wgpu paints. The scene is a <em>view</em> of protocol-plane
-state, never an owner of it; client DMA-BUFs import zero-copy.</li>
-<li><strong>Control</strong> — the Bus: <code>comp.*</code> verbs, the property tree and event topics.
-No frame ever waits on the bus; the compositor runs with no broker at all.</li>
-</ul>
-<p>Apps follow the same model. A CTK app draws itself at 60 fps but keeps an
-addressable Bus command port (the ARexx idea): it answers <code>app.describe</code>,
-can opt in to <code>app.controls.list/get/set</code> so an agent enumerates and drives
-its native controls without screen scraping, and registers as
-<code>&lt;slug&gt;-&lt;engine&gt;-&lt;pid&gt;</code>. Application chrome — menu bar, toolbar, sidebars,
-centre, status row — is one composed <code>DcsAppShell</code> component that apps fill
-by slot and never assemble by hand.</p>
-<h2 id="what-it-replaced">What it replaced</h2>
-<p>Before 2026-07 the desktop was a <strong>markdown-over-Bus display lane</strong>: producers
-sent <code>ui.window</code> messages and a domain-blind CPU renderer (<code>cosmix-disp-skia</code>,
-tiny-skia + cosmic-text) painted them. That lane was retired by the
-2026-07-18 control-plane decision — the Bus controls apps, it does not paint
-pixels — and archived on 2026-07-20 together with <code>cosmix-lib-display</code> and the
-<code>ui.*</code> vocabulary. Nothing of it is in this repository; the source survives on
-the frozen <code>markc/cos</code> repo under the git tag <code>amp-display-archive</code>, and the
-documentation page was removed from this site on 2026-08-31. Any material
-describing <code>disp-skia</code>, <code>cosmix-deskd</code>, <code>cosmix-disp-wgpu</code> or <code>ui.panel</code> as the
-current desktop is historical.</p>
-<h2 id="running-it">Running it</h2>
-<pre><code class="language-sh">cd $COSMIX/src/desktop
-cargo run --release -p cosmix-comp -- --nested     # inside an existing Wayland session
-cargo run --release -p ctk --example widget_gallery
-</code></pre>
-<p>The compositor's supported Wayland protocols, stacking rules and session-lock
-behaviour are documented on <a href="/cos/cosmix-comp">cosmix-comp</a>.</p>
-<h2 id="see-also">See also</h2>
-<ul>
-<li><a href="/cos/busviewer">BusViewer</a> — browse ABP services and verbs, inspect mesh membership and call verbs with JSON</li>
-<li><a href="/cos/cosmix-comp">cosmix-comp</a> — protocol globals, layer strata, session lock</li>
-<li><a href="/cos/cosmix-wgpu-dmabuf">cosmix-wgpu-dmabuf</a> — Vulkan import roles and ownership contracts</li>
-<li><a href="/cos/overview">overview</a> — the daemon family the desktop sits on</li>
-<li><a href="/cos/noded">noded</a> — the Bus broker every app and the compositor talk to</li>
-<li><a href="/cos/cosmix-interactd/">interactd</a> — system-to-human dialogs, presented natively by Interact GUI</li>
-</ul></div></div>
+        <div id="content-doc" data-prerendered="cos/busviewer.md"><div class="prose"><h1 id="busviewer">BusViewer</h1>
+<p>BusViewer is a native CTK companion to the <code>bus</code> CLI, modelled on QDBusViewer.
+It opens a dark 1400 × 1400 window with File/Help menus, a searchable service
+tree, a draggable divider, verb details, a JSON input and a reply panel.</p>
+<p>Build the <code>cosmix-busviewer</code> package in the separate <code>src/desktop</code> workspace.
+Its binary is <code>busviewer</code>; its application id is <code>dev.cosmix.busviewer</code> and
+its installation metadata component is <code>busviewer</code>.</p>
+<p>Launch <code>busviewer</code> using the shared node configuration, or supply
+<code>--noded-url URL</code> to choose a broker. <code>--help</code> and <code>--version</code> work without a
+desktop session. Typography follows CTK's shared <code>COSMIX_UI_FONT</code> and
+<code>COSMIX_UI_FONT_PX</code> settings, including system clipboard support.</p>
+<p>Expand a service and select a verb to see its argument signature,
+description and read-only flag. Enter an optional JSON body and press Call.
+Blank input sends no body; invalid JSON sends no request. The reply includes
+the target, verb, actual Bus return code and pretty-printed JSON (or verbatim
+text when the reply is not JSON). Transport errors are separate from service
+errors. Calls time out after 20 seconds and are never automatically retried;
+a timeout can leave the remote outcome unknown. Only one call is active at
+a time. Selecting another verb does not relabel an outstanding reply.</p>
+<p>Discovery uses NodedClient over ABP: <code>noded.list</code>, <code>noded.peers</code>, and universal
+<code>HELP</code>, with <code>app.describe</code> fallback for older services. Legacy descriptions
+without a read-only flag display “unknown”. The broker itself is included
+even when absent from its citizen registry. HELP requests run in the
+background with at most eight concurrent service inspections. Search matches
+service names and loaded verb names, signatures and descriptions. Use
+File → Refresh to reload services and retry failed descriptions.</p>
+<p>Some broker versions do not implement HELP or app.describe for <code>noded</code>
+itself. That entry shows an introspection error; other services remain
+available. BusViewer does not invent a broker verb catalogue.</p>
+<p>The Mesh nodes branch lists authority routing members, excluding this node,
+and falls back to the older peers list when authority metadata is absent.
+Membership alone does not indicate a live connection. Remote service
+drill-down is planned; version 0.1 calls services through the selected local
+broker. Replies larger than one million characters are explicitly truncated
+for display.</p>
+<p>The app reuses CTK 0.54.4 tree views/disclosures, text fields, read-only text
+areas, buttons, menus and the existing DCS split widget. It does not embed
+the DCS application shell or add desktop furniture.</p></div></div>
     </div>
 
 </main>

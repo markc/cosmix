@@ -402,7 +402,7 @@ async fn serve(
         {
             Ok(client) => {
                 backoff = Duration::from_secs(1);
-                let client = Arc::new(client);
+                let client = Arc::new(client.with_verbs(verb_manifest()));
                 let _ = client_tx.send(Some(client.clone()));
                 eprintln!(
                     "cosmix-interactd: registered as '{service}' (sink={sink:?}); serving notify.v1"
@@ -457,6 +457,133 @@ impl PendingActions {
     fn take_for_attempt(&mut self) -> Option<DispatchOrder> {
         self.queue.pop_front()
     }
+}
+
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "interact.notify",
+            &[
+                "summary",
+                "body",
+                "urgency",
+                "category",
+                "icon",
+                "dedupe_key",
+                "timeout_ms",
+                "actions",
+                "owner_token",
+            ],
+            "Create a notification from notify.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.update",
+            &[
+                "handle",
+                "owner_token",
+                "summary",
+                "body",
+                "urgency",
+                "category",
+                "icon",
+                "dedupe_key",
+                "timeout_ms",
+                "actions",
+            ],
+            "Update an owned notification",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.dismiss",
+            &["handle", "owner_token"],
+            "Dismiss an owned notification",
+            false,
+        ),
+        VerbDescriptor::new("interact.props.get", &["path"], "Read properties", true),
+        VerbDescriptor::new("interact.props.list", &[], "List properties", true),
+        VerbDescriptor::new(
+            "interact.props.describe",
+            &["path"],
+            "Describe properties",
+            true,
+        ),
+        VerbDescriptor::new("interact.props.watch", &[], "Watch property changes", true),
+        VerbDescriptor::new(
+            "interact.dialog-open",
+            &["dialog", "deadline_ms"],
+            "Open a dialog using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.dialog-progress-update",
+            &["handle", "owner_token", "patch"],
+            "Update dialog progress using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.dialog-progress-complete",
+            &["handle", "owner_token", "completion"],
+            "Complete a progress dialog using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.dialog-cancel",
+            &["handle", "owner_token"],
+            "Cancel an owned dialog using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.dialog-result",
+            &["handle", "owner_token"],
+            "Read an owned dialog result using dialog.v1 JSON",
+            true,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-register",
+            &[],
+            "Register a dialog presenter lease using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-release",
+            &["lease"],
+            "Release a presenter lease using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-next",
+            &["lease"],
+            "Claim the next dialog for presentation using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-mark-presented",
+            &["lease", "handle", "attempt_token"],
+            "Mark a dialog as presented using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-resolve",
+            &["lease", "handle", "attempt_token", "value"],
+            "Resolve a presented dialog using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-fail",
+            &["lease", "handle", "attempt_token"],
+            "Report a dialog presentation failure using dialog.v1 JSON",
+            false,
+        ),
+        VerbDescriptor::new(
+            "interact.presenter-progress-cancel",
+            &["lease", "handle", "attempt_token"],
+            "Request cancellation of a progress dialog using dialog.v1 JSON",
+            false,
+        ),
+    ]
 }
 
 async fn send_action(client: &NodedClient, order: &DispatchOrder) -> bool {

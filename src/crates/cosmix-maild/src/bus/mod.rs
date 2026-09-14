@@ -310,6 +310,214 @@ pub async fn run(
     }
 }
 
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "maild.props.get",
+            &["namespace", "key"],
+            "Read properties",
+            true,
+        ),
+        VerbDescriptor::new("maild.props.list", &["namespace"], "List properties", true),
+        VerbDescriptor::new(
+            "maild.props.describe",
+            &["namespace"],
+            "Describe properties",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.props.watch",
+            &["namespace"],
+            "Watch property changes",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.props.audit.watch",
+            &["namespace"],
+            "Watch property audit events",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.props.set",
+            &["namespace", "key", "body", "merge", "if_version"],
+            "Set a property record",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.props.delete",
+            &["namespace", "key", "if_version"],
+            "Delete a property record",
+            false,
+        ),
+        VerbDescriptor::new("maild.rules.reload", &[], "Reload mail rules", false),
+        VerbDescriptor::new(
+            "maild.rules.stats",
+            &["top_n"],
+            "Read mail rule statistics",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.rules.explain",
+            &[
+                "account_id",
+                "envelope_from",
+                "envelope_to",
+                "peer_ip",
+                "message_b64",
+                "sender_authenticated",
+                "mail_auth",
+            ],
+            "Explain rule evaluation for a message",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.bayesian.stats",
+            &["account_id"],
+            "Read Bayesian classifier statistics",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.bayesian.classify",
+            &["account_id", "message_b64"],
+            "Classify a message without training",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.bayesian.rebuild",
+            &["account_id", "snapshot", "wait", "allow_empty"],
+            "Rebuild Bayesian training data",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.bayesian.rebuild_status",
+            &["account_id"],
+            "Read Bayesian rebuild progress",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.accounts.seed_mailboxes",
+            &["email"],
+            "Seed account mailboxes",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.accounts.seed_content",
+            &["email"],
+            "Seed account content",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.accounts.revoke_tokens",
+            &["email"],
+            "Revoke account tokens",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.accounts.verify",
+            &["email", "password"],
+            "Verify account credentials",
+            true,
+        ),
+        VerbDescriptor::new("maild.accounts.lock", &["email"], "Lock an account", false),
+        VerbDescriptor::new(
+            "maild.accounts.unlock",
+            &["email"],
+            "Unlock an account",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.search.rebuild",
+            &["email"],
+            "Rebuild mail search indexes",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.stats.mailboxes",
+            &["email"],
+            "Read mailbox statistics",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.stats.account",
+            &["email"],
+            "Read account statistics",
+            true,
+        ),
+        VerbDescriptor::new("maild.stats.online", &[], "List online mail sessions", true),
+        VerbDescriptor::new(
+            "maild.stats.server",
+            &[],
+            "Read mail server statistics",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.stats.top",
+            &["by", "limit"],
+            "Rank accounts by mail usage",
+            true,
+        ),
+        VerbDescriptor::new("maild.retention.status", &[], "Read retention status", true),
+        VerbDescriptor::new(
+            "maild.retention.run",
+            &["email", "dry_run"],
+            "Run a retention sweep",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.vtoken.mint_opaque",
+            &[
+                "account",
+                "real_email",
+                "verification_strength",
+                "service",
+                "allowed_sender",
+                "active",
+            ],
+            "Mint an opaque virtual address token",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.vtoken.list_opaque",
+            &[],
+            "List opaque virtual address tokens",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.vtoken.lookup_opaque",
+            &["token_hmac"],
+            "Look up an opaque virtual address token",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.vtoken.disable_opaque",
+            &["token_hmac"],
+            "Disable an opaque virtual address token",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.dkim.generate",
+            &["domain", "selector", "algorithm"],
+            "Generate a DKIM signing key",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.dkim.rotate",
+            &["domain", "selector", "algorithm"],
+            "Rotate a DKIM signing key",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.dkim.retire",
+            &["domain", "selector"],
+            "Retire a DKIM signing key",
+            false,
+        ),
+        VerbDescriptor::new("maild.tls.reload", &[], "Reload mail TLS identities", false),
+    ]
+}
+
 /// Loop until `NodedClient::connect_default` succeeds, advancing the
 /// caller's `delay` (1s → 60s exponential, cap at 60s) on each
 /// failure. The caller owns the backoff state so it can preserve it
@@ -328,7 +536,7 @@ async fn connect_with_backoff(
         {
             Ok(c) => {
                 tracing::info!(service = BUS_SERVICE, "registered as Bus service");
-                return c;
+                return c.with_verbs(verb_manifest());
             }
             Err(e) => {
                 tracing::warn!(

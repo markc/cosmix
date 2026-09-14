@@ -3242,6 +3242,192 @@ async fn main() -> Result<()> {
     }
 }
 
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "indexd.embed",
+            &["texts", "prefix"],
+            "Generate text embeddings",
+            true,
+        ),
+        VerbDescriptor::new(
+            "embed",
+            &["texts", "prefix"],
+            "Alias for indexd.embed",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.store",
+            &["texts", "source", "metadata"],
+            "Store indexed text",
+            false,
+        ),
+        VerbDescriptor::new(
+            "store",
+            &["texts", "source", "metadata"],
+            "Alias for indexd.store",
+            false,
+        ),
+        VerbDescriptor::new(
+            "indexd.search",
+            &["query", "limit", "source", "metadata_filter"],
+            "Search indexed text",
+            true,
+        ),
+        VerbDescriptor::new(
+            "search",
+            &["query", "limit", "source", "metadata_filter"],
+            "Alias for indexd.search",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.update",
+            &["id", "content", "metadata", "source"],
+            "Update an indexed chunk",
+            false,
+        ),
+        VerbDescriptor::new(
+            "update",
+            &["id", "content", "metadata", "source"],
+            "Alias for indexd.update",
+            false,
+        ),
+        VerbDescriptor::new("indexd.delete", &["ids"], "Delete indexed chunks", false),
+        VerbDescriptor::new("delete", &["ids"], "Alias for indexd.delete", false),
+        VerbDescriptor::new(
+            "indexd.list",
+            &["source", "limit", "offset"],
+            "List indexed chunks",
+            true,
+        ),
+        VerbDescriptor::new(
+            "list",
+            &["source", "limit", "offset"],
+            "Alias for indexd.list",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.feedback",
+            &["id", "useful"],
+            "Record usefulness feedback",
+            false,
+        ),
+        VerbDescriptor::new(
+            "feedback",
+            &["id", "useful"],
+            "Alias for indexd.feedback",
+            false,
+        ),
+        VerbDescriptor::new(
+            "indexd.supersede",
+            &["old_id", "new_id", "reason"],
+            "Mark an older chunk superseded",
+            false,
+        ),
+        VerbDescriptor::new(
+            "supersede",
+            &["old_id", "new_id", "reason"],
+            "Alias for indexd.supersede",
+            false,
+        ),
+        VerbDescriptor::new(
+            "indexd.stale",
+            &[
+                "source",
+                "never_retrieved_age_days",
+                "low_value_min_retrievals",
+                "long_dormant_days",
+                "per_bucket_limit",
+            ],
+            "Find stale indexed chunks",
+            true,
+        ),
+        VerbDescriptor::new(
+            "stale",
+            &[
+                "source",
+                "never_retrieved_age_days",
+                "low_value_min_retrievals",
+                "long_dormant_days",
+                "per_bucket_limit",
+            ],
+            "Alias for indexd.stale",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.index_file",
+            &["path", "content", "source", "domain", "background"],
+            "Index a markdown file",
+            false,
+        ),
+        VerbDescriptor::new(
+            "index_file",
+            &["path", "content", "source", "domain", "background"],
+            "Alias for indexd.index_file",
+            false,
+        ),
+        VerbDescriptor::new("indexd.stats", &[], "Return index statistics", true),
+        VerbDescriptor::new("stats", &[], "Alias for indexd.stats", true),
+        VerbDescriptor::new(
+            "indexd.stats.snapshot",
+            &[],
+            "Return service metric snapshots",
+            true,
+        ),
+        VerbDescriptor::new(
+            "stats.snapshot",
+            &[],
+            "Alias for indexd.stats.snapshot",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.props.get",
+            &["path", "namespace", "key"],
+            "Read properties",
+            true,
+        ),
+        VerbDescriptor::new("indexd.props.list", &["namespace"], "List properties", true),
+        VerbDescriptor::new(
+            "indexd.props.describe",
+            &["path", "namespace"],
+            "Describe properties",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.props.watch",
+            &["namespace"],
+            "Watch property changes",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.props.audit.watch",
+            &["namespace"],
+            "Watch property audit events",
+            true,
+        ),
+        VerbDescriptor::new(
+            "indexd.props.set",
+            &["namespace", "key", "body", "merge", "if_version"],
+            "Set a property record",
+            false,
+        ),
+        VerbDescriptor::new(
+            "indexd.props.delete",
+            &["namespace", "key", "if_version"],
+            "Delete a property record",
+            false,
+        ),
+        VerbDescriptor::new(
+            "props.watch",
+            &[],
+            "Return the property changes topic",
+            true,
+        ),
+    ]
+}
+
 /// Handle incoming Bus commands from the broker mesh.
 /// Maps Bus commands to the same JSON protocol used by the Unix socket.
 /// Supervised Bus broker registration: register, serve commands until the
@@ -3270,7 +3456,7 @@ async fn run_bus_client_loop(
             Ok(client) => {
                 info!("registered as Bus service 'indexd' on broker");
                 backoff = Duration::from_secs(1);
-                let client = std::sync::Arc::new(client);
+                let client = std::sync::Arc::new(client.with_verbs(verb_manifest()));
 
                 // SPEC 07 §3+§4 — periodic snapshot diff publishing
                 // (props.changed events + world.indexd retained snapshot).

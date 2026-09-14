@@ -214,7 +214,7 @@ async fn main() -> ExitCode {
         Err(error) => return fail(error),
     };
 
-    let client = match bus::connect().await {
+    let client = match bus::connect(false).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
@@ -284,7 +284,7 @@ async fn run_controller(cli: Cli) -> ExitCode {
         Ok(value) => Arc::new(value),
         Err(error) => return fail(error),
     };
-    let client = match bus::connect().await {
+    let client = match bus::connect(true).await {
         Ok(value) => value,
         Err(error) => return fail(error),
     };

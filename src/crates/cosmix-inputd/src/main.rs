@@ -175,6 +175,7 @@ async fn serve(
         .await
         {
             Ok(client) => {
+                let client = client.with_verbs(service::verb_manifest());
                 eprintln!("cosmix-inputd: registered as '{SERVICE}'; serving input.*");
                 serve_bus(&client, &resolver, keymap_path.as_deref(), &mut fire_rx).await;
                 eprintln!("cosmix-inputd: broker disconnected; reconnecting");

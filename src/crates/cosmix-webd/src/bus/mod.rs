@@ -345,6 +345,99 @@ pub async fn run(node: Arc<NodeState>) {
     }
 }
 
+fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
+    use cosmix_bus::VerbDescriptor;
+    vec![
+        VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
+        VerbDescriptor::new(
+            "webd.props.get",
+            &["namespace", "key"],
+            "Read properties",
+            true,
+        ),
+        VerbDescriptor::new("webd.props.list", &["namespace"], "List properties", true),
+        VerbDescriptor::new(
+            "webd.props.describe",
+            &["namespace"],
+            "Describe properties",
+            true,
+        ),
+        VerbDescriptor::new(
+            "webd.props.watch",
+            &["namespace"],
+            "Watch property changes",
+            true,
+        ),
+        VerbDescriptor::new(
+            "webd.props.audit.watch",
+            &["namespace"],
+            "Watch property audit events",
+            true,
+        ),
+        VerbDescriptor::new(
+            "webd.props.set",
+            &["namespace", "key", "body", "merge", "if_version"],
+            "Set a property record",
+            false,
+        ),
+        VerbDescriptor::new(
+            "webd.props.delete",
+            &["namespace", "key", "if_version"],
+            "Delete a property record",
+            false,
+        ),
+        VerbDescriptor::new("webd.routes.list", &[], "List HTTP routes", true),
+        VerbDescriptor::new("webd.stats", &[], "Read HTTP statistics", true),
+        VerbDescriptor::new("webd.tls.status", &[], "Read TLS status", true),
+        VerbDescriptor::new(
+            "webd.autoconfig.served_domains",
+            &[],
+            "List autoconfiguration domains",
+            true,
+        ),
+        VerbDescriptor::new(
+            "webd.vhost.add",
+            &["fqdn", "www_dir"],
+            "Add or update a virtual host",
+            false,
+        ),
+        VerbDescriptor::new(
+            "webd.vhost.remove",
+            &["fqdn"],
+            "Remove a virtual host",
+            false,
+        ),
+        VerbDescriptor::new("webd.vhost.list", &[], "List virtual hosts", true),
+        VerbDescriptor::new(
+            "webd.acme.renew",
+            &["fqdn"],
+            "Request certificate renewal",
+            false,
+        ),
+        VerbDescriptor::new("webd.acme.status", &["fqdn"], "Read ACME status", true),
+        VerbDescriptor::new("webd.listener.enable", &["id"], "Enable a listener", false),
+        VerbDescriptor::new(
+            "webd.listener.disable",
+            &["id"],
+            "Disable a listener",
+            false,
+        ),
+        VerbDescriptor::new(
+            "webd.listener.status",
+            &["id"],
+            "Read listener status",
+            true,
+        ),
+        VerbDescriptor::new("webd.tls.reload", &[], "Reload TLS identities", false),
+        VerbDescriptor::new(
+            "webd.session.revoke",
+            &["email"],
+            "Revoke an account's web sessions",
+            false,
+        ),
+    ]
+}
+
 /// Loop until `NodedClient::connect_default` succeeds, advancing the
 /// caller's `delay` (1s → 60s exponential, cap at 60s) on each
 /// failure. The caller owns the backoff state so it can preserve it
@@ -363,7 +456,7 @@ async fn connect_with_backoff(
         {
             Ok(c) => {
                 tracing::info!(service = BUS_SERVICE, "registered as Bus service");
-                return c;
+                return c.with_verbs(verb_manifest());
             }
             Err(e) => {
                 tracing::warn!(
