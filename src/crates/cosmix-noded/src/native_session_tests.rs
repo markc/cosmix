@@ -56,6 +56,7 @@ impl Broker {
                 mesh_config_path: None,
                 spec_dir: None,
                 admission_mode: AdmissionMode::Off,
+                mesh_open: false,
                 observe_allowed_services: vec!["audit-observer".into()],
                 unix_socket: unix.then(|| root.join("bus.sock")),
                 pending_grants_per_parent,

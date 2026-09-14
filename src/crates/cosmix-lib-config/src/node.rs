@@ -288,6 +288,15 @@ pub struct NodedConfig {
     pub mesh_config: Option<String>,
     /// SPEC 13 §9a D2 admission posture (off | observe | enforce). Default off.
     pub admission: AdmissionMode,
+    /// AGENTIC-FIRST posture switch (Mark, 2026-09-14). When `true` (the
+    /// default), noded lets ABP flow freely between admitted WG mesh peers:
+    /// the per-message principal/native-session-locality guards are relaxed and
+    /// the WG /24 + signed inventory (mesh membership) is the trust boundary.
+    /// This is the CLAUDE.md "default open, opt-in hard" law — the enforcement
+    /// code is retained and re-armed by setting this to `false` per node once
+    /// the mesh/app layer is mature. Membership trust (WG + signed inventory)
+    /// is UNAFFECTED either way; only per-message authorization relaxes.
+    pub mesh_open: bool,
 }
 
 fn absolute_unix_socket<'de, D: serde::Deserializer<'de>>(
@@ -310,6 +319,7 @@ impl Default for NodedConfig {
             pending_grants_per_parent: 32,
             mesh_config: None,
             admission: AdmissionMode::Off,
+            mesh_open: true,
         }
     }
 }

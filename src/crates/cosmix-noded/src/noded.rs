@@ -393,6 +393,12 @@ struct AppState {
     /// (default) sends no challenge — behaviour-neutral. `observe` challenges +
     /// verdicts + logs but never refuses. Start-immutable.
     admission_mode: AdmissionMode,
+    /// AGENTIC-FIRST posture (Mark, 2026-09-14). When true, per-message
+    /// principal/native-session-locality egress guards are relaxed so ABP flows
+    /// freely between admitted WG mesh peers (the /24 + signed inventory is the
+    /// boundary). Enforcement code is retained and re-armed by config. Carried
+    /// across per-connection clones like every other field.
+    mesh_open: bool,
     /// SPEC 13 §9a B1 self-check (2-c-2b) — is the listener bound to this node's
     /// own WG/mesh IP? Start-immutable (the bind never changes at runtime). A
     /// fail-closed input to the enforce gate: a non-WG bind cannot hold the WG
@@ -496,6 +502,7 @@ pub struct RunConfig {
     pub mesh_config_path: Option<String>,
     pub spec_dir: Option<PathBuf>,
     pub admission_mode: AdmissionMode,
+    pub mesh_open: bool,
     pub observe_allowed_services: Vec<String>,
 }
 
@@ -511,6 +518,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         mesh_config_path,
         spec_dir,
         admission_mode,
+        mesh_open,
         observe_allowed_services,
     } = config;
     anyhow::ensure!(
@@ -868,6 +876,7 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         listener_port,
         listener_endpoint_diverged,
         admission_mode,
+        mesh_open,
         wg_bound,
         challenge_table: Arc::new(crate::admission::ChallengeTable::new()),
         live_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -2765,7 +2774,14 @@ async fn handle_socket(socket: WebSocket, mut state: AppState, transport: Transp
                 // There is no cross-node native-session classification or UID
                 // delegation contract in v1. Do not export protected traffic to
                 // a legacy hop whose observers cannot retain its classification.
-                if state.principal.is_some() {
+                //
+                // AGENTIC-FIRST (Mark, 2026-09-14): under the `mesh_open` posture
+                // this guard is relaxed — principal-carrying (native-session)
+                // traffic egresses cross-node to admitted WG mesh peers, so ABP
+                // flows freely and the WG /24 + signed inventory is the trust
+                // boundary. The refusal (and its v1 rationale) is retained and
+                // re-armed by setting noded.mesh_open=false once the mesh matures.
+                if state.principal.is_some() && !state.mesh_open {
                     let mut reply = BusMessage::new().with_header("type", "response").with_header("rc", "10")
                         .with_body(r#"{"error_code":"UNSUPPORTED","message":"native session traffic is node-local","details":{}}"#);
                     if let Some(id) = bus_msg.get("id") {
@@ -5555,6 +5571,10 @@ mod tests {
             listener_port,
             listener_endpoint_diverged: Arc::new(AtomicBool::new(false)),
             admission_mode: AdmissionMode::Off,
+            // Tests default to the LOCKED posture so the existing node-local
+            // egress-refusal assertions still exercise the guard; a test opts
+            // into the open posture by flipping this.
+            mesh_open: false,
             wg_bound: true,
             challenge_table: Arc::new(crate::admission::ChallengeTable::new()),
             live_sessions: Arc::new(RwLock::new(HashMap::new())),
