@@ -170,10 +170,11 @@ impl Listener {
         if !permit.valid() {
             return Err("FORBIDDEN");
         }
-        if writes
-            .owner
-            .as_ref()
-            .is_some_and(|(owner, p)| owner != actor && p.valid())
+        if !crate::control::mesh_open()
+            && writes
+                .owner
+                .as_ref()
+                .is_some_and(|(owner, p)| owner != actor && p.valid())
         {
             return Err("BUSY");
         }

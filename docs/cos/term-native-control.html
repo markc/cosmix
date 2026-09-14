@@ -454,7 +454,14 @@ authority.</p>
 connection. It uses the broker-stamped principal, its own current Term record,
 and the live pane model. It never takes identity or policy from request bodies,
 service names, PIDs or ordinary TCP headers.</p>
-<p><code>COSMIX_TERM_POLICY=restricted</code> selects the restricted policy at allocation;
+<p><code>COSMIX_MESH_OPEN</code> defaults to open (unset or any value other than <code>0</code>), matching
+CTK app-control and desktop.mix. Every validated broker principal has every
+capability on every pane, regardless of caller UID, node, broker epoch, session
+ownership, grant set or allocation policy. Caller session leases do not gate
+this posture. Instance/incarnation continuity, live pane identity/generation,
+recipient lifecycle, foreground freshness and PTY-boundary rechecks still apply.</p>
+<p>With <code>COSMIX_MESH_OPEN=0</code>, the strict rules below apply.
+<code>COSMIX_TERM_POLICY=restricted</code> selects the restricted policy at allocation;
 the default is <code>default-open</code>. An invalid value disables native bootstrap.
 The allocated record's policy remains authoritative on resumption.</p>
 <p>Under default-open, an independent verified same-UID owner connection has all
@@ -480,7 +487,8 @@ request IDs use decimal strings. A graphics-only pane has no protected control
 authority: delivering a launch descriptor alone is insufficient. The actor must
 first observe or reconcile a successful child attachment. There is no active-pane
 fallback for mutations.</p>
-<table><thead><tr><th>Verb</th><th>Required capability</th><th>Additional fields / result</th></tr></thead><tbody>
+<p>Capabilities and owner restrictions in this table apply only in strict posture.</p>
+<table><thead><tr><th>Verb</th><th>Strict capability</th><th>Additional fields / result</th></tr></thead><tbody>
 <tr><td><code>term.session</code>, <code>term.list</code>, <code>term.tabs</code>, <code>term.panes</code></td><td><code>read_state</code></td><td>Scoped pane/tab metadata, binding diagnostic, input generation, retry epoch/high-water and limits</td></tr>
 <tr><td><code>term.snapshot</code></td><td><code>read_state</code></td><td>Metadata only by default</td></tr>
 <tr><td><code>term.snapshot</code> with <code>contents:true</code></td><td><code>read_contents</code></td><td>Snapshot text, bounded by the response limit</td></tr>
@@ -589,8 +597,10 @@ an absent optional native context. Broad property-write strings cannot bypass
 the pane gate. Private watches, audit subscriptions and retained screen replay
 are not installed by this adapter; unsupported property operations are refused.</p>
 <h2 id="input-and-revocation">Input and revocation</h2>
-<p>Each accepted input request claims a two-second, one-writer lease for the pane.
-Another actor receives <code>BUSY</code> while that lease is live. Input requires the current
+<p>Each accepted input request has a two-second delivery deadline. In strict posture
+it also claims a one-writer lease: another actor receives <code>BUSY</code> while that lease
+is live. Mesh-open admits every actor through the same serialised PTY queue.
+Input requires the current
 foreground generation; human keys, focus/layout changes and observed PTY foreground
 process-group changes invalidate old generations. The first human key revokes
 agent ownership before its own admission. It never waits for lease expiry.</p>
@@ -601,7 +611,8 @@ The request envelope is limited to 8,192 bytes; responses to 256 KiB. Queue
 admission is atomic and actual nonblocking PTY writes recheck the permit. Expired
 or revoked, unwritten agent bytes are discarded without counting them as PTY
 writes. Already written bytes cannot be recalled.</p>
-<p>Term establishes conservative <code>Deadline</code>s outside the model/property locks, from
+<p>Term establishes conservative <code>Deadline</code>s outside the model/property locks. In
+strict posture these come from
 two different sources because <code>lease.check</code> answers only for a record the asking
 connection holds a delivery dependency on. A bound caller's request registers
 exactly that dependency, so its lease is a real <code>lease.check</code>, reused within one
@@ -612,6 +623,8 @@ renew refuses unless the record is attached on that very connection, and returns
 the refreshed remainder. A failed renew, a reconnect, a gap or a notice about
 Term's own attachment leaves no deadline at all rather than a stale one. Queued
 permits retain those deadlines and a read-only connection-liveness probe.
+Mesh-open retains the recipient deadline and live pane guard, without the caller
+lease or caller-session revocation gate.
 Lifecycle revocation/suspension, successor binding generations, gaps, connection
 loss, pane close and child exit invalidate permits. No missed notice can extend
 a deadline. The verified client inbox is bounded at
@@ -652,6 +665,13 @@ record only the event discriminant, not clipboard/title/text fields.</p>
 <code>session.hello</code> or <code>term.session</code>. Preserve the exact epoch and JSON payload when
 retrying. The epoch constrains the ID; it never supplies the authenticated actor.
 <code>term.session</code> reports the current actor's request high-water mark.</p>
+<p>For grantless mesh-open input/layout requests, <code>request_epoch</code> may be omitted.
+Term uses the broker-stamped current connection ID, so a one-shot <code>send</code> can type
+without an earlier request on that same connection. IDs and retries remain scoped
+to that connection; an explicitly supplied stale epoch still returns
+<code>UNKNOWN_OUTCOME</code>. Preserve an explicit epoch for retries across reconnects: an
+omitted epoch on a new connection represents a new request, not a retry of the
+old connection's request. <code>foreground_generation</code> remains mandatory for typing.</p>
 <p>Entries bind the authenticated actor, target incarnation/generation, verb and
 payload hash. That hash covers the request bytes AS SENT: Term does not
 canonicalise, so two encodings of the same object are two different payloads and

@@ -16,6 +16,14 @@ connection. It uses the broker-stamped principal, its own current Term record,
 and the live pane model. It never takes identity or policy from request bodies,
 service names, PIDs or ordinary TCP headers.
 
+`COSMIX_MESH_OPEN` defaults to open (unset or any value other than `0`), matching
+CTK app-control and desktop.mix. Every validated broker principal has every
+capability on every pane, regardless of caller UID, node, broker epoch, session
+ownership, grant set or allocation policy. Caller session leases do not gate
+this posture. Instance/incarnation continuity, live pane identity/generation,
+recipient lifecycle, foreground freshness and PTY-boundary rechecks still apply.
+
+With `COSMIX_MESH_OPEN=0`, the strict rules below apply.
 `COSMIX_TERM_POLICY=restricted` selects the restricted policy at allocation;
 the default is `default-open`. An invalid value disables native bootstrap.
 The allocated record's policy remains authoritative on resumption.
@@ -48,7 +56,9 @@ authority: delivering a launch descriptor alone is insufficient. The actor must
 first observe or reconcile a successful child attachment. There is no active-pane
 fallback for mutations.
 
-| Verb | Required capability | Additional fields / result |
+Capabilities and owner restrictions in this table apply only in strict posture.
+
+| Verb | Strict capability | Additional fields / result |
 | --- | --- | --- |
 | `term.session`, `term.list`, `term.tabs`, `term.panes` | `read_state` | Scoped pane/tab metadata, binding diagnostic, input generation, retry epoch/high-water and limits |
 | `term.snapshot` | `read_state` | Metadata only by default |
@@ -177,8 +187,10 @@ are not installed by this adapter; unsupported property operations are refused.
 
 ## Input and revocation
 
-Each accepted input request claims a two-second, one-writer lease for the pane.
-Another actor receives `BUSY` while that lease is live. Input requires the current
+Each accepted input request has a two-second delivery deadline. In strict posture
+it also claims a one-writer lease: another actor receives `BUSY` while that lease
+is live. Mesh-open admits every actor through the same serialised PTY queue.
+Input requires the current
 foreground generation; human keys, focus/layout changes and observed PTY foreground
 process-group changes invalidate old generations. The first human key revokes
 agent ownership before its own admission. It never waits for lease expiry.
@@ -191,7 +203,8 @@ admission is atomic and actual nonblocking PTY writes recheck the permit. Expire
 or revoked, unwritten agent bytes are discarded without counting them as PTY
 writes. Already written bytes cannot be recalled.
 
-Term establishes conservative `Deadline`s outside the model/property locks, from
+Term establishes conservative `Deadline`s outside the model/property locks. In
+strict posture these come from
 two different sources because `lease.check` answers only for a record the asking
 connection holds a delivery dependency on. A bound caller's request registers
 exactly that dependency, so its lease is a real `lease.check`, reused within one
@@ -202,6 +215,8 @@ renew refuses unless the record is attached on that very connection, and returns
 the refreshed remainder. A failed renew, a reconnect, a gap or a notice about
 Term's own attachment leaves no deadline at all rather than a stale one. Queued
 permits retain those deadlines and a read-only connection-liveness probe.
+Mesh-open retains the recipient deadline and live pane guard, without the caller
+lease or caller-session revocation gate.
 Lifecycle revocation/suspension, successor binding generations, gaps, connection
 loss, pane close and child exit invalidate permits. No missed notice can extend
 a deadline. The verified client inbox is bounded at
@@ -246,6 +261,14 @@ Mutations require a nonzero, monotonically increasing `request_id` and
 `session.hello` or `term.session`. Preserve the exact epoch and JSON payload when
 retrying. The epoch constrains the ID; it never supplies the authenticated actor.
 `term.session` reports the current actor's request high-water mark.
+
+For grantless mesh-open input/layout requests, `request_epoch` may be omitted.
+Term uses the broker-stamped current connection ID, so a one-shot `send` can type
+without an earlier request on that same connection. IDs and retries remain scoped
+to that connection; an explicitly supplied stale epoch still returns
+`UNKNOWN_OUTCOME`. Preserve an explicit epoch for retries across reconnects: an
+omitted epoch on a new connection represents a new request, not a retry of the
+old connection's request. `foreground_generation` remains mandatory for typing.
 
 Entries bind the authenticated actor, target incarnation/generation, verb and
 payload hash. That hash covers the request bytes AS SENT: Term does not

@@ -20,6 +20,11 @@ const PER_ACTOR: usize = 1024;
 const TOTAL: usize = 4096;
 const ACTORS: usize = 256;
 
+/// Same default-open posture as CTK app-control and desktop.mix.
+pub(crate) fn mesh_open() -> bool {
+    std::env::var("COSMIX_MESH_OPEN").map_or(true, |value| value != "0")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
@@ -548,7 +553,8 @@ impl Control {
         if capability_of(verb, request.contents).is_none() {
             return Reply::error("UNSUPPORTED");
         }
-        if matches!(verb, "term.tab.new" | "term.pane.split")
+        if !mesh_open()
+            && matches!(verb, "term.tab.new" | "term.pane.split")
             && actor
                 .session
                 .as_ref()
@@ -573,7 +579,11 @@ impl Control {
         // it completes here — outside the synchronous capability resolution
         // below, which may never block on a Bus call (PROP-024). A live cached
         // check from this lease window satisfies the requirement instead.
-        let actor_deadline = if let Some(s) = &actor.session {
+        let actor_deadline = if mesh_open() {
+            // Caller session ownership and leases are not authorisation on the
+            // mesh. The recipient's own deadline and pane guard still apply.
+            None
+        } else if let Some(s) = &actor.session {
             let reference = reference(s);
             let cached = self
                 .state
@@ -752,6 +762,13 @@ impl Control {
         }
         let mutation = layout || capability == Capability::Input;
         if mutation {
+            // One-shot grantless send has no earlier call on this connection
+            // from which to learn an epoch. Bind an omitted epoch to the actual
+            // broker-stamped delivery, never to a body assertion. Explicit old
+            // epochs still fail, and request IDs remain connection-scoped.
+            if mesh_open() && actor.session.is_none() && request.request_epoch.is_none() {
+                request.request_epoch = Some(actor.connection_id);
+            }
             match request.request_epoch {
                 None => return Reply::error("INVALID_ARGUMENT"),
                 Some(epoch) if epoch != actor.connection_id => {
@@ -842,7 +859,10 @@ impl Control {
                             Ok(()) => {
                                 state.permits.retain(|(_, p)| p.strong_count() > 0);
                                 state.permits.push((
-                                    actor.session.as_ref().map(reference),
+                                    permit
+                                        .actor
+                                        .as_ref()
+                                        .map(|deadline| deadline.target().clone()),
                                     Arc::downgrade(&permit),
                                 ));
                                 Reply::ok(
@@ -1537,6 +1557,9 @@ fn principal_label(actor: &BrokerPrincipal) -> String {
 }
 
 fn principal_allowed(parent: &SessionRecord, actor: &BrokerPrincipal) -> bool {
+    if mesh_open() {
+        return actor.validate().is_ok();
+    }
     actor.validate().is_ok()
         && actor.unix_uid == parent.owner_uid
         && actor.owner_node == parent.owner_node
@@ -1567,6 +1590,9 @@ pub fn allows(
         || target.pane_generation.0 == 0
     {
         return false;
+    }
+    if mesh_open() {
+        return true;
     }
     match &actor.session {
         None => parent.policy == Policy::DefaultOpen,
