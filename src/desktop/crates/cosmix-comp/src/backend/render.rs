@@ -850,6 +850,15 @@ fn build_live_render_app(
         && std::env::var("COSMIX_COMP_HUD_PROBE").as_deref() != Ok("1")
     {
         crate::native_shell::install(&mut app);
+        // Force continuous rendering in native mode. Without it comp's
+        // idle-render-skip (backend/render_idle.rs) stops driving the pulse
+        // when it judges the scene settled, and pointer motion then delays
+        // the wallpaper/app CLIENTS' frame callbacks — the boing wallpaper
+        // "stalls when the mouse moves" (finding #8). hud-probe already
+        // inserts this (render_hud_probe.rs); the persistent native path
+        // needs it too until the vblank-aligned pulse-admission fix
+        // (kms_live.rs pulse skip+rebase, realignment doc finding #2) lands.
+        app.insert_resource(idle::ContinuousRendering);
     }
     app.insert_resource(FirstLiveRenderError::default())
         .insert_resource(RenderErrorHandler(stop_live_rendering_after_first_error));
