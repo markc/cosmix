@@ -13,7 +13,7 @@ display = "BusViewer"
 engine = "bevy"
 
 [[bin]]
-name = "busviewer"
+name = "cosmix-busviewer"
 path = "src/main.rs"
 
 [dependencies]
