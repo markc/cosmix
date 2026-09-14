@@ -423,6 +423,15 @@ fn caller_allowed($ctx,$verb,$headers)
   else
     return false
   end
+  -- AGENTIC-FIRST open posture (Mark, 2026-09-14): a mesh caller for one of the
+  -- mesh-addressable clipboard verbs above is trusted on WG membership alone.
+  -- `broker_origin` is set by noded from the source IP and is not forgeable, so
+  -- `broker_origin=="mesh"` already proves an admitted WG peer, and the WG /24 +
+  -- signed inventory is the trust boundary. The strict per-peer bridge
+  -- attestation below (grants + from=bridge-<peer> + broker_service) is retained
+  -- and re-armed by setting COSMIX_MESH_OPEN=0. `$grants` above still scopes
+  -- WHICH verbs are ever mesh-addressable; only the per-peer proof relaxes.
+  if env("COSMIX_MESH_OPEN", "1") != "0" then return true end
   if type($grants) != "list" or type($headers.broker_peer) != "string" or not contains($grants,$headers.broker_peer) then return false end
   return $headers.from == "bridge-" .. $headers.broker_peer and type($headers.broker_service) == "string" and re_match($headers.broker_service,"^[a-z][a-z0-9-]{1,30}$")
 end

@@ -161,6 +161,18 @@ pub fn authorize_caller(request: &InboundRequest) -> Result<(), LocalCallerError
     if header("broker_origin") != Some("mesh") {
         return Err(LocalCallerError::RemoteIdentityUnavailable);
     }
+    // AGENTIC-FIRST open posture (Mark, 2026-09-14): trust any admitted WG mesh
+    // peer on membership alone. `broker_origin` is set by noded from the source
+    // IP and is not forgeable, and wire-asserted identity headers were rejected
+    // above, so `broker_origin=="mesh"` already proves an admitted WG peer — the
+    // WG /24 + signed inventory is the trust boundary. The strict per-peer bridge
+    // attestation below is retained and re-armed by setting COSMIX_MESH_OPEN=0.
+    // (Interim: MUST-IMPLEMENT the shared cosmix-authd authorizer —
+    // _plan/2026-09-14-cosmix-authd-mesh-authorization.md — so this posture
+    // lives in ONE place instead of every app's gate.)
+    if std::env::var("COSMIX_MESH_OPEN").map_or(true, |v| v != "0") {
+        return Ok(());
+    }
     match (header("broker_peer"), header("broker_service")) {
         (Some(peer), Some(service))
             if !peer.is_empty()
