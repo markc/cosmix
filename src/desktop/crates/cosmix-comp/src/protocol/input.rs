@@ -707,7 +707,37 @@ pub(crate) fn host_input_from_event<B: InputBackend>(
 /// that test before the blocked read is deliberately reachable with a queue in
 /// place, so the defect it rejects is exactly this one: a `pending_kms_input`
 /// queue drained at `handle_frame` leaves it the only assertion that fails.
+/// A stable numeric tag per `InputEvent` variant, so a frame trace can tell a
+/// pointer-motion burst apart from button/key/axis traffic without carrying the
+/// generic backend type into the trace layer. Kept in sync with the match in
+/// [`host_input_from_event`]; the exact values are opaque — only their identity
+/// matters to the analyzer.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn input_event_code<B: InputBackend>(event: &InputEvent<B>) -> u64 {
+    match event {
+        InputEvent::Keyboard { .. } => 1,
+        InputEvent::PointerMotion { .. } => 2,
+        InputEvent::PointerMotionAbsolute { .. } => 3,
+        InputEvent::PointerButton { .. } => 4,
+        InputEvent::PointerAxis { .. } => 5,
+        InputEvent::DeviceAdded { .. } => 6,
+        InputEvent::DeviceRemoved { .. } => 7,
+        InputEvent::TouchDown { .. } => 8,
+        InputEvent::TouchMotion { .. } => 9,
+        InputEvent::TouchUp { .. } => 10,
+        InputEvent::TouchCancel { .. } => 11,
+        InputEvent::TouchFrame { .. } => 12,
+        _ => 0,
+    }
+}
+
 pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event: InputEvent<B>) {
+    // Wall + CPU cost of dispatching one host input event, on the dispatch
+    // thread. A pointer-motion burst that blocks the render/service loop shows
+    // up here as long/frequent `comp_input_dispatch` spans interleaved with the
+    // pulse pacing events.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    let _dispatch_span = crate::frame_trace::span("comp_input_dispatch", input_event_code(&event));
     let keyboard = &state.keyboard;
     let pointer = &state.pointer;
     let routing = host_input_from_event(

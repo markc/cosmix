@@ -13,6 +13,10 @@ struct Recorder {
     sender: SyncSender<Record>,
     sequence: AtomicU64,
     dropped: AtomicU64,
+    // Runtime record ceiling. 0 == unbounded (file-sink capture); otherwise the
+    // recorder stops after `limit` records and emits a single `trace_limit`
+    // sentinel, so a stderr sink can never be flooded without bound.
+    limit: u64,
 }
 struct Record {
     sequence: u64,
@@ -42,20 +46,71 @@ fn clock_us(clock: libc::clockid_t) -> u64 {
         .saturating_add(value.tv_nsec as u64 / 1_000)
 }
 
+/// Resolve the record ceiling. `COSMIX_FRAME_TRACE_LIMIT` overrides the default
+/// (0 == unbounded, for a file sink capturing a long session); an unset or
+/// unparsable value keeps the stderr-safe default so the fast path is unchanged.
+fn resolve_limit() -> u64 {
+    match std::env::var("COSMIX_FRAME_TRACE_LIMIT") {
+        Ok(raw) => raw.trim().parse::<u64>().unwrap_or(LIMIT),
+        Err(_) => LIMIT,
+    }
+}
+
+/// A line sink for the trace thread: a file when `COSMIX_FRAME_TRACE_FILE` names
+/// a writable path, else stderr. The file is truncated on open so each capture
+/// starts clean, and a path that cannot be opened falls back to stderr rather
+/// than losing the trace.
+enum Sink {
+    File(std::fs::File),
+    Stderr(std::io::Stderr),
+}
+
+impl Sink {
+    fn open() -> Self {
+        if let Ok(path) = std::env::var("COSMIX_FRAME_TRACE_FILE") {
+            if !path.is_empty() {
+                match std::fs::File::create(&path) {
+                    Ok(file) => return Sink::File(file),
+                    Err(error) => {
+                        eprintln!("FRAME_TRACE sink open failed path={path} error={error}");
+                    }
+                }
+            }
+        }
+        Sink::Stderr(std::io::stderr())
+    }
+
+    fn write_line(&mut self, line: &str) {
+        match self {
+            Sink::File(file) => {
+                let _ = file.write_all(line.as_bytes());
+            }
+            Sink::Stderr(stderr) => {
+                let _ = write!(stderr.lock(), "{line}");
+            }
+        }
+    }
+}
+
 fn recorder() -> Option<&'static Recorder> {
     RECORDER.get_or_init(|| {
         if std::env::var("COSMIX_FRAME_TRACE").as_deref() != Ok("1") { return None; }
-        let (sender, receiver) = sync_channel::<Record>(4096);
+        let limit = resolve_limit();
+        // A file sink can absorb a long capture, so it gets a deeper backlog;
+        // stderr keeps the tight channel that never lets tracing dominate a run.
+        let file_sink = std::env::var("COSMIX_FRAME_TRACE_FILE").map(|p| !p.is_empty()).unwrap_or(false);
+        let depth = if file_sink { 65_536 } else { 4096 };
+        let (sender, receiver) = sync_channel::<Record>(depth);
         std::thread::Builder::new().name("frame-trace".into()).spawn(move || {
-            let stderr = std::io::stderr();
+            let mut sink = Sink::open();
             for r in receiver {
-                let _ = writeln!(stderr.lock(),
-                    "FRAME_TRACE component=comp pid={} sequence={} stage={} subject={} detail={} aux={} tid={} start_us={} end_us={} duration_us={} cpu_us={} dropped={} limit={}",
+                sink.write_line(&format!(
+                    "FRAME_TRACE component=comp pid={} sequence={} stage={} subject={} detail={} aux={} tid={} start_us={} end_us={} duration_us={} cpu_us={} dropped={} limit={}\n",
                     std::process::id(), r.sequence, r.stage, r.subject, r.detail, r.aux, r.tid, r.start_us,
-                    r.end_us, r.end_us.saturating_sub(r.start_us), r.cpu_us, r.dropped, LIMIT);
+                    r.end_us, r.end_us.saturating_sub(r.start_us), r.cpu_us, r.dropped, limit));
             }
         }).ok()?;
-        Some(Recorder { sender, sequence: AtomicU64::new(0), dropped: AtomicU64::new(0) })
+        Some(Recorder { sender, sequence: AtomicU64::new(0), dropped: AtomicU64::new(0), limit })
     }).as_ref()
 }
 
@@ -76,24 +131,18 @@ pub(crate) fn event(stage: &'static str, fields: impl FnOnce() -> (u64, u64, u64
 
 fn event_to(recorder: &Recorder, stage: &'static str, fields: impl FnOnce() -> (u64, u64, u64)) {
     let sequence = recorder.sequence.fetch_add(1, Ordering::Relaxed);
-    if sequence > LIMIT {
+    let bounded = recorder.limit != 0;
+    if bounded && sequence > recorder.limit {
         return;
     }
-    let (subject, detail, aux) = if sequence == LIMIT {
-        (0, 0, 0)
-    } else {
-        fields()
-    };
+    let at_limit = bounded && sequence == recorder.limit;
+    let (subject, detail, aux) = if at_limit { (0, 0, 0) } else { fields() };
     let now = clock_us(libc::CLOCK_MONOTONIC);
     send_record(
         recorder,
         Record {
             sequence,
-            stage: if sequence == LIMIT {
-                "trace_limit"
-            } else {
-                stage
-            },
+            stage: if at_limit { "trace_limit" } else { stage },
             subject,
             detail,
             aux,
@@ -118,10 +167,11 @@ pub(crate) fn span(stage: &'static str, subject: u64) -> Span {
         return Span(None);
     };
     let sequence = recorder.sequence.fetch_add(1, Ordering::Relaxed);
-    if sequence > LIMIT {
+    let bounded = recorder.limit != 0;
+    if bounded && sequence > recorder.limit {
         return Span(None);
     }
-    let stage = if sequence == LIMIT {
+    let stage = if bounded && sequence == recorder.limit {
         "trace_limit"
     } else {
         stage
@@ -304,6 +354,7 @@ mod tests {
             sender,
             sequence: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            limit: LIMIT,
         };
         event_to(&recorder, "test_release", || (17, 23, 2));
         // A full queue drops instead of blocking the protocol thread.
@@ -324,6 +375,25 @@ mod tests {
             panic!("exhausted recorder must not resolve identities")
         });
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn unbounded_limit_keeps_recording_past_the_default_cap() {
+        // A file-sink capture (limit == 0) must never stop or emit the sentinel,
+        // even after passing the bounded default — otherwise a long mouse-move
+        // trace would silently truncate exactly where the interesting data is.
+        let (sender, receiver) = sync_channel(4);
+        let recorder = Recorder {
+            sender,
+            sequence: AtomicU64::new(LIMIT),
+            dropped: AtomicU64::new(0),
+            limit: 0,
+        };
+        event_to(&recorder, "past_cap", || (9, 8, 7));
+        let record = receiver.try_recv().unwrap();
+        assert_eq!(record.sequence, LIMIT);
+        assert_eq!(record.stage, "past_cap");
+        assert_eq!((record.subject, record.detail, record.aux), (9, 8, 7));
     }
 
     #[test]
