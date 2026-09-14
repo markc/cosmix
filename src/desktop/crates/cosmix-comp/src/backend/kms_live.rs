@@ -5761,36 +5761,54 @@ fn finish_service_cadence<M: LiveCoordinatorMailbox>(
     }
     let observed_at = now();
     let pulse_deadline = *next_pulse_at;
-    if (healthy_idle || submissions > 0) && observed_at >= *next_pulse_at {
+    // detail/aux share the coordinator's clock origin, not necessarily
+    // CLOCK_MONOTONIC's origin. Their signed difference is lateness in us. The
+    // trace timestamp correlates this decision with rendering/flips.
+    let trace_fields = || {
+        (
+            submissions as u64,
+            observed_at.as_micros().min(u128::from(u64::MAX)) as u64,
+            pulse_deadline.as_micros().min(u128::from(u64::MAX)) as u64,
+        )
+    };
+    if submissions > 0 {
+        // Busy frame: this update's render already blocked through its pageflip
+        // (vblank) before returning here, so *now* is the vblank-aligned moment
+        // to hand the animating client its frame callback. Deliver one callback
+        // per presented frame and do NOT gate it against the CPU-side nominal
+        // accumulator.
+        //
+        // The old gate (`observed_at >= next_pulse_at`, then rebase) throttled
+        // busy pulses to the accumulator instead of the display. Because a
+        // present-bound loop iteration jitters either side of the refresh
+        // interval, the accumulator skipped roughly one busy frame in three
+        // (comp_pulse_skipped_busy), pacing an animating client — bg-showcase's
+        // Boing, a video, a drag — down to ~30 fps on a 60 Hz display even
+        // though both could sustain 60. A frame we already presented at vblank
+        // must always wake the client for the next one. Rebase the accumulator
+        // off this presentation so a following idle stretch paces from real
+        // vblank rather than a stale origin.
         pulse()?;
-        // detail/aux share the coordinator's clock origin, not necessarily
-        // CLOCK_MONOTONIC's origin. Their signed difference is lateness in us.
-        // The trace timestamp correlates this decision with rendering/flips.
-        crate::frame_trace::event(
-            if healthy_idle {
-                "comp_pulse_sent_idle"
-            } else {
-                "comp_pulse_sent_busy"
-            },
-            || (
-                submissions as u64,
-                observed_at.as_micros().min(u128::from(u64::MAX)) as u64,
-                pulse_deadline.as_micros().min(u128::from(u64::MAX)) as u64,
-            ),
-        );
+        crate::frame_trace::event("comp_pulse_sent_busy", trace_fields);
+        *next_pulse_at = observed_at.saturating_add(nominal);
+    } else if healthy_idle && observed_at >= *next_pulse_at {
+        // Idle frame: no pageflip paced us, so the nominal accumulator is the
+        // only clock. Keep the throttle here — idle callbacks exist to keep a
+        // client's frame clock alive, not to chase the display.
+        pulse()?;
+        crate::frame_trace::event("comp_pulse_sent_idle", trace_fields);
         *next_pulse_at = observed_at.saturating_add(nominal);
     } else {
         crate::frame_trace::event(
             if healthy_idle {
                 "comp_pulse_skipped_idle"
             } else {
+                // Busy iteration that presented nothing (no damage / cancelled
+                // presentation): no vblank occurred, so there is no frame to
+                // pace a callback against.
                 "comp_pulse_skipped_busy"
             },
-            || (
-                submissions as u64,
-                observed_at.as_micros().min(u128::from(u64::MAX)) as u64,
-                pulse_deadline.as_micros().min(u128::from(u64::MAX)) as u64,
-            ),
+            trace_fields,
         );
     }
     Ok(None)
@@ -11831,7 +11849,15 @@ mod tests {
     }
 
     #[test]
-    fn real_submissions_cannot_pulse_twice_in_one_refresh_interval() {
+    fn busy_frames_pulse_every_presentation_without_accumulator_throttle() {
+        // Each busy call models a presented frame: the render already blocked
+        // through its pageflip (vblank) before this cadence step, so every one
+        // must wake the client — even several within one nominal interval and
+        // even when the monotonic clock has not advanced between them. Gating a
+        // busy pulse against the accumulator is what paced an animating client
+        // down to ~30 fps (comp_pulse_skipped_busy in the frame trace); the
+        // pump serialises real presentations on the flip, so "many at the same
+        // instant" is a degenerate input, not a burst to suppress.
         let mut mailbox = SupervisorMailbox::new([], []);
         let mut now = mailbox.now();
         let mut next = Duration::ZERO;
@@ -11852,12 +11878,13 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(pulses.get(), 1);
-        mailbox.clock.set(nominal);
+        assert_eq!(pulses.get(), 3, "every presented busy frame pulses");
+        // A busy iteration that presented nothing has no vblank to pace, so it
+        // does not pulse — the callback rides real frames, not empty ones.
         finish_service_cadence(
             &mut mailbox,
             false,
-            1,
+            0,
             &mut next,
             nominal,
             &mut now,
@@ -11867,7 +11894,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pulses.get(), 2);
+        assert_eq!(pulses.get(), 3, "a busy frame with no submission never pulses");
     }
 
     #[test]
