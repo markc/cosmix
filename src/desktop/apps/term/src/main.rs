@@ -8,6 +8,7 @@ mod input_tests;
 #[cfg(test)]
 mod layout_tests;
 mod metrics;
+mod mouse_input;
 mod native_session;
 mod panes;
 mod raster;
@@ -95,6 +96,22 @@ struct Core(Arc<Mutex<TabSet>>, tabs::Cleanup);
 struct NotifyTx(Option<tokio::sync::mpsc::UnboundedSender<tabs::CompletionNote>>);
 #[derive(Resource)]
 struct Painter(Mutex<raster::Raster>);
+#[derive(Component)]
+struct SquareButton;
+
+fn square_buttons(mut nodes: Query<&mut Node, With<SquareButton>>) {
+    for mut node in &mut nodes {
+        if node.width != node.height
+            || node.min_width != node.height
+            || node.padding != UiRect::ZERO
+        {
+            node.width = node.height;
+            node.min_width = node.height;
+            node.padding = UiRect::ZERO;
+        }
+    }
+}
+
 #[derive(Resource)]
 struct View {
     terminal: Entity,
@@ -344,6 +361,12 @@ fn main() {
         .add_observer(on_menu)
         .add_systems(Update, record_focus_activity)
         .add_systems(Update, (menu_focus, sync_tabs, sync_panes).chain())
+        // CTK's private update_button_style sets height/min_width in Update.
+        // Square afterwards every frame, before layout resolves the new size.
+        .add_systems(
+            PostUpdate,
+            square_buttons.before(bevy::ui::UiSystems::Layout),
+        )
         .add_systems(PostUpdate, refresh.after(bevy::ui::UiSystems::Layout))
         .run();
     let removed = terminal.lock().unwrap().shutdown();
@@ -392,9 +415,8 @@ fn setup(
                 flex_basis: px(0),
                 min_height: px(0),
                 overflow: Overflow::clip(),
-                // Match the server-side window's rounded bottom corners so the
-                // black content clips to the curve instead of poking a square
-                // nub past the frame. Bevy's clip respects the border radius.
+                // Match the window's rounded bottom corners. Bevy clips children
+                // rectangularly, so pane borders and images are rounded directly.
                 border_radius: BorderRadius::bottom(px(9.0)),
                 ..default()
             },
@@ -478,7 +500,8 @@ fn sync_tabs(mut commands: Commands, core: Res<Core>, mut view: ResMut<View>) {
         view.tab_buttons.push(button);
     }
     let button =
-        ctk::button::spawn_button(&mut commands, ButtonDef::text("+").size(ButtonSize::Sm));
+        ctk::button::spawn_button(&mut commands, ButtonDef::text("+"));
+    commands.entity(button).insert(SquareButton);
     commands.entity(button).observe(
         |_: On<bevy::ui_widgets::Activate>,
          core: Res<Core>,
@@ -863,6 +886,7 @@ fn spawn_pane_tree(
                     ImageNode::new(image.clone()),
                     Node {
                         flex_shrink: 0.0,
+                        border_radius: BorderRadius::bottom(px(8.0)),
                         ..default()
                     },
                 ))
@@ -876,6 +900,7 @@ fn spawn_pane_tree(
                         min_height: px(0),
                         border: UiRect::all(px(1)),
                         overflow: Overflow::clip(),
+                        border_radius: BorderRadius::bottom(px(8.0)),
                         ..default()
                     },
                     BorderColor::DEFAULT,
@@ -896,6 +921,7 @@ fn spawn_pane_tree(
                     },
                 )
                 .id();
+            mouse_input::observe(commands, container, entity, id);
             views.push(PaneView {
                 id,
                 container,

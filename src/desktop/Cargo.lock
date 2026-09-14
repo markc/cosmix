@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.52.1"
+version = "0.52.2"
 dependencies = [
  "bevy",
  "chrono",
@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "bevy",
  "cosmix-actions",

@@ -1,4 +1,7 @@
 use crate::metrics::Metrics;
+#[path = "mouse.rs"]
+mod mouse;
+pub use mouse::MouseModifiers;
 use rio_vt::{
     ansi::CursorShape,
     corcovado::{Poll, PollOpt, Ready, Token, channel},
