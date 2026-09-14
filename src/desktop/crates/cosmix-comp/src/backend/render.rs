@@ -834,6 +834,23 @@ fn build_live_render_app(
     if scene_mode == LiveSceneMode::ClientContent {
         hud_probe::install_from_environment(&mut app);
     }
+    // Native Quoin as a PERSISTENT desktop, independent of the hud-probe
+    // comparison harness. Previously native_shell::install ran ONLY from
+    // inside hud_probe::install (render_hud_probe.rs), so panels embedded in
+    // comp were reachable only via the bounded HUD_PROBE demo (auto panel
+    // cycle, ~timed). With COSMIX_COMP_NATIVE_QUOIN=1 and HUD_PROBE off, the
+    // panels never installed and the daemon fell back to the standalone
+    // layer-shell Quoin whose surface create/destroy on panel reveal/hide
+    // starves the wallpaper client (the Boing wallpaper stutter). Install the
+    // panels here for the persistent case; when HUD_PROBE=1 the harness
+    // above already installed them, so guard against a double-install.
+    #[cfg(feature = "native-quoin")]
+    if scene_mode == LiveSceneMode::ClientContent
+        && std::env::var("COSMIX_COMP_NATIVE_QUOIN").as_deref() == Ok("1")
+        && std::env::var("COSMIX_COMP_HUD_PROBE").as_deref() != Ok("1")
+    {
+        crate::native_shell::install(&mut app);
+    }
     app.insert_resource(FirstLiveRenderError::default())
         .insert_resource(RenderErrorHandler(stop_live_rendering_after_first_error));
     assert_non_pipelined_rendering(&app)?;
