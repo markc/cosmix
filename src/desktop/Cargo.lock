@@ -2812,6 +2812,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-busviewer"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "cosmix-lib-client",
+ "ctk",
+ "flume",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cosmix-capture"
 version = "0.1.2"
 dependencies = [

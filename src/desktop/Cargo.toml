@@ -6,6 +6,7 @@ members = [
     "apps/tray",
     "apps/trayd",
     "apps/tower",
+    "apps/busviewer",
     "apps/mail",
     "apps/interactgui",
     "apps/imeprobe",
