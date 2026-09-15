@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell-host"
-version = "0.6.5"
+version = "0.6.6"
 description = "SCTK layer-shell renderer host for Cosmix Quoin"
 edition = "2024"
 rust-version = "1.95"
@@ -52,3 +52,4 @@ xkbcommon-dl = "=0.4.2"
 
 [dev-dependencies]
 pretty_assertions = "1"
+wgpu = { version = "=29.0.4", features = ["noop"] }

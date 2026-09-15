@@ -96,6 +96,8 @@ struct LayerHostUpdateWake(bool);
 pub struct LayerHostDeadline(pub Option<Duration>);
 
 /// Opt-in bounded diagnostics shared by native layer and scene hosts.
+/// A nonempty COSMIX_HOST_FRAME_TRACE_FILE selects an append-only sink;
+/// otherwise records go to stderr. The compositor's file variable is ignored.
 pub mod frame_trace {
     use bevy::{
         app::{App, SubApp},
@@ -126,12 +128,14 @@ pub mod frame_trace {
     struct State {
         sender: SyncSender<Record>,
         counters: Arc<Counters>,
+        stages: Option<Vec<String>>,
     }
     struct Record {
         tid: u32,
         stage: &'static str,
         subject: u64,
         detail: u64,
+        aux: u64,
         sequence: u64,
         start_us: u64,
         end_us: u64,
@@ -150,18 +154,33 @@ pub mod frame_trace {
             });
             let report = counters.clone();
             std::thread::Builder::new().name("cosmix-frame-trace".into()).spawn(move || {
-                let stderr = std::io::stderr();
+                // Separate from the compositor's truncating sink. A shared
+                // parent environment must not make the two writers collide.
+                let mut output: Box<dyn Write> = match std::env::var_os("COSMIX_HOST_FRAME_TRACE_FILE")
+                    .filter(|path| !path.is_empty()) {
+                    Some(path) => match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        Ok(file) => Box::new(file),
+                        Err(error) => {
+                            tracing::warn!(%error, "host frame trace file unavailable; using stderr");
+                            Box::new(std::io::stderr())
+                        }
+                    },
+                    None => Box::new(std::io::stderr()),
+                };
                 for r in receiver {
                     // Only this diagnostic thread can block on journal IO.
-                    let _ = writeln!(stderr.lock(),
-                        "FRAME_TRACE mono_us={} start_us={} end_us={} duration_us={} cpu_us={} cpu_scope=caller pid={} tid={} sequence={} stage={} subject={} detail={} dropped_total={} capped={}",
+                    let _ = writeln!(output,
+                        "FRAME_TRACE mono_us={} start_us={} end_us={} duration_us={} cpu_us={} cpu_scope=caller pid={} tid={} sequence={} stage={} subject={} detail={} aux={} dropped_total={} capped={}",
                         r.start_us, r.start_us, r.end_us, r.end_us.saturating_sub(r.start_us),
-                        r.cpu_us, std::process::id(), r.tid, r.sequence, r.stage, r.subject, r.detail,
+                        r.cpu_us, std::process::id(), r.tid, r.sequence, r.stage, r.subject, r.detail, r.aux,
                         report.dropped.load(Ordering::Relaxed),
                         report.attempted.load(Ordering::Relaxed) >= LIMIT);
                 }
             }).ok()?;
-            Some(State { sender, counters })
+            let stages = std::env::var("COSMIX_FRAME_TRACE_STAGES").ok().map(|value| {
+                value.split(',').map(|stage| stage.trim().to_owned()).collect()
+            });
+            Some(State { sender, counters, stages })
         }).as_ref()
     }
 
@@ -185,6 +204,13 @@ pub mod frame_trace {
     pub fn span(stage: &'static str, subject: u64) -> Span {
         let record = (|| {
             let state = state()?;
+            if state
+                .stages
+                .as_ref()
+                .is_some_and(|stages| !stages.iter().any(|s| s == stage))
+            {
+                return None;
+            }
             let sequence = reserve(&state.counters.attempted)?;
             let start_us = clock_us(ClockId::Monotonic);
             let cpu = clock_us(ClockId::ThreadCPUTime);
@@ -194,6 +220,7 @@ pub mod frame_trace {
                     stage,
                     subject,
                     detail: 0,
+                    aux: 0,
                     sequence,
                     start_us,
                     end_us: 0,
@@ -213,6 +240,13 @@ pub mod frame_trace {
         let mut event = span(stage, subject);
         if let Some((record, _)) = &mut event.record {
             record.detail = detail;
+        }
+    }
+    fn allocation_event(stage: &'static str, subject: u64, detail: u64, aux: u64) {
+        let mut event = span(stage, subject);
+        if let Some((record, _)) = &mut event.record {
+            record.detail = detail;
+            record.aux = aux;
         }
     }
     impl Drop for Span {
@@ -424,6 +458,11 @@ pub mod frame_trace {
         }
         if wgpu::diagnostics::install(api_event).is_err() {
             drop(span("wgpu_observer_already_installed", 0));
+        }
+        if !wgpu::hal::diagnostics::install_allocations(allocation_event) {
+            tracing::warn!(
+                "host allocation diagnostic observer already installed; keeping its owner"
+            );
         }
         if let Some(render) = app.get_sub_app_mut(RenderApp) {
             render.init_resource::<AcquiredProbe>().add_systems(

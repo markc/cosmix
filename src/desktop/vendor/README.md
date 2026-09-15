@@ -551,6 +551,14 @@ changes above. Update both exact dependency versions together, run the two
 comparison rather than copying a registry working directory whose provenance
 has not been checked.
 
+## bevy_render 0.19.1: selective texture-cache ageing
+
+One-file patch to `src/texture/texture_cache.rs`: a retained-ID set plus
+opt-in usage capture so the shell host can preserve waiting outputs' render
+targets across control-only updates (reservations still release every
+cleanup). Full provenance, rationale, alternatives considered, and the
+refresh checklist: `bevy_render/README.cosmix.md`.
+
 ## smithay
 
 | | |
