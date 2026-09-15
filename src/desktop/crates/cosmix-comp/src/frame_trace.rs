@@ -67,13 +67,13 @@ enum Sink {
 
 impl Sink {
     fn open() -> Self {
-        if let Ok(path) = std::env::var("COSMIX_FRAME_TRACE_FILE") {
-            if !path.is_empty() {
-                match std::fs::File::create(&path) {
-                    Ok(file) => return Sink::File(file),
-                    Err(error) => {
-                        eprintln!("FRAME_TRACE sink open failed path={path} error={error}");
-                    }
+        if let Ok(path) = std::env::var("COSMIX_FRAME_TRACE_FILE")
+            && !path.is_empty()
+        {
+            match std::fs::File::create(&path) {
+                Ok(file) => return Sink::File(file),
+                Err(error) => {
+                    eprintln!("FRAME_TRACE sink open failed path={path} error={error}");
                 }
             }
         }

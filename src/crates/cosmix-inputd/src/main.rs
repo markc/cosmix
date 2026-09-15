@@ -2,7 +2,7 @@
 //! successor).
 //!
 //! Registers the `inputd` Bus service and serves keymap verbs over the
-//! [`cosmix_input_core::Resolver`] and pointer injection through a persistent
+//! [`cosmix_input_core::Resolver`] and key/pointer injection through a persistent
 //! uinput device — no physical keyboard needed for either surface. An
 //! optional `--observe <device>` reader validates resolution against real
 //! hardware safely (no grab, no re-emit, no verbs fired). The interception path
@@ -30,7 +30,7 @@ const SERVICE: &str = "inputd";
     name = "cosmix-inputd",
     about = "Input verb broker: keys become Bus verbs. Serves the inputd service; \
              --observe validates resolution on real hardware (safe); --grab is the \
-             supervised interception path. Pointer verbs inject through uinput."
+             supervised interception path. Key and pointer verbs inject through uinput."
 )]
 struct Args {
     /// Read this keyboard event node in OBSERVE-ONLY mode (no grab, no re-emit,

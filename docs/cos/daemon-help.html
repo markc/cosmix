@@ -458,15 +458,25 @@ verbs and are not advertised. Props reads and watches are read-only; props
 set/delete and other mutations are marked writable. A read-only flag describes
 the command's operation, not an authorisation grant or a promise that diagnostic
 counters will remain unchanged.</p>
-<h2 id="inputd-pointer-injection">Inputd pointer injection</h2>
-<p><code>cosmix-inputd</code> 0.3.0 serves these writable verbs on the <code>inputd</code> Bus service.
+<h2 id="inputd-key-and-pointer-injection">Inputd key and pointer injection</h2>
+<p><code>cosmix-inputd</code> 0.4.0 serves these writable verbs on the <code>inputd</code> Bus service.
 All accept JSON bodies and are reachable by local and mesh callers, with no
 node-local gate. The existing keymap mutation gates are unchanged.</p>
 <table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>input.key</code></td><td><code>{"key":"F9","action":"tap"}</code></td><td>Key press (value 1), release (value 0), or tap (press then release); SYN_REPORT after each state change</td></tr>
 <tr><td><code>input.pointer.move</code></td><td><code>{"dx":12,"dy":-4}</code></td><td>Relative X/Y motion, then SYN_REPORT</td></tr>
 <tr><td><code>input.pointer.button</code></td><td><code>{"button":"left","action":"click"}</code></td><td>Left/right/middle press, release or click; SYN_REPORT after each state change</td></tr>
 <tr><td><code>input.pointer.scroll</code></td><td><code>{"dy":1,"dx":-1}</code></td><td>Vertical wheel steps and optional horizontal wheel steps, then SYN_REPORT</td></tr>
 </tbody></table>
+<p>Key names are case-insensitive: F1–F12, A–Z, Enter, Escape, Space, Tab,
+Backspace, Delete, Left/Right/Up/Down, Home/End/PageUp/PageDown, and
+Left/Right Ctrl, Shift, Alt and Meta (without spaces, e.g. <code>LeftCtrl</code>).
+An optional <code>KEY_</code> prefix is accepted. Bare decimal strings always mean raw
+Linux input-event codes in 0–767 (<code>0x2ff</code>), e.g. <code>"67"</code> is F9; use <code>KEY_0</code>
+through <code>KEY_9</code> to name the physical digit keys unambiguously. These are physical
+codes; the compositor's keyboard layout determines the resulting character.
+Unknown names and out-of-range codes return rc 10 naming the bad key.
+Actions are exactly <code>press</code>, <code>release</code> or <code>tap</code>; tap emits two SYN frames.</p>
 <p>Motion and wheel deltas are signed 32-bit integers. Positive wheel <code>dy</code> means
 up and positive <code>dx</code> means right (desktop natural-scroll settings may reverse
 the displayed result). Success returns rc 0 with <code>{"ok":true}</code>; malformed
@@ -474,7 +484,8 @@ requests, unavailable <code>/dev/uinput</code> or failed writes return rc 10 wit
 <code>error</code> message. Success acknowledges the kernel write, not compositor delivery.</p>
 <p>The service lazily creates and retains a separate <code>cosmix-inputd virtual pointer</code>
 uinput device, independently of <code>--grab</code> or <code>--observe</code>, and keeps it across
-broker reconnects. It advertises EV_SYN, EV_KEY for the three buttons, and EV_REL
+broker reconnects. It advertises EV_SYN, the full EV_KEY range 0–767 (including
+the pointer buttons), and EV_REL
 for X/Y and both wheel axes. First use allows 300 ms for seat discovery before
 writing. The daemon needs permission to open <code>/dev/uinput</code>; failed creation is
 retried on the next valid request. Drop or process exit destroys the device.

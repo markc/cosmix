@@ -15,10 +15,19 @@ cursor width/height caps (64×64 for older drivers without these caps).
 Cursor images use two transparent, pitch-aware ARGB dumb buffers. Image
 changes pass an atomic test-only check before a synchronous cursor-plane
 commit; hotspots, output scale, SHM source rectangles and transforms are
-applied to the uploaded image and placement. Motion commits change only
-`CRTC_X`/`CRTC_Y`, use `NONBLOCK`, and request no pageflip event. A busy motion
-commit is retried with the newest position on the next scene drain. These
-commits do not flip the primary plane or advance its scene revision.
+applied to the uploaded image and placement. For an admitted image, motion
+retains only the latest desired position. The next primary atomic submission
+appends the cursor plane properties, including its current framebuffer and
+`CRTC_X`/`CRTC_Y`, to the same request. Both planes share one commit and one
+primary pageflip completion. Submitted cursor coordinates advance only when
+the ioctl succeeds; every busy retry picks up the latest desired position.
+
+When the presentation pump proves the primary scene idle, it flushes pending
+motion with a cursor-only `NONBLOCK` commit and no pageflip event. EBUSY keeps
+the position pending for the next refresh-paced pump update, even if input
+has stopped. Motion neither rotates cursor buffers nor advances the primary
+scene revision. Image replacement, hide and teardown remain synchronised
+with the cursor submission lock and the existing blocking image commits.
 If a pending cursor commit makes the next primary commit busy, the presenter
 retries at bounded 2 ms intervals within its original deadline; it does not
 wait for a cursor pageflip event that was never requested.
@@ -690,11 +699,15 @@ The per-destination fd duplication and Vulkan image creation/bind syscalls run
 on the render thread. This is intentionally retained for S-2: admission is
 bounded to eight destinations per render batch, and moving import into the
 worker would break same-frame copy-out. Hardware-gate runs should continue to
-record this bounded syscall cost. They should also flag the
-`failed to release DMA-BUF queue ownership; backing and release use stranded
-fail-closed` log line: it means the sampled path exceeded its 250 ms exact-index
-wait, deliberately withheld `wl_buffer.release`, and requires a fresh import
-before that client buffer can be used again.
+record this bounded syscall cost. Sampled-image cleanup now retains FOREIGN
+release batches across frames and checks their exact submission with a zero
+timeout. Acquire remains queue-ordered ahead of sampling. The retirement worker
+also polls without holding wgpu's fence lock across GPU progress waits. See the
+[asynchronous ownership contract](cosmix-wgpu-dmabuf.md#asynchronous-sampled-image-retirement-0150).
+Flag either `failed to release DMA-BUF queue ownership` or
+`DMA-BUF release completion unproven`: submission failure or an unproved release
+after the 250 ms deadline strands the backing and withholds `wl_buffer.release`.
+That cached image cannot be reused; another use requires a fresh import.
 
 Live renderer reconstruction currently rebuilds the renderer, capture bridge,
 advertisement registry and retirement worker together, leaving DMA-BUF
