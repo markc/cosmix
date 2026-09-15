@@ -389,6 +389,7 @@ pub(crate) struct AtomicPresenter<I: AtomicIo> {
     modeset_required: bool,
     pending_commit: Option<PendingAtomicCommit>,
     displayed_timestamp: Option<(u64, u32)>,
+    pub(crate) cursor: cursor::HardwareCursorBridge,
 }
 
 impl<I: AtomicIo> AtomicPresenter<I> {
@@ -410,6 +411,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             modeset_required: true,
             pending_commit: None,
             displayed_timestamp: None,
+            cursor: cursor::HardwareCursorBridge::default(),
         }
     }
 
@@ -710,7 +712,22 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             if self.cancellation.cancelled(generation) {
                 return Ok(CommitWaitOutcome::Cancelled);
             }
-            let commit = self.io.commit(request, options);
+            let commit = if !options.test_only && options.correlation.is_some() {
+                self.cursor
+                    .commit_primary(request, generation, self.selection.crtc_id, |merged| {
+                        // Image upload/commit may have held the cursor lock
+                        // while authority was revoked. Recheck after locking.
+                        if self.cancellation.cancelled(generation) {
+                            return Err(AtomicCommitError::synthetic(
+                                "primary cursor merge",
+                                "output generation was cancelled",
+                            ));
+                        }
+                        self.io.commit(merged, options)
+                    })
+            } else {
+                self.io.commit(request, options)
+            };
             match commit {
                 Ok(()) if self.cancellation.cancelled(generation) => {
                     return Ok(CommitWaitOutcome::CommittedThenCancelled);
@@ -1800,6 +1817,116 @@ mod tests {
         cancel_on_decode: Option<(Arc<AtomicCancellation>, CancelScope)>,
         remove_results: VecDeque<Result<(), String>>,
         removed_framebuffers: Vec<u32>,
+    }
+
+    #[test]
+    fn primary_submission_merges_motion_and_only_success_consumes_it() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        presenter.cursor = cursor::HardwareCursorBridge::pending_for_test(7, || {
+            panic!("a primary presentation must never flush cursor-only")
+        });
+        let request = presenter.pageflip_request(ScanoutSlotId(0)).unwrap();
+        let options = AtomicCommitOptions {
+            test_only: false,
+            allow_modeset: false,
+            nonblock: true,
+            page_flip_event: true,
+            correlation: Some(AtomicCommitCorrelation {
+                generation: 7,
+                slot: ScanoutSlotId(0),
+            }),
+        };
+        // A hard refusal leaves the cursor pending as well as an EBUSY.
+        presenter
+            .io
+            .commit_results
+            .push_back(Err(commit_errno(libc::EINVAL)));
+        assert!(
+            presenter
+                .commit_with_busy_retry(
+                    &request,
+                    options,
+                    7,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        presenter
+            .io
+            .commit_results
+            .extend([Err(commit_errno(libc::EBUSY)), Ok(())]);
+        assert_eq!(
+            presenter
+                .commit_with_busy_retry(
+                    &request,
+                    options,
+                    7,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .unwrap(),
+            CommitWaitOutcome::Committed
+        );
+        for merged in &presenter.io.requests {
+            assert_eq!(
+                &merged.properties[..request.properties.len()],
+                &request.properties
+            );
+            assert_eq!(merged.properties.len(), request.properties.len() + 3);
+            assert!(
+                merged.properties[request.properties.len()..]
+                    .iter()
+                    .all(|p| p.object == 90)
+            );
+            assert_eq!(merged.properties[request.properties.len()].value, 100);
+        }
+        assert!(presenter.io.commits.iter().all(|o| *o == options));
+        presenter
+            .commit_with_busy_retry(
+                &request,
+                options,
+                7,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(presenter.io.requests.last(), Some(&request));
+    }
+
+    #[test]
+    fn merged_motion_shares_the_primary_completion_and_cancellation() {
+        for cancelled in [false, true] {
+            let mut io = FakeAtomicIo::default();
+            io.waits.push_back(AtomicWaitReady::Ready {
+                drm: true,
+                cancel: false,
+            });
+            io.events.push_back(vec![matching_flip(7)]);
+            let mut presenter = presenter(io);
+            presenter.cursor = cursor::HardwareCursorBridge::pending_for_test(7, || false);
+            if cancelled {
+                presenter.cancellation.cancel(CancelScope::Generation(7));
+            }
+            let outcome = presenter
+                .present(
+                    ScanoutSlotId(0),
+                    7,
+                    PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                )
+                .unwrap();
+            if cancelled {
+                assert_eq!(outcome, PresentOutcome::Cancelled);
+                assert!(presenter.io.requests.is_empty());
+            } else {
+                assert_eq!(outcome, PresentOutcome::Displayed);
+                assert_eq!(presenter.io.commits.len(), 1);
+                assert!(
+                    presenter.io.requests[0]
+                        .properties
+                        .iter()
+                        .any(|p| p.object == 90)
+                );
+                assert!(!presenter.has_pending_commit());
+            }
+        }
     }
 
     impl AtomicIo for FakeAtomicIo {

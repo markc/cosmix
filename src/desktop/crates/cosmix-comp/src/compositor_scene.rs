@@ -1766,7 +1766,7 @@ fn project_hardware_cursor(world: &World) -> bool {
             return false;
         }
         if !cursor.position.on_output || cursor.selection == ProjectedCursorSelection::Hidden {
-            return bridge.update(None);
+            return bridge.project(None);
         }
         let snapshot = if cursor.client.as_ref().is_some_and(|client| {
             cursor.selection == ProjectedCursorSelection::Surface
@@ -1779,10 +1779,11 @@ fn project_hardware_cursor(world: &World) -> bool {
         if snapshot.is_none() {
             // GPU-only cursors retain their existing material path. Detach any
             // previous hardware image before showing the software replacement.
-            bridge.update(None);
+            bridge.project(None);
             return false;
         }
-        bridge.update(snapshot.as_ref())
+        // Already-admitted images retain motion for the presentation owner.
+        bridge.project(snapshot.as_ref())
     }
     #[cfg(not(any(feature = "kms-live", test)))]
     {

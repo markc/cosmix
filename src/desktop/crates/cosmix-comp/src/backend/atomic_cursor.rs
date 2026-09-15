@@ -1,6 +1,6 @@
-//! Optional cursor plane. No primary-plane properties or pageflip events are
-//! submitted here. Image/hide commits synchronise buffer retirement; motion
-//! commits are nonblocking and coalesce when a primary flip makes KMS busy.
+//! Optional cursor plane. Image/hide commits synchronise buffer retirement.
+//! Motion is retained for the primary atomic submission, or flushed by the
+//! presentation pump when the primary scene is proven idle.
 
 use super::*;
 use crate::capture::CaptureCursorSnapshot;
@@ -17,6 +17,9 @@ trait CursorPlane: Send {
     /// False means this image needs software projection; the hardware image
     /// has already been detached. Errors retire the plane for this generation.
     fn project(&mut self, image: Option<&CaptureCursorSnapshot>) -> Result<bool, String>;
+    fn pending_request(&self, generation: u64, crtc: u32) -> Option<AtomicRequest>;
+    fn position_submitted(&mut self);
+    fn flush_position(&mut self, generation: u64) -> Result<(), String>;
 }
 
 impl HardwareCursorBridge {
@@ -53,7 +56,7 @@ impl HardwareCursorBridge {
 
     /// `None` hides the cursor. An unsupported visible image must instead call
     /// this with None and use software projection for that image.
-    pub(crate) fn update(&self, image: Option<&CaptureCursorSnapshot>) -> bool {
+    pub(crate) fn project(&self, image: Option<&CaptureCursorSnapshot>) -> bool {
         let Ok(mut slot) = self.0.lock() else {
             return false;
         };
@@ -72,6 +75,45 @@ impl HardwareCursorBridge {
         }
     }
 
+    /// Keep image replacement/destruction excluded until the ioctl returns.
+    /// Each EBUSY retry rebuilds from the latest position and current FB.
+    pub(super) fn commit_primary(
+        &self,
+        request: &AtomicRequest,
+        generation: u64,
+        crtc: u32,
+        commit: impl FnOnce(&AtomicRequest) -> Result<(), AtomicCommitError>,
+    ) -> Result<(), AtomicCommitError> {
+        let mut slot = self
+            .0
+            .lock()
+            .map_err(|_| AtomicCommitError::synthetic("cursor merge", "cursor lock poisoned"))?;
+        let Some(cursor) = slot.as_mut() else {
+            return commit(request);
+        };
+        let Some(pending) = cursor.pending_request(generation, crtc) else {
+            return commit(request);
+        };
+        let mut merged = request.clone();
+        merged.properties.extend(pending.properties);
+        commit(&merged)?;
+        cursor.position_submitted();
+        Ok(())
+    }
+
+    /// Called only by a healthy-idle pump update, never by an input event.
+    pub(crate) fn flush_idle(&self, generation: u64) {
+        let Ok(mut slot) = self.0.lock() else {
+            return;
+        };
+        if let Some(cursor) = slot.as_mut()
+            && let Err(error) = cursor.flush_position(generation)
+        {
+            tracing::warn!(%error, "DRM cursor flush failed; restoring software cursor");
+            slot.take();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         project: impl FnMut(Option<&CaptureCursorSnapshot>) -> Result<bool, String> + Send + 'static,
@@ -84,8 +126,55 @@ impl HardwareCursorBridge {
             fn project(&mut self, image: Option<&CaptureCursorSnapshot>) -> Result<bool, String> {
                 (self.0)(image)
             }
+            fn pending_request(&self, _: u64, _: u32) -> Option<AtomicRequest> {
+                None
+            }
+            fn position_submitted(&mut self) {}
+            fn flush_position(&mut self, _: u64) -> Result<(), String> {
+                Ok(())
+            }
         }
         Self(Arc::new(Mutex::new(Some(Box::new(Fake(project))))))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(
+        generation: u64,
+        idle: impl FnMut() -> bool + Send + 'static,
+    ) -> Self {
+        struct Fake<F> {
+            generation: u64,
+            pending: bool,
+            idle: F,
+        }
+        impl<F: FnMut() -> bool + Send> CursorPlane for Fake<F> {
+            fn project(&mut self, _: Option<&CaptureCursorSnapshot>) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn pending_request(&self, generation: u64, _: u32) -> Option<AtomicRequest> {
+                (self.pending && self.generation == generation).then(|| {
+                    let mut request = AtomicRequest::default();
+                    request.set(90, 1, 100);
+                    request.set(90, 3, (-7_i64) as u64);
+                    request.set(90, 4, 13);
+                    request
+                })
+            }
+            fn position_submitted(&mut self) {
+                self.pending = false;
+            }
+            fn flush_position(&mut self, generation: u64) -> Result<(), String> {
+                if self.pending && generation == self.generation && (self.idle)() {
+                    self.position_submitted();
+                }
+                Ok(())
+            }
+        }
+        Self(Arc::new(Mutex::new(Some(Box::new(Fake {
+            generation,
+            pending: true,
+            idle,
+        })))))
     }
 }
 
@@ -105,11 +194,44 @@ struct HardwareCursor {
     buffers: Vec<CursorBuffer>,
     front: usize,
     image: Option<CaptureCursorSnapshot>,
+    pending_position: Option<(i32, i32)>,
     cancellation: Arc<AtomicCancellation>,
     generation: u64,
 }
 
 impl CursorPlane for HardwareCursor {
+    fn pending_request(&self, generation: u64, crtc: u32) -> Option<AtomicRequest> {
+        if generation != self.generation
+            || crtc != self.crtc
+            || self.cancellation.cancelled(generation)
+        {
+            return None;
+        }
+        let (x, y) = self.pending_position?;
+        let mut image = self.image.clone()?;
+        image.x = x;
+        image.y = y;
+        let fb = self.buffers.get(self.front)?.fb;
+        Some(self.request(Some(&image), fb.into(), true))
+    }
+
+    fn position_submitted(&mut self) {
+        if let Some((x, y)) = self.pending_position.take()
+            && let Some(image) = self.image.as_mut()
+        {
+            image.x = x;
+            image.y = y;
+        }
+    }
+
+    fn flush_position(&mut self, generation: u64) -> Result<(), String> {
+        let Some(request) = self.pending_request(generation, self.crtc) else {
+            return Ok(());
+        };
+        let result = self.commit(&request, false, true);
+        self.finish_position_commit(result)
+    }
+
     fn project(&mut self, image: Option<&CaptureCursorSnapshot>) -> Result<bool, String> {
         if self.cancellation.cancelled(self.generation) {
             return Ok(false);
@@ -142,6 +264,18 @@ impl CursorPlane for HardwareCursor {
 }
 
 impl HardwareCursor {
+    fn finish_position_commit(
+        &mut self,
+        result: Result<(), AtomicCommitError>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(()) => self.position_submitted(),
+            Err(error) if error.is_busy() => (),
+            Err(error) => return Err(error.to_string()),
+        }
+        Ok(())
+    }
+
     fn new(
         fd: OwnedFd,
         selection: AtomicOutputSelection,
@@ -208,6 +342,7 @@ impl HardwareCursor {
                 buffers: Vec::new(),
                 front: 0,
                 image: None,
+                pending_position: None,
                 cancellation,
                 generation,
             });
@@ -275,15 +410,14 @@ impl HardwareCursor {
             (Some(old), Some(new)) => !same_pixels(old, new),
             _ => true,
         };
-        if !changed
-            && self
-                .image
-                .as_ref()
-                .zip(image)
-                .is_some_and(|(a, b)| a.x == b.x && a.y == b.y)
-        {
+        if !changed {
+            self.pending_position = self.image.as_ref().zip(image).and_then(|(old, new)| {
+                (old.x != new.x || old.y != new.y).then_some((new.x, new.y))
+            });
             return Ok(());
         }
+        // An image replacement/hide supersedes any motion for the old image.
+        self.pending_position = None;
         if let Some(image) = image {
             if image.width > self.size.0 || image.height > self.size.1 {
                 return Err("cursor image exceeds driver cursor dimensions".into());
@@ -330,19 +464,8 @@ impl HardwareCursor {
                 .map_err(|e| e.to_string())?;
         }
         match self.commit(&request, false, !changed) {
-            // A busy CRTC coalesces: keep the last successfully submitted
-            // state (front/image are not advanced below) and let the next
-            // update — motion OR image change — retry with the newest
-            // position/pixels, without spinning, consuming flip events, or
-            // forcing a primary render. The next update is input-driven
-            // (pointer motion or a cursor-shape change), so a fully-stopped
-            // pointer self-heals on its next event, not necessarily the next
-            // frame. Crucially this now also covers a *changed* (image)
-            // commit: a blocking image commit that a driver rejects with
-            // EBUSY must NOT propagate Err, because the caller
-            // (HardwareCursorBridge::update) drops the plane on Err — which
-            // would silently retire the whole cursor to software and restore
-            // the exact per-frame-render stall this plane removes.
+            // Preserve the existing image-commit lifetime rule: EBUSY does
+            // not advance front/image or retire the plane to software.
             Err(error) if error.is_busy() => return Ok(()),
             Err(error) => return Err(error.to_string()),
             Ok(()) => (),
@@ -515,6 +638,7 @@ mod tests {
             buffers: Vec::new(),
             front: 0,
             image: None,
+            pending_position: None,
             cancellation: AtomicCancellation::new().unwrap(),
             generation: 1,
         };
@@ -558,8 +682,42 @@ mod tests {
                 },
             ]
         );
+        // An admitted position-only update must never reach the eventfd's
+        // invalid DRM ioctl. Coalesce, return to the submitted point, then
+        // prove submitted coordinates advance only at successful submission.
+        cursor.image = Some(image());
+        cursor.admitted = true;
+        let mut moved = image();
+        moved.x = 40;
+        assert!(cursor.project(Some(&moved)).unwrap());
+        moved.x = 70;
+        assert!(cursor.project(Some(&moved)).unwrap());
+        assert_eq!(cursor.pending_position, Some((70, 13)));
+        assert_eq!(cursor.image.as_ref().unwrap().x, -7);
+        assert_eq!(cursor.front, 0);
+        assert!(cursor.buffers.is_empty());
+        cursor
+            .finish_position_commit(Err(AtomicCommitError {
+                operation: "cursor test",
+                errno: Some(libc::EBUSY),
+                detail: "busy".into(),
+            }))
+            .unwrap();
+        assert_eq!(cursor.pending_position, Some((70, 13)));
+        assert_eq!(cursor.image.as_ref().unwrap().x, -7);
+        cursor.project(Some(&image())).unwrap();
+        assert_eq!(cursor.pending_position, None);
+        cursor.project(Some(&moved)).unwrap();
+        cursor.finish_position_commit(Ok(())).unwrap();
+        assert_eq!(cursor.image.as_ref().unwrap().x, 70);
+        assert_eq!(cursor.pending_position, None);
+        moved.y = 42;
+        cursor.project(Some(&moved)).unwrap();
         cursor.cancellation.cancel(CancelScope::Generation(1));
         assert!(!cursor.project(Some(&image())).unwrap());
+        assert!(cursor.pending_request(1, 20).is_none());
+        assert!(cursor.pending_request(2, 20).is_none());
+        cursor.flush_position(1).unwrap();
         // eventfd is not DRM: reaching the ioctl would fail with ENOTTY.
         let error = cursor.commit(&motion, false, true).unwrap_err();
         assert!(error.to_string().contains("generation was cancelled"));
