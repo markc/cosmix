@@ -1,5 +1,23 @@
 # Vendored upstream sources
 
+## Smithay libinput: opt-in dispatch fairness
+
+`smithay/src/backend/libinput/mod.rs` adds `set_dispatch_budget` for comp's
+live KMS source (16 events or 2 ms per calloop turn). Upstream's unit-returning
+callback cannot stop its unbounded drain, so comp cannot enforce this at
+registration alone. Unconfigured sources keep the original unlimited drain.
+
+The patch checks the budget before removing the next libinput event and
+requests synthetic readiness through `before_sleep` when it yields. A
+per-turn guard prevents synthetic plus real readiness from doubling the
+budget. No separate queue, input coalescing or event conversion is introduced.
+The `fairness_tests` module covers FIFO preservation, time exhaustion,
+progress, fd-independent continuation and duplicate readiness. Run it with
+the Smithay manifest (`--no-default-features --features backend_libinput
+--lib backend::libinput::fairness_tests`); the desktop workspace excludes
+vendor packages from its test membership. Retain this patch until upstream
+offers bounded draining with an explicit continuation guarantee.
+
 ## calloop 0.14.4: composed-channel idle wakeups
 
 Imported from the crates.io `calloop-0.14.4.crate` archive, SHA-256

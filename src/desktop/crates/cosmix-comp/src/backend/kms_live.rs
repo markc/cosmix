@@ -2891,7 +2891,12 @@ fn live_input_source(
         assigned.map_err(|()| -> Box<dyn Error + Send + Sync> {
             format!("libinput could not assign seat {seat}").into()
         })?;
-        Ok(LibinputInputBackend::new(libinput))
+        let mut backend = LibinputInputBackend::new(libinput);
+        // At most 2 ms of cooperative routing (or 16 cheap events) before
+        // calloop services frame commands and dispatch_cycle commits/flushes.
+        // Smithay schedules continuation for its internally buffered events.
+        backend.set_dispatch_budget(16, Duration::from_millis(2));
+        Ok(backend)
     }))
 }
 

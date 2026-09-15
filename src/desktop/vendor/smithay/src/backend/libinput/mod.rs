@@ -12,6 +12,7 @@ use std::{
     io,
     os::unix::io::{AsFd, BorrowedFd},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 #[cfg(feature = "backend_session")]
 use std::{os::unix::io::OwnedFd, path::Path};
@@ -31,6 +32,10 @@ pub struct LibinputInputBackend {
     context: libinput::Libinput,
     token: Option<Token>,
     span: tracing::Span,
+    // Local Cosmix patch: opt-in fairness without changing upstream defaults.
+    dispatch_budget: Option<(usize, Duration)>,
+    dispatch_pending: bool,
+    dispatched_this_turn: bool,
 }
 
 impl LibinputInputBackend {
@@ -47,12 +52,25 @@ impl LibinputInputBackend {
             context,
             token: None,
             span,
+            dispatch_budget: None,
+            dispatch_pending: false,
+            dispatched_this_turn: false,
         }
     }
 
     /// Returns a reference to the underlying libinput context
     pub fn context(&self) -> &libinput::Libinput {
         &self.context
+    }
+
+    /// Local Cosmix patch: bound routing per calloop turn, retaining FIFO order.
+    ///
+    /// The time limit is cooperative: an individual event callback and libinput's
+    /// dispatch cannot be preempted. A reached limit schedules another turn even
+    /// if libinput has already consumed all kernel fd readiness.
+    pub fn set_dispatch_budget(&mut self, max_events: usize, max_time: Duration) {
+        assert!(max_events > 0 && !max_time.is_zero());
+        self.dispatch_budget = Some((max_events, max_time));
     }
 }
 
@@ -725,11 +743,51 @@ impl AsFd for LibinputInputBackend {
     }
 }
 
+// Local Cosmix patch: check before advancing the iterator, so yielding never
+// consumes (and loses) the first event of the next batch. Kept generic to test
+// the actual drain boundary without a privileged input device.
+fn next_dispatch_event<I: Iterator>(
+    events: &mut I,
+    budget: Option<(usize, Duration)>,
+    processed: &mut usize,
+    started: Instant,
+    pending: &mut bool,
+) -> Option<I::Item> {
+    if budget
+        .is_some_and(|(count, time)| *processed >= count || (*processed > 0 && started.elapsed() >= time))
+    {
+        // An exactly full final batch costs one harmless empty turn.
+        *pending = true;
+        return None;
+    }
+    let event = events.next()?;
+    *processed += 1;
+    Some(event)
+}
+
 impl EventSource for LibinputInputBackend {
     type Event = InputEvent<LibinputInputBackend>;
     type Metadata = ();
     type Ret = ();
     type Error = io::Error;
+
+    const NEEDS_EXTRA_LIFECYCLE_EVENTS: bool = true;
+
+    fn before_sleep(&mut self) -> calloop::Result<Option<(Readiness, Token)>> {
+        Ok(self.token.filter(|_| self.dispatch_pending).map(|token| {
+            (
+                Readiness {
+                    readable: true,
+                    ..Readiness::EMPTY
+                },
+                token,
+            )
+        }))
+    }
+
+    fn before_handle_events(&mut self, _: calloop::EventIterator<'_>) {
+        self.dispatched_this_turn = false;
+    }
 
     #[profiling::function]
     fn process_events<F>(&mut self, _: Readiness, token: Token, mut callback: F) -> io::Result<PostAction>
@@ -737,10 +795,25 @@ impl EventSource for LibinputInputBackend {
         F: FnMut(Self::Event, &mut ()) -> Self::Ret,
     {
         if Some(token) == self.token {
+            // Synthetic readiness and fd readiness can both arrive in one
+            // poll. They must share one batch, not multiply the turn's budget.
+            if self.dispatch_budget.is_some() && self.dispatched_this_turn {
+                return Ok(PostAction::Continue);
+            }
+            self.dispatched_this_turn = true;
+            self.dispatch_pending = false;
+            let started = Instant::now();
             let _guard = self.span.enter();
             self.context.dispatch()?;
 
-            for event in &mut self.context {
+            let mut processed = 0;
+            while let Some(event) = next_dispatch_event(
+                &mut self.context,
+                self.dispatch_budget,
+                &mut processed,
+                started,
+                &mut self.dispatch_pending,
+            ) {
                 match event {
                     libinput::Event::Device(device_event) => match device_event {
                         event::DeviceEvent::Added(device_added_event) => {
@@ -908,5 +981,113 @@ impl EventSource for LibinputInputBackend {
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
         self.token = None;
         poll.unregister(self.as_fd())
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use super::*;
+
+    #[test]
+    fn count_budget_yields_without_consuming_next_event() {
+        let mut events = 0..48;
+        let mut routed = Vec::new();
+        for turn in 0..4 {
+            let mut pending = false;
+            let mut processed = 0;
+            let started = Instant::now();
+            while let Some(event) = next_dispatch_event(
+                &mut events,
+                Some((16, Duration::from_secs(60))),
+                &mut processed,
+                started,
+                &mut pending,
+            ) {
+                routed.push(event);
+            }
+            assert_eq!(processed, if turn < 3 { 16 } else { 0 });
+            assert_eq!(pending, turn < 3);
+        }
+        assert_eq!(routed, (0..48).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn elapsed_budget_yields_but_always_makes_progress() {
+        let mut events = 0..3;
+        let mut pending = false;
+        let mut processed = 0;
+        let started = Instant::now() - Duration::from_millis(10);
+        let budget = Some((16, Duration::from_millis(2)));
+        assert_eq!(
+            next_dispatch_event(&mut events, budget, &mut processed, started, &mut pending),
+            Some(0)
+        );
+        assert_eq!(
+            next_dispatch_event(&mut events, budget, &mut processed, started, &mut pending),
+            None
+        );
+        assert!(pending);
+        assert_eq!(events.next(), Some(1));
+    }
+
+    struct NoDevices;
+
+    impl libinput::LibinputInterface for NoDevices {
+        fn open_restricted(&mut self, _: &std::path::Path, _: i32) -> Result<std::os::fd::OwnedFd, i32> {
+            panic!("test must not open input devices")
+        }
+        fn close_restricted(&mut self, _: std::os::fd::OwnedFd) {}
+    }
+
+    #[test]
+    fn continuation_wakes_without_fd_readiness_and_duplicate_dispatch_yields() {
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        let mut backend = LibinputInputBackend::new(libinput::Libinput::new_from_path(NoDevices));
+        backend.set_dispatch_budget(16, Duration::from_millis(2));
+        // Simulate a full final batch. The real source must clear this in a
+        // continuation even though there are no devices or readable input fd.
+        backend.dispatch_pending = true;
+        let source = calloop::Dispatcher::new(backend, |_, _, _: &mut usize| panic!("no devices"));
+        event_loop.handle().register_dispatcher(source.clone()).unwrap();
+        let (ping, ping_source) = calloop::ping::make_ping().unwrap();
+        event_loop
+            .handle()
+            .insert_source(ping_source, |_, _, turns| *turns += 1)
+            .unwrap();
+        ping.ping();
+        let mut turns = 0;
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut turns)
+            .unwrap();
+        assert_eq!(turns, 1);
+        assert!(!source.as_source_ref().dispatch_pending);
+        {
+            let mut backend = source.as_source_mut();
+            assert!(backend.dispatched_this_turn);
+            backend.dispatch_pending = true;
+            let token = backend.token.unwrap();
+            backend
+                .process_events(
+                    Readiness {
+                        readable: true,
+                        ..Readiness::EMPTY
+                    },
+                    token,
+                    |_, _| panic!("duplicate batch"),
+                )
+                .unwrap();
+            assert!(
+                backend.dispatch_pending,
+                "duplicate readiness must not drain again"
+            );
+        }
+        // No ping now: only synthetic readiness can promptly run this turn.
+        let started = Instant::now();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut turns)
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!source.as_source_ref().dispatch_pending);
+        assert!(source.as_source_mut().before_sleep().unwrap().is_none());
     }
 }
