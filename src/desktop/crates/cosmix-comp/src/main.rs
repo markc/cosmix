@@ -370,7 +370,10 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
     let policy = WaylandRuntimePolicy {
         keybindings_enabled: cli.keybindings_enabled,
         f9_bus: cli.f9_bus.clone(),
-        explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
+        // DIAGNOSTIC (diag-no-explicit-sync): force implicit sync to test whether
+        // the motion stutter lives in the linux-drm-syncobj-v1 fence path. Revert
+        // to Production once the diagnosis is known.
+        explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
         decoration: decoration.clone(),
     };
     #[cfg(feature = "bus")]
