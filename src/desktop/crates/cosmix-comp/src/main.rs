@@ -2126,6 +2126,7 @@ mod tests {
                 DmabufBufferId(73),
                 true,
                 DmabufDescriptor {
+                    explicit_acquire: false,
                     width: 8,
                     height: 8,
                     fourcc: Fourcc::Argb8888 as u32,

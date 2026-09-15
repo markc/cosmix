@@ -56,8 +56,8 @@ CoS — substrate libraries and daemon family
 | `cosmix-filesd` | 0.8.0 |
 | `cosmix-indexd` | 0.9.0 |
 | `cosmix-input-core` | 0.1.2 |
-| `cosmix-input-schema` | 0.1.2 |
-| `cosmix-inputd` | 0.3.0 |
+| `cosmix-input-schema` | 0.1.3 |
+| `cosmix-inputd` | 0.4.0 |
 | `cosmix-interactd` | 0.5.0 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
@@ -102,7 +102,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bg-boing` | 0.1.0 |
 | `cosmix-bg-showcase` | 0.2.3 |
 | `cosmix-capture` | 0.1.2 |
-| `cosmix-comp` | 0.51.1 |
+| `cosmix-comp` | 0.54.0 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
@@ -120,7 +120,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
 | `cosmix-wallpaper` | 0.2.0 |
-| `cosmix-wgpu-dmabuf` | 0.14.0 |
+| `cosmix-wgpu-dmabuf` | 0.15.0 |
 | `cosmix-wl-dnd` | 0.4.2 |
 | `ctk` | 0.54.1 |
 | `spike-wl-dnd` | 0.1.0 |

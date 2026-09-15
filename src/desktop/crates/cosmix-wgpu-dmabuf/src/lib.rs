@@ -4,6 +4,7 @@
 //! DRM metadata and Bevy image handles. All Vulkan and wgpu-hal ownership is
 //! private to this crate.
 
+pub mod diagnostics;
 mod drm;
 mod formats;
 mod import;
@@ -78,6 +79,10 @@ pub struct DmabufPlane {
 /// Fully owned metadata required to import one client buffer.
 #[derive(Debug)]
 pub struct DmabufDescriptor {
+    /// Diagnostic only: the applied client commit carried a syncobj acquire point.
+    /// Never used to select synchronisation or rendering behaviour.
+    /// This diagnostics-only restriction is a convention, not enforced by the type.
+    pub explicit_acquire: bool,
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
@@ -95,6 +100,7 @@ impl DmabufDescriptor {
     /// can be handed to another bounded import attempt.
     pub fn try_clone(&self) -> std::io::Result<Self> {
         Ok(Self {
+            explicit_acquire: self.explicit_acquire,
             width: self.width,
             height: self.height,
             fourcc: self.fourcc,

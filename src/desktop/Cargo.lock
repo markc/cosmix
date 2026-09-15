@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.53.0"
+version = "0.56.1"
 dependencies = [
  "bevy",
  "chrono",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wgpu-dmabuf"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "ash",
  "bevy",
@@ -4655,8 +4655,6 @@ dependencies = [
 [[package]]
 name = "gpu-allocator"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51255ea7cfaadb6c5f1528d43e92a82acb2b96c43365989a28b2d44ee38f8795"
 dependencies = [
  "ash",
  "hashbrown 0.16.1",
@@ -9586,8 +9584,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97ace1c17727311c22a46e4e3faf56ea6de81af99dcc839bdfb54857b94d448d"
 dependencies = [
  "android_system_properties",
  "arrayvec",

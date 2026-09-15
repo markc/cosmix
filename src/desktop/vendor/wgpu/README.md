@@ -177,11 +177,47 @@ It preserves the original API operations, ordering, iterator
 consumption and deferred actions. No observer means no clock reads or recording;
 the existing Cosmix opt-in recorder owns timing and bounded asynchronous output.
 Surface identities are private, lazy, process-local counters carried into the
-acquired texture; queue events use subject zero. The observer is installed once,
+acquired texture. Queue-submit subjects hash their source file/line/column;
+`detail` carries the `SubmitOrigin` ID below. The observer is installed once,
 cannot replace an existing owner, and must not block or re-enter wgpu. End events
 also occur on unwind and do not assert operation success. Observer panics are
 caught on unwind builds; panic-abort behaviour cannot be intercepted.
 
-The addition is limited to `src/diagnostics.rs` and small API boundary hooks.
+The 2026-09-15 attribution extension adds clock-free hooks in the vendored
+wgpu-core submit path: fence-lock acquisition, command preparation/resource
+initialisation, pending-write preparation, HAL submission and maintenance.
+Core hooks feed the same observer; the compositor copies the enclosing submit's
+subject/detail into each nested phase. No queue, lock, fence or command ordering
+changes. The five timings exclude some intervening bookkeeping and need not sum
+exactly to the outer submit. Core hooks compile to no-ops without `std`.
+
+Submit `detail` IDs (zero remains valid for old traces and untagged callers):
+
+| ID | Origin |
+|---:|---|
+| 0 | Other; `subject` distinguishes source locations |
+| 1 | Sampled DMA-BUF acquisition |
+| 2 | Bevy graph command flush |
+| 3 | DMA-BUF ownership release |
+| 4 | Retirement completion marker (empty submit) |
+| 5 | Cursor composition |
+| 6 | Scanout completion marker (empty submit) |
+| 7 | Capture copy/fallback blit |
+| 8 | Debug readback probe |
+| 9 | Unwritten-output clear |
+| 10 | Resource normalisation before release |
+| 11 | Bevy post-graph screenshot/readback submit |
+| 12 | Other Bevy upload/storage submit |
+
+Group queue stages by `(stage, detail)`, optionally by `subject` for individual
+sites. Source hashes are build-specific, not persistent resource identities.
+Explicit origins are thread-local RAII scopes and incur no TLS access without
+an observer. Untagged Bevy submits are classified at the actual tracked caller:
+`renderer/render_context.rs` is the graph flush, `renderer/mod.rs` is finalisation,
+and other Bevy render files are upload/storage. Recheck those source boundaries
+when upgrading Bevy; this does not depend on which worker runs a submit.
+
+The addition is limited to diagnostics modules and boundary hooks.
+The `#[track_caller]` on `Queue::submit` is the single element with non-zero cost when tracing is disabled.
 It adds no dependencies, rendering policy, public media or Bevy fork. Upstream
 wgpu licensing remains unchanged (MIT OR Apache-2.0).

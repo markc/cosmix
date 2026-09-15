@@ -703,6 +703,7 @@ fn import_scanout_allocation(
         .import(
             drm_device,
             DmabufDescriptor {
+                explicit_acquire: false,
                 width: selection.mode.width,
                 height: selection.mode.height,
                 fourcc: selection.format,

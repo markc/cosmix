@@ -70,6 +70,8 @@ pub mod binding_model;
 pub mod command;
 mod conv;
 pub mod device;
+// Cosmix downstream: optional submit-phase diagnostics (no timing in core).
+pub mod diagnostics;
 pub mod error;
 pub mod global;
 mod hash_utils;

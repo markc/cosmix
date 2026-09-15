@@ -60,6 +60,32 @@ queue. The exact wgpu/wgpu-hal pin maps `TextureUses::COPY_DST` to Vulkan
 Re-verify the mapping and the no-extra-transition tracker seed whenever the
 pinned wgpu version changes.
 
+### Asynchronous sampled-image retirement (0.15.0)
+
+Sampled acquires are queue-ordered before drawing; preparing an image does not
+wait for the acquire submission to finish. Cleanup submits FOREIGN release and
+retains the exact retired uses, Vulkan backings and release callbacks in a
+pending batch. Subsequent cleanup passes check that batch's submission with a
+zero timeout. They publish callbacks only after completion, outside the import
+registry lock. Pending releases keep `has_pending_render_work()` true, including
+when client animation stops. Cached images awaiting handback cannot be reused
+until completion; their pending replacement preserves the previous image.
+
+The pinned Vulkan HAL passes the zero timeout directly to
+`vkWaitSemaphores`/`vkWaitForFences`. No render cleanup waits for GPU progress.
+The retirement worker also checks a fixed submission with zero-timeout polls,
+sleeping between checks outside wgpu. This avoids holding wgpu's device fence
+read lock across a GPU wait, which would block queue submission's write lock.
+Later submissions do not extend the captured completion frontier.
+
+An uncompleted batch retains its leases. After the existing 250 ms retirement
+deadline, an unsuccessful check evicts its cached backings and strands the uses
+without publishing release. Dropping the registry with pending batches likewise
+strands them: raw ownership barriers do not register texture references with
+wgpu. Terminal device-only drains and opt-in diagnostic readbacks may still
+wait synchronously. Live fullscreen DMA-BUF animation with mouse motion remains
+the hardware performance and correctness acceptance test.
+
 An acquire failure means no copy may be encoded. Capture retirement retries a
 transient bounded timeout, but a terminal wait failure, worker disconnection or
 FOREIGN release failure means the imported image has unknown ownership and must

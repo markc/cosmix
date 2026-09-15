@@ -2,13 +2,13 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use thiserror::Error;
 
-/// The single bounded GPU wait used for each retirement batch.
+/// Completion deadline for each retirement batch.
 pub const RETIREMENT_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -61,18 +61,46 @@ impl WgpuWaitForSubmittedWork {
 
     /// Wait for one exact wgpu submission. Capture destinations use this for
     /// both the copy and the subsequent FOREIGN release submission.
+    /// Checks are non-blocking inside wgpu; only the caller sleeps between them.
     pub fn wait_for_submission(
         &self,
         submission: wgpu::SubmissionIndex,
         timeout: Duration,
     ) -> Result<(), RetirementWaitError> {
-        poll_submitted_work(
-            &self.device,
-            wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(timeout),
-            },
-        )
+        let started = Instant::now();
+        loop {
+            if self.submission_complete(submission.clone())? {
+                return Ok(());
+            }
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return Err(RetirementWaitError::Timeout);
+            };
+            // Never hold wgpu's device fence read lock across a GPU wait:
+            // queue submission needs its write lock. Sleep only outside poll.
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+
+    /// Check an exact submission without waiting for GPU progress. Unlike a
+    /// queue-empty check, later submissions cannot delay this completion.
+    pub fn submission_complete(
+        &self,
+        submission: wgpu::SubmissionIndex,
+    ) -> Result<bool, RetirementWaitError> {
+        match poll_submitted_work(&self.device, submission_poll(submission)) {
+            Ok(()) => Ok(true),
+            Err(RetirementWaitError::Timeout) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn submission_poll(submission: wgpu::SubmissionIndex) -> wgpu::PollType {
+    // The pinned Vulkan HAL passes this timeout through as zero nanoseconds
+    // to vkWaitSemaphores/vkWaitForFences: a status query, not a GPU wait.
+    wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        timeout: Some(Duration::ZERO),
     }
 }
 
@@ -86,8 +114,14 @@ fn submitted_work_wait(timeout: Duration) -> wgpu::PollType {
 impl WaitForSubmittedWork for WgpuWaitForSubmittedWork {
     fn wait_for_submitted_work(&mut self, timeout: Duration) -> Result<(), RetirementWaitError> {
         if let Some(queue) = &self.queue {
-            queue.submit(std::iter::empty());
+            let submit_origin = wgpu::diagnostics::submit_origin_if_unset(
+                wgpu::diagnostics::SubmitOrigin::Retirement,
+            );
+            let submission = queue.submit(std::iter::empty());
+            drop(submit_origin);
+            return self.wait_for_submission(submission, timeout);
         }
+        // Device-only adapters are used for quiescent terminal drains.
         poll_submitted_work(&self.device, submitted_work_wait(timeout))
     }
 }
@@ -219,12 +253,10 @@ fn run_retirement_worker_from<F>(
 ) where
     F: FnMut(RetirementWorkerReport) -> bool,
 {
-    // A batch waits once for the wgpu submission frontier captured after all
-    // requests in that batch were received. The wait may delay one concurrent
-    // render submission until success, failure, or the 250 ms timeout. Failures
-    // are terminal and never retried. Requests arriving after the frontier form
-    // a later batch, so sustained successful batches may delay successive render
-    // submissions, but neither protocol dispatch nor teardown waits on the GPU.
+    // A batch captures the submission frontier after receiving its requests.
+    // The production queue adapter checks that fixed frontier non-blockingly,
+    // sleeping outside wgpu between checks. Failures remain terminal. Requests
+    // arriving after the frontier form a later batch.
     while let Ok(first) = receiver.recv() {
         let mut high_water = first;
         let mut sequence_error = None;
@@ -311,6 +343,27 @@ mod tests {
             }
             self.outcome.clone()
         }
+    }
+
+    #[test]
+    fn exact_submission_check_has_zero_gpu_wait_timeout() {
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let submission = queue.submit([]);
+        match submission_poll(submission.clone()) {
+            wgpu::PollType::Wait {
+                submission_index,
+                timeout,
+            } => {
+                assert!(submission_index.is_some());
+                assert_eq!(timeout, Some(Duration::ZERO));
+            }
+            wgpu::PollType::Poll => panic!("completion must name the exact submission"),
+        }
+        assert!(
+            WgpuWaitForSubmittedWork::new(RenderDevice::from(device))
+                .submission_complete(submission)
+                .unwrap()
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use cosmix_input_core::Edge;
 use cosmix_input_schema::{
-    PointerButton, PointerButtonAction, PointerButtonName, PointerMove, PointerScroll,
+    KeyAction, PointerButton, PointerButtonAction, PointerButtonName, PointerMove, PointerScroll,
     SideModifiers,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -50,6 +50,98 @@ const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
 /// Highest key code we enable on the virtual device (input-event-codes.h KEY_MAX).
 const KEY_MAX: u16 = 0x2ff;
+
+/// Resolve Linux physical key names, not layout-dependent keysyms. Bare
+/// decimal strings always mean raw codes; KEY_1 names the physical digit key.
+pub fn key_code(key: &str) -> Result<u16, String> {
+    if !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit()) {
+        return key
+            .parse::<u16>()
+            .ok()
+            .filter(|&code| code <= KEY_MAX)
+            .ok_or_else(|| format!("invalid key code {key:?}: expected 0..={KEY_MAX}"));
+    }
+    let name = key.to_ascii_lowercase();
+    let name = name.strip_prefix("key_").unwrap_or(&name);
+    KEY_NAMES
+        .iter()
+        .find_map(|&(candidate, code)| (candidate == name).then_some(code))
+        .ok_or_else(|| format!("unknown key: {key:?}"))
+}
+
+// Linux input-event-codes.h; alphabetic codes follow physical keyboard rows.
+const KEY_NAMES: &[(&str, u16)] = &[
+    ("f1", 59),
+    ("f2", 60),
+    ("f3", 61),
+    ("f4", 62),
+    ("f5", 63),
+    ("f6", 64),
+    ("f7", 65),
+    ("f8", 66),
+    ("f9", 67),
+    ("f10", 68),
+    ("f11", 87),
+    ("f12", 88),
+    ("a", 30),
+    ("b", 48),
+    ("c", 46),
+    ("d", 32),
+    ("e", 18),
+    ("f", 33),
+    ("g", 34),
+    ("h", 35),
+    ("i", 23),
+    ("j", 36),
+    ("k", 37),
+    ("l", 38),
+    ("m", 50),
+    ("n", 49),
+    ("o", 24),
+    ("p", 25),
+    ("q", 16),
+    ("r", 19),
+    ("s", 31),
+    ("t", 20),
+    ("u", 22),
+    ("v", 47),
+    ("w", 17),
+    ("x", 45),
+    ("y", 21),
+    ("z", 44),
+    ("0", 11),
+    ("1", 2),
+    ("2", 3),
+    ("3", 4),
+    ("4", 5),
+    ("5", 6),
+    ("6", 7),
+    ("7", 8),
+    ("8", 9),
+    ("9", 10),
+    ("enter", 28),
+    ("escape", 1),
+    ("space", 57),
+    ("tab", 15),
+    ("backspace", 14),
+    ("delete", 111),
+    ("left", 105),
+    ("right", 106),
+    ("up", 103),
+    ("down", 108),
+    ("home", 102),
+    ("end", 107),
+    ("pageup", 104),
+    ("pagedown", 109),
+    ("leftctrl", KEY_LEFTCTRL),
+    ("rightctrl", KEY_RIGHTCTRL),
+    ("leftshift", KEY_LEFTSHIFT),
+    ("rightshift", KEY_RIGHTSHIFT),
+    ("leftalt", KEY_LEFTALT),
+    ("rightalt", KEY_RIGHTALT),
+    ("leftmeta", KEY_LEFTMETA),
+    ("rightmeta", KEY_RIGHTMETA),
+];
 
 /// One `struct input_event` on 64-bit Linux: timeval (2×i64) + type + code +
 /// value = 24 bytes.
@@ -292,7 +384,7 @@ struct HeldKey {
     repeat_fire: Option<FiredVerb>,
 }
 
-/// Owned uinput device. Keyboard and pointer use separate instances and
+/// Owned uinput device. Keyboard grab and injection use separate instances and
 /// capabilities; both are destroyed on drop (or kernel fd close).
 struct UinputDevice {
     file: File,
@@ -307,7 +399,7 @@ impl UinputDevice {
         Self::create(
             b"cosmix-inputd virtual pointer",
             2,
-            [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE],
+            0..=KEY_MAX,
             &[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL],
         )
     }
@@ -370,7 +462,7 @@ impl Drop for UinputDevice {
     }
 }
 
-/// Service-owned injector, independent of physical readers and broker
+/// Service-owned key/pointer injector, independent of physical readers and broker
 /// connections. Invalid requests never create a device; failed creation can
 /// be retried on the next valid request.
 #[derive(Default)]
@@ -402,6 +494,7 @@ impl PointerInjector {
 }
 
 pub enum PointerInjection {
+    Key { code: u16, action: KeyAction },
     Move(PointerMove),
     Button(PointerButton),
     Scroll(PointerScroll),
@@ -419,6 +512,15 @@ impl PointerInjection {
             events.push(event);
         };
         match self {
+            Self::Key { code, action } => match action {
+                KeyAction::Press => emit(EV_KEY, code, 1),
+                KeyAction::Release => emit(EV_KEY, code, 0),
+                KeyAction::Tap => {
+                    emit(EV_KEY, code, 1);
+                    emit(EV_SYN, SYN_REPORT, 0);
+                    emit(EV_KEY, code, 0);
+                }
+            },
             Self::Move(PointerMove { dx, dy }) => {
                 emit(EV_REL, REL_X, dx);
                 emit(EV_REL, REL_Y, dy);
@@ -490,4 +592,69 @@ fn set_modifier(mods: &mut SideModifiers, code: u16, down: bool) -> bool {
         _ => return false,
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_key_names_and_raw_codes() {
+        for (name, code) in [
+            ("F1", 59),
+            ("F2", 60),
+            ("F3", 61),
+            ("F4", 62),
+            ("F5", 63),
+            ("F6", 64),
+            ("F7", 65),
+            ("F8", 66),
+            ("F9", 67),
+            ("F10", 68),
+            ("F11", 87),
+            ("F12", 88),
+            ("Enter", 28),
+            ("Escape", 1),
+            ("Space", 57),
+            ("Tab", 15),
+            ("Backspace", 14),
+            ("Delete", 111),
+            ("Left", 105),
+            ("Right", 106),
+            ("Up", 103),
+            ("Down", 108),
+            ("Home", 102),
+            ("End", 107),
+            ("PageUp", 104),
+            ("PageDown", 109),
+            ("LeftCtrl", 29),
+            ("RightCtrl", 97),
+            ("LeftShift", 42),
+            ("RightShift", 54),
+            ("LeftAlt", 56),
+            ("RightAlt", 100),
+            ("LeftMeta", 125),
+            ("RightMeta", 126),
+        ] {
+            assert_eq!(key_code(name), Ok(code));
+            assert_eq!(key_code(&name.to_ascii_lowercase()), Ok(code));
+            assert_eq!(key_code(&name.to_ascii_uppercase()), Ok(code));
+        }
+        for (name, code) in ('a'..='z').zip([
+            30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47,
+            17, 45, 21, 44,
+        ]) {
+            assert_eq!(key_code(&name.to_string()), Ok(code));
+            assert_eq!(key_code(&name.to_ascii_uppercase().to_string()), Ok(code));
+        }
+        for (name, code) in (0..=9).zip([11, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+            assert_eq!(key_code(&format!("KEY_{name}")), Ok(code));
+        }
+        for code in 0..=KEY_MAX {
+            assert_eq!(key_code(&code.to_string()), Ok(code));
+        }
+        assert_eq!(key_code("0067"), Ok(67));
+        assert!(key_code("NotAKey").unwrap_err().contains("NotAKey"));
+        assert!(key_code("768").is_err());
+    }
 }

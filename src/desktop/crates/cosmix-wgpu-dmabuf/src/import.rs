@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     mem,
     os::fd::AsRawFd,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use ash::vk;
@@ -191,6 +192,7 @@ impl Default for ImportInstrumentation {
 
 struct ImportedUse<T> {
     backing: Arc<T>,
+    acquire_trace: Option<crate::diagnostics::AcquireState>,
     _physical_release: Option<ReleaseOnDrop>,
     _logical_release: Option<ReleaseOnDrop>,
 }
@@ -200,6 +202,7 @@ impl<T> ImportedUse<T> {
         let (physical_release, logical_release) = release.split();
         Self {
             backing,
+            acquire_trace: None,
             _physical_release: physical_release,
             _logical_release: logical_release,
         }
@@ -207,6 +210,41 @@ impl<T> ImportedUse<T> {
 }
 
 type ImportedTexture = ImportedUse<CachedTexture>;
+
+/// Raw ownership barriers do not register texture uses with wgpu. Keep the
+/// complete leases (and therefore VkImages) alive until the release fence is
+/// proved complete, even if the registry is destroyed during terminal teardown.
+struct PendingRelease<T, S = wgpu::SubmissionIndex> {
+    submission: S,
+    backings: Vec<Arc<T>>,
+    uses: Option<Vec<ImportedUse<T>>>,
+    started: Instant,
+}
+
+impl<T, S> PendingRelease<T, S> {
+    fn new(submission: S, backings: Vec<Arc<T>>, uses: Vec<ImportedUse<T>>) -> Self {
+        Self {
+            submission,
+            backings,
+            uses: Some(uses),
+            started: Instant::now(),
+        }
+    }
+
+    fn complete(mut self) -> Vec<ImportedUse<T>> {
+        self.uses.take().expect("pending release owns its uses")
+    }
+}
+
+impl<T, S> Drop for PendingRelease<T, S> {
+    fn drop(&mut self) {
+        if let Some(uses) = self.uses.take() {
+            // Failure or teardown is not proof of FOREIGN handback. Preserve
+            // both the raw Vulkan objects and the unpublished callbacks.
+            mem::forget(uses);
+        }
+    }
+}
 
 struct ReadyImport<T> {
     current: T,
@@ -340,6 +378,7 @@ struct ImportRegistry {
     ever_imported: bool,
     local_owned: HashSet<usize>,
     ownership_retired: Vec<ImportedTexture>,
+    pending_releases: VecDeque<PendingRelease<CachedTexture>>,
     debug: DmabufDebugState,
 }
 
@@ -467,6 +506,7 @@ impl ImportedDmabufImages {
             .expect("DMA-BUF import registry mutex poisoned");
         imports.debug.pending_output_probe
             || !imports.debug.pending_sample_probes.is_empty()
+            || !imports.pending_releases.is_empty()
             || has_import_render_work(
                 &imports.active,
                 &imports.retired,
@@ -544,12 +584,18 @@ impl ImportedDmabufImages {
             .expect("DMA-BUF import registry mutex poisoned");
         let wgpu_descriptor = texture_descriptor(&descriptor, imports.debug.options.probe)?;
         imports.ever_imported = true;
-        let handle = images.add(Image::new_uninit(
+        let mut placeholder = Image::new_uninit(
             wgpu_descriptor.size,
             wgpu_descriptor.dimension,
             wgpu_descriptor.format,
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-        ));
+        );
+        // Diagnostic identity only: keep allocation, sampling and asset events
+        // unchanged. Distinguishes Bevy's placeholder from the imported image.
+        if crate::diagnostics::enabled() {
+            placeholder.texture_descriptor.label = Some("cosmix DMA-BUF placeholder");
+        }
+        let handle = images.add(placeholder);
         imports.active.insert(
             handle.id(),
             ImportState::Pending(PendingImport {
@@ -795,6 +841,7 @@ where
         cacheable,
     } = pending;
     let retained_bytes = dmabuf_retained_bytes(&descriptor);
+    let acquire_trace = crate::diagnostics::AcquireState::capture(buffer_id, &descriptor);
     let cached = (!no_cache).then(|| cache.get(buffer_id)).flatten();
     let (backing, newly_imported) = if let Some(backing) = cached {
         (backing, false)
@@ -808,8 +855,10 @@ where
         }
         (backing, true)
     };
+    let mut current = ImportedUse::new(backing, release);
+    current.acquire_trace = acquire_trace;
     Ok(ReadyImport {
-        current: ImportedUse::new(backing, release),
+        current,
         previous,
         newly_imported,
         probe_after_acquire: newly_imported && instrumentation.probe,
@@ -962,6 +1011,20 @@ fn apply_imports(
         }
 
         if matches!(imports.active.get(&id), Some(ImportState::Pending(_))) {
+            if let Some(ImportState::Pending(pending)) = imports.active.get(&id)
+                && let Some(cached) = imports.cache.entries.get(&pending.buffer_id)
+                && imports.pending_releases.iter().any(|release| {
+                    release
+                        .backings
+                        .iter()
+                        .any(|backing| Arc::ptr_eq(backing, &cached.backing))
+                })
+            {
+                // The cache still owns this image, but FOREIGN handback is in
+                // flight. Keep the request and previous image until completion;
+                // never mistake release-in-flight for locally acquired state.
+                continue;
+            }
             let Some(ImportState::Pending(pending)) = imports.active.remove(&id) else {
                 continue;
             };
@@ -1238,7 +1301,19 @@ fn acquire_external_images(
             .0
             .lock()
             .expect("DMA-BUF import registry mutex poisoned");
-        pending_acquire_batch(&imports.active, &imports.local_owned)
+        let batch = pending_acquire_batch(&imports.active, &imports.local_owned);
+        if crate::diagnostics::enabled() {
+            // Observe each committed use participating in this submit, including
+            // cache hits. Polls do not gate acquisition or alter batch membership.
+            for id in &batch.submitted_ids {
+                if let Some(ImportState::Imported(ready)) = imports.active.get(id)
+                    && let Some(state) = &ready.current.acquire_trace
+                {
+                    state.record(batch.submitted_backings.len() as u64);
+                }
+            }
+        }
+        batch
     };
     let barrier_result = submit_ownership_barrier(
         &device,
@@ -1247,6 +1322,8 @@ fn acquire_external_images(
         OwnershipDirection::Acquire,
     )
     .map(|_| ());
+    // Acquire needs queue ordering, not CPU completion: every subsequent
+    // sampling submission uses the same wgpu queue and follows this barrier.
     let mut imports = imports
         .0
         .lock()
@@ -1437,7 +1514,9 @@ fn readback_probe(
             },
         );
     }
+    let submit_origin = wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Probe);
     queue.submit([encoder.finish()]);
+    drop(submit_origin);
 
     let slice = buffer.slice(..);
     let (mapped_sender, mapped_receiver) = std::sync::mpsc::sync_channel(1);
@@ -1515,6 +1594,7 @@ fn active_retains_backing<T>(
 
 fn releasable_retired_backings<T>(
     active: &HashMap<AssetId<Image>, ImportState<ImportedUse<T>>>,
+    retired: &HashMap<AssetId<Image>, Vec<ImportedUse<T>>>,
     ownership_retired: &[ImportedUse<T>],
     local_owned: &HashSet<usize>,
 ) -> Vec<Arc<T>> {
@@ -1526,6 +1606,11 @@ fn releasable_retired_backings<T>(
             local_owned.contains(&identity)
                 && seen.insert(identity)
                 && !active_retains_backing(active, identity)
+                // Unregistering does not remove render-world GpuImages yet.
+                // A shared backing must wait for those registrations as well.
+                && !retired.values().flatten().any(|other| {
+                    Arc::as_ptr(&other.backing) as usize == identity
+                })
         })
         .map(|imported| Arc::clone(&imported.backing))
         .collect()
@@ -1609,6 +1694,7 @@ fn release_external_images(
     queue: Res<RenderQueue>,
     imports: Res<ImportedDmabufImages>,
 ) {
+    reclaim_external_images(&device, &imports);
     let release_backings = {
         let imports = imports
             .0
@@ -1616,6 +1702,7 @@ fn release_external_images(
             .expect("DMA-BUF import registry mutex poisoned");
         releasable_retired_backings(
             &imports.active,
+            &imports.retired,
             &imports.ownership_retired,
             &imports.local_owned,
         )
@@ -1630,15 +1717,7 @@ fn release_external_images(
         &release_backings,
         OwnershipDirection::Release,
     )
-    .map_err(|error| error.to_string())
-    .and_then(|submission| {
-        let Some(submission) = submission else {
-            return Ok(());
-        };
-        crate::WgpuWaitForSubmittedWork::new(device.clone())
-            .wait_for_submission(submission, crate::RETIREMENT_WAIT_TIMEOUT)
-            .map_err(|error| error.to_string())
-    });
+    .map_err(|error| error.to_string());
     let mut imports = imports
         .0
         .lock()
@@ -1649,18 +1728,88 @@ fn release_external_images(
         ownership_retired,
         ..
     } = &mut *imports;
+    let submission = barrier_result.as_ref().ok().cloned().flatten();
     let completion = complete_release(
         local_owned,
         cache,
         ownership_retired,
         &release_backings,
-        barrier_result,
+        barrier_result.map(|_| ()),
     );
+    // Move the exact retired uses out of local ownership at submission time.
+    // Later completion must not alter a newer use's ownership bookkeeping.
+    let completion = match (completion, submission) {
+        (Ok(uses), Some(submission)) => {
+            imports.pending_releases.push_back(PendingRelease::new(
+                submission,
+                release_backings,
+                uses,
+            ));
+            Ok(Vec::new())
+        }
+        (completion, _) => completion,
+    };
     drop(imports);
     match completion {
         Ok(completed) => drop(completed),
         Err(failure) => {
             error!(barrier_error = %failure.error, "failed to release DMA-BUF queue ownership; backing and release use stranded fail-closed");
+        }
+    }
+}
+
+fn reclaim_external_images(device: &RenderDevice, imports: &ImportedDmabufImages) {
+    let adapter = crate::WgpuWaitForSubmittedWork::new(device.clone());
+    reclaim_external_images_with(imports, |submission| {
+        adapter.submission_complete(submission)
+    });
+}
+
+fn reclaim_external_images_with(
+    imports: &ImportedDmabufImages,
+    mut poll: impl FnMut(wgpu::SubmissionIndex) -> Result<bool, crate::RetirementWaitError>,
+) {
+    loop {
+        let submission = {
+            let imports = imports
+                .0
+                .lock()
+                .expect("DMA-BUF import registry mutex poisoned");
+            let Some(pending) = imports.pending_releases.front() else {
+                return;
+            };
+            pending.submission.clone()
+        };
+        // Poll outside the registry lock: wgpu can dispatch callbacks here.
+        let result = poll(submission);
+        let mut registry = imports
+            .0
+            .lock()
+            .expect("DMA-BUF import registry mutex poisoned");
+        let pending = registry
+            .pending_releases
+            .front()
+            .expect("render thread owns release queue");
+        let result = match result {
+            Ok(false) if pending.started.elapsed() < crate::RETIREMENT_WAIT_TIMEOUT => return,
+            Ok(false) => Err(crate::RetirementWaitError::Timeout),
+            Ok(true) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let pending = registry
+            .pending_releases
+            .pop_front()
+            .expect("pending release exists");
+        if result.is_err() {
+            evict_cache_backings(&mut registry.cache, &pending.backings);
+        }
+        drop(registry);
+        match result {
+            Ok(()) => drop(pending.complete()),
+            Err(error) => {
+                error!(%error, "DMA-BUF release completion unproven; backing and release use stranded fail-closed");
+                drop(pending);
+            }
         }
     }
 }
@@ -1692,6 +1841,8 @@ fn transition_imported_images_to_resource(
             state: TextureUses::RESOURCE,
         }),
     );
+    let _submit_origin =
+        wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::ReleaseNormalise);
     render_queue.submit([encoder.finish()]);
 }
 
@@ -1749,6 +1900,10 @@ fn submit_ownership_barrier(
             OwnershipRole::Sampled,
         )?;
     }
+    let _submit_origin = wgpu::diagnostics::submit_origin(match direction {
+        OwnershipDirection::Acquire => wgpu::diagnostics::SubmitOrigin::Acquire,
+        OwnershipDirection::Release => wgpu::diagnostics::SubmitOrigin::Release,
+    });
     Ok(Some(render_queue.submit([encoder.finish()])))
 }
 
@@ -2427,6 +2582,7 @@ mod tests {
             .expect("/dev/null is available")
             .into();
         DmabufDescriptor {
+            explicit_acquire: false,
             width: 64,
             height: 32,
             fourcc: DrmFourcc::Argb8888 as u32,
@@ -3118,6 +3274,7 @@ mod tests {
         }
         let release_backings = releasable_retired_backings(
             &harness.active,
+            &HashMap::new(),
             &harness.ownership_retired,
             &harness.local_owned,
         );
@@ -3280,6 +3437,207 @@ mod tests {
             descriptor,
             probe: None,
         })
+    }
+
+    fn queued_test_release(
+        imports: &ImportedDmabufImages,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        released: &Arc<AtomicUsize>,
+        explicit: bool,
+    ) -> Arc<CachedTexture> {
+        let backing = noop_cached_texture(device, "pending release");
+        let count = Arc::clone(released);
+        let registry = Arc::clone(&imports.0);
+        let callback: ReleaseCallback = Box::new(move || {
+            assert!(
+                registry.try_lock().is_ok(),
+                "callback must run outside registry lock"
+            );
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let release = if explicit {
+            DmabufRelease::Explicit(callback)
+        } else {
+            DmabufRelease::Implicit(callback)
+        };
+        let uses = vec![ImportedUse::new(
+            Arc::clone(&backing),
+            ReleaseLease::new(release),
+        )];
+        imports
+            .0
+            .lock()
+            .unwrap()
+            .pending_releases
+            .push_back(PendingRelease::new(
+                queue.submit([]),
+                vec![Arc::clone(&backing)],
+                uses,
+            ));
+        backing
+    }
+
+    #[test]
+    fn asynchronous_release_retains_each_batch_until_its_own_completion() {
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let imports = ImportedDmabufImages::default();
+        let released = Arc::new(AtomicUsize::new(0));
+        let first = queued_test_release(&imports, &device, &queue, &released, false);
+        let second = queued_test_release(&imports, &device, &queue, &released, true);
+        let first_weak = Arc::downgrade(&first);
+        let second_weak = Arc::downgrade(&second);
+        drop((first, second));
+        for _ in 0..3 {
+            let mut polls = 0;
+            reclaim_external_images_with(&imports, |_| {
+                polls += 1;
+                Ok(false)
+            });
+            assert_eq!(polls, 1, "pending front must return, never spin or wait");
+            assert!(imports.has_pending_render_work());
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            assert!(first_weak.upgrade().is_some());
+        }
+        let mut polls = 0;
+        reclaim_external_images_with(&imports, |_| {
+            polls += 1;
+            Ok(polls == 1)
+        });
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(first_weak.upgrade().is_none());
+        assert!(second_weak.upgrade().is_some());
+        assert!(imports.has_pending_render_work());
+        reclaim_external_images(&RenderDevice::from(device), &imports);
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+        assert!(second_weak.upgrade().is_none());
+        assert!(!imports.has_pending_render_work());
+    }
+
+    #[test]
+    fn cache_reuse_waits_for_pending_foreign_handback() {
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let imports = ImportedDmabufImages::default();
+        let released = Arc::new(AtomicUsize::new(0));
+        let backing = queued_test_release(&imports, &device, &queue, &released, false);
+        let mut images = Assets::<Image>::default();
+        let id = images.add(Image::default()).id();
+        {
+            let mut registry = imports.0.lock().unwrap();
+            registry
+                .cache
+                .insert(DmabufBufferId(1), Arc::clone(&backing), 4);
+            registry.active.insert(
+                id,
+                ImportState::Pending(PendingImport {
+                    buffer_id: DmabufBufferId(1),
+                    descriptor: dummy_descriptor(),
+                    release: ReleaseLease::new(DmabufRelease::Implicit(Box::new(|| {}))),
+                    previous: None,
+                    cacheable: true,
+                }),
+            );
+        }
+        let mut gpu_images = RenderAssets::<GpuImage>::default();
+        gpu_images.insert(id, noop_gpu_image(&device, "placeholder"));
+        let mut world = World::new();
+        world.insert_resource(imports.clone());
+        world.insert_resource(RenderDevice::from(device));
+        world.insert_resource(gpu_images);
+        world.init_resource::<SpriteAssetEvents>();
+        world.run_system_once(apply_imports).unwrap();
+        assert!(matches!(
+            imports.0.lock().unwrap().active[&id],
+            ImportState::Pending(_)
+        ));
+        reclaim_external_images_with(&imports, |_| Ok(true));
+        world.run_system_once(apply_imports).unwrap();
+        let registry = imports.0.lock().unwrap();
+        let batch = pending_acquire_batch(&registry.active, &registry.local_owned);
+        assert!(
+            batch.submitted_ids.contains(&id),
+            "reuse must acquire again"
+        );
+        assert!(Arc::ptr_eq(&batch.submitted_backings[0], &backing));
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_or_timed_out_async_release_strands_uses_and_evicts_cache() {
+        for timeout in [false, true] {
+            let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+            let imports = ImportedDmabufImages::default();
+            let released = Arc::new(AtomicUsize::new(0));
+            let backing = queued_test_release(&imports, &device, &queue, &released, true);
+            {
+                let mut registry = imports.0.lock().unwrap();
+                registry
+                    .cache
+                    .insert(DmabufBufferId(1), Arc::clone(&backing), 4);
+                if timeout {
+                    registry.pending_releases.front_mut().unwrap().started =
+                        Instant::now() - crate::RETIREMENT_WAIT_TIMEOUT;
+                }
+            }
+            reclaim_external_images_with(&imports, |_| {
+                if timeout {
+                    Ok(false)
+                } else {
+                    Err(crate::RetirementWaitError::Failed(
+                        "injected failure".into(),
+                    ))
+                }
+            });
+            assert!(!imports.has_pending_render_work());
+            assert!(!imports.0.lock().unwrap().cache.contains(DmabufBufferId(1)));
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            assert!(
+                Arc::strong_count(&backing) > 1,
+                "unproved raw image must stay alive"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_backing_waits_for_unregistered_gpu_image_before_release() {
+        let backing = Arc::new(7);
+        let make_use = || {
+            ImportedUse::new(
+                Arc::clone(&backing),
+                ReleaseLease::new(DmabufRelease::Implicit(Box::new(|| {}))),
+            )
+        };
+        let mut images = Assets::<Image>::default();
+        let id = images.add(Image::default()).id();
+        let mut retired = HashMap::from([(id, vec![make_use()])]);
+        let mut uses = vec![make_use()];
+        let owned = HashSet::from([Arc::as_ptr(&backing) as usize]);
+        assert!(releasable_retired_backings(&HashMap::new(), &retired, &uses, &owned).is_empty());
+        let (_, evictions) = collect_retired_without_gpu(&mut retired, |_| false);
+        retire_imported_uses(&mut uses, &owned, evictions);
+        let backings = releasable_retired_backings(&HashMap::new(), &retired, &uses, &owned);
+        assert_eq!(backings.len(), 1);
+        assert_eq!(take_retired_for_backings(&mut uses, &backings).len(), 2);
+    }
+
+    #[test]
+    fn dropping_uncompleted_release_retains_raw_backing_and_callback() {
+        let backing = Arc::new(7);
+        let released = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&released);
+        let pending = PendingRelease::new(
+            (),
+            vec![Arc::clone(&backing)],
+            vec![ImportedUse::new(
+                Arc::clone(&backing),
+                ReleaseLease::new(DmabufRelease::Implicit(Box::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }))),
+            )],
+        );
+        drop(pending);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&backing), 2);
     }
 
     fn noop_gpu_image_with_format(
@@ -3738,12 +4096,19 @@ mod tests {
             .expect("sibling sprite material exists")
             .clone();
         let render_world = app.sub_app_mut(RenderApp).world_mut();
+        let linear_sampler: bevy::render::render_resource::Sampler = device
+            .create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                ..Default::default()
+            })
+            .into();
         {
             let mut gpu_images = render_world.resource_mut::<RenderAssets<GpuImage>>();
-            gpu_images.insert(
-                replaced_image.id(),
-                noop_gpu_image(&device, "old replaced image"),
-            );
+            let mut initial_image = noop_gpu_image(&device, "old replaced image");
+            initial_image.sampler = linear_sampler.clone();
+            gpu_images.insert(replaced_image.id(), initial_image);
             gpu_images.insert(sibling_image.id(), noop_gpu_image(&device, "sibling image"));
         }
         {
@@ -3758,60 +4123,81 @@ mod tests {
             .run_system_once(prepare_assets::<PreparedMaterial2d<SpriteMaterial>>)
             .expect("initial Bevy sprite-material preparation runs");
 
-        let old_view = prepared_sprite_material_texture_view(render_world, replaced_material);
         let sibling_bind_group = render_world
             .resource::<RenderAssets<PreparedMaterial2d<SpriteMaterial>>>()
             .get(sibling_material)
             .expect("sibling material is prepared")
             .bind_group
             .id();
-        let replacement = noop_cached_texture(&device, "new replaced image");
-        let replacement_view = replacement.texture_view.id();
-        assert_ne!(old_view, replacement_view);
+        // No main-world Image Modified events or GpuImage re-extraction between
+        // these replacements: only the imported view and material are refreshed.
+        for _ in 0..3 {
+            assert!(
+                render_world
+                    .resource::<ExtractedAssets<GpuImage>>()
+                    .extracted
+                    .is_empty()
+            );
+            let old_view = prepared_sprite_material_texture_view(render_world, replaced_material);
+            let replacement = noop_cached_texture(&device, "new replaced image");
+            let replacement_view = replacement.texture_view.id();
+            assert_ne!(old_view, replacement_view);
 
-        {
-            let imports = render_world.resource::<ImportedDmabufImages>();
-            let mut registry = imports
-                .0
-                .lock()
-                .expect("DMA-BUF import registry mutex is available");
-            let identity = Arc::as_ptr(&replacement) as usize;
-            registry.local_owned.insert(identity);
-            registry.active.insert(
-                replaced_image.id(),
-                ImportState::Imported(ReadyImport {
-                    current: ImportedUse::new(
-                        replacement,
-                        ReleaseLease::new(DmabufRelease::Explicit(Box::new(|| {}))),
-                    ),
-                    previous: None,
-                    newly_imported: false,
-                    probe_after_acquire: false,
-                }),
+            {
+                let imports = render_world.resource::<ImportedDmabufImages>();
+                let mut registry = imports
+                    .0
+                    .lock()
+                    .expect("DMA-BUF import registry mutex is available");
+                let identity = Arc::as_ptr(&replacement) as usize;
+                registry.local_owned.insert(identity);
+                registry.active.insert(
+                    replaced_image.id(),
+                    ImportState::Imported(ReadyImport {
+                        current: ImportedUse::new(
+                            replacement,
+                            ReleaseLease::new(DmabufRelease::Explicit(Box::new(|| {}))),
+                        ),
+                        previous: None,
+                        newly_imported: false,
+                        probe_after_acquire: false,
+                    }),
+                );
+            }
+            render_world
+                .resource_mut::<ExtractedAssets<PreparedMaterial2d<SpriteMaterial>>>()
+                .extracted
+                .push((replaced_material, replaced_material_asset.clone()));
+
+            render_world.run_schedule(Render);
+
+            assert_eq!(
+                render_world
+                    .resource::<RenderAssets<GpuImage>>()
+                    .get(replaced_image.id())
+                    .expect("replacement image is installed")
+                    .sampler
+                    .id(),
+                linear_sampler.id(),
+                "replacement preserves the original linear sampler without Image Modified",
+            );
+
+            assert_eq!(
+                prepared_sprite_material_texture_view(render_world, replaced_material),
+                replacement_view,
+                "the next real Bevy sprite-material prepare must bind the installed texture view",
+            );
+            assert_eq!(
+                render_world
+                    .resource::<RenderAssets<PreparedMaterial2d<SpriteMaterial>>>()
+                    .get(sibling_material)
+                    .expect("sibling material stays prepared")
+                    .bind_group
+                    .id(),
+                sibling_bind_group,
+                "a replacement must not rebuild a sibling material bind group",
             );
         }
-        render_world
-            .resource_mut::<ExtractedAssets<PreparedMaterial2d<SpriteMaterial>>>()
-            .extracted
-            .push((replaced_material, replaced_material_asset));
-
-        render_world.run_schedule(Render);
-
-        assert_eq!(
-            prepared_sprite_material_texture_view(render_world, replaced_material),
-            replacement_view,
-            "the next real Bevy sprite-material prepare must bind the installed texture view",
-        );
-        assert_eq!(
-            render_world
-                .resource::<RenderAssets<PreparedMaterial2d<SpriteMaterial>>>()
-                .get(sibling_material)
-                .expect("sibling material stays prepared")
-                .bind_group
-                .id(),
-            sibling_bind_group,
-            "a replacement must not rebuild a sibling material bind group",
-        );
     }
 
     #[test]
@@ -3898,8 +4284,12 @@ mod tests {
             );
             retire_imported_uses(&mut ownership_retired, &local_owned, retired);
 
-            let release_backings =
-                releasable_retired_backings(&active, &ownership_retired, &local_owned);
+            let release_backings = releasable_retired_backings(
+                &active,
+                &HashMap::new(),
+                &ownership_retired,
+                &local_owned,
+            );
             if !release_backings.is_empty() {
                 let Ok(completed) = complete_release(
                     &mut local_owned,
@@ -3998,6 +4388,7 @@ mod tests {
         file.set_len(ALLOCATION_BYTES)
             .expect("sparse memfd allocation can be sized");
         let descriptor = DmabufDescriptor {
+            explicit_acquire: false,
             width: 1,
             height: 1,
             fourcc: DrmFourcc::Argb8888 as u32,

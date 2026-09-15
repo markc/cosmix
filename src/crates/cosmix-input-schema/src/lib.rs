@@ -190,12 +190,30 @@ pub mod verbs {
     pub const RELOAD: &str = "input.reload";
     /// Gesture/idle fact subscription.
     pub const OBSERVE: &str = "input.observe";
+    /// Inject a key press, release or tap.
+    pub const KEY: &str = "input.key";
     /// Inject relative pointer motion.
     pub const POINTER_MOVE: &str = "input.pointer.move";
     /// Inject a pointer button state change or click.
     pub const POINTER_BUTTON: &str = "input.pointer.button";
     /// Inject wheel steps.
     pub const POINTER_SCROLL: &str = "input.pointer.scroll";
+}
+
+/// A synthetic physical key operation, independent of the active keymap.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct KeyInjection {
+    /// Case-insensitive key name or decimal Linux input-event code (0..=0x2ff).
+    pub key: String,
+    pub action: KeyAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyAction {
+    Press,
+    Release,
+    Tap,
 }
 
 /// Relative pointer motion in evdev units.

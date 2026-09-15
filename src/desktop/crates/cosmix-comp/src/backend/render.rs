@@ -1201,6 +1201,15 @@ fn update_live_app_with_idle(
         .is_some_and(|(key, generation)| idle::eligible(app, key, generation, demand_revision))
     {
         idle::finish_idle_update(app)?;
+        // The idle proof excludes retained/acquired primary presentations.
+        // The pump services idle updates at refresh cadence, so EBUSY motion
+        // retries even after input stops, without forcing a primary render.
+        if let Some(cursor) = app
+            .world()
+            .get_resource::<super::atomic_presentation::cursor::HardwareCursorBridge>()
+        {
+            cursor.flush_idle(output.expect("idle requires an output").1);
+        }
         LiveUpdateExecution::HealthyIdle {
             demand_revision: demand_revision.expect("idle requires known demand"),
         }
@@ -3982,6 +3991,7 @@ impl LiveAtomicOwnership {
                 tracing::warn!(%error, "cursor fd duplication failed; using software cursor")
             }
         }
+        presenter.cursor = self.cursor.clone();
         let state = Arc::new(Mutex::new(LiveAtomicTargetState {
             pool,
             presenter,
@@ -4064,7 +4074,11 @@ impl LiveAtomicOwnership {
                         // linux-drm-syncobj client sync is separate and IS
                         // implemented.
                         let trace = crate::frame_trace::span("comp_gpu_complete", generation);
+                        let submit_origin = wgpu::diagnostics::submit_origin(
+                            wgpu::diagnostics::SubmitOrigin::EmptyMarker,
+                        );
                         let complete = state.pool.prove_rendering_complete(slot);
+                        drop(submit_origin);
                         drop(trace);
                         if let Err(error) = complete {
                             // The pool already moved a timed-out Rendering
@@ -5949,6 +5963,8 @@ fn clear_unwritten_output_frames(
     }
 
     if let Some(encoder) = encoder {
+        let _submit_origin =
+            wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Clear);
         render_queue.submit([encoder.finish()]);
     }
 }
@@ -6102,7 +6118,9 @@ fn readback_dmabuf_output_probe(
             },
         );
     }
+    let submit_origin = wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Probe);
     queue.submit([encoder.finish()]);
+    drop(submit_origin);
 
     let slice = buffer.slice(..);
     let (mapped_sender, mapped_receiver) = std::sync::mpsc::sync_channel(1);
@@ -7042,6 +7060,17 @@ pub(crate) mod tests {
                 })
                 .unwrap()
         };
+        let cursor_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&cursor_attempts);
+        // Install before settlement: hardware admission itself changes the
+        // primary scene once to remove the software cursor. No input follows.
+        // The first idle submission is busy and the second succeeds.
+        engine.app.as_mut().unwrap().insert_resource(
+            super::super::atomic_presentation::cursor::HardwareCursorBridge::pending_for_test(
+                engine.generation,
+                move || attempts.fetch_add(1, Ordering::SeqCst) > 0,
+            ),
+        );
         let mut idle_reached = false;
         for _ in 0..120 {
             if matches!(
@@ -7081,6 +7110,7 @@ pub(crate) mod tests {
             assert!(report.frame_events.is_empty());
         }
         assert_eq!(main_updates.load(Ordering::SeqCst), main_before + 16);
+        assert_eq!(cursor_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(presented.load(Ordering::SeqCst), presentations);
         assert_eq!(
             engine
@@ -7954,6 +7984,7 @@ pub(crate) mod tests {
                 DmabufBufferId(73),
                 true,
                 DmabufDescriptor {
+                    explicit_acquire: false,
                     width: 8,
                     height: 8,
                     fourcc: Fourcc::Argb8888 as u32,
