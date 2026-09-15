@@ -190,6 +190,50 @@ pub mod verbs {
     pub const RELOAD: &str = "input.reload";
     /// Gesture/idle fact subscription.
     pub const OBSERVE: &str = "input.observe";
+    /// Inject relative pointer motion.
+    pub const POINTER_MOVE: &str = "input.pointer.move";
+    /// Inject a pointer button state change or click.
+    pub const POINTER_BUTTON: &str = "input.pointer.button";
+    /// Inject wheel steps.
+    pub const POINTER_SCROLL: &str = "input.pointer.scroll";
+}
+
+/// Relative pointer motion in evdev units.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PointerMove {
+    pub dx: i32,
+    pub dy: i32,
+}
+
+/// Wheel steps; positive dy scrolls up, positive dx scrolls right.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PointerScroll {
+    pub dy: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dx: Option<i32>,
+}
+
+/// A synthetic pointer button operation.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PointerButton {
+    pub button: PointerButtonName,
+    pub action: PointerButtonAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerButtonName {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerButtonAction {
+    Press,
+    Release,
+    Click,
 }
 
 /// The `input` event topics.
@@ -260,7 +304,11 @@ mod tests {
         assert!(!SideModifiers::RIGHT_CTRL.is_empty());
         let mut left = SideModifiers::NONE;
         left.left_ctrl = true;
-        assert_ne!(left, SideModifiers::RIGHT_CTRL, "L-ctrl must not equal R-ctrl");
+        assert_ne!(
+            left,
+            SideModifiers::RIGHT_CTRL,
+            "L-ctrl must not equal R-ctrl"
+        );
     }
 
     #[test]

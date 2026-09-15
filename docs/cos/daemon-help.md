@@ -18,3 +18,33 @@ verbs and are not advertised. Props reads and watches are read-only; props
 set/delete and other mutations are marked writable. A read-only flag describes
 the command's operation, not an authorisation grant or a promise that diagnostic
 counters will remain unchanged.
+
+## Inputd pointer injection
+
+`cosmix-inputd` 0.3.0 serves these writable verbs on the `inputd` Bus service.
+All accept JSON bodies and are reachable by local and mesh callers, with no
+node-local gate. The existing keymap mutation gates are unchanged.
+
+| Verb | Body | Effect |
+|---|---|---|
+| `input.pointer.move` | `{"dx":12,"dy":-4}` | Relative X/Y motion, then SYN_REPORT |
+| `input.pointer.button` | `{"button":"left","action":"click"}` | Left/right/middle press, release or click; SYN_REPORT after each state change |
+| `input.pointer.scroll` | `{"dy":1,"dx":-1}` | Vertical wheel steps and optional horizontal wheel steps, then SYN_REPORT |
+
+Motion and wheel deltas are signed 32-bit integers. Positive wheel `dy` means
+up and positive `dx` means right (desktop natural-scroll settings may reverse
+the displayed result). Success returns rc 0 with `{"ok":true}`; malformed
+requests, unavailable `/dev/uinput` or failed writes return rc 10 with an
+`error` message. Success acknowledges the kernel write, not compositor delivery.
+
+The service lazily creates and retains a separate `cosmix-inputd virtual pointer`
+uinput device, independently of `--grab` or `--observe`, and keeps it across
+broker reconnects. It advertises EV_SYN, EV_KEY for the three buttons, and EV_REL
+for X/Y and both wheel axes. First use allows 300 ms for seat discovery before
+writing. The daemon needs permission to open `/dev/uinput`; failed creation is
+retried on the next valid request. Drop or process exit destroys the device.
+The keyboard grab device retains its existing keyboard capabilities.
+
+Injection enters the kernel/libinput path for the compositor owning the seat,
+including cosmix-comp and Plasma. Absolute pointer warp is a follow-up requiring
+an EV_ABS device or a compositor verb with output geometry.

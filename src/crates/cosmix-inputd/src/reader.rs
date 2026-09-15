@@ -20,7 +20,10 @@ use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
 use cosmix_input_core::Edge;
-use cosmix_input_schema::SideModifiers;
+use cosmix_input_schema::{
+    PointerButton, PointerButtonAction, PointerButtonName, PointerMove, PointerScroll,
+    SideModifiers,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::service::Shared;
@@ -28,6 +31,15 @@ use crate::service::Shared;
 // input-event-codes.h
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
+const EV_REL: u16 = 2;
+const SYN_REPORT: u16 = 0;
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+const REL_HWHEEL: u16 = 0x06;
+const REL_WHEEL: u16 = 0x08;
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTSHIFT: u16 = 42;
@@ -50,6 +62,7 @@ const EVENT_SIZE: usize = 24;
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
 const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
+const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
 const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
 const UI_DEV_CREATE: libc::c_ulong = 0x5501;
 const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
@@ -122,7 +135,7 @@ pub fn run_grab(
 
     // Build the virtual output FIRST — if uinput setup fails we return before
     // ever grabbing, so a broken setup can never leave the keyboard captured.
-    let mut uinput = UinputKeyboard::create()?;
+    let mut uinput = UinputDevice::keyboard()?;
 
     // Let the compositor discover and open the new virtual device BEFORE we grab.
     // If we grabbed immediately, keystrokes in that discovery window would be
@@ -228,7 +241,13 @@ pub fn run_grab(
                 if let Some(fire) = press_fire {
                     let _ = fire_tx.send(fire);
                 }
-                held.insert(code, HeldKey { swallowed: swallow, repeat_fire });
+                held.insert(
+                    code,
+                    HeldKey {
+                        swallowed: swallow,
+                        repeat_fire,
+                    },
+                );
                 if !swallow {
                     uinput.emit(&buffer)?;
                 }
@@ -273,33 +292,56 @@ struct HeldKey {
     repeat_fire: Option<FiredVerb>,
 }
 
-/// A minimal uinput virtual keyboard: EV_SYN + EV_KEY with every key code
-/// enabled, so the grab reader can re-emit any stroke. Destroyed on drop.
-struct UinputKeyboard {
+/// Owned uinput device. Keyboard and pointer use separate instances and
+/// capabilities; both are destroyed on drop (or kernel fd close).
+struct UinputDevice {
     file: File,
 }
 
-impl UinputKeyboard {
-    fn create() -> std::io::Result<Self> {
+impl UinputDevice {
+    fn keyboard() -> std::io::Result<Self> {
+        Self::create(b"cosmix-inputd virtual keyboard", 1, 0..=KEY_MAX, &[])
+    }
+
+    fn pointer() -> std::io::Result<Self> {
+        Self::create(
+            b"cosmix-inputd virtual pointer",
+            2,
+            [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE],
+            &[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL],
+        )
+    }
+
+    fn create(
+        name: &[u8],
+        product: u16,
+        keys: impl IntoIterator<Item = u16>,
+        axes: &[u16],
+    ) -> std::io::Result<Self> {
         let file = OpenOptions::new().write(true).open("/dev/uinput")?;
         let fd = file.as_raw_fd();
         unsafe {
             check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
             check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
-            for code in 0..=KEY_MAX {
+            for code in keys {
                 check(libc::ioctl(fd, UI_SET_KEYBIT, code as libc::c_int))?;
+            }
+            if !axes.is_empty() {
+                check(libc::ioctl(fd, UI_SET_EVBIT, EV_REL as libc::c_int))?;
+                for &code in axes {
+                    check(libc::ioctl(fd, UI_SET_RELBIT, code as libc::c_int))?;
+                }
             }
             let mut setup = UinputSetup {
                 id: InputId {
                     bustype: BUS_USB,
                     vendor: 0x1d5b,
-                    product: 0x0001,
+                    product,
                     version: 1,
                 },
                 name: [0u8; 80],
                 ff_effects_max: 0,
             };
-            let name = b"cosmix-inputd virtual keyboard";
             setup.name[..name.len()].copy_from_slice(name);
             check(libc::ioctl(
                 fd,
@@ -319,12 +361,93 @@ impl UinputKeyboard {
     }
 }
 
-impl Drop for UinputKeyboard {
+impl Drop for UinputDevice {
     fn drop(&mut self) {
         // Best-effort destroy; the fd close on drop also removes the device.
         unsafe {
             libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY);
         }
+    }
+}
+
+/// Service-owned injector, independent of physical readers and broker
+/// connections. Invalid requests never create a device; failed creation can
+/// be retried on the next valid request.
+#[derive(Default)]
+pub struct PointerInjector {
+    device: Option<UinputDevice>,
+}
+
+impl PointerInjector {
+    pub fn inject(&mut self, request: PointerInjection) -> std::io::Result<()> {
+        if self.device.is_none() {
+            self.device = Some(UinputDevice::pointer()?);
+            // Give the seat's compositor time to discover the device before
+            // the first frame, as for the keyboard grab path.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let device = self.device.as_mut().expect("pointer device created");
+        for event in request.events() {
+            device.emit(&event)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn with_test_file(file: File) -> Self {
+        Self {
+            device: Some(UinputDevice { file }),
+        }
+    }
+}
+
+pub enum PointerInjection {
+    Move(PointerMove),
+    Button(PointerButton),
+    Scroll(PointerScroll),
+}
+
+impl PointerInjection {
+    // TODO: input.pointer.warp needs an EV_ABS device or a comp-side verb that knows output geometry
+    fn events(self) -> Vec<[u8; EVENT_SIZE]> {
+        let mut events = Vec::with_capacity(4);
+        let mut emit = |kind: u16, code: u16, value: i32| {
+            let mut event = [0; EVENT_SIZE];
+            event[16..18].copy_from_slice(&kind.to_ne_bytes());
+            event[18..20].copy_from_slice(&code.to_ne_bytes());
+            event[20..24].copy_from_slice(&value.to_ne_bytes());
+            events.push(event);
+        };
+        match self {
+            Self::Move(PointerMove { dx, dy }) => {
+                emit(EV_REL, REL_X, dx);
+                emit(EV_REL, REL_Y, dy);
+            }
+            Self::Scroll(PointerScroll { dy, dx }) => {
+                emit(EV_REL, REL_WHEEL, dy);
+                if let Some(dx) = dx {
+                    emit(EV_REL, REL_HWHEEL, dx);
+                }
+            }
+            Self::Button(PointerButton { button, action }) => {
+                let code = match button {
+                    PointerButtonName::Left => BTN_LEFT,
+                    PointerButtonName::Right => BTN_RIGHT,
+                    PointerButtonName::Middle => BTN_MIDDLE,
+                };
+                match action {
+                    PointerButtonAction::Press => emit(EV_KEY, code, 1),
+                    PointerButtonAction::Release => emit(EV_KEY, code, 0),
+                    PointerButtonAction::Click => {
+                        emit(EV_KEY, code, 1);
+                        emit(EV_SYN, SYN_REPORT, 0);
+                        emit(EV_KEY, code, 0);
+                    }
+                }
+            }
+        }
+        emit(EV_SYN, SYN_REPORT, 0);
+        events
     }
 }
 

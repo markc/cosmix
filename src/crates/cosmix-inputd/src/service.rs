@@ -5,6 +5,7 @@
 //! (`bind`/`unbind`/`mode`/`reload`) are gated to node-local callers for now
 //! (the broker stamps `broker_origin: local`); remote mesh rebinds behind a
 //! mesh-trust capability are a P3 refinement. Reads (`query`) are open.
+//! Pointer injection is also mesh-reachable, with no node-local gate.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -15,17 +16,13 @@ use cosmix_input_schema::{BindingRow, InputMode, PhysicalStroke, verbs};
 use serde_json::{Value, json};
 
 use crate::keymap_file;
+use crate::reader::{PointerInjection, PointerInjector};
 
 pub fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
     use cosmix_bus::VerbDescriptor;
     vec![
         VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
-        VerbDescriptor::new(
-            "input.query",
-            &[],
-            "Read the keymap and input mode",
-            true,
-        ),
+        VerbDescriptor::new("input.query", &[], "Read the keymap and input mode", true),
         VerbDescriptor::new(
             "input.bind",
             &["body"],
@@ -44,10 +41,23 @@ pub fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
             "Set or toggle the input mode",
             false,
         ),
+        VerbDescriptor::new("input.reload", &[], "Reload the keymap file", false),
         VerbDescriptor::new(
-            "input.reload",
-            &[],
-            "Reload the keymap file",
+            verbs::POINTER_MOVE,
+            &["dx", "dy"],
+            "Inject relative pointer motion (signed i32 deltas)",
+            false,
+        ),
+        VerbDescriptor::new(
+            verbs::POINTER_BUTTON,
+            &["button", "action"],
+            "Inject left/right/middle button press/release/click",
+            false,
+        ),
+        VerbDescriptor::new(
+            verbs::POINTER_SCROLL,
+            &["dy", "dx"],
+            "Inject wheel steps (signed i32 dy, optional dx)",
             false,
         ),
     ]
@@ -62,6 +72,7 @@ pub type Shared = Arc<Mutex<Resolver>>;
 pub fn dispatch(
     resolver: &Shared,
     keymap_path: Option<&Path>,
+    injector: &mut PointerInjector,
     cmd: &IncomingCommand,
 ) -> (u8, String) {
     match cmd.command.as_str() {
@@ -70,7 +81,27 @@ pub fn dispatch(
         verbs::UNBIND => guard_local(cmd, || unbind(resolver, keymap_path, &cmd.body)),
         verbs::MODE => guard_local(cmd, || mode(resolver, &cmd.body)),
         verbs::RELOAD => guard_local(cmd, || reload(resolver, keymap_path)),
+        verbs::POINTER_MOVE | verbs::POINTER_BUTTON | verbs::POINTER_SCROLL => {
+            pointer(injector, &cmd.command, &cmd.body)
+        }
         other => error(&format!("unknown input verb: {other}")),
+    }
+}
+
+fn pointer(injector: &mut PointerInjector, verb: &str, body: &str) -> (u8, String) {
+    let request = match verb {
+        verbs::POINTER_MOVE => serde_json::from_str(body).map(PointerInjection::Move),
+        verbs::POINTER_BUTTON => serde_json::from_str(body).map(PointerInjection::Button),
+        verbs::POINTER_SCROLL => serde_json::from_str(body).map(PointerInjection::Scroll),
+        _ => unreachable!("only pointer verbs reach this handler"),
+    };
+    let request = match request {
+        Ok(request) => request,
+        Err(err) => return error(&format!("invalid pointer request: {err}")),
+    };
+    match injector.inject(request) {
+        Ok(()) => (0, json!({ "ok": true }).to_string()),
+        Err(err) => error(&format!("pointer injection failed: {err}")),
     }
 }
 
@@ -78,14 +109,21 @@ pub fn dispatch(
 /// save failure does not fail the verb — the in-memory rebind still took.
 fn persist(resolver: &Shared, keymap_path: Option<&Path>) {
     let Some(path) = keymap_path else { return };
-    let rows = resolver.lock().expect("resolver poisoned").physical_rows().to_vec();
+    let rows = resolver
+        .lock()
+        .expect("resolver poisoned")
+        .physical_rows()
+        .to_vec();
     if let Err(error) = keymap_file::save(path, &rows) {
-        eprintln!("cosmix-inputd: keymap save to {} failed: {error}", path.display());
+        eprintln!(
+            "cosmix-inputd: keymap save to {} failed: {error}",
+            path.display()
+        );
     }
 }
 
 /// The broker stamps `broker_origin` from the source socket; a node-local
-/// caller (loopback/same-node) is stamped `local`. Mutations require it.
+/// caller (loopback/same-node) is stamped `local`. Keymap mutations require it.
 fn guard_local(cmd: &IncomingCommand, apply: impl FnOnce() -> (u8, String)) -> (u8, String) {
     let local = cmd
         .headers
@@ -121,11 +159,17 @@ fn bind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, Strin
             return error("semantic (keysym) rows are not yet resolved; use a physical row");
         }
     };
-    let result = resolver.lock().expect("resolver poisoned").bind_physical(binding);
+    let result = resolver
+        .lock()
+        .expect("resolver poisoned")
+        .bind_physical(binding);
     match result {
         Ok(generation) => {
             persist(resolver, keymap_path);
-            (0, json!({ "ok": true, "generation": generation }).to_string())
+            (
+                0,
+                json!({ "ok": true, "generation": generation }).to_string(),
+            )
         }
         Err(err) => error(&format!("rebind refused: {err:?}")),
     }
@@ -136,15 +180,24 @@ fn unbind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, Str
         Ok(stroke) => stroke,
         Err(err) => return error(&format!("invalid stroke: {err}")),
     };
-    let removed = resolver.lock().expect("resolver poisoned").unbind_physical(&stroke);
+    let removed = resolver
+        .lock()
+        .expect("resolver poisoned")
+        .unbind_physical(&stroke);
     match removed {
         Some(generation) => {
             persist(resolver, keymap_path);
-            (0, json!({ "ok": true, "generation": generation }).to_string())
+            (
+                0,
+                json!({ "ok": true, "generation": generation }).to_string(),
+            )
         }
         None => {
             let generation = resolver.lock().expect("resolver poisoned").generation();
-            (0, json!({ "ok": true, "generation": generation, "removed": false }).to_string())
+            (
+                0,
+                json!({ "ok": true, "generation": generation, "removed": false }).to_string(),
+            )
         }
     }
 }
@@ -171,18 +224,31 @@ fn mode(resolver: &Shared, body: &str) -> (u8, String) {
         InputMode::Transparent => InputMode::Normal,
     });
     let generation = resolver.set_mode(next);
-    (0, json!({ "mode": next, "generation": generation }).to_string())
+    (
+        0,
+        json!({ "mode": next, "generation": generation }).to_string(),
+    )
 }
 
 fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
     let Some(path) = keymap_path else {
         let generation = resolver.lock().expect("resolver poisoned").generation();
-        return (0, json!({ "ok": true, "generation": generation, "note": "no keymap file configured" }).to_string());
+        return (
+            0,
+            json!({ "ok": true, "generation": generation, "note": "no keymap file configured" })
+                .to_string(),
+        );
     };
     match keymap_file::load(path) {
         Some(rows) => {
-            let generation = resolver.lock().expect("resolver poisoned").replace_physical(rows);
-            (0, json!({ "ok": true, "generation": generation }).to_string())
+            let generation = resolver
+                .lock()
+                .expect("resolver poisoned")
+                .replace_physical(rows);
+            (
+                0,
+                json!({ "ok": true, "generation": generation }).to_string(),
+            )
         }
         None => error(&format!("keymap file {} could not be read", path.display())),
     }
@@ -190,4 +256,182 @@ fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
 
 fn error(message: &str) -> (u8, String) {
     (10, json!({ "error": message }).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    fn command(verb: &str, body: Value, origin: Option<&str>) -> IncomingCommand {
+        IncomingCommand {
+            from: "agent@beta".into(),
+            command: verb.into(),
+            id: Some("pointer-test".into()),
+            args: json!({}),
+            body: body.to_string(),
+            headers: origin
+                .map(|value| ("broker_origin".into(), value.into()))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn resolver() -> Shared {
+        Arc::new(Mutex::new(Resolver::new(
+            cosmix_input_core::default_keymap(),
+        )))
+    }
+
+    #[test]
+    fn mesh_pointer_dispatch_emits_exact_frames_without_a_reader() {
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut injector = PointerInjector::with_test_file(File::from(OwnedFd::from(writer)));
+        let resolver = resolver();
+        let mut cases = vec![
+            (
+                verbs::POINTER_MOVE,
+                json!({"dx": -17, "dy": 23}),
+                vec![(2, 0, -17), (2, 1, 23), (0, 0, 0)],
+            ),
+            (
+                verbs::POINTER_MOVE,
+                json!({"dx": i32::MIN, "dy": i32::MAX}),
+                vec![(2, 0, i32::MIN), (2, 1, i32::MAX), (0, 0, 0)],
+            ),
+            (
+                verbs::POINTER_SCROLL,
+                json!({"dy": -2}),
+                vec![(2, 8, -2), (0, 0, 0)],
+            ),
+            (
+                verbs::POINTER_SCROLL,
+                json!({"dy": 3, "dx": -1}),
+                vec![(2, 8, 3), (2, 6, -1), (0, 0, 0)],
+            ),
+            (
+                verbs::POINTER_SCROLL,
+                json!({"dy": 0, "dx": 0}),
+                vec![(2, 8, 0), (2, 6, 0), (0, 0, 0)],
+            ),
+        ];
+        for (button, code) in [("left", 0x110), ("right", 0x111), ("middle", 0x112)] {
+            for (action, events) in [
+                ("press", vec![(1, code, 1), (0, 0, 0)]),
+                ("release", vec![(1, code, 0), (0, 0, 0)]),
+                (
+                    "click",
+                    vec![(1, code, 1), (0, 0, 0), (1, code, 0), (0, 0, 0)],
+                ),
+            ] {
+                cases.push((
+                    verbs::POINTER_BUTTON,
+                    json!({"button": button, "action": action}),
+                    events,
+                ));
+            }
+        }
+        // Reuse one injector across calls, for mesh, local and unstamped callers.
+        for origin in [Some("mesh"), Some("local"), None] {
+            for (verb, body, expected) in &cases {
+                let cmd = command(verb, body.clone(), origin);
+                let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+                assert_eq!(rc, 0, "{reply}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&reply).unwrap(),
+                    json!({"ok": true})
+                );
+                for &(kind, code, value) in expected {
+                    let mut event = [0; 24];
+                    reader.read_exact(&mut event).unwrap();
+                    assert_eq!(&event[..16], &[0; 16]);
+                    assert_eq!(u16::from_ne_bytes(event[16..18].try_into().unwrap()), kind);
+                    assert_eq!(u16::from_ne_bytes(event[18..20].try_into().unwrap()), code);
+                    assert_eq!(i32::from_ne_bytes(event[20..24].try_into().unwrap()), value);
+                }
+            }
+        }
+        // No extra frames, and dropping the injector closes the owned fd.
+        drop(injector);
+        assert_eq!(reader.read(&mut [0; 24]).unwrap(), 0);
+    }
+
+    #[test]
+    fn invalid_pointer_requests_are_rejected_before_device_access() {
+        let mut injector = PointerInjector::default();
+        for (verb, body) in [
+            (verbs::POINTER_MOVE, json!({"dx": 1})),
+            (verbs::POINTER_MOVE, json!({"dx": 2147483648_i64, "dy": 0})),
+            (verbs::POINTER_MOVE, json!({"dx": -2147483649_i64, "dy": 0})),
+            (verbs::POINTER_MOVE, json!({"dx": 1.5, "dy": 0})),
+            (verbs::POINTER_MOVE, json!({"dx": "1", "dy": 0})),
+            (verbs::POINTER_SCROLL, json!({"dx": 1})),
+            (verbs::POINTER_SCROLL, json!({"dy": 0, "dx": false})),
+            (
+                verbs::POINTER_SCROLL,
+                json!({"dy": 0, "dx": 2147483648_i64}),
+            ),
+            (
+                verbs::POINTER_BUTTON,
+                json!({"button": "side", "action": "click"}),
+            ),
+            (
+                verbs::POINTER_BUTTON,
+                json!({"button": "left", "action": "toggle"}),
+            ),
+            (verbs::POINTER_BUTTON, json!({"button": "left"})),
+            (verbs::POINTER_BUTTON, json!(null)),
+            (verbs::POINTER_MOVE, json!([])),
+        ] {
+            let cmd = command(verb, body, Some("mesh"));
+            let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+            assert_eq!(rc, 10);
+            assert!(reply.contains("invalid pointer request"), "{reply}");
+        }
+        let mut cmd = command(verbs::POINTER_MOVE, json!({}), None);
+        cmd.body = "{".into();
+        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        assert_eq!(rc, 10);
+        assert!(reply.contains("invalid pointer request"));
+    }
+
+    #[test]
+    fn pointer_write_errors_are_reported_and_keymap_gate_is_preserved() {
+        let mut injector =
+            PointerInjector::with_test_file(File::options().write(true).open("/dev/full").unwrap());
+        let cmd = command(verbs::POINTER_MOVE, json!({"dx": 1, "dy": 0}), Some("mesh"));
+        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        assert_eq!(rc, 10);
+        assert!(reply.contains("pointer injection failed"));
+        let cmd = command(verbs::MODE, json!({"mode": "transparent"}), Some("mesh"));
+        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        assert_eq!(rc, 10);
+        assert!(reply.contains("node-local caller"));
+    }
+
+    #[test]
+    fn pointer_manifest_lists_writable_verbs_and_arguments() {
+        let manifest = serde_json::to_value(verb_manifest()).unwrap();
+        for (verb, args) in [
+            (verbs::POINTER_MOVE, json!(["dx", "dy"])),
+            (verbs::POINTER_BUTTON, json!(["button", "action"])),
+            (verbs::POINTER_SCROLL, json!(["dy", "dx"])),
+        ] {
+            let entry = manifest
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == verb)
+                .unwrap();
+            assert_eq!(entry["args"], args);
+            assert_eq!(entry["read_only"], false);
+        }
+    }
 }

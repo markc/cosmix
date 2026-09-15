@@ -1,13 +1,12 @@
 //! `cosmix-inputd` — the input verb broker daemon (AmigaOS `input.device`
-//! successor). See `~/.ctl/_plan/2026-09-12-cosmix-inputd-plan.md`.
+//! successor).
 //!
-//! This is the **non-grab scaffolding**: it registers the `inputd` Bus service
-//! and serves the `input.*` verbs (query/bind/unbind/mode/reload) over the
-//! [`cosmix_input_core::Resolver`] — no keyboard needed for that surface. An
+//! Registers the `inputd` Bus service and serves keymap verbs over the
+//! [`cosmix_input_core::Resolver`] and pointer injection through a persistent
+//! uinput device — no physical keyboard needed for either surface. An
 //! optional `--observe <device>` reader validates resolution against real
 //! hardware safely (no grab, no re-emit, no verbs fired). The interception path
-//! (`--grab`, EVIOCGRAB + uinput) is the dead-keyboard-risk step reserved for a
-//! supervised bring-up and is not wired.
+//! (`--grab`, EVIOCGRAB + uinput) re-emits unbound keys and fires bound verbs.
 
 mod keymap_file;
 mod reader;
@@ -31,7 +30,7 @@ const SERVICE: &str = "inputd";
     name = "cosmix-inputd",
     about = "Input verb broker: keys become Bus verbs. Serves the inputd service; \
              --observe validates resolution on real hardware (safe); --grab is the \
-             supervised interception step (not yet wired)."
+             supervised interception path. Pointer verbs inject through uinput."
 )]
 struct Args {
     /// Read this keyboard event node in OBSERVE-ONLY mode (no grab, no re-emit,
@@ -159,6 +158,8 @@ async fn serve(
     mut fire_rx: tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
 ) -> anyhow::Result<()> {
     let bi = cosmix_buildinfo::build_info!();
+    // Retained across broker reconnects, with or without an evdev reader.
+    let mut injector = reader::PointerInjector::default();
     let provenance = cosmix_bus::RegisterProvenance::from_parts(
         bi.pkg,
         bi.version,
@@ -177,7 +178,14 @@ async fn serve(
             Ok(client) => {
                 let client = client.with_verbs(service::verb_manifest());
                 eprintln!("cosmix-inputd: registered as '{SERVICE}'; serving input.*");
-                serve_bus(&client, &resolver, keymap_path.as_deref(), &mut fire_rx).await;
+                serve_bus(
+                    &client,
+                    &resolver,
+                    keymap_path.as_deref(),
+                    &mut injector,
+                    &mut fire_rx,
+                )
+                .await;
                 eprintln!("cosmix-inputd: broker disconnected; reconnecting");
             }
             Err(error) => {
@@ -194,6 +202,7 @@ async fn serve_bus(
     client: &cosmix_client::NodedClient,
     resolver: &Shared,
     keymap_path: Option<&std::path::Path>,
+    injector: &mut reader::PointerInjector,
     fire_rx: &mut tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
 ) {
     let Some(mut rx) = client.incoming_async().await else {
@@ -203,7 +212,7 @@ async fn serve_bus(
         tokio::select! {
             maybe_cmd = rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break };
-                let (rc, body) = service::dispatch(resolver, keymap_path, &cmd);
+                let (rc, body) = service::dispatch(resolver, keymap_path, injector, &cmd);
                 let _ = client
                     .respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body)
                     .await;
