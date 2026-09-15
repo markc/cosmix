@@ -1201,6 +1201,15 @@ fn update_live_app_with_idle(
         .is_some_and(|(key, generation)| idle::eligible(app, key, generation, demand_revision))
     {
         idle::finish_idle_update(app)?;
+        // The idle proof excludes retained/acquired primary presentations.
+        // The pump services idle updates at refresh cadence, so EBUSY motion
+        // retries even after input stops, without forcing a primary render.
+        if let Some(cursor) = app
+            .world()
+            .get_resource::<super::atomic_presentation::cursor::HardwareCursorBridge>()
+        {
+            cursor.flush_idle(output.expect("idle requires an output").1);
+        }
         LiveUpdateExecution::HealthyIdle {
             demand_revision: demand_revision.expect("idle requires known demand"),
         }
@@ -3982,6 +3991,7 @@ impl LiveAtomicOwnership {
                 tracing::warn!(%error, "cursor fd duplication failed; using software cursor")
             }
         }
+        presenter.cursor = self.cursor.clone();
         let state = Arc::new(Mutex::new(LiveAtomicTargetState {
             pool,
             presenter,
@@ -7042,6 +7052,17 @@ pub(crate) mod tests {
                 })
                 .unwrap()
         };
+        let cursor_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&cursor_attempts);
+        // Install before settlement: hardware admission itself changes the
+        // primary scene once to remove the software cursor. No input follows.
+        // The first idle submission is busy and the second succeeds.
+        engine.app.as_mut().unwrap().insert_resource(
+            super::super::atomic_presentation::cursor::HardwareCursorBridge::pending_for_test(
+                engine.generation,
+                move || attempts.fetch_add(1, Ordering::SeqCst) > 0,
+            ),
+        );
         let mut idle_reached = false;
         for _ in 0..120 {
             if matches!(
@@ -7081,6 +7102,7 @@ pub(crate) mod tests {
             assert!(report.frame_events.is_empty());
         }
         assert_eq!(main_updates.load(Ordering::SeqCst), main_before + 16);
+        assert_eq!(cursor_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(presented.load(Ordering::SeqCst), presentations);
         assert_eq!(
             engine
