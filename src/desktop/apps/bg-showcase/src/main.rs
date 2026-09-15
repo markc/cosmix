@@ -670,9 +670,32 @@ fn step(last: &mut Option<Instant>, now: Instant) -> f32 {
     dt
 }
 
+fn animation_step(
+    last: &mut Option<Instant>,
+    now: Instant,
+    admitted: bool,
+    suspended: bool,
+) -> Option<f32> {
+    // Callbacks can be withheld without a SceneControl transition (e.g. an
+    // inactive VT). Allow the supported 1 fps cadence, but discard a longer
+    // interruption instead of advancing one clamped physics step on resume.
+    const CALLBACK_SUSPENSION_GAP: Duration = Duration::from_secs(2);
+    // An admitted, force-rendered suspended surface deliberately gets dt=0:
+    // submit settled content for reconfiguration/retry without advancing motion.
+    if suspended
+        || last.is_some_and(|at| now.saturating_duration_since(at) > CALLBACK_SUSPENSION_GAP)
+    {
+        *last = None;
+    }
+    // A control-only wake is not a pause. Preserve elapsed animation time
+    // between admitted frames, but never catch up time spent suspended.
+    admitted.then(|| step(last, now))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn animate(
     tick: Res<SceneTick>,
+    control: Res<cosmix_shell_host::scene::SceneControl>,
     options: Res<Options>,
     mut instances: ResMut<Instances>,
     mut transforms: Query<&mut Transform>,
@@ -685,11 +708,16 @@ fn animate(
 ) {
     let now = Instant::now();
     for (name, instance) in &mut instances.0 {
-        if !tick.0.contains(name) {
-            instance.last = None;
+        let Some(dt) = animation_step(
+            &mut instance.last,
+            now,
+            tick.0.contains(name),
+            control.paused
+                || control.hidden
+                || control.suspended_outputs.contains(&instance.window),
+        ) else {
             continue;
-        }
-        let dt = step(&mut instance.last, now);
+        };
         instance.elapsed += dt;
         let t = instance.elapsed;
         if options.scene == Scene::Boids {
@@ -698,6 +726,17 @@ fn animate(
         if options.scene == Scene::Boing {
             if let Some(simulation) = simulations.0.get_mut(&instance.window) {
                 let pose = simulation.advance(dt);
+                cosmix_shell_host::runner::frame_trace::point(
+                    "scene_boing_step",
+                    instance.window.to_bits(),
+                    (dt * 1_000_000.0) as u64,
+                );
+                cosmix_shell_host::runner::frame_trace::point(
+                    "scene_boing_pose",
+                    instance.window.to_bits(),
+                    (u64::from(pose.translation.x.to_bits()) << 32)
+                        | u64::from(pose.translation.y.to_bits()),
+                );
                 if let Ok(mut transform) = transforms.get_mut(simulation.visual) {
                     *transform = pose;
                 }
@@ -1212,5 +1251,56 @@ mod tests {
         assert_eq!(step(&mut last, now + Duration::from_secs(60)), 0.05);
         last = None;
         assert_eq!(step(&mut last, now + Duration::from_secs(120)), 0.0);
+    }
+
+    #[test]
+    fn control_wakes_preserve_motion_time_and_suspension_resets_it() {
+        let now = Instant::now();
+        let mut last = None;
+        assert_eq!(animation_step(&mut last, now, true, false), Some(0.0));
+        for milliseconds in [2, 5, 12] {
+            assert_eq!(
+                animation_step(
+                    &mut last,
+                    now + Duration::from_millis(milliseconds),
+                    false,
+                    false
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            animation_step(&mut last, now + Duration::from_millis(16), true, false),
+            Some(0.016)
+        );
+        assert_eq!(
+            animation_step(&mut last, now + Duration::from_secs(1), false, true),
+            None
+        );
+        assert_eq!(
+            animation_step(&mut last, now + Duration::from_secs(60), true, false),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn withheld_callbacks_reset_motion_without_a_control_flag() {
+        let now = Instant::now();
+        let mut last = Some(now);
+        assert_eq!(
+            animation_step(&mut last, now + Duration::from_secs(10), true, false),
+            Some(0.0)
+        );
+        assert_eq!(
+            animation_step(&mut last, now + Duration::from_secs(11), true, false),
+            Some(0.05)
+        );
+    }
+
+    #[test]
+    fn force_render_while_suspended_submits_settled_content() {
+        let now = Instant::now();
+        let mut last = Some(now - Duration::from_millis(16));
+        assert_eq!(animation_step(&mut last, now, true, true), Some(0.0));
     }
 }

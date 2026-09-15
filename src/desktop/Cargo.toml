@@ -45,6 +45,7 @@ bin = "cosmix-quoin"
 # Vendored upstream sources with narrow local patches: see vendor/README.md for
 # provenance, exact patch shape and source-routing assertions.
 [patch.crates-io]
+bevy_render = { path = "vendor/bevy_render" }
 calloop = { path = "vendor/calloop" }
 smithay = { path = "vendor/smithay" }
 wgpu = { path = "vendor/wgpu" }

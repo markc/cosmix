@@ -313,6 +313,109 @@ fn configure_scene_schedules(app: &mut App) {
     }
 }
 
+/// Waiting outputs intentionally retain their latest targets without a timeout:
+/// the next callback needs them, and recreating them caused the submit stall.
+/// Output removal, explicit suspension, or device recovery drops retention.
+/// The application's two-second animation-clock reset does not expire these
+/// targets: callback withholding alone can retain them indefinitely. Snapshots
+/// replace prior batches and the output cap bounds retained history, not time.
+#[derive(Resource, Default)]
+struct SceneCacheOutputs {
+    waiting: Vec<Entity>,
+    rendered: Vec<Entity>,
+}
+
+impl SceneCacheOutputs {
+    /// Extraction-only retirement wakes render no views, but surviving outputs
+    /// still need their last batch when their next callback arrives.
+    fn retiring(app: &App, retired: &[Entity]) -> Self {
+        Self {
+            waiting: app
+                .world()
+                .get_resource::<SceneTextureRetention>()
+                .map(|retention| {
+                    retention
+                        .outputs
+                        .keys()
+                        .copied()
+                        .filter(|output| !retired.contains(output))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rendered: Vec::new(),
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct SceneTextureRetention {
+    device: Option<bevy::ecs::change_detection::Tick>,
+    // One latest batch snapshot per output, never accumulated resize history.
+    outputs: BTreeMap<Entity, Vec<bevy::render::render_resource::TextureId>>,
+}
+
+/// Keep the real cache visible to preparation, including zero-view PBR work.
+/// Cleanup releases reservations normally; waiting outputs pin only ageing.
+/// Mid-wake get() uses the real cache's taken flags: another request cannot
+/// duplicate a reserved texture through a restored CachedTexture/Arc snapshot.
+/// Preparation must still precede Cleanup, which captures usage and releases
+/// reservations; the fixture uses Bevy's base render schedule to pin that order.
+fn update_scene_app(app: &mut App) {
+    use bevy::render::{renderer::RenderDevice, texture::TextureCache};
+    let mut retention = app
+        .world_mut()
+        .remove_resource::<SceneTextureRetention>()
+        .unwrap_or_default();
+    let policy = app
+        .world_mut()
+        .remove_resource::<SceneCacheOutputs>()
+        .unwrap_or_default();
+    let generation = app.get_sub_app(RenderApp).and_then(|render| {
+        render
+            .world()
+            .get_resource_ref::<RenderDevice>()
+            .map(|device| device.last_changed())
+    });
+    if retention.device != generation {
+        retention.outputs.clear();
+    }
+    retention
+        .outputs
+        .retain(|output, _| policy.waiting.contains(output) || policy.rendered.contains(output));
+    if let Some(render) = app.get_sub_app_mut(RenderApp)
+        && let Some(mut cache) = render.world_mut().get_resource_mut::<TextureCache>()
+    {
+        cache.set_update_policy(
+            retention
+                .outputs
+                .iter()
+                .filter(|(output, _)| policy.waiting.contains(output))
+                .flat_map(|(_, ids)| ids.iter().copied()),
+        );
+    }
+    app.update();
+    let current = app.get_sub_app(RenderApp).and_then(|render| {
+        render
+            .world()
+            .get_resource_ref::<RenderDevice>()
+            .map(|device| device.last_changed())
+    });
+    if current != generation {
+        // Recovery owns its new cache. No old cache or texture is restored.
+        retention.outputs.clear();
+    } else if let Some(render) = app.get_sub_app(RenderApp)
+        && let Some(cache) = render.world().get_resource::<TextureCache>()
+    {
+        for output in policy.rendered {
+            retention
+                .outputs
+                .insert(output, cache.recently_used().to_vec());
+        }
+    }
+    retention.device = current;
+    app.insert_resource(retention);
+}
+
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
@@ -320,6 +423,384 @@ mod schedule_tests {
 
     #[derive(Resource)]
     struct Extracted;
+
+    fn texture_cache_app() -> App {
+        use bevy::render::{
+            renderer::RenderDevice,
+            texture::{TextureCache, update_texture_cache_system},
+        };
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let mut render = SubApp::new();
+        render.add_schedule(Render::base_schedule());
+        render.update_schedule = Some(Render.intern());
+        render
+            .insert_resource(RenderDevice::from(device))
+            .insert_resource(bevy::render::renderer::RenderQueue(std::sync::Arc::new(
+                bevy::render::renderer::WgpuWrapper::new(queue),
+            )))
+            .init_resource::<TextureCache>()
+            .add_systems(
+                Render,
+                update_texture_cache_system.in_set(bevy::render::RenderSystems::Cleanup),
+            );
+        let mut app = App::new();
+        app.insert_sub_app(RenderApp, render);
+        app
+    }
+
+    fn cached_view_texture(
+        app: &mut App,
+        label: &'static str,
+    ) -> bevy::render::render_resource::Texture {
+        cached_sized_texture(app, label, 16, 4)
+    }
+
+    fn cached_sized_texture(
+        app: &mut App,
+        label: &'static str,
+        size: u32,
+        samples: u32,
+    ) -> bevy::render::render_resource::Texture {
+        use bevy::render::{renderer::RenderDevice, texture::TextureCache};
+        let world = app.sub_app_mut(RenderApp).world_mut();
+        let device = world.resource::<RenderDevice>().clone();
+        world
+            .resource_mut::<TextureCache>()
+            .get(
+                &device,
+                wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size,
+                        height: size,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: if label == "view_depth_texture" {
+                        wgpu::TextureFormat::Depth32Float
+                    } else {
+                        wgpu::TextureFormat::Rgba8Unorm
+                    },
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                },
+            )
+            .texture
+    }
+
+    // NOT compiled by a bare `cargo test -p cosmix-shell-host` — run with
+    // `--features scene-3d` (or co-select -p cosmix-bg-showcase, which
+    // enables it). This test guards the vendored bevy_render cache patch.
+    #[cfg(feature = "scene-3d")]
+    #[test]
+    fn warm_pbr_control_wakes_create_no_new_shadow_textures() {
+        use bevy::{
+            light::{
+                DirectionalLightShadowMap, GlobalAmbientLight, PointLightShadowMap,
+                cluster::Clusters,
+            },
+            pbr::{
+                ExtractedClusterConfig, GlobalClusterableObjectMeta, LightKeyCache, LightMeta,
+                Shadow, SpecializedShadowMaterialPipelineCache, prepare_lights,
+            },
+            render::{
+                batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
+                camera::{SortedCamera, SortedCameras},
+                render_phase::ViewBinnedRenderPhases,
+                render_resource::BufferBindingType,
+                sync_world::MainEntity,
+                texture::TextureCache,
+                view::{ExtractedView, RetainedViewEntity},
+            },
+        };
+        #[derive(Resource, Default)]
+        struct WakeUsage(Vec<Vec<bevy::render::render_resource::TextureId>>);
+        fn observe_usage(cache: Res<TextureCache>, mut observations: ResMut<WakeUsage>) {
+            observations.0.push(cache.recently_used().to_vec());
+        }
+        let mut app = texture_cache_app();
+        let render = app.sub_app_mut(RenderApp);
+        render
+            .init_resource::<WakeUsage>()
+            .add_systems(
+                Render,
+                observe_usage.in_set(bevy::render::RenderSystems::PostCleanup),
+            )
+            .insert_resource(GlobalClusterableObjectMeta::new(
+                BufferBindingType::Storage { read_only: true },
+            ))
+            .init_resource::<LightMeta>()
+            .init_resource::<GlobalAmbientLight>()
+            .init_resource::<PointLightShadowMap>()
+            .init_resource::<DirectionalLightShadowMap>()
+            .init_resource::<ViewBinnedRenderPhases<Shadow>>()
+            .init_resource::<LightKeyCache>()
+            .init_resource::<SpecializedShadowMaterialPipelineCache>()
+            .insert_resource(GpuPreprocessingSupport {
+                max_supported_mode: GpuPreprocessingMode::None,
+            })
+            .add_systems(
+                Render,
+                prepare_lights.in_set(bevy::render::RenderSystems::PrepareResources),
+            );
+        let main = MainEntity::from(Entity::from_bits(1));
+        let view = render
+            .world_mut()
+            .spawn((
+                Camera3d::default(),
+                main,
+                ExtractedClusterConfig::from(&Clusters::default()),
+                ExtractedView {
+                    retained_view_entity: RetainedViewEntity::new(main, None, 0),
+                    clip_from_view: Mat4::IDENTITY,
+                    world_from_view: GlobalTransform::IDENTITY,
+                    clip_from_world: None,
+                    target_format: wgpu::TextureFormat::Rgba8Unorm,
+                    viewport: UVec4::new(0, 0, 16, 16),
+                    color_grading: default(),
+                    invert_culling: false,
+                },
+            ))
+            .id();
+        render.insert_resource(SortedCameras(vec![SortedCamera {
+            entity: view,
+            order: 0,
+            target: None,
+            hdr: false,
+            output_mode: default(),
+        }]));
+        update_scene_app(&mut app);
+        let warm = app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<WakeUsage>()
+            .0
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            warm.len(),
+            2,
+            "real PBR preparation allocated both shadow maps"
+        );
+        app.sub_app_mut(RenderApp).world_mut().despawn(view);
+        app.sub_app_mut(RenderApp)
+            .world_mut()
+            .resource_mut::<SortedCameras>()
+            .0
+            .clear();
+        for wake in 0..12 {
+            update_scene_app(&mut app);
+            let observations = app.sub_app(RenderApp).world().resource::<WakeUsage>();
+            assert_eq!(observations.0.len(), wake + 2);
+            let used = observations.0.last().unwrap();
+            assert_eq!(used.len(), 2, "zero-view PBR preparation must still run");
+            assert!(
+                used.iter().all(|id| warm.contains(id)),
+                "control wake created a shadow texture"
+            );
+        }
+        // Negative control: reproduce the former throwaway-cache swap. The
+        // separate Render observation must reject it even after restoring the
+        // warm cache (whose recently_used IDs would mask this regression).
+        let warm_cache = app
+            .sub_app_mut(RenderApp)
+            .world_mut()
+            .remove_resource::<TextureCache>()
+            .unwrap();
+        app.sub_app_mut(RenderApp)
+            .insert_resource(TextureCache::default());
+        update_scene_app(&mut app);
+        app.sub_app_mut(RenderApp).insert_resource(warm_cache);
+        let observations = app.sub_app(RenderApp).world().resource::<WakeUsage>();
+        assert_eq!(observations.0.len(), 14);
+        let mutant = observations.0.last().unwrap();
+        assert_eq!(mutant.len(), 2);
+        assert!(
+            !mutant.iter().all(|id| warm.contains(id)),
+            "reuse assertion must fail under the former swap behaviour"
+        );
+        assert!(
+            app.sub_app(RenderApp)
+                .world()
+                .resource::<TextureCache>()
+                .recently_used()
+                .iter()
+                .all(|id| warm.contains(id)),
+            "restored-cache-only observation would incorrectly pass"
+        );
+    }
+
+    #[test]
+    fn waiting_output_survives_peer_resize_and_msaa_updates_then_expires() {
+        let mut app = texture_cache_app();
+        let a = Entity::from_bits(1);
+        let b = Entity::from_bits(2);
+        let old_a = cached_sized_texture(&mut app, "main_texture_sampled", 16, 4);
+        let old_b = cached_sized_texture(&mut app, "main_texture_sampled", 32, 4);
+        app.insert_resource(SceneCacheOutputs {
+            waiting: vec![],
+            rendered: vec![a, b],
+        });
+        update_scene_app(&mut app);
+        for frame in 0..12 {
+            let size = 64 + frame;
+            let samples = if frame % 2 == 0 { 1 } else { 4 };
+            let resized = cached_sized_texture(&mut app, "main_texture_sampled", size, samples);
+            assert_eq!(resized.width(), size);
+            assert_eq!(resized.sample_count(), samples);
+            assert_ne!(resized.id(), old_a.id());
+            assert_ne!(resized.id(), old_b.id());
+            app.insert_resource(SceneCacheOutputs {
+                waiting: vec![b],
+                rendered: vec![a],
+            });
+            update_scene_app(&mut app);
+            let retained = app.world().resource::<SceneTextureRetention>();
+            assert_eq!(retained.outputs.len(), 2);
+            assert!(retained.outputs.values().all(|ids| ids.len() <= 2));
+        }
+        // Retire A through the same extraction-barrier policy as production,
+        // then leave B waiting beyond the normal three-update eviction age.
+        app.insert_resource(SceneCacheOutputs::retiring(&app, &[a]));
+        update_scene_app(&mut app);
+        assert_eq!(
+            app.world()
+                .resource::<SceneTextureRetention>()
+                .outputs
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![b]
+        );
+        for _ in 0..5 {
+            app.insert_resource(SceneCacheOutputs {
+                waiting: vec![b],
+                rendered: vec![],
+            });
+            update_scene_app(&mut app);
+        }
+        assert_eq!(
+            cached_sized_texture(&mut app, "main_texture_sampled", 32, 4).id(),
+            old_b.id()
+        );
+        app.insert_resource(SceneCacheOutputs {
+            waiting: vec![],
+            rendered: vec![b],
+        });
+        update_scene_app(&mut app);
+        // No active/waiting outputs: ordinary cleanup reclaims retained history.
+        for _ in 0..3 {
+            update_scene_app(&mut app);
+        }
+        assert!(
+            app.world()
+                .resource::<SceneTextureRetention>()
+                .outputs
+                .is_empty()
+        );
+        assert_ne!(
+            cached_sized_texture(&mut app, "main_texture_sampled", 32, 4).id(),
+            old_b.id()
+        );
+    }
+
+    #[test]
+    fn control_only_updates_reuse_msaa_targets_but_idle_cleanup_still_expires_them() {
+        let mut app = texture_cache_app();
+        let colour = cached_view_texture(&mut app, "main_texture_sampled");
+        let depth = cached_view_texture(&mut app, "view_depth_texture");
+        let output = Entity::from_bits(1);
+        app.insert_resource(SceneCacheOutputs {
+            waiting: vec![],
+            rendered: vec![output],
+        });
+        update_scene_app(&mut app);
+        for _ in 0..3 {
+            for _ in 0..5 {
+                app.insert_resource(SceneCacheOutputs {
+                    waiting: vec![output],
+                    rendered: vec![],
+                });
+                update_scene_app(&mut app); // More than Bevy's eviction threshold.
+            }
+            assert_eq!(
+                cached_view_texture(&mut app, "main_texture_sampled").id(),
+                colour.id()
+            );
+            assert_eq!(
+                cached_view_texture(&mut app, "view_depth_texture").id(),
+                depth.id()
+            );
+            app.insert_resource(SceneCacheOutputs {
+                waiting: vec![],
+                rendered: vec![output],
+            });
+            update_scene_app(&mut app);
+        }
+        // Paused/hidden/teardown updates retain normal unused-resource eviction.
+        for _ in 0..3 {
+            update_scene_app(&mut app);
+        }
+        assert_ne!(
+            cached_view_texture(&mut app, "main_texture_sampled").id(),
+            colour.id()
+        );
+        assert_ne!(
+            cached_view_texture(&mut app, "view_depth_texture").id(),
+            depth.id()
+        );
+    }
+
+    #[test]
+    fn control_only_cache_preservation_does_not_restore_old_device_textures() {
+        use bevy::render::{renderer::RenderDevice, texture::TextureCache};
+        let mut app = texture_cache_app();
+        let old = cached_view_texture(&mut app, "main_texture_sampled");
+        let output = Entity::from_bits(1);
+        app.insert_resource(SceneCacheOutputs {
+            waiting: vec![],
+            rendered: vec![output],
+        });
+        update_scene_app(&mut app);
+        assert_eq!(
+            app.world()
+                .resource::<SceneTextureRetention>()
+                .outputs
+                .len(),
+            1
+        );
+        let (device, _) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let replacement = RenderDevice::from(device);
+        app.sub_app_mut(RenderApp)
+            .add_systems(Render, move |mut commands: Commands| {
+                commands.insert_resource(replacement.clone());
+                commands.insert_resource(TextureCache::default());
+            });
+        app.insert_resource(SceneCacheOutputs {
+            waiting: vec![output],
+            rendered: vec![],
+        });
+        update_scene_app(&mut app);
+        assert!(
+            app.world()
+                .resource::<SceneTextureRetention>()
+                .outputs
+                .is_empty()
+        );
+        assert!(
+            app.sub_app(RenderApp)
+                .world()
+                .resource::<TextureCache>()
+                .is_empty()
+        );
+        assert_ne!(
+            cached_view_texture(&mut app, "main_texture_sampled").id(),
+            old.id()
+        );
+    }
 
     #[test]
     fn revoked_output_does_not_disable_other_outputs_or_reappear_on_update() {
@@ -599,18 +1080,38 @@ fn run(
     for surface in state.surfaces.values() {
         surface.target.detach(&mut state.app);
     }
-    state.update_scene();
+    state.update_scene(false);
     state.surfaces.clear();
     tracing::info!("SCENE_HOST_STOPPED render_handles_drained=true");
     result
 }
 
 impl State {
-    fn update_scene(&mut self) {
+    fn update_scene(&mut self, track_outputs: bool) {
+        let mut outputs = SceneCacheOutputs::default();
+        let control = self.app.world().resource::<SceneControl>();
+        let tick = self.app.world().resource::<SceneTick>();
+        if track_outputs && !control.hidden && !control.paused {
+            for (name, surface) in &self.surfaces {
+                if surface.configured && !control.suspended_outputs.contains(&surface.target.window)
+                {
+                    if tick.0.contains(name) {
+                        outputs.rendered.push(surface.target.window);
+                    } else {
+                        outputs.waiting.push(surface.target.window);
+                    }
+                }
+            }
+        }
+        self.update_scene_with_policy(outputs);
+    }
+
+    fn update_scene_with_policy(&mut self, outputs: SceneCacheOutputs) {
+        self.app.insert_resource(outputs);
         let started = Instant::now();
         {
             let _trace = crate::runner::frame_trace::span("scene_app_update", 0);
-            self.app.update();
+            update_scene_app(&mut self.app);
         }
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let mut metrics = self.app.world_mut().resource_mut::<SceneMetrics>();
@@ -685,7 +1186,13 @@ impl State {
                     .0
                     .remove(name);
             }
-            self.update_scene(); // extraction barrier before any native object drops
+            let retired: Vec<_> = removed
+                .iter()
+                .map(|name| self.surfaces[name].target.window)
+                .collect();
+            // Keep surviving outputs through extraction; only retired outputs
+            // lose their snapshots before the native objects are dropped.
+            self.update_scene_with_policy(SceneCacheOutputs::retiring(&self.app, &retired));
             for name in removed {
                 let surface = self.surfaces.remove(&name).expect("retired output");
                 self.app.world_mut().despawn(surface.target.camera);
@@ -873,7 +1380,7 @@ impl State {
                 self.app.world_mut().resource_mut::<SceneViews>().0 = views;
                 self.app.world_mut().resource_mut::<SceneTick>().0 =
                     rendering.iter().map(|(name, _)| name.clone()).collect();
-                self.update_scene();
+                self.update_scene(true);
                 // Persist presentation changes before any failed-frame retry
                 // can skip the bottom-of-loop comparison. The next iteration
                 // must retire/recreate roles even if no buffer was submitted.
