@@ -330,10 +330,20 @@ impl HardwareCursor {
                 .map_err(|e| e.to_string())?;
         }
         match self.commit(&request, false, !changed) {
-            // Keep the last successfully submitted coordinates. The next
-            // scene drain retries with the newest pointer position, without
-            // spinning, consuming flip events or forcing a primary render.
-            Err(error) if !changed && error.is_busy() => return Ok(()),
+            // A busy CRTC coalesces: keep the last successfully submitted
+            // state (front/image are not advanced below) and let the next
+            // update — motion OR image change — retry with the newest
+            // position/pixels, without spinning, consuming flip events, or
+            // forcing a primary render. The next update is input-driven
+            // (pointer motion or a cursor-shape change), so a fully-stopped
+            // pointer self-heals on its next event, not necessarily the next
+            // frame. Crucially this now also covers a *changed* (image)
+            // commit: a blocking image commit that a driver rejects with
+            // EBUSY must NOT propagate Err, because the caller
+            // (HardwareCursorBridge::update) drops the plane on Err — which
+            // would silently retire the whole cursor to software and restore
+            // the exact per-frame-render stall this plane removes.
+            Err(error) if error.is_busy() => return Ok(()),
             Err(error) => return Err(error.to_string()),
             Ok(()) => (),
         }
