@@ -1573,6 +1573,18 @@ fn clear_client_cursor(world: &mut World) {
 }
 
 fn set_client_image_linear(world: &mut World, image: &Handle<Image>) {
+    // Relies on Bevy render_asset.rs re-extraction for Unused-removal, deferral-requeue and device recovery; Modified is not their only re-prepare trigger.
+    let linear = ImageSampler::linear();
+    // Replacing an imported view does not change its sampler. A redundant
+    // mutable assignment emits Image::Modified, making Bevy allocate the
+    // ordinary placeholder again before we install the next imported view.
+    if world
+        .resource::<Assets<Image>>()
+        .get(image)
+        .is_none_or(|image| image.sampler == linear)
+    {
+        return;
+    }
     if let Some(mut image) = world.resource_mut::<Assets<Image>>().get_mut(image) {
         // Phase 3b intentionally gives SHM and DMA-BUF the same linear sampler over
         // encoded-sRGB, encoded-premultiplied UNORM bytes. Fractional samples across
@@ -1583,7 +1595,7 @@ fn set_client_image_linear(world: &mut World, image: &Handle<Image>) {
         // RGB and alpha by rounded coverage, then blend One/OneMinusSrcAlpha.
         // Bevy 0.19 has no AlphaMode2d::Premultiplied, but Material2d::specialize
         // can set that blend state directly on the colour target.
-        image.sampler = ImageSampler::linear();
+        image.sampler = linear;
     }
 }
 
@@ -3723,6 +3735,7 @@ mod tests {
             cacheable: true,
             token,
             descriptor: DmabufDescriptor {
+                explicit_acquire: false,
                 width: 8,
                 height: 8,
                 fourcc: Fourcc::Argb8888 as u32,
@@ -3735,6 +3748,164 @@ mod tests {
             },
             use_id: Some(DmabufUseId::for_test(use_id)),
         })
+    }
+
+    #[test]
+    fn dmabuf_replacements_keep_surface_and_cursor_image_assets_clean() {
+        use bevy::asset::{AssetApp, AssetEvent, AssetPlugin};
+
+        for cursor in [false, true] {
+            let (sender, feed) = ClientSceneFeed::test_channel();
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+                .init_asset::<Image>()
+                .init_resource::<ImportedDmabufImages>()
+                .insert_resource(feed)
+                .add_plugins(CompositorScenePlugin::new(
+                    320,
+                    240,
+                    SceneCursorMode::SoftwareCursor,
+                ));
+            let id = SurfaceId(40);
+            let event = |token| {
+                if cursor {
+                    ProtocolEvent::CursorUpdated {
+                        image: CursorImage::Surface {
+                            id: ObjectId::null(),
+                            hotspot: (1, 2),
+                            presentation: CursorPresentation {
+                                width: 8.0,
+                                height: 8.0,
+                                source: None,
+                                transform: SurfaceTransform::Normal,
+                            },
+                            frame: Some(dmabuf_frame(token, token)),
+                        },
+                    }
+                } else {
+                    ProtocolEvent::SurfaceUpserted {
+                        id,
+                        scene: scene(layout(40)),
+                        frame: dmabuf_frame(token, token),
+                    }
+                }
+            };
+            publish(&mut app, &sender, vec![event(9000)]);
+            let image = if cursor {
+                app.world()
+                    .resource::<CursorScene>()
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .image
+                    .handle()
+                    .clone()
+            } else {
+                app.world().resource::<SurfaceEntities>().surfaces[&id]
+                    .image
+                    .handle()
+                    .clone()
+            };
+            assert_eq!(
+                app.world()
+                    .resource::<Assets<Image>>()
+                    .get(&image)
+                    .unwrap()
+                    .sampler,
+                ImageSampler::linear()
+            );
+            app.world_mut()
+                .resource_mut::<Messages<AssetEvent<Image>>>()
+                .clear();
+
+            for token in 9001..=9003 {
+                publish(&mut app, &sender, vec![event(token)]);
+                let current = if cursor {
+                    app.world()
+                        .resource::<CursorScene>()
+                        .client
+                        .as_ref()
+                        .unwrap()
+                        .image
+                        .id()
+                } else {
+                    app.world().resource::<SurfaceEntities>().surfaces[&id]
+                        .image
+                        .id()
+                };
+                assert_eq!(
+                    current,
+                    image.id(),
+                    "replacement retains the placeholder asset"
+                );
+                let events: Vec<_> = app
+                    .world_mut()
+                    .resource_mut::<Messages<AssetEvent<Image>>>()
+                    .drain()
+                    .collect();
+                assert!(
+                    !events.iter().any(
+                        |event| matches!(event, AssetEvent::Modified { id } if *id == image.id())
+                    ),
+                    "unchanged sampler must not re-prepare a GPU placeholder (cursor={cursor}): {events:?}"
+                );
+                assert_eq!(
+                    app.world()
+                        .resource::<ClientSceneFeed>()
+                        .released_dmabuf_tokens_for_test(),
+                    vec![token - 1],
+                    "replacement still advances the import registry and retires the superseded pending buffer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn client_sampler_change_still_emits_modified() {
+        use bevy::asset::{AssetApp, AssetEvent, AssetPlugin};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>();
+        let initial = Image {
+            sampler: ImageSampler::nearest(),
+            ..Image::default()
+        };
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(initial);
+        app.update();
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Image>>>()
+            .clear();
+        set_client_image_linear(app.world_mut(), &image);
+        app.update();
+        let events: Vec<_> = app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Image>>>()
+            .drain()
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AssetEvent::Modified { id } if *id == image.id()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&image)
+                .unwrap()
+                .sampler,
+            ImageSampler::linear()
+        );
+        set_client_image_linear(app.world_mut(), &image);
+        app.update();
+        assert!(
+            !app.world_mut()
+                .resource_mut::<Messages<AssetEvent<Image>>>()
+                .drain()
+                .any(|event| matches!(event, AssetEvent::Modified { id } if id == image.id()))
+        );
     }
 
     fn publish(app: &mut App, sender: &SyncSender<Vec<ProtocolEvent>>, events: Vec<ProtocolEvent>) {
@@ -5346,6 +5517,7 @@ mod tests {
         };
         for fourcc in [Fourcc::Xrgb8888, Fourcc::Xbgr8888] {
             let descriptor = DmabufDescriptor {
+                explicit_acquire: false,
                 width: 1,
                 height: 1,
                 fourcc: fourcc as u32,

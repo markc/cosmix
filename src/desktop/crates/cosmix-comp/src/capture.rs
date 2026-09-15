@@ -2930,7 +2930,10 @@ fn capture_output_frames(
                 nested_blitted.insert(source_id.clone());
             }
         }
+        let submit_origin =
+            wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Capture);
         let submission = queue.submit([encoder.finish()]);
+        drop(submit_origin);
         let nested_acquisition = matches!(&source_id, CaptureSourceId::Nested { .. })
             .then(|| {
                 pending_nested
@@ -3085,6 +3088,8 @@ fn capture_output_frames(
             destination,
             format,
         ) {
+            let _submit_origin =
+                wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Cursor);
             queue.submit([encoder.finish()]);
         }
     }
@@ -3107,6 +3112,8 @@ fn capture_output_frames(
             &redirect.source_id,
             &source,
         ) {
+            let _submit_origin =
+                wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Capture);
             queue.submit([encoder.finish()]);
         }
     }

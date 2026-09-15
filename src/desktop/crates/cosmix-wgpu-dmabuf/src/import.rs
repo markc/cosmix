@@ -192,6 +192,7 @@ impl Default for ImportInstrumentation {
 
 struct ImportedUse<T> {
     backing: Arc<T>,
+    acquire_trace: Option<crate::diagnostics::AcquireState>,
     _physical_release: Option<ReleaseOnDrop>,
     _logical_release: Option<ReleaseOnDrop>,
 }
@@ -201,6 +202,7 @@ impl<T> ImportedUse<T> {
         let (physical_release, logical_release) = release.split();
         Self {
             backing,
+            acquire_trace: None,
             _physical_release: physical_release,
             _logical_release: logical_release,
         }
@@ -582,12 +584,18 @@ impl ImportedDmabufImages {
             .expect("DMA-BUF import registry mutex poisoned");
         let wgpu_descriptor = texture_descriptor(&descriptor, imports.debug.options.probe)?;
         imports.ever_imported = true;
-        let handle = images.add(Image::new_uninit(
+        let mut placeholder = Image::new_uninit(
             wgpu_descriptor.size,
             wgpu_descriptor.dimension,
             wgpu_descriptor.format,
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-        ));
+        );
+        // Diagnostic identity only: keep allocation, sampling and asset events
+        // unchanged. Distinguishes Bevy's placeholder from the imported image.
+        if crate::diagnostics::enabled() {
+            placeholder.texture_descriptor.label = Some("cosmix DMA-BUF placeholder");
+        }
+        let handle = images.add(placeholder);
         imports.active.insert(
             handle.id(),
             ImportState::Pending(PendingImport {
@@ -833,6 +841,7 @@ where
         cacheable,
     } = pending;
     let retained_bytes = dmabuf_retained_bytes(&descriptor);
+    let acquire_trace = crate::diagnostics::AcquireState::capture(buffer_id, &descriptor);
     let cached = (!no_cache).then(|| cache.get(buffer_id)).flatten();
     let (backing, newly_imported) = if let Some(backing) = cached {
         (backing, false)
@@ -846,8 +855,10 @@ where
         }
         (backing, true)
     };
+    let mut current = ImportedUse::new(backing, release);
+    current.acquire_trace = acquire_trace;
     Ok(ReadyImport {
-        current: ImportedUse::new(backing, release),
+        current,
         previous,
         newly_imported,
         probe_after_acquire: newly_imported && instrumentation.probe,
@@ -1290,7 +1301,19 @@ fn acquire_external_images(
             .0
             .lock()
             .expect("DMA-BUF import registry mutex poisoned");
-        pending_acquire_batch(&imports.active, &imports.local_owned)
+        let batch = pending_acquire_batch(&imports.active, &imports.local_owned);
+        if crate::diagnostics::enabled() {
+            // Observe each committed use participating in this submit, including
+            // cache hits. Polls do not gate acquisition or alter batch membership.
+            for id in &batch.submitted_ids {
+                if let Some(ImportState::Imported(ready)) = imports.active.get(id)
+                    && let Some(state) = &ready.current.acquire_trace
+                {
+                    state.record(batch.submitted_backings.len() as u64);
+                }
+            }
+        }
+        batch
     };
     let barrier_result = submit_ownership_barrier(
         &device,
@@ -1491,7 +1514,9 @@ fn readback_probe(
             },
         );
     }
+    let submit_origin = wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Probe);
     queue.submit([encoder.finish()]);
+    drop(submit_origin);
 
     let slice = buffer.slice(..);
     let (mapped_sender, mapped_receiver) = std::sync::mpsc::sync_channel(1);
@@ -1816,6 +1841,8 @@ fn transition_imported_images_to_resource(
             state: TextureUses::RESOURCE,
         }),
     );
+    let _submit_origin =
+        wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::ReleaseNormalise);
     render_queue.submit([encoder.finish()]);
 }
 
@@ -1873,6 +1900,10 @@ fn submit_ownership_barrier(
             OwnershipRole::Sampled,
         )?;
     }
+    let _submit_origin = wgpu::diagnostics::submit_origin(match direction {
+        OwnershipDirection::Acquire => wgpu::diagnostics::SubmitOrigin::Acquire,
+        OwnershipDirection::Release => wgpu::diagnostics::SubmitOrigin::Release,
+    });
     Ok(Some(render_queue.submit([encoder.finish()])))
 }
 
@@ -2551,6 +2582,7 @@ mod tests {
             .expect("/dev/null is available")
             .into();
         DmabufDescriptor {
+            explicit_acquire: false,
             width: 64,
             height: 32,
             fourcc: DrmFourcc::Argb8888 as u32,
@@ -4064,12 +4096,19 @@ mod tests {
             .expect("sibling sprite material exists")
             .clone();
         let render_world = app.sub_app_mut(RenderApp).world_mut();
+        let linear_sampler: bevy::render::render_resource::Sampler = device
+            .create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                ..Default::default()
+            })
+            .into();
         {
             let mut gpu_images = render_world.resource_mut::<RenderAssets<GpuImage>>();
-            gpu_images.insert(
-                replaced_image.id(),
-                noop_gpu_image(&device, "old replaced image"),
-            );
+            let mut initial_image = noop_gpu_image(&device, "old replaced image");
+            initial_image.sampler = linear_sampler.clone();
+            gpu_images.insert(replaced_image.id(), initial_image);
             gpu_images.insert(sibling_image.id(), noop_gpu_image(&device, "sibling image"));
         }
         {
@@ -4084,60 +4123,81 @@ mod tests {
             .run_system_once(prepare_assets::<PreparedMaterial2d<SpriteMaterial>>)
             .expect("initial Bevy sprite-material preparation runs");
 
-        let old_view = prepared_sprite_material_texture_view(render_world, replaced_material);
         let sibling_bind_group = render_world
             .resource::<RenderAssets<PreparedMaterial2d<SpriteMaterial>>>()
             .get(sibling_material)
             .expect("sibling material is prepared")
             .bind_group
             .id();
-        let replacement = noop_cached_texture(&device, "new replaced image");
-        let replacement_view = replacement.texture_view.id();
-        assert_ne!(old_view, replacement_view);
+        // No main-world Image Modified events or GpuImage re-extraction between
+        // these replacements: only the imported view and material are refreshed.
+        for _ in 0..3 {
+            assert!(
+                render_world
+                    .resource::<ExtractedAssets<GpuImage>>()
+                    .extracted
+                    .is_empty()
+            );
+            let old_view = prepared_sprite_material_texture_view(render_world, replaced_material);
+            let replacement = noop_cached_texture(&device, "new replaced image");
+            let replacement_view = replacement.texture_view.id();
+            assert_ne!(old_view, replacement_view);
 
-        {
-            let imports = render_world.resource::<ImportedDmabufImages>();
-            let mut registry = imports
-                .0
-                .lock()
-                .expect("DMA-BUF import registry mutex is available");
-            let identity = Arc::as_ptr(&replacement) as usize;
-            registry.local_owned.insert(identity);
-            registry.active.insert(
-                replaced_image.id(),
-                ImportState::Imported(ReadyImport {
-                    current: ImportedUse::new(
-                        replacement,
-                        ReleaseLease::new(DmabufRelease::Explicit(Box::new(|| {}))),
-                    ),
-                    previous: None,
-                    newly_imported: false,
-                    probe_after_acquire: false,
-                }),
+            {
+                let imports = render_world.resource::<ImportedDmabufImages>();
+                let mut registry = imports
+                    .0
+                    .lock()
+                    .expect("DMA-BUF import registry mutex is available");
+                let identity = Arc::as_ptr(&replacement) as usize;
+                registry.local_owned.insert(identity);
+                registry.active.insert(
+                    replaced_image.id(),
+                    ImportState::Imported(ReadyImport {
+                        current: ImportedUse::new(
+                            replacement,
+                            ReleaseLease::new(DmabufRelease::Explicit(Box::new(|| {}))),
+                        ),
+                        previous: None,
+                        newly_imported: false,
+                        probe_after_acquire: false,
+                    }),
+                );
+            }
+            render_world
+                .resource_mut::<ExtractedAssets<PreparedMaterial2d<SpriteMaterial>>>()
+                .extracted
+                .push((replaced_material, replaced_material_asset.clone()));
+
+            render_world.run_schedule(Render);
+
+            assert_eq!(
+                render_world
+                    .resource::<RenderAssets<GpuImage>>()
+                    .get(replaced_image.id())
+                    .expect("replacement image is installed")
+                    .sampler
+                    .id(),
+                linear_sampler.id(),
+                "replacement preserves the original linear sampler without Image Modified",
+            );
+
+            assert_eq!(
+                prepared_sprite_material_texture_view(render_world, replaced_material),
+                replacement_view,
+                "the next real Bevy sprite-material prepare must bind the installed texture view",
+            );
+            assert_eq!(
+                render_world
+                    .resource::<RenderAssets<PreparedMaterial2d<SpriteMaterial>>>()
+                    .get(sibling_material)
+                    .expect("sibling material stays prepared")
+                    .bind_group
+                    .id(),
+                sibling_bind_group,
+                "a replacement must not rebuild a sibling material bind group",
             );
         }
-        render_world
-            .resource_mut::<ExtractedAssets<PreparedMaterial2d<SpriteMaterial>>>()
-            .extracted
-            .push((replaced_material, replaced_material_asset));
-
-        render_world.run_schedule(Render);
-
-        assert_eq!(
-            prepared_sprite_material_texture_view(render_world, replaced_material),
-            replacement_view,
-            "the next real Bevy sprite-material prepare must bind the installed texture view",
-        );
-        assert_eq!(
-            render_world
-                .resource::<RenderAssets<PreparedMaterial2d<SpriteMaterial>>>()
-                .get(sibling_material)
-                .expect("sibling material stays prepared")
-                .bind_group
-                .id(),
-            sibling_bind_group,
-            "a replacement must not rebuild a sibling material bind group",
-        );
     }
 
     #[test]
@@ -4328,6 +4388,7 @@ mod tests {
         file.set_len(ALLOCATION_BYTES)
             .expect("sparse memfd allocation can be sized");
         let descriptor = DmabufDescriptor {
+            explicit_acquire: false,
             width: 1,
             height: 1,
             fourcc: DrmFourcc::Argb8888 as u32,

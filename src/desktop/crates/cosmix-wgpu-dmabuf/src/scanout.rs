@@ -390,6 +390,8 @@ impl ImportedCaptureDestination {
         if let Err(error) = encoded {
             return Err(CaptureDestinationError::Release(error.to_string()));
         }
+        let _submit_origin =
+            wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Release);
         let submission = queue.submit([encoder.finish()]);
         Ok(PendingCaptureDestinationRelease {
             destination: std::mem::ManuallyDrop::into_inner(destination),
@@ -925,6 +927,7 @@ mod tests {
 
     fn descriptor(fourcc: DrmFourcc) -> DmabufDescriptor {
         DmabufDescriptor {
+            explicit_acquire: false,
             width: 1920,
             height: 1080,
             fourcc: fourcc as u32,

@@ -4074,7 +4074,11 @@ impl LiveAtomicOwnership {
                         // linux-drm-syncobj client sync is separate and IS
                         // implemented.
                         let trace = crate::frame_trace::span("comp_gpu_complete", generation);
+                        let submit_origin = wgpu::diagnostics::submit_origin(
+                            wgpu::diagnostics::SubmitOrigin::EmptyMarker,
+                        );
                         let complete = state.pool.prove_rendering_complete(slot);
+                        drop(submit_origin);
                         drop(trace);
                         if let Err(error) = complete {
                             // The pool already moved a timed-out Rendering
@@ -5959,6 +5963,8 @@ fn clear_unwritten_output_frames(
     }
 
     if let Some(encoder) = encoder {
+        let _submit_origin =
+            wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Clear);
         render_queue.submit([encoder.finish()]);
     }
 }
@@ -6112,7 +6118,9 @@ fn readback_dmabuf_output_probe(
             },
         );
     }
+    let submit_origin = wgpu::diagnostics::submit_origin(wgpu::diagnostics::SubmitOrigin::Probe);
     queue.submit([encoder.finish()]);
+    drop(submit_origin);
 
     let slice = buffer.slice(..);
     let (mapped_sender, mapped_receiver) = std::sync::mpsc::sync_channel(1);
@@ -7976,6 +7984,7 @@ pub(crate) mod tests {
                 DmabufBufferId(73),
                 true,
                 DmabufDescriptor {
+                    explicit_acquire: false,
                     width: 8,
                     height: 8,
                     fourcc: Fourcc::Argb8888 as u32,

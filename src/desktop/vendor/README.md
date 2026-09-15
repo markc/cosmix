@@ -497,7 +497,12 @@ continues to seed `TextureUses::UNINITIALIZED`. The additive
 `wgpu-core::Device::create_texture_from_hal`, where it replaces
 `UNINITIALIZED` only for that call. It returns the installed tracker seed so the
 offline noop/HAL regression can observe the patched state before encoding the
-first `RESOURCE` use. No wgpu-hal source is patched.
+first `RESOURCE` use. The separate Phase A.2 timing patch also vendors
+`wgpu-hal` 29.0.4; provenance and its narrow Vulkan submission hooks are in
+[`wgpu-hal/README.cosmix.md`](wgpu-hal/README.cosmix.md).
+Allocation attribution also vendors `gpu-allocator` 0.28.0 to observe actual
+Vulkan block creation and release; see
+[`gpu-allocator/COSMIX-PATCH.md`](gpu-allocator/COSMIX-PATCH.md).
 
 The initial-usage patch changes these upstream files:
 

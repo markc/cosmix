@@ -114,7 +114,11 @@ fn submitted_work_wait(timeout: Duration) -> wgpu::PollType {
 impl WaitForSubmittedWork for WgpuWaitForSubmittedWork {
     fn wait_for_submitted_work(&mut self, timeout: Duration) -> Result<(), RetirementWaitError> {
         if let Some(queue) = &self.queue {
+            let submit_origin = wgpu::diagnostics::submit_origin_if_unset(
+                wgpu::diagnostics::SubmitOrigin::Retirement,
+            );
             let submission = queue.submit(std::iter::empty());
+            drop(submit_origin);
             return self.wait_for_submission(submission, timeout);
         }
         // Device-only adapters are used for quiescent terminal drains.

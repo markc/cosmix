@@ -10715,7 +10715,7 @@ impl WaylandState {
         buffer_transform: wl_output_protocol::Transform,
     ) {
         if let Ok(dmabuf) = get_dmabuf(&buffer) {
-            let descriptor = match describe_dmabuf(dmabuf) {
+            let mut descriptor = match describe_dmabuf(dmabuf) {
                 Ok(descriptor) => descriptor,
                 Err(error) => {
                     self.retire_buffer_immediately(buffer);
@@ -10723,6 +10723,13 @@ impl WaylandState {
                     return;
                 }
             };
+            // Diagnostic only; inspect the applied transaction without consuming it.
+            if crate::frame_trace::enabled() {
+                descriptor.explicit_acquire = compositor::with_states(surface, |states| {
+                    let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                    committed_syncobj_state(&mut cached).acquire_point.is_some()
+                });
+            }
             let presentation = match surface_presentation(
                 surface,
                 descriptor.width,
@@ -14782,7 +14789,15 @@ impl WaylandState {
         self.mark_surface_dirty(surface_id, "wayland.map");
         if let Ok(dmabuf) = get_dmabuf(&buffer) {
             match describe_dmabuf(dmabuf) {
-                Ok(descriptor) => {
+                Ok(mut descriptor) => {
+                    // Diagnostic only; read the applied transaction, not a newer
+                    // pending commit, and never consume the acquire point.
+                    if crate::frame_trace::enabled() {
+                        descriptor.explicit_acquire = compositor::with_states(surface, |states| {
+                            let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                            committed_syncobj_state(&mut cached).acquire_point.is_some()
+                        });
+                    }
                     let width = descriptor.width;
                     let height = descriptor.height;
                     let presentation = match surface_presentation(
@@ -14825,6 +14840,9 @@ impl WaylandState {
                         }
                     };
                     let (buffer_id, cacheable) = self.dmabuf_buffer_identity(&buffer);
+                    crate::frame_trace::event("comp_dmabuf_buffer_identity", || {
+                        (buffer_id.0, trace_object_identity(&buffer.id()), surface_id.0)
+                    });
                     let backing_buffer = buffer.clone();
                     let Some(token) = self.try_retain_dmabuf(surface, buffer) else {
                         return;
@@ -16288,6 +16306,7 @@ fn describe_dmabuf(dmabuf: &Dmabuf) -> Result<DmabufDescriptor, String> {
         .collect::<Result<Vec<_>, String>>()?;
     let format = dmabuf.format();
     Ok(DmabufDescriptor {
+        explicit_acquire: false,
         width,
         height,
         fourcc: format.code as u32,

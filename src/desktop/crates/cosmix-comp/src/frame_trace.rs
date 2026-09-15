@@ -116,6 +116,11 @@ fn recorder() -> Option<&'static Recorder> {
 
 pub(crate) struct Span(Option<(&'static Recorder, Record, u64)>);
 
+/// Also usable on the protocol thread before render observer installation.
+pub(crate) fn enabled() -> bool {
+    recorder().is_some()
+}
+
 fn thread_id() -> u32 {
     // SAFETY: gettid has no arguments or pointers and cannot change state.
     unsafe { libc::gettid() as u32 }
@@ -163,6 +168,10 @@ fn send_record(recorder: &Recorder, mut record: Record) {
 }
 
 pub(crate) fn span(stage: &'static str, subject: u64) -> Span {
+    span_with_detail(stage, subject, 0)
+}
+
+fn span_with_detail(stage: &'static str, subject: u64, detail: u64) -> Span {
     let Some(recorder) = recorder() else {
         return Span(None);
     };
@@ -182,7 +191,7 @@ pub(crate) fn span(stage: &'static str, subject: u64) -> Span {
             sequence,
             stage,
             subject,
-            detail: 0,
+            detail,
             aux: 0,
             tid: thread_id(),
             start_us: clock_us(libc::CLOCK_MONOTONIC),
@@ -278,6 +287,16 @@ pub(crate) fn install_render_phases(app: &mut bevy::prelude::App) {
     if wgpu::diagnostics::install(wgpu_event).is_err() {
         tracing::warn!("wgpu diagnostic observer already installed; keeping its owner");
     }
+    if !cosmix_wgpu_dmabuf::diagnostics::install(|subject, detail, aux| {
+        event("comp_dmabuf_acquire_state", || (subject, detail, aux));
+    }) {
+        tracing::warn!("DMA-BUF diagnostic observer already installed; keeping its owner");
+    }
+    if !wgpu::hal::diagnostics::install_allocations(|stage, subject, detail, aux| {
+        event(stage, || (subject, detail, aux));
+    }) {
+        tracing::warn!("wgpu allocation diagnostic observer already installed; keeping its owner");
+    }
     install_graph_markers(render);
     render.add_systems(
         Render,
@@ -291,10 +310,36 @@ pub(crate) fn install_render_phases(app: &mut bevy::prelude::App) {
 // Suppressed nested calls still balance their ends and never pop an outer span.
 #[derive(Default)]
 struct GpuCalls {
-    stack: Vec<(wgpu::diagnostics::Operation, u64, Span)>,
+    stack: Vec<(wgpu::diagnostics::Operation, u64, u64, Span)>,
     suppressed: usize,
 }
 impl GpuCalls {
+    fn fields(&self, event: wgpu::diagnostics::Event) -> (u64, u64) {
+        use wgpu::diagnostics::Operation;
+        if matches!(
+            event.operation,
+            Operation::QueueSubmitInner
+                | Operation::QueueDeferredActions
+                | Operation::QueueFenceLock
+                | Operation::QueueCommandPrep
+                | Operation::QueuePendingWrites
+                | Operation::QueueHalSubmit
+                | Operation::QueueHalBookkeeping
+                | Operation::QueueVkSubmit
+                | Operation::QueueMaintenance
+        ) {
+            self.stack
+                .iter()
+                .rev()
+                .find_map(|(operation, subject, detail, _)| {
+                    (*operation == Operation::QueueSubmit).then_some((*subject, *detail))
+                })
+                .unwrap_or((event.subject, event.detail))
+        } else {
+            (event.subject, event.detail)
+        }
+    }
+
     fn event(&mut self, event: wgpu::diagnostics::Event) {
         use wgpu::diagnostics::{Operation, Phase};
         match event.phase {
@@ -307,18 +352,32 @@ impl GpuCalls {
                     Operation::QueueSubmit => "comp_wgpu_queue_submit",
                     Operation::QueueSubmitInner => "comp_wgpu_queue_submit_inner",
                     Operation::QueueDeferredActions => "comp_wgpu_queue_deferred_actions",
+                    Operation::QueueFenceLock => "comp_wgpu_submit_fence_lock",
+                    Operation::QueueCommandPrep => "comp_wgpu_submit_command_prep",
+                    Operation::QueuePendingWrites => "comp_wgpu_submit_pending_writes",
+                    Operation::QueueHalSubmit => "comp_wgpu_submit_hal",
+                    Operation::QueueHalBookkeeping => "comp_wgpu_submit_hal_bookkeeping",
+                    Operation::QueueVkSubmit => "comp_wgpu_submit_vk",
+                    Operation::QueueMaintenance => "comp_wgpu_submit_maintenance",
                     Operation::DevicePoll => "comp_wgpu_device_poll",
                     Operation::SurfaceConfigure => "comp_wgpu_surface_configure",
                     Operation::SurfaceAcquire => "comp_wgpu_surface_acquire",
                     Operation::SurfacePresent => "comp_wgpu_surface_present",
                 };
-                self.stack
-                    .push((event.operation, event.subject, span(stage, event.subject)));
+                // Nested queue phases inherit the exact public submit's site
+                // and origin. Keep event.subject separately for balanced ends.
+                let (subject, detail) = self.fields(event);
+                self.stack.push((
+                    event.operation,
+                    event.subject,
+                    detail,
+                    span_with_detail(stage, subject, detail),
+                ));
             }
             Phase::End => {
                 if self.suppressed != 0 {
                     self.suppressed -= 1;
-                } else if self.stack.last().is_some_and(|(operation, subject, _)| {
+                } else if self.stack.last().is_some_and(|(operation, subject, _, _)| {
                     *operation == event.operation && *subject == event.subject
                 }) {
                     self.stack.pop();
@@ -417,6 +476,7 @@ mod tests {
                 operation: Operation::SurfacePresent,
                 phase: Phase::Begin,
                 subject,
+                detail: 0,
             });
         }
         assert_eq!(calls.stack.len(), 16);
@@ -426,10 +486,78 @@ mod tests {
                 operation: Operation::SurfacePresent,
                 phase: Phase::End,
                 subject,
+                detail: 0,
             });
         }
         assert!(calls.stack.is_empty());
         assert_eq!(calls.suppressed, 0);
+    }
+
+    #[test]
+    fn core_phases_inherit_submit_site_and_origin_without_relabelling_polls() {
+        use wgpu::diagnostics::{Event, Operation, Phase};
+        let mut calls = GpuCalls::default();
+        let submit = Event {
+            operation: Operation::QueueSubmit,
+            phase: Phase::Begin,
+            subject: 123,
+            detail: 1,
+        };
+        calls.event(submit);
+        for operation in [
+            Operation::QueueSubmitInner,
+            Operation::QueueFenceLock,
+            Operation::QueueCommandPrep,
+            Operation::QueuePendingWrites,
+            Operation::QueueHalSubmit,
+            Operation::QueueHalBookkeeping,
+            Operation::QueueVkSubmit,
+            Operation::QueueMaintenance,
+            Operation::QueueDeferredActions,
+        ] {
+            let begin = Event {
+                operation,
+                phase: Phase::Begin,
+                subject: 0,
+                detail: 0,
+            };
+            assert_eq!(calls.fields(begin), (123, 1));
+            calls.event(begin);
+            calls.event(Event {
+                phase: Phase::End,
+                ..begin
+            });
+        }
+        let poll = Event {
+            operation: Operation::DevicePoll,
+            phase: Phase::Begin,
+            subject: 1,
+            detail: 0,
+        };
+        assert_eq!(calls.fields(poll), (1, 0));
+        let nested = Event {
+            subject: 456,
+            detail: 3,
+            ..submit
+        };
+        calls.event(nested);
+        let core = Event {
+            operation: Operation::QueueHalSubmit,
+            subject: 0,
+            detail: 0,
+            ..submit
+        };
+        assert_eq!(calls.fields(core), (456, 3));
+        calls.event(Event {
+            phase: Phase::End,
+            ..nested
+        });
+        assert_eq!(calls.fields(core), (123, 1));
+        calls.event(Event {
+            phase: Phase::End,
+            ..submit
+        });
+        assert!(calls.stack.is_empty());
     }
 
     #[test]

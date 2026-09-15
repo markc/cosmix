@@ -10291,6 +10291,7 @@ fn synthetic_dmabuf_event(id: u64, token: u64, use_id: Option<DmabufUseId>) -> P
             cacheable: true,
             token,
             descriptor: DmabufDescriptor {
+                explicit_acquire: false,
                 width: 64,
                 height: 32,
                 fourcc: 0,

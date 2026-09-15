@@ -49,6 +49,8 @@ calloop = { path = "vendor/calloop" }
 smithay = { path = "vendor/smithay" }
 wgpu = { path = "vendor/wgpu" }
 wgpu-core = { path = "vendor/wgpu-core" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
+gpu-allocator = { path = "vendor/gpu-allocator" }
 
 # FD handoff patch, drift guard and upstream-PR exit: README.teletypewriter-patch.md.
 [patch."https://github.com/raphamorim/rio"]

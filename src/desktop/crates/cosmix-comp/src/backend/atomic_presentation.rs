@@ -708,6 +708,9 @@ impl<I: AtomicIo> AtomicPresenter<I> {
         generation: u64,
         absolute_deadline: Instant,
     ) -> Result<CommitWaitOutcome, AtomicCommitError> {
+        // Start only on the first EBUSY: includes subsequent retry ioctls/waits,
+        // never the ordinary successful first commit. RAII covers all exits.
+        let mut busy_trace = None;
         loop {
             if self.cancellation.cancelled(generation) {
                 return Ok(CommitWaitOutcome::Cancelled);
@@ -734,6 +737,9 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                 }
                 Ok(()) => return Ok(CommitWaitOutcome::Committed),
                 Err(error) if error.is_busy() => {
+                    busy_trace.get_or_insert_with(|| {
+                        crate::frame_trace::span("comp_atomic_busy_retry", generation)
+                    });
                     if self.cancellation.cancelled(generation) {
                         tracing::debug!(
                             operation = error.operation,
@@ -1586,6 +1592,7 @@ fn wait_on_drm_and_cancel(
                 revents: 0,
             },
         ];
+        let trace = crate::frame_trace::span("comp_pageflip_event_wait", 0);
         let ready = unsafe {
             libc::ppoll(
                 descriptors.as_mut_ptr(),
@@ -1594,11 +1601,14 @@ fn wait_on_drm_and_cancel(
                 std::ptr::null(),
             )
         };
+        // Capture errno before tracing can make any further system calls.
+        let error = (ready < 0).then(io::Error::last_os_error);
+        drop(trace);
         if ready == 0 {
             return Ok(AtomicWaitReady::Deadline);
         }
-        if ready < 0 {
-            return Err(io::Error::last_os_error());
+        if let Some(error) = error {
+            return Err(error);
         }
         Ok(AtomicWaitReady::Ready {
             drm: descriptors[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0,
@@ -1758,6 +1768,12 @@ impl AtomicIo for ProductionAtomicIo {
             reserved: 0,
             user_data: token,
         };
+        let trace = crate::frame_trace::span(
+            "comp_atomic_commit_ioctl",
+            options
+                .correlation
+                .map_or(0, |correlation| correlation.generation),
+        );
         let result = unsafe {
             libc::ioctl(
                 self.card.as_fd().as_raw_fd(),
@@ -1765,14 +1781,13 @@ impl AtomicIo for ProductionAtomicIo {
                 &mut raw,
             )
         };
-        if result < 0 {
+        let error = (result < 0).then(io::Error::last_os_error);
+        drop(trace);
+        if let Some(error) = error {
             if token != 0 {
                 self.events.unregister(token);
             }
-            return Err(AtomicCommitError::from_io(
-                "atomic commit ioctl",
-                io::Error::last_os_error(),
-            ));
+            return Err(AtomicCommitError::from_io("atomic commit ioctl", error));
         }
         Ok(())
     }

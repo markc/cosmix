@@ -1199,8 +1199,12 @@ impl Queue {
             let snatch_guard = self.device.snatchable_lock.read();
 
             // Fence lock must be acquired after the snatch lock everywhere to avoid deadlocks.
+            // Cosmix downstream: timing guards only; preserve lock and submit ordering.
+            let diagnostic = crate::diagnostics::begin(crate::diagnostics::Operation::FenceLock);
             let mut fence = self.device.fence.write();
+            drop(diagnostic);
 
+            let diagnostic = crate::diagnostics::begin(crate::diagnostics::Operation::CommandPrep);
             let mut command_index_guard = self.device.command_indices.write();
             command_index_guard.active_submission_index += 1;
             submit_index = command_index_guard.active_submission_index;
@@ -1372,6 +1376,9 @@ impl Queue {
                 }
             }
 
+            drop(diagnostic);
+            let diagnostic =
+                crate::diagnostics::begin(crate::diagnostics::Operation::PendingWrites);
             let mut pending_writes = self.pending_writes.lock();
 
             {
@@ -1423,6 +1430,7 @@ impl Queue {
                 Ok(None) => {}
                 Err(e) => break 'error Err(e.into()),
             }
+            drop(diagnostic);
             let hal_command_buffers = active_executions
                 .iter()
                 .flat_map(|e| e.inner.list.iter().map(|b| b.as_ref()))
@@ -1442,15 +1450,17 @@ impl Queue {
                     submit_surface_textures.push(raw);
                 }
 
-                if let Err(e) = unsafe {
+                let diagnostic =
+                    crate::diagnostics::begin(crate::diagnostics::Operation::HalSubmit);
+                let submission_result = unsafe {
                     self.raw().submit(
                         &hal_command_buffers,
                         &submit_surface_textures,
                         (fence.as_mut(), submit_index),
                     )
-                }
-                .map_err(|e| self.device.handle_hal_error(e))
-                {
+                };
+                drop(diagnostic);
+                if let Err(e) = submission_result.map_err(|e| self.device.handle_hal_error(e)) {
                     break 'error Err(e.into());
                 }
 
@@ -1463,6 +1473,7 @@ impl Queue {
             }
 
             profiling::scope!("cleanup");
+            let _diagnostic = crate::diagnostics::begin(crate::diagnostics::Operation::Maintenance);
 
             // this will register the new submission to the life time tracker
             self.lock_life()

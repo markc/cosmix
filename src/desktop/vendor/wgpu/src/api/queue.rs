@@ -254,13 +254,14 @@ impl Queue {
     }
 
     /// Submits a series of finished command buffers for execution.
+    // Cosmix downstream: source identity is resolved only with diagnostics on.
+    #[track_caller]
     pub fn submit<I: IntoIterator<Item = CommandBuffer>>(
         &self,
         command_buffers: I,
     ) -> SubmissionIndex {
         #[cfg(std)]
-        let _diagnostic =
-            crate::diagnostics::begin(crate::diagnostics::Operation::QueueSubmit, || 0);
+        let _diagnostic = crate::diagnostics::begin_submit(core::panic::Location::caller());
         // As submit drains the iterator (even on error), collect deferred actions
         // from each CommandBuffer along the way.
         let mut actions = DeferredCommandBufferActions::default();
