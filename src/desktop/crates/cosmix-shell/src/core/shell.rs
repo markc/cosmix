@@ -93,7 +93,9 @@ impl ShellModel {
     ) -> Result<(), PanelConfigError> {
         let thickness = if thickness.is_finite() && thickness > 0.0 {
             thickness.min(self.thickness_budget(edge))
-        } else { thickness };
+        } else {
+            thickness
+        };
         self.panels[edge.index()].restore_thickness(thickness)
     }
 

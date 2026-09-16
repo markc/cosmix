@@ -296,11 +296,16 @@ mod tests {
         for edge in [Edge::Left, Edge::Right] {
             set_page_thickness(app.world_mut(), edge, 100_000.0);
             let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
-            runtime.model.panel_input(edge, Duration::ZERO, PanelInput::Pin).unwrap();
+            runtime
+                .model
+                .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                .unwrap();
         }
         let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
         for width in [800.0, 320.0, 100.0] {
-            runtime.model.set_geometry(LogicalSize::new(width, 600.0).unwrap());
+            runtime
+                .model
+                .set_geometry(LogicalSize::new(width, 600.0).unwrap());
             let left = runtime.model.panel(Edge::Left);
             let right = runtime.model.panel(Edge::Right);
             assert!(left.exclusive_zone_px + right.exclusive_zone_px < width);

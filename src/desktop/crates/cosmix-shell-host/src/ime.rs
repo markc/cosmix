@@ -166,7 +166,11 @@ impl Dispatch<ZwpTextInputV3, ()> for RunnerState {
         if state.text_input.input.as_ref() != Some(input) {
             return;
         }
-        let focus = state.app.world().get_resource::<InputFocus>().and_then(InputFocus::get);
+        let focus = state
+            .app
+            .world()
+            .get_resource::<InputFocus>()
+            .and_then(InputFocus::get);
         for event in state.text_input.receive(event, focus) {
             state.emit_ime(event);
         }
@@ -249,21 +253,57 @@ mod tests {
         let second = world.spawn_empty().id();
         let window = world.spawn_empty().id();
         let mut bridge = TextInputBridge {
-            manager: None, input: None, surface: None,
-            enabled: Some((first, window)), preedit: None, committed: None,
-            rectangle: None, generation: 1, batch_generation: None, commit_serial: 1,
+            manager: None,
+            input: None,
+            surface: None,
+            enabled: Some((first, window)),
+            preedit: None,
+            committed: None,
+            rectangle: None,
+            generation: 1,
+            batch_generation: None,
+            commit_serial: 1,
         };
-        bridge.receive(zwp_text_input_v3::Event::CommitString { text: Some("old".into()) }, Some(first));
+        bridge.receive(
+            zwp_text_input_v3::Event::CommitString {
+                text: Some("old".into()),
+            },
+            Some(first),
+        );
         bridge.enabled = Some((second, window));
         bridge.generation = 2;
         bridge.commit_serial = 3; // disable + enable commits
-        assert!(bridge.receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second)).is_empty());
+        assert!(
+            bridge
+                .receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second))
+                .is_empty()
+        );
         // An entire old batch can arrive after the new field was enabled.
-        bridge.receive(zwp_text_input_v3::Event::PreeditString { text: Some("stale".into()), cursor_begin: 0, cursor_end: 0 }, Some(second));
-        assert!(bridge.receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second)).is_empty());
-        bridge.receive(zwp_text_input_v3::Event::CommitString { text: Some("new".into()) }, Some(second));
+        bridge.receive(
+            zwp_text_input_v3::Event::PreeditString {
+                text: Some("stale".into()),
+                cursor_begin: 0,
+                cursor_end: 0,
+            },
+            Some(second),
+        );
+        assert!(
+            bridge
+                .receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second))
+                .is_empty()
+        );
+        bridge.receive(
+            zwp_text_input_v3::Event::CommitString {
+                text: Some("new".into()),
+            },
+            Some(second),
+        );
         let events = bridge.receive(zwp_text_input_v3::Event::Done { serial: 3 }, Some(second));
         assert!(matches!(&events[..], [Ime::Commit { value, .. }] if value == "new"));
-        assert!(bridge.receive(zwp_text_input_v3::Event::Done { serial: 3 }, Some(second)).is_empty());
+        assert!(
+            bridge
+                .receive(zwp_text_input_v3::Event::Done { serial: 3 }, Some(second))
+                .is_empty()
+        );
     }
 }

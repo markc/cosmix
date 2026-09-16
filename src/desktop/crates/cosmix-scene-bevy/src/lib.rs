@@ -230,18 +230,29 @@ fn digest(tree: &ResolvedScene) -> String {
 // Measure the complete canonical AMP document, including metadata and JSON
 // escaping, rather than the patch or the original source retained by P1.
 fn serialised_document(document: &SceneDocument) -> String {
-    let mut wire = format!("---\nscene: 1\nname: {}\ncitizen: {}\n", document.name, document.citizen);
+    let mut wire = format!(
+        "---\nscene: 1\nname: {}\ncitizen: {}\n",
+        document.name, document.citizen
+    );
     for (key, value) in [
-        ("window", &document.window), ("subscribe", &document.subscribe),
-        ("targets", &document.targets), ("model", &document.model),
+        ("window", &document.window),
+        ("subscribe", &document.subscribe),
+        ("targets", &document.targets),
+        ("model", &document.model),
     ] {
-        if let Some(value) = value { wire.push_str(&format!("{key}: {value}\n")); }
+        if let Some(value) = value {
+            wire.push_str(&format!("{key}: {value}\n"));
+        }
     }
     wire.push_str("---\n```mix\n");
     for (id, node) in &document.nodes {
         let mut value = serde_json::Map::new();
         value.insert("widget".into(), json!(node.widget));
-        value.extend(node.ports.iter().map(|(key, value)| (key.clone(), value.clone())));
+        value.extend(
+            node.ports
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         wire.push_str(&format!("{id}: {}\n", Value::Object(value)));
     }
     wire.push_str("```\n");
@@ -255,14 +266,28 @@ mod tests {
     #[test]
     fn cumulative_patch_size_is_transactional() {
         let mut store = SceneStore::default();
-        store.request(SceneVerb::Load, FIXTURE, &Value::Null).unwrap();
+        store
+            .request(SceneVerb::Load, FIXTURE, &Value::Null)
+            .unwrap();
         // Each patch fits the ingress bound; their combined document does not.
         for path in ["text.text", "field.value"] {
-            store.request(SceneVerb::Patch, "", &json!({"scene":"conformance","path":path,"value":"x".repeat(100_000)})).unwrap();
+            store
+                .request(
+                    SceneVerb::Patch,
+                    "",
+                    &json!({"scene":"conformance","path":path,"value":"x".repeat(100_000)}),
+                )
+                .unwrap();
         }
         let before = store.scenes["conformance"].tree.clone();
         let revision = store.scenes["conformance"].revision;
-        let error = store.request(SceneVerb::Patch, "", &json!({"scene":"conformance","path":"button.label","value":"x".repeat(100_000)})).unwrap_err();
+        let error = store
+            .request(
+                SceneVerb::Patch,
+                "",
+                &json!({"scene":"conformance","path":"button.label","value":"x".repeat(100_000)}),
+            )
+            .unwrap_err();
         assert_eq!(error["diagnostics"][0]["code"], "document-size");
         assert_eq!(store.scenes["conformance"].tree, before);
         assert_eq!(store.scenes["conformance"].revision, revision);
