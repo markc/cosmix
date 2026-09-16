@@ -1,4 +1,6 @@
 //! Mix Scenes host adapter. Validation and resolved ports belong exclusively to P1.
+#[cfg(feature = "gate")]
+mod gate;
 mod render;
 pub use render::Events as SceneEvents;
 
@@ -15,6 +17,8 @@ impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SceneStore>();
         render::install(app);
+        #[cfg(feature = "gate")]
+        gate::install(app);
         app.add_systems(
             Update,
             render::reconcile
