@@ -6,10 +6,10 @@
 //! A removed port is represented by `SetPort { value: null }` (clear).
 
 use cosmix_bus::bus::parse_strict;
-use cosmix_mix::{value::Value, MixError};
+use cosmix_mix::{MixError, value::Value};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
 
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
@@ -17,52 +17,1079 @@ pub const MAX_NODES: usize = 2_000;
 pub const MAX_ROWS: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Severity { Error, Warning }
+pub enum Severity {
+    Error,
+    Warning,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Diagnostic { pub severity: Severity, pub code: String, pub line: usize, pub message: String }
-impl Diagnostic { fn error(c:impl Into<String>,l:usize,m:impl Into<String>)->Self{Self{severity:Severity::Error,code:c.into(),line:l,message:m.into()}} fn warning(c:impl Into<String>,l:usize,m:impl Into<String>)->Self{Self{severity:Severity::Warning,code:c.into(),line:l,message:m.into()}} }
+pub struct Diagnostic {
+    pub severity: Severity,
+    pub code: String,
+    pub line: usize,
+    pub message: String,
+}
+impl Diagnostic {
+    fn error(c: impl Into<String>, l: usize, m: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            code: c.into(),
+            line: l,
+            message: m.into(),
+        }
+    }
+    fn warning(c: impl Into<String>, l: usize, m: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            code: c.into(),
+            line: l,
+            message: m.into(),
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
-pub struct SceneDocument { pub name:String,pub citizen:String,pub window:Option<JsonValue>,pub subscribe:Option<JsonValue>,pub targets:Option<JsonValue>,pub model:Option<JsonValue>,pub nodes:IndexMap<String,RawNode>,source:String }
-#[derive(Clone, Debug, PartialEq)] pub struct RawNode { pub widget:String,pub ports:IndexMap<String,JsonValue>,pub line:usize }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] pub struct Node { pub family:String,pub ports:IndexMap<String,JsonValue>,pub line:usize,pub is_template:bool }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] pub struct ResolvedScene { pub name:String,pub citizen:String,pub window:Option<JsonValue>,pub subscribe:Option<JsonValue>,pub nodes:IndexMap<String,Node>,pub templates:Vec<String> }
+pub struct SceneDocument {
+    pub name: String,
+    pub citizen: String,
+    pub window: Option<JsonValue>,
+    pub subscribe: Option<JsonValue>,
+    pub targets: Option<JsonValue>,
+    pub model: Option<JsonValue>,
+    pub nodes: IndexMap<String, RawNode>,
+    source: String,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawNode {
+    pub widget: String,
+    pub ports: IndexMap<String, JsonValue>,
+    pub line: usize,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Op { Insert{id:String,parent:Option<String>,index:usize,node:Node},Remove{id:String},SetPort{id:String,port:String,value:JsonValue},Reparent{id:String,parent:Option<String>,index:usize},SetScene{field:String,value:JsonValue} }
+pub struct Node {
+    pub family: String,
+    pub ports: IndexMap<String, JsonValue>,
+    pub line: usize,
+    pub is_template: bool,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PortDescribe { pub path:String,#[serde(rename="type")]pub ty:String,pub mutable:bool,pub sensitive:bool,pub description:String,#[serde(rename="enum",skip_serializing_if="Option::is_none")]pub enum_values:Option<Vec<String>>,#[serde(skip_serializing_if="Option::is_none")]pub default:Option<JsonValue>,#[serde(skip_serializing_if="Option::is_none")]pub min:Option<f64>,#[serde(skip_serializing_if="Option::is_none")]pub max:Option<f64> }
-#[derive(Clone, Copy)] struct Port { name:&'static str,ty:&'static str,required:bool,default:Option<&'static str>,enum_values:&'static [&'static str],min:Option<f64> }
-const fn p(n:&'static str,t:&'static str,r:bool,d:Option<&'static str>)->Port{Port{name:n,ty:t,required:r,default:d,enum_values:&[],min:None}}
-const fn pe(n:&'static str,d:&'static str,e:&'static [&'static str])->Port{Port{name:n,ty:"string",required:false,default:Some(d),enum_values:e,min:None}}
-const fn pnd(n:&'static str,d:&'static str,m:Option<f64>)->Port{Port{name:n,ty:"number",required:false,default:Some(d),enum_values:&[],min:m}} const fn pn(n:&'static str,r:bool,m:Option<f64>)->Port{Port{name:n,ty:"number",required:r,default:None,enum_values:&[],min:m}}
-fn schema(f:&str)->Option<&'static[Port]>{
- static EDGE:&[&str]=&["right","left","top","bottom"];static ALIGN:&[&str]=&["start","center","end","stretch"];static TONE:&[&str]=&["normal","danger","primary"];static KIND:&[&str]=&["edge"];
- static WINDOW:[Port;5]=[Port{name:"kind",ty:"string",required:true,default:None,enum_values:KIND,min:None},pe("edge","\"right\"",EDGE),p("title","string",false,None),pn("w",false,Some(0.0)),pn("h",false,Some(0.0))];
- static BOX:[Port;4]=[p("children","list",true,None),pn("gap",false,Some(0.0)),pn("padding",false,Some(0.0)),p("fill","bool",false,Some("false"))];
- static ROW:[Port;10]=[p("children","list",true,None),pn("gap",false,Some(0.0)),pn("padding",false,Some(0.0)),p("fill","bool",false,Some("false")),Port{name:"align",ty:"string",required:false,default:Some("\"start\""),enum_values:ALIGN,min:None},pn("height",false,Some(0.0)),pn("radius",false,Some(0.0)),p("background","string",false,None),p("hover","string",false,None),p("on_click","string",false,None)];
- static TEXT:[Port;9]=[p("text","string",true,None),pnd("size","13",Some(0.0)),p("bold","bool",false,Some("false")),p("mono","bool",false,Some("false")),p("color","string",false,None),p("elide","bool",false,Some("false")),pn("width",false,Some(0.0)),p("fill","bool",false,Some("false")),p("hidden","bool",false,Some("false"))];
- static FIELD:[Port;6]=[p("value","string",true,None),p("placeholder","string",false,None),pn("width",false,Some(0.0)),p("password","bool",false,Some("false")),p("on_change","string",false,None),p("on_submit","string",false,None)];
- static BUTTON:[Port;4]=[p("label","string",true,None),Port{name:"tone",ty:"string",required:false,default:Some("\"normal\""),enum_values:TONE,min:None},pn("width",false,Some(0.0)),p("on_click","string",false,None)];
- static TOGGLE:[Port;3]=[p("value","bool",true,None),p("label","string",true,None),p("on_change","string",false,None)];
- static LIST:[Port;8]=[p("rows","list",true,None),p("row","string",true,None),pn("row_height",true,Some(0.0)),pn("gap",false,Some(0.0)),pn("max_rows",false,Some(0.0)),p("fill","bool",false,Some("false")),p("hidden_if_empty","bool",false,Some("false")),p("on_click","string",false,None)];
- static IMAGE:[Port;3]=[p("src","string",true,None),pn("w",false,Some(0.0)),pn("h",false,Some(0.0))];static SPACER:[Port;1]=[pnd("size","13",Some(0.0))];
- Some(match f{"window"=>&WINDOW,"column"=>&BOX,"row"=>&ROW,"text"=>&TEXT,"field"=>&FIELD,"button"=>&BUTTON,"toggle"=>&TOGGLE,"list"=>&LIST,"image"=>&IMAGE,"spacer"=>&SPACER,_=>return None})
+pub struct ResolvedScene {
+    pub name: String,
+    pub citizen: String,
+    pub window: Option<JsonValue>,
+    pub subscribe: Option<JsonValue>,
+    pub nodes: IndexMap<String, Node>,
+    pub templates: Vec<String>,
 }
-pub fn describe(f:&str)->Option<Vec<PortDescribe>>{schema(f).map(|ps|ps.iter().map(|p|PortDescribe{path:p.name.into(),ty:p.ty.into(),mutable:true,sensitive:p.name=="value"&&f=="field",description:format!("{} port of {}",p.name,f),enum_values:(!p.enum_values.is_empty()).then(||p.enum_values.iter().map(|x|(*x).into()).collect()),default:p.default.and_then(|x|serde_json::from_str(x).ok()).map(normalize_number),min:p.min,max:None}).collect())}
-pub fn parse(source:&str)->Result<SceneDocument,Vec<Diagnostic>>{
- let mut ds=Vec::new();if source.len()>MAX_DOCUMENT_BYTES{return Err(vec![Diagnostic::error("document-too-large",1,"scene document exceeds 256 KiB")]);}let msg=match parse_strict(source){Ok(m)=>m,Err(e)=>return Err(vec![Diagnostic::error("envelope",1,e.to_string())])};for k in ["scene","name","citizen"]{if msg.get(k).is_none(){ds.push(Diagnostic::error("missing-header",1,format!("missing required header {k}")));}}if msg.get("scene")!=Some("1"){ds.push(Diagnostic::error("scene-version",1,"scene header must be 1"));}if let Some(n)=msg.get("name"){if !valid_name(n){ds.push(Diagnostic::error("invalid-name",1,"invalid scene name"));}}
- let bs=source.find("\n---\n").map(|i|i+5).unwrap_or(source.len());let body=msg.body.clone();let base=source[..bs].lines().count();let fs=fence_ranges(&body);if fs.len()!=1{ds.push(Diagnostic::error("fence-count",base.max(1),"body must contain exactly one ```mix fence"));return Err(ds);}let(open,_,interior)=fs[0].clone();let value=match cosmix_mix::parse_data(&interior){Ok(v)=>v,Err(e)=>{ds.push(mix_diagnostic(e,base+open));return Err(ds);}};let map=match &value{Value::Map(m)=>m,_=>{ds.push(Diagnostic::error("root-type",base+open+1,"fence must contain a map of nodes"));return Err(ds);}};let mut nodes=IndexMap::new();for(id,v)in map.iter(){let line=base+open+line_in(&interior,id).unwrap_or(1);if id.contains('@'){ds.push(Diagnostic::error("invalid-id",line,"@ is reserved for template instance ids"));}let fields=match v{Value::Map(m)=>m,_=>{ds.push(Diagnostic::error("node-type",line,format!("node {id} must be a map")));continue;}};let widget=match fields.get("widget").and_then(as_string){Some(x)=>x.to_string(),None=>{ds.push(Diagnostic::error("missing-widget",line,format!("node {id} is missing widget")));continue;}};nodes.insert(id.clone(),RawNode{widget,ports:fields.iter().filter(|(k,_)|k.as_str()!="widget").map(|(k,v)|(k.clone(),json_value(v))).collect(),line});}if !ds.is_empty(){return Err(sorted(ds));}let document=SceneDocument{name:msg.get("name").unwrap_or_default().into(),citizen:msg.get("citizen").unwrap_or_default().into(),window:header_json(msg.get("window"),&mut ds,1),subscribe:header_json(msg.get("subscribe"),&mut ds,1),targets:header_json(msg.get("targets"),&mut ds,1),model:header_json(msg.get("model"),&mut ds,1),nodes,source:source.into()};if ds.is_empty(){Ok(document)}else{Err(sorted(ds))}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Op {
+    Insert {
+        id: String,
+        parent: Option<String>,
+        index: usize,
+        node: Node,
+    },
+    Remove {
+        id: String,
+    },
+    SetPort {
+        id: String,
+        port: String,
+        value: JsonValue,
+    },
+    Reparent {
+        id: String,
+        parent: Option<String>,
+        index: usize,
+    },
+    SetScene {
+        field: String,
+        value: JsonValue,
+    },
 }
-pub fn lint(doc:&SceneDocument)->Vec<Diagnostic>{
- let mut out=Vec::new();if doc.source.len()>MAX_DOCUMENT_BYTES{out.push(Diagnostic::error("document-too-large",1,"scene document exceeds 256 KiB"));}if doc.nodes.len()>MAX_NODES{out.push(Diagnostic::error("node-limit",1,"scene has more than 2,000 nodes"));}let mut parents:HashMap<String,usize>=HashMap::new();
- for(id,n)in&doc.nodes{if id.contains('@'){out.push(Diagnostic::error("invalid-id",n.line,"@ is reserved for template instance ids"));}let Some(ps)=schema(&n.widget)else{out.push(Diagnostic::error("unknown-family",n.line,format!("unknown widget family {}",n.widget)));continue;};for(k,v)in&n.ports{let Some(p)=ps.iter().find(|p|p.name==k)else{out.push(Diagnostic::error("unknown-port",n.line,format!("unknown port {k} on {id}")));continue;};if !type_matches(v,p.ty){out.push(Diagnostic::error("port-type",n.line,format!("port {k} on {id} must be {}",p.ty)));}if !p.enum_values.is_empty()&&v.as_str().is_some_and(|x|!p.enum_values.contains(&x)){out.push(Diagnostic::error("enum-value",n.line,format!("invalid value for {k} on {id}")));}if let Some(min)=p.min{if v.as_f64().is_some_and(|x|x<=min){out.push(Diagnostic::error("port-min",n.line,format!("port {k} on {id} must be > {min}")));}}}for p in ps{if p.required&&!n.ports.contains_key(p.name){out.push(Diagnostic::error("missing-port",n.line,format!("missing required port {} on {id}",p.name)));}}if let Some(cs)=n.ports.get("children").and_then(JsonValue::as_array){for(i,c)in cs.iter().enumerate(){if let Some(c)=c.as_str(){if !doc.nodes.contains_key(c){out.push(Diagnostic::error("dangling-child",n.line,format!("{id} refers to missing child {c}")));}else{*parents.entry(c.into()).or_default()+=1;}}else{out.push(Diagnostic::error("child-type",n.line,format!("child {i} of {id} is not a string")));}}}if n.widget=="window"&&n.ports.get("kind").and_then(JsonValue::as_str)!=Some("edge"){out.push(Diagnostic::error("window-kind",n.line,"window kind must be edge in v0"));}if n.widget=="list"{validate_rows(n,&mut out);if let Some(row)=n.ports.get("row").and_then(JsonValue::as_str){match doc.nodes.get(row){Some(t)=>check_template(t,doc,minimum_cells(n),&mut out,&mut HashSet::new()),None=>out.push(Diagnostic::error("dangling-child",n.line,format!("missing row template {row}")))}}}}
- if !doc.nodes.contains_key("root"){out.push(Diagnostic::error("missing-root",1,"scene must contain a node named root"));}if parents.values().any(|n|*n>1){out.push(Diagnostic::error("multiple-parents",1,"a node has more than one parent"));}if let Some(w)=&doc.window{if let Some(n)=doc.nodes.get("window"){if n.ports.get("kind")!=w.get("kind"){out.push(Diagnostic::error("window-disagreement",n.line,"window envelope and window node disagree"));}}}let reach=reachable(doc);for id in doc.nodes.keys(){if id!="root"&&!reach.contains(id){out.push(Diagnostic::warning("orphan-node",doc.nodes[id].line,format!("node {id} is unreachable from root")));}}if has_cycle(doc){out.push(Diagnostic::error("cycle",1,"scene child graph contains a cycle"));}sorted(out)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PortDescribe {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub mutable: bool,
+    pub sensitive: bool,
+    pub description: String,
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
 }
-pub fn resolve(doc:&SceneDocument)->Result<ResolvedScene,Vec<Diagnostic>>{let es=lint(doc);if es.iter().any(|d|d.severity==Severity::Error){return Err(es);}let mut ts=HashSet::new();for n in doc.nodes.values(){if let Some(r)=n.ports.get("row").and_then(JsonValue::as_str){ts.insert(r.to_string());}}let mut nodes=IndexMap::new();for(id,r)in&doc.nodes{let Some(ps)=schema(&r.widget)else{return Err(vec![Diagnostic::error("unknown-family",r.line,"unknown widget family")]);};let ports=ps.iter().filter_map(|p|r.ports.get(p.name).cloned().or_else(||p.default.and_then(|v|serde_json::from_str(v).ok())).map(|v|(p.name.into(),normalize_number(v)))).collect();nodes.insert(id.clone(),Node{family:r.widget.clone(),ports,line:r.line,is_template:ts.contains(id)});}let mut templates:Vec<_>=ts.into_iter().collect();templates.sort();Ok(ResolvedScene{name:doc.name.clone(),citizen:doc.citizen.clone(),window:doc.window.clone(),subscribe:doc.subscribe.clone(),nodes,templates})}
-pub fn diff(old:&ResolvedScene,new:&ResolvedScene)->Vec<Op>{let mut ops=Vec::new();for id in old.nodes.keys(){if !new.nodes.contains_key(id){ops.push(Op::Remove{id:id.clone()});}}for(id,n)in&new.nodes{if let Some(o)=old.nodes.get(id){let keys:HashSet<_>=o.ports.keys().chain(n.ports.keys()).collect();for k in keys{let v=n.ports.get(k).cloned().unwrap_or(JsonValue::Null);if o.ports.get(k)!=Some(&v){ops.push(Op::SetPort{id:id.clone(),port:k.clone(),value:v});}}}else{let(p,i)=parent_of(new,id).map_or((None,0),|(p,i)|(Some(p),i));ops.push(Op::Insert{id:id.clone(),parent:p,index:i,node:n.clone()});}}for id in new.nodes.keys(){if old.nodes.contains_key(id)&&parent_of(old,id)!=parent_of(new,id){let(p,i)=parent_of(new,id).map_or((None,0),|(p,i)|(Some(p),i));ops.push(Op::Reparent{id:id.clone(),parent:p,index:i});}}for(field,a,b)in[("name",json!(old.name),json!(new.name)),("citizen",json!(old.citizen),json!(new.citizen)),("window",old.window.clone().unwrap_or(JsonValue::Null),new.window.clone().unwrap_or(JsonValue::Null)),("subscribe",old.subscribe.clone().unwrap_or(JsonValue::Null),new.subscribe.clone().unwrap_or(JsonValue::Null))]{if a!=b{ops.push(Op::SetScene{field:field.into(),value:b});}}ops}
-pub fn source(d:&SceneDocument)->&str{&d.source}fn valid_name(s:&str)->bool{let b=s.as_bytes();b.len()>=2&&b.len()<=31&&b[0].is_ascii_lowercase()&&b.iter().all(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||*c==b'-')}fn as_string(v:&Value)->Option<&str>{if let Value::String(s)=v{Some(s)}else{None}}fn json_value(v:&Value)->JsonValue{match v{Value::Nil=>JsonValue::Null,Value::Bool(x)=>json!(x),Value::Number(x)=>json!(x),Value::String(x)=>json!(x),Value::List(xs)=>xs.iter().map(json_value).collect(),Value::Map(xs)=>xs.iter().map(|(k,v)|(k.clone(),json_value(v))).collect(),_=>JsonValue::Null}}fn normalize_number(v:JsonValue)->JsonValue{if let Some(n)=v.as_f64(){JsonValue::Number(serde_json::Number::from_f64(n).unwrap())}else if let Some(a)=v.as_array(){JsonValue::Array(a.iter().cloned().map(normalize_number).collect())}else if let Some(o)=v.as_object(){JsonValue::Object(o.iter().map(|(k,v)|(k.clone(),normalize_number(v.clone()))).collect())}else{v}}fn header_json(v:Option<&str>,ds:&mut Vec<Diagnostic>,line:usize)->Option<JsonValue>{v.map(|s|match serde_json::from_str(s){Ok(v)=>normalize_number(v),Err(_)=>{ds.push(Diagnostic::error("header-json",line,"header JSON is invalid"));JsonValue::Null}})}
-fn line_in(t:&str,id:&str)->Option<usize>{t.lines().position(|l|l.trim_start().starts_with(&format!("{}:",id))).map(|x|x+1)}fn type_matches(v:&JsonValue,t:&str)->bool{match t{"string"=>v.is_string(),"number"=>v.is_number(),"bool"=>v.is_boolean(),"list"=>v.is_array(),"object"=>v.is_object(),_=>true}}fn validate_rows(n:&RawNode,o:&mut Vec<Diagnostic>){if let Some(rs)=n.ports.get("rows").and_then(JsonValue::as_array){if rs.len()>MAX_ROWS{o.push(Diagnostic::error("row-limit",n.line,"list has more than 500 rows"));}for r in rs{if r.get("id").and_then(JsonValue::as_str).is_none()||r.get("cells").and_then(JsonValue::as_array).is_none_or(|cs|cs.iter().any(|c|!c.is_string())){o.push(Diagnostic::error("row-type",n.line,"each row must contain string id and string cells"));}}}}fn minimum_cells(n:&RawNode)->usize{n.ports.get("rows").and_then(JsonValue::as_array).map(|rs|rs.iter().filter_map(|r|r.get("cells").and_then(JsonValue::as_array).map(Vec::len)).min().unwrap_or(usize::MAX)).unwrap_or(usize::MAX)}
-fn check_template(n:&RawNode,d:&SceneDocument,cells:usize,o:&mut Vec<Diagnostic>,seen:&mut HashSet<String>){let Some(id)=d.nodes.iter().find(|(_,x)|std::ptr::eq(*x,n)).map(|(i,_)|i.clone())else{return;};if !seen.insert(id){return;}if !["row","column","text","spacer","image"].contains(&n.widget.as_str()){o.push(Diagnostic::error("invalid-template",n.line,"list row template has an invalid family"));return;}for(k,v)in&n.ports{if let Some(s)=v.as_str(){if s.contains("{cells[")&&k!="text"{o.push(Diagnostic::error("cell-substitution",n.line,"cell substitution is allowed only in text.text"));}if k=="text"{for(start,_)in s.match_indices("{cells["){if let Some(e)=s[start+7..].find("]}"){if s[start+7..start+7+e].parse::<usize>().map_or(true,|i|i>=cells){o.push(Diagnostic::error("cell-substitution",n.line,"cell index is not present"));}}}}}}if let Some(cs)=n.ports.get("children").and_then(JsonValue::as_array){for c in cs.iter().filter_map(JsonValue::as_str).filter_map(|x|d.nodes.get(x)){check_template(c,d,cells,o,seen);}}}
-fn fence_ranges(b:&str)->Vec<(usize,usize,String)>{let l:Vec<_>=b.lines().collect();let mut r=Vec::new();let mut i=0;while i<l.len(){if l[i].trim()=="```mix"{let s=i+1;i+=1;while i<l.len()&&l[i].trim()!="```"{i+=1;}if i<l.len(){r.push((s,i,l[s..i].join("\n")));}}i+=1;}r}fn parent_of(s:&ResolvedScene,id:&str)->Option<(String,usize)>{for(p,n)in&s.nodes{if let Some(cs)=n.ports.get("children").and_then(JsonValue::as_array){if let Some(i)=cs.iter().position(|v|v.as_str()==Some(id)){return Some((p.clone(),i));}}}None}fn reachable(d:&SceneDocument)->HashSet<String>{let mut s=HashSet::new();fn go(id:&str,d:&SceneDocument,s:&mut HashSet<String>){if !s.insert(id.into()){return;}if let Some(n)=d.nodes.get(id){if let Some(cs)=n.ports.get("children").and_then(JsonValue::as_array){for c in cs.iter().filter_map(JsonValue::as_str){go(c,d,s);}}}}if d.nodes.contains_key("root"){go("root",d,&mut s);}s}fn has_cycle(d:&SceneDocument)->bool{fn go(id:&str,d:&SceneDocument,a:&mut HashSet<String>,done:&mut HashSet<String>)->bool{if a.contains(id){return true;}if done.contains(id){return false;}a.insert(id.into());if let Some(n)=d.nodes.get(id){if let Some(cs)=n.ports.get("children").and_then(JsonValue::as_array){for c in cs.iter().filter_map(JsonValue::as_str){if go(c,d,a,done){return true;}}}}a.remove(id);done.insert(id.into());false}let mut a=HashSet::new();let mut done=HashSet::new();d.nodes.keys().any(|id|go(id,d,&mut a,&mut done))}
-fn mix_diagnostic(e:MixError,o:usize)->Diagnostic{match e{MixError::StrictDataViolation{construct,line,hint}=>{let c=if construct.starts_with("duplicate map key"){"duplicate-id"}else{"strict-data"};Diagnostic::error(c,o+line,format!("{construct}: {hint}"))},MixError::ParseError{msg,span}|MixError::LexerError{msg,span}|MixError::IncompleteInput{msg,span}=>Diagnostic::error("mix-parse",o+span.line,msg),MixError::AssignmentChainParseError{operator,span}=>Diagnostic::error("mix-parse",o+span.line,format!("assignment chain operator {operator}")),_=>Diagnostic::error("mix-parse",o+1,e.to_string())}}fn sorted(mut d:Vec<Diagnostic>)->Vec<Diagnostic>{d.sort_by(|a,b|a.line.cmp(&b.line).then(a.code.cmp(&b.code)));d}
+#[derive(Clone, Copy)]
+struct Port {
+    name: &'static str,
+    ty: &'static str,
+    required: bool,
+    default: Option<&'static str>,
+    enum_values: &'static [&'static str],
+    min: Option<f64>,
+}
+const fn p(n: &'static str, t: &'static str, r: bool, d: Option<&'static str>) -> Port {
+    Port {
+        name: n,
+        ty: t,
+        required: r,
+        default: d,
+        enum_values: &[],
+        min: None,
+    }
+}
+const fn pe(n: &'static str, d: &'static str, e: &'static [&'static str]) -> Port {
+    Port {
+        name: n,
+        ty: "string",
+        required: false,
+        default: Some(d),
+        enum_values: e,
+        min: None,
+    }
+}
+const fn pnd(n: &'static str, d: &'static str, m: Option<f64>) -> Port {
+    Port {
+        name: n,
+        ty: "number",
+        required: false,
+        default: Some(d),
+        enum_values: &[],
+        min: m,
+    }
+}
+const fn pn(n: &'static str, r: bool, m: Option<f64>) -> Port {
+    Port {
+        name: n,
+        ty: "number",
+        required: r,
+        default: None,
+        enum_values: &[],
+        min: m,
+    }
+}
+fn schema(f: &str) -> Option<&'static [Port]> {
+    static EDGE: &[&str] = &["right", "left", "top", "bottom"];
+    static ALIGN: &[&str] = &["start", "center", "end", "stretch"];
+    static TONE: &[&str] = &["normal", "danger", "primary"];
+    static KIND: &[&str] = &["edge"];
+    static WINDOW: [Port; 5] = [
+        Port {
+            name: "kind",
+            ty: "string",
+            required: true,
+            default: None,
+            enum_values: KIND,
+            min: None,
+        },
+        pe("edge", "\"right\"", EDGE),
+        p("title", "string", false, None),
+        pn("w", false, Some(0.0)),
+        pn("h", false, Some(0.0)),
+    ];
+    static BOX: [Port; 4] = [
+        p("children", "list", true, None),
+        pn("gap", false, Some(0.0)),
+        pn("padding", false, Some(0.0)),
+        p("fill", "bool", false, Some("false")),
+    ];
+    static ROW: [Port; 10] = [
+        p("children", "list", true, None),
+        pn("gap", false, Some(0.0)),
+        pn("padding", false, Some(0.0)),
+        p("fill", "bool", false, Some("false")),
+        Port {
+            name: "align",
+            ty: "string",
+            required: false,
+            default: Some("\"start\""),
+            enum_values: ALIGN,
+            min: None,
+        },
+        pn("height", false, Some(0.0)),
+        pn("radius", false, Some(0.0)),
+        p("background", "string", false, None),
+        p("hover", "string", false, None),
+        p("on_click", "string", false, None),
+    ];
+    static TEXT: [Port; 9] = [
+        p("text", "string", true, None),
+        pnd("size", "13", Some(0.0)),
+        p("bold", "bool", false, Some("false")),
+        p("mono", "bool", false, Some("false")),
+        p("color", "string", false, None),
+        p("elide", "bool", false, Some("false")),
+        pn("width", false, Some(0.0)),
+        p("fill", "bool", false, Some("false")),
+        p("hidden", "bool", false, Some("false")),
+    ];
+    static FIELD: [Port; 6] = [
+        p("value", "string", true, None),
+        p("placeholder", "string", false, None),
+        pn("width", false, Some(0.0)),
+        p("password", "bool", false, Some("false")),
+        p("on_change", "string", false, None),
+        p("on_submit", "string", false, None),
+    ];
+    static BUTTON: [Port; 4] = [
+        p("label", "string", true, None),
+        Port {
+            name: "tone",
+            ty: "string",
+            required: false,
+            default: Some("\"normal\""),
+            enum_values: TONE,
+            min: None,
+        },
+        pn("width", false, Some(0.0)),
+        p("on_click", "string", false, None),
+    ];
+    static TOGGLE: [Port; 3] = [
+        p("value", "bool", true, None),
+        p("label", "string", true, None),
+        p("on_change", "string", false, None),
+    ];
+    static LIST: [Port; 8] = [
+        p("rows", "list", true, None),
+        p("row", "string", true, None),
+        pn("row_height", true, Some(0.0)),
+        pn("gap", false, Some(0.0)),
+        pn("max_rows", false, Some(0.0)),
+        p("fill", "bool", false, Some("false")),
+        p("hidden_if_empty", "bool", false, Some("false")),
+        p("on_click", "string", false, None),
+    ];
+    static IMAGE: [Port; 3] = [
+        p("src", "string", true, None),
+        pn("w", false, Some(0.0)),
+        pn("h", false, Some(0.0)),
+    ];
+    static SPACER: [Port; 1] = [pnd("size", "13", Some(0.0))];
+    Some(match f {
+        "window" => &WINDOW,
+        "column" => &BOX,
+        "row" => &ROW,
+        "text" => &TEXT,
+        "field" => &FIELD,
+        "button" => &BUTTON,
+        "toggle" => &TOGGLE,
+        "list" => &LIST,
+        "image" => &IMAGE,
+        "spacer" => &SPACER,
+        _ => return None,
+    })
+}
+pub fn describe(f: &str) -> Option<Vec<PortDescribe>> {
+    schema(f).map(|ps| {
+        ps.iter()
+            .map(|p| PortDescribe {
+                path: p.name.into(),
+                ty: p.ty.into(),
+                mutable: true,
+                sensitive: p.name == "value" && f == "field",
+                description: format!("{} port of {}", p.name, f),
+                enum_values: (!p.enum_values.is_empty())
+                    .then(|| p.enum_values.iter().map(|x| (*x).into()).collect()),
+                default: p
+                    .default
+                    .and_then(|x| serde_json::from_str(x).ok())
+                    .map(normalize_number),
+                min: p.min,
+                max: None,
+            })
+            .collect()
+    })
+}
+pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
+    let mut ds = Vec::new();
+    if source.len() > MAX_DOCUMENT_BYTES {
+        return Err(vec![Diagnostic::error(
+            "document-too-large",
+            1,
+            "scene document exceeds 256 KiB",
+        )]);
+    }
+    let msg = match parse_strict(source) {
+        Ok(m) => m,
+        Err(e) => return Err(vec![Diagnostic::error("envelope", 1, e.to_string())]),
+    };
+    for k in ["scene", "name", "citizen"] {
+        if msg.get(k).is_none() {
+            ds.push(Diagnostic::error(
+                "missing-header",
+                1,
+                format!("missing required header {k}"),
+            ));
+        }
+    }
+    if msg.get("scene") != Some("1") {
+        ds.push(Diagnostic::error(
+            "scene-version",
+            1,
+            "scene header must be 1",
+        ));
+    }
+    if let Some(n) = msg.get("name") {
+        if !valid_name(n) {
+            ds.push(Diagnostic::error("invalid-name", 1, "invalid scene name"));
+        }
+    }
+    let bs = source
+        .find("\n---\n")
+        .map(|i| i + 5)
+        .unwrap_or(source.len());
+    let body = msg.body.clone();
+    let base = source[..bs].lines().count();
+    let fs = fence_ranges(&body);
+    if fs.len() != 1 {
+        ds.push(Diagnostic::error(
+            "fence-count",
+            base.max(1),
+            "body must contain exactly one ```mix fence",
+        ));
+        return Err(ds);
+    }
+    let (open, _, interior) = fs[0].clone();
+    let value = match cosmix_mix::parse_data(&interior) {
+        Ok(v) => v,
+        Err(e) => {
+            ds.push(mix_diagnostic(e, base + open));
+            return Err(ds);
+        }
+    };
+    let map = match &value {
+        Value::Map(m) => m,
+        _ => {
+            ds.push(Diagnostic::error(
+                "root-type",
+                base + open + 1,
+                "fence must contain a map of nodes",
+            ));
+            return Err(ds);
+        }
+    };
+    let mut nodes = IndexMap::new();
+    for (id, v) in map.iter() {
+        let line = base + open + line_in(&interior, id).unwrap_or(1);
+        if id.contains('@') {
+            ds.push(Diagnostic::error(
+                "invalid-id",
+                line,
+                "@ is reserved for template instance ids",
+            ));
+        }
+        let fields = match v {
+            Value::Map(m) => m,
+            _ => {
+                ds.push(Diagnostic::error(
+                    "node-type",
+                    line,
+                    format!("node {id} must be a map"),
+                ));
+                continue;
+            }
+        };
+        let widget = match fields.get("widget").and_then(as_string) {
+            Some(x) => x.to_string(),
+            None => {
+                ds.push(Diagnostic::error(
+                    "missing-widget",
+                    line,
+                    format!("node {id} is missing widget"),
+                ));
+                continue;
+            }
+        };
+        nodes.insert(
+            id.clone(),
+            RawNode {
+                widget,
+                ports: fields
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "widget")
+                    .map(|(k, v)| (k.clone(), json_value(v)))
+                    .collect(),
+                line,
+            },
+        );
+    }
+    if !ds.is_empty() {
+        return Err(sorted(ds));
+    }
+    let document = SceneDocument {
+        name: msg.get("name").unwrap_or_default().into(),
+        citizen: msg.get("citizen").unwrap_or_default().into(),
+        window: header_json(msg.get("window"), &mut ds, 1),
+        subscribe: header_json(msg.get("subscribe"), &mut ds, 1),
+        targets: header_json(msg.get("targets"), &mut ds, 1),
+        model: header_json(msg.get("model"), &mut ds, 1),
+        nodes,
+        source: source.into(),
+    };
+    if ds.is_empty() {
+        Ok(document)
+    } else {
+        Err(sorted(ds))
+    }
+}
+pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if doc.source.len() > MAX_DOCUMENT_BYTES {
+        out.push(Diagnostic::error(
+            "document-too-large",
+            1,
+            "scene document exceeds 256 KiB",
+        ));
+    }
+    if doc.nodes.len() > MAX_NODES {
+        out.push(Diagnostic::error(
+            "node-limit",
+            1,
+            "scene has more than 2,000 nodes",
+        ));
+    }
+    let mut parents: HashMap<String, usize> = HashMap::new();
+    for (id, n) in &doc.nodes {
+        if id.contains('@') {
+            out.push(Diagnostic::error(
+                "invalid-id",
+                n.line,
+                "@ is reserved for template instance ids",
+            ));
+        }
+        let Some(ps) = schema(&n.widget) else {
+            out.push(Diagnostic::error(
+                "unknown-family",
+                n.line,
+                format!("unknown widget family {}", n.widget),
+            ));
+            continue;
+        };
+        for (k, v) in &n.ports {
+            let Some(p) = ps.iter().find(|p| p.name == k) else {
+                out.push(Diagnostic::error(
+                    "unknown-port",
+                    n.line,
+                    format!("unknown port {k} on {id}"),
+                ));
+                continue;
+            };
+            if !type_matches(v, p.ty) {
+                out.push(Diagnostic::error(
+                    "port-type",
+                    n.line,
+                    format!("port {k} on {id} must be {}", p.ty),
+                ));
+            }
+            if !p.enum_values.is_empty() && v.as_str().is_some_and(|x| !p.enum_values.contains(&x))
+            {
+                out.push(Diagnostic::error(
+                    "enum-value",
+                    n.line,
+                    format!("invalid value for {k} on {id}"),
+                ));
+            }
+            if let Some(min) = p.min {
+                if v.as_f64().is_some_and(|x| x <= min) {
+                    out.push(Diagnostic::error(
+                        "port-min",
+                        n.line,
+                        format!("port {k} on {id} must be > {min}"),
+                    ));
+                }
+            }
+        }
+        for p in ps {
+            if p.required && !n.ports.contains_key(p.name) {
+                out.push(Diagnostic::error(
+                    "missing-port",
+                    n.line,
+                    format!("missing required port {} on {id}", p.name),
+                ));
+            }
+        }
+        if let Some(cs) = n.ports.get("children").and_then(JsonValue::as_array) {
+            for (i, c) in cs.iter().enumerate() {
+                if let Some(c) = c.as_str() {
+                    if !doc.nodes.contains_key(c) {
+                        out.push(Diagnostic::error(
+                            "dangling-child",
+                            n.line,
+                            format!("{id} refers to missing child {c}"),
+                        ));
+                    } else {
+                        *parents.entry(c.into()).or_default() += 1;
+                    }
+                } else {
+                    out.push(Diagnostic::error(
+                        "child-type",
+                        n.line,
+                        format!("child {i} of {id} is not a string"),
+                    ));
+                }
+            }
+        }
+        if n.widget == "window" && n.ports.get("kind").and_then(JsonValue::as_str) != Some("edge") {
+            out.push(Diagnostic::error(
+                "window-kind",
+                n.line,
+                "window kind must be edge in v0",
+            ));
+        }
+        if n.widget == "list" {
+            validate_rows(n, &mut out);
+            if let Some(row) = n.ports.get("row").and_then(JsonValue::as_str) {
+                match doc.nodes.get(row) {
+                    Some(t) => {
+                        check_template(t, doc, minimum_cells(n), &mut out, &mut HashSet::new())
+                    }
+                    None => out.push(Diagnostic::error(
+                        "dangling-child",
+                        n.line,
+                        format!("missing row template {row}"),
+                    )),
+                }
+            }
+        }
+    }
+    if !doc.nodes.contains_key("root") {
+        out.push(Diagnostic::error(
+            "missing-root",
+            1,
+            "scene must contain a node named root",
+        ));
+    }
+    if parents.values().any(|n| *n > 1) {
+        out.push(Diagnostic::error(
+            "multiple-parents",
+            1,
+            "a node has more than one parent",
+        ));
+    }
+    if let Some(w) = &doc.window {
+        if let Some(n) = doc.nodes.get("window") {
+            if n.ports.get("kind") != w.get("kind") {
+                out.push(Diagnostic::error(
+                    "window-disagreement",
+                    n.line,
+                    "window envelope and window node disagree",
+                ));
+            }
+        }
+    }
+    let reach = reachable(doc);
+    for id in doc.nodes.keys() {
+        if id != "root" && !reach.contains(id) {
+            out.push(Diagnostic::warning(
+                "orphan-node",
+                doc.nodes[id].line,
+                format!("node {id} is unreachable from root"),
+            ));
+        }
+    }
+    if has_cycle(doc) {
+        out.push(Diagnostic::error(
+            "cycle",
+            1,
+            "scene child graph contains a cycle",
+        ));
+    }
+    sorted(out)
+}
+pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
+    let es = lint(doc);
+    if es.iter().any(|d| d.severity == Severity::Error) {
+        return Err(es);
+    }
+    let mut ts = HashSet::new();
+    for n in doc.nodes.values() {
+        if let Some(r) = n.ports.get("row").and_then(JsonValue::as_str) {
+            ts.insert(r.to_string());
+        }
+    }
+    let mut nodes = IndexMap::new();
+    for (id, r) in &doc.nodes {
+        let Some(ps) = schema(&r.widget) else {
+            return Err(vec![Diagnostic::error(
+                "unknown-family",
+                r.line,
+                "unknown widget family",
+            )]);
+        };
+        let ports = ps
+            .iter()
+            .filter_map(|p| {
+                r.ports
+                    .get(p.name)
+                    .cloned()
+                    .or_else(|| p.default.and_then(|v| serde_json::from_str(v).ok()))
+                    .map(|v| (p.name.into(), normalize_number(v)))
+            })
+            .collect();
+        nodes.insert(
+            id.clone(),
+            Node {
+                family: r.widget.clone(),
+                ports,
+                line: r.line,
+                is_template: ts.contains(id),
+            },
+        );
+    }
+    let mut templates: Vec<_> = ts.into_iter().collect();
+    templates.sort();
+    Ok(ResolvedScene {
+        name: doc.name.clone(),
+        citizen: doc.citizen.clone(),
+        window: doc.window.clone(),
+        subscribe: doc.subscribe.clone(),
+        nodes,
+        templates,
+    })
+}
+pub fn diff(old: &ResolvedScene, new: &ResolvedScene) -> Vec<Op> {
+    let mut ops = Vec::new();
+    for id in old.nodes.keys() {
+        if !new.nodes.contains_key(id) {
+            ops.push(Op::Remove { id: id.clone() });
+        }
+    }
+    for (id, n) in &new.nodes {
+        if let Some(o) = old.nodes.get(id) {
+            let keys: HashSet<_> = o.ports.keys().chain(n.ports.keys()).collect();
+            for k in keys {
+                let v = n.ports.get(k).cloned().unwrap_or(JsonValue::Null);
+                if o.ports.get(k) != Some(&v) {
+                    ops.push(Op::SetPort {
+                        id: id.clone(),
+                        port: k.clone(),
+                        value: v,
+                    });
+                }
+            }
+        } else {
+            let (p, i) = parent_of(new, id).map_or((None, 0), |(p, i)| (Some(p), i));
+            ops.push(Op::Insert {
+                id: id.clone(),
+                parent: p,
+                index: i,
+                node: n.clone(),
+            });
+        }
+    }
+    for id in new.nodes.keys() {
+        if old.nodes.contains_key(id) && parent_of(old, id) != parent_of(new, id) {
+            let (p, i) = parent_of(new, id).map_or((None, 0), |(p, i)| (Some(p), i));
+            ops.push(Op::Reparent {
+                id: id.clone(),
+                parent: p,
+                index: i,
+            });
+        }
+    }
+    for (field, a, b) in [
+        ("name", json!(old.name), json!(new.name)),
+        ("citizen", json!(old.citizen), json!(new.citizen)),
+        (
+            "window",
+            old.window.clone().unwrap_or(JsonValue::Null),
+            new.window.clone().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "subscribe",
+            old.subscribe.clone().unwrap_or(JsonValue::Null),
+            new.subscribe.clone().unwrap_or(JsonValue::Null),
+        ),
+    ] {
+        if a != b {
+            ops.push(Op::SetScene {
+                field: field.into(),
+                value: b,
+            });
+        }
+    }
+    ops
+}
+pub fn source(d: &SceneDocument) -> &str {
+    &d.source
+}
+fn valid_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2
+        && b.len() <= 31
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+fn as_string(v: &Value) -> Option<&str> {
+    if let Value::String(s) = v {
+        Some(s)
+    } else {
+        None
+    }
+}
+fn json_value(v: &Value) -> JsonValue {
+    match v {
+        Value::Nil => JsonValue::Null,
+        Value::Bool(x) => json!(x),
+        Value::Number(x) => json!(x),
+        Value::String(x) => json!(x),
+        Value::List(xs) => xs.iter().map(json_value).collect(),
+        Value::Map(xs) => xs.iter().map(|(k, v)| (k.clone(), json_value(v))).collect(),
+        _ => JsonValue::Null,
+    }
+}
+fn normalize_number(v: JsonValue) -> JsonValue {
+    if let Some(n) = v.as_f64() {
+        JsonValue::Number(serde_json::Number::from_f64(n).unwrap())
+    } else if let Some(a) = v.as_array() {
+        JsonValue::Array(a.iter().cloned().map(normalize_number).collect())
+    } else if let Some(o) = v.as_object() {
+        JsonValue::Object(
+            o.iter()
+                .map(|(k, v)| (k.clone(), normalize_number(v.clone())))
+                .collect(),
+        )
+    } else {
+        v
+    }
+}
+fn header_json(v: Option<&str>, ds: &mut Vec<Diagnostic>, line: usize) -> Option<JsonValue> {
+    v.map(|s| match serde_json::from_str(s) {
+        Ok(v) => normalize_number(v),
+        Err(_) => {
+            ds.push(Diagnostic::error(
+                "header-json",
+                line,
+                "header JSON is invalid",
+            ));
+            JsonValue::Null
+        }
+    })
+}
+fn line_in(t: &str, id: &str) -> Option<usize> {
+    t.lines()
+        .position(|l| l.trim_start().starts_with(&format!("{}:", id)))
+        .map(|x| x + 1)
+}
+fn type_matches(v: &JsonValue, t: &str) -> bool {
+    match t {
+        "string" => v.is_string(),
+        "number" => v.is_number(),
+        "bool" => v.is_boolean(),
+        "list" => v.is_array(),
+        "object" => v.is_object(),
+        _ => true,
+    }
+}
+fn validate_rows(n: &RawNode, o: &mut Vec<Diagnostic>) {
+    if let Some(rs) = n.ports.get("rows").and_then(JsonValue::as_array) {
+        if rs.len() > MAX_ROWS {
+            o.push(Diagnostic::error(
+                "row-limit",
+                n.line,
+                "list has more than 500 rows",
+            ));
+        }
+        for r in rs {
+            if r.get("id").and_then(JsonValue::as_str).is_none()
+                || r.get("cells")
+                    .and_then(JsonValue::as_array)
+                    .is_none_or(|cs| cs.iter().any(|c| !c.is_string()))
+            {
+                o.push(Diagnostic::error(
+                    "row-type",
+                    n.line,
+                    "each row must contain string id and string cells",
+                ));
+            }
+        }
+    }
+}
+fn minimum_cells(n: &RawNode) -> usize {
+    n.ports
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| r.get("cells").and_then(JsonValue::as_array).map(Vec::len))
+                .min()
+                .unwrap_or(usize::MAX)
+        })
+        .unwrap_or(usize::MAX)
+}
+fn check_template(
+    n: &RawNode,
+    d: &SceneDocument,
+    cells: usize,
+    o: &mut Vec<Diagnostic>,
+    seen: &mut HashSet<String>,
+) {
+    let Some(id) = d
+        .nodes
+        .iter()
+        .find(|(_, x)| std::ptr::eq(*x, n))
+        .map(|(i, _)| i.clone())
+    else {
+        return;
+    };
+    if !seen.insert(id) {
+        return;
+    }
+    if !["row", "column", "text", "spacer", "image"].contains(&n.widget.as_str()) {
+        o.push(Diagnostic::error(
+            "invalid-template",
+            n.line,
+            "list row template has an invalid family",
+        ));
+        return;
+    }
+    for (k, v) in &n.ports {
+        if let Some(s) = v.as_str() {
+            if s.contains("{cells[") && k != "text" {
+                o.push(Diagnostic::error(
+                    "cell-substitution",
+                    n.line,
+                    "cell substitution is allowed only in text.text",
+                ));
+            }
+            if k == "text" {
+                for (start, _) in s.match_indices("{cells[") {
+                    if let Some(e) = s[start + 7..].find("]}") {
+                        if s[start + 7..start + 7 + e]
+                            .parse::<usize>()
+                            .map_or(true, |i| i >= cells)
+                        {
+                            o.push(Diagnostic::error(
+                                "cell-substitution",
+                                n.line,
+                                "cell index is not present",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(cs) = n.ports.get("children").and_then(JsonValue::as_array) {
+        for c in cs
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .filter_map(|x| d.nodes.get(x))
+        {
+            check_template(c, d, cells, o, seen);
+        }
+    }
+}
+fn fence_ranges(b: &str) -> Vec<(usize, usize, String)> {
+    let l: Vec<_> = b.lines().collect();
+    let mut r = Vec::new();
+    let mut i = 0;
+    while i < l.len() {
+        if l[i].trim() == "```mix" {
+            let s = i + 1;
+            i += 1;
+            while i < l.len() && l[i].trim() != "```" {
+                i += 1;
+            }
+            if i < l.len() {
+                r.push((s, i, l[s..i].join("\n")));
+            }
+        }
+        i += 1;
+    }
+    r
+}
+fn parent_of(s: &ResolvedScene, id: &str) -> Option<(String, usize)> {
+    for (p, n) in &s.nodes {
+        if let Some(cs) = n.ports.get("children").and_then(JsonValue::as_array) {
+            if let Some(i) = cs.iter().position(|v| v.as_str() == Some(id)) {
+                return Some((p.clone(), i));
+            }
+        }
+    }
+    None
+}
+fn reachable(d: &SceneDocument) -> HashSet<String> {
+    let mut s = HashSet::new();
+    fn go(id: &str, d: &SceneDocument, s: &mut HashSet<String>) {
+        if !s.insert(id.into()) {
+            return;
+        }
+        if let Some(n) = d.nodes.get(id) {
+            if let Some(cs) = n.ports.get("children").and_then(JsonValue::as_array) {
+                for c in cs.iter().filter_map(JsonValue::as_str) {
+                    go(c, d, s);
+                }
+            }
+        }
+    }
+    if d.nodes.contains_key("root") {
+        go("root", d, &mut s);
+    }
+    s
+}
+fn has_cycle(d: &SceneDocument) -> bool {
+    fn go(
+        id: &str,
+        d: &SceneDocument,
+        a: &mut HashSet<String>,
+        done: &mut HashSet<String>,
+    ) -> bool {
+        if a.contains(id) {
+            return true;
+        }
+        if done.contains(id) {
+            return false;
+        }
+        a.insert(id.into());
+        if let Some(n) = d.nodes.get(id) {
+            if let Some(cs) = n.ports.get("children").and_then(JsonValue::as_array) {
+                for c in cs.iter().filter_map(JsonValue::as_str) {
+                    if go(c, d, a, done) {
+                        return true;
+                    }
+                }
+            }
+        }
+        a.remove(id);
+        done.insert(id.into());
+        false
+    }
+    let mut a = HashSet::new();
+    let mut done = HashSet::new();
+    d.nodes.keys().any(|id| go(id, d, &mut a, &mut done))
+}
+fn mix_diagnostic(e: MixError, o: usize) -> Diagnostic {
+    match e {
+        MixError::StrictDataViolation {
+            construct,
+            line,
+            hint,
+        } => {
+            let c = if construct.starts_with("duplicate map key") {
+                "duplicate-id"
+            } else {
+                "strict-data"
+            };
+            Diagnostic::error(c, o + line, format!("{construct}: {hint}"))
+        }
+        MixError::ParseError { msg, span }
+        | MixError::LexerError { msg, span }
+        | MixError::IncompleteInput { msg, span } => {
+            Diagnostic::error("mix-parse", o + span.line, msg)
+        }
+        MixError::AssignmentChainParseError { operator, span } => Diagnostic::error(
+            "mix-parse",
+            o + span.line,
+            format!("assignment chain operator {operator}"),
+        ),
+        _ => Diagnostic::error("mix-parse", o + 1, e.to_string()),
+    }
+}
+fn sorted(mut d: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    d.sort_by(|a, b| a.line.cmp(&b.line).then(a.code.cmp(&b.code)));
+    d
+}
 
-#[cfg(test)]mod tests{use super::*;const C:&str=include_str!("../tests/fixtures/clippanel.scene.md");const F:&str=include_str!("../tests/fixtures/conformance.scene.md");const S:&str=include_str!("../tests/fixtures/static.scene.md");fn doc(b:&str)->SceneDocument{parse(&format!("---\nscene: 1\nname: test\ncitizen: c\n---\n```mix\n{b}\n```\n")).unwrap()}#[test]fn fixture_round_trips(){for s in[C,F,S]{let d=parse(s).unwrap();assert!(lint(&d).iter().all(|x|x.severity==Severity::Warning),"{:?}",lint(&d));let r=resolve(&d).unwrap();assert!(diff(&r,&r).is_empty());}}#[test]fn resolved_defaults(){let n=&resolve(&doc("root: {widget: \"text\", text: \"x\"}" )).unwrap().nodes["root"];for(k,v)in[("size",json!(13.0)),("bold",json!(false)),("mono",json!(false)),("elide",json!(false)),("fill",json!(false)),("hidden",json!(false))]{assert_eq!(n.ports[k],v);}}#[test]fn fixture_equals_hub(){let h=std::env::var("COSMIX_HUB").unwrap_or_else(|_|std::env::var("HOME").unwrap_or_else(|_|"/home/user".into()) + "/.ctl");let p=std::path::Path::new(&h).join("_lib/scenes/clippanel/clippanel.scene.md");if !p.exists(){println!("fixture hub absent: {}",p.display());return;}assert_eq!(std::fs::read_to_string(p).unwrap(),C);}#[test]fn numeric_default_diff_is_empty(){let a=resolve(&doc("root: {widget: \"text\", text: \"x\"}")).unwrap();let b=resolve(&doc("root: {widget: \"text\", text: \"x\", size: 13}")).unwrap();assert!(diff(&a,&b).is_empty());}#[test]fn graph_and_lint_regressions(){let d=doc("root: {widget: \"column\", children: [\"a\"]}\na: {widget: \"text\", text: \"x\"}\nb: {widget: \"column\", children: [\"c\"]}\nc: {widget: \"column\", children: [\"b\"]}");let codes:HashSet<_>=lint(&d).into_iter().map(|x|x.code).collect();assert!(codes.contains("cycle")&&codes.contains("orphan-node"));}#[test]fn diff_covers_mutation_insert_remove_reparent(){let a=resolve(&doc("root: {widget: \"column\", children: [\"x\",\"y\"]}\nx: {widget: \"text\", text: \"x\"}\ny: {widget: \"text\", text: \"y\"}")).unwrap();let mut b=a.clone();b.nodes["x"].ports.insert("text".into(),json!("z"));b.nodes.shift_remove("y");b.nodes.insert("z".into(),Node{family:"text".into(),ports:IndexMap::from([(String::from("text"),json!("z"))]),line:1,is_template:false});b.nodes["root"].ports["children"]=json!(["z","x"]);let o=diff(&a,&b);assert!(o.iter().any(|x|matches!(x,Op::SetPort{..}))&&o.iter().any(|x|matches!(x,Op::Remove{..}))&&o.iter().any(|x|matches!(x,Op::Insert{parent:Some(_),..}))&&o.iter().any(|x|matches!(x,Op::Reparent{..})));}}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const C: &str = include_str!("../tests/fixtures/clippanel.scene.md");
+    const F: &str = include_str!("../tests/fixtures/conformance.scene.md");
+    const S: &str = include_str!("../tests/fixtures/static.scene.md");
+    fn doc(b: &str) -> SceneDocument {
+        parse(&format!(
+            "---\nscene: 1\nname: test\ncitizen: c\n---\n```mix\n{b}\n```\n"
+        ))
+        .unwrap()
+    }
+    #[test]
+    fn fixture_round_trips() {
+        for s in [C, F, S] {
+            let d = parse(s).unwrap();
+            assert!(
+                lint(&d).iter().all(|x| x.severity == Severity::Warning),
+                "{:?}",
+                lint(&d)
+            );
+            let r = resolve(&d).unwrap();
+            assert!(diff(&r, &r).is_empty());
+        }
+    }
+    #[test]
+    fn resolved_defaults() {
+        let n = &resolve(&doc("root: {widget: \"text\", text: \"x\"}"))
+            .unwrap()
+            .nodes["root"];
+        for (k, v) in [
+            ("size", json!(13.0)),
+            ("bold", json!(false)),
+            ("mono", json!(false)),
+            ("elide", json!(false)),
+            ("fill", json!(false)),
+            ("hidden", json!(false)),
+        ] {
+            assert_eq!(n.ports[k], v);
+        }
+    }
+    #[test]
+    fn fixture_equals_hub() {
+        let h = std::env::var("COSMIX_HUB").unwrap_or_else(|_| {
+            std::env::var("HOME").unwrap_or_else(|_| "/home/user".into()) + "/.ctl"
+        });
+        let p = std::path::Path::new(&h).join("_lib/scenes/clippanel/clippanel.scene.md");
+        if !p.exists() {
+            println!("fixture hub absent: {}", p.display());
+            return;
+        }
+        assert_eq!(std::fs::read_to_string(p).unwrap(), C);
+    }
+    #[test]
+    fn numeric_default_diff_is_empty() {
+        let a = resolve(&doc("root: {widget: \"text\", text: \"x\"}")).unwrap();
+        let b = resolve(&doc("root: {widget: \"text\", text: \"x\", size: 13}")).unwrap();
+        assert!(diff(&a, &b).is_empty());
+    }
+    #[test]
+    fn graph_and_lint_regressions() {
+        let d = doc(
+            "root: {widget: \"column\", children: [\"a\"]}\na: {widget: \"text\", text: \"x\"}\nb: {widget: \"column\", children: [\"c\"]}\nc: {widget: \"column\", children: [\"b\"]}",
+        );
+        let codes: HashSet<_> = lint(&d).into_iter().map(|x| x.code).collect();
+        assert!(codes.contains("cycle") && codes.contains("orphan-node"));
+    }
+    #[test]
+    fn diff_covers_mutation_insert_remove_reparent() {
+        let a=resolve(&doc("root: {widget: \"column\", children: [\"x\",\"y\"]}\nx: {widget: \"text\", text: \"x\"}\ny: {widget: \"text\", text: \"y\"}")).unwrap();
+        let mut b = a.clone();
+        b.nodes["x"].ports.insert("text".into(), json!("z"));
+        b.nodes.shift_remove("y");
+        b.nodes.insert(
+            "z".into(),
+            Node {
+                family: "text".into(),
+                ports: IndexMap::from([(String::from("text"), json!("z"))]),
+                line: 1,
+                is_template: false,
+            },
+        );
+        b.nodes["root"].ports["children"] = json!(["z", "x"]);
+        let o = diff(&a, &b);
+        assert!(
+            o.iter().any(|x| matches!(x, Op::SetPort { .. }))
+                && o.iter().any(|x| matches!(x, Op::Remove { .. }))
+                && o.iter().any(|x| matches!(
+                    x,
+                    Op::Insert {
+                        parent: Some(_),
+                        ..
+                    }
+                ))
+                && o.iter().any(|x| matches!(x, Op::Reparent { .. }))
+        );
+    }
+}
