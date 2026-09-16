@@ -1839,6 +1839,20 @@ mod tests {
                 .unwrap()
                 .value()
                 .to_string(),
+            "old",
+            "Bevy rejects the whole insertion when its filter rejects a character"
+        );
+        app.world_mut()
+            .get_mut::<EditableText>(entities.input)
+            .unwrap()
+            .queue_edit(TextEdit::Insert("xy".into()));
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<EditableText>(entities.input)
+                .unwrap()
+                .value()
+                .to_string(),
             "oldxy"
         );
         assert!(

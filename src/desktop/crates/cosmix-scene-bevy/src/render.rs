@@ -455,7 +455,24 @@ fn spawn(world: &mut World, tree: &ResolvedScene, id: &str, node: &SceneNode) ->
         "field" => {
             let value = text(node, "value");
             let field = if flag(node, "password") {
-                spawn_secret_field(&mut commands, CtkSecretFieldProps::new(value, id))
+                let field = spawn_secret_field(&mut commands, CtkSecretFieldProps::new(value, id));
+                let hint = commands
+                    .spawn((
+                        Text::new(text(node, "placeholder")),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.5, 0.5, 0.5)),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(7),
+                            top: px(4),
+                            ..default()
+                        },
+                        bevy::picking::Pickable::IGNORE,
+                        CtkTextFieldPlaceholder { input: field.input },
+                    ))
+                    .id();
+                commands.entity(field.input).add_child(hint);
+                field
             } else {
                 spawn_text_field(
                     &mut commands,
