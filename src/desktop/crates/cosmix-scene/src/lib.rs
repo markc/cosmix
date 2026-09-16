@@ -1153,7 +1153,6 @@ mod tests {
                 "list",
                 [
                     ("gap", json!(0.0)),
-                    ("max_rows", json!(1.0)),
                     ("fill", json!(false)),
                     ("hidden_if_empty", json!(false)),
                 ]
