@@ -581,10 +581,11 @@ fn update(
                 layout.flex_shrink = 0.0;
             }
             layout.border_radius = BorderRadius::all(px(number(node, "radius", 0.0)));
-            layout.align_items = match text(node, "align") {
-                "center" => AlignItems::Center,
-                "end" => AlignItems::End,
-                "stretch" => AlignItems::Stretch,
+            layout.align_items = match (node.family.as_str(), text(node, "align")) {
+                ("column", _) => AlignItems::Stretch,
+                (_, "center") => AlignItems::Center,
+                (_, "end") => AlignItems::End,
+                (_, "stretch") => AlignItems::Stretch,
                 _ => AlignItems::Start,
             };
             let normal = color(text(node, "background"), Color::NONE);
@@ -743,6 +744,7 @@ impl VirtualListModel for ListModel {
         world.entity_mut(content).insert((binding, ClickRow));
         let template = text(node, "row");
         let root = template_node(world, &data.tree, template, item);
+        world.get_mut::<Node>(root).unwrap().width = percent(100);
         world.entity_mut(content).add_child(root);
     }
 }
