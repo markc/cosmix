@@ -6,7 +6,7 @@ window: {"kind":"edge","edge":"left","title":"Conformance","w":640,"h":480}
 ---
 ```mix
 root: {widget: "column", children: ["win", "row", "field", "button", "toggle", "list", "image", "spacer"], gap: 1, padding: 2, fill: true}
-win: {widget: "window", kind: "edge", edge: "left", title: "X", w: 640, h: 480}
+win: {widget: "window", kind: "edge", edge: "left", title: "Conformance", w: 640, h: 480}
 row: {widget: "row", children: ["text"], gap: 2, padding: 1, fill: true, align: "center", height: 20, radius: 2, background: "#000", hover: "#111", on_click: "pick"}
 text: {widget: "text", text: "hello", size: 12, bold: true, mono: true, color: "#fff", elide: true, width: 40, fill: true, hidden: false}
 field: {widget: "field", value: "", placeholder: "type", width: 100, password: false, on_change: "change", on_submit: "submit"}

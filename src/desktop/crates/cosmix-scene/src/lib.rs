@@ -12,11 +12,46 @@ use cosmix_mix::{MixError, value::Value};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_NODES: usize = 2_000;
 pub const MAX_ROWS: usize = 500;
+pub const ALL_CODES: &[&str] = &[
+    "document-too-large",
+    "envelope",
+    "missing-header",
+    "scene-version",
+    "invalid-name",
+    "fence-count",
+    "mix-parse",
+    "strict-data",
+    "duplicate-id",
+    "root-type",
+    "node-type",
+    "missing-widget",
+    "invalid-id",
+    "header-json",
+    "node-limit",
+    "unknown-family",
+    "unknown-port",
+    "port-type",
+    "enum-value",
+    "port-min",
+    "missing-port",
+    "dangling-child",
+    "child-type",
+    "window-kind",
+    "row-limit",
+    "row-type",
+    "invalid-template",
+    "cell-substitution",
+    "missing-root",
+    "multiple-parents",
+    "window-disagreement",
+    "orphan-node",
+    "cycle",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
@@ -189,19 +224,19 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         },
         pe("edge", "\"right\"", EDGE),
         p("title", "string", false, None),
-        pn("w", false, Some(0.0)),
-        pn("h", false, Some(0.0)),
+        pn("w", false, None),
+        pn("h", false, None),
     ];
     static BOX: [Port; 4] = [
         p("children", "list", true, None),
-        pn("gap", false, Some(0.0)),
-        pn("padding", false, Some(0.0)),
+        pnd("gap", "0", None),
+        pnd("padding", "0", None),
         p("fill", "bool", false, Some("false")),
     ];
     static ROW: [Port; 10] = [
         p("children", "list", true, None),
-        pn("gap", false, Some(0.0)),
-        pn("padding", false, Some(0.0)),
+        pnd("gap", "0", None),
+        pnd("padding", "0", None),
         p("fill", "bool", false, Some("false")),
         Port {
             name: "align",
@@ -211,8 +246,8 @@ fn schema(f: &str) -> Option<&'static [Port]> {
             enum_values: ALIGN,
             min: None,
         },
-        pn("height", false, Some(0.0)),
-        pn("radius", false, Some(0.0)),
+        pn("height", false, None),
+        pn("radius", false, None),
         p("background", "string", false, None),
         p("hover", "string", false, None),
         p("on_click", "string", false, None),
@@ -224,14 +259,14 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         p("mono", "bool", false, Some("false")),
         p("color", "string", false, None),
         p("elide", "bool", false, Some("false")),
-        pn("width", false, Some(0.0)),
+        pn("width", false, None),
         p("fill", "bool", false, Some("false")),
         p("hidden", "bool", false, Some("false")),
     ];
     static FIELD: [Port; 6] = [
         p("value", "string", true, None),
         p("placeholder", "string", false, None),
-        pn("width", false, Some(0.0)),
+        pn("width", false, None),
         p("password", "bool", false, Some("false")),
         p("on_change", "string", false, None),
         p("on_submit", "string", false, None),
@@ -258,8 +293,8 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         p("rows", "list", true, None),
         p("row", "string", true, None),
         pn("row_height", true, Some(0.0)),
-        pn("gap", false, Some(0.0)),
-        pn("max_rows", false, Some(0.0)),
+        pnd("gap", "0", None),
+        pn("max_rows", false, Some(1.0)),
         p("fill", "bool", false, Some("false")),
         p("hidden_if_empty", "bool", false, Some("false")),
         p("on_click", "string", false, None),
@@ -269,7 +304,7 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         pn("w", false, Some(0.0)),
         pn("h", false, Some(0.0)),
     ];
-    static SPACER: [Port; 1] = [pnd("size", "13", Some(0.0))];
+    static SPACER: [Port; 1] = [pn("size", false, None)];
     Some(match f {
         "window" => &WINDOW,
         "column" => &BOX,
@@ -495,7 +530,12 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
                 ));
             }
             if let Some(min) = p.min {
-                if v.as_f64().is_some_and(|x| x <= min) {
+                let invalid = if p.name == "max_rows" {
+                    v.as_f64().is_some_and(|x| x < min)
+                } else {
+                    v.as_f64().is_some_and(|x| x <= min)
+                };
+                if invalid {
                     out.push(Diagnostic::error(
                         "port-min",
                         n.line,
@@ -544,9 +584,20 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
         if n.widget == "list" {
             validate_rows(n, &mut out);
             if let Some(row) = n.ports.get("row").and_then(JsonValue::as_str) {
+                if n.ports
+                    .get("children")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|cs| cs.iter().any(|c| c.as_str() == Some(row)))
+                {
+                    out.push(Diagnostic::error(
+                        "invalid-template",
+                        n.line,
+                        "list row template must not also be a child",
+                    ));
+                }
                 match doc.nodes.get(row) {
                     Some(t) => {
-                        check_template(t, doc, minimum_cells(n), &mut out, &mut HashSet::new())
+                        check_template(row, t, doc, minimum_cells(n), &mut out, &mut HashSet::new())
                     }
                     None => out.push(Diagnostic::error(
                         "dangling-child",
@@ -572,8 +623,11 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
         ));
     }
     if let Some(w) = &doc.window {
-        if let Some(n) = doc.nodes.get("window") {
-            if n.ports.get("kind") != w.get("kind") {
+        if let Some((_, n)) = doc.nodes.iter().find(|(_, n)| n.widget == "window") {
+            if ["edge", "title", "w", "h"]
+                .iter()
+                .any(|k| n.ports.get(*k) != w.get(*k))
+            {
                 out.push(Diagnostic::error(
                     "window-disagreement",
                     n.line,
@@ -661,7 +715,7 @@ pub fn diff(old: &ResolvedScene, new: &ResolvedScene) -> Vec<Op> {
     }
     for (id, n) in &new.nodes {
         if let Some(o) = old.nodes.get(id) {
-            let keys: HashSet<_> = o.ports.keys().chain(n.ports.keys()).collect();
+            let keys: BTreeSet<_> = o.ports.keys().chain(n.ports.keys()).collect();
             for k in keys {
                 let v = n.ports.get(k).cloned().unwrap_or(JsonValue::Null);
                 if o.ports.get(k) != Some(&v) {
@@ -746,7 +800,9 @@ fn json_value(v: &Value) -> JsonValue {
 }
 fn normalize_number(v: JsonValue) -> JsonValue {
     if let Some(n) = v.as_f64() {
-        JsonValue::Number(serde_json::Number::from_f64(n).unwrap())
+        serde_json::Number::from_f64(n)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null)
     } else if let Some(a) = v.as_array() {
         JsonValue::Array(a.iter().cloned().map(normalize_number).collect())
     } else if let Some(o) = v.as_object() {
@@ -774,7 +830,11 @@ fn header_json(v: Option<&str>, ds: &mut Vec<Diagnostic>, line: usize) -> Option
 }
 fn line_in(t: &str, id: &str) -> Option<usize> {
     t.lines()
-        .position(|l| l.trim_start().starts_with(&format!("{}:", id)))
+        .position(|l| {
+            l.trim_start()
+                .strip_prefix(id)
+                .is_some_and(|rest| rest.trim_start().starts_with(':'))
+        })
         .map(|x| x + 1)
 }
 fn type_matches(v: &JsonValue, t: &str) -> bool {
@@ -824,21 +884,14 @@ fn minimum_cells(n: &RawNode) -> usize {
         .unwrap_or(usize::MAX)
 }
 fn check_template(
+    id: &str,
     n: &RawNode,
     d: &SceneDocument,
     cells: usize,
     o: &mut Vec<Diagnostic>,
     seen: &mut HashSet<String>,
 ) {
-    let Some(id) = d
-        .nodes
-        .iter()
-        .find(|(_, x)| std::ptr::eq(*x, n))
-        .map(|(i, _)| i.clone())
-    else {
-        return;
-    };
-    if !seen.insert(id) {
+    if !seen.insert(id.to_owned()) {
         return;
     }
     if !["row", "column", "text", "spacer", "image"].contains(&n.widget.as_str()) {
@@ -877,12 +930,10 @@ fn check_template(
         }
     }
     if let Some(cs) = n.ports.get("children").and_then(JsonValue::as_array) {
-        for c in cs
-            .iter()
-            .filter_map(JsonValue::as_str)
-            .filter_map(|x| d.nodes.get(x))
-        {
-            check_template(c, d, cells, o, seen);
+        for id in cs.iter().filter_map(JsonValue::as_str) {
+            if let Some(c) = d.nodes.get(id) {
+                check_template(id, c, d, cells, o, seen);
+            }
         }
     }
 }
@@ -931,6 +982,11 @@ fn reachable(d: &SceneDocument) -> HashSet<String> {
     }
     if d.nodes.contains_key("root") {
         go("root", d, &mut s);
+    }
+    for n in d.nodes.values() {
+        if let Some(row) = n.ports.get("row").and_then(JsonValue::as_str) {
+            go(row, d, &mut s);
+        }
     }
     s
 }
@@ -999,6 +1055,7 @@ fn sorted(mut d: Vec<Diagnostic>) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::useless_conversion)]
     use super::*;
     const C: &str = include_str!("../tests/fixtures/clippanel.scene.md");
     const F: &str = include_str!("../tests/fixtures/conformance.scene.md");
@@ -1013,11 +1070,7 @@ mod tests {
     fn fixture_round_trips() {
         for s in [C, F, S] {
             let d = parse(s).unwrap();
-            assert!(
-                lint(&d).iter().all(|x| x.severity == Severity::Warning),
-                "{:?}",
-                lint(&d)
-            );
+            assert!(lint(&d).is_empty(), "{:?}", lint(&d));
             let r = resolve(&d).unwrap();
             assert!(diff(&r, &r).is_empty());
         }
@@ -1037,6 +1090,21 @@ mod tests {
         ] {
             assert_eq!(n.ports[k], v);
         }
+    }
+    #[test]
+    fn resolved_defaults_cover_all_families() {
+        let d = doc(
+            "root: {widget: \"column\", children: [\"win\",\"row\",\"field\",\"button\",\"toggle\",\"list\",\"image\",\"spacer\"]}\nwin: {widget: \"window\", kind: \"edge\"}\nrow: {widget: \"row\", children: [\"text\"]}\ntext: {widget: \"text\", text: \"x\"}\nfield: {widget: \"field\", value: \"x\"}\nbutton: {widget: \"button\", label: \"x\"}\ntoggle: {widget: \"toggle\", value: false, label: \"x\"}\nlist: {widget: \"list\", rows: [], row: \"template\", row_height: 1}\ntemplate: {widget: \"row\", children: []}\nimage: {widget: \"image\", src: \"x\"}\nspacer: {widget: \"spacer\"}",
+        );
+        let r = resolve(&d).unwrap();
+        for family in [
+            "window", "column", "row", "text", "field", "button", "toggle", "list", "image",
+            "spacer",
+        ] {
+            assert!(r.nodes.values().any(|n| n.family == family), "{family}");
+        }
+        assert_eq!(r.nodes["root"].ports["gap"], json!(0.0));
+        assert_eq!(r.nodes["spacer"].ports.len(), 0);
     }
     #[test]
     fn fixture_equals_hub() {
@@ -1065,33 +1133,150 @@ mod tests {
         assert!(codes.contains("cycle") && codes.contains("orphan-node"));
     }
     #[test]
-    fn diff_covers_mutation_insert_remove_reparent() {
-        let a=resolve(&doc("root: {widget: \"column\", children: [\"x\",\"y\"]}\nx: {widget: \"text\", text: \"x\"}\ny: {widget: \"text\", text: \"y\"}")).unwrap();
-        let mut b = a.clone();
-        b.nodes["x"].ports.insert("text".into(), json!("z"));
-        b.nodes.shift_remove("y");
-        b.nodes.insert(
-            "z".into(),
-            Node {
-                family: "text".into(),
-                ports: IndexMap::from([(String::from("text"), json!("z"))]),
-                line: 1,
-                is_template: false,
-            },
+    fn diff_covers_exact_ops_from_resolved_documents() {
+        let a = resolve(&doc("root: {widget: \"column\", children: [\"x\",\"y\"]}\nx: {widget: \"text\", text: \"x\", color: \"red\"}\ny: {widget: \"text\", text: \"y\"}")).unwrap();
+        let b = resolve(&parse("---\nscene: 1\nname: newer\ncitizen: d\nwindow: {\"kind\":\"edge\"}\nsubscribe: [\"x\"]\n---\n```mix\nroot: {widget: \"column\", children: [\"z\",\"x\"]}\nx: {widget: \"text\", text: \"z\"}\nz: {widget: \"text\", text: \"new\"}\n```").unwrap()).unwrap();
+        assert_eq!(
+            diff(&a, &b),
+            vec![
+                Op::Remove { id: "y".into() },
+                Op::SetPort {
+                    id: "root".into(),
+                    port: "children".into(),
+                    value: json!(["z", "x"])
+                },
+                Op::SetPort {
+                    id: "x".into(),
+                    port: "color".into(),
+                    value: JsonValue::Null
+                },
+                Op::SetPort {
+                    id: "x".into(),
+                    port: "text".into(),
+                    value: json!("z")
+                },
+                Op::Insert {
+                    id: "z".into(),
+                    parent: Some("root".into()),
+                    index: 0,
+                    node: b.nodes["z"].clone()
+                },
+                Op::Reparent {
+                    id: "x".into(),
+                    parent: Some("root".into()),
+                    index: 1
+                },
+                Op::SetScene {
+                    field: "name".into(),
+                    value: json!("newer")
+                },
+                Op::SetScene {
+                    field: "citizen".into(),
+                    value: json!("d")
+                },
+                Op::SetScene {
+                    field: "window".into(),
+                    value: json!({"kind":"edge"})
+                },
+                Op::SetScene {
+                    field: "subscribe".into(),
+                    value: json!(["x"])
+                },
+            ]
         );
-        b.nodes["root"].ports["children"] = json!(["z", "x"]);
-        let o = diff(&a, &b);
+    }
+    #[test]
+    fn every_lint_class_has_a_diagnostic() {
+        let valid =
+            |body: &str| format!("---\nscene: 1\nname: test\ncitizen: c\n---\n```mix\n{body}\n```");
+        let cases = vec![
+            ("document-too-large", "x".repeat(MAX_DOCUMENT_BYTES + 1)),
+            ("envelope", "not an envelope".into()),
+            ("missing-header", "---\nscene: 1\n---\n```mix\nroot: {widget: \"text\", text: \"x\"}\n```\n".into()),
+            ("scene-version", valid("root: {widget: \"text\", text: \"x\"}").replacen("scene: 1", "scene: 2", 1)),
+            ("invalid-name", valid("root: {widget: \"text\", text: \"x\"}").replacen("name: test", "name: Bad", 1)),
+            ("fence-count", "---\nscene: 1\nname: test\ncitizen: c\n---\n```mix\nroot: {widget: \"text\", text: \"x\"}\n```\n```mix\na: {widget: \"text\", text: \"x\"}\n```\n".into()),
+            ("mix-parse", valid("root: {widget: \"text\", text: \"x\"}\n\"unterminated").into()),
+            ("strict-data", valid("root: {widget: \"text\", text: \"x\"}\nvalue: \"a\" ..\n  \"b\"").into()),
+            ("duplicate-id", valid("root: {widget: \"text\", text: \"x\"}\nroot: {widget: \"text\", text: \"y\"}").into()),
+            ("root-type", valid("[\"x\"]").into()),
+            ("node-type", valid("root: \"x\"").into()),
+            ("missing-widget", valid("root: {}").into()),
+            ("invalid-id", valid("root: {widget: \"column\", children: [\"bad@id\"]}\n\"bad@id\": {widget: \"text\", text: \"x\"}").into()),
+            ("header-json", valid("root: {widget: \"text\", text: \"x\"}").replacen("citizen: c", "citizen: c\nwindow: nope", 1)),
+            ("node-limit", valid(&(0..=MAX_NODES).map(|i| format!("n{i}: {{widget: \"text\", text: \"x\"}}\n")).collect::<String>())),
+            ("unknown-family", valid("root: {widget: \"unknown\"}").into()),
+            ("unknown-port", valid("root: {widget: \"text\", text: \"x\", nope: 1}").into()),
+            ("port-type", valid("root: {widget: \"text\", text: 1}").into()),
+            ("enum-value", valid("root: {widget: \"button\", label: \"x\", tone: \"bad\"}").into()),
+            ("port-min", valid("root: {widget: \"list\", rows: [], row: \"t\", row_height: 0}\nt: {widget: \"row\", children: []}").into()),
+            ("missing-port", valid("root: {widget: \"text\"}").into()),
+            ("dangling-child", valid("root: {widget: \"column\", children: [\"gone\"]}").into()),
+            ("child-type", valid("root: {widget: \"column\", children: [1]}").into()),
+            ("window-kind", valid("root: {widget: \"window\", kind: \"floating\"}").into()),
+            ("row-limit", valid("root: {widget: \"list\", rows: [], row: \"t\", row_height: 1}\nt: {widget: \"row\", children: []}").into()),
+            ("row-type", valid("root: {widget: \"list\", rows: [{}], row: \"t\", row_height: 1}\nt: {widget: \"row\", children: []}").into()),
+            ("invalid-template", valid("root: {widget: \"list\", rows: [], row: \"t\", row_height: 1}\nt: {widget: \"button\", label: \"x\"}").into()),
+            ("cell-substitution", valid("root: {widget: \"list\", rows: [{id: \"1\", cells: [\"x\"]}], row: \"t\", row_height: 1}\nt: {widget: \"row\", children: [\"x\"]}\nx: {widget: \"text\", text: \"{cells[1]}\"}").into()),
+            ("missing-root", valid("x: {widget: \"text\", text: \"x\"}").into()),
+            ("multiple-parents", valid("root: {widget: \"column\", children: [\"a\", \"b\"]}\na: {widget: \"column\", children: [\"x\"]}\nb: {widget: \"column\", children: [\"x\"]}\nx: {widget: \"text\", text: \"x\"}").into()),
+            ("window-disagreement", valid("root: {widget: \"window\", kind: \"edge\", title: \"node\"}").replacen("citizen: c", "citizen: c\nwindow: {\"kind\":\"edge\",\"title\":\"header\"}", 1)),
+            ("orphan-node", valid("root: {widget: \"text\", text: \"x\"}\nother: {widget: \"text\", text: \"y\"}").into()),
+            ("cycle", valid("root: {widget: \"column\", children: [\"a\"]}\na: {widget: \"column\", children: [\"root\"]}").into()),
+        ];
+        let table: HashSet<_> = cases.iter().map(|(code, _)| *code).collect();
+        for code in ALL_CODES {
+            assert!(table.contains(code), "missing table entry: {code}");
+        }
+        for (expected, source) in cases {
+            let diagnostics = match parse(&source) {
+                Ok(mut d) if expected == "row-limit" => {
+                    let rows = (0..=MAX_ROWS)
+                        .map(|i| json!({"id": i.to_string(), "cells": ["x"]}))
+                        .collect();
+                    d.nodes["root"]
+                        .ports
+                        .insert("rows".into(), JsonValue::Array(rows));
+                    lint(&d)
+                }
+                Ok(d) => lint(&d),
+                Err(d) => d,
+            };
+            assert!(
+                diagnostics.iter().any(|d| d.code == expected),
+                "{expected}: {diagnostics:?}"
+            );
+        }
+    }
+    #[test]
+    fn hundred_rows_parse() {
+        let mut body = String::from("root: {widget: \"list\", rows: [");
+        for i in 0..100 {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!("{{id: \"{i}\", cells: [\"x\"]}}"));
+        }
+        body.push_str("], row: \"t\", row_height: 1}\nt: {widget: \"row\", children: []}");
+        let start = std::time::Instant::now();
         assert!(
-            o.iter().any(|x| matches!(x, Op::SetPort { .. }))
-                && o.iter().any(|x| matches!(x, Op::Remove { .. }))
-                && o.iter().any(|x| matches!(
-                    x,
-                    Op::Insert {
-                        parent: Some(_),
-                        ..
-                    }
-                ))
-                && o.iter().any(|x| matches!(x, Op::Reparent { .. }))
+            parse(&format!(
+                "---\nscene: 1\nname: test\ncitizen: c\n---\n```mix\n{body}\n```\n"
+            ))
+            .is_ok()
         );
+        assert!(
+            start.elapsed().as_millis() < 5,
+            "100-row parse took {:?}",
+            start.elapsed()
+        );
+    }
+    #[test]
+    fn ragged_rows_reject_missing_cell() {
+        let d = doc(
+            "root: {widget: \"list\", rows: [{id: \"a\", cells: [\"x\"]}, {id: \"b\", cells: []}], row: \"t\", row_height: 1}\nt: {widget: \"row\", children: [\"x\"]}\nx: {widget: \"text\", text: \"{cells[0]}\"}",
+        );
+        let codes: HashSet<_> = lint(&d).into_iter().map(|x| x.code).collect();
+        assert!(codes.contains("cell-substitution"));
     }
 }
