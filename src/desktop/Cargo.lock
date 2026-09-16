@@ -2838,6 +2838,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-clip-bevy"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "cosmix-lib-client",
+ "ctk",
+ "flume",
+ "regex",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cosmix-comp"
 version = "0.57.0"
 dependencies = [

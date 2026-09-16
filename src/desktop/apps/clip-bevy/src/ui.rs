@@ -230,6 +230,7 @@ pub fn receive(
     mut panel: ResMut<Panel>,
     windows: Query<Entity, With<Window>>,
 ) {
+    let mut live_window = windows.iter().next();
     for event in bus.events.try_iter() {
         match event {
             Event::Snapshot(snapshot) => {
@@ -247,10 +248,8 @@ pub fn receive(
             Event::ClearExpired(_) => {}
             Event::Toggle => {
                 // The Window entity must be destroyed, not made invisible.
-                if !windows.is_empty() {
-                    for entity in &windows {
-                        commands.entity(entity).despawn();
-                    }
+                if let Some(entity) = live_window.take() {
+                    commands.entity(entity).despawn();
                     if let Some(view) = panel.view.take() {
                         commands.entity(view.root).despawn();
                         commands.entity(view.camera).despawn();
@@ -260,7 +259,7 @@ pub fn receive(
                         commands.entity(view.root).despawn();
                         commands.entity(view.camera).despawn();
                     }
-                    commands.spawn((window(), PrimaryWindow));
+                    live_window = Some(commands.spawn((window(), PrimaryWindow)).id());
                     panel.view = Some(create_view(&mut commands, &panel.filter));
                     panel.dirty = true;
                 }
@@ -324,7 +323,9 @@ pub fn activate(
             } else {
                 panel.clear = Some(Instant::now());
                 panel.clear_token += 1;
-                Request::ClearTimer(panel.clear_token)
+                bus.arm_clear(panel.clear_token);
+                panel.dirty = true;
+                return;
             }
         }
     };

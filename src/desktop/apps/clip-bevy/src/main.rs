@@ -20,7 +20,12 @@ fn main() {
         .insert_resource(WinitSettings::desktop_app())
         .insert_resource(ClearColor(ui::colour(0x1b1d23)))
         .insert_resource(ctk::theme::CtkThemeMode(ctk::theme::Mode::Dark))
-        .add_plugins((FeathersPlugins, CtkThemePlugin::default(), CtkWidgetsPlugin))
+        .add_plugins((
+            FeathersPlugins,
+            CtkThemePlugin::default(),
+            CtkWidgetsPlugin,
+            CtkTextFieldPlugin,
+        ))
         .init_resource::<ui::Panel>()
         .add_systems(Startup, (ui::start_bus, ui::setup).chain())
         .add_systems(

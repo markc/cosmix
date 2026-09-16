@@ -63,7 +63,6 @@ pub enum Request {
     RemotePick(Value),
     Pause(bool),
     Clear,
-    ClearTimer(u64),
 }
 
 pub enum Event {
@@ -77,6 +76,8 @@ pub enum Event {
 pub struct Bus {
     pub requests: flume::Sender<Request>,
     pub events: flume::Receiver<Event>,
+    timer_events: flume::Sender<Event>,
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -91,6 +92,8 @@ impl Bus {
     pub fn start(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (requests, rx) = flume::bounded(32);
         let (tx, events) = flume::bounded(256);
+        let timer_events = tx.clone();
+        let timer_wake = wake.clone();
         std::thread::spawn(move || {
             runtime().block_on(async {
                 let result = async {
@@ -99,16 +102,11 @@ impl Bus {
                     let mut incoming = session.client.incoming_bounded().ok_or("No incoming lane")?;
                     let mut connection = session.client.subscribe_state();
                     let mut due = Some(Instant::now() + Duration::from_millis(250));
-                    let mut clear_due: Option<(Instant, u64)> = None;
                     loop {
                         let far = Instant::now() + Duration::from_secs(86400 * 365);
                         tokio::select! {
                             request = rx.recv_async() => {
                                 let Ok(request) = request else { break; };
-                                if let Request::ClearTimer(token) = request {
-                                    clear_due = Some((Instant::now() + Duration::from_millis(2500), token));
-                                    continue;
-                                }
                                 if let Err(e) = session.action(request).await { emit(&tx, &wake, Event::Error(e)); }
                                 due = Some(Instant::now() + Duration::from_millis(250));
                             }
@@ -136,9 +134,6 @@ impl Bus {
                                 let snapshot = session.refresh().await;
                                 emit(&tx, &wake, Event::Snapshot(Box::new(snapshot)));
                             }
-                            _ = sleep_until(clear_due.map(|v| v.0).unwrap_or(far)), if clear_due.is_some() => {
-                                if let Some((_, token)) = clear_due.take() { emit(&tx, &wake, Event::ClearExpired(token)); }
-                            }
                         }
                     }
                     session.client.close().await;
@@ -147,7 +142,22 @@ impl Bus {
                 if let Err(e) = result { emit(&tx, &wake, Event::Error(e)); }
             });
         });
-        Self { requests, events }
+        Self {
+            requests,
+            events,
+            timer_events,
+            wake: timer_wake,
+        }
+    }
+
+    pub fn arm_clear(&self, token: u64) {
+        let tx = self.timer_events.clone();
+        let wake = self.wake.clone();
+        // One one-shot wake; a slow provider must not delay the confirmation expiry.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            emit(&tx, &wake, Event::ClearExpired(token));
+        });
     }
 }
 
@@ -248,9 +258,11 @@ impl Session {
     }
 
     async fn refresh(&mut self) -> Snapshot {
-        let mut s = Snapshot::default();
-        s.local = json!({"target":self.config.local,"instance":"","ok":false,"entries":0,"total":0,"revision":-1,"persistence":"unreachable","paused":false,"skipped":0,"subscribed":false,"topic":self.topic});
-        s.remote = json!({"target":self.config.remote,"instance":"","ok":false,"entries":null});
+        let mut s = Snapshot {
+            local: json!({"target":self.config.local,"instance":"","ok":false,"entries":0,"total":0,"revision":-1,"persistence":"unreachable","paused":false,"skipped":0,"subscribed":false,"topic":self.topic}),
+            remote: json!({"target":self.config.remote,"instance":"","ok":false,"entries":null}),
+            ..Snapshot::default()
+        };
         match self.capabilities(false).await {
             Ok(caps) => {
                 let h = &caps["clipboard"]["history"];
@@ -324,7 +336,6 @@ impl Session {
                 }
                 ("desktop.clipboard.write", json!({"text":entry["text"]}))
             }
-            Request::ClearTimer(_) => return Ok(()),
         };
         let (rc, _) = self.rpc(false, verb, body).await?;
         if rc != 0 {
