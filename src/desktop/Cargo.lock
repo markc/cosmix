@@ -3170,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3180,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "bevy",
  "bevy_winit",
@@ -3532,7 +3532,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.55.0"
+version = "0.55.1"
 dependencies = [
  "accesskit",
  "ammonia",

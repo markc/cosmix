@@ -663,9 +663,9 @@ impl RowMetrics for FixedRows {
 }
 
 fn reconcile_virtual_lists(world: &mut World) {
-    let mut timing = world
-        .remove_resource::<VirtualListFrameTiming>()
-        .unwrap_or_default();
+    // Resources are entities in Bevy 0.19. Removing and reinserting one
+    // abandons its empty entity each frame; move only the value instead.
+    let mut timing = std::mem::take(&mut *world.resource_mut::<VirtualListFrameTiming>());
     timing.started = Some(Instant::now());
     timing.lists.clear();
     timing.measured.clear();
@@ -687,7 +687,7 @@ fn reconcile_virtual_lists(world: &mut World) {
         model.bind(world, job.content, job.index);
     }
     timing.bind_jobs.clear();
-    world.insert_resource(timing);
+    *world.resource_mut::<VirtualListFrameTiming>() = timing;
 }
 
 fn reconcile_one(world: &mut World, entity: Entity, bind_jobs: &mut Vec<BindJob>) -> bool {
@@ -1206,9 +1206,7 @@ fn realise_window(
 }
 
 fn paint_virtual_rows(world: &mut World) {
-    let mut timing = world
-        .remove_resource::<VirtualListFrameTiming>()
-        .unwrap_or_default();
+    let mut timing = std::mem::take(&mut *world.resource_mut::<VirtualListFrameTiming>());
     timing.paint_rows.clear();
     timing.paint_rows.extend(
         world
@@ -1237,7 +1235,7 @@ fn paint_virtual_rows(world: &mut World) {
         }
     }
     let Some(started) = timing.started.take() else {
-        world.insert_resource(timing);
+        *world.resource_mut::<VirtualListFrameTiming>() = timing;
         return;
     };
     let elapsed = started.elapsed();
@@ -1252,7 +1250,7 @@ fn paint_virtual_rows(world: &mut World) {
         }
     }
     timing.measured.clear();
-    world.insert_resource(timing);
+    *world.resource_mut::<VirtualListFrameTiming>() = timing;
 }
 
 fn find_row(model: &dyn VirtualListModel, id: RowId) -> Option<usize> {
@@ -1394,6 +1392,18 @@ fn handle_key(world: &mut World, list_entity: Entity, key: KeyCode, shift: bool,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_frames_do_not_abandon_resource_entities() {
+        let mut app = App::new();
+        app.add_plugins(VirtualListPlugin);
+        app.update();
+        let count = app.world().entities().count_spawned();
+        for _ in 0..600 {
+            app.update();
+        }
+        assert_eq!(app.world().entities().count_spawned(), count);
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
 

@@ -10,7 +10,8 @@ The envelope's `window` header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
 An absent or cleared extent uses the shell's output-derived default thickness.
 Authored extents fit the output space left by opposing exclusive zones;
-pinning and output changes recheck that budget. Clearing ports resets their
+pinning and output changes recheck that budget. Pointer resizes exceeding the
+remaining budget are rejected without changing panel thickness. Clearing ports resets their
 derived layout constraints. A spacer without a size flexes into free space.
 For a nested development host, select its compositor with `--comp-service`
 and a distinct registration with `--bus-service`; the default registration
@@ -41,13 +42,16 @@ Changing a field's family or password mode replaces that widget.
 
 List rows use CTK VirtualList. Row templates are instantiated with
 `template-node@row-id` identities and substitute only `{cells[i]}` in text.
+Idle reconciliation preserves its resource entity rather than accumulating
+empty entities on each frame, including when no scenes are loaded.
 Text elision uses CTK's middle-elision policy.
 
 The standalone shell host bridges Wayland text-input-v3 preedit and commit
 events to Bevy's editable text pipeline. Candidate positions come from the
 focused field's layout in its panel surface, without a primary Winit window.
 Focus generations and text-input `done` serials discard delayed batches for
-previously focused fields.
+previously focused fields. Cursor-rectangle commits extend the current focus
+generation's serial range; input already in flight for that field still applies.
 The synthetic `cosmix-imeprobe --external-field` mode exercises an existing
 client field without opening the probe's own text window.
 

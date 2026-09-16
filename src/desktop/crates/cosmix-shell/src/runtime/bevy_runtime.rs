@@ -281,6 +281,28 @@ fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
 mod tests {
     use super::*;
     #[test]
+    fn resizing_pinned_panel_cannot_exceed_output_budget() {
+        let mut app = app();
+        let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+        let model = &mut runtime.model;
+        model.set_geometry(LogicalSize::new(800.0, 600.0).unwrap());
+        for (edge, thickness) in [(Edge::Left, 798.0), (Edge::Right, 1.0)] {
+            model.restore_thickness(edge, thickness).unwrap();
+            model
+                .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                .unwrap();
+        }
+        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 798.0);
+        assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
+        assert_eq!(
+            model.resize_thickness(Edge::Right, 120.0),
+            Err(crate::core::PanelConfigError::InvalidThickness(120.0))
+        );
+        assert_eq!(model.panel(Edge::Right).thickness_px, 1.0);
+        assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
+    }
+
+    #[test]
     fn unmounting_last_dynamic_page_clears_carousel() {
         let mut app = app();
         set_shell_pages(app.world_mut(), Edge::Top, vec!["scene-only".into()], None);

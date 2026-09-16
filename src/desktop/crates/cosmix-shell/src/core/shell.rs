@@ -133,6 +133,9 @@ impl ShellModel {
     }
 
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
+        if thickness > self.thickness_budget(edge) {
+            return Err(PanelConfigError::InvalidThickness(thickness));
+        }
         self.panels[edge.index()].resize_thickness(thickness)
     }
 

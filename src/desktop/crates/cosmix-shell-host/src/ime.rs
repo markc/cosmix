@@ -23,6 +23,9 @@ pub(super) struct TextInputBridge {
     generation: u64,
     batch_generation: Option<u64>,
     commit_serial: u32,
+    // First commit enabling the current focus generation. Rectangle commits
+    // extend this generation's serial interval without invalidating input.
+    focus_serial: u32,
 }
 
 impl TextInputBridge {
@@ -38,6 +41,7 @@ impl TextInputBridge {
             generation: 0,
             batch_generation: None,
             commit_serial: 0,
+            focus_serial: 0,
         }
     }
     pub(super) fn attach(&mut self, seat: &WlSeat, qh: &QueueHandle<RunnerState>) {
@@ -59,6 +63,7 @@ impl TextInputBridge {
         self.generation = self.generation.wrapping_add(1);
         self.batch_generation = None;
         self.commit_serial = 0;
+        self.focus_serial = 0;
     }
 }
 
@@ -104,6 +109,7 @@ impl RunnerState {
                 input.enable();
                 input.commit();
                 self.text_input.commit_serial = self.text_input.commit_serial.wrapping_add(1);
+                self.text_input.focus_serial = self.text_input.commit_serial;
             }
         }
         if let Some((entity, _)) = enabled {
@@ -223,7 +229,8 @@ impl TextInputBridge {
                 if let Some((entity, window)) = self.enabled
                     && focus == Some(entity)
                     && generation == Some(self.generation)
-                    && serial == self.commit_serial
+                    && serial.wrapping_sub(self.focus_serial)
+                        <= self.commit_serial.wrapping_sub(self.focus_serial)
                 {
                     if let Some(value) = committed {
                         events.push(Ime::Commit { window, value });
@@ -247,6 +254,70 @@ impl TextInputBridge {
 mod tests {
     use super::*;
     #[test]
+    fn protocol_bridge_accepts_inflight_input_across_rectangle_commit() {
+        let mut world = World::new();
+        let field = world.spawn_empty().id();
+        let window = world.spawn_empty().id();
+        for start in [1, u32::MAX] {
+            let mut bridge = TextInputBridge {
+                manager: None,
+                input: None,
+                surface: None,
+                enabled: Some((field, window)),
+                preedit: None,
+                committed: None,
+                rectangle: None,
+                generation: 1,
+                batch_generation: None,
+                commit_serial: start,
+                focus_serial: start,
+            };
+            bridge.receive(
+                zwp_text_input_v3::Event::CommitString {
+                    text: Some("typed".into()),
+                },
+                Some(field),
+            );
+            bridge.commit_serial = start.wrapping_add(1); // cursor rectangle commit
+            let events = bridge.receive(
+                zwp_text_input_v3::Event::Done { serial: start },
+                Some(field),
+            );
+            assert!(matches!(&events[..], [Ime::Commit { value, .. }] if value == "typed"));
+            // A whole batch can also arrive after the rectangle was committed.
+            bridge.receive(
+                zwp_text_input_v3::Event::PreeditString {
+                    text: Some("compose".into()),
+                    cursor_begin: 0,
+                    cursor_end: 7,
+                },
+                Some(field),
+            );
+            let events = bridge.receive(
+                zwp_text_input_v3::Event::Done { serial: start },
+                Some(field),
+            );
+            assert!(matches!(&events[..], [Ime::Preedit { value, .. }] if value == "compose"));
+            bridge.receive(
+                zwp_text_input_v3::Event::CommitString {
+                    text: Some("future".into()),
+                },
+                Some(field),
+            );
+            assert!(
+                bridge
+                    .receive(
+                        zwp_text_input_v3::Event::Done {
+                            serial: start.wrapping_add(2)
+                        },
+                        Some(field),
+                    )
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn protocol_bridge_drops_delayed_batches_after_focus_change() {
         let mut world = World::new();
         let first = world.spawn_empty().id();
@@ -263,6 +334,7 @@ mod tests {
             generation: 1,
             batch_generation: None,
             commit_serial: 1,
+            focus_serial: 1,
         };
         bridge.receive(
             zwp_text_input_v3::Event::CommitString {
@@ -273,6 +345,7 @@ mod tests {
         bridge.enabled = Some((second, window));
         bridge.generation = 2;
         bridge.commit_serial = 3; // disable + enable commits
+        bridge.focus_serial = 3;
         assert!(
             bridge
                 .receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second))
