@@ -553,9 +553,6 @@ fn update(
         .entity_mut(view.input.unwrap_or(view.root))
         .insert(binding);
     let mut layout = world.get::<Node>(view.root).cloned().unwrap_or_default();
-    // Reset every derived constraint before applying the current resolved ports.
-    layout.flex_shrink = Node::default().flex_shrink;
-    layout.max_height = Val::Auto;
     layout.width = node
         .ports
         .get("width")
@@ -572,6 +569,9 @@ fn update(
     };
     match node.family.as_str() {
         "column" | "row" => {
+            // Clear the height-derived constraint while preserving CTK-owned
+            // baseline constraints on other widget families.
+            layout.flex_shrink = Node::default().flex_shrink;
             layout.flex_direction = if node.family == "row" {
                 FlexDirection::Row
             } else {
@@ -687,9 +687,11 @@ fn update(
         }
         "list" => {
             layout.height = px(list_height(node));
-            if node.ports.contains_key("max_rows") {
-                layout.max_height = layout.height;
-            }
+            layout.max_height = if node.ports.contains_key("max_rows") {
+                layout.height
+            } else {
+                Val::Auto
+            };
         }
         "image" => {
             let image = world
