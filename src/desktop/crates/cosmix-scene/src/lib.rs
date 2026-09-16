@@ -5,7 +5,7 @@
 //! Bevy, CTK, event loop, or Bus transport is linked here.
 
 use cosmix_bus::bus::parse_strict;
-use cosmix_mix::{MixError, Value};
+use cosmix_mix::{value::Value, MixError};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -130,7 +130,7 @@ pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
     let (open, _, interior) = fences[0].clone();
     let value = match cosmix_mix::parse_data(&interior) { Ok(v) => v, Err(e) => { diagnostics.push(mix_diagnostic(e, body_base + open)); return Err(diagnostics); } };
     let map = match value { Value::Map(m) => m, _ => { diagnostics.push(Diagnostic::error("root-type", open + 1, "fence must contain a map of nodes")); return Err(diagnostics); } };
-    let mut nodes = IndexMap::new();
+    let mut nodes: IndexMap<String, RawNode> = IndexMap::new();
     for (id, value) in map.iter() {
         let line = body_base + open + line_in(&interior, id).unwrap_or(1);
         let fields = match value { Value::Map(m) => m, _ => { diagnostics.push(Diagnostic::error("node-type", line, format!("node {id} must be a map"))); continue; } };
