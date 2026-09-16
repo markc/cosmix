@@ -7,7 +7,7 @@
 # then rots. This one runs on every gate.
 [package]
 name = "cosmix-imeprobe"
-version = "0.1.0"
+version = "0.1.1"
 description = "CosMix synthetic input method — gate fixture for zwp_input_method_v2"
 edition = "2021"
 rust-version = "1.95"

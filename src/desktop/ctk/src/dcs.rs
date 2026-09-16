@@ -1294,7 +1294,9 @@ mod tests {
     use bevy::ecs::world::CommandQueue;
     use bevy::image::{ImagePlugin, TextureAtlasPlugin};
     use bevy::input::InputPlugin;
-    use bevy::math::{UVec2, Vec2};
+    use bevy::math::UVec2;
+    #[cfg(debug_assertions)]
+    use bevy::math::Vec2;
     use bevy::mesh::MeshPlugin;
     use bevy::picking::PickingPlugin;
     use bevy::prelude::MinimalPlugins;
