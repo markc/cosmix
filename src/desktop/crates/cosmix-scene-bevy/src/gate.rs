@@ -20,6 +20,9 @@ struct Gate {
 }
 
 pub(super) fn install(app: &mut App) {
+    if std::env::var_os("COSMIX_SCENE_MEMORY_GATE").is_some() {
+        app.add_systems(Last, memory_probe);
+    }
     if let Ok(scene) = std::env::var("COSMIX_SCENE_EDIT_GATE") {
         app.insert_resource(Gate {
             scene,
@@ -32,6 +35,26 @@ pub(super) fn install(app: &mut App) {
         })
         .add_systems(Last, probe);
     }
+}
+
+fn memory_probe(
+    time: Res<Time<Real>>,
+    atlases: Res<bevy::text::FontAtlasSet>,
+    images: Res<Assets<Image>>,
+    fonts: Query<(Entity, &TextFont, Option<&Text>)>,
+    mut previous: Local<(f64, u64)>,
+) {
+    if time.elapsed_secs_f64() - previous.0 < 5.0 {
+        return;
+    }
+    let bytes = atlases.total_bytes(&images);
+    if bytes != previous.1 {
+        eprintln!("SCENE_MEMORY_GATE atlas_bytes={bytes} keys={:?}", atlases.keys().collect::<Vec<_>>());
+        for (entity, font, text) in &fonts {
+            eprintln!("SCENE_MEMORY_FONT {entity} {font:?} {text:?}");
+        }
+    }
+    *previous = (time.elapsed_secs_f64(), bytes);
 }
 
 fn snapshot(world: &World, input: Entity) -> String {

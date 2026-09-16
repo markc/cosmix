@@ -42,8 +42,6 @@ Changing a field's family or password mode replaces that widget.
 
 List rows use CTK VirtualList. Row templates are instantiated with
 `template-node@row-id` identities and substitute only `{cells[i]}` in text.
-Idle reconciliation preserves its resource entity rather than accumulating
-empty entities on each frame, including when no scenes are loaded.
 Text elision uses CTK's middle-elision policy.
 
 The standalone shell host bridges Wayland text-input-v3 preedit and commit

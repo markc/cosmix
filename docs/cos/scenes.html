@@ -479,8 +479,6 @@ edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.</p>
 <p>List rows use CTK VirtualList. Row templates are instantiated with
 <code>template-node@row-id</code> identities and substitute only <code>{cells[i]}</code> in text.
-Idle reconciliation preserves its resource entity rather than accumulating
-empty entities on each frame, including when no scenes are loaded.
 Text elision uses CTK's middle-elision policy.</p>
 <p>The standalone shell host bridges Wayland text-input-v3 preedit and commit
 events to Bevy's editable text pipeline. Candidate positions come from the
