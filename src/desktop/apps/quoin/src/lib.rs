@@ -153,6 +153,7 @@ fn configure_content(
             CtkThemePlugin::default(),
             QuoinChromePlugin,
             ShellBusPlugin,
+            cosmix_scene_bevy::ScenePlugin,
             launcher::LauncherPlugin,
             wallpaper::WallpaperPlugin,
             demos::DemoPlugin,

@@ -11,10 +11,10 @@ pub use messages::{
     CarouselInput, HostGeometry, KeyboardInteractivity, PanelPresentation, ShellCommand,
     ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, WakePolicy,
 };
-pub use semantic::{ShellSemanticVerb, semantic_shell_command};
+pub use semantic::{SceneVerb, ShellSemanticVerb, semantic_shell_command};
 
 #[cfg(feature = "chrome-core")]
 pub use bevy_runtime::{
     ShellEffects, ShellFrameState, ShellQuitHandler, ShellRuntimePlugin, ShellRuntimeSet,
-    replace_shell_model,
+    replace_shell_model, set_shell_pages,
 };

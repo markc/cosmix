@@ -25,6 +25,7 @@ pub struct ShellCommand {
 /// Semantic shell actions; no transport is implied.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ShellCommandKind {
+    Scene(super::SceneVerb),
     Quit,
     Geometry(LogicalSize),
     Resize {

@@ -2126,11 +2126,14 @@ fn spawn_call(
 ) {
     let client = Arc::clone(control);
     calls.spawn(async move {
-        let result = client
-            .call_with_headers_raw(&to, &command, &headers, &body)
-            .await
-            .map(|(rc, body, result)| BusReply { rc, body, result })
-            .map_err(|error| error.to_string());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call_with_headers_raw(&to, &command, &headers, &body),
+        )
+        .await
+        .map_err(|_| "Bus request timed out after 2 s".to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+        .map(|(rc, body, result)| BusReply { rc, body, result });
         (request_id, result)
     });
 }

@@ -1,0 +1,15 @@
+[package]
+name = "cosmix-scene-bevy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Retained CTK adapter for renderer-neutral Mix Scenes"
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "bevy_ui_widgets", "bevy_feathers", "png"] }
+cosmix-scene = { path = "../cosmix-scene" }
+cosmix-shell = { path = "../cosmix-shell", features = ["chrome"] }
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "virtual-list"] }
+serde_json = "1"
+sha2 = "0.10"

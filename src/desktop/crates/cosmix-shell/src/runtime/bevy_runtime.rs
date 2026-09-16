@@ -101,6 +101,25 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     }
 }
 
+/// Update a dynamic carousel while retaining its active page when possible.
+pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: Option<&str>) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    let selected = select
+        .map(str::to_owned)
+        .or_else(|| runtime.model.carousel(edge).active_id().map(str::to_owned));
+    let Ok(mut carousel) = crate::core::Carousel::new(ids) else {
+        return;
+    };
+    if let Some(selected) = selected {
+        carousel.select_id(&selected);
+    }
+    runtime.model.set_carousel(edge, carousel);
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
+}
+
 fn update_model(
     time: Res<Time<Real>>,
     mut commands: MessageReader<ShellCommand>,
@@ -119,6 +138,8 @@ fn update_model(
         }
         let at = command.at.clamp(runtime.model.last_update(), now);
         match &command.kind {
+            // Scene content is owned by the host adapter; it has no motion effect.
+            ShellCommandKind::Scene(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
                 let _ = runtime.model.resize_thickness(*edge, *thickness_px);
             }
