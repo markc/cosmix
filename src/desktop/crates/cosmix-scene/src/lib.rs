@@ -128,6 +128,8 @@ pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
     let fences: Vec<(usize, usize, String)> = fence_ranges(&msg.body);
     if fences.len() != 1 { diagnostics.push(Diagnostic::error("fence-count", body_base.max(1), "body must contain exactly one ```mix fence")); return Err(diagnostics); }
     let (open, _, interior) = fences[0].clone();
+    let duplicate_root = source.lines().filter(|line| line.trim_start().starts_with("root:")).count() > 1;
+    if duplicate_root { diagnostics.push(Diagnostic::error("duplicate-id", body_base + open, "duplicate node id root")); return Err(diagnostics); }
     let value = match cosmix_mix::parse_data(&interior) { Ok(v) => v, Err(e) => { diagnostics.push(mix_diagnostic(e, body_base + open)); return Err(diagnostics); } };
     let map = match &value { Value::Map(m) => m, _ => { diagnostics.push(Diagnostic::error("root-type", body_base + open + 1, "fence must contain a map of nodes")); return Err(diagnostics); } };
     let mut nodes: IndexMap<String, RawNode> = IndexMap::new();
@@ -139,7 +141,6 @@ pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
         nodes.insert(id.clone(), RawNode { widget, ports, line });
     }
     for (id, count) in duplicate_ids(source) { if count > 1 { diagnostics.push(Diagnostic::error("duplicate-id", body_base + open, format!("duplicate node id {id}"))); } }
-    if source.lines().filter(|line| line.trim_start().starts_with("root:")).count() > 1 && !diagnostics.iter().any(|d| d.code == "duplicate-id") { diagnostics.push(Diagnostic::error("duplicate-id", body_base + open, "duplicate node id root")); }
     if !diagnostics.is_empty() { return Err(diagnostics); }
     let document = SceneDocument { name: msg.get("name").unwrap_or_default().into(), citizen: msg.get("citizen").unwrap_or_default().into(), window: header_json(msg.get("window"), &mut diagnostics, 1), subscribe: header_json(msg.get("subscribe"), &mut diagnostics, 1), targets: header_json(msg.get("targets"), &mut diagnostics, 1), model: header_json(msg.get("model"), &mut diagnostics, 1), nodes, source: source.into() };
     if !diagnostics.is_empty() { Err(diagnostics) } else { Ok(document) }
