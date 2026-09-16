@@ -229,13 +229,14 @@ struct Reply {
 }
 impl Reply {
     fn report(self) -> Value {
-        let mut body = if self.body.is_object() {
-            self.body
-        } else {
-            json!({"body":self.body})
-        };
-        body["rc"] = json!(self.rc);
-        body
+        // Smoke summaries deliberately contain no clipboard text/previews.
+        let mut summary = json!({"rc":self.rc});
+        for key in ["paused", "total", "id", "accepted", "moved", "menu"] {
+            if let Some(value) = self.body.get(key) {
+                summary[key] = value.clone();
+            }
+        }
+        summary
     }
 }
 
