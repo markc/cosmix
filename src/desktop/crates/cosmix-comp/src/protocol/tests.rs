@@ -13305,6 +13305,167 @@ fn buttons_pressed_during_chrome_capture_stay_suppressed_after_it_ends() {
 }
 
 #[test]
+fn click_inside_a_grabbing_popup_delivers_the_button_without_dismissing_it() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    route_pointer_to(&mut harness, 60.0, 80.0);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let press = pointer_body(&harness.sync(), pointer, 3);
+    let serial = word(&press, 0);
+    let (popup_object, popup_role) = map_test_popup(&mut harness, Some(serial));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    let (px, py) = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get(&popup_object)
+            .expect("mapped popup remains tracked");
+        (
+            f64::from(record.layout.x + record.layout.width / 2.0),
+            f64::from(record.layout.y + record.layout.height / 2.0),
+        )
+    };
+    route_pointer_to(&mut harness, px, py);
+    let _ = harness.sync();
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != popup_role || *opcode != 1),
+        "a click INSIDE the grabbing popup must not dismiss it"
+    );
+    assert!(
+        !pointer_bodies(&traffic, pointer, 3).is_empty(),
+        "the press inside the popup must reach the client"
+    );
+    assert!(
+        harness.server.state.pointer.is_grabbed(),
+        "the popup grab survives an in-popup press"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+}
+
+#[test]
+fn click_inside_an_ungrabbed_popup_keeps_toplevel_keyboard_focus() {
+    // Firefox opens bookmark and context menus WITHOUT xdg_popup.grab. A press
+    // inside such a menu must not move keyboard focus to the popup: the
+    // toplevel's wl_keyboard.leave reads as window deactivation and the client
+    // rolls the menu up before the click activates anything.
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    route_pointer_to(&mut harness, 60.0, 80.0);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    let (popup_object, popup_role) = map_test_popup(&mut harness, None);
+    let _ = harness.sync();
+
+    let (px, py) = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get(&popup_object)
+            .expect("mapped popup remains tracked");
+        (
+            f64::from(record.layout.x + record.layout.width / 2.0),
+            f64::from(record.layout.y + record.layout.height / 2.0),
+        )
+    };
+    route_pointer_to(&mut harness, px, py);
+    let _ = harness.sync();
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != TEST_KEYBOARD_ID || *opcode != 2),
+        "a press inside an ungrabbed popup must not steal the toplevel's keyboard focus"
+    );
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != popup_role || *opcode != 1),
+        "a press inside an ungrabbed popup must not dismiss it"
+    );
+    assert!(
+        !pointer_bodies(&traffic, pointer, 3).is_empty(),
+        "the press inside the ungrabbed popup must reach the client"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+}
+
+#[test]
+fn click_inside_a_grabbing_popup_survives_fractional_scale() {
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    harness.admit_kms_4k_at_250_percent();
+    let pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .values_mut()
+            .find(|record| {
+                record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID
+            })
+            .expect("real toplevel exists");
+        record.mapped = true;
+    }
+    route_pointer_to(&mut harness, 200.0, 180.0);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let press = pointer_body(&harness.sync(), pointer, 3);
+    let serial = word(&press, 0);
+    let (popup_object, popup_role) = map_test_popup(&mut harness, Some(serial));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    let (px, py) = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get(&popup_object)
+            .expect("mapped popup remains tracked");
+        (
+            f64::from(record.layout.x + record.layout.width / 2.0),
+            f64::from(record.layout.y + record.layout.height / 2.0),
+        )
+    };
+    route_pointer_to(&mut harness, px, py);
+    let _ = harness.sync();
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != popup_role || *opcode != 1),
+        "at 250% scale a click INSIDE the grabbing popup must not dismiss it"
+    );
+    assert!(
+        !pointer_bodies(&traffic, pointer, 3).is_empty(),
+        "at 250% scale the press inside the popup must reach the client"
+    );
+    assert!(
+        harness.server.state.pointer.is_grabbed(),
+        "at 250% scale the popup grab survives an in-popup press"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+}
+
+#[test]
 fn live_popup_pointer_grab_bypasses_chrome_and_receives_the_outside_click() {
     let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
     route_pointer_to(&mut harness, 60.0, 80.0);

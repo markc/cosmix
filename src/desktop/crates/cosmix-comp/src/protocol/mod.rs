@@ -12983,7 +12983,13 @@ impl WaylandState {
                 .get(&layer_root)
                 .map(|record| record.role.wl_surface().clone());
         }
-        Some(root_compositor_surface(surface))
+        // Resolve through the xdg popup chain, not just the subsurface tree.
+        // A click on a popup is an interaction with its root toplevel: keyboard
+        // focus must stay there, or an UNGRABBED menu (Firefox bookmark and
+        // context menus take no xdg_popup.grab) sees wl_keyboard.leave on its
+        // toplevel at press time, reads it as window deactivation, and rolls
+        // the menu up before the click can activate anything.
+        Some(canonical_root_surface(&self.popup_manager, surface))
     }
 
     fn raise_for_focus_interaction(&mut self, surface: &WlSurface) {
