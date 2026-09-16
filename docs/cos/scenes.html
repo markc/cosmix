@@ -470,7 +470,19 @@ edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.</p>
 <p>List rows use CTK VirtualList. Row templates are instantiated with
 <code>template-node@row-id</code> identities and substitute only <code>{cells[i]}</code> in text.
-Text elision uses CTK's middle-elision policy.</p></div></div>
+Text elision uses CTK's middle-elision policy.</p>
+<p>The standalone shell host bridges Wayland text-input-v3 preedit and commit
+events to Bevy's editable text pipeline. Candidate positions come from the
+focused field's layout in its panel surface, without a primary Winit window.
+The synthetic <code>cosmix-imeprobe --external-field</code> mode exercises an existing
+client field without opening the probe's own text window.</p>
+<p>Development builds may enable Quoin's <code>scene-gates</code> feature and set
+<code>COSMIX_SCENE_EDIT_GATE=clippanel</code>. The opt-in probe types, selects and starts
+composition through CTK, logs <code>SCENE_RETAINED_GATE READY</code>, then waits for a
+Bus reload. It checks entity identity, focus, selection, history and preedit,
+then performs undo and logs <code>SCENE_RETAINED_GATE PASS</code>. This is an in-process
+editing probe, not a physical keyboard or pointer injection test. It is absent
+from production builds.</p></div></div>
     </div>
 
 </main>
