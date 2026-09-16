@@ -397,7 +397,9 @@ impl Plugin for CtkTextAreaPlugin {
             .add_systems(PreUpdate, (blur_on_window_unfocus, scroll_text_areas))
             .add_systems(
                 PostUpdate,
-                process_text_area_edits.before(EditableTextSystems),
+                process_text_area_edits
+                    .before(EditableTextSystems)
+                    .after(crate::text_field::strip_secret_clipboard_edits),
             )
             .add_systems(
                 PostUpdate,
@@ -1389,6 +1391,7 @@ fn sync_text_areas(
         &mut EditableText,
         &mut CtkTextArea,
         &mut AccessibilityNode,
+        Has<crate::text_field::CtkSecretField>,
     )>,
     mut text_runs: Query<&mut AccessibilityNode, Without<CtkTextArea>>,
     mut fonts: ResMut<FontCx>,
@@ -1396,7 +1399,7 @@ fn sync_text_areas(
     time: Option<Res<Time<Real>>>,
 ) {
     let now = time.as_ref().map_or(0.0, |time| time.elapsed_secs_f64());
-    for (entity, mut editable, mut area, mut accessibility) in &mut areas {
+    for (entity, mut editable, mut area, mut accessibility, secret) in &mut areas {
         if area.ime_transaction_before.is_some() {
             if editable.is_composing() {
                 area.policy_snapshot = area.ime_transaction_before.clone().unwrap();
@@ -1432,33 +1435,35 @@ fn sync_text_areas(
         }
 
         let value = editable.value().to_string();
-        let lines = hard_lines(&value);
-        while area.a11y_runs.len() < lines.len() {
-            let run = commands.spawn_empty().id();
-            commands.entity(entity).add_child(run);
-            area.a11y_runs.push(run);
-        }
-        while area.a11y_runs.len() > lines.len() {
-            if let Some(run) = area.a11y_runs.pop() {
-                commands.entity(run).despawn();
+        if !secret {
+            let lines = hard_lines(&value);
+            while area.a11y_runs.len() < lines.len() {
+                let run = commands.spawn_empty().id();
+                commands.entity(entity).add_child(run);
+                area.a11y_runs.push(run);
             }
-        }
-        for (&line, &run) in lines.iter().zip(&area.a11y_runs) {
-            let node = text_run_accessibility(line);
-            if let Ok(mut current) = text_runs.get_mut(run) {
-                *current = node;
-            } else {
-                commands.entity(run).insert(node);
+            while area.a11y_runs.len() > lines.len() {
+                if let Some(run) = area.a11y_runs.pop() {
+                    commands.entity(run).despawn();
+                }
             }
-        }
+            for (&line, &run) in lines.iter().zip(&area.a11y_runs) {
+                let node = text_run_accessibility(line);
+                if let Ok(mut current) = text_runs.get_mut(run) {
+                    *current = node;
+                } else {
+                    commands.entity(run).insert(node);
+                }
+            }
 
-        sync_text_accessibility(
-            &editable,
-            &value,
-            area.read_only,
-            &area.a11y_runs,
-            &mut accessibility,
-        );
+            sync_text_accessibility(
+                &editable,
+                &value,
+                area.read_only,
+                &area.a11y_runs,
+                &mut accessibility,
+            );
+        }
 
         let composing = area.ime_transaction_before.is_some();
         if !composing {
@@ -1799,6 +1804,61 @@ mod tests {
         app.finish();
         app.cleanup();
         (app, window, camera)
+    }
+
+    #[test]
+    fn single_line_field_reuses_history_and_rejects_newlines() {
+        let (mut app, _window, camera) = test_app();
+        let entities = app
+            .world_mut()
+            .run_system_once(|mut commands: Commands| {
+                crate::text_field::spawn_text_field(
+                    &mut commands,
+                    crate::text_field::CtkTextFieldProps::new("old", "Search"),
+                )
+            })
+            .unwrap();
+        app.world_mut()
+            .entity_mut(entities.root)
+            .insert(UiTargetCamera(camera));
+        app.world_mut().entity_mut(entities.input).insert((
+            CtkTextArea::single_line("old", 4096),
+            EditableTextFilter::new(|c| c != '\n' && c != '\r'),
+        ));
+        app.world_mut()
+            .insert_resource(InputFocus::from_entity(entities.input));
+        app.update();
+        app.world_mut()
+            .get_mut::<EditableText>(entities.input)
+            .unwrap()
+            .queue_edit(TextEdit::Insert("x\ny".into()));
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<EditableText>(entities.input)
+                .unwrap()
+                .value()
+                .to_string(),
+            "oldxy"
+        );
+        assert!(
+            !app.world()
+                .get::<EditableText>(entities.input)
+                .unwrap()
+                .allow_newlines
+        );
+        app.world_mut().trigger(CtkTextAreaUndo {
+            area: entities.input,
+        });
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<EditableText>(entities.input)
+                .unwrap()
+                .value()
+                .to_string(),
+            "old"
+        );
     }
 
     fn spawn_camera(world: &mut World, window: Entity) -> Entity {
