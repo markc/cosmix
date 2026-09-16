@@ -129,7 +129,7 @@ pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
     if fences.len() != 1 { diagnostics.push(Diagnostic::error("fence-count", body_base.max(1), "body must contain exactly one ```mix fence")); return Err(diagnostics); }
     let (open, _, interior) = fences[0].clone();
     let value = match cosmix_mix::parse_data(&interior) { Ok(v) => v, Err(e) => { diagnostics.push(mix_diagnostic(e, body_base + open)); return Err(diagnostics); } };
-    let map = match value { Value::Map(m) => m, _ => { diagnostics.push(Diagnostic::error("root-type", open + 1, "fence must contain a map of nodes")); return Err(diagnostics); } };
+    let map = match &value { Value::Map(m) => m, _ => { diagnostics.push(Diagnostic::error("root-type", body_base + open + 1, "fence must contain a map of nodes")); return Err(diagnostics); } };
     let mut nodes: IndexMap<String, RawNode> = IndexMap::new();
     for (id, value) in map.iter() {
         let line = body_base + open + line_in(&interior, id).unwrap_or(1);
