@@ -302,14 +302,7 @@ pub(crate) fn reconcile(world: &mut World) {
                         .as_ref()
                         .and_then(|window| window[dimension].as_f64())
                     {
-                        world.write_message(ShellCommand {
-                            output: output.clone(),
-                            at,
-                            kind: ShellCommandKind::Resize {
-                                edge,
-                                thickness_px: size as f32,
-                            },
-                        });
+                        cosmix_shell::runtime::set_page_thickness(world, edge, size as f32);
                     }
                     world.write_message(ShellCommand {
                         output,
@@ -583,6 +576,10 @@ fn update(
                 .get("height")
                 .and_then(Value::as_f64)
                 .map_or(Val::Auto, |v| px(v as f32));
+            if node.ports.contains_key("height") {
+                layout.flex_grow = 0.0;
+                layout.flex_shrink = 0.0;
+            }
             layout.border_radius = BorderRadius::all(px(number(node, "radius", 0.0)));
             layout.align_items = match text(node, "align") {
                 "center" => AlignItems::Center,
@@ -680,6 +677,9 @@ fn update(
         }
         "list" => {
             layout.height = px(list_height(node));
+            if node.ports.contains_key("max_rows") {
+                layout.max_height = layout.height;
+            }
         }
         "image" => {
             let image = world

@@ -101,6 +101,18 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     }
 }
 
+/// Apply an authored page extent without persisting a pointer resize preference.
+pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    // Authored page sizes are not pointer-grip gestures (which have a 500px cap).
+    if runtime.model.restore_thickness(edge, thickness).is_ok() {
+        let frame = ShellFrame::from_model(&runtime.model);
+        world.resource_mut::<ShellFrameState>().0 = frame;
+    }
+}
+
 /// Update a dynamic carousel while retaining its active page when possible.
 pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: Option<&str>) {
     let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
