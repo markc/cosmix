@@ -456,6 +456,78 @@ pub fn spawn_quoin_chrome(
     }
 }
 
+/// Mount a dynamic page without rebuilding other pages or their editing state.
+/// Returns false until the host has created this edge's chrome.
+pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content: Entity) -> bool {
+    let mut query = world.query::<(Entity, &QuoinPanelChrome, &Children)>();
+    let Some((panel, host)) = query
+        .iter(world)
+        .find(|(_, chrome, _)| chrome.edge == edge)
+        .and_then(|(entity, _, children)| children.get(1).map(|host| (entity, *host)))
+    else {
+        return false;
+    };
+    let exists = world
+        .get::<QuoinPanelParts>(panel)
+        .unwrap()
+        .page_wrappers
+        .iter()
+        .any(|(page, _)| page == id);
+    if exists {
+        return true;
+    }
+    let wrapper = world
+        .spawn(Node {
+            width: percent(100),
+            height: percent(100),
+            min_width: px(0),
+            display: Display::None,
+            ..default()
+        })
+        .add_child(content)
+        .id();
+    world.entity_mut(host).add_child(wrapper);
+    let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
+    parts.page_titles.push((id.into(), title.into()));
+    parts.page_wrappers.push((id.into(), wrapper));
+    let ids = parts
+        .page_wrappers
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    crate::runtime::set_shell_pages(world, edge, ids, Some(id));
+    true
+}
+
+/// Remove a dynamic page and repair the carousel selection.
+pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
+    let mut query = world.query::<(Entity, &QuoinPanelChrome)>();
+    let Some(panel) = query
+        .iter(world)
+        .find(|(_, chrome)| chrome.edge == edge)
+        .map(|(e, _)| e)
+    else {
+        return;
+    };
+    let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
+    let wrapper = parts
+        .page_wrappers
+        .iter()
+        .find(|(page, _)| page == id)
+        .map(|(_, entity)| *entity);
+    parts.page_titles.retain(|(page, _)| page != id);
+    parts.page_wrappers.retain(|(page, _)| page != id);
+    let ids = parts
+        .page_wrappers
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    if let Some(wrapper) = wrapper {
+        world.despawn(wrapper);
+    }
+    crate::runtime::set_shell_pages(world, edge, ids, None);
+}
+
 fn spawn_panel(
     commands: &mut Commands,
     mount: Entity,

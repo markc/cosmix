@@ -102,6 +102,7 @@ const TYPING_COALESCE_SECS: f64 = 0.75;
 /// Behaviour and CTK-owned state attached to the editable node.
 #[derive(Component, Clone, Debug)]
 pub struct CtkTextArea {
+    single_line: bool,
     max_len: usize,
     read_only: bool,
     visible_lines: usize,
@@ -133,6 +134,7 @@ impl CtkTextArea {
         a11y_runs: Vec<Entity>,
     ) -> Self {
         Self {
+            single_line: false,
             max_len,
             read_only,
             visible_lines: visible_lines.max(1),
@@ -161,6 +163,20 @@ impl CtkTextArea {
             filtered_inflight: None,
             manual_scroll_y: None,
         }
+    }
+
+    /// Reuse CTK's editing transactions on a plain single-line field.
+    pub fn single_line(initial: impl Into<String>, max_len: usize) -> Self {
+        let mut state = Self::new(
+            initial.into(),
+            max_len,
+            false,
+            1,
+            DEFAULT_HISTORY_LIMIT,
+            Vec::new(),
+        );
+        state.single_line = true;
+        state
     }
 
     /// Maximum Unicode scalar-value count accepted by user and programmatic edits.
@@ -619,6 +635,10 @@ fn on_text_area_keyboard(
     let command = control;
 
     let handled = match &event.input.logical_key {
+        Key::Enter if area.single_line => {
+            area.submit_requested = !event.input.repeat;
+            true
+        }
         Key::PageUp if !control && !super_key && !alt => {
             queue_page_motion(
                 &mut area,
@@ -872,8 +892,8 @@ fn process_text_area_edits(
         if editable.visible_lines != Some(area.visible_lines as f32) {
             editable.visible_lines = Some(area.visible_lines as f32);
         }
-        if !editable.allow_newlines {
-            editable.allow_newlines = true;
+        if editable.allow_newlines == area.single_line {
+            editable.allow_newlines = !area.single_line;
         }
 
         if area.ime_transaction_before.is_some() {

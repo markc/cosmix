@@ -86,6 +86,8 @@ pub(crate) struct ShellBusPlugin;
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
+            .init_resource::<cosmix_scene_bevy::SceneStore>()
+            .init_resource::<cosmix_scene_bevy::SceneEvents>()
             .init_resource::<crate::wallpaper::WallpaperState>()
             .init_resource::<crate::demos::DemoState>()
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
@@ -100,6 +102,8 @@ fn service_bus(
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut power_text: Query<&mut Text, With<QuoinPowerText>>,
+    mut scenes: ResMut<cosmix_scene_bevy::SceneStore>,
+    mut scene_events: ResMut<cosmix_scene_bevy::SceneEvents>,
     mut wallpaper: (
         ResMut<crate::wallpaper::WallpaperState>,
         ResMut<cosmix_shell_host::LayerHostDeadline>,
@@ -116,6 +120,7 @@ fn service_bus(
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
+        scene_events.reply(&event);
         wallpaper.0.event(&event, time.elapsed());
         wallpaper.2.event(&event, time.elapsed());
         match event {
@@ -210,24 +215,29 @@ fn service_bus(
 
     for request in bridge.drain_inbound() {
         let started = std::time::Instant::now();
-        let (rc, body, command) = if request.command == "shell.debug.status" {
-            (
-                0,
-                json!({
-                    "requests":state.diagnostics.requests,
-                    "rejected":state.diagnostics.rejected,
-                    "accepted_mutations":state.diagnostics.accepted_mutations,
-                    "max_dispatch_us":state.diagnostics.max_dispatch_us,
-                    "pending_replies":state.pending_replies.len(),
-                    "connected":state.live_generation.is_some(),
-                    "scope":"this process; dispatch excludes model application and transport"
-                })
-                .to_string(),
-                None,
-            )
-        } else {
-            dispatch_shell_request(&request, &frame.0, time.elapsed())
-        };
+        let (rc, body, command) =
+            if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
+                let args = parse_args(&request).unwrap_or(Value::Null);
+                let (rc, body) = scenes.dispatch(verb, &request.body, &args, &bridge);
+                (rc, body, None)
+            } else if request.command == "shell.debug.status" {
+                (
+                    0,
+                    json!({
+                        "requests":state.diagnostics.requests,
+                        "rejected":state.diagnostics.rejected,
+                        "accepted_mutations":state.diagnostics.accepted_mutations,
+                        "max_dispatch_us":state.diagnostics.max_dispatch_us,
+                        "pending_replies":state.pending_replies.len(),
+                        "connected":state.live_generation.is_some(),
+                        "scope":"this process; dispatch excludes model application and transport"
+                    })
+                    .to_string(),
+                    None,
+                )
+            } else {
+                dispatch_shell_request(&request, &frame.0, time.elapsed())
+            };
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         state.diagnostics.record(rc, command.is_some(), elapsed_us);
         if command.is_some() || rc != 0 {
@@ -345,7 +355,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }

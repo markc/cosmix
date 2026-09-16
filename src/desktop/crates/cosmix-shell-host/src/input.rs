@@ -654,6 +654,7 @@ pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
 fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
     match kind {
         ShellCommandKind::Quit => "quit",
+        ShellCommandKind::Scene(_) => "scene",
         ShellCommandKind::Resize { .. } => "resize",
         ShellCommandKind::ResizeCommit { .. } => "resize-commit",
         ShellCommandKind::Geometry(_) => "geometry",

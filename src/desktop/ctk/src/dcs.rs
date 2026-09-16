@@ -12,7 +12,7 @@ use bevy::app::PostUpdate;
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 use bevy::ecs::hierarchy::Children;
 use bevy::ecs::observer::On;
 #[cfg(debug_assertions)]
