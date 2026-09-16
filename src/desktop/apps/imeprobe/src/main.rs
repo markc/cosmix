@@ -364,6 +364,17 @@ fn main() {
     app.input_method = Some(manager.get_input_method(&seat, &qh, ()));
     let _ = queue.roundtrip(&mut app);
 
+    // Exercise an existing client field without mapping the probe's own field.
+    if std::env::args().any(|arg| arg == "--external-field") {
+        println!("IMEPROBE waiting for an external text field");
+        loop {
+            if let Err(error) = queue.blocking_dispatch(&mut app) {
+                eprintln!("IMEPROBE dispatch failed: {error}");
+                std::process::exit(5);
+            }
+        }
+    }
+
     // Now the text field half: a real window that takes focus, so the
     // compositor has something to activate the input method FOR.
     let (Some(compositor), Some(wm_base), Some(text_input_manager)) = (

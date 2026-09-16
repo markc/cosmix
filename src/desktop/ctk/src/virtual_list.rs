@@ -2001,7 +2001,7 @@ mod tests {
         let model = TestModel::ids([0, 1, 1, 3, 4, 5, 6, 7, 8, 9]);
         let mut app = App::new();
         app.add_plugins(VirtualListPlugin);
-        let (root, viewport) = {
+        let (_root, viewport) = {
             let mut commands = app.world_mut().commands();
             let entities = spawn_virtual_list(
                 &mut commands,
@@ -2014,7 +2014,7 @@ mod tests {
         #[cfg(debug_assertions)]
         {
             app.world()
-                .get::<VirtualList>(root)
+                .get::<VirtualList>(_root)
                 .unwrap()
                 .state
                 .lock()
