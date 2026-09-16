@@ -195,11 +195,11 @@ fn row_click(
     bridge: Res<BusBridge>,
     mut events: ResMut<Events>,
 ) {
-    if let Ok(binding) = bindings.get(event.entity) {
-        if event.button == bevy::picking::pointer::PointerButton::Primary {
-            events.send(&bridge, binding, "click", None);
-            event.propagate(false);
-        }
+    if let Ok(binding) = bindings.get(event.entity)
+        && event.button == bevy::picking::pointer::PointerButton::Primary
+    {
+        events.send(&bridge, binding, "click", None);
+        event.propagate(false);
     }
 }
 fn hover(mut query: Query<(&Hovered, &SceneHover, &mut BackgroundColor), Changed<Hovered>>) {

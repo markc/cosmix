@@ -30,8 +30,7 @@ use ctk::theme::{
     tokens,
 };
 
-const USAGE: &str =
-    "usage: cosmix-quoin [--output NAME] [--comp-service NAME] [--smoke-all-panels|--smoke-hidden]";
+const USAGE: &str = "usage: cosmix-quoin [--output NAME] [--comp-service NAME] [--bus-service NAME] [--smoke-all-panels|--smoke-hidden]";
 
 #[derive(Debug)]
 struct Cli {
@@ -39,6 +38,7 @@ struct Cli {
     smoke_all_panels: bool,
     smoke_hidden: bool,
     comp_service: String,
+    bus_service: String,
 }
 
 impl Default for Cli {
@@ -48,6 +48,7 @@ impl Default for Cli {
             smoke_all_panels: false,
             smoke_hidden: false,
             comp_service: "comp".to_owned(),
+            bus_service: "shell".to_owned(),
         }
     }
 }
@@ -113,7 +114,7 @@ pub fn run_layer_host() -> AppExit {
     let mut app = App::new();
     configure_layer_host(&mut app, host);
     let wake = app.world().resource::<LayerHostWake>().callback();
-    let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
+    let mut bus = BusBridgeConfig::new(cli.bus_service, resolve_noded_url());
     bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
     bus.subscriptions.push("power.props.changed".to_owned());
     bus.subscriptions.push("wallpaper.props.changed".to_owned());
@@ -170,9 +171,23 @@ fn configure_content(
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
     let mut cli = Cli::default();
     let mut comp_service_seen = false;
+    let mut bus_service_seen = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--bus-service" => {
+                if bus_service_seen {
+                    return Err("--bus-service may be supplied only once".into());
+                }
+                let service = arguments
+                    .next()
+                    .ok_or_else(|| "--bus-service requires a NAME".to_owned())?;
+                if !valid_service_name(&service) {
+                    return Err("--bus-service requires a canonical service NAME".into());
+                }
+                cli.bus_service = service;
+                bus_service_seen = true;
+            }
             "--output" => {
                 if cli.output.is_some() {
                     return Err("--output may be supplied only once".to_owned());
