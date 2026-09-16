@@ -195,7 +195,10 @@ const fn pnd(n: &'static str, d: &'static str, m: Option<f64>) -> Port {
         required: false,
         default: Some(d),
         enum_values: &[],
-        min: Some(m.unwrap_or(0.0)),
+        min: Some(match m {
+            Some(value) => value,
+            None => 0.0,
+        }),
     }
 }
 const fn pn(n: &'static str, r: bool, m: Option<f64>) -> Port {
@@ -205,7 +208,10 @@ const fn pn(n: &'static str, r: bool, m: Option<f64>) -> Port {
         required: r,
         default: None,
         enum_values: &[],
-        min: Some(m.unwrap_or(0.0)),
+        min: Some(match m {
+            Some(value) => value,
+            None => 0.0,
+        }),
     }
 }
 fn schema(f: &str) -> Option<&'static [Port]> {
