@@ -885,7 +885,7 @@ mod tests {
                 store
                     .request(cosmix_shell::runtime::SceneVerb::Load, source, &Value::Null)
                     .unwrap();
-                let before = store.scenes["conformance"].tree.clone();
+                let mut before = store.scenes["conformance"].tree.clone();
                 if store
                     .request(
                         cosmix_shell::runtime::SceneVerb::Patch,
@@ -896,7 +896,12 @@ mod tests {
                 {
                     continue; // Required ports and window disagreements are not clearable.
                 }
-                let after = &store.scenes["conformance"].tree;
+                let mut after = store.scenes["conformance"].tree.clone();
+                // Also render template nodes directly to cover their derived
+                // constraints without relying on viewport-driven row binding.
+                before.templates.clear();
+                after.templates.clear();
+                let after = &after;
                 let mut world = World::new();
                 let mut patched = mounted(&mut world, &before);
                 apply(&mut world, &mut patched, &before);

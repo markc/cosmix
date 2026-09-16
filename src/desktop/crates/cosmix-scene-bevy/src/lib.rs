@@ -175,7 +175,7 @@ impl SceneStore {
                 }
                 if serialised_document(&document).len() > cosmix_scene::MAX_DOCUMENT_BYTES {
                     return Err(json!({"scene":name,"diagnostics":[{
-                        "severity":"error", "code":"document-size", "line":1,
+                        "severity":"error", "code":"document-too-large", "line":1,
                         "message":"patched document exceeds 256 KiB"
                     }]}));
                 }
@@ -288,7 +288,7 @@ mod tests {
                 &json!({"scene":"conformance","path":"button.label","value":"x".repeat(100_000)}),
             )
             .unwrap_err();
-        assert_eq!(error["diagnostics"][0]["code"], "document-size");
+        assert_eq!(error["diagnostics"][0]["code"], "document-too-large");
         assert_eq!(store.scenes["conformance"].tree, before);
         assert_eq!(store.scenes["conformance"].revision, revision);
     }
