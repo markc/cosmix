@@ -751,15 +751,7 @@ impl VirtualListModel for ListModel {
 fn template_node(world: &mut World, tree: &ResolvedScene, id: &str, item: &Value) -> Entity {
     let mut node = tree.nodes[id].clone();
     if node.family == "text" {
-        let mut value = text(&node, "text").to_owned();
-        if let Some(cells) = item["cells"].as_array() {
-            for (i, cell) in cells.iter().enumerate() {
-                value = value.replace(
-                    &format!("{{cells[{i}]}}"),
-                    cell.as_str().unwrap_or_default(),
-                );
-            }
-        }
+        let value = substitute_cells(text(&node, "text"), &item["cells"]);
         node.ports.insert("text".into(), json!(value));
     }
     let instance = format!("{id}@{}", item["id"].as_str().unwrap_or_default());
@@ -771,6 +763,30 @@ fn template_node(world: &mut World, tree: &ResolvedScene, id: &str, item: &Value
         .collect();
     world.entity_mut(view.root).add_children(&children);
     view.root
+}
+fn substitute_cells(mut source: &str, cells: &Value) -> String {
+    let mut out = String::new();
+    while let Some(start) = source.find("{cells[") {
+        out.push_str(&source[..start]);
+        let token = &source[start + 7..];
+        let Some(end) = token.find("]}") else {
+            out.push_str(&source[start..]);
+            return out;
+        };
+        if let Some(value) = token[..end]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| cells.get(index))
+            .and_then(Value::as_str)
+        {
+            out.push_str(value);
+        } else {
+            out.push_str(&source[start..start + 7 + end + 2]);
+        }
+        source = &token[end + 2..];
+    }
+    out.push_str(source);
+    out
 }
 fn children(node: &SceneNode) -> impl Iterator<Item = &str> {
     node.ports
@@ -833,6 +849,13 @@ fn color(value: &str, fallback: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cell_values_are_literal_and_not_reexpanded() {
+        assert_eq!(
+            substitute_cells("{cells[0]} / {cells[1]}", &json!(["{cells[1]}", "literal"])),
+            "{cells[1]} / literal"
+        );
+    }
     #[test]
     fn unrelated_reload_retains_the_entire_field_entity() {
         let doc = cosmix_scene::parse(include_str!(
