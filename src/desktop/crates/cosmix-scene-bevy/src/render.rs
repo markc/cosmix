@@ -368,14 +368,7 @@ fn template_ids(tree: &ResolvedScene) -> BTreeSet<String> {
 }
 
 fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
-    let mut ops = cosmix_scene::diff(&mounted.tree, tree);
-    ops.sort_by_key(|op| match op {
-        Op::Remove { .. } => 0,
-        Op::Insert { .. } => 1,
-        Op::SetPort { .. } => 2,
-        Op::Reparent { .. } => 3,
-        Op::SetScene { .. } => 4,
-    });
+    let ops = cosmix_scene::diff(&mounted.tree, tree);
     let templates = template_ids(tree);
     // Detach scene-owned roots before removals; a retained descendant must not
     // be recursively despawned with a removed parent.
@@ -910,6 +903,38 @@ mod tests {
         assert_eq!(mount_config(&store.scenes["node-mount"].tree).unwrap()["title"], "Node");
         store.request(cosmix_shell::runtime::SceneVerb::Patch, "", &json!({"scene":"node-mount","path":"root.edge","value":"right"})).unwrap();
         assert_eq!(scene_edge(&store.scenes["node-mount"].tree), Edge::Right);
+    }
+
+    #[test]
+    fn reconcile_moves_node_mount_and_unloads_last_page() {
+        use cosmix_shell::chrome::{QuoinPageRegistry, QuoinContentBindings, QuoinPanelMounts, spawn_quoin_chrome};
+        use cosmix_shell::core::{ShellModel, OutputKey, LogicalSize};
+        use cosmix_shell::runtime::{ShellFrameState, ShellRuntimePlugin, SceneVerb};
+        let mut app = App::new();
+        let model = ShellModel::new(OutputKey::new("test").unwrap(), LogicalSize::new(800.0,600.0).unwrap(), Duration::ZERO, Duration::from_millis(100), Duration::from_millis(100)).unwrap();
+        app.add_plugins(MinimalPlugins).add_plugins(ShellRuntimePlugin::new(model));
+        let world = app.world_mut();
+        let registry = QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap();
+        let props = registry.bind(&world.resource::<ShellFrameState>().0, QuoinContentBindings::default()).unwrap();
+        let mounts = QuoinPanelMounts::new(world.spawn_empty().id(), world.spawn_empty().id(), world.spawn_empty().id(), world.spawn_empty().id());
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
+        queue.apply(world);
+        let mut store = SceneStore::default();
+        store.request(SceneVerb::Load, "---\nscene: 1\nname: mount-test\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"left\", w: 200}\n```\n", &Value::Null).unwrap();
+        world.insert_resource(store);
+        reconcile(world);
+        assert_eq!(world.resource::<ShellFrameState>().0.panel(Edge::Left).page_ids.as_ref(), &["scene-mount-test"]);
+        let page = world.resource::<SceneStore>().scenes["mount-test"].mounted.as_ref().unwrap().page;
+        world.resource_mut::<SceneStore>().request(SceneVerb::Patch, "", &json!({"scene":"mount-test","path":"root.edge","value":"right"})).unwrap();
+        reconcile(world);
+        assert!(world.resource::<ShellFrameState>().0.panel(Edge::Left).page_ids.is_empty());
+        assert_eq!(world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids.as_ref(), &["scene-mount-test"]);
+        assert_eq!(world.resource::<SceneStore>().scenes["mount-test"].mounted.as_ref().unwrap().page, page);
+        world.resource_mut::<SceneStore>().request(SceneVerb::Unload, "", &json!({"scene":"mount-test"})).unwrap();
+        reconcile(world);
+        assert!(world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids.is_empty());
+        assert!(world.get_entity(page).is_err());
     }
 
     #[test]
