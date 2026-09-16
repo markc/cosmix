@@ -994,7 +994,7 @@ fn reachable(d: &SceneDocument) -> HashSet<String> {
     if d.nodes.contains_key("root") {
         go("root", d, &mut s);
     }
-    for n in d.nodes.values() {
+    for n in d.nodes.values().filter(|n| n.widget == "list") {
         if let Some(row) = n.ports.get("row").and_then(JsonValue::as_str) {
             go(row, d, &mut s);
         }
@@ -1161,7 +1161,7 @@ mod tests {
             ),
         ] {
             for (port, value) in expected {
-                assert_eq!(r.nodes[id].ports[*port], *value, "{id}.{port}");
+                assert_eq!(r.nodes[id].ports.get(*port), Some(value), "{id}.{port}");
             }
         }
         assert!(r.nodes["spacer"].ports.is_empty());
