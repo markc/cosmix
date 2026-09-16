@@ -448,9 +448,9 @@ fn sync_placeholders(
     mut hints: Query<(&CtkTextFieldPlaceholder, &mut Visibility)>,
 ) {
     for (hint, mut visibility) in &mut hints {
-        let show = fields
-            .get(hint.input)
-            .is_ok_and(|editable| editable.value().is_empty() && !editable.is_composing());
+        let show = fields.get(hint.input).is_ok_and(|editable| {
+            !editable.is_composing() && editable.value().to_string().is_empty()
+        });
         let next = if show {
             Visibility::Inherited
         } else {
@@ -576,6 +576,7 @@ mod tests {
             .get::<EditableText>(field.input)
             .unwrap()
             .value()
+            .to_string()
             .is_empty());
         let hint = app
             .world_mut()
