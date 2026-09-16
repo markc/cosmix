@@ -8,6 +8,7 @@ Invalid loads and patches return diagnostics and retain the last good tree.
 Scenes mount as pages in an edge panel. Floating windows are outside v0.
 The envelope's `window` header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
+An absent or cleared extent uses the shell's output-derived default thickness.
 Authored extents fit the output space left by opposing exclusive zones;
 pinning and output changes recheck that budget. Clearing ports resets their
 derived layout constraints. A spacer without a size flexes into free space.

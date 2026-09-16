@@ -300,12 +300,15 @@ pub(crate) fn reconcile(world: &mut World) {
                     } else {
                         "h"
                     };
-                    if let Some(size) = config
+                    let default_size = cosmix_shell::core::seed_panel_thickness(
+                        edge,
+                        world.resource::<ShellFrameState>().0.geometry.logical_size,
+                    );
+                    let size = config
                         .as_ref()
                         .and_then(|window| window[dimension].as_f64())
-                    {
-                        cosmix_shell::runtime::set_page_thickness(world, edge, size as f32);
-                    }
+                        .map_or(default_size, |size| size.min(f32::MAX as f64) as f32);
+                    cosmix_shell::runtime::set_page_thickness(world, edge, size);
                     world.write_message(ShellCommand {
                         output,
                         at,
@@ -1029,6 +1032,20 @@ mod tests {
                 .unwrap()
                 .page,
             page
+        );
+        world
+            .resource_mut::<SceneStore>()
+            .request(
+                SceneVerb::Patch,
+                "",
+                &json!({"scene":"mount-test","path":"root.w","value":null}),
+            )
+            .unwrap();
+        reconcile(world);
+        let frame = &world.resource::<ShellFrameState>().0;
+        assert_eq!(
+            frame.panel(Edge::Right).thickness_px,
+            cosmix_shell::core::seed_panel_thickness(Edge::Right, frame.geometry.logical_size)
         );
         world
             .resource_mut::<SceneStore>()
