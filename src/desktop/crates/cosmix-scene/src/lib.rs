@@ -138,7 +138,7 @@ pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
         let ports = fields.iter().filter(|(k, _)| k.as_str() != "widget").map(|(k, v)| (k.clone(), json_value(v))).collect();
         nodes.insert(id.clone(), RawNode { widget, ports, line });
     }
-    for (id, count) in duplicate_ids(&interior) { if count > 1 { diagnostics.push(Diagnostic::error("duplicate-id", body_base + open, format!("duplicate node id {id}"))); } }
+    for (id, count) in duplicate_ids(source) { if count > 1 { diagnostics.push(Diagnostic::error("duplicate-id", body_base + open, format!("duplicate node id {id}"))); } }
     if !diagnostics.is_empty() { return Err(diagnostics); }
     let document = SceneDocument { name: msg.get("name").unwrap_or_default().into(), citizen: msg.get("citizen").unwrap_or_default().into(), window: header_json(msg.get("window"), &mut diagnostics, 1), subscribe: header_json(msg.get("subscribe"), &mut diagnostics, 1), targets: header_json(msg.get("targets"), &mut diagnostics, 1), model: header_json(msg.get("model"), &mut diagnostics, 1), nodes, source: source.into() };
     if !diagnostics.is_empty() { Err(diagnostics) } else { Ok(document) }
