@@ -142,6 +142,11 @@ impl SceneStore {
                     .nodes
                     .get_mut(id)
                     .ok_or_else(|| json!({"error":"unknown node"}))?;
+                if !cosmix_scene::describe(&node.widget)
+                    .is_some_and(|ports| ports.iter().any(|description| description.path == port))
+                {
+                    return Err(json!({"error":"unknown port"}));
+                }
                 if value.is_null() {
                     node.ports.shift_remove(port);
                 } else {
@@ -168,9 +173,6 @@ impl SceneStore {
             return Err(json!({"diagnostics":diagnostics}));
         }
         let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
-        if serde_json::to_vec(&tree).unwrap().len() > cosmix_scene::MAX_DOCUMENT_BYTES {
-            return Err(json!({"error":"resolved scene exceeds 256 KiB"}));
-        }
         let ops = self.scenes.get(&tree.name).map_or(tree.nodes.len(), |old| {
             cosmix_scene::diff(&old.tree, &tree).len()
         });
