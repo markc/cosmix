@@ -209,6 +209,7 @@ fn hover(mut query: Query<(&Hovered, &SceneHover, &mut BackgroundColor), Changed
 }
 
 pub(crate) struct Mounted {
+    revision: u64,
     tree: ResolvedScene,
     page: Entity,
     edge: Edge,
@@ -246,6 +247,7 @@ pub(crate) fn reconcile(world: &mut World) {
                 m.registered = false;
             }
             let mounted = entry.mounted.get_or_insert_with(|| Mounted {
+                revision: 0,
                 tree: ResolvedScene {
                     nodes: Default::default(),
                     ..entry.tree.clone()
@@ -262,16 +264,18 @@ pub(crate) fn reconcile(world: &mut World) {
                 registered: false,
                 nodes: BTreeMap::new(),
             });
-            if mounted.tree != entry.tree {
-                if mounted.tree.window != entry.tree.window {
+            if mounted.revision != entry.revision {
+                if mount_config(&mounted.tree) != mount_config(&entry.tree) {
                     mounted.registered = false;
                 }
                 apply(world, mounted, &entry.tree);
+                mounted.revision = entry.revision;
+            } else {
+                debug_assert_eq!(mounted.tree, entry.tree);
             }
             if !mounted.registered {
-                let title = entry
-                    .tree
-                    .window
+                let config = mount_config(&entry.tree);
+                let title = config
                     .as_ref()
                     .and_then(|w| w["title"].as_str())
                     .unwrap_or(&entry.tree.name);
@@ -296,9 +300,7 @@ pub(crate) fn reconcile(world: &mut World) {
                     } else {
                         "h"
                     };
-                    if let Some(size) = entry
-                        .tree
-                        .window
+                    if let Some(size) = config
                         .as_ref()
                         .and_then(|window| window[dimension].as_f64())
                     {
@@ -328,8 +330,7 @@ fn page_id(tree: &ResolvedScene) -> String {
     format!("scene-{}", tree.name)
 }
 fn scene_edge(tree: &ResolvedScene) -> Edge {
-    match tree
-        .window
+    match mount_config(tree)
         .as_ref()
         .and_then(|w| w["edge"].as_str())
         .unwrap_or("right")
@@ -339,6 +340,13 @@ fn scene_edge(tree: &ResolvedScene) -> Edge {
         "bottom" => Edge::Bottom,
         _ => Edge::Right,
     }
+}
+
+fn mount_config(tree: &ResolvedScene) -> Option<Value> {
+    tree.window.clone().or_else(|| {
+        tree.nodes.values().find(|node| node.family == "window")
+            .map(|node| json!(node.ports))
+    })
 }
 
 fn template_ids(tree: &ResolvedScene) -> BTreeSet<String> {
@@ -547,6 +555,9 @@ fn update(
         .entity_mut(view.input.unwrap_or(view.root))
         .insert(binding);
     let mut layout = world.get::<Node>(view.root).cloned().unwrap_or_default();
+    // Reset every derived constraint before applying the current resolved ports.
+    layout.flex_shrink = Node::default().flex_shrink;
+    layout.max_height = Val::Auto;
     layout.width = node
         .ports
         .get("width")
@@ -693,9 +704,11 @@ fn update(
             layout.height = px(number(node, "h", 16.0));
         }
         "spacer" => {
-            layout.width = px(number(node, "size", 13.0));
+            layout.width = node.ports.get("size").and_then(Value::as_f64)
+                .map_or(Val::Auto, |size| px(size as f32));
             layout.height = layout.width;
             layout.flex_shrink = 0.0;
+            layout.flex_grow = if layout.width == Val::Auto { 1.0 } else { 0.0 };
         }
         "window" => {
             layout.width = px(number(node, "w", 0.0));
@@ -849,6 +862,66 @@ fn color(value: &str, fallback: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn mounted(world: &mut World, tree: &ResolvedScene) -> Mounted {
+        Mounted {
+            revision: 0,
+            tree: ResolvedScene { nodes: Default::default(), ..tree.clone() },
+            page: world.spawn_empty().id(), edge: scene_edge(tree),
+            registered: false, nodes: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn every_clearable_port_matches_a_fresh_mount() {
+        let source = include_str!("../../cosmix-scene/tests/fixtures/conformance.scene.md");
+        let mut checked = 0;
+        let doc = cosmix_scene::parse(source).unwrap();
+        for (id, node) in &doc.nodes {
+            for port in node.ports.keys() {
+                let mut store = SceneStore::default();
+                store.request(cosmix_shell::runtime::SceneVerb::Load, source, &Value::Null).unwrap();
+                let before = store.scenes["conformance"].tree.clone();
+                if store.request(cosmix_shell::runtime::SceneVerb::Patch, "",
+                    &json!({"scene":"conformance","path":format!("{id}.{port}"),"value":null})).is_err() {
+                    continue; // Required ports and window disagreements are not clearable.
+                }
+                let after = &store.scenes["conformance"].tree;
+                let mut world = World::new();
+                let mut patched = mounted(&mut world, &before);
+                apply(&mut world, &mut patched, &before);
+                apply(&mut world, &mut patched, after);
+                let mut fresh = mounted(&mut world, after);
+                apply(&mut world, &mut fresh, after);
+                for (key, view) in &patched.nodes {
+                    assert_eq!(world.get::<Node>(view.root), world.get::<Node>(fresh.nodes[key].root), "{id}.{port}: {key}");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 30, "only {checked} clearable ports tested");
+    }
+
+    #[test]
+    fn node_only_mount_and_edge_patch() {
+        let source = "---\nscene: 1\nname: node-mount\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"left\", title: \"Node\", w: 200}\n```\n";
+        let mut store = SceneStore::default();
+        store.request(cosmix_shell::runtime::SceneVerb::Load, source, &Value::Null).unwrap();
+        assert_eq!(scene_edge(&store.scenes["node-mount"].tree), Edge::Left);
+        assert_eq!(mount_config(&store.scenes["node-mount"].tree).unwrap()["title"], "Node");
+        store.request(cosmix_shell::runtime::SceneVerb::Patch, "", &json!({"scene":"node-mount","path":"root.edge","value":"right"})).unwrap();
+        assert_eq!(scene_edge(&store.scenes["node-mount"].tree), Edge::Right);
+    }
+
+    #[test]
+    fn unset_spacer_flexes() {
+        let tree = cosmix_scene::resolve(&cosmix_scene::parse("---\nscene: 1\nname: spacer-test\ncitizen: test\n---\n```mix\nroot: {widget: \"spacer\"}\n```\n").unwrap()).unwrap();
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let layout = world.get::<Node>(mounted.nodes["root"].root).unwrap();
+        assert_eq!(layout.width, Val::Auto);
+        assert_eq!(layout.flex_grow, 1.0);
+    }
     #[test]
     fn cell_values_are_literal_and_not_reexpanded() {
         assert_eq!(
@@ -866,6 +939,7 @@ mod tests {
         let mut world = World::new();
         let page = world.spawn_empty().id();
         let mut mounted = Mounted {
+            revision: 0,
             tree: ResolvedScene {
                 nodes: Default::default(),
                 ..tree.clone()

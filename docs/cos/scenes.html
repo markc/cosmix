@@ -447,6 +447,11 @@ The request body is the complete AMP document with one <code>mix</code> fence. T
 <code>cosmix-scene</code> parser and registry validate it before any live state changes.
 Invalid loads and patches return diagnostics and retain the last good tree.</p>
 <p>Scenes mount as pages in an edge panel. Floating windows are outside v0.
+The envelope's <code>window</code> header is the mount request; when absent, the window
+node supplies edge, title and extent. Patching that node reapplies the mount.
+Authored extents fit the output space left by opposing exclusive zones;
+pinning and output changes recheck that budget. Clearing ports resets their
+derived layout constraints. A spacer without a size flexes into free space.
 For a nested development host, select its compositor with <code>--comp-service</code>
 and a distinct registration with <code>--bus-service</code>; the default registration
 remains <code>shell</code>. Scene verb names retain the <code>shell.scene.</code> prefix.
@@ -454,6 +459,8 @@ remains <code>shell</code>. Scene verb names retain the <code>shell.scene.</code
 template metadata and numeric ports as floating-point values. An optional
 <code>path</code> selects <code>node.port</code>. <code>shell.scene.patch {scene,path,value}</code> validates
 a candidate before committing it; null clears an optional authored port.
+The complete serialised patch candidate must fit the same 256 KiB bound as
+loads. Rejected patches retain both the tree and its revision.
 <code>shell.scene.describe {family?}</code> reports the shared P1 registry.
 <code>shell.scene.unload {scene}</code> removes the page.</p>
 <p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
@@ -474,6 +481,8 @@ Text elision uses CTK's middle-elision policy.</p>
 <p>The standalone shell host bridges Wayland text-input-v3 preedit and commit
 events to Bevy's editable text pipeline. Candidate positions come from the
 focused field's layout in its panel surface, without a primary Winit window.
+Focus generations and text-input <code>done</code> serials discard delayed batches for
+previously focused fields.
 The synthetic <code>cosmix-imeprobe --external-field</code> mode exercises an existing
 client field without opening the probe's own text window.</p>
 <p>Development builds may enable Quoin's <code>scene-gates</code> feature and set

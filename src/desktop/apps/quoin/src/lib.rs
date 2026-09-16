@@ -121,7 +121,7 @@ pub fn run_layer_host() -> AppExit {
     bus.subscriptions
         .push("bg-showcase.props.changed".to_owned());
     bus.inbound_prefixes.push("shell.".to_owned());
-    bus.max_inbound_body_bytes = 256 * 1024;
+    bus.max_inbound_body_bytes = cosmix_scene::MAX_DOCUMENT_BYTES;
     bus.worker_wake = Some(BusWorkerWake::new(wake));
     configure_content(
         &mut app,

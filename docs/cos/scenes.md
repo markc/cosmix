@@ -6,6 +6,11 @@ The request body is the complete AMP document with one `mix` fence. The
 Invalid loads and patches return diagnostics and retain the last good tree.
 
 Scenes mount as pages in an edge panel. Floating windows are outside v0.
+The envelope's `window` header is the mount request; when absent, the window
+node supplies edge, title and extent. Patching that node reapplies the mount.
+Authored extents fit the output space left by opposing exclusive zones;
+pinning and output changes recheck that budget. Clearing ports resets their
+derived layout constraints. A spacer without a size flexes into free space.
 For a nested development host, select its compositor with `--comp-service`
 and a distinct registration with `--bus-service`; the default registration
 remains `shell`. Scene verb names retain the `shell.scene.` prefix.
@@ -13,6 +18,8 @@ remains `shell`. Scene verb names retain the `shell.scene.` prefix.
 template metadata and numeric ports as floating-point values. An optional
 `path` selects `node.port`. `shell.scene.patch {scene,path,value}` validates
 a candidate before committing it; null clears an optional authored port.
+The complete serialised patch candidate must fit the same 256 KiB bound as
+loads. Rejected patches retain both the tree and its revision.
 `shell.scene.describe {family?}` reports the shared P1 registry.
 `shell.scene.unload {scene}` removes the page.
 
@@ -38,6 +45,8 @@ Text elision uses CTK's middle-elision policy.
 The standalone shell host bridges Wayland text-input-v3 preedit and commit
 events to Bevy's editable text pipeline. Candidate positions come from the
 focused field's layout in its panel surface, without a primary Winit window.
+Focus generations and text-input `done` serials discard delayed batches for
+previously focused fields.
 The synthetic `cosmix-imeprobe --external-field` mode exercises an existing
 client field without opening the probe's own text window.
 

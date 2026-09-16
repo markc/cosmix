@@ -281,6 +281,33 @@ fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
 mod tests {
     use super::*;
     #[test]
+    fn unmounting_last_dynamic_page_clears_carousel() {
+        let mut app = app();
+        set_shell_pages(app.world_mut(), Edge::Top, vec!["scene-only".into()], None);
+        set_shell_pages(app.world_mut(), Edge::Top, vec![], None);
+        let runtime = app.world().resource::<ShellRuntime>();
+        assert!(runtime.model.carousel(Edge::Top).page_ids().is_empty());
+        assert_eq!(runtime.model.carousel(Edge::Top).active_id(), None);
+    }
+
+    #[test]
+    fn authored_opposing_panels_fit_on_pin_and_output_change() {
+        let mut app = app();
+        for edge in [Edge::Left, Edge::Right] {
+            set_page_thickness(app.world_mut(), edge, 100_000.0);
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            runtime.model.panel_input(edge, Duration::ZERO, PanelInput::Pin).unwrap();
+        }
+        let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+        for width in [800.0, 320.0, 100.0] {
+            runtime.model.set_geometry(LogicalSize::new(width, 600.0).unwrap());
+            let left = runtime.model.panel(Edge::Left);
+            let right = runtime.model.panel(Edge::Right);
+            assert!(left.exclusive_zone_px + right.exclusive_zone_px < width);
+            assert!(left.thickness_px > 0.0 && right.thickness_px > 0.0);
+        }
+    }
+    #[test]
     fn local_clock_timezone_probe() {
         let Ok(expected) = std::env::var("QUOIN_CLOCK_TEST_EXPECTED") else {
             return;

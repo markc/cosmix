@@ -20,6 +20,9 @@ pub(super) struct TextInputBridge {
     preedit: Option<(String, Option<(usize, usize)>)>,
     committed: Option<String>,
     rectangle: Option<(i32, i32, i32, i32)>,
+    generation: u64,
+    batch_generation: Option<u64>,
+    commit_serial: u32,
 }
 
 impl TextInputBridge {
@@ -32,6 +35,9 @@ impl TextInputBridge {
             preedit: None,
             committed: None,
             rectangle: None,
+            generation: 0,
+            batch_generation: None,
+            commit_serial: 0,
         }
     }
     pub(super) fn attach(&mut self, seat: &WlSeat, qh: &QueueHandle<RunnerState>) {
@@ -50,6 +56,9 @@ impl TextInputBridge {
         self.preedit = None;
         self.committed = None;
         self.rectangle = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.batch_generation = None;
+        self.commit_serial = 0;
     }
 }
 
@@ -83,14 +92,18 @@ impl RunnerState {
             if self.text_input.enabled.is_some() {
                 input.disable();
                 input.commit();
+                self.text_input.commit_serial = self.text_input.commit_serial.wrapping_add(1);
             }
             self.text_input.preedit = None;
             self.text_input.committed = None;
             self.text_input.rectangle = None;
             self.text_input.enabled = enabled;
+            self.text_input.generation = self.text_input.generation.wrapping_add(1);
+            self.text_input.batch_generation = None;
             if enabled.is_some() {
                 input.enable();
                 input.commit();
+                self.text_input.commit_serial = self.text_input.commit_serial.wrapping_add(1);
             }
         }
         if let Some((entity, _)) = enabled {
@@ -116,6 +129,7 @@ impl RunnerState {
             {
                 input.set_cursor_rectangle(x, y, w, h);
                 input.commit();
+                self.text_input.commit_serial = self.text_input.commit_serial.wrapping_add(1);
                 self.text_input.rectangle = rect;
             }
         }
@@ -152,18 +166,33 @@ impl Dispatch<ZwpTextInputV3, ()> for RunnerState {
         if state.text_input.input.as_ref() != Some(input) {
             return;
         }
+        let focus = state.app.world().get_resource::<InputFocus>().and_then(InputFocus::get);
+        for event in state.text_input.receive(event, focus) {
+            state.emit_ime(event);
+        }
+        state.needs_update = true;
+    }
+}
+
+impl TextInputBridge {
+    // This is the protocol dispatch path, shared by the real Wayland callback
+    // and regression tests. The done serial identifies the client commit, not
+    // whichever field happens to have focus when an old batch arrives.
+    fn receive(&mut self, event: zwp_text_input_v3::Event, focus: Option<Entity>) -> Vec<Ime> {
+        let mut events = Vec::new();
         match event {
             zwp_text_input_v3::Event::Enter { surface } => {
-                state.text_input.surface = Some(surface);
-                state.needs_update = true;
+                self.surface = Some(surface);
             }
             zwp_text_input_v3::Event::Leave { .. } => {
-                if let Some((_, window)) = state.text_input.enabled.take() {
-                    state.emit_ime(Ime::Disabled { window });
+                if let Some((_, window)) = self.enabled.take() {
+                    events.push(Ime::Disabled { window });
                 }
-                state.text_input.surface = None;
-                state.text_input.preedit = None;
-                state.text_input.committed = None;
+                self.surface = None;
+                self.preedit = None;
+                self.committed = None;
+                self.generation = self.generation.wrapping_add(1);
+                self.batch_generation = None;
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
@@ -176,20 +205,27 @@ impl Dispatch<ZwpTextInputV3, ()> for RunnerState {
                     && cursor_begin as usize <= text.len()
                     && cursor_end as usize <= text.len())
                 .then_some((cursor_begin as usize, cursor_end as usize));
-                state.text_input.preedit = Some((text, cursor));
+                self.batch_generation.get_or_insert(self.generation);
+                self.preedit = Some((text, cursor));
             }
-            zwp_text_input_v3::Event::CommitString { text } => state.text_input.committed = text,
-            zwp_text_input_v3::Event::Done { .. } => {
-                let committed = state.text_input.committed.take();
-                let preedit = state.text_input.preedit.take();
-                if let Some((entity, window)) = state.text_input.enabled
-                    && state.app.world().resource::<InputFocus>().get() == Some(entity)
+            zwp_text_input_v3::Event::CommitString { text } => {
+                self.batch_generation.get_or_insert(self.generation);
+                self.committed = text;
+            }
+            zwp_text_input_v3::Event::Done { serial } => {
+                let committed = self.committed.take();
+                let preedit = self.preedit.take();
+                let generation = self.batch_generation.take();
+                if let Some((entity, window)) = self.enabled
+                    && focus == Some(entity)
+                    && generation == Some(self.generation)
+                    && serial == self.commit_serial
                 {
                     if let Some(value) = committed {
-                        state.emit_ime(Ime::Commit { window, value });
+                        events.push(Ime::Commit { window, value });
                     }
                     if let Some((value, cursor)) = preedit {
-                        state.emit_ime(Ime::Preedit {
+                        events.push(Ime::Preedit {
                             window,
                             value,
                             cursor,
@@ -199,5 +235,35 @@ impl Dispatch<ZwpTextInputV3, ()> for RunnerState {
             }
             _ => {}
         }
+        events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn protocol_bridge_drops_delayed_batches_after_focus_change() {
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        let window = world.spawn_empty().id();
+        let mut bridge = TextInputBridge {
+            manager: None, input: None, surface: None,
+            enabled: Some((first, window)), preedit: None, committed: None,
+            rectangle: None, generation: 1, batch_generation: None, commit_serial: 1,
+        };
+        bridge.receive(zwp_text_input_v3::Event::CommitString { text: Some("old".into()) }, Some(first));
+        bridge.enabled = Some((second, window));
+        bridge.generation = 2;
+        bridge.commit_serial = 3; // disable + enable commits
+        assert!(bridge.receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second)).is_empty());
+        // An entire old batch can arrive after the new field was enabled.
+        bridge.receive(zwp_text_input_v3::Event::PreeditString { text: Some("stale".into()), cursor_begin: 0, cursor_end: 0 }, Some(second));
+        assert!(bridge.receive(zwp_text_input_v3::Event::Done { serial: 1 }, Some(second)).is_empty());
+        bridge.receive(zwp_text_input_v3::Event::CommitString { text: Some("new".into()) }, Some(second));
+        let events = bridge.receive(zwp_text_input_v3::Event::Done { serial: 3 }, Some(second));
+        assert!(matches!(&events[..], [Ime::Commit { value, .. }] if value == "new"));
+        assert!(bridge.receive(zwp_text_input_v3::Event::Done { serial: 3 }, Some(second)).is_empty());
     }
 }
