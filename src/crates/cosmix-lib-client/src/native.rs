@@ -1241,7 +1241,9 @@ impl NodedClient {
                 continue;
             }
 
-            if msg.get("command").is_some() {
+            // Topic deliveries may carry type:event without a command, or a
+            // command without type:event. Preserve both for subscribers.
+            if msg.get("command").is_some() || msg.get("topic").is_some() {
                 let cmd = IncomingCommand {
                     from: msg.get("from").unwrap_or("").to_string(),
                     command: msg.get("command").unwrap_or("").to_string(),

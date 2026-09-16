@@ -16,6 +16,10 @@ The registered, supervised native Bus client runs on a worker thread and wakes
 Bevy when data arrives. The UI uses `WinitSettings::desktop_app()` without a
 polling refresh timer. Row ages update when the view is redrawn.
 
+Native client 0.6.3 preserves topic deliveries with or without a `command`
+header. The panel dispatches by `topic`, not by `type: event`, so both Mix
+publications and event-only envelopes reach the same subscription handler.
+
 Set `CLIPPANEL_SMOKE=1` for one headless refresh, or `CLIPPANEL_SMOKE=verbs`
 to also exercise pause on/off, server search, pick, menu and topic delivery.
 Both write `$XDG_RUNTIME_DIR/clippanel_smoke.out` (the system temporary directory

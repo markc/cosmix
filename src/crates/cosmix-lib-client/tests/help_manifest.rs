@@ -85,6 +85,47 @@ async fn exercise(manifest: Option<Vec<VerbDescriptor>>) {
 }
 
 #[tokio::test]
+async fn topic_delivery_does_not_require_command_or_event_type() {
+    timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let client = NodedClient::connect_anonymous(&url).await.unwrap();
+        let mut server = server.await.unwrap();
+        let mut incoming = client.incoming_async().await.unwrap();
+        for kind in 0..3 {
+            let mut message = BusMessage::new().with_header("topic", "example.changed");
+            if kind == 0 {
+                message = message.with_header("type", "event");
+            } else if kind == 1 {
+                message = message.with_header("command", "example.changed");
+            }
+            message.body = r#"{"action":"menu"}"#.into();
+            server
+                .send(Message::Text(message.to_wire().into()))
+                .await
+                .unwrap();
+            let delivered = incoming.recv().await.unwrap();
+            assert_eq!(
+                delivered.headers.get("topic").map(String::as_str),
+                Some("example.changed")
+            );
+            assert_eq!(delivered.body, message.body);
+            assert_eq!(
+                delivered.command,
+                if kind == 1 { "example.changed" } else { "" }
+            );
+        }
+        client.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn reader_consumes_help_only_when_manifest_is_present() {
     timeout(Duration::from_secs(5), async {
         exercise(None).await;
