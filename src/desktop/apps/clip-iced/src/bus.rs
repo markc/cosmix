@@ -361,7 +361,7 @@ pub async fn smoke(mode: &str) -> i32 {
             } else { verbs["pick"] = json!("skipped: empty history"); }
             // Drain earlier pause/pick and retained menu deliveries, then await
             // a fresh menu event (not merely the first changed event).
-            while tokio::time::timeout(Duration::from_millis(1), session.incoming.recv()).await.is_ok() {}
+            while matches!(tokio::time::timeout(Duration::from_millis(1), session.incoming.recv()).await, Ok(Some(_))) {}
             verbs["menu"] = session.data.local.rpc(&session.client, "desktop.clipboard.menu", json!({})).await.report();
             let event = tokio::time::timeout(Duration::from_secs(3), async {
                 while let Some(event) = session.incoming.recv().await {
