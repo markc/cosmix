@@ -62,7 +62,27 @@ impl SceneStore {
                 }
                 (0, reply.to_string())
             }
-            Err(error) => (10, error.to_string()),
+            Err(error) => {
+                if matches!(verb, SceneVerb::Load | SceneVerb::Patch) {
+                    let name = error["scene"].as_str().or_else(|| args["scene"].as_str());
+                    let revision = name
+                        .and_then(|name| self.revisions.get(name))
+                        .copied()
+                        .unwrap_or(0);
+                    let diagnostics = error
+                        .get("diagnostics")
+                        .cloned()
+                        .unwrap_or_else(|| json!([error]));
+                    let summary =
+                        json!({"scene":name,"revision":revision,"ops":0,"diagnostics":diagnostics});
+                    let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
+                    if let Err(error) = bridge.try_publish_topic("shell.scene.changed", false, wire)
+                    {
+                        warn!("scene summary publish failed: {error}");
+                    }
+                }
+                (10, error.to_string())
+            }
         }
     }
 
@@ -170,7 +190,7 @@ impl SceneStore {
     fn accept(&mut self, document: SceneDocument) -> Result<(Value, Option<Value>), Value> {
         let diagnostics = cosmix_scene::lint(&document);
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {
-            return Err(json!({"diagnostics":diagnostics}));
+            return Err(json!({"scene":document.name,"diagnostics":diagnostics}));
         }
         let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
         let ops = self.scenes.get(&tree.name).map_or(tree.nodes.len(), |old| {

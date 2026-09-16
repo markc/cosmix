@@ -1,5 +1,7 @@
 # cosmix-scene
 
+For the retained CTK renderer and shell verbs, see [Mix Scenes in Quoin](scenes).
+
 `cosmix-scene` parses a bounded Mix Scenes v0 document into a renderer-neutral
 tree. A document is a Bus envelope with required `scene: 1`, `name` and
 `citizen` headers. `window`, `subscribe`, `targets` and `model` are optional
