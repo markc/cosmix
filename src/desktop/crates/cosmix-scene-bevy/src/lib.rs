@@ -51,6 +51,7 @@ impl SceneStore {
         args: &Value,
         bridge: &BusBridge,
     ) -> (u8, String) {
+        let changes_scene = matches!(verb, SceneVerb::Load | SceneVerb::Patch);
         match self.request(verb, body, args) {
             Ok((reply, summary)) => {
                 if let Some(summary) = summary {
@@ -63,7 +64,7 @@ impl SceneStore {
                 (0, reply.to_string())
             }
             Err(error) => {
-                if matches!(verb, SceneVerb::Load | SceneVerb::Patch) {
+                if changes_scene {
                     let name = error["scene"].as_str().or_else(|| args["scene"].as_str());
                     let revision = name
                         .and_then(|name| self.revisions.get(name))
