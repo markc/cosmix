@@ -288,6 +288,8 @@ pub struct BusBridgeConfig {
     pub subscriptions: Vec<String>,
     /// Additional directed command prefixes admitted to the exclusive service port.
     pub inbound_prefixes: Vec<String>,
+    /// Body bound for directed requests, before the UI thread parses them.
+    pub max_inbound_body_bytes: usize,
     /// Explicit non-winit event-loop wake. When absent, CTK retains its winit fallback.
     pub worker_wake: Option<BusWorkerWake>,
     /// Topics whose newest message replaces the previous one instead of queuing.
@@ -311,6 +313,7 @@ impl BusBridgeConfig {
             provenance: process_provenance(),
             subscriptions: Vec::new(),
             inbound_prefixes: Vec::new(),
+            max_inbound_body_bytes: MAX_INBOUND_BODY_BYTES,
             worker_wake: None,
             latest_topics: Vec::new(),
             outbound_capacity: 64,
@@ -1764,7 +1767,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                 // Oversized bodies are refused before they can reach the
                 // Bevy-thread JSON parse; an id-less sender simply cannot be
                 // told about that refusal.
-                if command.body.len() > MAX_INBOUND_BODY_BYTES {
+                if command.body.len() > config.max_inbound_body_bytes {
                     if let Some(id) = command.id {
                         let (rc, body) = app_body_too_large_error(&command.command);
                         spawn_respond(
@@ -2149,11 +2152,14 @@ fn spawn_observation_call(
 ) {
     let client = Arc::clone(observation);
     calls.spawn(async move {
-        let result = client
-            .call_with_headers_raw(&to, &command, &headers, &body)
-            .await
-            .map(|(rc, body, result)| BusReply { rc, body, result })
-            .map_err(|error| error.to_string());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call_with_headers_raw(&to, &command, &headers, &body),
+        )
+        .await
+        .map_err(|_| "Bus observation request timed out after 2 s".to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+        .map(|(rc, body, result)| BusReply { rc, body, result });
         (request_id, result)
     });
 }

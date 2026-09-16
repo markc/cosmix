@@ -6,7 +6,7 @@ use bevy::input_focus::InputFocus;
 use bevy::picking::events::{Click, Pointer};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::text::{EditableText, FontWeight};
+use bevy::text::{EditableText, EditableTextFilter, FontWeight};
 use bevy::ui::Checked;
 use bevy::ui_widgets::Activate;
 use cosmix_scene::{Node as SceneNode, Op, ResolvedScene};
@@ -256,6 +256,9 @@ pub(crate) fn reconcile(world: &mut World) {
                 nodes: BTreeMap::new(),
             });
             if mounted.tree != entry.tree {
+                if mounted.tree.window != entry.tree.window {
+                    mounted.registered = false;
+                }
                 apply(world, mounted, &entry.tree);
             }
             if !mounted.registered {
@@ -272,6 +275,44 @@ pub(crate) fn reconcile(world: &mut World) {
                     title,
                     mounted.page,
                 );
+                if mounted.registered {
+                    use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
+                    let output = world
+                        .resource::<ShellFrameState>()
+                        .0
+                        .geometry
+                        .output
+                        .clone();
+                    let at = world.resource::<Time<bevy::time::Real>>().elapsed();
+                    let dimension = if matches!(edge, Edge::Left | Edge::Right) {
+                        "w"
+                    } else {
+                        "h"
+                    };
+                    if let Some(size) = entry
+                        .tree
+                        .window
+                        .as_ref()
+                        .and_then(|window| window[dimension].as_f64())
+                    {
+                        world.write_message(ShellCommand {
+                            output: output.clone(),
+                            at,
+                            kind: ShellCommandKind::Resize {
+                                edge,
+                                thickness_px: size as f32,
+                            },
+                        });
+                    }
+                    world.write_message(ShellCommand {
+                        output,
+                        at,
+                        kind: ShellCommandKind::Panel {
+                            edge,
+                            input: cosmix_shell::core::PanelInput::Reveal,
+                        },
+                    });
+                }
             }
         }
     });
@@ -342,6 +383,9 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
                     mounted.tree.nodes.get(*id).is_none_or(|old| {
                         old.family != new.family
                             || old.ports.get("password") != new.ports.get("password")
+                            || (new.family == "list"
+                                && (old.ports.get("row_height") != new.ports.get("row_height")
+                                    || old.ports.get("gap") != new.ports.get("gap")))
                     })
                 })
         })
@@ -411,11 +455,10 @@ fn spawn(world: &mut World, tree: &ResolvedScene, id: &str, node: &SceneNode) ->
                     CtkTextFieldProps::new(value, id).placeholder(text(node, "placeholder")),
                 )
             };
-            if !flag(node, "password") {
-                commands
-                    .entity(field.input)
-                    .insert(CtkTextArea::single_line(value, 4096));
-            }
+            commands.entity(field.input).insert((
+                CtkTextArea::single_line(value, 4096),
+                EditableTextFilter::new(|c| c != '\n' && c != '\r'),
+            ));
             input = Some(field.input);
             field.root
         }
@@ -759,4 +802,51 @@ fn color(value: &str, fallback: Color) -> Color {
     bevy::color::Srgba::hex(value)
         .map(Color::Srgba)
         .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unrelated_reload_retains_the_entire_field_entity() {
+        let doc = cosmix_scene::parse(include_str!(
+            "../../cosmix-scene/tests/fixtures/conformance.scene.md"
+        ))
+        .unwrap();
+        let tree = cosmix_scene::resolve(&doc).unwrap();
+        let mut world = World::new();
+        let page = world.spawn_empty().id();
+        let mut mounted = Mounted {
+            tree: ResolvedScene {
+                nodes: Default::default(),
+                ..tree.clone()
+            },
+            page,
+            edge: Edge::Left,
+            registered: false,
+            nodes: BTreeMap::new(),
+        };
+        apply(&mut world, &mut mounted, &tree);
+        let input = mounted.nodes["field"].input.unwrap();
+        world.insert_resource(InputFocus::from_entity(input));
+        world.get_mut::<EditableText>(input).unwrap().queue_edit(
+            bevy::text::TextEdit::ImeSetCompose {
+                value: "pending".into(),
+                cursor: None,
+            },
+        );
+        let before = format!("{:?}", world.get::<CtkTextArea>(input).unwrap());
+        let mut changed = tree.clone();
+        changed.nodes["text"]
+            .ports
+            .insert("text".into(), json!("new status"));
+        apply(&mut world, &mut mounted, &changed);
+        assert_eq!(mounted.nodes["field"].input, Some(input));
+        assert_eq!(world.resource::<InputFocus>().get(), Some(input));
+        assert_eq!(
+            format!("{:?}", world.get::<CtkTextArea>(input).unwrap()),
+            before
+        );
+        assert!(world.get::<EditableText>(input).unwrap().pending_edits.iter().any(|edit| matches!(edit, bevy::text::TextEdit::ImeSetCompose { value, .. } if value == "pending")));
+    }
 }

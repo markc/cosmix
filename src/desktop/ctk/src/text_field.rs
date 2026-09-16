@@ -525,7 +525,9 @@ fn paint_text_input_focus_borders(
     }
 }
 
-fn strip_secret_clipboard_edits(mut fields: Query<&mut EditableText, With<CtkSecretField>>) {
+pub(crate) fn strip_secret_clipboard_edits(
+    mut fields: Query<&mut EditableText, With<CtkSecretField>>,
+) {
     for mut editable in &mut fields {
         remove_secret_clipboard_edits(&mut editable);
     }

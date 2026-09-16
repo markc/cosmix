@@ -474,6 +474,15 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
         .iter()
         .any(|(page, _)| page == id);
     if exists {
+        if let Some((_, current)) = world
+            .get_mut::<QuoinPanelParts>(panel)
+            .unwrap()
+            .page_titles
+            .iter_mut()
+            .find(|(page, _)| page == id)
+        {
+            *current = title.into();
+        }
         return true;
     }
     let wrapper = world
@@ -492,7 +501,13 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
     let mut queue = bevy::ecs::world::CommandQueue::default();
     let mut commands = Commands::new(&mut queue, world);
     let label = text(&mut commands, "○", 11.0, true);
-    let dot = button(&mut commands, edge, QuoinAction::Select(id.into()), label, &format!("Show {title}"));
+    let dot = button(
+        &mut commands,
+        edge,
+        QuoinAction::Select(id.into()),
+        label,
+        &format!("Show {title}"),
+    );
     commands.entity(dots).add_child(dot);
     queue.apply(world);
     let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
@@ -520,7 +535,11 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
         return;
     };
     let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
-    let dot_label = parts.dot_labels.iter().find(|(page, _)| page == id).map(|(_, e)| *e);
+    let dot_label = parts
+        .dot_labels
+        .iter()
+        .find(|(page, _)| page == id)
+        .map(|(_, e)| *e);
     parts.dot_labels.retain(|(page, _)| page != id);
     let wrapper = parts
         .page_wrappers
@@ -535,8 +554,13 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
         .map(|(id, _)| id.clone())
         .collect();
     if let Some(label) = dot_label
-        && let Some(parent) = world.get::<ChildOf>(label).map(ChildOf::parent) {
-        world.get_mut::<QuoinPanelParts>(panel).unwrap().controls.retain(|e| *e != parent);
+        && let Some(parent) = world.get::<ChildOf>(label).map(ChildOf::parent)
+    {
+        world
+            .get_mut::<QuoinPanelParts>(panel)
+            .unwrap()
+            .controls
+            .retain(|e| *e != parent);
         world.despawn(parent);
     }
     if let Some(wrapper) = wrapper {
