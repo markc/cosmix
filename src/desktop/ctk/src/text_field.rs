@@ -445,15 +445,19 @@ pub struct CtkTextFieldPlaceholder {
 
 fn sync_placeholders(
     fields: Query<&EditableText>,
-    mut hints: Query<(&CtkTextFieldPlaceholder, &mut Node)>,
+    mut hints: Query<(&CtkTextFieldPlaceholder, &mut Visibility)>,
 ) {
-    for (hint, mut node) in &mut hints {
+    for (hint, mut visibility) in &mut hints {
         let show = fields
             .get(hint.input)
             .is_ok_and(|editable| editable.value().is_empty() && !editable.is_composing());
-        let display = if show { Display::Flex } else { Display::None };
-        if node.display != display {
-            node.display = display;
+        let next = if show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != next {
+            *visibility = next;
         }
     }
 }
@@ -484,9 +488,12 @@ impl Plugin for CtkTextFieldPlugin {
                 PostUpdate,
                 strip_secret_clipboard_edits.before(EditableTextSystems),
             )
+            .add_systems(PostUpdate, sync_secret_fields.after(EditableTextSystems))
             .add_systems(
                 PostUpdate,
-                (sync_secret_fields, sync_placeholders).after(EditableTextSystems),
+                sync_placeholders
+                    .after(EditableTextSystems)
+                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
             );
     }
 }
@@ -577,8 +584,8 @@ mod tests {
             .unwrap();
         assert_eq!(app.world().get::<Text>(hint).unwrap().0, "search…");
         assert_eq!(
-            app.world().get::<Node>(hint).unwrap().display,
-            Display::Flex
+            *app.world().get::<Visibility>(hint).unwrap(),
+            Visibility::Inherited
         );
 
         app.world_mut()
@@ -586,16 +593,16 @@ mod tests {
             .insert(EditableText::new("query"));
         app.update();
         assert_eq!(
-            app.world().get::<Node>(hint).unwrap().display,
-            Display::None
+            *app.world().get::<Visibility>(hint).unwrap(),
+            Visibility::Hidden
         );
         app.world_mut()
             .entity_mut(field.input)
             .insert(EditableText::new(""));
         app.update();
         assert_eq!(
-            app.world().get::<Node>(hint).unwrap().display,
-            Display::Flex
+            *app.world().get::<Visibility>(hint).unwrap(),
+            Visibility::Inherited
         );
     }
 
