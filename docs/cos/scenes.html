@@ -447,6 +447,9 @@ The request body is the complete AMP document with one <code>mix</code> fence. T
 <code>cosmix-scene</code> parser and registry validate it before any live state changes.
 Invalid loads and patches return diagnostics and retain the last good tree.</p>
 <p>Scenes mount as pages in an edge panel. Floating windows are outside v0.
+For a nested development host, select its compositor with <code>--comp-service</code>
+and a distinct registration with <code>--bus-service</code>; the default registration
+remains <code>shell</code>. Scene verb names retain the <code>shell.scene.</code> prefix.
 <code>shell.scene.get {scene}</code> returns the P1 resolved tree, including defaults,
 template metadata and numeric ports as floating-point values. An optional
 <code>path</code> selects <code>node.port</code>. <code>shell.scene.patch {scene,path,value}</code> validates

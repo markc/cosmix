@@ -6,6 +6,9 @@ The request body is the complete AMP document with one `mix` fence. The
 Invalid loads and patches return diagnostics and retain the last good tree.
 
 Scenes mount as pages in an edge panel. Floating windows are outside v0.
+For a nested development host, select its compositor with `--comp-service`
+and a distinct registration with `--bus-service`; the default registration
+remains `shell`. Scene verb names retain the `shell.scene.` prefix.
 `shell.scene.get {scene}` returns the P1 resolved tree, including defaults,
 template metadata and numeric ports as floating-point values. An optional
 `path` selects `node.port`. `shell.scene.patch {scene,path,value}` validates
