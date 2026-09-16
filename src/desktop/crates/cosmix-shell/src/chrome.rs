@@ -487,7 +487,17 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
         .add_child(content)
         .id();
     world.entity_mut(host).add_child(wrapper);
+    let header = world.get::<Children>(panel).unwrap()[0];
+    let dots = world.get::<Children>(header).unwrap()[3];
+    let mut queue = bevy::ecs::world::CommandQueue::default();
+    let mut commands = Commands::new(&mut queue, world);
+    let label = text(&mut commands, "○", 11.0, true);
+    let dot = button(&mut commands, edge, QuoinAction::Select(id.into()), label, &format!("Show {title}"));
+    commands.entity(dots).add_child(dot);
+    queue.apply(world);
     let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
+    parts.controls.push(dot);
+    parts.dot_labels.push((id.into(), label));
     parts.page_titles.push((id.into(), title.into()));
     parts.page_wrappers.push((id.into(), wrapper));
     let ids = parts
@@ -510,6 +520,8 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
         return;
     };
     let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
+    let dot_label = parts.dot_labels.iter().find(|(page, _)| page == id).map(|(_, e)| *e);
+    parts.dot_labels.retain(|(page, _)| page != id);
     let wrapper = parts
         .page_wrappers
         .iter()
@@ -522,6 +534,11 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
         .iter()
         .map(|(id, _)| id.clone())
         .collect();
+    if let Some(label) = dot_label
+        && let Some(parent) = world.get::<ChildOf>(label).map(ChildOf::parent) {
+        world.get_mut::<QuoinPanelParts>(panel).unwrap().controls.retain(|e| *e != parent);
+        world.despawn(parent);
+    }
     if let Some(wrapper) = wrapper {
         world.despawn(wrapper);
     }
