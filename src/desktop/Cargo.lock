@@ -3130,12 +3130,13 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
  "cosmix-lib-config",
  "cosmix-lib-props-core",
+ "cosmix-scene",
  "cosmix-scene-bevy",
  "cosmix-shell",
  "cosmix-shell-host",
@@ -3146,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-mix",
@@ -3157,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bevy",
  "cosmix-scene",
@@ -3169,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3179,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "bevy",
  "bevy_winit",
