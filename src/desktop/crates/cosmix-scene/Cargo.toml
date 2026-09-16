@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-scene"
-version = "0.1.0"
+version = "0.1.1"
 description = "Headless Mix Scenes document parser, registry and diff"
 edition = "2024"
 rust-version = "1.95"
@@ -8,8 +8,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
-cosmix_bus = { package = "cosmix-lib-bus", path = "../../../../src/crates/cosmix-lib-bus", default-features = false }
-cosmix-lib-mix = { path = "../../../../src/crates/cosmix-lib-mix" }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus", default-features = false }
+cosmix-mix = { package = "cosmix-lib-mix", path = "../../../crates/cosmix-lib-mix" }
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

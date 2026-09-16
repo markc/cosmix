@@ -195,7 +195,7 @@ const fn pnd(n: &'static str, d: &'static str, m: Option<f64>) -> Port {
         required: false,
         default: Some(d),
         enum_values: &[],
-        min: m,
+        min: Some(m.unwrap_or(0.0)),
     }
 }
 const fn pn(n: &'static str, r: bool, m: Option<f64>) -> Port {
@@ -205,7 +205,7 @@ const fn pn(n: &'static str, r: bool, m: Option<f64>) -> Port {
         required: r,
         default: None,
         enum_values: &[],
-        min: m,
+        min: Some(m.unwrap_or(0.0)),
     }
 }
 fn schema(f: &str) -> Option<&'static [Port]> {
@@ -382,9 +382,10 @@ pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
     let base = source[..bs].lines().count();
     let fs = fence_ranges(&body);
     if fs.len() != 1 {
+        let line = fs.get(1).map_or(base + 1, |(open, _, _)| base + open);
         ds.push(Diagnostic::error(
             "fence-count",
-            base.max(1),
+            line,
             "body must contain exactly one ```mix fence",
         ));
         return Err(ds);
@@ -530,16 +531,18 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
                 ));
             }
             if let Some(min) = p.min {
-                let invalid = if p.name == "max_rows" {
-                    v.as_f64().is_some_and(|x| x < min)
-                } else {
-                    v.as_f64().is_some_and(|x| x <= min)
-                };
+                let exclusive = p.name == "row_height";
+                let invalid = v
+                    .as_f64()
+                    .is_some_and(|x| if exclusive { x <= min } else { x < min });
                 if invalid {
                     out.push(Diagnostic::error(
                         "port-min",
                         n.line,
-                        format!("port {k} on {id} must be > {min}"),
+                        format!(
+                            "port {k} on {id} must be {} {min}",
+                            if exclusive { ">" } else { ">=" }
+                        ),
                     ));
                 }
             }
@@ -584,11 +587,13 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
         if n.widget == "list" {
             validate_rows(n, &mut out);
             if let Some(row) = n.ports.get("row").and_then(JsonValue::as_str) {
-                if n.ports
-                    .get("children")
-                    .and_then(JsonValue::as_array)
-                    .is_some_and(|cs| cs.iter().any(|c| c.as_str() == Some(row)))
-                {
+                if doc.nodes.values().any(|parent| {
+                    parent
+                        .ports
+                        .get("children")
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(|cs| cs.iter().any(|c| c.as_str() == Some(row)))
+                }) {
                     out.push(Diagnostic::error(
                         "invalid-template",
                         n.line,
@@ -623,8 +628,8 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
         ));
     }
     if let Some(w) = &doc.window {
-        if let Some((_, n)) = doc.nodes.iter().find(|(_, n)| n.widget == "window") {
-            if ["edge", "title", "w", "h"]
+        for n in doc.nodes.values().filter(|n| n.widget == "window") {
+            if ["kind", "edge", "title", "w", "h"]
                 .iter()
                 .any(|k| n.ports.get(*k) != w.get(*k))
             {
@@ -661,7 +666,7 @@ pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
         return Err(es);
     }
     let mut ts = HashSet::new();
-    for n in doc.nodes.values() {
+    for n in doc.nodes.values().filter(|n| n.widget == "list") {
         if let Some(r) = n.ports.get("row").and_then(JsonValue::as_str) {
             ts.insert(r.to_string());
         }
@@ -1103,8 +1108,195 @@ mod tests {
         ] {
             assert!(r.nodes.values().any(|n| n.family == family), "{family}");
         }
-        assert_eq!(r.nodes["root"].ports["gap"], json!(0.0));
-        assert_eq!(r.nodes["spacer"].ports.len(), 0);
+        for (id, expected) in [
+            ("win", [("edge", json!("right"))].as_slice()),
+            (
+                "root",
+                [
+                    ("gap", json!(0.0)),
+                    ("padding", json!(0.0)),
+                    ("fill", json!(false)),
+                ]
+                .as_slice(),
+            ),
+            (
+                "row",
+                [
+                    ("gap", json!(0.0)),
+                    ("padding", json!(0.0)),
+                    ("fill", json!(false)),
+                    ("align", json!("start")),
+                ]
+                .as_slice(),
+            ),
+            (
+                "text",
+                [
+                    ("size", json!(13.0)),
+                    ("bold", json!(false)),
+                    ("mono", json!(false)),
+                    ("elide", json!(false)),
+                    ("fill", json!(false)),
+                    ("hidden", json!(false)),
+                ]
+                .as_slice(),
+            ),
+            ("field", [("password", json!(false))].as_slice()),
+            ("button", [("tone", json!("normal"))].as_slice()),
+            (
+                "list",
+                [
+                    ("gap", json!(0.0)),
+                    ("max_rows", json!(1.0)),
+                    ("fill", json!(false)),
+                    ("hidden_if_empty", json!(false)),
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for (port, value) in expected {
+                assert_eq!(r.nodes[id].ports[*port], *value, "{id}.{port}");
+            }
+        }
+        assert!(r.nodes["spacer"].ports.is_empty());
+    }
+
+    fn numeric_probe(family: &str, port: &str, value: f64) -> Vec<Diagnostic> {
+        let mut nodes = IndexMap::new();
+        let mut ports = IndexMap::new();
+        for (name, value) in [
+            ("kind", json!("edge")),
+            ("children", json!([])),
+            ("text", json!("x")),
+            ("value", json!("x")),
+            ("label", json!("x")),
+            ("rows", json!([])),
+            ("row", json!("template")),
+            ("row_height", json!(1.0)),
+            ("src", json!("x")),
+        ] {
+            ports.insert(name.into(), value);
+        }
+        ports.insert(port.into(), json!(value));
+        nodes.insert(
+            "root".into(),
+            RawNode {
+                widget: family.into(),
+                ports,
+                line: 1,
+            },
+        );
+        if family == "list" {
+            nodes.insert(
+                "template".into(),
+                RawNode {
+                    widget: "row".into(),
+                    ports: [("children".into(), json!([]))].into_iter().collect(),
+                    line: 1,
+                },
+            );
+        }
+        lint(&SceneDocument {
+            name: "test".into(),
+            citizen: "c".into(),
+            window: None,
+            subscribe: None,
+            targets: None,
+            model: None,
+            nodes,
+            source: String::new(),
+        })
+    }
+
+    #[test]
+    fn numeric_port_boundaries_are_table_driven() {
+        for family in [
+            "window", "column", "row", "text", "field", "button", "list", "image", "spacer",
+        ] {
+            for port in schema(family).unwrap().iter().filter(|p| p.ty == "number") {
+                let zero = numeric_probe(family, port.name, 0.0);
+                let negative = numeric_probe(family, port.name, -1.0);
+                if port.name == "row_height" {
+                    assert!(zero.iter().any(|d| d.code == "port-min"));
+                    assert!(
+                        !numeric_probe(family, port.name, 0.5)
+                            .iter()
+                            .any(|d| d.code == "port-min")
+                    );
+                } else if port.name == "max_rows" {
+                    assert!(zero.iter().any(|d| d.code == "port-min"));
+                    assert!(
+                        !numeric_probe(family, port.name, 1.0)
+                            .iter()
+                            .any(|d| d.code == "port-min")
+                    );
+                } else {
+                    assert!(!zero.iter().any(|d| d.code == "port-min"));
+                }
+                assert!(
+                    negative.iter().any(|d| d.code == "port-min"),
+                    "{family}.{port_name}",
+                    port_name = port.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn window_disagreement_checks_all_windows_and_fields() {
+        for (field, value) in [
+            ("kind", "floating"),
+            ("edge", "left"),
+            ("title", "wrong"),
+            ("w", "10"),
+            ("h", "20"),
+        ] {
+            let source = r#"---
+scene: 1
+name: test
+citizen: c
+window: {"kind":"edge","edge":"right","title":"ok","w":1,"h":2}
+---
+```mix
+root: {widget: "column", children: ["a","b"]}
+a: {widget: "window", kind: "edge", edge: "right", title: "ok", w: 1, h: 2}
+b: {widget: "window", kind: "edge", edge: "right", title: "ok", w: 1, h: 2}
+```
+"#
+            .to_string();
+            let mut d = parse(&source).unwrap();
+            d.nodes["b"].ports.insert(
+                field.into(),
+                match field {
+                    "kind" | "edge" | "title" => json!(value),
+                    _ => json!(value.parse::<f64>().unwrap()),
+                },
+            );
+            assert!(
+                lint(&d).iter().any(|x| x.code == "window-disagreement"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_list_row_does_not_seed_template_reachability() {
+        let d = doc(
+            "root: {widget: \"text\", text: \"x\", row: \"template\"}\ntemplate: {widget: \"text\", text: \"x\"}",
+        );
+        assert!(
+            lint(&d)
+                .iter()
+                .any(|x| x.code == "orphan-node" && x.message.contains("template"))
+        );
+    }
+
+    #[test]
+    fn list_template_child_check_scans_all_nodes() {
+        let d = doc(
+            "root: {widget: \"column\", children: [\"list\",\"holder\"]}\nlist: {widget: \"list\", rows: [], row: \"template\", row_height: 1}\nholder: {widget: \"column\", children: [\"template\"]}\ntemplate: {widget: \"row\", children: []}",
+        );
+        assert!(lint(&d).iter().any(|x| x.code == "invalid-template"));
     }
     #[test]
     fn fixture_equals_hub() {
@@ -1196,9 +1388,11 @@ mod tests {
             ("scene-version", valid("root: {widget: \"text\", text: \"x\"}").replacen("scene: 1", "scene: 2", 1)),
             ("invalid-name", valid("root: {widget: \"text\", text: \"x\"}").replacen("name: test", "name: Bad", 1)),
             ("fence-count", "---\nscene: 1\nname: test\ncitizen: c\n---\n```mix\nroot: {widget: \"text\", text: \"x\"}\n```\n```mix\na: {widget: \"text\", text: \"x\"}\n```\n".into()),
+            ("fence-count", "---\nscene: 1\nname: test\ncitizen: c\n---\nno fence\n".into()),
             ("mix-parse", valid("root: {widget: \"text\", text: \"x\"}\n\"unterminated").into()),
             ("strict-data", valid("root: {widget: \"text\", text: \"x\"}\nvalue: \"a\" ..\n  \"b\"").into()),
             ("duplicate-id", valid("root: {widget: \"text\", text: \"x\"}\nroot: {widget: \"text\", text: \"y\"}").into()),
+            ("duplicate-id", valid("root: {widget: \"column\", children: [\"child\"]}\nchild: {widget: \"text\", text: \"x\"}\nchild: {widget: \"text\", text: \"y\"}").into()),
             ("root-type", valid("[\"x\"]").into()),
             ("node-type", valid("root: \"x\"").into()),
             ("missing-widget", valid("root: {}").into()),
