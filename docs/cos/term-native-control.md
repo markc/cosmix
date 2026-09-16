@@ -1,13 +1,31 @@
 # Term native control
 
-The global TCP `term` diagnostic registration serves discovery (`INFO` and
-`HELP`) and sends completion notifications. It refuses all protected reads,
-mutations and property requests with `FORBIDDEN`, including when native-session
-bootstrap fails. It is not an alternative control route.
+The global TCP `term` registration sends completion notifications and, under
+the default mesh-open posture (`COSMIX_MESH_OPEN` unset or any value other
+than `0`), serves the full **targetless** active-tab verb set to any mesh or
+local caller with no grant: `term.tabs`, `term.tab.new/select/close`,
+`term.panes`, `term.pane.split/select/close`, `term.snapshot`, `term.type`,
+plus `INFO`/`HELP` (term 0.8.5, per the 2026-09-15 full-mesh-access law).
+These verbs act on the active tab/pane of the instance holding the name at
+delivery time; they carry no target binding. `term.type` revokes any
+delegated control writer exactly as real keys do. Any mutating verb's body
+(`tab.*`, `pane.*`, `type`) may add `"request_id":"<string>"`: a resend of
+the same request (same verb and arguments; JSON key order is free) replays
+the recorded reply instead of re-executing the verb (last 128 remembered) —
+use it on every mutation that might be resent after a lost reply. A reused
+id with a different verb or arguments is refused as a conflict, never
+answered with another request's reply; the replay is the recorded outcome
+of the original attempt, so retrying after changing state needs a fresh id.
+Reads never consult the cache and always answer current state. With
+`COSMIX_MESH_OPEN=0` the strict diagnostic-only lane returns: `INFO`/`HELP`
+only, everything else refused with `FORBIDDEN`, including when
+native-session bootstrap fails.
 
-Protected controls belong on the broker-allocated, verified Unix Term identity.
-BROKER-023 defines their policy; a diagnostic service name is never proof of
-authority.
+Target-bound protected controls belong on the broker-allocated, verified Unix
+Term identity. BROKER-023 defines their policy; a service name is never proof
+of authority, which is why the global lane's verbs stay targetless — a caller
+that needs instance/incarnation/pane-generation binding uses the
+native-session route.
 
 ## Recipient gate
 

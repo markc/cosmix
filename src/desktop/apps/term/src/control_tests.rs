@@ -1090,7 +1090,12 @@ fn p0i_10_real_tcp_fallback_is_control_free() {
     let fixture = Fixture::new(Policy::DefaultOpen);
     let (notify, receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(notify);
-    let service = crate::bus::start_at(fixture.tabs.clone(), receiver, fixture.broker.url.clone());
+    let service = crate::bus::start_at(
+        fixture.tabs.clone(),
+        fixture.cleanup.clone(),
+        receiver,
+        fixture.broker.url.clone(),
+    );
     runtime().block_on(async {
         let client = NodedClient::connect_anonymous(&fixture.broker.url)
             .await
@@ -1227,7 +1232,8 @@ fn p0i_10_parent_bootstrap_outage_has_only_diagnostic_lane() {
         .install_control(tabs.clone(), cleanup.clone());
     let (notify, receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(notify);
-    let diagnostic = crate::bus::start_at(tabs.clone(), receiver, broker.url.clone());
+    let diagnostic =
+        crate::bus::start_at(tabs.clone(), cleanup.clone(), receiver, broker.url.clone());
     runtime().block_on(async {
         let owner = verified(&broker).await;
         assert!(

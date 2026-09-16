@@ -111,9 +111,19 @@ impl Listener {
         });
         Ok(())
     }
-    #[cfg(test)]
+    // Synthetic keys assert foreground authority exactly like real ones:
+    // revoke any delegated control writer before enqueuing, mirroring key().
+    // The empty-bytes early return is deliberately BEFORE the revoke, unlike
+    // key() which revokes unconditionally: a no-op write must not invalidate
+    // a live control writer.
     pub fn type_text(&self, text: &str) -> Result<(), String> {
-        self.write(encode_text(text)?, Some(Instant::now()))
+        let bytes = encode_text(text)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut writes = self.writes.lock().unwrap();
+        Self::revoke_writer(&mut writes);
+        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)
     }
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
         let mut writes = self.writes.lock().unwrap();

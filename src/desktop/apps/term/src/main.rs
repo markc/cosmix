@@ -373,6 +373,10 @@ fn main() {
     let removed = terminal.lock().unwrap().shutdown();
     cleanup.submit(removed);
     // Let a last-tab Bus close finish its bounded reply before process exit.
+    // Ordering constraint: the reaper's receive loop ends only when the LAST
+    // Cleanup sender is gone, and the bus thread owns a clone — so every
+    // Cleanup (this one and the bus thread's, via join) must be released
+    // before reaper.join(), or it hangs forever.
     let _ = bus.join();
     drop(cleanup);
     let _ = reaper.join();

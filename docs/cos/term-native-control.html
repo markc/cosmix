@@ -442,13 +442,31 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/term-native-control.md"><div class="prose"><h1 id="term-native-control">Term native control</h1>
-<p>The global TCP <code>term</code> diagnostic registration serves discovery (<code>INFO</code> and
-<code>HELP</code>) and sends completion notifications. It refuses all protected reads,
-mutations and property requests with <code>FORBIDDEN</code>, including when native-session
-bootstrap fails. It is not an alternative control route.</p>
-<p>Protected controls belong on the broker-allocated, verified Unix Term identity.
-BROKER-023 defines their policy; a diagnostic service name is never proof of
-authority.</p>
+<p>The global TCP <code>term</code> registration sends completion notifications and, under
+the default mesh-open posture (<code>COSMIX_MESH_OPEN</code> unset or any value other
+than <code>0</code>), serves the full <strong>targetless</strong> active-tab verb set to any mesh or
+local caller with no grant: <code>term.tabs</code>, <code>term.tab.new/select/close</code>,
+<code>term.panes</code>, <code>term.pane.split/select/close</code>, <code>term.snapshot</code>, <code>term.type</code>,
+plus <code>INFO</code>/<code>HELP</code> (term 0.8.5, per the 2026-09-15 full-mesh-access law).
+These verbs act on the active tab/pane of the instance holding the name at
+delivery time; they carry no target binding. <code>term.type</code> revokes any
+delegated control writer exactly as real keys do. Any mutating verb's body
+(<code>tab.*</code>, <code>pane.*</code>, <code>type</code>) may add <code>"request_id":"&lt;string&gt;"</code>: a resend of
+the same request (same verb and arguments; JSON key order is free) replays
+the recorded reply instead of re-executing the verb (last 128 remembered) —
+use it on every mutation that might be resent after a lost reply. A reused
+id with a different verb or arguments is refused as a conflict, never
+answered with another request's reply; the replay is the recorded outcome
+of the original attempt, so retrying after changing state needs a fresh id.
+Reads never consult the cache and always answer current state. With
+<code>COSMIX_MESH_OPEN=0</code> the strict diagnostic-only lane returns: <code>INFO</code>/<code>HELP</code>
+only, everything else refused with <code>FORBIDDEN</code>, including when
+native-session bootstrap fails.</p>
+<p>Target-bound protected controls belong on the broker-allocated, verified Unix
+Term identity. BROKER-023 defines their policy; a service name is never proof
+of authority, which is why the global lane's verbs stay targetless — a caller
+that needs instance/incarnation/pane-generation binding uses the
+native-session route.</p>
 <h2 id="recipient-gate">Recipient gate</h2>
 <p>The native identity actor receives protected requests on its own verified Unix
 connection. It uses the broker-stamped principal, its own current Term record,
