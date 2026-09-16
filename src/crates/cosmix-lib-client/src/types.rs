@@ -10,6 +10,12 @@ use std::collections::BTreeMap;
 #[derive(Debug)]
 pub struct IncomingCommand {
     pub from: String,
+    /// The `command` header. EMPTY for a topic delivery whose inner envelope
+    /// carried no `command` (a hand-built publish body, e.g. `topic` +
+    /// `type: event`): since lib-client 0.7.0 the reader surfaces such frames
+    /// because the `topic` header identifies a delivery. Consumers that
+    /// dispatch on `command` alone must treat `""` as "not a verb" and use
+    /// [`IncomingCommand::is_topic_delivery`] / the `topic` header instead.
     pub command: String,
     pub id: Option<String>,
     pub args: serde_json::Value,
@@ -42,5 +48,17 @@ impl IncomingCommand {
     /// Check if this is a `ui.*` display protocol command.
     pub fn is_ui_command(&self) -> bool {
         self.command.starts_with("ui.")
+    }
+
+    /// True when this frame is a broker topic delivery: it carries a `topic`
+    /// header. Dispatch subscriptions on this (or [`Self::topic`]), never on
+    /// `command`, which may be empty for a delivery.
+    pub fn is_topic_delivery(&self) -> bool {
+        self.headers.contains_key("topic")
+    }
+
+    /// The `topic` header of a delivery, if any.
+    pub fn topic(&self) -> Option<&str> {
+        self.header("topic")
     }
 }

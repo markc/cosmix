@@ -1241,7 +1241,9 @@ impl NodedClient {
                 continue;
             }
 
-            if msg.get("command").is_some() {
+            // Topic delivery is identified by its topic header; an event
+            // envelope need not contain a command (or type: event).
+            if msg.get("command").is_some() || msg.get("topic").is_some() {
                 let cmd = IncomingCommand {
                     from: msg.get("from").unwrap_or("").to_string(),
                     command: msg.get("command").unwrap_or("").to_string(),
@@ -1358,6 +1360,20 @@ mod verified_bound_tests {
                 "term.session"
             );
             assert!(commands.try_recv().is_err());
+            // Topic headers, not command/type headers, identify deliveries.
+            // This is also the reader used by clipboard subscriptions.
+            let mut event = BusMessage::new().with_header("topic", "desktop.clipboard.changed");
+            event.body = r#"{"action":"menu","revision":7}"#.into();
+            peer.send(Message::Text(event.to_wire().into()))
+                .await
+                .unwrap();
+            let delivered = commands.recv().await.unwrap();
+            assert_eq!(
+                delivered.command().header("topic"),
+                Some("desktop.clipboard.changed")
+            );
+            assert_eq!(delivered.command().args["action"], "menu");
+            assert_eq!(delivered.command().args["revision"], 7);
             peer.close(None).await.unwrap();
             reader.await.unwrap();
         })

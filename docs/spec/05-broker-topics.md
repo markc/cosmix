@@ -121,6 +121,15 @@ the same publisher. Sequence is monotonic within one topic-state lifetime,
 not across deletion/purge/recreation or broker restart. No global ordering,
 exactly-once delivery, persistence or multi-producer exclusion is promised.
 
+The inner envelope need not carry a `command` (or `type: event`) header: the
+broker admits a BROKER-007-shaped body whose only routing header is `topic`,
+and a subscriber therefore receives a delivery identified by the broker-owned
+`topic` header alone. Clients MUST dispatch subscriptions on `topic`, never on
+`command` — `cosmix-lib-client` 0.7.0 surfaces such frames with an empty
+`command` and offers `is_topic_delivery()`; earlier readers dropped them. This
+records a tolerance of the producer, not a requirement on it: a producer
+SHOULD still set `command` (Mix's `publish()` always does).
+
 **BROKER-009:** Ordinary subscription is idempotent per connection/topic.
 An existing identical subscription is not replayed twice. Property watch
 grants can add namespace-filtered variants; the underlying identity is then

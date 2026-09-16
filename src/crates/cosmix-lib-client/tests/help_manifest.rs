@@ -85,6 +85,110 @@ async fn exercise(manifest: Option<Vec<VerbDescriptor>>) {
 }
 
 #[tokio::test]
+async fn topic_delivery_does_not_require_command_or_event_type() {
+    timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let client = NodedClient::connect_anonymous(&url).await.unwrap();
+        let mut server = server.await.unwrap();
+        let mut incoming = client.incoming_async().await.unwrap();
+        for kind in 0..3 {
+            let mut message = BusMessage::new().with_header("topic", "example.changed");
+            if kind == 0 {
+                message = message.with_header("type", "event");
+            } else if kind == 1 {
+                message = message.with_header("command", "example.changed");
+            }
+            message.body = r#"{"action":"menu"}"#.into();
+            server
+                .send(Message::Text(message.to_wire().into()))
+                .await
+                .unwrap();
+            let delivered = incoming.recv().await.unwrap();
+            assert_eq!(
+                delivered.headers.get("topic").map(String::as_str),
+                Some("example.changed")
+            );
+            assert_eq!(delivered.body, message.body);
+            assert_eq!(
+                delivered.command,
+                if kind == 1 { "example.changed" } else { "" }
+            );
+            assert!(delivered.is_topic_delivery());
+            assert_eq!(delivered.topic(), Some("example.changed"));
+        }
+        client.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// The exclusions the topic widening rests on, pinned: a `type: response`
+/// frame is never redispatched as a command even when it carries a `topic`
+/// header (orphan responses are dropped by the response filter that runs
+/// BEFORE the topic check). Proven by ordering: the negatives are sent
+/// first, then a positive marker; the first delivery must be the marker.
+#[tokio::test]
+async fn response_frames_with_a_topic_header_are_not_delivered() {
+    timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let client = NodedClient::connect_anonymous(&url).await.unwrap();
+        let mut server = server.await.unwrap();
+        let mut incoming = client.incoming_async().await.unwrap();
+
+        // Negative 1: an orphan response that also carries a topic header.
+        let mut orphan = BusMessage::new()
+            .with_header("type", "response")
+            .with_header("id", "no-such-pending-id")
+            .with_header("rc", "0")
+            .with_header("topic", "example.changed");
+        orphan.body = r#"{"leaked":true}"#.into();
+        server
+            .send(Message::Text(orphan.to_wire().into()))
+            .await
+            .unwrap();
+        // Negative 2: a response with no id at all, topic header present.
+        let mut idless = BusMessage::new()
+            .with_header("type", "response")
+            .with_header("rc", "0")
+            .with_header("topic", "example.changed");
+        idless.body = r#"{"leaked":true}"#.into();
+        server
+            .send(Message::Text(idless.to_wire().into()))
+            .await
+            .unwrap();
+        // (A HELP frame is deliberately NOT a negative here: an anonymous
+        // client carries no manifest, so the reader hands HELP to the
+        // consumer as an ordinary command — see
+        // `reader_consumes_help_only_when_manifest_is_present`. A topic
+        // header does not change that.)
+        // Positive marker: a genuine delivery.
+        let mut marker = BusMessage::new().with_header("topic", "example.changed");
+        marker.body = r#"{"marker":true}"#.into();
+        server
+            .send(Message::Text(marker.to_wire().into()))
+            .await
+            .unwrap();
+
+        let delivered = incoming.recv().await.unwrap();
+        assert!(delivered.is_topic_delivery());
+        assert_eq!(delivered.body, marker.body, "a negative frame leaked through as a delivery");
+        client.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn reader_consumes_help_only_when_manifest_is_present() {
     timeout(Duration::from_secs(5), async {
         exercise(None).await;

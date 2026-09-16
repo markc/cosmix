@@ -1242,25 +1242,24 @@ async fn worker_loop(params: WorkerLoopParams) {
     // CONTROL plane: the broker-verified writing identity. Every
     // WorkerRequest::Call is issued here and it carries NO subscriptions, so
     // RPC replies are never head-of-line-blocked behind telemetry publications.
-    let control = Arc::new(
-        match {
-            let mut options =
-                SupervisedClient::connect_options(&config.service_name, &config.noded_url)
-                    .with_provenance(config.provenance.clone());
-            if let Some(verbs) = &config.verbs {
-                options = options.with_verbs(verbs.clone());
-            }
-            options.connect().await
-        } {
-            Ok(client) => client,
-            Err(error) => {
-                let _ = events
-                    .send_async(BusBridgeEvent::Fatal(error.to_string()))
-                    .await;
-                return;
-            }
-        },
-    );
+    let connection = {
+        let mut options =
+            SupervisedClient::connect_options(&config.service_name, &config.noded_url)
+                .with_provenance(config.provenance.clone());
+        if let Some(verbs) = &config.verbs {
+            options = options.with_verbs(verbs.clone());
+        }
+        options.connect().await
+    };
+    let control = Arc::new(match connection {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = events
+                .send_async(BusBridgeEvent::Fatal(error.to_string()))
+                .await;
+            return;
+        }
+    });
 
     // TELEMETRY plane: a separate `…-sub` identity that carries ALL
     // subscriptions and never issues a write. Keeping the 60 Hz meter/changed

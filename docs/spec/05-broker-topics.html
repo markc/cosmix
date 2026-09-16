@@ -535,6 +535,14 @@ an existing snapshot, but increments the sequence and can clear staleness for
 the same publisher. Sequence is monotonic within one topic-state lifetime,
 not across deletion/purge/recreation or broker restart. No global ordering,
 exactly-once delivery, persistence or multi-producer exclusion is promised.</p>
+<p>The inner envelope need not carry a <code>command</code> (or <code>type: event</code>) header: the
+broker admits a BROKER-007-shaped body whose only routing header is <code>topic</code>,
+and a subscriber therefore receives a delivery identified by the broker-owned
+<code>topic</code> header alone. Clients MUST dispatch subscriptions on <code>topic</code>, never on
+<code>command</code> — <code>cosmix-lib-client</code> 0.7.0 surfaces such frames with an empty
+<code>command</code> and offers <code>is_topic_delivery()</code>; earlier readers dropped them. This
+records a tolerance of the producer, not a requirement on it: a producer
+SHOULD still set <code>command</code> (Mix's <code>publish()</code> always does).</p>
 <p><strong>BROKER-009:</strong> Ordinary subscription is idempotent per connection/topic.
 An existing identical subscription is not replayed twice. Property watch
 grants can add namespace-filtered variants; the underlying identity is then
