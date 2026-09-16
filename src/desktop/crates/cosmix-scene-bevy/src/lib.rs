@@ -253,7 +253,7 @@ fn serialised_document(document: &SceneDocument) -> String {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        wire.push_str(&format!("{id}: {}\n", Value::Object(value)));
+        wire.push_str(&format!("{}: {}\n", json!(id), Value::Object(value)));
     }
     wire.push_str("```\n");
     wire
@@ -291,6 +291,22 @@ mod tests {
         assert_eq!(error["diagnostics"][0]["code"], "document-too-large");
         assert_eq!(store.scenes["conformance"].tree, before);
         assert_eq!(store.scenes["conformance"].revision, revision);
+    }
+
+    #[test]
+    fn measured_candidate_is_a_complete_scene_document() {
+        let document = cosmix_scene::parse(FIXTURE).unwrap();
+        let wire = serialised_document(&document);
+        let reparsed = cosmix_scene::parse(&wire).unwrap();
+        let expected = cosmix_scene::resolve(&document).unwrap();
+        let actual = cosmix_scene::resolve(&reparsed).unwrap();
+        assert_eq!(expected.name, actual.name);
+        assert_eq!(expected.citizen, actual.citizen);
+        assert_eq!(expected.window, actual.window);
+        for (id, node) in &expected.nodes {
+            assert_eq!(node.family, actual.nodes[id].family);
+            assert_eq!(node.ports, actual.nodes[id].ports);
+        }
     }
     #[test]
     fn conformance_and_last_good() {

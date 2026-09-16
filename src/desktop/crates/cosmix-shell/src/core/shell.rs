@@ -110,8 +110,7 @@ impl ShellModel {
         // A zero-sized layer configure means "client chooses", not a valid
         // empty viewport, and can otherwise disconnect opposing panels.
         let minimum = 1.0_f32.min(extent / 4.0);
-        (extent - self.panel(opposite).exclusive_zone_px.max(minimum) - minimum)
-            .max(minimum)
+        (extent - self.panel(opposite).exclusive_zone_px.max(minimum) - minimum).max(minimum)
     }
 
     fn fit_output_budget(&mut self) {
