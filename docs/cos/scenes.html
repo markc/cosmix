@@ -480,6 +480,9 @@ Changing a field's family or password mode replaces that widget.</p>
 <p>List rows use CTK VirtualList. Row templates are instantiated with
 <code>template-node@row-id</code> identities and substitute only <code>{cells[i]}</code> in text.
 Text elision uses CTK's middle-elision policy.</p>
+<p>CTK shares the font source cache through weak references. Fonts still used by
+retained layouts keep the same atlas identity after idle cache pruning, so
+periodically updated labels do not accumulate duplicate font-atlas textures.</p>
 <p>The standalone shell host bridges Wayland text-input-v3 preedit and commit
 events to Bevy's editable text pipeline. Candidate positions come from the
 focused field's layout in its panel surface, without a primary Winit window.

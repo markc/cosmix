@@ -44,6 +44,10 @@ List rows use CTK VirtualList. Row templates are instantiated with
 `template-node@row-id` identities and substitute only `{cells[i]}` in text.
 Text elision uses CTK's middle-elision policy.
 
+CTK shares the font source cache through weak references. Fonts still used by
+retained layouts keep the same atlas identity after idle cache pruning, so
+periodically updated labels do not accumulate duplicate font-atlas textures.
+
 The standalone shell host bridges Wayland text-input-v3 preedit and commit
 events to Bevy's editable text pipeline. Candidate positions come from the
 focused field's layout in its panel surface, without a primary Winit window.

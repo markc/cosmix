@@ -1162,6 +1162,11 @@ fn configure_typography(
     typography: &mut CtkTypography,
     font_cx: &mut FontCx,
 ) -> bool {
+    // Bevy prunes the local font source cache after two frames. Keep a weak
+    // backing cache so fonts still held by text layouts retain their Blob ID
+    // when reused after an idle gap. Otherwise each reload gives the same face
+    // a new FontAtlasKey and leaves another atlas texture resident.
+    font_cx.source_cache.make_shared();
     // An unresolved family is retried on every pass, not once per theme
     // revision: the font collection is built from the system at `FontCx`
     // construction, but families can still be registered into it afterwards,
@@ -4015,6 +4020,30 @@ mod tests {
             scale_authored_font_size(first, 20.0),
             "the second live apply must use the authored size, not the first result"
         );
+    }
+
+    #[test]
+    fn font_identity_survives_idle_source_cache_pruning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-font.ttf");
+        std::fs::write(&path, bevy::text::DEFAULT_FONT_DATA).unwrap();
+        let source = fontique::SourceInfo::new(
+            fontique::SourceId::new(),
+            fontique::SourceKind::Path(path.into()),
+        );
+        let mut app = App::new();
+        app.init_resource::<FontCx>()
+            .add_plugins(CtkThemePlugin::default());
+        app.update();
+        let mut fonts = app.world_mut().resource_mut::<FontCx>();
+        // A retained layout owns this blob while another label (e.g. a clock)
+        // is reshaped after Bevy has evicted its local source-cache entry.
+        let retained = fonts.source_cache.get(&source).unwrap();
+        for _ in 0..120 {
+            fonts.source_cache.prune(0, false);
+            let reloaded = fonts.source_cache.get(&source).unwrap();
+            assert_eq!(reloaded.id(), retained.id(), "font atlas identity drifted");
+        }
     }
 
     #[test]
