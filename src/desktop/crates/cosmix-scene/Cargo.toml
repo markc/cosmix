@@ -2,13 +2,13 @@
 name = "cosmix-scene"
 version = "0.1.0"
 description = "Headless Mix Scenes document parser, registry and diff"
-edition = "2021"
+edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 publish = false
 
 [dependencies]
-cosmix-lib-bus = { path = "../../../../src/crates/cosmix-lib-bus", default-features = false }
+cosmix-lib-bus = { package = "cosmix-lib-bus", path = "../../../../src/crates/cosmix-lib-bus", default-features = false }
 cosmix-lib-mix = { path = "../../../../src/crates/cosmix-lib-mix" }
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
