@@ -5,6 +5,8 @@
 //! Incremental application order is Remove, Insert, SetPort, then Reparent.
 //! A removed port is represented by `SetPort { value: null }` (clear).
 
+#![allow(clippy::collapsible_if)]
+
 use cosmix_bus::bus::parse_strict;
 use cosmix_mix::{MixError, value::Value};
 use indexmap::IndexMap;
