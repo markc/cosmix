@@ -6,6 +6,7 @@ use bevy::{feathers::FeathersPlugins, prelude::*, window::ExitCondition, winit::
 use ctk::prelude::*;
 
 fn main() {
+    // Keep the smoke entry point ahead of all window and renderer setup.
     if let Ok(mode) = std::env::var("CLIPPANEL_SMOKE") {
         if !mode.is_empty() {
             std::process::exit(bus::smoke(&mode));
