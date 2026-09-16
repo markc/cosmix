@@ -1,3 +1,4 @@
+//! Floating clipboard panel; the Bus listener survives window recreation.
 mod bus;
 
 use bus::{Action, Event, Request, Snapshot};
