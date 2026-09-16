@@ -1241,7 +1241,9 @@ impl NodedClient {
                 continue;
             }
 
-            if msg.get("command").is_some() {
+            // Topic delivery is identified by its topic header; an event
+            // envelope need not contain a command (or type: event).
+            if msg.get("command").is_some() || msg.get("topic").is_some() {
                 let cmd = IncomingCommand {
                     from: msg.get("from").unwrap_or("").to_string(),
                     command: msg.get("command").unwrap_or("").to_string(),
