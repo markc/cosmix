@@ -103,7 +103,7 @@ impl WaitForSubmittedWork for SuccessfulRetirementAdapter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
-        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT);
+        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_BATCH_DEADLINE);
         Ok(())
     }
 }
@@ -119,7 +119,7 @@ impl WaitForSubmittedWork for FailingRetirementAdapter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
-        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT);
+        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_BATCH_DEADLINE);
         Err(self.0.clone())
     }
 }
@@ -135,7 +135,7 @@ impl WaitForSubmittedWork for FirstWaitGatedRetirementAdapter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
-        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT);
+        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_BATCH_DEADLINE);
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if call == 1 {
             self.first_wait_entered
@@ -5836,7 +5836,7 @@ fn backing_then_renderer_release_retires_only_after_renderer_owner() {
 }
 
 #[test]
-fn retirement_timeout_faults_disconnects_and_abandons_without_stopping_protocol() {
+fn retirement_timeout_faults_disconnects_abandons_and_requests_loud_shutdown() {
     let mut harness = KeybindingHarness::new_with_retirement_adapter(
         true,
         Some(Box::new(FailingRetirementAdapter(
@@ -5874,6 +5874,13 @@ fn retirement_timeout_faults_disconnects_and_abandons_without_stopping_protocol(
         (2, 2),
         "the failed batch and a still-live use both remain accounted before fault dispatch"
     );
+    let healthy_info = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+        .expect("pre-fault snapshot")
+        .info;
+    assert!(
+        healthy_info.explicit_sync_advertised && healthy_info.explicit_sync_healthy,
+        "props leaves read from live state before the fault: {healthy_info:?}"
+    );
     pump_protocol_event_loop_until(
         &mut harness.server,
         "permanent explicit-sync timeout fault",
@@ -5894,7 +5901,19 @@ fn retirement_timeout_faults_disconnects_and_abandons_without_stopping_protocol(
     assert_eq!(live_point.signal_count(), 0);
     assert!(!harness.server.state.release_uses.explicit_sync_healthy());
     harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
-    assert_eq!(harness.server.state.shutdown_cause, None);
+    assert_eq!(
+        harness.server.state.shutdown_cause,
+        Some(ProtocolShutdownCause::RuntimeFailure),
+        "a permanent retirement fault must request a loud compositor restart, \
+         not run on silently degraded to implicit sync"
+    );
+    let faulted_info = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+        .expect("post-fault snapshot")
+        .info;
+    assert!(
+        !faulted_info.explicit_sync_advertised && !faulted_info.explicit_sync_healthy,
+        "props leaves must reflect the fault from live state, not fixtures: {faulted_info:?}"
+    );
     assert_eq!(
         harness.server.state.release_uses.accounting_counts(&client),
         (0, 0)
@@ -6005,6 +6024,12 @@ fn retirement_sequence_exhaustion_faults_before_requesting_a_wait() {
     assert!(!harness.server.state.release_uses.explicit_sync_healthy());
     harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
     assert_eq!(
+        harness.server.state.shutdown_cause,
+        Some(ProtocolShutdownCause::RuntimeFailure),
+        "a synchronous retirement fault must request the loud restart too; \
+         the async handlers can never fire for it once health is latched"
+    );
+    assert_eq!(
         harness.server.state.release_uses.accounting_counts(&client),
         (0, 0)
     );
@@ -6016,6 +6041,29 @@ fn retirement_sequence_exhaustion_faults_before_requesting_a_wait() {
             .observations()
             .faults,
         [ExplicitSyncFault::RetirementSequenceExhausted]
+    );
+}
+
+#[test]
+fn info_snapshot_distinguishes_advertisement_from_health() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.arm_explicit_sync_withdrawal_probe();
+    let info = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+        .expect("baseline snapshot")
+        .info;
+    assert!(info.explicit_sync_advertised && info.explicit_sync_healthy);
+
+    harness
+        .server
+        .state
+        .withdraw_explicit_sync_global("test: advertisement withdrawn without a fault");
+    let info = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+        .expect("post-withdrawal snapshot")
+        .info;
+    assert!(!info.explicit_sync_advertised);
+    assert!(
+        info.explicit_sync_healthy,
+        "withdrawal alone is not a pipeline fault; swapped build-site reads fail here"
     );
 }
 

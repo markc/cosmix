@@ -21,9 +21,9 @@ pub use import::{
 };
 pub use init::{ManualVulkanRenderer, ScanoutProbeRenderer};
 pub use retirement::{
-    RETIREMENT_WAIT_TIMEOUT, RetirementBatchId, RetirementRequestError, RetirementRequestSender,
-    RetirementSequence, RetirementWaitError, RetirementWorker, RetirementWorkerError,
-    RetirementWorkerReport, WaitForSubmittedWork, WgpuWaitForSubmittedWork,
+    RETIREMENT_BATCH_DEADLINE, RETIREMENT_WAIT_TIMEOUT, RetirementBatchId, RetirementRequestError,
+    RetirementRequestSender, RetirementSequence, RetirementWaitError, RetirementWorker,
+    RetirementWorkerError, RetirementWorkerReport, WaitForSubmittedWork, WgpuWaitForSubmittedWork,
     spawn_retirement_worker,
 };
 pub use scanout::{

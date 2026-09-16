@@ -935,6 +935,34 @@ cannot create surfaces or unlock it. Destroying the accepted resource during
 `Locking` aborts safely. An orphaned lock never auto-unlocks and persists until
 the compositor exits.
 
+## Explicit-sync fault policy
+
+A permanently faulted explicit-sync retirement pipeline restarts the
+compositor loudly instead of degrading the session (since 0.57.0). Previously
+a retirement fault withdrew the `linux-drm-syncobj-v1` global and the session
+kept running on implicit sync — DMA-BUF clients could then be scanned out
+mid-write, which shows as constant flicker, and nothing surfaced the
+degradation. Now every fault path (asynchronous worker report, worker channel
+closure, and the synchronous request-time fault) withdraws the global for the
+brief teardown window, then requests a `RuntimeFailure` shutdown: under KMS
+the process exits non-zero for its supervisor to restart with explicit sync
+intact; nested, the scene fails loudly.
+
+Transient stalls get bounded patience before that happens: the retirement
+worker grants each batch one 3 s wait on its captured submission index (sized
+to outlast a GPU engine-reset recovery) before a timeout is terminal — a
+single fixed-target wait, not a retry loop, because re-invoking the wait
+submits a fresh empty batch and chases a moving target. Structural faults
+(adapter panic, wait failure) are terminal immediately.
+
+Two read-only props leaves expose the state over the Bus:
+`info.explicit_sync_advertised` (the protocol global is currently offered to
+clients) and `info.explicit_sync_healthy` (the retirement pipeline has not
+permanently faulted). Reads are computed from live state per request. They are
+not covered by `comp.props.watch` diffs: after the loud-restart policy a
+fault's unhealthy window is at most one dispatch cycle, so the leaves are
+process-lifetime constants in practice — poll them, don't watch them.
+
 ## Vendored changes
 
 The vendored Smithay layer-surface handle has an additive `reset_after_unmap`
@@ -990,3 +1018,10 @@ The associated output resource is retained until lock-surface destruction,
 valid unlock or generation abort so Smithay's resource duplicate registry and
 Cosmix's physical-output ownership map are both released while the
 compositor-owned blank remains.
+
+The vendored wgpu-core carries a hand-backport of upstream wgpu `385520f7`
+("re-read the fence before the queue-empty assert in `Device::maintain`").
+Without it, a timed-out fence wait racing another thread's queue-drain
+panicked the retirement worker on a defensive assert — the trigger for the
+explicit-sync fault policy above firing every session. Provenance and the
+inherited caveats are in `src/desktop/vendor/README.md`.

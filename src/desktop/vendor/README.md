@@ -504,6 +504,27 @@ Allocation attribution also vendors `gpu-allocator` 0.28.0 to observe actual
 Vulkan block creation and release; see
 [`gpu-allocator/COSMIX-PATCH.md`](gpu-allocator/COSMIX-PATCH.md).
 
+2026-09-16 backport: upstream wgpu commit `385520f7` ("fix(core): re-read the
+fence before the queue-empty assert in Device::maintain") is applied to
+`vendor/wgpu-core/src/device/resource.rs`. The pre-fix `Device::maintain`
+asserted `current_finished_submission >= wait_submission_index` whenever
+`queue_empty` came back true, but after a wait TIMEOUT the queue can drain
+(another thread's maintain) before this thread re-reads its stale fence value —
+the assert then panics with the fence 1–5 submissions behind. On the desktop
+this killed comp's `cosmix-gpu-retirement` worker (and once the KMS pump) every
+run, silently withdrawing explicit sync. The backport captures the wait result
+and refuses the `QueueEmpty` branch when the wait timed out, reporting
+`WaitSucceeded`/`Timeout` from the fence comparison instead.
+
+Two callers inherit the changed status after a timed-out wait, neither
+reachable from comp's uses (indefinite waits and passive polls):
+`poll_all_devices_of_api` (`device/global.rs`) counts only `Ok(QueueEmpty)`
+toward `all_queue_empty`, so `Instance::poll_all` can now answer `false` where
+it previously answered `true`; and `configure_surface`
+(`device/resource.rs`) maps a `WaitSucceeded` result to `GpuWaitTimeout`, so a
+reconfigure racing a timed-out-then-completed wait now errors. Both are the
+upstream semantics; a future caller doing bounded waits inherits them.
+
 The initial-usage patch changes these upstream files:
 
 - `vendor/wgpu/src/api/device.rs`

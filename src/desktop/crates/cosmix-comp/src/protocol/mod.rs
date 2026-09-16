@@ -8293,14 +8293,30 @@ impl WaylandState {
 
     fn handle_retirement_report(&mut self, report: RetirementWorkerReport) {
         if self.release_uses.handle_retirement_event(report) {
-            self.withdraw_explicit_sync_global("retirement report fault");
+            self.fail_on_retirement_fault("retirement report fault");
         }
     }
 
     fn handle_retirement_worker_closed(&mut self) {
         if self.release_uses.retirement_worker_closed() {
-            self.withdraw_explicit_sync_global("retirement worker closed");
+            self.fail_on_retirement_fault("retirement worker closed");
         }
+    }
+
+    /// A permanently faulted retirement worker must take the compositor down
+    /// loudly, not silently downgrade the session to implicit sync. A session
+    /// that keeps running without the explicit-sync global scans out buffers
+    /// its clients are still writing (visible flicker), and nothing surfaces
+    /// the degradation. The global is still withdrawn first so the brief
+    /// window before teardown is protocol-correct.
+    fn fail_on_retirement_fault(&mut self, reason: &'static str) {
+        self.withdraw_explicit_sync_global(reason);
+        tracing::error!(
+            reason,
+            "explicit-sync retirement permanently faulted; requesting compositor restart \
+             instead of running degraded on implicit sync"
+        );
+        self.request_shutdown(ProtocolShutdownCause::RuntimeFailure);
     }
 
     fn handle_frame(&mut self, inputs: Vec<HostInput>) {
@@ -14641,7 +14657,11 @@ impl WaylandState {
             self.release_uses.release_owner(token),
             release_use::ReleaseOwnerDecision::Faulted(_)
         ) {
-            self.withdraw_explicit_sync_global("release owner fault");
+            // Synchronous fault path (queue full / worker gone at request
+            // time). transition_to_fault has already latched Faulted, so the
+            // asynchronous report/closed handlers will never fire for this
+            // fault — it must take the loud-restart path here or nothing will.
+            self.fail_on_retirement_fault("release owner fault");
         }
         let budgeted = self.budgeted_dmabuf_tokens.remove(&token);
         if budgeted
@@ -14841,7 +14861,11 @@ impl WaylandState {
                     };
                     let (buffer_id, cacheable) = self.dmabuf_buffer_identity(&buffer);
                     crate::frame_trace::event("comp_dmabuf_buffer_identity", || {
-                        (buffer_id.0, trace_object_identity(&buffer.id()), surface_id.0)
+                        (
+                            buffer_id.0,
+                            trace_object_identity(&buffer.id()),
+                            surface_id.0,
+                        )
                     });
                     let backing_buffer = buffer.clone();
                     let Some(token) = self.try_retain_dmabuf(surface, buffer) else {

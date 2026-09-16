@@ -439,7 +439,6 @@ impl<P: ReleaseUsePlatform> ReleaseUseEngine<P> {
         )
     }
 
-    #[cfg(test)]
     pub(super) fn explicit_sync_healthy(&self) -> bool {
         self.platform.explicit_sync_healthy()
     }

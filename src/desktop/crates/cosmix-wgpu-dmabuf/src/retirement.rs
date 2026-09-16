@@ -8,8 +8,24 @@ use std::{
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use thiserror::Error;
 
-/// Completion deadline for each retirement batch.
+/// Completion deadline for one-shot retirement waits (capture destinations,
+/// scanout completion checks). Not the retirement worker's batch budget.
 pub const RETIREMENT_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Completion deadline for a retirement worker batch before a timed-out GPU
+/// wait becomes a terminal worker fault.
+///
+/// A 250 ms miss is not evidence the pipeline is broken — a GPU hang + reset
+/// recovery or a page-realisation stall under memory pressure can exceed it
+/// and then complete normally. Since a terminal fault restarts the whole
+/// compositor (loud RuntimeFailure policy), a transient stall gets bounded
+/// patience: 3 s, sized to outlast an i915 engine-reset recovery. This must be
+/// ONE wait on the batch's captured submission index, never a retry loop
+/// around `wait_for_submitted_work` — each production call submits a fresh
+/// empty batch and waits for the NEW index, so retries chase a moving target
+/// and can all time out while the original work finished long ago. Structural
+/// faults (adapter panic, wait failure) stay terminal on first occurrence.
+pub const RETIREMENT_BATCH_DEADLINE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RetirementSequence(pub u64);
@@ -289,7 +305,7 @@ fn run_retirement_worker_from<F>(
         let result = match sequence_error {
             Some(error) => Err(error),
             None => catch_unwind(AssertUnwindSafe(|| {
-                adapter.wait_for_submitted_work(RETIREMENT_WAIT_TIMEOUT)
+                adapter.wait_for_submitted_work(RETIREMENT_BATCH_DEADLINE)
             }))
             .map_err(|_| RetirementWorkerError::AdapterPanicked)
             .and_then(|result| result.map_err(RetirementWorkerError::Wait)),
@@ -333,7 +349,10 @@ mod tests {
             &mut self,
             timeout: Duration,
         ) -> Result<(), RetirementWaitError> {
-            assert_eq!(timeout, RETIREMENT_WAIT_TIMEOUT);
+            assert_eq!(
+                timeout, RETIREMENT_BATCH_DEADLINE,
+                "the worker grants each batch the full transient-stall budget"
+            );
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(entered) = self.entered.take() {
                 entered.send(()).expect("observe wait entry");
@@ -471,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_failure_is_reported_once_without_retry() {
+    fn a_batch_deadline_timeout_is_terminal_in_one_wait() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (report_sender, report_receiver) = mpsc::channel();
         let (requests, mut worker) = spawn_retirement_worker(
@@ -493,12 +512,61 @@ mod tests {
             Err(RetirementWorkerError::Wait(RetirementWaitError::Timeout))
         );
         worker.join().expect("faulted worker exits");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "transient patience is one long wait on a fixed submission target; \
+             a retry loop would re-submit and chase a moving target"
+        );
         assert_eq!(
             requests.try_send(RetirementSequence(2)),
             Err(RetirementRequestError::Disconnected)
         );
     }
+
+    #[test]
+    fn a_structural_wait_failure_is_reported_once_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (report_sender, report_receiver) = mpsc::channel();
+        let (requests, mut worker) = spawn_retirement_worker(
+            Box::new(RecordingAdapter {
+                calls: Arc::clone(&calls),
+                outcome: Err(RetirementWaitError::Failed("device lost".into())),
+                entered: None,
+                release: None,
+            }),
+            4,
+            move |event| report_sender.send(event).is_ok(),
+        )
+        .expect("spawn worker");
+
+        requests.try_send(RetirementSequence(1)).expect("request");
+        let report = report_receiver.recv().expect("failure report");
+        assert_eq!(
+            report.result,
+            Err(RetirementWorkerError::Wait(RetirementWaitError::Failed(
+                "device lost".into()
+            )))
+        );
+        worker.join().expect("faulted worker exits");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a structural failure is terminal on first occurrence — no retry"
+        );
+        assert_eq!(
+            requests.try_send(RetirementSequence(2)),
+            Err(RetirementRequestError::Disconnected)
+        );
+    }
+
+    // Transient-stall RECOVERY is not testable at this seam: it lives inside
+    // `wait_for_submission`, which polls the SAME captured submission index
+    // until the batch deadline, so a stall shorter than
+    // RETIREMENT_BATCH_DEADLINE completes mid-wait. The RecordingAdapter
+    // deadline assertion above pins that the worker grants that budget in one
+    // call rather than a per-250ms retry loop (which would re-submit and
+    // chase a moving target — see RETIREMENT_BATCH_DEADLINE's doc).
 
     #[test]
     fn an_adapter_panic_becomes_a_terminal_worker_report() {

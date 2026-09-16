@@ -111,6 +111,8 @@ pub(crate) struct InfoSnapshot {
     pub(crate) backend: &'static str,
     pub(crate) engine: &'static str,
     pub(crate) instance: Arc<str>,
+    pub(crate) explicit_sync_advertised: bool,
+    pub(crate) explicit_sync_healthy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -422,7 +424,16 @@ macro_rules! flat_snapshot {
     };
 }
 
-flat_snapshot!(InfoSnapshot, service, version, backend, engine, instance);
+flat_snapshot!(
+    InfoSnapshot,
+    service,
+    version,
+    backend,
+    engine,
+    instance,
+    explicit_sync_advertised,
+    explicit_sync_healthy,
+);
 #[cfg(feature = "xwayland")]
 flat_snapshot!(XwaylandSnapshot, enabled, persist_path);
 flat_snapshot!(
@@ -831,6 +842,8 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             backend: context.backend,
             engine: context.engine,
             instance: context.instance.clone(),
+            explicit_sync_advertised: state.explicit_sync_global_advertised,
+            explicit_sync_healthy: state.release_uses.explicit_sync_healthy(),
         },
         outputs,
         surfaces,
@@ -1120,6 +1133,16 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         &[L("info"), L("instance")],
         String,
         "Random per-process compositor instance id"
+    ),
+    descriptor!(
+        &[L("info"), L("explicit_sync_advertised")],
+        Bool,
+        "Explicit-sync protocol global currently advertised to clients"
+    ),
+    descriptor!(
+        &[L("info"), L("explicit_sync_healthy")],
+        Bool,
+        "Explicit-sync retirement pipeline has not permanently faulted"
     ),
     descriptor!(
         &[L("outputs"), O, L("name")],
@@ -1981,6 +2004,8 @@ mod tests {
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),
+                explicit_sync_advertised: false,
+                explicit_sync_healthy: true,
             },
             outputs,
             surfaces,

@@ -78,9 +78,17 @@ sleeping between checks outside wgpu. This avoids holding wgpu's device fence
 read lock across a GPU wait, which would block queue submission's write lock.
 Later submissions do not extend the captured completion frontier.
 
-An uncompleted batch retains its leases. After the existing 250 ms retirement
-deadline, an unsuccessful check evicts its cached backings and strands the uses
-without publishing release. Dropping the registry with pending batches likewise
+An uncompleted batch retains its leases. The retirement worker grants each
+batch one `RETIREMENT_BATCH_DEADLINE` (3 s) wait on its captured submission
+index — sized to outlast a GPU engine-reset recovery — before a timeout
+becomes a terminal worker fault (since 0.16.1). It is deliberately a single
+fixed-target wait, never a retry loop around `wait_for_submitted_work`, whose
+production form submits a fresh empty batch per call and would chase a moving
+target. Adapter panics and wait failures stay terminal on first occurrence.
+The one-shot 250 ms `RETIREMENT_WAIT_TIMEOUT` remains the deadline for capture
+and scanout completion checks. After a terminal outcome, an unsuccessful check
+evicts its cached backings and strands the uses without publishing release.
+Dropping the registry with pending batches likewise
 strands them: raw ownership barriers do not register texture references with
 wgpu. Terminal device-only drains and opt-in diagnostic readbacks may still
 wait synchronously. Live fullscreen DMA-BUF animation with mouse motion remains

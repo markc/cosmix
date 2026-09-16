@@ -9,16 +9,16 @@ mod client_surface_material;
 mod compositor_scene;
 mod decoration;
 mod decoration_scene;
-mod frame_trace;
-#[cfg(any(all(feature = "kms-live", not(test)), test))]
-mod readiness;
-#[cfg(feature = "native-quoin")]
-mod native_shell;
 #[cfg(feature = "frame-capture")]
 mod frame_capture;
+mod frame_trace;
+#[cfg(feature = "native-quoin")]
+mod native_shell;
 #[cfg(feature = "bus")]
 mod port;
 mod protocol;
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+mod readiness;
 mod render_asset_demand;
 mod render_asset_readiness;
 mod render_component_demand;

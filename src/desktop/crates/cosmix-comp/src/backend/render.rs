@@ -5872,7 +5872,7 @@ fn present_output_frames(
             let target = views.iter().find_map(|(camera, target)| {
                 (camera.order == 0
                     && camera.target == Some(NormalizedRenderTarget::TextureView(source.handle)))
-                    .then_some(target)
+                .then_some(target)
             });
             ExtractedOutputView {
                 key: key.clone(),

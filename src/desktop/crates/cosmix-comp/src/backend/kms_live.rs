@@ -11917,7 +11917,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pulses.get(), 3, "a busy frame with no submission never pulses");
+        assert_eq!(
+            pulses.get(),
+            3,
+            "a busy frame with no submission never pulses"
+        );
     }
 
     #[test]
