@@ -17,6 +17,7 @@ members = [
     "apps/media",
     "apps/term",
     "crates/cosmix-design",
+    "crates/cosmix-scene",
     "crates/cosmix-comp",
     "crates/cosmix-deco",
     "crates/cosmix-shell",
