@@ -115,6 +115,8 @@ impl CtkTextField {
 #[derive(Clone, Debug)]
 pub struct CtkTextFieldProps {
     pub initial: String,
+    /// Visual hint only; never inserted into the editable value.
+    pub placeholder: String,
     pub accessible_label: String,
     pub max_length: usize,
     pub select_all: bool,
@@ -125,6 +127,7 @@ impl CtkTextFieldProps {
     pub fn new(initial: impl Into<String>, accessible_label: impl Into<String>) -> Self {
         Self {
             initial: initial.into(),
+            placeholder: String::new(),
             accessible_label: accessible_label.into(),
             max_length: 4_096,
             select_all: false,
@@ -134,6 +137,11 @@ impl CtkTextFieldProps {
 
     pub fn max_length(mut self, max_length: usize) -> Self {
         self.max_length = max_length;
+        self
+    }
+
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
         self
     }
 
@@ -187,6 +195,22 @@ pub fn spawn_text_field(commands: &mut Commands, props: CtkTextFieldProps) -> Ct
         input.insert(SelectAllOnFocus);
     }
     let input = input.id();
+    let hint = commands
+        .spawn((
+            Text::new(props.placeholder),
+            TextFont::from_font_size(13.0),
+            ThemeTextColor(tokens::TEXT_DIM),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(7),
+                top: px(4),
+                ..default()
+            },
+            Pickable::IGNORE,
+            CtkTextFieldPlaceholder { input },
+        ))
+        .id();
+    commands.entity(input).add_child(hint);
     commands
         .entity(input)
         .insert(CtkTextInputFocusBorder::new(tokens::CONTROL));
@@ -413,6 +437,27 @@ fn text_accessibility(label: &str, secret: bool) -> AccessibilityNode {
 /// Installs the secret-field edit guard and mask synchronisation.
 pub struct CtkTextFieldPlugin;
 
+/// Non-interactive ghost text associated with an editable field.
+#[derive(Component)]
+pub struct CtkTextFieldPlaceholder {
+    pub input: Entity,
+}
+
+fn sync_placeholders(
+    fields: Query<&EditableText>,
+    mut hints: Query<(&CtkTextFieldPlaceholder, &mut Node)>,
+) {
+    for (hint, mut node) in &mut hints {
+        let show = fields
+            .get(hint.input)
+            .is_ok_and(|editable| editable.value().is_empty() && !editable.is_composing());
+        let display = if show { Display::Flex } else { Display::None };
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
 impl Plugin for CtkTextFieldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<InputFocus>()
@@ -439,7 +484,10 @@ impl Plugin for CtkTextFieldPlugin {
                 PostUpdate,
                 strip_secret_clipboard_edits.before(EditableTextSystems),
             )
-            .add_systems(PostUpdate, sync_secret_fields.after(EditableTextSystems));
+            .add_systems(
+                PostUpdate,
+                (sync_secret_fields, sync_placeholders).after(EditableTextSystems),
+            );
     }
 }
 
@@ -502,6 +550,54 @@ fn sync_secret_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_is_separate_from_value_and_tracks_empty_input() {
+        use bevy::ecs::world::CommandQueue;
+
+        let mut app = App::new();
+        app.add_systems(Update, sync_placeholders);
+        let mut queue = CommandQueue::default();
+        let field = spawn_text_field(
+            &mut Commands::new(&mut queue, app.world()),
+            CtkTextFieldProps::new("", "Search").placeholder("search…"),
+        );
+        queue.apply(app.world_mut());
+        app.update();
+        assert!(app
+            .world()
+            .get::<EditableText>(field.input)
+            .unwrap()
+            .value()
+            .is_empty());
+        let hint = app
+            .world_mut()
+            .query_filtered::<Entity, With<CtkTextFieldPlaceholder>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(app.world().get::<Text>(hint).unwrap().0, "search…");
+        assert_eq!(
+            app.world().get::<Node>(hint).unwrap().display,
+            Display::Flex
+        );
+
+        app.world_mut()
+            .entity_mut(field.input)
+            .insert(EditableText::new("query"));
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(hint).unwrap().display,
+            Display::None
+        );
+        app.world_mut()
+            .entity_mut(field.input)
+            .insert(EditableText::new(""));
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(hint).unwrap().display,
+            Display::Flex
+        );
+    }
 
     #[test]
     fn text_input_focus_border_tracks_focus_resting_token_and_theme_changes() {
