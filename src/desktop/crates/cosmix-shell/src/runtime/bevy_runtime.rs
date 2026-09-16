@@ -300,6 +300,11 @@ mod tests {
                 .model
                 .panel_input(edge, Duration::ZERO, PanelInput::Pin)
                 .unwrap();
+            assert!(
+                runtime.model.panel(Edge::Left).exclusive_zone_px
+                    + runtime.model.panel(Edge::Right).exclusive_zone_px
+                    < runtime.model.geometry().width()
+            );
         }
         let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
         for width in [800.0, 320.0, 100.0] {
