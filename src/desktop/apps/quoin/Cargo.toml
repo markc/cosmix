@@ -10,6 +10,7 @@ default-run = "cosmix-quoin"
 
 [features]
 default = []
+scene-gates = ["cosmix-scene-bevy/gate"]
 demo = ["cosmix-shell/dev-host"]
 
 [[bin]]

@@ -216,6 +216,13 @@ pub(crate) struct Mounted {
     nodes: BTreeMap<String, View>,
 }
 
+#[cfg(feature = "gate")]
+impl Mounted {
+    pub(crate) fn input(&self, id: &str) -> Option<Entity> {
+        self.nodes.get(id)?.input
+    }
+}
+
 struct View {
     root: Entity,
     input: Option<Entity>,

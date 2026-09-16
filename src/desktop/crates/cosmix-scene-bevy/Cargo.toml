@@ -6,6 +6,9 @@ rust-version = "1.95"
 license = "MIT"
 description = "Retained CTK adapter for renderer-neutral Mix Scenes"
 
+[features]
+gate = []
+
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "bevy_ui_widgets", "bevy_feathers", "png"] }
 cosmix-scene = { path = "../cosmix-scene" }
