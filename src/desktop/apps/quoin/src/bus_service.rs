@@ -95,15 +95,20 @@ impl Plugin for ShellBusPlugin {
     }
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct SceneBus<'w, 's> {
+    power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
+    scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
+    events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
+}
+
 fn service_bus(
     bridge: Res<BusBridge>,
     frame: Res<ShellFrameState>,
     time: Res<Time<Real>>,
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
-    mut power_text: Query<&mut Text, With<QuoinPowerText>>,
-    mut scenes: ResMut<cosmix_scene_bevy::SceneStore>,
-    mut scene_events: ResMut<cosmix_scene_bevy::SceneEvents>,
+    mut content: SceneBus,
     mut wallpaper: (
         ResMut<crate::wallpaper::WallpaperState>,
         ResMut<cosmix_shell_host::LayerHostDeadline>,
@@ -120,7 +125,7 @@ fn service_bus(
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
-        scene_events.reply(&event);
+        content.events.reply(&event);
         wallpaper.0.event(&event, time.elapsed());
         wallpaper.2.event(&event, time.elapsed());
         match event {
@@ -190,7 +195,7 @@ fn service_bus(
     wallpaper.2.tick(&bridge, time.elapsed(), &mut wallpaper.1);
     if power_changed {
         let rendered = state.power.render();
-        for mut text in &mut power_text {
+        for mut text in &mut content.power_text {
             **text = rendered.clone();
         }
     }
@@ -218,7 +223,7 @@ fn service_bus(
         let (rc, body, command) =
             if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
                 let args = parse_args(&request).unwrap_or(Value::Null);
-                let (rc, body) = scenes.dispatch(verb, &request.body, &args, &bridge);
+                let (rc, body) = content.scenes.dispatch(verb, &request.body, &args, &bridge);
                 (rc, body, None)
             } else if request.command == "shell.debug.status" {
                 (
