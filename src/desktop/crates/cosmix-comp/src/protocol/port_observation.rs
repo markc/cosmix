@@ -33,6 +33,7 @@ use super::{
         SurfaceSnapshot, WindowSnapshot, project_focus, project_output, project_outputs,
         project_stack, project_surface_by_id, project_window_row, snapshot,
     },
+    window_control::WindowTargetError,
 };
 
 pub(crate) const PROPS_TOPIC_SUFFIX: &str = "props.changed";
@@ -1914,6 +1915,27 @@ fn diff_window_row(
             PropValue::String(old.band.into()),
             PropValue::String(new.band.into()),
         ),
+        (
+            "generation",
+            PropValue::U64(old.generation),
+            PropValue::U64(new.generation),
+        ),
+        (
+            "window_x",
+            PropValue::F32(old.window_x),
+            PropValue::F32(new.window_x),
+        ),
+        (
+            "window_y",
+            PropValue::F32(old.window_y),
+            PropValue::F32(new.window_y),
+        ),
+        (
+            "visible",
+            PropValue::Bool(old.visible),
+            PropValue::Bool(new.visible),
+        ),
+        ("pid", prop_opt_u64(old.pid), prop_opt_u64(new.pid)),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -1951,6 +1973,16 @@ fn diff_focus(
             "session_lock",
             prop_str(old.session_lock),
             prop_str(new.session_lock),
+        ),
+        (
+            "window.id",
+            prop_opt_u64(old.window.id),
+            prop_opt_u64(new.window.id),
+        ),
+        (
+            "window.generation",
+            prop_opt_u64(old.window.generation),
+            prop_opt_u64(new.window.generation),
         ),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
@@ -2043,9 +2075,20 @@ fn service_controls(state: &mut WaylandState) {
     }
     controls.sort_by_key(PortControl::order);
     let mut changes = PendingPropChanges::new();
+    // Mutations run in arrival order, so a script's set -> minimise ->
+    // restore lands in the order it was sent.
     for control in &mut controls {
-        if let PortControl::Set(request) = control {
-            service_set(state, request, &mut changes);
+        match control {
+            PortControl::Set(request) => service_set(state, request, &mut changes),
+            PortControl::Window(request) => {
+                let reply = state.service_window_op(&request.op);
+                if let Some(sender) = request.reply.take() {
+                    let _ = sender.send(reply);
+                }
+            }
+            PortControl::Watch(_)
+            | PortControl::PointerWatch(_)
+            | PortControl::WatchState { .. } => {}
         }
     }
     flush_set_changes(state, changes);
@@ -2070,7 +2113,7 @@ fn service_controls(state: &mut WaylandState) {
                 watches.push(request);
             }
             PortControl::WatchState { active, .. } => desired_active = active,
-            PortControl::Set(_) => {}
+            PortControl::Set(_) | PortControl::Window(_) => {}
         }
     }
 
@@ -2114,8 +2157,37 @@ fn service_set(
         service_set_xwayland_enabled(state, request, changes);
         return;
     }
-    if let Some(window) = parse_window_band_path(&path) {
-        service_set_window_band(state, request, window);
+    if let Some((window, leaf)) = parse_window_leaf_path(&path) {
+        // The optional fence is checked before any leaf logic, so a stale
+        // write never reaches whatever window inherited the id.
+        if let Some(generation) = request.generation
+            && let Err(error @ WindowTargetError::StaleTarget { .. }) =
+                state.resolve_window_target(window, Some(generation))
+        {
+            if let Some(reply) = request.reply.take() {
+                let _ = reply.send(ControlReply::WindowTarget { id: window, error });
+            }
+            return;
+        }
+        match leaf {
+            "band" => service_set_window_band(state, request, window),
+            "minimized" => service_set_window_minimized(state, request, window),
+            _ => {
+                if let Some(reply) = request.reply.take() {
+                    let _ = reply.send(ControlReply::Validation(read_only_or_unknown(&path)));
+                }
+            }
+        }
+        return;
+    }
+    if request.generation.is_some() {
+        if let Some(reply) = request.reply.take() {
+            let _ = reply.send(ControlReply::Validation(invalid_value(
+                "generation",
+                "absent",
+                "generation applies to windows.s<id>.* paths only",
+            )));
+        }
         return;
     }
     let old_config = state.observations.corner_config;
@@ -2252,6 +2324,61 @@ fn service_set_window_band(state: &mut WaylandState, request: &mut PortSetReques
     }
 }
 
+/// The `windows.s<id>.minimized` set: `true` minimises exactly like the
+/// title-bar button, `false` restores THIS window (not the LIFO top) and
+/// focuses and raises it. Like the band leaf, the changed events come from
+/// the window-row diff, here attributed to `props.set`.
+fn service_set_window_minimized(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    window: u64,
+) {
+    let path = request.path.clone();
+    let Some(minimized) = request.value.as_bool() else {
+        if let Some(reply) = request.reply.take() {
+            let _ = reply.send(ControlReply::Validation(invalid_value(
+                &path,
+                "bool",
+                "true|false",
+            )));
+        }
+        return;
+    };
+    let reply_value = if state.session_lock_active() {
+        ControlReply::Locked
+    } else {
+        match state.resolve_window_target(window, request.generation) {
+            Ok(object) => {
+                state.mark_surface_dirty(SurfaceId(window), "props.set");
+                match state.set_window_minimized(&object, minimized) {
+                    Some((old, new)) => ControlReply::Set {
+                        path,
+                        old: PropValue::Bool(old),
+                        new: PropValue::Bool(new),
+                        persisted: None,
+                    },
+                    None => missing_window(&path),
+                }
+            }
+            Err(error @ WindowTargetError::StaleTarget { .. }) => {
+                ControlReply::WindowTarget { id: window, error }
+            }
+            Err(_) => missing_window(&path),
+        }
+    };
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(reply_value);
+    }
+}
+
+fn missing_window(path: &str) -> ControlReply {
+    ControlReply::Validation(invalid_value(
+        path,
+        "existing window id",
+        "a live toplevel window",
+    ))
+}
+
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     flush_prop_changes(state, changes);
     if let Some(baseline) = state.observations.watched_baseline.as_mut() {
@@ -2267,7 +2394,16 @@ fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
 /// Only this exact shape is writable; every other `windows.*` path stays
 /// read-only through `known_read_only_path`.
 pub(crate) fn parse_window_band_path(path: &str) -> Option<u64> {
-    let id = path.strip_prefix("windows.s")?.strip_suffix(".band")?;
+    parse_window_leaf_path(path).and_then(|(id, leaf)| (leaf == "band").then_some(id))
+}
+
+/// Parse `windows.s<id>.<leaf>` into the canonical id and the one-segment
+/// leaf name. Used by the write gate and the `generation` fence.
+pub(crate) fn parse_window_leaf_path(path: &str) -> Option<(u64, &str)> {
+    let (id, leaf) = path.strip_prefix("windows.s")?.split_once('.')?;
+    if leaf.is_empty() || leaf.contains('.') {
+        return None;
+    }
     // Canonical ids only: a leading zero ("windows.s0007.band") would write
     // through an alias that reads, describes and event-diffs as "s7" — the
     // reply would name a path that can never be read back.
@@ -2277,7 +2413,16 @@ pub(crate) fn parse_window_band_path(path: &str) -> Option<u64> {
     {
         return None;
     }
-    id.parse().ok()
+    Some((id.parse().ok()?, leaf))
+}
+
+/// Unknown and read-only window leaves keep the ordinary set errors.
+fn read_only_or_unknown(path: &str) -> SetValidationError {
+    if known_read_only_path(path) {
+        SetValidationError::ReadOnly
+    } else {
+        SetValidationError::UnknownPath
+    }
 }
 
 /// A window band write accepts exactly the two operator-reachable bands:
@@ -2312,6 +2457,13 @@ pub(crate) fn validate_set_request(path: &str, value: &Value) -> Result<(), SetV
     }
     if parse_window_band_path(path).is_some() {
         return validate_window_band_value(path, value).map(|_| ());
+    }
+    if parse_window_leaf_path(path).is_some_and(|(_, leaf)| leaf == "minimized") {
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(invalid_value(path, "bool", "true|false"))
+        };
     }
     validate_corner_value(path, value).map(|_| ())
 }
@@ -2751,6 +2903,7 @@ mod tests {
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("f_7".into()),
+            window: Default::default(),
         };
         let window = project_window_row(&surface);
         let mut keyed = PendingPropChanges::new();

@@ -1675,8 +1675,7 @@ impl WaylandState {
                 // the window's position memory for the remap, and
                 // discarding it here would reopen a moved/maximized window
                 // in the wrong place.
-                displaced_geometry =
-                    Some(role.granted_geometry).filter(|_| role.phase.ever_granted);
+                displaced_geometry = role.phase.ever_granted.then_some(role.granted_geometry);
                 Some(role.wl_surface.clone())
             });
             match displaced_surface {
@@ -1857,8 +1856,10 @@ impl WaylandState {
         }));
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
+        let role_generation = self.next_role_generation();
         let id = if let Some(record) = self.surfaces.get_mut(&object) {
             let id = record.id;
+            record.generation = role_generation;
             // Re-associating a presented record withdraws it: tell the
             // renderer, or it keeps an entity the protocol thinks is gone.
             if record.mapped {
@@ -1898,6 +1899,7 @@ impl WaylandState {
                 object.clone(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role,
                     mapped: false,
                     layout,
