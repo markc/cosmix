@@ -73,16 +73,22 @@ selection through a non-blocking pipe in the loop; the result arrives as
 `Event::SelectionText`. A selection this app still owns is answered
 directly. Writes to other clients are also non-blocking loop sources.
 
-## Other threads
+## Timers and other threads
 
-`Ctx::waker()` returns a `Send` handle; `Waker::wake(token)` delivers
-`Event::Wake(token)` on the loop thread.
+`Ctx::set_timer(token, instant)` arms a one-shot loop timer that arrives as
+`Event::Timer(token)`; `cancel_timer` removes it. A timer exists only while
+armed, so an app that arms one only for a pending deadline (a caret blink)
+stays idle otherwise. `Ctx::waker()` returns a `Send` handle;
+`Waker::wake(token)` delivers `Event::Wake(token)` on the loop thread.
+
+`Event::SelectionChanged` reports that another client set a selection, for
+apps that keep a synchronous clipboard cache.
 
 ## Not yet
 
 These are not implemented yet: xdg-activation, touch, drag and drop,
 multiple seats, SIGTERM handling, and a way for the app to add its own
-calloop sources (use `Waker` from a thread for now).
+calloop sources (use `Waker` or a timer for now).
 
 ## Demo
 
@@ -94,4 +100,11 @@ clipboard.
 - `WL_DEMO_TRACE=1` logs notable events.
 - `WL_DEMO_EXIT_AFTER=N` exits after N seconds.
 - The demo prints its startup time and, on exit, the frame count.
-- The iced twin, `wl-iced-demo`, is added to the same package.
+- `wl-iced-demo` (feature `iced`, built in its own cargo invocation) draws
+  the same grid under iced chrome from `cosmix-iced-host`: a tab bar, a menu
+  bar and a search `TextField` from `cosmix-iced-widgets`, rasterised into the
+  same buffer, with grid and chrome damage merged into one commit. Menu
+  panels are `xdg_popup`s, each with its own iced `Surface`; the state
+  machine is `menus.rs` (pure), the popup reconciler `iced/popups.rs`. The
+  panel program is a local stand-in until `cosmix-iced-widgets` exposes a
+  standalone panel and its menu state.

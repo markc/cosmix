@@ -4,8 +4,9 @@
 use super::chrome::{self, Chrome};
 use super::clipboard::Shared;
 use super::damage::{Commit, merge};
+use super::ime;
+use super::keys::{self, Route};
 use super::popups::{Bar, MenuPopups};
-use super::{ime, keys};
 use crate::menus::{Entry, Metrics, Outcome};
 use crate::raw::RawDemo;
 use crate::startup::Clock;
@@ -15,8 +16,8 @@ use cosmix_iced_host::core::widget::operation::focusable;
 use cosmix_iced_host::core::{Point, Size};
 use cosmix_iced_host::{PixelFormat, Redraw, Settings, Surface, Update, input};
 use cosmix_wl_app::{
-    App, BTN_LEFT, ButtonState, Ctx, CursorShape, Event, Frame, KeyState, Keysym, PointerKind,
-    Selection, SurfaceId, SurfaceInfo,
+    App, BTN_LEFT, ButtonState, Ctx, CursorShape, Event, Frame, PointerKind, Selection, SurfaceId,
+    SurfaceInfo,
 };
 
 /// Timer token for the chrome's next redraw deadline (caret blink).
@@ -248,43 +249,24 @@ impl IcedDemo {
     }
 
     fn key(&mut self, cx: &mut Ctx<'_>, key: cosmix_wl_app::KeyEvent) {
-        if key.state == KeyState::Released {
-            self.chrome.queue_event(keys::key_event(&key));
-            self.process(cx);
-            return;
-        }
-        if self.menus.nav.is_open() {
-            // Menus are modal: every press goes to them.
-            if let Some(nav) = keys::nav_key(key.keysym) {
+        match keys::route(&key, self.menus.nav.is_open()) {
+            Route::Menu(nav) => {
                 let outcome = self.menus.nav.key(&self.menus.bar, nav);
                 self.outcome(cx, outcome);
             }
-            return;
-        }
-        if keys::is_f10(&key) {
-            self.menus.nav.open(&self.menus.bar, 0, true);
-            self.after_menu_change(cx);
-            return;
-        }
-        if keys::ctrl_shift(&key, Keysym::c, Keysym::C) {
-            return self.run(cx, Action::Copy);
-        }
-        if keys::ctrl_shift(&key, Keysym::v, Keysym::V) {
-            return self.run(cx, Action::Paste);
-        }
-        if keys::ctrl_shift(&key, Keysym::l, Keysym::L) {
-            return self.run(cx, Action::ClearTab);
-        }
-        if keys::ctrl_shift(&key, Keysym::q, Keysym::Q) {
-            return self.run(cx, Action::Quit);
-        }
-        if key.modifiers.ctrl && !key.modifiers.shift && key.keysym == Keysym::f {
-            return self.run(cx, Action::FocusSearch);
-        }
-        self.chrome.queue_event(keys::key_event(&key));
-        let update = self.process(cx);
-        if update.statuses.first() != Some(&Status::Captured) {
-            self.raw.event(cx, Event::Key(key));
+            Route::Swallow => {}
+            Route::OpenBar => {
+                self.menus.nav.open(&self.menus.bar, 0, true);
+                self.after_menu_change(cx);
+            }
+            Route::Shortcut(action) => self.run(cx, action),
+            Route::Chrome { then_grid } => {
+                self.chrome.queue_event(keys::key_event(&key));
+                let update = self.process(cx);
+                if then_grid && update.statuses.first() != Some(&Status::Captured) {
+                    self.raw.event(cx, Event::Key(key));
+                }
+            }
         }
     }
 
@@ -464,9 +446,22 @@ impl App for IcedDemo {
 
     fn event(&mut self, cx: &mut Ctx<'_>, event: Event) {
         match event {
-            ev @ Event::Configure { surface, info, .. } if Some(surface) == self.raw.window() => {
+            ev @ Event::Configure {
+                surface,
+                info,
+                first,
+                ..
+            } if Some(surface) == self.raw.window() => {
                 self.raw.event(cx, ev);
                 self.resize_chrome(&info);
+                // Measurement hook: with no input injection, focus the
+                // search field (and tell iced the window is focused) so the
+                // caret-blink idle cost can be measured.
+                if first && std::env::var_os("WL_DEMO_FOCUS_SEARCH").is_some_and(|v| v == "1") {
+                    self.chrome.queue_event(input::focus_event(true));
+                    self.process(cx);
+                    self.run(cx, Action::FocusSearch);
+                }
             }
             ev @ Event::ScaleChanged { surface, info } => {
                 if Some(surface) == self.raw.window() {

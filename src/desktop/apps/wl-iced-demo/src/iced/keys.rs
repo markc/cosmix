@@ -1,5 +1,6 @@
 //! Glue: cosmix-wl-app keyboard events to iced events and menu keys.
 
+use super::app::Action;
 use crate::menus::NavKey;
 use cosmix_iced_host::core::Event as IcedEvent;
 use cosmix_iced_host::keys::{self, KeyInput};
@@ -51,6 +52,51 @@ pub fn ctrl_shift(key: &KeyEvent, lower: Keysym, upper: Keysym) -> bool {
     key.modifiers.ctrl && key.modifiers.shift && (key.keysym == lower || key.keysym == upper)
 }
 
+/// Where a key goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Menus are open and modal: navigate.
+    Menu(NavKey),
+    /// Menus are open and the key means nothing to them.
+    Swallow,
+    /// F10: open the first menu with its first row selected.
+    OpenBar,
+    Shortcut(Action),
+    /// To the chrome; if it does not capture the key and `then_grid`, to the
+    /// grid. Releases only update the chrome's key state.
+    Chrome {
+        then_grid: bool,
+    },
+}
+
+pub fn route(key: &KeyEvent, menus_open: bool) -> Route {
+    if key.state == KeyState::Released {
+        return Route::Chrome { then_grid: false };
+    }
+    if menus_open {
+        return nav_key(key.keysym).map_or(Route::Swallow, Route::Menu);
+    }
+    if is_f10(key) {
+        return Route::OpenBar;
+    }
+    let shortcuts = [
+        (Keysym::c, Keysym::C, Action::Copy),
+        (Keysym::v, Keysym::V, Action::Paste),
+        (Keysym::l, Keysym::L, Action::ClearTab),
+        (Keysym::q, Keysym::Q, Action::Quit),
+    ];
+    for (lower, upper, action) in shortcuts {
+        if ctrl_shift(key, lower, upper) {
+            return Route::Shortcut(action);
+        }
+    }
+    let m = key.modifiers;
+    if m.ctrl && !m.shift && !m.alt && key.keysym == Keysym::f {
+        return Route::Shortcut(Action::FocusSearch);
+    }
+    Route::Chrome { then_grid: true }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +140,40 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn routing_between_bar_popups_chrome_and_grid() {
+        let press = |sym| KeyEvent {
+            modifiers: Modifiers::default(),
+            ..key(sym, None, KeyState::Pressed)
+        };
+        assert_eq!(route(&press(Keysym::F10), false), Route::OpenBar);
+        assert_eq!(route(&press(Keysym::Down), true), Route::Menu(NavKey::Down));
+        assert_eq!(
+            route(&press(Keysym::Escape), true),
+            Route::Menu(NavKey::Escape)
+        );
+        // Menus are modal: typing and F10 are swallowed while open.
+        assert_eq!(route(&press(Keysym::a), true), Route::Swallow);
+        assert_eq!(route(&press(Keysym::F10), true), Route::Swallow);
+        assert_eq!(
+            route(&press(Keysym::a), false),
+            Route::Chrome { then_grid: true }
+        );
+        // Releases never reach the grid or the menus.
+        assert_eq!(
+            route(&key(Keysym::Down, None, KeyState::Released), true),
+            Route::Chrome { then_grid: false }
+        );
+        let mut ctrl_f = press(Keysym::f);
+        ctrl_f.modifiers.ctrl = true;
+        assert_eq!(route(&ctrl_f, false), Route::Shortcut(Action::FocusSearch));
+        let mut copy = press(Keysym::C);
+        copy.modifiers.ctrl = true;
+        copy.modifiers.shift = true;
+        assert_eq!(route(&copy, false), Route::Shortcut(Action::Copy));
+        assert_eq!(route(&copy, true), Route::Swallow);
     }
 
     #[test]
