@@ -189,12 +189,16 @@ impl<F: Feedback> PresentationLedger<F> {
         self.pending.keys().copied().collect()
     }
 
+    // Read by the stats surface (step 6) and the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending_count(&self, id: SurfaceId) -> usize {
         self.pending.get(&id).map_or(0, |queue| {
             queue.iter().map(|entry| entry.callbacks.len()).sum()
         })
     }
 
+    // Read by the stats surface (step 6) and the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn counters(&self, id: SurfaceId) -> PresentationCounters {
         self.counters.get(&id).copied().unwrap_or_default()
     }
@@ -306,6 +310,8 @@ impl SourceLedger {
         }
     }
 
+    // Read by the stats surface (step 6) and the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get(&self, id: &str) -> Option<&SourceCounters> {
         self.sources.get(id)
     }

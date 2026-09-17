@@ -1348,12 +1348,6 @@ impl ClientSceneFeed {
         }
     }
 
-    pub(crate) fn frame_presentation_reporter(&self) -> FramePresentationReporter {
-        FramePresentationReporter {
-            commands: self.commands.clone(),
-        }
-    }
-
     pub(crate) fn cursor_position(&self) -> CursorPositionSnapshot {
         *self
             .cursor_position
