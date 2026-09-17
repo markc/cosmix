@@ -29290,6 +29290,94 @@ fn mesh_minimise_cancels_a_client_move_in_progress() {
     assert_eq!(harness.server.state.surfaces[&object].window_origin, origin);
 }
 
+/// The resize case of the above: a minimised window stays alive, so the
+/// client must be told the resize ended (Resizing unset), and restore must
+/// not resume it.
+#[cfg(feature = "bus")]
+#[test]
+fn mesh_minimise_ends_a_client_resize_in_progress() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let record = &harness.server.state.surfaces[&object];
+    let toplevel = record.role.toplevel().expect("xdg toplevel").clone();
+    let surface = toplevel.wl_surface().clone();
+    let (origin, size) = (record.window_origin, record.configured_size);
+    // What the xdg resize request handler does on a matching grab.
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
+        surface: surface.clone(),
+        edges: xdg_toplevel::ResizeEdge::BottomRight,
+        start_pointer: (0.0, 0.0),
+        start_origin: origin,
+        start_size: size,
+    });
+    toplevel.with_pending_state(|state| {
+        state.states.set(xdg_toplevel::State::Resizing);
+    });
+    let _ = harness
+        .server
+        .state
+        .send_pending_toplevel_configure(&surface, false);
+    let started = harness.sync();
+    assert!(
+        toplevel_configure_states(&started, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| states.contains(&(xdg_toplevel::State::Resizing as u32))),
+        "precondition: the client was told it is resizing"
+    );
+
+    let runtime = control_reply_runtime();
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Minimize { id, generation })
+        .expect("minimize admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.interactive_pointer.is_none());
+    let ended = toplevel_configure_states(&harness.sync(), TEST_TOPLEVEL_ID);
+    // Focus also leaves the window, which may send its own configure; what
+    // matters is that the client hears the resize end and never again
+    // hears it continue.
+    assert!(!ended.is_empty(), "the client is told the resize ended");
+    assert!(
+        ended
+            .iter()
+            .all(|states| !states.contains(&(xdg_toplevel::State::Resizing as u32))),
+        "{ended:?}"
+    );
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(400.0, 300.0)
+    );
+    assert_eq!(harness.server.state.surfaces[&object].configured_size, size);
+
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Restore {
+            target: Some((id, generation)),
+        })
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.interactive_pointer.is_none());
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(500.0, 400.0)
+    );
+    assert!(
+        toplevel_configure_states(&harness.sync(), TEST_TOPLEVEL_ID)
+            .iter()
+            .all(|states| !states.contains(&(xdg_toplevel::State::Resizing as u32))),
+        "restore does not resume the resize"
+    );
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.configured_size, size);
+    assert_eq!(record.window_origin, origin);
+}
+
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
 /// event, no-op dedup, validation, and the startup gate it feeds. The
 /// PERSISTED half (the etc-tree file) is deliberately not driven here —

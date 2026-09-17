@@ -13209,11 +13209,13 @@ impl WaylandState {
             return;
         };
         // A client-started move/resize must not keep steering a hidden
-        // window (a Bus minimise can land mid-drag), as on unmap.
+        // window (a Bus minimise can land mid-drag). Unlike unmap, the
+        // window stays alive, so a resize ends properly: Resizing is unset
+        // and the client is told (xdg only; X11 and moves send nothing).
         if interactive_surface(self.interactive_pointer.as_ref())
             .is_some_and(|interactive| interactive == surface)
         {
-            self.interactive_pointer = None;
+            self.finish_interactive_pointer(true);
         }
         // X11 windows also learn the state through EWMH so the client can
         // stop rendering.
