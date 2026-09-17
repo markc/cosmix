@@ -129,6 +129,12 @@ pub(crate) enum ControlReply {
     NotFound {
         minimized_count: usize,
     },
+    /// A verb argument the verb does not define (a typo must not be
+    /// silently ignored, or `{"gen": 3}` would act unfenced).
+    InvalidArgs {
+        field: String,
+        allowed: &'static [&'static str],
+    },
     Locked,
     Busy,
 }
@@ -236,6 +242,13 @@ impl ControlReply {
                 10,
                 Arc::from(
                     json!({"error": "not_found", "minimized_count": minimized_count}).to_string(),
+                ),
+            ),
+            Self::InvalidArgs { field, allowed } => (
+                10,
+                Arc::from(
+                    json!({"error": "invalid_args", "field": field, "allowed": allowed})
+                        .to_string(),
                 ),
             ),
             Self::Locked => error("locked"),
@@ -1347,6 +1360,16 @@ fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
             return Err(invalid_argument("args", "JSON object", "{id, generation}"));
         }
     };
+    const WINDOW_ARGS: &[&str] = &["id", "generation"];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !WINDOW_ARGS.contains(&field.as_str()))
+    {
+        return Err(ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed: WINDOW_ARGS,
+        });
+    }
     let id = window_arg(object, "id")?;
     let generation = window_arg(object, "generation")?;
     let target = match (id, generation) {
@@ -2372,6 +2395,21 @@ mod tests {
             assert_eq!(rc, 10, "{verb} {args}");
             assert_eq!(body["error"], "invalid_value", "{verb} {args}");
             assert_eq!(body["path"], field, "{verb} {args}");
+        }
+    }
+
+    #[test]
+    fn window_verb_unknown_fields_are_refused_by_name() {
+        for verb in ["comp.window.restore", "comp.window.minimize"] {
+            let reply = parse_window_op(verb, &json!({"id": 7, "gen": 3}))
+                .expect_err("a typo must not be ignored");
+            let (rc, body) = reply.into_wire();
+            assert_eq!(rc, 10);
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "invalid_args", "field": "gen", "allowed": ["id", "generation"]}),
+                "{verb}"
+            );
         }
     }
 

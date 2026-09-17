@@ -77,9 +77,14 @@ impl WaylandState {
         Some((before, after))
     }
 
-    fn window_reply(&self, object: &ObjectId, changed: bool) -> ControlReply {
+    fn window_reply(&self, object: &ObjectId, id: u64, changed: bool) -> ControlReply {
+        // The record can only vanish between the operation and this read if
+        // the operation itself destroyed it; say so rather than `busy`.
         let Some(record) = self.surfaces.get(object) else {
-            return ControlReply::Busy;
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
         };
         ControlReply::Window {
             id: record.id.0,
@@ -91,11 +96,26 @@ impl WaylandState {
         }
     }
 
+    /// Mapped managed windows currently minimised. Every such window is on
+    /// the minimise LIFO, so when `restore {}` finds the LIFO empty this is
+    /// 0; it is still reported (as `not_found.minimized_count`) so a lost
+    /// LIFO entry would show up to the caller instead of hiding.
     fn minimized_window_count(&self) -> usize {
         self.surfaces
             .values()
             .filter(|record| record.mapped && record.minimized && record.role.managed_toplevel())
             .count()
+    }
+
+    /// The entry the LIFO pop will restore: the newest one that is still a
+    /// mapped, minimised, managed toplevel (the pop discards older invalid
+    /// entries on its way down).
+    fn next_lifo_restore(&self) -> Option<(ObjectId, SurfaceId)> {
+        self.minimized_toplevels.iter().rev().find_map(|object| {
+            let record = self.surfaces.get(object)?;
+            (record.mapped && record.minimized && record.role.managed_toplevel())
+                .then(|| (object.clone(), record.id))
+        })
     }
 
     /// `comp.window.minimize` / `comp.window.restore`. A session lock
@@ -110,11 +130,32 @@ impl WaylandState {
                 target: Some(target),
             } => (target, false),
             WindowOp::Restore { target: None } => {
-                return match self.restore_most_recently_minimized() {
-                    Some(object) => self.window_reply(&object, true),
-                    None => ControlReply::NotFound {
-                        minimized_count: self.minimized_window_count(),
-                    },
+                // Mark first: the first cause recorded for a surface wins,
+                // and the restore itself would record "wayland.focus".
+                let expected = self.next_lifo_restore();
+                if let Some((_, id)) = &expected {
+                    self.mark_surface_dirty(*id, "comp.window");
+                }
+                let restored = self.restore_most_recently_minimized();
+                debug_assert_eq!(
+                    restored.as_ref(),
+                    expected.as_ref().map(|(object, _)| object),
+                    "the LIFO pop restores the predicted entry"
+                );
+                return match (restored, expected) {
+                    (Some(object), Some((_, id))) => self.window_reply(&object, id.0, true),
+                    (Some(object), None) => {
+                        let id = self.surfaces.get(&object).map_or(0, |record| record.id.0);
+                        self.window_reply(&object, id, true)
+                    }
+                    (None, _) => {
+                        let minimized_count = self.minimized_window_count();
+                        debug_assert_eq!(
+                            minimized_count, 0,
+                            "every minimised window is on the LIFO"
+                        );
+                        ControlReply::NotFound { minimized_count }
+                    }
                 };
             }
         };
@@ -125,7 +166,7 @@ impl WaylandState {
         };
         self.mark_surface_dirty(SurfaceId(id), "comp.window");
         match self.set_window_minimized(&object, minimized) {
-            Some((before, after)) => self.window_reply(&object, before != after),
+            Some((before, after)) => self.window_reply(&object, id, before != after),
             None => ControlReply::WindowTarget {
                 id,
                 error: WindowTargetError::UnknownWindow,
