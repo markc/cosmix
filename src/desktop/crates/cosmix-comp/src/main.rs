@@ -335,8 +335,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
             primary_window: Some(Window {
                 title: WINDOW_TITLE.into(),
                 resolution: (INITIAL_WIDTH, INITIAL_HEIGHT).into(),
-                present_mode: PresentMode::AutoVsync,
-                desired_maximum_frame_latency: std::num::NonZero::new(3),
+                present_mode: PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
