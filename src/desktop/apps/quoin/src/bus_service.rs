@@ -121,14 +121,14 @@ fn reply_resizes(
             let (rc, body) = match &result.result {
                 Ok(()) => (0, json!({"accepted":true})),
                 Err(cosmix_shell::runtime::ShellResizeError::Configuration(
-                    cosmix_shell::core::PanelConfigError::ThicknessBudget {
+                    error @ cosmix_shell::core::PanelConfigError::ThicknessBudget {
                         edge,
                         requested,
                         max,
                     },
                 )) => (
                     10,
-                    json!({"error_code":"PANEL_THICKNESS_BUDGET", "edge":format!("{edge:?}").to_lowercase(), "requested":requested, "max":max}),
+                    json!({"error_code":"PANEL_THICKNESS_BUDGET", "error":error.to_string(), "edge":format!("{edge:?}").to_lowercase(), "requested":requested, "max":max}),
                 ),
                 Err(cosmix_shell::runtime::ShellResizeError::OutputChanged) => (
                     10,

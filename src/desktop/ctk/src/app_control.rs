@@ -1073,9 +1073,10 @@ mod tests {
         app
     }
 
-    /// Build a request that looks like an attested, admitted mesh peer: the
-    /// broker-stamped `broker_origin: mesh`, the recipient noded's attestation
-    /// (`broker_peer` + `broker_service`), and the canonical bridge `from`.
+    /// Build a request shaped like a real bridged mesh delivery: the
+    /// broker-stamped `broker_origin: mesh`, the `broker_peer` +
+    /// `broker_service` headers noded adds (informational only; admission
+    /// ignores them), and the canonical bridge `from`.
     fn attested_mesh(command: &str, peer: &str, service: &str) -> InboundRequest {
         let mut request = request(command, &[]);
         request.from = format!("bridge-{peer}");
