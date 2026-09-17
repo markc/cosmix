@@ -351,7 +351,7 @@ fn adapter_hand_over_attaches_the_new_page_in_both_directions() {
     spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
     queue.apply(world);
     let (bridge, _peer) = ctk::bus::test_bridge("test");
-    let mut load = |app: &mut App, adapter: &str| {
+    let load = |app: &mut App, adapter: &str| {
         let (rc, reply) = app.world_mut().resource_mut::<SceneStore>().dispatch(
             SceneVerb::Load,
             SCENE,
