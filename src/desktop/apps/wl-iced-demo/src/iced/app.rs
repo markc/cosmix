@@ -2,13 +2,13 @@
 //! This file is the event-loop glue: routing, redraw scheduling, cursor.
 
 use super::chrome::{self, Chrome};
-use super::clipboard::Shared;
+use super::clipboard::{Fetch, Shared};
 use super::damage::{Commit, merge};
 use super::ime;
 use super::keys::{self, Route};
 use super::popups::{Bar, MenuPopups};
 use crate::menus::{Entry, Metrics, Outcome};
-use crate::raw::RawDemo;
+use crate::raw::{IME_GRID, RawDemo};
 use crate::startup::Clock;
 use cosmix_iced_host::core::event::Status;
 use cosmix_iced_host::core::mouse::Interaction;
@@ -22,6 +22,8 @@ use cosmix_wl_app::{
 
 /// Timer token for the chrome's next redraw deadline (caret blink).
 pub const TIMER_CHROME: u64 = 1;
+/// The search field's input-method target.
+pub const IME_FIELD: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -368,7 +370,8 @@ impl IcedDemo {
             return;
         };
         match ime::to_wl(&self.chrome.requests().ime, window, (0, 0)) {
-            Some(state) => {
+            Some(mut state) => {
+                state.target = IME_FIELD;
                 self.field_ime = true;
                 self.raw.set_ime_blocked(cx, true);
                 cx.set_ime(Some(state));
@@ -417,6 +420,10 @@ impl IcedDemo {
             Commit::Rects(rects) => frame.commit_with_damage(&rects),
         }
         let committed = grid_full || !grid.is_empty() || !chrome_rects.is_empty();
+        if !committed {
+            // Neither the grid nor iced wrote a pixel.
+            frame.keep_contents();
+        }
         if committed {
             self.raw.note_frame();
             if self.raw.trace() {
@@ -521,31 +528,49 @@ impl App for IcedDemo {
                     self.popup_pointer(cx, level, p);
                 }
             }
-            Event::Ime { surface, event } => {
-                if self.field_ime {
-                    self.raw.log(format_args!("ime -> chrome {event:?}"));
-                    if let Some(e) = ime::to_iced(&event) {
-                        self.chrome.queue_event(e);
-                        self.process(cx);
-                    }
-                } else {
-                    self.raw.event(cx, Event::Ime { surface, event });
+            // Input-method results go to the owner they were meant for.
+            Event::Ime {
+                target: IME_FIELD,
+                event,
+                ..
+            } => {
+                self.raw.log(format_args!("ime -> chrome {event:?}"));
+                if let Some(e) = ime::to_iced(&event) {
+                    self.chrome.queue_event(e);
+                    self.process(cx);
                 }
+            }
+            ev @ Event::Ime {
+                target: IME_GRID, ..
+            } => self.raw.event(cx, ev),
+            Event::Ime { target, .. } => {
+                self.raw
+                    .log(format_args!("ime for unknown target {target}"));
             }
             Event::SelectionChanged { selection } | Event::SelectionLost { selection } => {
-                if self.clipboard.0.borrow_mut().start_fetch(selection) {
-                    cx.request_selection(selection);
-                }
+                let token = cx.request_selection(selection);
+                self.clipboard.0.borrow_mut().start_fetch(selection, token);
             }
-            Event::SelectionText { selection, text } => {
-                let refill = self
+            ev @ Event::SelectionText { .. } => {
+                let Event::SelectionText {
+                    selection,
+                    token,
+                    ref text,
+                    status,
+                } = ev
+                else {
+                    return;
+                };
+                let fetch = self
                     .clipboard
                     .0
                     .borrow_mut()
-                    .finish_fetch(selection, text.clone());
-                if !refill {
-                    self.clipboard.0.borrow_mut().set(selection, text.clone());
-                    self.raw.event(cx, Event::SelectionText { selection, text });
+                    .finish_fetch(token, text.clone(), status);
+                if fetch == Fetch::NotAFetch {
+                    if text.is_some() {
+                        self.clipboard.0.borrow_mut().set(selection, text.clone());
+                    }
+                    self.raw.event(cx, ev);
                 }
             }
             Event::Timer(TIMER_CHROME) => {

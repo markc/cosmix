@@ -35,14 +35,22 @@ pub mod pool;
 pub mod repeat;
 mod runtime;
 pub mod scale;
+pub mod serial;
+mod xkb_state;
+
+/// The calloop the runtime runs on, for sources given to
+/// [`Ctx::insert_source`].
+pub use calloop;
 
 pub use event::{
     BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, ButtonState, Event, KeyEvent, KeyState, Keysym, Modifiers,
-    PointerEvent, PointerKind, Selection, WindowState,
+    PointerEvent, PointerKind, ReadStatus, Selection, WindowState,
 };
 pub use geom::{Damage, Rect};
 pub use ime::{ContentHint, ContentPurpose, ImeEvent, ImeState};
-pub use runtime::{Ctx, Error, Frame, PopupSpec, Stats, Waker, WindowSpec, run};
+pub use runtime::{
+    Ctx, Error, Frame, FramePacing, PopupSpec, SourceToken, Stats, Waker, WindowSpec, run,
+};
 pub use scale::{Scale, SurfaceInfo};
 pub use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape as CursorShape;
 pub use wayland_protocols::xdg::shell::client::xdg_positioner::{

@@ -57,7 +57,8 @@ impl<A> Entry<A> {
     pub fn selectable(&self) -> bool {
         match self {
             Entry::Action { enabled, .. } => *enabled,
-            Entry::Submenu { children, .. } => !children.is_empty(),
+            // A submenu with nothing to choose opens no panel.
+            Entry::Submenu { children, .. } => children.iter().any(Entry::selectable),
             Entry::Separator => false,
         }
     }
@@ -372,7 +373,7 @@ impl MenuNav {
             NavKey::Up => set(self, step(entries, current, false)),
             NavKey::Home => set(self, first(entries)),
             NavKey::End => set(self, last(entries)),
-            NavKey::Right | NavKey::Enter if matches!(selected_entry, Some(Entry::Submenu { children, .. }) if !children.is_empty()) =>
+            NavKey::Right | NavKey::Enter if matches!(selected_entry, Some(e @ Entry::Submenu { .. }) if e.selectable()) =>
             {
                 let Some(Entry::Submenu { children, .. }) = selected_entry else {
                     return Outcome::None;
@@ -528,6 +529,36 @@ mod tests {
         assert!(!nav.hover_root(&bar, 2));
         assert_eq!(nav.close(), Outcome::Closed);
         assert!(!nav.hover_root(&bar, 1), "closed bar ignores hover");
+    }
+
+    #[test]
+    fn empty_submenus_open_nothing() {
+        let bar: Bar = vec![(
+            "Go".into(),
+            vec![
+                Entry::submenu("Empty", vec![]),
+                Entry::submenu(
+                    "Dead",
+                    vec![Entry::Separator, Entry::action("x", 1).disabled()],
+                ),
+                Entry::action("Ok", 2),
+            ],
+        )];
+        let mut nav = MenuNav::default();
+        nav.open(&bar, 0, false);
+        assert!(!nav.hover(&bar, 0, Some(0)));
+        assert!(!nav.hover(&bar, 0, Some(1)));
+        assert_eq!(nav.depth(), 1, "no level pushed");
+        assert_eq!(nav.click(&bar, 0, 1), Outcome::None);
+        assert_eq!(nav.depth(), 1);
+        nav.open(&bar, 0, true);
+        assert_eq!(nav.selected(0), Some(2), "keyboard skips them too");
+        assert_eq!(nav.key(&bar, NavKey::Right), Outcome::Changed);
+        assert_eq!(
+            nav.depth(),
+            1,
+            "Right switches roots, not into a dead submenu"
+        );
     }
 
     #[test]

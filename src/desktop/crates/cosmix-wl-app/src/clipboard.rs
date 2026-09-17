@@ -1,11 +1,17 @@
 //! Clipboard and primary selection, text only. Pipes are non-blocking and
 //! driven by the event loop in both directions.
+//!
+//! Text types: `text/plain;charset=utf-8`, `UTF8_STRING` and `text/plain`
+//! are UTF-8. `STRING` is ISO 8859-1 (characters outside it are written as
+//! `?`). `TEXT` has no fixed encoding; it is written as UTF-8 and read as
+//! UTF-8, falling back to ISO 8859-1, as is `text/plain`.
 
-use crate::event::{Event, Selection};
+use crate::event::{Event, ReadStatus, Selection};
 use crate::runtime::{OwnedSource, Runtime, State};
-use calloop::PostAction;
 use calloop::generic::Generic;
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, Mode};
+use calloop::{PostAction, RegistrationToken};
 use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
 use smithay_client_toolkit::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
 use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
@@ -15,6 +21,7 @@ use smithay_client_toolkit::primary_selection::selection::PrimarySelectionSource
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::time::Duration;
 use wayland_client::protocol::wl_data_device::WlDataDevice;
 use wayland_client::protocol::wl_data_device_manager::DndAction;
 use wayland_client::protocol::wl_data_source::WlDataSource;
@@ -32,6 +39,8 @@ const TEXT_MIMES: [&str; 5] = [
 ];
 /// Refuse to buffer more than this from another client.
 const MAX_READ: usize = 64 << 20;
+/// A read that has not finished by then is abandoned.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The preferred text mime type among those offered.
 pub fn pick_text_mime(offered: &[String]) -> Option<String> {
@@ -39,6 +48,34 @@ pub fn pick_text_mime(offered: &[String]) -> Option<String> {
         .iter()
         .find(|m| offered.iter().any(|o| o == *m))
         .map(|m| (*m).to_string())
+}
+
+/// Decode what arrived for `mime`.
+pub fn decode_text(mime: &str, bytes: Vec<u8>) -> Option<String> {
+    let latin1 = |b: &[u8]| b.iter().map(|c| char::from(*c)).collect::<String>();
+    match mime {
+        "STRING" => Some(latin1(&bytes)),
+        "text/plain" | "TEXT" => {
+            Some(String::from_utf8(bytes).unwrap_or_else(|e| latin1(e.as_bytes())))
+        }
+        _ => String::from_utf8(bytes).ok(),
+    }
+}
+
+/// Encode `text` for a receiver that asked for `mime`.
+pub fn encode_text(mime: &str, text: &str) -> Vec<u8> {
+    if mime == "STRING" {
+        text.chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .collect()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
+pub(crate) struct PendingRead {
+    pipe: RegistrationToken,
+    timer: Option<RegistrationToken>,
 }
 
 fn set_nonblocking(fd: impl AsFd) -> std::io::Result<()> {
@@ -76,79 +113,135 @@ impl Runtime {
         true
     }
 
-    pub(crate) fn request_selection(&mut self, selection: Selection) {
+    fn selection_text(&mut self, selection: Selection, token: u64, status: ReadStatus) {
+        self.queue.push_back(Event::SelectionText {
+            selection,
+            token,
+            text: None,
+            status,
+        });
+    }
+
+    pub(crate) fn selection_generation(&self, selection: Selection) -> u64 {
+        self.selection_gens.get(&selection).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn request_selection(&mut self, selection: Selection) -> u64 {
+        self.next_read += 1;
+        let token = self.next_read;
         if let Some((_, text)) = self.sources.get(&selection) {
             let text = Some(text.clone());
-            self.queue
-                .push_back(Event::SelectionText { selection, text });
-            return;
+            self.queue.push_back(Event::SelectionText {
+                selection,
+                token,
+                text,
+                status: ReadStatus::Complete,
+            });
+            return token;
         }
-        let pipe = match selection {
+        let receive = match selection {
             Selection::Clipboard => self.seat.data_device.as_ref().and_then(|d| {
                 let offer = d.data().selection_offer()?;
                 let mime = offer.with_mime_types(pick_text_mime)?;
-                offer
-                    .receive(mime)
-                    .map_err(|e| log::warn!("clipboard receive: {e}"))
-                    .ok()
+                Some(offer.receive(mime.clone()).map(|pipe| (pipe, mime)))
             }),
             Selection::Primary => self.seat.primary_device.as_ref().and_then(|d| {
                 let offer = d.data().selection_offer()?;
                 let mime = offer.with_mime_types(pick_text_mime)?;
-                offer
-                    .receive(mime)
-                    .map_err(|e| log::warn!("primary receive: {e}"))
-                    .ok()
+                Some(offer.receive(mime.clone()).map(|pipe| (pipe, mime)))
             }),
         };
-        let Some(pipe) = pipe else {
-            self.queue.push_back(Event::SelectionText {
-                selection,
-                text: None,
-            });
-            return;
-        };
-        if let Err(e) = self.read_pipe(selection, pipe) {
-            log::warn!("selection read: {e}");
-            self.queue.push_back(Event::SelectionText {
-                selection,
-                text: None,
-            });
+        match receive {
+            None => self.selection_text(selection, token, ReadStatus::Empty),
+            Some(Err(e)) => {
+                log::warn!("selection receive: {e}");
+                self.selection_text(selection, token, ReadStatus::Failed);
+            }
+            Some(Ok((pipe, mime))) => {
+                if let Err(e) = self.read_pipe(selection, token, pipe, mime) {
+                    log::warn!("selection read: {e}");
+                    self.selection_text(selection, token, ReadStatus::Failed);
+                }
+            }
         }
+        token
     }
 
-    fn read_pipe(&mut self, selection: Selection, pipe: ReadPipe) -> Result<(), String> {
+    fn read_pipe(
+        &mut self,
+        selection: Selection,
+        token: u64,
+        pipe: ReadPipe,
+        mime: String,
+    ) -> Result<(), String> {
         set_nonblocking(&pipe).map_err(|e| e.to_string())?;
+        let generation = self.selection_generation(selection);
         let mut data = Vec::new();
-        self.handle
+        let pipe = self
+            .handle
             .insert_source(pipe, move |(), file, state: &mut State| {
                 let mut chunk = [0u8; 16 * 1024];
-                loop {
+                let status = loop {
                     match (&**file).read(&mut chunk) {
-                        Ok(0) => break,
+                        Ok(0) => break ReadStatus::Complete,
                         Ok(n) if data.len() + n <= MAX_READ => data.extend_from_slice(&chunk[..n]),
                         Ok(_) => {
                             log::warn!("selection larger than {MAX_READ} bytes, dropped");
-                            data.clear();
-                            break;
+                            break ReadStatus::TooLarge;
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => return PostAction::Continue,
                         Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                         Err(e) => {
                             log::warn!("selection read: {e}");
-                            data.clear();
-                            break;
+                            break ReadStatus::Failed;
                         }
                     }
+                };
+                let bytes = std::mem::take(&mut data);
+                let superseded = state.rt.selection_generation(selection) != generation;
+                let (status, text) = match status {
+                    ReadStatus::Complete if superseded => (ReadStatus::Superseded, None),
+                    ReadStatus::Complete if bytes.is_empty() => (ReadStatus::Empty, None),
+                    ReadStatus::Complete => match decode_text(&mime, bytes) {
+                        Some(text) => (ReadStatus::Complete, Some(text)),
+                        None => (ReadStatus::Failed, None),
+                    },
+                    other => (other, None),
+                };
+                if let Some(read) = state.rt.reads.remove(&token)
+                    && let Some(timer) = read.timer
+                {
+                    state.rt.handle.remove(timer);
                 }
-                let text = String::from_utf8(std::mem::take(&mut data))
-                    .ok()
-                    .filter(|t| !t.is_empty());
-                state.emit(Event::SelectionText { selection, text });
+                state.emit(Event::SelectionText {
+                    selection,
+                    token,
+                    text,
+                    status,
+                });
                 PostAction::Remove
             })
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let timer = self
+            .handle
+            .insert_source(
+                Timer::from_duration(READ_TIMEOUT),
+                move |_, _, state: &mut State| {
+                    if let Some(read) = state.rt.reads.remove(&token) {
+                        state.rt.handle.remove(read.pipe);
+                        log::warn!("selection read timed out");
+                        state
+                            .rt
+                            .selection_text(selection, token, ReadStatus::TimedOut);
+                        state.drain();
+                    }
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|e| log::warn!("selection read timer: {e}"))
+            .ok();
+        self.reads.insert(token, PendingRead { pipe, timer });
+        Ok(())
     }
 
     fn write_pipe(&mut self, text: Vec<u8>, pipe: WritePipe) {
@@ -195,27 +288,13 @@ impl Runtime {
 
 impl State {
     fn selection_changed(&mut self, selection: Selection) {
+        // Reads still running were for the previous offer.
+        *self.rt.selection_gens.entry(selection).or_default() += 1;
         // The compositor echoes our own selection back; that is not news.
         if self.rt.sources.contains_key(&selection) {
             return;
         }
-        let offered = match selection {
-            Selection::Clipboard => self
-                .rt
-                .seat
-                .data_device
-                .as_ref()
-                .is_some_and(|d| d.data().selection_offer().is_some()),
-            Selection::Primary => self
-                .rt
-                .seat
-                .primary_device
-                .as_ref()
-                .is_some_and(|d| d.data().selection_offer().is_some()),
-        };
-        if offered {
-            self.emit(Event::SelectionChanged { selection });
-        }
+        self.emit(Event::SelectionChanged { selection });
     }
 }
 
@@ -272,14 +351,16 @@ impl DataSourceHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         source: &WlDataSource,
-        _mime: String,
+        mime: String,
         pipe: WritePipe,
     ) {
-        let text = match self.rt.sources.get(&Selection::Clipboard) {
-            Some((OwnedSource::Clipboard(s), text)) if s.inner() == source => text.clone(),
+        let bytes = match self.rt.sources.get(&Selection::Clipboard) {
+            Some((OwnedSource::Clipboard(s), text)) if s.inner() == source => {
+                encode_text(&mime, text)
+            }
             _ => return,
         };
-        self.rt.write_pipe(text.into_bytes(), pipe);
+        self.rt.write_pipe(bytes, pipe);
     }
 
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
@@ -312,14 +393,16 @@ impl PrimarySelectionSourceHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         source: &ZwpPrimarySelectionSourceV1,
-        _mime: String,
+        mime: String,
         pipe: WritePipe,
     ) {
-        let text = match self.rt.sources.get(&Selection::Primary) {
-            Some((OwnedSource::Primary(s), text)) if s.inner() == source => text.clone(),
+        let bytes = match self.rt.sources.get(&Selection::Primary) {
+            Some((OwnedSource::Primary(s), text)) if s.inner() == source => {
+                encode_text(&mime, text)
+            }
             _ => return,
         };
-        self.rt.write_pipe(text.into_bytes(), pipe);
+        self.rt.write_pipe(bytes, pipe);
     }
 
     fn cancelled(
@@ -348,5 +431,30 @@ mod tests {
             Some("text/plain;charset=utf-8")
         );
         assert_eq!(pick_text_mime(&["image/png".to_string()]), None);
+    }
+
+    #[test]
+    fn text_types_encode_and_decode() {
+        let text = "caf\u{e9} \u{2192}";
+        for mime in [
+            "text/plain;charset=utf-8",
+            "UTF8_STRING",
+            "TEXT",
+            "text/plain",
+        ] {
+            let bytes = encode_text(mime, text);
+            assert_eq!(bytes, text.as_bytes());
+            assert_eq!(decode_text(mime, bytes).as_deref(), Some(text));
+        }
+        let latin1 = encode_text("STRING", text);
+        assert_eq!(latin1, b"caf\xe9 ?");
+        assert_eq!(
+            decode_text("STRING", latin1).as_deref(),
+            Some("caf\u{e9} ?")
+        );
+        // Invalid UTF-8: rejected for the UTF-8 types, read as Latin-1 for
+        // the untyped ones.
+        assert_eq!(decode_text("UTF8_STRING", vec![0xe9]), None);
+        assert_eq!(decode_text("TEXT", vec![0xe9]).as_deref(), Some("\u{e9}"));
     }
 }

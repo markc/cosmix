@@ -110,6 +110,13 @@ pub(crate) struct Swapchain {
     pub(crate) allocations: u64,
 }
 
+pub(crate) enum AcquireError {
+    /// Every slot is held; the compositor's release wakes the loop.
+    Held,
+    /// A new buffer could not be made; nothing will wake the loop for it.
+    Alloc(String),
+}
+
 pub(crate) struct Acquired {
     pub index: usize,
     /// True when the buffer's contents are undefined (new or resized).
@@ -132,9 +139,13 @@ impl Swapchain {
         self.size
     }
 
-    /// Get a buffer to draw the next frame into, or `None` while every slot
-    /// is held by the compositor.
-    pub fn acquire(&mut self, shm: &Shm, width: u32, height: u32) -> Option<Acquired> {
+    /// Get a buffer to draw the next frame into.
+    pub fn acquire(
+        &mut self,
+        shm: &Shm,
+        width: u32,
+        height: u32,
+    ) -> Result<Acquired, AcquireError> {
         if self.size != (width, height) {
             // Dropping a held buffer defers its destruction to the release.
             self.slots.clear();
@@ -152,20 +163,25 @@ impl Swapchain {
             .collect();
         let newest_seq = self.newest.and_then(|i| self.slots[i].seq);
         match choose_slot(&views, newest_seq, MAX_SLOTS) {
-            SlotChoice::Current(index) => Some(Acquired {
+            SlotChoice::Current(index) => Ok(Acquired {
                 index,
                 fresh: false,
             }),
             SlotChoice::Stale(index) => {
                 let fresh = !self.copy_forward(index);
-                Some(Acquired { index, fresh })
+                Ok(Acquired { index, fresh })
             }
             SlotChoice::Allocate => {
-                let stride = width.checked_mul(4)?;
-                let len = usize::try_from(stride).ok()? * height as usize;
+                let too_big = || AcquireError::Alloc(format!("{width}x{height} is too large"));
+                let stride = width
+                    .checked_mul(4)
+                    .filter(|s| i32::try_from(*s).is_ok())
+                    .ok_or_else(too_big)?;
+                let len = (stride as usize)
+                    .checked_mul(height as usize)
+                    .ok_or_else(too_big)?;
                 let mut pool = SlotPool::new(len.max(4), shm)
-                    .map_err(|e| log::error!("wl_shm pool: {e}"))
-                    .ok()?;
+                    .map_err(|e| AcquireError::Alloc(format!("wl_shm pool: {e}")))?;
                 let (buffer, _) = pool
                     .create_buffer(
                         width as i32,
@@ -173,8 +189,7 @@ impl Swapchain {
                         stride as i32,
                         wl_shm::Format::Argb8888,
                     )
-                    .map_err(|e| log::error!("wl_shm buffer: {e}"))
-                    .ok()?;
+                    .map_err(|e| AcquireError::Alloc(format!("wl_shm buffer: {e}")))?;
                 self.allocations += 1;
                 self.slots.push(Slot {
                     pool,
@@ -183,9 +198,9 @@ impl Swapchain {
                 });
                 let index = self.slots.len() - 1;
                 let fresh = !self.copy_forward(index);
-                Some(Acquired { index, fresh })
+                Ok(Acquired { index, fresh })
             }
-            SlotChoice::Wait => None,
+            SlotChoice::Wait => Err(AcquireError::Held),
         }
     }
 
@@ -239,9 +254,13 @@ impl Swapchain {
         self.newest = Some(index);
     }
 
-    /// Forget a slot's contents after a draw that was not committed: the app
-    /// may have scribbled on it.
-    pub fn discard(&mut self, index: usize) {
+    /// A draw into `index` was not committed. If the app `touched` the
+    /// pixels, the slot's contents are unknown and are forgotten; otherwise
+    /// the slot still holds what it held.
+    pub fn discard(&mut self, index: usize, touched: bool) {
+        if !touched {
+            return;
+        }
         if self.newest != Some(index) {
             self.slots[index].seq = None;
         } else {

@@ -7,12 +7,15 @@
 //! (`SelectionChanged`/`SelectionLost`), the app requests its text and
 //! stores the answer here; text the app sets itself goes straight in. A
 //! paste in the same instant as a foreign copy can see the previous text.
+//! Every change starts a new fetch; an answer to an older fetch is dropped,
+//! so a slow or dead read never blocks the next one.
 //! Writes are queued and applied by the app after `process`, with the
 //! input serial of the event being processed.
 
 use cosmix_iced_host::{Clipboard, ClipboardKind};
-use cosmix_wl_app::Selection;
+use cosmix_wl_app::{ReadStatus, Selection};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Debug, Default)]
@@ -20,8 +23,21 @@ pub struct Cache {
     pub standard: Option<String>,
     pub primary: Option<String>,
     pub writes: Vec<(Selection, String)>,
-    /// Selections whose text was requested to refill the cache.
-    pub pending: Vec<Selection>,
+    /// Read tokens of refills still out, with the selection each is for.
+    fetches: HashMap<u64, Selection>,
+    /// The newest refill per selection; only its answer fills the cache.
+    latest: HashMap<Selection, u64>,
+}
+
+/// What an answer to `request_selection` was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fetch {
+    /// The newest refill: the cache was updated.
+    Filled,
+    /// An older refill, overtaken by a newer one: ignore it.
+    Stale,
+    /// Not a refill (an explicit paste).
+    NotAFetch,
 }
 
 impl Cache {
@@ -32,24 +48,29 @@ impl Cache {
         }
     }
 
-    /// Record that `selection` is being fetched. False if already pending.
-    pub fn start_fetch(&mut self, selection: Selection) -> bool {
-        if self.pending.contains(&selection) {
-            return false;
-        }
-        self.pending.push(selection);
-        true
+    /// Record that `token` is a refill of `selection`, replacing any refill
+    /// still out for it.
+    pub fn start_fetch(&mut self, selection: Selection, token: u64) {
+        self.fetches.insert(token, selection);
+        self.latest.insert(selection, token);
     }
 
-    /// Consume a fetch answer. False when nobody asked for a refill (the
-    /// answer belongs to an explicit paste).
-    pub fn finish_fetch(&mut self, selection: Selection, text: Option<String>) -> bool {
-        let Some(i) = self.pending.iter().position(|s| *s == selection) else {
-            return false;
+    /// Consume the answer for `token`.
+    pub fn finish_fetch(&mut self, token: u64, text: Option<String>, status: ReadStatus) -> Fetch {
+        let Some(selection) = self.fetches.remove(&token) else {
+            return Fetch::NotAFetch;
         };
-        self.pending.remove(i);
-        self.set(selection, text);
-        true
+        if self.latest.get(&selection) != Some(&token) {
+            return Fetch::Stale;
+        }
+        self.latest.remove(&selection);
+        match status {
+            ReadStatus::Complete | ReadStatus::Empty => self.set(selection, text),
+            // A failed or superseded read says nothing about the current
+            // text; keep what we have.
+            _ => {}
+        }
+        Fetch::Filled
     }
 }
 
@@ -98,11 +119,54 @@ mod tests {
     #[test]
     fn fetches_fill_cache_and_pastes_pass_through() {
         let mut cache = Cache::default();
-        assert!(cache.start_fetch(Selection::Clipboard));
-        assert!(!cache.start_fetch(Selection::Clipboard));
-        assert!(cache.finish_fetch(Selection::Clipboard, Some("x".into())));
+        cache.start_fetch(Selection::Clipboard, 1);
+        assert_eq!(
+            cache.finish_fetch(1, Some("x".into()), ReadStatus::Complete),
+            Fetch::Filled
+        );
         assert_eq!(cache.standard.as_deref(), Some("x"));
-        assert!(!cache.finish_fetch(Selection::Clipboard, Some("paste".into())));
+        assert_eq!(
+            cache.finish_fetch(2, Some("paste".into()), ReadStatus::Complete),
+            Fetch::NotAFetch
+        );
         assert_eq!(cache.standard.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn foreign_copy_after_own_is_not_frozen() {
+        // We own the clipboard; another client copies. `cancelled` comes
+        // first (SelectionLost -> fetch 1, which reads our own dead offer),
+        // then `selection` (SelectionChanged -> fetch 2).
+        let mut cache = Cache::default();
+        cache.set(Selection::Clipboard, Some("ours".into()));
+        cache.start_fetch(Selection::Clipboard, 1);
+        cache.start_fetch(Selection::Clipboard, 2);
+        assert_eq!(
+            cache.finish_fetch(2, Some("theirs".into()), ReadStatus::Complete),
+            Fetch::Filled
+        );
+        // The dead read ends late and must not overwrite the new text.
+        assert_eq!(
+            cache.finish_fetch(1, None, ReadStatus::Superseded),
+            Fetch::Stale
+        );
+        assert_eq!(cache.standard.as_deref(), Some("theirs"));
+        // A timed-out refill keeps the cache as it was, and the next change
+        // is fetched regardless.
+        cache.start_fetch(Selection::Clipboard, 3);
+        assert_eq!(
+            cache.finish_fetch(3, None, ReadStatus::TimedOut),
+            Fetch::Filled
+        );
+        assert_eq!(cache.standard.as_deref(), Some("theirs"));
+        cache.start_fetch(Selection::Clipboard, 4);
+        assert_eq!(
+            cache.finish_fetch(4, None, ReadStatus::Empty),
+            Fetch::Filled
+        );
+        assert_eq!(
+            cache.standard, None,
+            "a cleared selection empties the cache"
+        );
     }
 }

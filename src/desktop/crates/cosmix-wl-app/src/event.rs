@@ -28,11 +28,17 @@ pub struct KeyEvent {
     pub surface: Option<SurfaceId>,
     pub state: KeyState,
     pub keysym: Keysym,
+    /// The key's keysym at shift level 0 in the active layout, ignoring
+    /// modifiers (what kitty's keyboard protocol calls the base key).
+    pub base_keysym: Keysym,
     /// The evdev key code (without xkb's +8 offset).
     pub raw_code: u32,
     /// Text the key produces, after compose. `None` on release.
     pub text: Option<String>,
     pub modifiers: Modifiers,
+    /// Modifiers xkb used up to produce `keysym` (Shift for `A`), so
+    /// `modifiers` minus these is what an encoder should report.
+    pub consumed: Modifiers,
     /// Compositor timestamp in milliseconds (synthesised for repeats).
     pub time: u32,
 }
@@ -96,7 +102,25 @@ pub struct WindowState {
     pub server_decorations: bool,
 }
 
+/// Why a selection read ended. `text` is `Some` only for `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStatus {
+    Complete,
+    /// No selection, or none offered as text.
+    Empty,
+    /// The selection changed while it was being read; what arrived may be
+    /// cut short, so it is dropped.
+    Superseded,
+    /// Nothing complete arrived within the read timeout.
+    TimedOut,
+    /// Larger than the read limit.
+    TooLarge,
+    /// A pipe error, or bytes that do not decode as the offered type.
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     /// A toplevel was configured. The first configure precedes the first
     /// draw; `info` may change size or scale on later ones.
@@ -137,16 +161,20 @@ pub enum Event {
     Key(KeyEvent),
     Modifiers(Modifiers),
     Pointer(PointerEvent),
-    /// Input method results for `surface`.
+    /// Input method results for `surface`, for the owner `target` (see
+    /// [`crate::ImeState::target`]).
     Ime {
         surface: Option<SurfaceId>,
+        target: u64,
         event: ImeEvent,
     },
-    /// Result of [`crate::Ctx::request_selection`]. `None` when the
-    /// selection is empty, not text, or could not be read.
+    /// Result of [`crate::Ctx::request_selection`]; `token` is the value
+    /// that call returned.
     SelectionText {
         selection: Selection,
+        token: u64,
         text: Option<String>,
+        status: ReadStatus,
     },
     /// Another client took a selection this app had set.
     SelectionLost {
@@ -156,7 +184,8 @@ pub enum Event {
     Wake(u64),
     /// A one-shot timer set with [`crate::Ctx::set_timer`] fired.
     Timer(u64),
-    /// Another client set `selection`; request it to read the text.
+    /// Another client set or cleared `selection`; request it to read the
+    /// text.
     SelectionChanged {
         selection: Selection,
     },

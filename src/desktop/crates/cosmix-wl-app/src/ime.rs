@@ -17,6 +17,11 @@ pub use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImeState {
     pub surface: crate::SurfaceId,
+    /// App-chosen owner of the input (a grid, a text field). Changing it
+    /// restarts the input method, so input in flight for the previous
+    /// owner is dropped, and [`crate::Event::Ime`] carries the owner each
+    /// result belongs to.
+    pub target: u64,
     /// Caret rectangle in logical surface coordinates.
     pub cursor: Rect,
     pub hint: ContentHint,
@@ -29,6 +34,7 @@ impl ImeState {
     pub fn new(surface: crate::SurfaceId, cursor: Rect) -> Self {
         Self {
             surface,
+            target: 0,
             cursor,
             hint: ContentHint::None,
             purpose: ContentPurpose::Normal,
@@ -188,6 +194,36 @@ impl ImeSerials {
     }
 }
 
+/// What `sync` must send to bring the input method from `sent` to `want`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImePlan {
+    Nothing,
+    /// `disable` + `commit`.
+    Disable,
+    /// `enable`, the full state, `commit`.
+    Enable,
+    /// Disable + commit, then enable + commit: a new owner (surface or
+    /// target) starts a new generation.
+    Restart,
+    /// The changed state + `commit`.
+    Update,
+}
+
+pub fn plan(enabled: bool, sent: Option<&ImeState>, want: Option<&ImeState>) -> ImePlan {
+    match (want, enabled) {
+        (None, false) => ImePlan::Nothing,
+        (None, true) => ImePlan::Disable,
+        (Some(_), false) => ImePlan::Enable,
+        (Some(want), true) => match sent {
+            Some(sent) if sent.surface != want.surface || sent.target != want.target => {
+                ImePlan::Restart
+            }
+            Some(sent) if sent == want => ImePlan::Nothing,
+            _ => ImePlan::Update,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +320,62 @@ mod tests {
             &s.done(1)[..],
             [ImeEvent::Preedit { cursor: None, .. }]
         ));
+    }
+
+    #[test]
+    fn plan_restarts_on_new_target() {
+        let surface = crate::SurfaceId::from_raw(1);
+        let grid = ImeState {
+            target: 1,
+            ..ImeState::new(surface, Rect::new(0, 0, 1, 10))
+        };
+        let field = ImeState {
+            target: 2,
+            ..grid.clone()
+        };
+        let moved = ImeState {
+            cursor: Rect::new(5, 0, 1, 10),
+            ..grid.clone()
+        };
+        assert_eq!(plan(false, None, None), ImePlan::Nothing);
+        assert_eq!(plan(false, None, Some(&grid)), ImePlan::Enable);
+        assert_eq!(plan(true, Some(&grid), Some(&grid)), ImePlan::Nothing);
+        assert_eq!(plan(true, Some(&grid), Some(&moved)), ImePlan::Update);
+        assert_eq!(plan(true, Some(&grid), Some(&field)), ImePlan::Restart);
+        assert_eq!(plan(true, Some(&grid), None), ImePlan::Disable);
+    }
+
+    #[test]
+    fn handover_drops_batch_for_old_target() {
+        // The grid owns the input method and shows a preedit.
+        let mut s = enabled_at(1);
+        s.preedit(Some("ka".into()), 2, 2);
+        assert_eq!(s.done(1).len(), 1);
+        // A batch for the grid is in flight when the search field takes
+        // over: Restart = disable + commit, enable + commit.
+        s.commit_string(Some("grid text".into()));
+        let cleared = s.disabled_and_committed();
+        assert_eq!(
+            cleared,
+            vec![
+                ImeEvent::Preedit {
+                    text: String::new(),
+                    cursor: None
+                },
+                ImeEvent::Focus { active: false }
+            ],
+            "the old owner's preedit is cleared"
+        );
+        s.enabled_and_committed();
+        assert_eq!(s.commits(), 3);
+        // The compositor answers the grid's batch with its old serial.
+        assert!(s.done(1).is_empty());
+        // Even a whole batch re-sent under the disable commit is dropped.
+        s.commit_string(Some("grid text".into()));
+        assert!(s.done(2).is_empty());
+        // Input for the field, after its enable, is delivered.
+        s.commit_string(Some("field".into()));
+        assert_eq!(s.done(3), vec![ImeEvent::Commit("field".into())]);
     }
 
     #[test]

@@ -1,18 +1,22 @@
 //! Connection, event loop, surfaces and input dispatch.
 
+use crate::clipboard::PendingRead;
 use crate::event::{
     ButtonState, Event, KeyEvent, KeyState, Modifiers, PointerEvent, PointerKind, Selection,
     WindowState,
 };
 use crate::geom::{Damage, Rect};
-use crate::ime::{ImeEvent, ImeSerials, ImeState};
-use crate::pool::Swapchain;
+use crate::ime::{self, ImeEvent, ImePlan, ImeSerials, ImeState};
+use crate::pool::{AcquireError, Swapchain};
 use crate::repeat::{Repeat, RepeatRate, TimerAction};
 use crate::scale::{Scale, SurfaceInfo};
+use crate::serial::GrabSerials;
+use crate::xkb_state::XkbState;
 use crate::{App, CursorShape, SurfaceId};
 use calloop::channel::{Channel, Sender};
+use calloop::ping::Ping;
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::{EventLoop, LoopHandle, LoopSignal, RegistrationToken};
+use calloop::{EventLoop, EventSource, LoopHandle, LoopSignal, RegistrationToken};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::data_device_manager::DataDeviceManagerState;
 use smithay_client_toolkit::data_device_manager::data_device::DataDevice;
@@ -24,8 +28,8 @@ use smithay_client_toolkit::primary_selection::selection::PrimarySelectionSource
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{
-    KeyEvent as SctkKeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers as SctkModifiers,
-    RepeatInfo,
+    KeyEvent as SctkKeyEvent, KeyboardData, KeyboardDataExt, KeyboardHandler, Keymap, Keysym,
+    Modifiers as SctkModifiers, RepeatInfo,
 };
 use smithay_client_toolkit::seat::pointer::cursor_shape::CursorShapeManager;
 use smithay_client_toolkit::seat::pointer::{
@@ -42,16 +46,19 @@ use smithay_client_toolkit::shell::xdg::window::{
 use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell, XdgSurface};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
-    delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm,
-    delegate_xdg_popup, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
+    delegate_compositor, delegate_data_device, delegate_output, delegate_pointer,
+    delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_popup,
+    delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_keyboard::WlKeyboard, wl_output::WlOutput, wl_pointer::WlPointer, wl_seat::WlSeat,
+    wl_keyboard::{self, WlKeyboard},
+    wl_output::WlOutput,
+    wl_pointer::WlPointer,
+    wl_seat::WlSeat,
     wl_surface::WlSurface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
@@ -70,7 +77,6 @@ use wayland_protocols::wp::viewporter::client::{
 use wayland_protocols::xdg::shell::client::xdg_positioner::{
     Anchor, ConstraintAdjustment, Gravity,
 };
-use xkbcommon::xkb;
 
 #[derive(Debug)]
 pub enum Error {
@@ -125,7 +131,9 @@ pub struct PopupSpec {
     pub gravity: Gravity,
     pub constraint: ConstraintAdjustment,
     pub offset: (i32, i32),
-    /// Take an explicit grab with the latest input serial (menus).
+    /// Take an explicit grab (menus). The first grabbing popup uses the
+    /// latest button or key press; popups opened while that chain is open
+    /// reuse its serial.
     pub grab: bool,
     /// Ask the compositor to re-place the popup when the parent moves.
     pub reactive: bool,
@@ -181,12 +189,70 @@ impl Waker {
     }
 }
 
+/// When a surface asks for frame callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FramePacing {
+    /// Only when the app asks for another redraw while drawing. A one-off
+    /// change draws at once and costs no callback wakeup; redraws requested
+    /// between frames are not throttled to the display.
+    #[default]
+    OnDemand,
+    /// After every commit: redraws wait for the compositor's frame callback,
+    /// so a stream of changes (terminal output) draws at most once a frame.
+    Always,
+}
+
+/// A source added with [`Ctx::insert_source`].
+#[derive(Debug, Clone, Copy)]
+pub struct SourceToken(RegistrationToken);
+
+/// A first frame at an unknown fractional scale waits this long for
+/// `preferred_scale`.
+const SCALE_WAIT: Duration = Duration::from_millis(50);
+/// Retry delay after a failed buffer allocation.
+const ALLOC_RETRY: Duration = Duration::from_millis(250);
+/// Retry delay for a redraw asked for on a surface that is not mapped and
+/// so gets no frame callback.
+const UNMAPPED_RETRY: Duration = Duration::from_millis(16);
+/// Draw passes per loop iteration before yielding to other sources.
+const FLUSH_PASSES: usize = 8;
+
 enum Role {
     Window(Window),
-    Popup { popup: Popup, parent: SurfaceId },
+    Popup {
+        popup: Popup,
+        parent: SurfaceId,
+        grab: bool,
+    },
+    /// Created once the parent has shown a buffer.
+    PendingPopup {
+        parent: SurfaceId,
+        spec: PopupSpec,
+        serial: Option<u32>,
+    },
+}
+
+impl Role {
+    fn parent(&self) -> Option<SurfaceId> {
+        match self {
+            Role::Window(_) => None,
+            Role::Popup { parent, .. } | Role::PendingPopup { parent, .. } => Some(*parent),
+        }
+    }
+
+    fn grabbing(&self) -> bool {
+        match self {
+            Role::Window(_) => false,
+            Role::Popup { grab, .. } => *grab,
+            Role::PendingPopup { spec, serial, .. } => spec.grab && serial.is_some(),
+        }
+    }
 }
 
 struct Surface {
+    // Dropped (destroyed) by hand in `Drop`: buffers, then the scale
+    // objects, then the role, which destroys the wl_surface last.
+    chain: Option<Swapchain>,
     role: Role,
     wl: WlSurface,
     fractional: Option<WpFractionalScaleV1>,
@@ -195,20 +261,83 @@ struct Surface {
     configured: bool,
     dirty: bool,
     frame_pending: bool,
+    pacing: FramePacing,
+    /// No buffer could be had this iteration; retried on the next wakeup.
+    stalled: bool,
+    /// Hold the first draw until `preferred_scale` arrives or this passes.
+    scale_deadline: Option<Instant>,
     /// Scale and size last sent with a buffer.
     applied: Option<SurfaceInfo>,
-    chain: Option<Swapchain>,
     window_state: WindowState,
+}
+
+impl Surface {
+    fn new(
+        role: Role,
+        wl: WlSurface,
+        scale_objects: (Option<WpFractionalScaleV1>, Option<WpViewport>),
+        info: SurfaceInfo,
+        scale_deadline: Option<Instant>,
+    ) -> Self {
+        Self {
+            chain: None,
+            role,
+            wl,
+            fractional: scale_objects.0,
+            viewport: scale_objects.1,
+            info,
+            configured: false,
+            dirty: true,
+            frame_pending: false,
+            pacing: FramePacing::default(),
+            stalled: false,
+            scale_deadline,
+            applied: None,
+            window_state: WindowState::default(),
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        self.configured
+            && self.dirty
+            && !self.frame_pending
+            && !self.stalled
+            && self.scale_deadline.is_none_or(|d| now >= d)
+    }
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        // Free buffers are destroyed now; one the compositor still holds is
+        // destroyed when it is released, which a compositor does when the
+        // wl_surface goes.
+        drop(self.chain.take());
         if let Some(f) = self.fractional.take() {
             f.destroy();
         }
         if let Some(v) = self.viewport.take() {
             v.destroy();
         }
+        // Window and Popup own their wl_surface and destroy it after their
+        // xdg objects; a pending popup has no role object yet.
+        if matches!(self.role, Role::PendingPopup { .. }) {
+            self.wl.destroy();
+        }
+    }
+}
+
+/// `wl_keyboard` user data: sctk's, plus a hook for raw modifier masks.
+pub(crate) struct KbData(KeyboardData<State>);
+
+impl KeyboardDataExt for KbData {
+    type State = State;
+
+    fn keyboard_data(&self) -> &KeyboardData<State> {
+        &self.0
+    }
+
+    fn keyboard_data_mut(&mut self) -> &mut KeyboardData<State> {
+        &mut self.0
     }
 }
 
@@ -257,20 +386,31 @@ pub(crate) struct Runtime {
     repeat: Repeat,
     repeat_timer: Option<RegistrationToken>,
     repeat_key: Option<KeyEvent>,
-    keymap: Option<xkb::Keymap>,
+    xkb: Option<XkbState>,
+    /// The last `wl_keyboard.modifiers`: depressed, latched, locked, group.
+    raw_mods: [u32; 4],
     // pointer
     pointer_focus: Option<(SurfaceId, u32)>,
     cursor: CursorShape,
+    /// The latest input serial of any kind (selection requests).
     pub(crate) last_serial: u32,
+    grabs: GrabSerials,
     // text input
     ime: ImeSerials,
     ime_want: Option<ImeState>,
     ime_sent: Option<ImeState>,
     ime_surface: Option<SurfaceId>,
+    /// The target of the enabled input-method generation.
+    ime_target: u64,
     // selections
     pub(crate) sources: HashMap<Selection, (OwnedSource, String)>,
+    pub(crate) next_read: u64,
+    pub(crate) selection_gens: HashMap<Selection, u64>,
+    pub(crate) reads: HashMap<u64, PendingRead>,
     exit: bool,
     timers: HashMap<u64, RegistrationToken>,
+    retry: Option<(Instant, RegistrationToken)>,
+    ping: Ping,
     stats: Stats,
     waker: Sender<u64>,
 }
@@ -293,6 +433,8 @@ pub struct Frame<'a> {
     fresh: bool,
     canvas: &'a mut [u8],
     commit: Option<Damage>,
+    touched: bool,
+    kept: bool,
 }
 
 impl Frame<'_> {
@@ -312,13 +454,25 @@ impl Frame<'_> {
     }
 
     /// Pixels, width, height and stride (bytes per row), all physical.
+    /// Taking the buffer without committing makes its contents unknown, so
+    /// the next frame is a full one, unless [`Frame::keep_contents`] says
+    /// nothing was written.
     pub fn buffer_mut(&mut self) -> (&mut [u8], u32, u32, u32) {
+        self.touched = true;
         let (w, h) = self.info.physical;
         (self.canvas, w, h, w * 4)
     }
 
+    /// Declare that no pixel was written in this draw, though the buffer
+    /// was taken. Only matters when nothing is committed.
+    pub fn keep_contents(&mut self) {
+        self.kept = true;
+    }
+
     /// Commit what was drawn, damaging the given physical rectangles. Can be
     /// called more than once before returning from `draw`; the damage adds up.
+    /// A frame that [`Frame::needs_full_redraw`] is always committed with
+    /// full damage.
     pub fn commit_with_damage(&mut self, rects: &[Rect]) {
         let (w, h) = self.info.physical;
         let damage = self.commit.get_or_insert_with(|| Damage::new(w, h));
@@ -350,6 +504,11 @@ pub fn run(app: impl App + 'static) -> Result<Stats, Error> {
             }
         })
         .map_err(|e| Error::Loop(e.to_string()))?;
+    // Wakes the loop for draws left over from a busy iteration.
+    let (ping, ping_source) = calloop::ping::make_ping().map_err(|e| Error::Loop(e.to_string()))?;
+    handle
+        .insert_source(ping_source, |_, _, _: &mut State| {})
+        .map_err(|e| Error::Loop(e.to_string()))?;
     let compositor = CompositorState::bind(&globals, &qh)
         .map_err(|e| Error::Global(format!("wl_compositor: {e}")))?;
     let xdg =
@@ -379,17 +538,25 @@ pub fn run(app: impl App + 'static) -> Result<Stats, Error> {
         repeat: Repeat::default(),
         repeat_timer: None,
         repeat_key: None,
-        keymap: None,
+        xkb: None,
+        raw_mods: [0; 4],
         pointer_focus: None,
         cursor: CursorShape::Default,
         last_serial: 0,
+        grabs: GrabSerials::default(),
         ime: ImeSerials::default(),
         ime_want: None,
         ime_sent: None,
         ime_surface: None,
+        ime_target: 0,
         sources: HashMap::new(),
+        next_read: 0,
+        selection_gens: HashMap::new(),
+        reads: HashMap::new(),
         exit: false,
         timers: HashMap::new(),
+        retry: None,
+        ping,
         stats: Stats::default(),
         waker,
         signal: event_loop.get_signal(),
@@ -481,6 +648,12 @@ impl Ctx<'_> {
         }
     }
 
+    pub fn set_frame_pacing(&mut self, id: SurfaceId, pacing: FramePacing) {
+        if let Some(s) = self.rt.surfaces.get_mut(&id) {
+            s.pacing = pacing;
+        }
+    }
+
     pub fn surface_info(&self, id: SurfaceId) -> Option<SurfaceInfo> {
         self.rt.surfaces.get(&id).map(|s| s.info)
     }
@@ -514,10 +687,11 @@ impl Ctx<'_> {
         self.rt.set_selection(selection, text)
     }
 
-    /// Read `selection` as text; the answer arrives as
-    /// [`Event::SelectionText`].
-    pub fn request_selection(&mut self, selection: Selection) {
-        self.rt.request_selection(selection);
+    /// Read `selection` as text. The answer arrives as
+    /// [`Event::SelectionText`] carrying the returned token, within two
+    /// seconds.
+    pub fn request_selection(&mut self, selection: Selection) -> u64 {
+        self.rt.request_selection(selection)
     }
 
     pub fn modifiers(&self) -> Modifiers {
@@ -563,6 +737,35 @@ impl Ctx<'_> {
         Waker(self.rt.waker.clone())
     }
 
+    /// Add a calloop source (a pty, a socket) to the loop. The callback
+    /// runs on the loop thread with a `Ctx`; to hand data to the app, keep
+    /// it in shared state and call [`Ctx::notify`], which delivers
+    /// [`Event::Wake`] once the callback returns.
+    pub fn insert_source<S, F>(&mut self, source: S, mut callback: F) -> Result<SourceToken, Error>
+    where
+        S: EventSource + 'static,
+        F: FnMut(S::Event, &mut S::Metadata, &mut Ctx<'_>) -> S::Ret + 'static,
+    {
+        self.rt
+            .handle
+            .insert_source(source, move |event, meta, state: &mut State| {
+                let ret = callback(event, meta, &mut Ctx { rt: &mut state.rt });
+                state.drain();
+                ret
+            })
+            .map(SourceToken)
+            .map_err(|e| Error::Loop(e.error.to_string()))
+    }
+
+    pub fn remove_source(&mut self, token: SourceToken) {
+        self.rt.handle.remove(token.0);
+    }
+
+    /// Queue [`Event::Wake`] for `token` on this thread.
+    pub fn notify(&mut self, token: u64) {
+        self.rt.queue.push_back(Event::Wake(token));
+    }
+
     pub fn stats(&self) -> Stats {
         self.rt.stats
     }
@@ -585,20 +788,34 @@ impl State {
         }
     }
 
+    /// Runs after every loop dispatch. Draws until no surface is both dirty
+    /// and free to draw, so a redraw asked for by an event that a draw
+    /// caused is not left waiting for a wakeup that never comes.
     fn flush(&mut self) {
         self.drain();
-        let mut ready: Vec<SurfaceId> = self
-            .rt
-            .surfaces
-            .iter()
-            .filter(|(_, s)| s.configured && s.dirty && !s.frame_pending)
-            .map(|(id, _)| *id)
-            .collect();
-        ready.sort();
-        for id in ready {
-            self.draw(id);
-            self.drain();
+        for s in self.rt.surfaces.values_mut() {
+            s.stalled = false;
         }
+        let mut settled = false;
+        for _ in 0..FLUSH_PASSES {
+            self.rt.open_pending_popups();
+            self.drain();
+            let ready = self.rt.ready_surfaces(Instant::now());
+            if ready.is_empty() {
+                settled = true;
+                break;
+            }
+            for id in ready {
+                self.draw(id);
+                self.drain();
+            }
+        }
+        if !settled {
+            // Let other sources run, then come straight back.
+            self.rt.ping.ping();
+        }
+        let grabbing = self.rt.surfaces.values().any(|s| s.role.grabbing());
+        self.rt.grabs.settle(grabbing);
         if self.rt.exit {
             self.rt.signal.stop();
         }
@@ -614,26 +831,37 @@ impl State {
         let mut chain = surface.chain.take().unwrap_or_else(Swapchain::new);
         let (w, h) = info.physical;
         let resized = chain.size() != (w, h);
-        let Some(acquired) = chain.acquire(&rt.shm, w, h) else {
-            // All buffers are held; the release wakes the loop and we retry.
-            surface.chain = Some(chain);
-            return;
+        let acquired = match chain.acquire(&rt.shm, w, h) {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                surface.chain = Some(chain);
+                surface.stalled = true;
+                // A held buffer's release wakes the loop; a failed
+                // allocation needs a timer.
+                if let AcquireError::Alloc(msg) = e {
+                    log::error!("surface {id:?}: {msg}; retrying");
+                    rt.arm_retry(Instant::now() + ALLOC_RETRY);
+                }
+                return;
+            }
         };
         let scale_changed = surface.applied.is_some_and(|a| a.scale != info.scale);
         surface.dirty = false;
         let fresh = acquired.fresh || resized || scale_changed;
         let index = acquired.index;
-        let commit = {
+        let (commit, touched) = {
             let mut frame = Frame {
                 surface: id,
                 info,
                 fresh,
                 canvas: chain.canvas(index),
                 commit: None,
+                touched: false,
+                kept: false,
             };
             let mut cx = Ctx { rt: &mut self.rt };
             self.app.draw(&mut cx, &mut frame);
-            frame.commit
+            (frame.commit, frame.touched && !frame.kept)
         };
         let rt = &mut self.rt;
         rt.stats.buffer_allocations += chain.allocations;
@@ -641,11 +869,27 @@ impl State {
         let Some(surface) = rt.surfaces.get_mut(&id) else {
             return;
         };
-        let Some(damage) = commit.filter(|d| !d.is_empty()) else {
-            chain.discard(index);
+        let Some(mut damage) = commit.filter(|d| !d.is_empty()) else {
+            chain.discard(index, touched);
             surface.chain = Some(chain);
+            // Nothing to show, but the app asked for another frame while
+            // drawing: wait for the display rather than spin.
+            if surface.dirty {
+                if surface.applied.is_some() {
+                    surface.wl.frame(&rt.qh, surface.wl.clone());
+                    surface.frame_pending = true;
+                    surface.wl.commit();
+                } else {
+                    surface.stalled = true;
+                    rt.arm_retry(Instant::now() + UNMAPPED_RETRY);
+                }
+            }
             return;
         };
+        if fresh {
+            // The buffer's old contents mean nothing to the compositor.
+            damage.add_full();
+        }
         let wl = &surface.wl;
         if surface.applied != Some(info) {
             match info.scale {
@@ -677,10 +921,10 @@ impl State {
                 wl.damage(0, 0, i32::MAX, i32::MAX);
             }
         }
-        // A frame callback only when the app already wants another frame
-        // (animation, caret); otherwise the next change draws at once and an
-        // idle surface gets no callback wakeup.
-        if surface.dirty {
+        // On demand, a frame callback only when the app already wants
+        // another frame (animation, caret); otherwise the next change draws
+        // at once and an idle surface gets no callback wakeup.
+        if surface.dirty || surface.pacing == FramePacing::Always {
             wl.frame(&rt.qh, wl.clone());
             surface.frame_pending = true;
         }
@@ -696,13 +940,18 @@ impl State {
     }
 
     fn key_event(&self, event: SctkKeyEvent, state: KeyState) -> KeyEvent {
+        let xkb = self.rt.xkb.as_ref();
         KeyEvent {
             surface: self.rt.keyboard_focus,
             state,
             keysym: event.keysym,
+            base_keysym: xkb
+                .and_then(|x| x.base_keysym(event.raw_code))
+                .unwrap_or(event.keysym),
             raw_code: event.raw_code,
             text: event.utf8.filter(|t| !t.is_empty()),
             modifiers: self.rt.modifiers,
+            consumed: xkb.map(|x| x.consumed(event.raw_code)).unwrap_or_default(),
             time: event.time,
         }
     }
@@ -742,8 +991,18 @@ impl State {
                     return TimeoutAction::Drop;
                 };
                 key.time = key.time.wrapping_add(interval.as_millis() as u32);
-                key.modifiers = self.rt.modifiers;
                 key.surface = self.rt.keyboard_focus;
+                // Like X autorepeat and sctk's own repeat, a repeat reads the
+                // key with the modifiers held now: hold `a`, press Shift, and
+                // the repeats become `A`. Keysym, text and modifiers stay
+                // consistent with each other.
+                key.modifiers = self.rt.modifiers;
+                if let Some(xkb) = &self.rt.xkb {
+                    let t = xkb.translate(raw);
+                    key.keysym = t.keysym;
+                    key.text = t.text;
+                    key.consumed = t.consumed;
+                }
                 let key = key.clone();
                 self.emit(Event::Key(key));
                 if self.rt.repeat_timer.is_none() {
@@ -772,8 +1031,13 @@ impl Runtime {
         let id = self.alloc_id();
         let wl = self.compositor.create_surface(&self.qh);
         self.by_wl.insert(wl.id(), id);
-        let (fractional, viewport) = self.scale_objects(&wl, id);
-        let scale = self.initial_scale(fractional.is_some(), None);
+        let scale_objects = self.scale_objects(&wl, id);
+        let fractional = scale_objects.0.is_some();
+        let scale = self.initial_scale(fractional, None);
+        // With no scale seen yet, give preferred_scale a moment so the
+        // first frame is not drawn at 1.0 and thrown away.
+        let deadline =
+            (fractional && self.last_scale.is_none()).then(|| Instant::now() + SCALE_WAIT);
         let window = self
             .xdg
             .create_window(wl.clone(), WindowDecorations::RequestServer, &self.qh);
@@ -786,19 +1050,13 @@ impl Runtime {
         window.commit();
         self.surfaces.insert(
             id,
-            Surface {
-                role: Role::Window(window),
+            Surface::new(
+                Role::Window(window),
                 wl,
-                fractional,
-                viewport,
-                info: SurfaceInfo::new(spec.size, scale),
-                configured: false,
-                dirty: true,
-                frame_pending: false,
-                applied: None,
-                chain: None,
-                window_state: WindowState::default(),
-            },
+                scale_objects,
+                SurfaceInfo::new(spec.size, scale),
+                deadline,
+            ),
         );
         id
     }
@@ -843,24 +1101,93 @@ impl Runtime {
         Some(p)
     }
 
+    /// The popup surface exists at once; its `xdg_popup` is made once the
+    /// parent has shown a buffer (a popup must not map before its parent).
     fn create_popup(&mut self, parent: SurfaceId, spec: &PopupSpec) -> Result<SurfaceId, Error> {
-        let parent_surface = self
+        let parent_scale = self
             .surfaces
             .get(&parent)
-            .ok_or(Error::NoSuchSurface(parent))?;
-        let parent_scale = parent_surface.info.scale;
-        let parent_xdg = match &parent_surface.role {
-            Role::Window(w) => w.xdg_surface().clone(),
-            Role::Popup { popup, .. } => popup.xdg_surface().clone(),
-        };
-        let positioner = self
-            .positioner(spec)
-            .ok_or_else(|| Error::Global("xdg_positioner".into()))?;
+            .ok_or(Error::NoSuchSurface(parent))?
+            .info
+            .scale;
         let id = self.alloc_id();
         let wl = self.compositor.create_surface(&self.qh);
         self.by_wl.insert(wl.id(), id);
-        let (fractional, viewport) = self.scale_objects(&wl, id);
-        let scale = self.initial_scale(fractional.is_some(), Some(parent_scale));
+        let scale_objects = self.scale_objects(&wl, id);
+        let scale = self.initial_scale(scale_objects.0.is_some(), Some(parent_scale));
+        // The grab serial is fixed now, while the input that asked for the
+        // popup is still the latest.
+        let serial = if spec.grab {
+            self.grabs.for_grab()
+        } else {
+            None
+        };
+        if spec.grab && serial.is_none() {
+            log::warn!("popup {id:?}: no press to grab with; opening without a grab");
+        }
+        self.surfaces.insert(
+            id,
+            Surface::new(
+                Role::PendingPopup {
+                    parent,
+                    spec: spec.clone(),
+                    serial,
+                },
+                wl,
+                scale_objects,
+                SurfaceInfo::new(spec.size, scale),
+                None,
+            ),
+        );
+        self.open_pending_popups();
+        Ok(id)
+    }
+
+    /// Make the `xdg_popup` of every pending popup whose parent is mapped,
+    /// parents before children.
+    pub(crate) fn open_pending_popups(&mut self) {
+        loop {
+            let next = self
+                .surfaces
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(&s.role, Role::PendingPopup { parent, .. }
+                        if self.surfaces.get(parent).is_some_and(|p| p.applied.is_some()))
+                })
+                .map(|(id, _)| *id)
+                .min();
+            let Some(id) = next else {
+                break;
+            };
+            if let Err(e) = self.open_popup(id) {
+                log::error!("popup {id:?}: {e}");
+                self.close_tree(id);
+                self.queue.push_back(Event::PopupDone { surface: id });
+            }
+        }
+    }
+
+    fn open_popup(&mut self, id: SurfaceId) -> Result<(), Error> {
+        let Some(surface) = self.surfaces.get(&id) else {
+            return Ok(());
+        };
+        let Role::PendingPopup {
+            parent,
+            spec,
+            serial,
+        } = &surface.role
+        else {
+            return Ok(());
+        };
+        let (parent, serial, wl) = (*parent, *serial, surface.wl.clone());
+        let positioner = self
+            .positioner(spec)
+            .ok_or_else(|| Error::Global("xdg_positioner".into()))?;
+        let parent_xdg = match self.surfaces.get(&parent).map(|p| &p.role) {
+            Some(Role::Window(w)) => w.xdg_surface().clone(),
+            Some(Role::Popup { popup, .. }) => popup.xdg_surface().clone(),
+            _ => return Err(Error::NoSuchSurface(parent)),
+        };
         let popup = Popup::from_surface(
             Some(&parent_xdg),
             &positioner,
@@ -869,32 +1196,37 @@ impl Runtime {
             &self.xdg,
         )
         .map_err(|e| Error::Global(format!("xdg_popup: {e}")))?;
-        if spec.grab
-            && let Some(seat) = &self.seat.seat
-        {
-            popup.xdg_popup().grab(seat, self.last_serial);
-        }
+        let grab = match (serial, &self.seat.seat) {
+            (Some(serial), Some(seat)) => {
+                popup.xdg_popup().grab(seat, serial);
+                true
+            }
+            _ => false,
+        };
         wl.commit();
-        self.surfaces.insert(
-            id,
-            Surface {
-                role: Role::Popup { popup, parent },
-                wl,
-                fractional,
-                viewport,
-                info: SurfaceInfo::new(spec.size, scale),
-                configured: false,
-                dirty: true,
-                frame_pending: false,
-                applied: None,
-                chain: None,
-                window_state: WindowState::default(),
-            },
-        );
-        Ok(id)
+        if let Some(surface) = self.surfaces.get_mut(&id) {
+            surface.role = Role::Popup {
+                popup,
+                parent,
+                grab,
+            };
+        }
+        Ok(())
     }
 
     fn reposition_popup(&mut self, id: SurfaceId, spec: &PopupSpec, token: u32) {
+        let Some(surface) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        if let Role::PendingPopup { spec: pending, .. } = &mut surface.role {
+            // Not placed yet: it opens where it was last asked to be.
+            let grab = pending.grab;
+            *pending = PopupSpec {
+                grab,
+                ..spec.clone()
+            };
+            return;
+        }
         if self.xdg.xdg_wm_base().version() < 3 {
             return;
         }
@@ -910,7 +1242,7 @@ impl Runtime {
         let mut out: Vec<SurfaceId> = self
             .surfaces
             .iter()
-            .filter(|(_, s)| matches!(s.role, Role::Popup { parent, .. } if parent == id))
+            .filter(|(_, s)| s.role.parent() == Some(id))
             .map(|(k, _)| *k)
             .collect();
         out.sort();
@@ -948,6 +1280,7 @@ impl Runtime {
         let Some(surface) = self.surfaces.get_mut(&id) else {
             return;
         };
+        surface.scale_deadline = None;
         if surface.info.scale == scale {
             return;
         }
@@ -962,6 +1295,54 @@ impl Runtime {
         }
     }
 
+    /// Surfaces to draw now, in id order (parents first). Arms the retry
+    /// timer for the earliest one held back for its scale.
+    fn ready_surfaces(&mut self, now: Instant) -> Vec<SurfaceId> {
+        let mut ready: Vec<SurfaceId> = self
+            .surfaces
+            .iter()
+            .filter(|(_, s)| s.ready(now))
+            .map(|(id, _)| *id)
+            .collect();
+        ready.sort();
+        let waiting = self
+            .surfaces
+            .values()
+            .filter(|s| s.configured && s.dirty && !s.ready(now))
+            .filter_map(|s| s.scale_deadline.filter(|d| now < *d))
+            .min();
+        if let Some(at) = waiting {
+            self.arm_retry(at);
+        }
+        ready
+    }
+
+    /// Wake the loop at `at` (the earliest of all requests wins).
+    fn arm_retry(&mut self, at: Instant) {
+        if let Some((armed, token)) = self.retry {
+            if armed <= at {
+                return;
+            }
+            self.handle.remove(token);
+            self.retry = None;
+        }
+        let timer = Timer::from_deadline(at);
+        match self.handle.insert_source(timer, |_, _, state: &mut State| {
+            state.rt.retry = None;
+            TimeoutAction::Drop
+        }) {
+            Ok(token) => self.retry = Some((at, token)),
+            Err(e) => log::error!("retry timer: {e}"),
+        }
+    }
+
+    fn update_xkb_mask(&mut self, mask: [u32; 4]) {
+        self.raw_mods = mask;
+        if let Some(xkb) = &mut self.xkb {
+            xkb.update_mask(mask);
+        }
+    }
+
     pub(crate) fn sync_ime(&mut self) {
         let Some(input) = self.seat.text_input.clone() else {
             return;
@@ -969,48 +1350,47 @@ impl Runtime {
         let want = self.ime_want.clone().filter(|w| {
             Some(w.surface) == self.ime_surface && self.surfaces.contains_key(&w.surface)
         });
-        let events = match want {
-            None => {
-                self.ime_sent = None;
-                if !self.ime.enabled() {
-                    return;
-                }
-                input.disable();
+        let mut events = Vec::new();
+        let step = ime::plan(self.ime.enabled(), self.ime_sent.as_ref(), want.as_ref());
+        if matches!(step, ImePlan::Disable | ImePlan::Restart) {
+            input.disable();
+            input.commit();
+            // What is dropped (a showing preedit) belongs to the old owner.
+            let old = self.ime_target;
+            events.extend(
+                self.ime
+                    .disabled_and_committed()
+                    .into_iter()
+                    .map(|e| (old, e)),
+            );
+            self.ime_sent = None;
+        }
+        match (want, step) {
+            (Some(want), ImePlan::Enable | ImePlan::Restart) => {
+                input.enable();
+                send_ime_state(&input, None, &want);
                 input.commit();
-                self.ime.disabled_and_committed()
-            }
-            Some(want) => {
-                let mut events = Vec::new();
-                let refocus = self
-                    .ime_sent
-                    .as_ref()
-                    .is_some_and(|sent| sent.surface != want.surface);
-                if refocus && self.ime.enabled() {
-                    input.disable();
-                    input.commit();
-                    events.extend(self.ime.disabled_and_committed());
-                }
-                if !self.ime.enabled() {
-                    input.enable();
-                    send_ime_state(&input, None, &want);
-                    input.commit();
-                    self.ime.enabled_and_committed();
-                    events.push(ImeEvent::Focus { active: true });
-                } else if self.ime_sent.as_ref() != Some(&want) {
-                    send_ime_state(&input, self.ime_sent.as_ref(), &want);
-                    input.commit();
-                    self.ime.committed();
-                }
+                self.ime.enabled_and_committed();
+                self.ime_target = want.target;
+                events.push((want.target, ImeEvent::Focus { active: true }));
                 self.ime_sent = Some(want);
-                events
             }
-        };
+            (Some(want), ImePlan::Update) => {
+                send_ime_state(&input, self.ime_sent.as_ref(), &want);
+                input.commit();
+                self.ime.committed();
+                self.ime_sent = Some(want);
+            }
+            (None, _) => self.ime_sent = None,
+            _ => {}
+        }
         let surface = self.ime_surface;
-        self.queue.extend(
-            events
-                .into_iter()
-                .map(|event| Event::Ime { surface, event }),
-        );
+        self.queue
+            .extend(events.into_iter().map(|(target, event)| Event::Ime {
+                surface,
+                target,
+                event,
+            }));
     }
 }
 
@@ -1022,10 +1402,15 @@ fn send_ime_state(input: &ZwpTextInputV3, old: Option<&ImeState>, new: &ImeState
     if old.map(|o| (o.hint, o.purpose)) != Some((new.hint, new.purpose)) {
         input.set_content_type(new.hint, new.purpose);
     }
-    if old.map(|o| &o.surrounding) != Some(&new.surrounding)
-        && let Some((text, cursor, anchor)) = &new.surrounding
-    {
-        input.set_surrounding_text(text.clone(), *cursor, *anchor);
+    let old_surrounding = old.and_then(|o| o.surrounding.as_ref());
+    match &new.surrounding {
+        Some(s) if old_surrounding != Some(s) => {
+            input.set_surrounding_text(s.0.clone(), s.1, s.2);
+        }
+        // The protocol has no "unset"; empty text is how a client says it
+        // has none. After an enable the state starts empty anyway.
+        None if old_surrounding.is_some() => input.set_surrounding_text(String::new(), 0, 0),
+        _ => {}
     }
 }
 
@@ -1205,6 +1590,9 @@ impl PopupHandler for State {
         let Some(id) = self.surface_id(popup.wl_surface()) else {
             return;
         };
+        if self.rt.surfaces.get(&id).is_some_and(|s| s.role.grabbing()) {
+            self.rt.grabs.dismissed();
+        }
         self.rt.close_tree(id);
         self.emit(Event::PopupDone { surface: id });
     }
@@ -1264,7 +1652,8 @@ impl SeatHandler for State {
         }
         match capability {
             Capability::Keyboard if self.rt.seat.keyboard.is_none() => {
-                match self.rt.seat_state.get_keyboard(qh, &seat, None) {
+                let data = KbData(KeyboardData::new(seat.clone()));
+                match self.rt.seat_state.get_keyboard_with_data(qh, &seat, data) {
                     Ok(k) => self.rt.seat.keyboard = Some(k),
                     Err(e) => log::error!("keyboard: {e}"),
                 }
@@ -1330,9 +1719,11 @@ impl SeatHandler for State {
         self.rt.pointer_focus = None;
         self.rt.ime_surface = None;
         self.rt.ime_sent = None;
+        let target = self.rt.ime_target;
         for event in events {
             self.rt.queue.push_back(Event::Ime {
                 surface: None,
+                target,
                 event,
             });
         }
@@ -1393,11 +1784,12 @@ impl KeyboardHandler for State {
         event: SctkKeyEvent,
     ) {
         self.rt.last_serial = serial;
+        self.rt.grabs.pressed(serial);
         let repeats = self
             .rt
-            .keymap
+            .xkb
             .as_ref()
-            .is_none_or(|k| k.key_repeats(xkb::Keycode::new(event.raw_code + 8)));
+            .is_none_or(|x| x.repeats(event.raw_code));
         let key = self.key_event(event, KeyState::Pressed);
         let action = self.rt.repeat.press(key.raw_code, repeats);
         self.apply_repeat(action);
@@ -1466,13 +1858,7 @@ impl KeyboardHandler for State {
         _: &WlKeyboard,
         keymap: Keymap<'_>,
     ) {
-        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        self.rt.keymap = xkb::Keymap::new_from_string(
-            &context,
-            keymap.as_string(),
-            xkb::KEYMAP_FORMAT_TEXT_V1,
-            xkb::COMPILE_NO_FLAGS,
-        );
+        self.rt.xkb = XkbState::new(keymap.as_string(), self.rt.raw_mods);
     }
 }
 
@@ -1503,6 +1889,7 @@ impl PointerHandler for State {
                 PointerEventKind::Motion { .. } => PointerKind::Motion,
                 PointerEventKind::Press { button, serial, .. } => {
                     self.rt.last_serial = serial;
+                    self.rt.grabs.pressed(serial);
                     PointerKind::Button {
                         button,
                         state: ButtonState::Pressed,
@@ -1551,6 +1938,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
         }
         let rt = &mut state.rt;
         let surface = rt.ime_surface;
+        // Results belong to the owner of the generation they arrived in.
+        let target = rt.ime_target;
         let events = match event {
             zwp_text_input_v3::Event::Enter { surface } => {
                 rt.ime_surface = rt.by_wl.get(&surface.id()).copied();
@@ -1587,12 +1976,41 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
             zwp_text_input_v3::Event::Done { serial } => rt.ime.done(serial),
             _ => Vec::new(),
         };
-        rt.queue.extend(
-            events
-                .into_iter()
-                .map(|event| Event::Ime { surface, event }),
-        );
+        rt.queue.extend(events.into_iter().map(|event| Event::Ime {
+            surface,
+            target,
+            event,
+        }));
         state.drain();
+    }
+}
+
+impl Dispatch<WlKeyboard, KbData> for State {
+    fn event(
+        state: &mut Self,
+        keyboard: &WlKeyboard,
+        event: wl_keyboard::Event,
+        data: &KbData,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        // Our xkb state follows the same masks as sctk's, before sctk calls
+        // `update_modifiers`.
+        if let wl_keyboard::Event::Modifiers {
+            mods_depressed,
+            mods_latched,
+            mods_locked,
+            group,
+            ..
+        } = &event
+        {
+            state
+                .rt
+                .update_xkb_mask([*mods_depressed, *mods_latched, *mods_locked, *group]);
+        }
+        <SeatState as Dispatch<WlKeyboard, KbData, State>>::event(
+            state, keyboard, event, data, conn, qh,
+        );
     }
 }
 
@@ -1613,7 +2031,6 @@ delegate_compositor!(State);
 delegate_output!(State);
 delegate_shm!(State);
 delegate_seat!(State);
-delegate_keyboard!(State);
 delegate_pointer!(State);
 delegate_xdg_shell!(State);
 delegate_xdg_window!(State);

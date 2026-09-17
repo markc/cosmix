@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wl-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "calloop 0.13.0",
  "log",
@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wl-iced-demo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmix-iced-host",
  "cosmix-iced-widgets",

@@ -18,7 +18,7 @@ pub fn key_event(key: &KeyEvent) -> IcedEvent {
     keys::key_event(
         KeyInput {
             keysym: key.keysym,
-            unmodified_keysym: None,
+            unmodified_keysym: Some(key.base_keysym),
             keycode: key.raw_code + 8,
             modifiers: modifiers(key.modifiers),
             text: key.text.as_deref(),
@@ -107,12 +107,14 @@ mod tests {
             surface: None,
             state,
             keysym: sym,
+            base_keysym: sym,
             raw_code: 30,
             text: text.map(Into::into),
             modifiers: Modifiers {
                 shift: true,
                 ..Modifiers::default()
             },
+            consumed: Modifiers::default(),
             time: 0,
         }
     }

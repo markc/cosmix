@@ -12,6 +12,8 @@ use cosmix_wl_app::{
 
 /// Wake token that ends the run (sent by the `WL_DEMO_EXIT_AFTER` thread).
 pub const WAKE_EXIT: u64 = 1;
+/// The grid's input-method target (see `ImeState::target`).
+pub const IME_GRID: u64 = 1;
 
 const FONT_PX: f32 = 15.0;
 const HEADER: u32 = 28;
@@ -170,7 +172,14 @@ impl RawDemo {
         }
         self.ime_blocked = blocked;
         self.ime_rect = None;
-        if !blocked {
+        if blocked {
+            // Composition in the grid ends when the field takes the input
+            // method; the runtime drops whatever was still in flight for it.
+            if !self.preedit.is_empty() {
+                self.preedit.clear();
+                self.redraw(cx);
+            }
+        } else {
             self.sync_ime(cx);
         }
     }
@@ -291,6 +300,7 @@ impl RawDemo {
         if self.ime_rect != Some(rect) {
             self.ime_rect = Some(rect);
             let mut state = ImeState::new(window, rect);
+            state.target = IME_GRID;
             state.purpose = ContentPurpose::Terminal;
             cx.set_ime(Some(state));
         }
@@ -419,6 +429,10 @@ impl RawDemo {
         let (ox, oy) = self.grid_origin(&info);
         let (cells, _) = self.wanted();
         let font = self.font.as_mut()?;
+        if !full && cells.len() == self.drawn.len() && cells == self.drawn {
+            // Nothing to paint: leave the buffer untouched.
+            return Some((false, Vec::new()));
+        }
         let (pixels, width, height, stride) = frame.buffer_mut();
         let mut canvas = Canvas {
             pixels,
@@ -733,8 +747,15 @@ impl App for RawDemo {
                     _ => {}
                 }
             }
-            Event::Ime { surface, event } => {
-                self.log(format_args!("ime {surface:?} {event:?}"));
+            Event::Ime {
+                surface,
+                target,
+                event,
+            } => {
+                self.log(format_args!("ime {surface:?} target={target} {event:?}"));
+                if target != IME_GRID {
+                    return;
+                }
                 match event {
                     ImeEvent::Focus { .. } => {}
                     ImeEvent::DeleteSurrounding { before, .. } => {
@@ -754,9 +775,14 @@ impl App for RawDemo {
                 }
                 self.sync_ime(cx);
             }
-            Event::SelectionText { selection, text } => {
+            Event::SelectionText {
+                selection,
+                token,
+                text,
+                status,
+            } => {
                 self.log(format_args!(
-                    "selection {selection:?} {} bytes",
+                    "selection {selection:?} token={token} {status:?} {} bytes",
                     text.as_ref().map_or(0, |t| t.len())
                 ));
                 if let Some(text) = text {
