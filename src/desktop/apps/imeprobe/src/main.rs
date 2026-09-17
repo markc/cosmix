@@ -8,7 +8,9 @@
 //! It does the smallest thing a real IME does that the compositor must get
 //! right: bind the manager, take the input method for the seat, and — when the
 //! compositor says a text input has been focused — put a candidate window on
-//! screen and commit a pre-edit string. If the compositor never activates it,
+//! screen and commit a pre-edit string, and with `--commit <text>` also the
+//! commit string a real IME sends when the user accepts a candidate. If the
+//! compositor never activates it,
 //! or never paints the popup, that is exactly the user-visible failure an IME
 //! would suffer, and the gate sees it.
 //!
@@ -50,6 +52,80 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
 const POPUP_W: i32 = 180;
 const POPUP_H: i32 = 48;
 
+/// What the probe sends once the compositor activates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    /// Serve a field some other client owns; the probe maps none of its own.
+    pub external_field: bool,
+    /// Send a pre-edit string (the default).
+    pub preedit: bool,
+    /// Also send this as a commit string, as a real IME does when the user
+    /// accepts a candidate.
+    pub commit: Option<String>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            external_field: false,
+            preedit: true,
+            commit: None,
+        }
+    }
+}
+
+/// One input-method request, in the order the probe sends them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    Preedit(String),
+    Commit(String),
+    /// `zwp_input_method_v2.commit`, which applies the ones above.
+    Apply,
+}
+
+pub const PREEDIT: &str = "cosmix-ime";
+
+/// Parses the command line. Unknown arguments are refused rather than
+/// ignored: a gate that silently dropped `--commit` would report PARTIAL and
+/// look like a compositor fault.
+pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String> {
+    let mut options = Options::default();
+    let mut rest = args.into_iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--external-field" => options.external_field = true,
+            "--no-preedit" => options.preedit = false,
+            "--commit" => {
+                let text = rest.next().ok_or("--commit needs a string")?;
+                options.commit = Some(text);
+            }
+            other => match other.strip_prefix("--commit=") {
+                Some(text) => options.commit = Some(text.to_string()),
+                None => return Err(format!("unknown argument {other:?}")),
+            },
+        }
+    }
+    if !options.preedit && options.commit.is_none() {
+        return Err("--no-preedit without --commit would send nothing".into());
+    }
+    Ok(options)
+}
+
+/// The requests for these options. A commit string follows the pre-edit and
+/// both are applied by one `commit`, as a real IME does when a candidate is
+/// accepted.
+pub fn plan(options: &Options) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if options.preedit {
+        steps.push(Step::Preedit(PREEDIT.to_string()));
+    }
+    if let Some(text) = &options.commit {
+        steps.push(Step::Commit(text.clone()));
+    }
+    steps.push(Step::Apply);
+    steps
+}
+
 #[derive(Default)]
 struct App {
     compositor: Option<WlCompositor>,
@@ -72,6 +148,7 @@ struct App {
     serial: u32,
     activated: bool,
     painted: bool,
+    options: Options,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
@@ -206,15 +283,32 @@ impl App {
         surface.damage(0, 0, POPUP_W, POPUP_H);
         surface.commit();
 
-        // A pre-edit as well, because a compositor can place the popup and
-        // still drop the text — and a user notices the missing text first.
-        input_method.set_preedit_string("cosmix-ime".to_string(), 0, "cosmix-ime".len() as i32);
-        input_method.commit(self.serial);
+        // Text as well, because a compositor can place the popup and still
+        // drop the text — and a user notices the missing text first.
+        let mut sent = Vec::new();
+        for step in plan(&self.options) {
+            match step {
+                Step::Preedit(text) => {
+                    let cursor = text.len() as i32;
+                    input_method.set_preedit_string(text, 0, cursor);
+                    sent.push("preedit");
+                }
+                Step::Commit(text) => {
+                    println!("IMEPROBE commit {text}");
+                    input_method.commit_string(text);
+                    sent.push("commit");
+                }
+                Step::Apply => input_method.commit(self.serial),
+            }
+        }
 
         self.popup = Some(popup);
         self.popup_surface = Some(surface);
         self.painted = true;
-        println!("IMEPROBE painted candidate window {POPUP_W}x{POPUP_H} and committed a preedit");
+        println!(
+            "IMEPROBE painted candidate window {POPUP_W}x{POPUP_H} and committed a {}",
+            sent.join(" and a ")
+        );
     }
 }
 
@@ -337,6 +431,13 @@ impl Dispatch<XdgActivationTokenV1, ()> for App {
 delegate_noop!(App: ignore ZwpInputPopupSurfaceV2);
 
 fn main() {
+    let options = match parse_args(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(error) => {
+            println!("IMEPROBE FAILED {error}");
+            std::process::exit(2);
+        }
+    };
     let conn = match Connection::connect_to_env() {
         Ok(conn) => conn,
         Err(error) => {
@@ -349,7 +450,10 @@ fn main() {
     let display = conn.display();
     display.get_registry(&qh, ());
 
-    let mut app = App::default();
+    let mut app = App {
+        options: options.clone(),
+        ..App::default()
+    };
     // Two roundtrips: the first delivers the globals, the second whatever they
     // emit on bind.
     let _ = queue.roundtrip(&mut app);
@@ -365,7 +469,7 @@ fn main() {
     let _ = queue.roundtrip(&mut app);
 
     // Exercise an existing client field without mapping the probe's own field.
-    if std::env::args().any(|arg| arg == "--external-field") {
+    if options.external_field {
         println!("IMEPROBE waiting for an external text field");
         loop {
             if let Err(error) = queue.blocking_dispatch(&mut app) {
@@ -457,6 +561,84 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_args, plan, Options, Step, PREEDIT};
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn arguments_parse_or_are_refused() {
+        assert_eq!(parse_args(args(&[])), Ok(Options::default()));
+        assert_eq!(
+            parse_args(args(&["--commit", "かな"])),
+            Ok(Options {
+                commit: Some("かな".into()),
+                ..Options::default()
+            })
+        );
+        assert_eq!(
+            parse_args(args(&["--commit=かな"])),
+            parse_args(args(&["--commit", "かな"]))
+        );
+        assert_eq!(
+            parse_args(args(&["--external-field", "--no-preedit", "--commit", "x"])),
+            Ok(Options {
+                external_field: true,
+                preedit: false,
+                commit: Some("x".into()),
+            })
+        );
+        // A text that looks like a flag is still the commit string.
+        assert_eq!(
+            parse_args(args(&["--commit", "--external-field"])),
+            Ok(Options {
+                commit: Some("--external-field".into()),
+                ..Options::default()
+            })
+        );
+        assert!(parse_args(args(&["--commit"])).is_err(), "missing value");
+        assert!(
+            parse_args(args(&["--no-preedit"])).is_err(),
+            "sends nothing"
+        );
+        assert!(
+            parse_args(args(&["--commmit", "x"])).is_err(),
+            "typo refused"
+        );
+    }
+
+    #[test]
+    fn the_plan_commits_after_the_preedit_and_applies_last() {
+        assert_eq!(
+            plan(&Options::default()),
+            vec![Step::Preedit(PREEDIT.into()), Step::Apply]
+        );
+        assert_eq!(
+            plan(&parse_args(args(&["--commit", "かな"])).unwrap()),
+            vec![
+                Step::Preedit(PREEDIT.into()),
+                Step::Commit("かな".into()),
+                Step::Apply
+            ]
+        );
+        assert_eq!(
+            plan(&parse_args(args(&["--no-preedit", "--commit", "かな"])).unwrap()),
+            vec![Step::Commit("かな".into()), Step::Apply]
+        );
+        // Every plan ends with exactly one apply: the requests above it are
+        // pending state until that commit carries the serial.
+        for options in [
+            Options::default(),
+            parse_args(args(&["--commit", "x"])).unwrap(),
+            parse_args(args(&["--no-preedit", "--commit", "x"])).unwrap(),
+        ] {
+            let steps = plan(&options);
+            assert_eq!(steps.iter().filter(|s| **s == Step::Apply).count(), 1);
+            assert_eq!(steps.last(), Some(&Step::Apply));
+        }
+    }
+
     /// Seam guard: the smoke gate's `--ime` arm greps this binary's stdout for
     /// each milestone, across a repo boundary
     /// (`$CMCTL/_bin/smoke_desktop_nested.mix`). Reword a milestone without
@@ -470,6 +652,7 @@ mod tests {
         for needle in [
             "IMEPROBE activate",
             "IMEPROBE painted",
+            "IMEPROBE commit ",
             "IMEPROBE text-input entered",
             "no zwp_input_method_manager_v2 advertised",
         ] {
