@@ -29233,7 +29233,9 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         target: Some((alpha_id, alpha_generation)),
     };
     for expected_change in [true, false] {
-        let admission = ingress.request_window(restore_alpha.clone()).expect("admitted");
+        let admission = ingress
+            .request_window(restore_alpha.clone())
+            .expect("admitted");
         let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
         assert_eq!(rc, 0, "{body}");
         assert_eq!(body["changed"], expected_change);
@@ -29588,6 +29590,23 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
         },
     );
     assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
+
+    // Injected input: the next update committed after it answers it.
+    harness.server.state.note_injected_input(Some(id), 1);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let tv = crate::frame_trace::monotonic_us() + 1_000;
+    let (report, content) = test_frame_report(id, tv, content_seq(&harness, &object), true);
+    harness.server.state.frame_presented(report, content);
+    let (_, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: window.clone(),
+            samples: 512,
+        },
+    );
+    assert_eq!(body["input_to_present_us"].as_array().unwrap().len(), 1);
+    assert!(body["input_to_present_p50_us"].as_u64().unwrap() >= 1_000);
 
     let (rc, body) = stats_reply(
         &mut harness,
