@@ -201,14 +201,16 @@ impl SurfaceRenderer for IcedSceneRenderer {
                 let modifiers = iced_modifiers(modifiers);
                 if modifiers != self.modifiers {
                     self.modifiers = modifiers;
-                    self.surface.queue_event(Event::Keyboard(
-                        keyboard::Event::ModifiersChanged(modifiers),
-                    ));
+                    self.surface
+                        .queue_event(Event::Keyboard(keyboard::Event::ModifiersChanged(
+                            modifiers,
+                        )));
                 }
                 let key = iced_key(&surface_key);
-                let physical_key = latin
-                    .and_then(latin_code)
-                    .map_or(key::Physical::Unidentified(key::NativeCode::Unidentified), key::Physical::Code);
+                let physical_key = latin.and_then(latin_code).map_or(
+                    key::Physical::Unidentified(key::NativeCode::Unidentified),
+                    key::Physical::Code,
+                );
                 let location = keyboard::Location::Standard;
                 let event = if pressed {
                     keyboard::Event::KeyPressed {
@@ -235,9 +237,10 @@ impl SurfaceRenderer for IcedSceneRenderer {
                 let modifiers = iced_modifiers(modifiers);
                 if modifiers != self.modifiers {
                     self.modifiers = modifiers;
-                    self.surface.queue_event(Event::Keyboard(
-                        keyboard::Event::ModifiersChanged(modifiers),
-                    ));
+                    self.surface
+                        .queue_event(Event::Keyboard(keyboard::Event::ModifiersChanged(
+                            modifiers,
+                        )));
                 }
             }
             SurfaceEvent::Focus(focused) => {
@@ -254,9 +257,11 @@ impl SurfaceRenderer for IcedSceneRenderer {
                         self.surface
                             .queue_event(Event::InputMethod(input_method::Event::Opened));
                     }
-                    self.surface.queue_event(Event::InputMethod(
-                        input_method::Event::Preedit(text, cursor.map(|(a, b)| a..b)),
-                    ));
+                    self.surface
+                        .queue_event(Event::InputMethod(input_method::Event::Preedit(
+                            text,
+                            cursor.map(|(a, b)| a..b),
+                        )));
                 }
                 ImeEvent::Commit(text) => {
                     self.surface
@@ -372,13 +377,44 @@ fn iced_key(surface_key: &Key) -> keyboard::Key {
 fn latin_code(latin: char) -> Option<key::Code> {
     use key::Code as C;
     const LETTERS: [C; 26] = [
-        C::KeyA, C::KeyB, C::KeyC, C::KeyD, C::KeyE, C::KeyF, C::KeyG, C::KeyH, C::KeyI,
-        C::KeyJ, C::KeyK, C::KeyL, C::KeyM, C::KeyN, C::KeyO, C::KeyP, C::KeyQ, C::KeyR,
-        C::KeyS, C::KeyT, C::KeyU, C::KeyV, C::KeyW, C::KeyX, C::KeyY, C::KeyZ,
+        C::KeyA,
+        C::KeyB,
+        C::KeyC,
+        C::KeyD,
+        C::KeyE,
+        C::KeyF,
+        C::KeyG,
+        C::KeyH,
+        C::KeyI,
+        C::KeyJ,
+        C::KeyK,
+        C::KeyL,
+        C::KeyM,
+        C::KeyN,
+        C::KeyO,
+        C::KeyP,
+        C::KeyQ,
+        C::KeyR,
+        C::KeyS,
+        C::KeyT,
+        C::KeyU,
+        C::KeyV,
+        C::KeyW,
+        C::KeyX,
+        C::KeyY,
+        C::KeyZ,
     ];
     const DIGITS: [C; 10] = [
-        C::Digit0, C::Digit1, C::Digit2, C::Digit3, C::Digit4, C::Digit5, C::Digit6, C::Digit7,
-        C::Digit8, C::Digit9,
+        C::Digit0,
+        C::Digit1,
+        C::Digit2,
+        C::Digit3,
+        C::Digit4,
+        C::Digit5,
+        C::Digit6,
+        C::Digit7,
+        C::Digit8,
+        C::Digit9,
     ];
     match latin.to_ascii_lowercase() {
         c @ 'a'..='z' => Some(LETTERS[(c as u8 - b'a') as usize]),

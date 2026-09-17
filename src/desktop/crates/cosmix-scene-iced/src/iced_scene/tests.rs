@@ -189,9 +189,16 @@ fn action(kind: &'static str, handler: &str, node: &str, value: Option<Value>) -
 
 #[test]
 fn fixtures_render_then_idle() {
-    for (source, width, height) in [(CLIPPANEL, 720, 520), (CONFORMANCE, 640, 480), (STATIC, 300, 200)] {
+    for (source, width, height) in [
+        (CLIPPANEL, 720, 520),
+        (CONFORMANCE, 640, 480),
+        (STATIC, 300, 200),
+    ] {
         for scale in [1.0, 1.5] {
-            let (w, h) = ((width as f32 * scale) as u32, (height as f32 * scale) as u32);
+            let (w, h) = (
+                (width as f32 * scale) as u32,
+                (height as f32 * scale) as u32,
+            );
             let mut rig = Rig::new(source, w, h, scale);
             let (processed, damage) = rig.frame();
             assert!(processed.needs_redraw);
@@ -203,11 +210,7 @@ fn fixtures_render_then_idle() {
             assert_eq!(settled.ime, ImeRequest::Disabled);
             // A forced redraw of an unchanged scene paints nothing.
             let buffer = rig.buffer.clone();
-            assert!(
-                rig.renderer
-                    .draw(&mut rig.buffer, w, h, w * 4)
-                    .is_empty()
-            );
+            assert!(rig.renderer.draw(&mut rig.buffer, w, h, w * 4).is_empty());
             assert!(rig.buffer == buffer);
         }
     }
@@ -249,7 +252,10 @@ fn hover_damage_stays_on_the_row() {
     assert!(!damage.is_empty());
     for rect in &damage {
         assert!(
-            rect.x >= row.x && rect.y >= row.y && rect.right() <= row.right() && rect.bottom() <= row.bottom(),
+            rect.x >= row.x
+                && rect.y >= row.y
+                && rect.right() <= row.right()
+                && rect.bottom() <= row.bottom(),
             "{rect:?} outside {row:?}"
         );
     }
@@ -278,15 +284,18 @@ fn clicks_toggles_and_rows_reach_their_handlers() {
             ..action("click", "select", "list", None)
         }]
     );
-    // A patched toggle value is adopted.
+    // A patched toggle value is adopted: the port goes false -> true, so the
+    // next click turns it off.
     let mut tree = resolve(CONFORMANCE);
-    tree.nodes["toggle"].ports.insert("value".into(), json!(false));
-    rig.renderer.set_scene(&resolve(CONFORMANCE));
+    tree.nodes["toggle"]
+        .ports
+        .insert("value".into(), json!(true));
+    rig.renderer.set_scene(&tree);
     rig.settle();
     rig.click("toggle");
     assert_eq!(
         rig.actions(),
-        vec![action("change", "toggle", "toggle", Some(json!(true)))]
+        vec![action("change", "toggle", "toggle", Some(json!(false)))]
     );
 }
 
@@ -312,7 +321,11 @@ fn field_edits_submit_undo_and_survive_reloads() {
             action("change", "change", "field", Some(json!("ab"))),
         ]
     );
-    rig.key(Key::Named(NamedKey::Enter), Some("\r"), Modifiers::default());
+    rig.key(
+        Key::Named(NamedKey::Enter),
+        Some("\r"),
+        Modifiers::default(),
+    );
     assert_eq!(
         rig.actions(),
         vec![action("submit", "submit", "field", Some(json!("ab")))]
@@ -321,8 +334,12 @@ fn field_edits_submit_undo_and_survive_reloads() {
     // An unrelated patch plus an external value while focused: text, focus
     // and history are retained.
     let mut patched = resolve(CONFORMANCE);
-    patched.nodes["text"].ports.insert("text".into(), json!("new status"));
-    patched.nodes["field"].ports.insert("value".into(), json!("external"));
+    patched.nodes["text"]
+        .ports
+        .insert("text".into(), json!("new status"));
+    patched.nodes["field"]
+        .ports
+        .insert("value".into(), json!("external"));
     rig.renderer.set_scene(&patched);
     rig.settle();
     assert_eq!(rig.field(), "ab");
@@ -347,7 +364,9 @@ fn field_edits_submit_undo_and_survive_reloads() {
         cosmix_iced_host::ImeRequest::Disabled => None,
     };
     assert_eq!(preedit(&rig).as_deref(), Some("zz"));
-    patched.nodes["text"].ports.insert("text".into(), json!("again"));
+    patched.nodes["text"]
+        .ports
+        .insert("text".into(), json!("again"));
     rig.renderer.set_scene(&patched);
     rig.settle();
     assert_eq!(preedit(&rig).as_deref(), Some("zz"));
@@ -361,7 +380,9 @@ fn field_edits_submit_undo_and_survive_reloads() {
     rig.click("text");
     assert!(!rig.renderer.focused().contains("field"));
     assert_eq!(rig.settle().ime, ImeRequest::Disabled);
-    patched.nodes["field"].ports.insert("value".into(), json!("external 2"));
+    patched.nodes["field"]
+        .ports
+        .insert("value".into(), json!("external 2"));
     rig.renderer.set_scene(&patched);
     rig.settle();
     assert_eq!(rig.field(), "external 2");
@@ -390,7 +411,10 @@ fn scene_get_returns_the_p1_resolved_scene() {
             &bridge,
         );
         assert_eq!(rc, 0);
-        assert_eq!(serde_json::from_str::<Value>(&reply).unwrap(), json!(expected));
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap(),
+            json!(expected)
+        );
     }
 }
 

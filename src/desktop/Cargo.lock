@@ -3292,6 +3292,7 @@ dependencies = [
  "cosmix-scene-bevy",
  "cosmix-shell",
  "ctk",
+ "parley",
  "serde_json",
 ]
 

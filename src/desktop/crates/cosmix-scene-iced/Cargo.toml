@@ -23,4 +23,5 @@ cosmix-iced-widgets = { path = "../cosmix-iced-widgets", optional = true }
 ctk = { path = "../../ctk", default-features = false, features = ["bus"], optional = true }
 
 [dev-dependencies]
+parley = { version = "=0.9.0", default-features = false }
 ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }

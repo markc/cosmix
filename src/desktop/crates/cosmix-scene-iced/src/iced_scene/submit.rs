@@ -69,7 +69,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Submit<'_, Message> {
         self.content.as_widget().size()
     }
 
-    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         self.content.as_widget_mut().layout(tree, renderer, limits)
     }
 
@@ -80,7 +85,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Submit<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content.as_widget_mut().operate(tree, layout, renderer, operation);
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
     }
 
     fn update(
@@ -108,9 +115,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Submit<'_, Message> {
                 .operate(tree, layout, renderer, &mut probe);
             probe.0.contains(&self.id)
         };
-        self.content
-            .as_widget_mut()
-            .update(tree, event, layout, cursor, renderer, clipboard, shell, viewport);
+        self.content.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
         if submit {
             shell.publish(self.message.clone());
             shell.capture_event();

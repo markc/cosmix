@@ -8,6 +8,8 @@
 pub mod program;
 pub mod renderer;
 mod submit;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -58,7 +60,10 @@ impl Plugin for IcedRendererPlugin {
             .insert_resource(design)
             .init_resource::<SceneEvents>()
             // Before mounts, so a new renderer starts with the current look.
-            .add_systems(Update, (sync_look.before(crate::bridge::reconcile), send_actions));
+            .add_systems(
+                Update,
+                (sync_look.before(crate::bridge::reconcile), send_actions),
+            );
     }
 }
 
@@ -118,9 +123,11 @@ fn sync_look(
         .as_ref()
         .and_then(|d| d.revision())
         .map(|r| r.get());
-    let family = typography
-        .as_ref()
-        .map(|t| t.effective_family.clone().unwrap_or_else(|| t.requested_family.clone()));
+    let family = typography.as_ref().map(|t| {
+        t.effective_family
+            .clone()
+            .unwrap_or_else(|| t.requested_family.clone())
+    });
     let text_px = typography.as_ref().map_or(DEFAULT_TEXT_PX, |t| t.body_px);
     let key = (revision, family.clone(), text_px.to_bits());
     if last.as_ref() == Some(&key) {

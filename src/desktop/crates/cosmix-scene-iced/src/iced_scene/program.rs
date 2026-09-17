@@ -107,11 +107,16 @@ impl SceneProgram {
     /// port whenever it changes.
     pub fn set_scene(&mut self, tree: &ResolvedScene, focused: &HashSet<String>) {
         for (id, node) in &tree.nodes {
-            let old = self.tree.nodes.get(id).filter(|old| old.family == node.family);
+            let old = self
+                .tree
+                .nodes
+                .get(id)
+                .filter(|old| old.family == node.family);
             let changed = old.is_none_or(|old| old.ports.get("value") != node.ports.get("value"));
             match node.family.as_str() {
                 "field" if changed && !focused.contains(id) => {
-                    self.fields.insert(id.clone(), text_port(node, "value").to_owned());
+                    self.fields
+                        .insert(id.clone(), text_port(node, "value").to_owned());
                 }
                 "field" => {
                     self.fields
@@ -124,8 +129,10 @@ impl SceneProgram {
                 _ => {}
             }
         }
-        self.fields.retain(|id, _| tree.nodes.get(id).is_some_and(|n| n.family == "field"));
-        self.toggles.retain(|id, _| tree.nodes.get(id).is_some_and(|n| n.family == "toggle"));
+        self.fields
+            .retain(|id, _| tree.nodes.get(id).is_some_and(|n| n.family == "field"));
+        self.toggles
+            .retain(|id, _| tree.nodes.get(id).is_some_and(|n| n.family == "toggle"));
         self.templates = template_ids(tree);
         self.tree = tree.clone();
     }
@@ -150,7 +157,12 @@ impl SceneProgram {
         });
     }
 
-    fn node_view<'a>(&'a self, id: &str, parent: Axis, item: Option<&'a Value>) -> Element<'a, Msg> {
+    fn node_view<'a>(
+        &'a self,
+        id: &str,
+        parent: Axis,
+        item: Option<&'a Value>,
+    ) -> Element<'a, Msg> {
         let Some(node) = self.tree.nodes.get(id) else {
             return space().into();
         };
@@ -181,7 +193,8 @@ impl SceneProgram {
         let look = self.look;
         let content: Element<'a, Msg> = match node.family.as_str() {
             "column" => {
-                let children = children(node).map(|child| (hash(child), self.node_view(child, Axis::Column, item)));
+                let children = children(node)
+                    .map(|child| (hash(child), self.node_view(child, Axis::Column, item)));
                 keyed_column(children)
                     .spacing(number(node, "gap").unwrap_or(0.0))
                     .padding(number(node, "padding").unwrap_or(0.0))
@@ -205,7 +218,11 @@ impl SceneProgram {
                     .height(height);
                 let normal = colour(text_port(node, "background"));
                 let hover = colour(text_port(node, "hover")).or(normal);
-                let background = if self.hovered.contains(&key) { hover } else { normal };
+                let background = if self.hovered.contains(&key) {
+                    hover
+                } else {
+                    normal
+                };
                 let radius = number(node, "radius").unwrap_or(0.0);
                 let styled = container(inner).style(move |_| container::Style {
                     background: background.map(Background::Color),
@@ -250,7 +267,11 @@ impl SceneProgram {
                     } else {
                         look.font.family
                     },
-                    weight: if flag(node, "bold") { Weight::Bold } else { Weight::Normal },
+                    weight: if flag(node, "bold") {
+                        Weight::Bold
+                    } else {
+                        Weight::Normal
+                    },
                     ..look.font
                 };
                 let label = text(content)
@@ -280,16 +301,19 @@ impl SceneProgram {
                 };
                 on_submit(
                     field.into(),
-                    Msg::Submit { node: id.to_owned() },
+                    Msg::Submit {
+                        node: id.to_owned(),
+                    },
                     Id::from(key.clone()),
                 )
             }
             "button" => {
-                let style: fn(&Theme, button::Status) -> button::Style = match text_port(node, "tone") {
-                    "primary" => button::primary,
-                    "danger" => button::danger,
-                    _ => button::secondary,
-                };
+                let style: fn(&Theme, button::Status) -> button::Style =
+                    match text_port(node, "tone") {
+                        "primary" => button::primary,
+                        "danger" => button::danger,
+                        _ => button::secondary,
+                    };
                 let mut b = button(text(text_port(node, "label").to_owned()).size(look.text_px))
                     .on_press(Msg::Click {
                         node: id.to_owned(),
@@ -329,7 +353,10 @@ impl SceneProgram {
                         node: id.to_owned(),
                         item: Some(row_item.clone()),
                     });
-                    (hash(row_item["id"].as_str().unwrap_or_default()), area.into())
+                    (
+                        hash(row_item["id"].as_str().unwrap_or_default()),
+                        area.into(),
+                    )
                 });
                 scrollable(keyed_column(instances).spacing(gap).width(Length::Fill))
                     .width(Length::Fill)
@@ -464,19 +491,31 @@ fn rows(node: &Node) -> &[Value] {
 }
 
 fn string(node: &Node, port: &str) -> Option<String> {
-    node.ports.get(port).and_then(Value::as_str).map(str::to_owned)
+    node.ports
+        .get(port)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn text_port<'a>(node: &'a Node, port: &str) -> &'a str {
-    node.ports.get(port).and_then(Value::as_str).unwrap_or_default()
+    node.ports
+        .get(port)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn number(node: &Node, port: &str) -> Option<f32> {
-    node.ports.get(port).and_then(Value::as_f64).map(|v| v as f32)
+    node.ports
+        .get(port)
+        .and_then(Value::as_f64)
+        .map(|v| v as f32)
 }
 
 fn flag(node: &Node, port: &str) -> bool {
-    node.ports.get(port).and_then(Value::as_bool).unwrap_or(false)
+    node.ports
+        .get(port)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn list_height(node: &Node) -> f32 {
@@ -488,7 +527,11 @@ fn list_height(node: &Node) -> f32 {
 /// `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`, as Bevy's `Srgba::hex` accepts.
 pub(crate) fn colour(value: &str) -> Option<Color> {
     let hex = value.strip_prefix('#').unwrap_or(value);
-    let nibble = |i: usize| u8::from_str_radix(hex.get(i..i + 1)?, 16).ok().map(|v| v * 17);
+    let nibble = |i: usize| {
+        u8::from_str_radix(hex.get(i..i + 1)?, 16)
+            .ok()
+            .map(|v| v * 17)
+    };
     let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
     let [r, g, b, a] = match hex.len() {
         3 => [nibble(0)?, nibble(1)?, nibble(2)?, 255],
