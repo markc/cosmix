@@ -5,7 +5,9 @@
 use cosmix_iced_host::core::keyboard::{self, Key, Modifiers, key::Named, key::Physical};
 use cosmix_iced_host::core::mouse::{self, Button};
 use cosmix_iced_host::core::widget::{Id, Operation};
-use cosmix_iced_host::core::{Color, Event, Font, Length, Point, Rectangle, SmolStr};
+use cosmix_iced_host::core::{
+    Border, Color, Event, Font, Length, Point, Rectangle, Shadow, SmolStr, Vector, font,
+};
 use cosmix_iced_host::widget::{button, column, container, row, space, text, text_input};
 use cosmix_iced_host::{
     DamageRect, Element, Frame, ImeRequest, PixelFormat, Program, Settings, Surface,
@@ -21,6 +23,10 @@ const HEIGHT: f32 = 120.0;
 struct Chrome {
     active: usize,
     search: String,
+    /// Draw the chrome inside a shadowed card with an italic label: the
+    /// renderer paints a quad's shadow and glyph ink outside its measured
+    /// bounds without the clip mask, so both must be inside the damage.
+    card: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +75,35 @@ impl Program for Chrome {
                 .id(["tab0", "tab1", "tab2"][i]),
             );
         }
-        column![
+        let body = column![
             bar,
             tabs,
             text(format!("{} characters searched", self.search.len())).size(14.0)
-        ]
+        ];
+        if !self.card {
+            return body.into();
+        }
+        container(
+            column![
+                text("jaunty fjord Wg").size(14.0).font(Font {
+                    style: font::Style::Italic,
+                    ..Font::with_name("DejaVu Sans")
+                }),
+                body
+            ]
+            .padding(6.0),
+        )
+        .padding(10.0)
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb8(60, 62, 70).into()),
+            border: Border::default().rounded(8.0),
+            shadow: Shadow {
+                color: Color::from_rgba8(0, 0, 0, 0.7),
+                offset: Vector::new(3.0, 5.0),
+                blur_radius: 12.0,
+            },
+            ..container::Style::default()
+        })
         .into()
     }
 }
@@ -83,16 +113,24 @@ struct Target {
     buffer: Vec<u8>,
     width: u32,
     height: u32,
+    format: PixelFormat,
     now: Instant,
 }
 
 impl Target {
     fn new(scale: f32) -> Self {
+        Self::with_format(scale, PixelFormat::Argb8888, false)
+    }
+
+    fn with_format(scale: f32, format: PixelFormat, card: bool) -> Self {
         cosmix_iced_host::load_font(FONT);
         let width = (WIDTH * scale).round() as u32;
         let height = (HEIGHT * scale).round() as u32;
         let surface = Surface::new(
-            Chrome::default(),
+            Chrome {
+                card,
+                ..Chrome::default()
+            },
             Settings {
                 physical_size: (width, height).into(),
                 scale_factor: scale,
@@ -106,6 +144,7 @@ impl Target {
             buffer: vec![0; width as usize * height as usize * 4],
             width,
             height,
+            format,
             now: Instant::now(),
         }
     }
@@ -117,7 +156,7 @@ impl Target {
                 self.width,
                 self.height,
                 self.width * 4,
-                PixelFormat::Argb8888,
+                self.format,
                 self.now,
             )
             .expect("draw")
@@ -134,7 +173,7 @@ impl Target {
                 self.width,
                 self.height,
                 self.width * 4,
-                PixelFormat::Argb8888,
+                self.format,
                 self.now,
             )
             .expect("full draw");
@@ -442,4 +481,86 @@ fn random_small_edits_match_a_full_redraw() {
             "too few partial frames to mean anything"
         );
     }
+}
+
+#[test]
+fn shadows_and_glyph_overhang_stay_inside_the_damage() {
+    for format in [PixelFormat::Argb8888, PixelFormat::Rgba8] {
+        let mut t = Target::with_format(2.5, format, true);
+        t.draw();
+        let search = t.bounds("search");
+        t.click(search.center());
+        t.now = Instant::now();
+        t.draw();
+        let mut previous = t.full_redraw();
+        for step in 1..=6u64 {
+            t.now += Duration::from_millis(550);
+            let frame = t.draw();
+            let incremental = t.buffer.clone();
+            let full = t.full_redraw();
+            let c = check(&t, &frame, &incremental, &full, &previous)
+                .unwrap_or_else(|e| panic!("{format:?} blink {step}: {e}"));
+            assert!(c.changed > 0, "{format:?} blink {step} changed nothing");
+            eprintln!(
+                "DAMAGE_REPORT card {format:?} blink={step} rects={} area={} changed={} rounding={}",
+                frame.damage.len(),
+                damaged_area(&frame),
+                c.changed,
+                c.rounding
+            );
+            t.buffer.copy_from_slice(&full);
+            previous = full;
+        }
+    }
+}
+
+#[test]
+fn a_new_stride_or_format_repaints_everything() {
+    let mut t = Target::new(1.0);
+    assert!(t.draw().full);
+    assert!(!t.draw().full);
+    t.format = PixelFormat::Rgba8;
+    assert!(t.draw().full, "a format change must repaint");
+    let mut wide = vec![0; (t.width as usize + 8) * t.height as usize * 4];
+    let frame = t
+        .surface
+        .draw(&mut wide, t.width, t.height, (t.width + 8) * 4, t.format)
+        .expect("padded draw");
+    assert!(frame.full, "a stride change must repaint");
+}
+
+#[test]
+fn an_older_buffer_gets_the_frames_it_missed() {
+    let mut t = Target::new(1.0);
+    t.draw();
+    let search = t.bounds("search");
+    t.click(search.center());
+    t.draw();
+    // Two frames into buffer A, then one into buffer B, two frames old.
+    t.key(Key::Character("a".into()), Some("a"));
+    let first = t.draw();
+    t.key(Key::Character("b".into()), Some("b"));
+    let second = t.draw();
+    assert!(!first.full && !second.full);
+    let mut old = t.buffer.clone();
+    t.key(Key::Character("c".into()), Some("c"));
+    let aged = t
+        .surface
+        .draw_aged(&mut old, t.width, t.height, t.width * 4, t.format, 3)
+        .expect("aged draw");
+    assert!(!aged.full, "a known age must not repaint everything");
+    let area: u64 = aged.damage.iter().map(DamageRect::area).sum();
+    let latest: u64 = second.damage.iter().map(DamageRect::area).sum();
+    assert!(
+        area > latest,
+        "an older buffer needs more than the last frame"
+    );
+    // Beyond the history, or with unknown contents, everything is repainted.
+    let mut fresh = vec![0; t.buffer.len()];
+    assert!(
+        t.surface
+            .draw_aged(&mut fresh, t.width, t.height, t.width * 4, t.format, 0)
+            .expect("fresh draw")
+            .full
+    );
 }
