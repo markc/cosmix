@@ -1352,6 +1352,38 @@ mod tests {
     }
 
     #[test]
+    fn fast_pointer_drag_stages_the_effective_budget_limit() {
+        let (mut app, window, output) = pointer_app();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(600.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        model.restore_thickness(Edge::Right, 350.0).unwrap();
+        model
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .unwrap();
+        app.insert_resource(ShellFrameState(
+            cosmix_shell::runtime::ShellFrame::from_model(&model),
+        ));
+        let bridge = PointerBridge {
+            resize: Some(resize_session(Edge::Left)),
+            ..Default::default()
+        };
+        bridge.resize_motion(&mut app, &output, window, Vec2::splat(1000.0));
+        assert_eq!(
+            app.world().resource::<StagedShellCommands>().0[0].1,
+            ShellCommandKind::Resize {
+                edge: Edge::Left,
+                thickness_px: 249.0
+            }
+        );
+    }
+
+    #[test]
     fn resize_native_leave_retains_session_and_matching_release_completes_once() {
         let (mut app, window, output) = pointer_app();
         let mut bridge = PointerBridge::default();
