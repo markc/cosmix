@@ -113,12 +113,13 @@ impl Target {
         let mut buffer = std::mem::take(&mut self.buffer);
         let frame = self
             .surface
-            .draw_aged(
+            .draw_aged_at(
                 &mut buffer,
                 self.width,
                 self.height,
                 self.width * 4,
                 self.format,
+                self.now,
                 age,
             )
             .expect("draw");

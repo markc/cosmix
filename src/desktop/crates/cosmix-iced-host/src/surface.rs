@@ -498,7 +498,22 @@ impl<P: Program> Surface<P> {
         format: PixelFormat,
         age: u32,
     ) -> Result<Frame, DrawError> {
-        self.draw_inner(buffer, width, height, stride, format, Instant::now(), age)
+        self.draw_aged_at(buffer, width, height, stride, format, Instant::now(), age)
+    }
+
+    /// [`Surface::draw_aged`] at `now`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_aged_at(
+        &mut self,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: PixelFormat,
+        now: Instant,
+        age: u32,
+    ) -> Result<Frame, DrawError> {
+        self.draw_inner(buffer, width, height, stride, format, now, age)
     }
 
     /// Lays out and draws the program, diffs the result against the
