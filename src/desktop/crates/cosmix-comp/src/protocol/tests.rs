@@ -86,6 +86,7 @@ fn test_atomic_selection(
 
 fn scene(layout: SurfaceLayout) -> SurfaceSceneSnapshot {
     SurfaceSceneSnapshot {
+        commit_seq: 0,
         layout,
         kind: if layout.toplevel.is_some() {
             SceneSurfaceKind::Toplevel
@@ -11379,6 +11380,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         .push(ProtocolEvent::SurfaceUpserted {
             id,
             scene: SurfaceSceneSnapshot {
+                commit_seq: 0,
                 layout: first_layout,
                 kind: SceneSurfaceKind::Toplevel,
                 title: Some(Arc::from("First title")),
@@ -11396,6 +11398,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         .push(ProtocolEvent::SurfaceRelayout {
             id,
             scene: SurfaceSceneSnapshot {
+                commit_seq: 0,
                 layout: newest_layout,
                 kind: SceneSurfaceKind::Toplevel,
                 title: Some(Arc::from("Newest title")),
@@ -29376,6 +29379,255 @@ fn mesh_minimise_ends_a_client_resize_in_progress() {
     let record = &harness.server.state.surfaces[&object];
     assert_eq!(record.configured_size, size);
     assert_eq!(record.window_origin, origin);
+}
+
+fn request_presentation_feedback(harness: &mut KeybindingHarness, presentation: u32) -> u32 {
+    let callback = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        presentation,
+        1,
+        &words(&[TEST_TOPLEVEL_SURFACE_ID, callback]),
+    );
+    callback
+}
+
+fn test_frame_report(
+    id: SurfaceId,
+    time_us: u64,
+    commit_seq: u64,
+    shown: bool,
+) -> (presentation::PresentedFrame, presentation::FrameContent) {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    (
+        presentation::PresentedFrame {
+            output: None,
+            time: Duration::from_micros(time_us),
+            refresh: smithay::wayland::presentation::Refresh::Unknown,
+            seq: 0,
+            flags: Kind::empty(),
+        },
+        presentation::FrameContent {
+            surfaces: vec![presentation::FrameSurface {
+                id,
+                commit_seq,
+                shown,
+            }],
+            sources: Vec::new(),
+        },
+    )
+}
+
+/// Non-`sync_output` events addressed to one feedback object.
+fn feedback_outcome(events: &[(u32, u16, Vec<u8>)], callback: u32) -> Vec<(u16, Vec<u8>)> {
+    events
+        .iter()
+        .filter(|(object, opcode, _)| *object == callback && *opcode != 0)
+        .map(|(_, opcode, body)| (*opcode, body.clone()))
+        .collect()
+}
+
+/// `wp_presentation` end to end on the protocol thread: feedback is taken at
+/// commit (so a later commit cannot discard it), a frame report presents
+/// the commits it contained and leaves newer ones waiting, a commit without
+/// a new buffer resolves with the content it left on screen, and minimising
+/// discards what is still pending.
+#[test]
+fn presentation_feedback_is_taken_at_commit_and_resolved_by_frame_reports() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+
+    let registry = harness.allocate_object_id();
+    let sync = harness.allocate_object_id();
+    send_display_request(&mut harness.client, 1, registry);
+    send_display_request(&mut harness.client, 0, sync);
+    harness.dispatch_client();
+    let globals = registry_globals_for(&mut harness.client, registry, sync);
+    let (name, version) = globals["wp_presentation"];
+    let presentation = harness.allocate_object_id();
+    let interface = "wp_presentation";
+    let string_len = interface.len() + 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&name.to_ne_bytes());
+    body.extend_from_slice(&(string_len as u32).to_ne_bytes());
+    body.extend_from_slice(interface.as_bytes());
+    body.resize(8 + string_len.div_ceil(4) * 4, 0);
+    body.extend_from_slice(&version.min(2).to_ne_bytes());
+    body.extend_from_slice(&presentation.to_ne_bytes());
+    send_request(&mut harness.client, registry, 0, &body);
+    let bound = harness.sync();
+    assert!(
+        bound
+            .iter()
+            .any(|(object, opcode, body)| *object == presentation
+                && *opcode == 0
+                && body[0..4] == (libc::CLOCK_MONOTONIC as u32).to_ne_bytes()),
+        "wp_presentation.clock_id is CLOCK_MONOTONIC: {bound:?}"
+    );
+
+    let first = request_presentation_feedback(&mut harness, presentation);
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let second = request_presentation_feedback(&mut harness, presentation);
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let third = request_presentation_feedback(&mut harness, presentation);
+    // No new buffer: this commit shows whatever the second one left.
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after committing with presentation feedback");
+    let seq = harness.server.state.surfaces[&object].commit_count;
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        3,
+        "all three survive the later commits"
+    );
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .all(|(object, _, _)| ![first, second, third].contains(object)),
+        "nothing resolves before a frame report"
+    );
+
+    let (frame, content) = test_frame_report(id, 1_000_000, seq - 1, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    let presented = feedback_outcome(&events, first);
+    assert_eq!(presented.len(), 1, "{events:?}");
+    assert_eq!(presented[0].0, 1, "presented");
+    let body = &presented[0].1;
+    assert_eq!(word(body, 0), 0, "tv_sec_hi");
+    assert_eq!(word(body, 1), 1, "tv_sec_lo");
+    assert_eq!(word(body, 2), 0, "tv_nsec");
+    assert_eq!(word(body, 3), 0, "refresh unknown");
+    assert_eq!((word(body, 4), word(body, 5)), (0, 0), "no sequence");
+    assert_eq!(word(body, 6), 0, "no flags");
+    assert!(feedback_outcome(&events, second).is_empty());
+    assert!(feedback_outcome(&events, third).is_empty());
+
+    let (frame, content) = test_frame_report(id, 2_000_000, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    for callback in [second, third] {
+        let resolved = feedback_outcome(&events, callback);
+        assert_eq!(resolved.len(), 1, "{events:?}");
+        assert_eq!(resolved[0].0, 1, "presented at the second frame");
+        assert_eq!(word(&resolved[0].1, 1), 2);
+    }
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .counters(id)
+            .presented,
+        3
+    );
+
+    // Pending feedback does not survive a minimise.
+    let fourth = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&surface);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(
+        feedback_outcome(&events, fourth)
+            .into_iter()
+            .map(|(opcode, _)| opcode)
+            .collect::<Vec<_>>(),
+        [2],
+        "discarded"
+    );
+}
+
+/// A frame that does not show the surface (hidden, or its texture not
+/// prepared) discards what it covered; a surface the renderer can no longer
+/// present loses its pending feedback at the next report even if unlisted.
+#[test]
+fn presentation_feedback_is_discarded_when_not_shown_or_unmapped() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let registry = harness.allocate_object_id();
+    let sync = harness.allocate_object_id();
+    send_display_request(&mut harness.client, 1, registry);
+    send_display_request(&mut harness.client, 0, sync);
+    harness.dispatch_client();
+    let globals = registry_globals_for(&mut harness.client, registry, sync);
+    let (name, _) = globals["wp_presentation"];
+    let presentation = harness.allocate_object_id();
+    let interface = "wp_presentation";
+    let mut body = Vec::new();
+    body.extend_from_slice(&name.to_ne_bytes());
+    body.extend_from_slice(&((interface.len() + 1) as u32).to_ne_bytes());
+    body.extend_from_slice(interface.as_bytes());
+    body.resize(8 + (interface.len() + 1).div_ceil(4) * 4, 0);
+    body.extend_from_slice(&1_u32.to_ne_bytes());
+    body.extend_from_slice(&presentation.to_ne_bytes());
+    send_request(&mut harness.client, registry, 0, &body);
+    harness.sync();
+
+    let hidden = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let seq = harness.server.state.surfaces[&object].commit_count;
+    let (frame, content) = test_frame_report(id, 5_000, seq, false);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_outcome(&events, hidden)[0].0, 2, "{events:?}");
+
+    let unmapped = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // Detach the buffer: the unmap path discards immediately.
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after unmapping");
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_outcome(&events, unmapped)[0].0, 2, "{events:?}");
 }
 
 /// The XWayland runtime switch as a props leaf: set round-trip, changed

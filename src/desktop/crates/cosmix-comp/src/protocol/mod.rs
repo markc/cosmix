@@ -426,6 +426,10 @@ pub(crate) struct SurfaceSceneSnapshot {
     pub(crate) layout: SurfaceLayout,
     pub(crate) kind: SceneSurfaceKind,
     pub(crate) title: Option<Arc<str>>,
+    /// The surface's content sequence (`SurfaceRecord::commit_count`) when
+    /// the snapshot was taken. Only an upsert's value names the content it
+    /// carries; a relayout's is informational.
+    pub(crate) commit_seq: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -979,6 +983,16 @@ enum ProtocolCommand {
         presentation_epoch: u64,
         evidence: SecurityPresentationEvidence,
     },
+    FramePresented {
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    },
+    ContentSourceRegistered {
+        id: String,
+    },
+    ContentSourceUnregistered {
+        id: String,
+    },
     CapturePixels(CapturePixels),
     CaptureDmabufComplete(CaptureDmabufComplete),
     CaptureDmabufFailed(CaptureDmabufFailed),
@@ -1485,6 +1499,41 @@ impl SecurityPresentationReporter {
                 evidence: SecurityPresentationEvidence::Kms { generation, output },
             })
             .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
+}
+
+/// Renderer-to-protocol report of presented frames and content-source
+/// registrations. Only what a backend proved goes through it.
+#[derive(Clone, bevy::prelude::Resource)]
+pub(crate) struct FramePresentationReporter {
+    commands: CommandSender<ProtocolCommand>,
+}
+
+impl FramePresentationReporter {
+    pub(crate) fn presented(
+        &self,
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    ) {
+        if self
+            .commands
+            .send(ProtocolCommand::FramePresented { frame, content })
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before a frame presentation report");
+        }
+    }
+
+    pub(crate) fn source_registered(&self, id: String) {
+        let _ = self
+            .commands
+            .send(ProtocolCommand::ContentSourceRegistered { id });
+    }
+
+    pub(crate) fn source_unregistered(&self, id: String) {
+        let _ = self
+            .commands
+            .send(ProtocolCommand::ContentSourceUnregistered { id });
     }
 }
 
@@ -2156,6 +2205,12 @@ impl WaylandRuntime {
         }
     }
 
+    pub(crate) fn frame_presentation_reporter(&self) -> FramePresentationReporter {
+        FramePresentationReporter {
+            commands: self.commands.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_ecs_action(action: EcsAction) -> Self {
         let (commands, command_source) = channel::channel();
@@ -2809,6 +2864,14 @@ impl ProtocolServer {
         let fractional_scale_state =
             FractionalScaleManagerState::new::<WaylandState>(&display_handle);
         let viewporter_state = ViewporterState::new::<WaylandState>(&display_handle);
+        // Only a backend that reports presented frames advertises
+        // wp_presentation (kms-live joins with its flip report).
+        let presentation_global = matches!(backend_kind, BackendKind::Winit).then(|| {
+            smithay::wayland::presentation::PresentationState::new::<WaylandState>(
+                &display_handle,
+                libc::CLOCK_MONOTONIC as u32,
+            )
+        });
         let shm_state = ShmState::new::<WaylandState>(&display_handle, Vec::new());
         let supported_dmabuf_formats = dmabuf_capabilities
             .formats
@@ -3013,6 +3076,12 @@ impl ProtocolServer {
             xdg_decoration_state,
             fractional_scale_state,
             viewporter_state,
+            presentation: presentation::PresentationRuntime {
+                _global: presentation_global,
+                ledger: presentation::PresentationLedger::default(),
+                sources: presentation::SourceLedger::default(),
+                applied_commits: Vec::new(),
+            },
             #[cfg(feature = "xwayland")]
             xwayland_shell_state,
             #[cfg(feature = "xwayland")]
@@ -3360,6 +3429,15 @@ impl ProtocolServer {
                     evidence,
                 }) => {
                     state.acknowledge_security_presentation(presentation_epoch, evidence);
+                }
+                ChannelEvent::Msg(ProtocolCommand::FramePresented { frame, content }) => {
+                    state.frame_presented(frame, content);
+                }
+                ChannelEvent::Msg(ProtocolCommand::ContentSourceRegistered { id }) => {
+                    state.content_source_registered(&id);
+                }
+                ChannelEvent::Msg(ProtocolCommand::ContentSourceUnregistered { id }) => {
+                    state.content_source_unregistered(&id);
                 }
                 ChannelEvent::Msg(ProtocolCommand::CapturePixels(pixels)) => {
                     state.capture_pixels_ready(pixels);
@@ -4747,6 +4825,7 @@ impl SurfaceRecord {
             layout: self.layout,
             kind: self.role.scene_kind(),
             title: self.title.clone(),
+            commit_seq: self.commit_count,
         }
     }
 }
@@ -5762,6 +5841,7 @@ struct WaylandState {
     fractional_scale_state: FractionalScaleManagerState,
     #[allow(dead_code)]
     viewporter_state: ViewporterState,
+    presentation: presentation::PresentationRuntime,
     #[cfg(feature = "xwayland")]
     xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     #[cfg(feature = "xwayland")]
@@ -10480,7 +10560,7 @@ impl WaylandState {
         {
             return;
         }
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&surface.id());
         let Some(record) = self.surfaces.get_mut(&surface.id()) else {
             return;
         };
@@ -13208,6 +13288,7 @@ impl WaylandState {
         }) else {
             return;
         };
+        self.discard_presentation_feedback(_id, "minimize");
         // A client-started move/resize must not keep steering a hidden
         // window (a Bus minimise can land mid-drag). Unlike unmap, the
         // window stays alive, so a resize ends properly: Resizing is unset
@@ -13278,6 +13359,15 @@ impl WaylandState {
         self.arbitrate_keyboard_focus(Some(surface), false, false);
         self.retarget_pointer_after_visibility_change();
         true
+    }
+
+    /// A surface is about to take (or lose) a role: whatever it committed
+    /// under the old role will never be shown as that role's content.
+    fn role_change_generation(&mut self, object: &ObjectId) -> u64 {
+        if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
+            self.discard_presentation_feedback(id, "role");
+        }
+        self.next_role_generation()
     }
 
     /// Hands out the next role generation (see `SurfaceRecord::generation`).
@@ -15418,6 +15508,7 @@ mod explicit_sync;
 mod focus;
 mod handlers;
 mod input;
+pub(crate) mod presentation;
 mod release_use;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;

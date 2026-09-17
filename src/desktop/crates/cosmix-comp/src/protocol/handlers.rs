@@ -136,7 +136,7 @@ impl CompositorHandler for WaylandState {
             .is_some_and(|record| record.mapped);
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface);
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&surface.id());
         let id = if let Some(record) = self.surfaces.get_mut(&surface.id()) {
             let id = record.id;
             record.generation = role_generation;
@@ -262,6 +262,7 @@ impl CompositorHandler for WaylandState {
 
     fn commit(&mut self, surface: &WlSurface) {
         self.committed_surfaces.insert(surface.id());
+        self.note_presentation_commit(surface);
         // Smithay invokes this handler only when a transaction is applied.
         // Synchronized-child commits remain counted while cached under their
         // parent, then reset here when the parent makes them current.
@@ -553,6 +554,7 @@ impl CompositorHandler for WaylandState {
                     self.release_buffer_token(released_dmabuf_token);
                 }
                 if let Some(id) = unmapped_id {
+                    self.discard_presentation_feedback(id, "unmap");
                     self.close_foreign_toplevel(surface);
                     self.cancel_chrome_pointer_grab_for_surface(surface, false);
                     self.reset_chrome_pointer_tracking(&surface.id());
@@ -699,6 +701,7 @@ impl CompositorHandler for WaylandState {
     }
 
     fn transaction_applied(&mut self) {
+        self.take_presentation_commits();
         self.pointer_hit_test_transaction_applying = false;
         self.reconcile_deferred_pointer_hit_test();
     }
@@ -712,6 +715,9 @@ impl CompositorHandler for WaylandState {
         self.damage_requests_since_apply.remove(&surface.id());
         self.remove_subsurface_topology(surface);
         self.destroy_cursor_surface(surface);
+        if let Some(id) = self.surfaces.get(&surface.id()).map(|record| record.id) {
+            self.presentation.ledger.forget_surface(id);
+        }
         self.destroy_surface_record(surface);
         if let Some(former_root) = former_root {
             self.refresh_toplevel_window_geometry(&former_root);
@@ -785,7 +791,7 @@ impl WlrLayerShellHandler for WaylandState {
         };
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&surface_object);
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.generation = role_generation;
@@ -994,7 +1000,7 @@ impl XdgShellHandler for WaylandState {
         set_toplevel_configuration(&surface, configured_size);
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&surface_object);
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.generation = role_generation;
@@ -1217,7 +1223,7 @@ impl XdgShellHandler for WaylandState {
 
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&surface_object);
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.generation = role_generation;
@@ -1729,7 +1735,7 @@ impl SessionLockHandler for WaylandState {
         let surface_object = surface.wl_surface().id();
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&surface_object);
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.generation = role_generation;
@@ -2870,6 +2876,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(WaylandState: [
 ] => XdgDecorationState);
 delegate_fractional_scale!(WaylandState);
 delegate_viewporter!(WaylandState);
+smithay::delegate_presentation!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_dmabuf!(WaylandState);
 smithay::delegate_drm_syncobj!(WaylandState);

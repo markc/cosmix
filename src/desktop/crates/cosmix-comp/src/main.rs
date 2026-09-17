@@ -7,10 +7,12 @@ mod capture;
 mod chrome_frame_material;
 mod client_surface_material;
 mod compositor_scene;
+mod content_source;
 mod decoration;
 mod decoration_scene;
 #[cfg(feature = "frame-capture")]
 mod frame_capture;
+mod frame_content;
 mod frame_trace;
 #[cfg(feature = "native-quoin")]
 mod native_shell;
@@ -63,8 +65,8 @@ use decoration::DecorationStartup;
 use decoration_scene::init_chrome_font_cx;
 use protocol::{
     CaptureCompletionReporter, EcsAction, ExplicitSyncExposureMode, ExplicitSyncPreparation,
-    ExplicitSyncStartupReport, ExplicitSyncStartupVerdict, HostAxis, HostButtonState, HostInput,
-    SecurityPresentationReporter, WaylandRuntime, WaylandRuntimePolicy,
+    ExplicitSyncStartupReport, ExplicitSyncStartupVerdict, FramePresentationReporter, HostAxis,
+    HostButtonState, HostInput, SecurityPresentationReporter, WaylandRuntime, WaylandRuntimePolicy,
     judge_explicit_sync_startup,
 };
 
@@ -411,6 +413,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         runtime.security_presentation_reporter(),
         capture_reporter.clone(),
     );
+    install_nested_frame_presentation(&mut app, runtime.frame_presentation_reporter());
     #[cfg(feature = "bus")]
     runtime.start_port().map_err(io::Error::other)?;
 
@@ -1303,6 +1306,30 @@ struct NestedPresentCandidate {
     acquisition: Option<capture::NestedCaptureAcquisition>,
     epochs: Vec<(u64, protocol::SecurityPresentationTarget)>,
     captures: Vec<capture::PendingCapturePresentation>,
+    content: Option<protocol::presentation::FrameContent>,
+}
+
+/// Nested `wp_presentation`: report a frame's content only after its
+/// swapchain image was handed to the host (the same proof capture and the
+/// security barrier use). The host gives no timing signal, so the report is
+/// honest about it: CLOCK_MONOTONIC at hand-off, no flags, no sequence,
+/// unknown refresh.
+fn install_nested_frame_presentation(app: &mut App, reporter: FramePresentationReporter) {
+    app.insert_resource(reporter.clone());
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.insert_resource(reporter);
+    }
+}
+
+fn nested_presented_frame(timestamp: (u64, u32)) -> protocol::presentation::PresentedFrame {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    protocol::presentation::PresentedFrame {
+        output: None,
+        time: Duration::new(timestamp.0, timestamp.1),
+        refresh: smithay::wayland::presentation::Refresh::Unknown,
+        seq: 0,
+        flags: Kind::empty(),
+    }
 }
 
 #[derive(Resource)]
@@ -1359,11 +1386,13 @@ fn capture_nested_swapchain_acquisition(
     pending: Res<NestedSecurityPresentation>,
     capture_pending: Res<capture::CapturePresentationPending>,
     windows: Res<ExtractedWindows>,
+    content: Option<Res<frame_content::RenderFrameContent>>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     candidate.acquisition = None;
     candidate.epochs.clear();
     candidate.captures.clear();
+    candidate.content = None;
     capture_pending.set_nested_acquisition(None);
     let Some(primary) = windows.primary else {
         return;
@@ -1384,6 +1413,7 @@ fn capture_nested_swapchain_acquisition(
         texture_view: texture_view.id(),
     };
     candidate.acquisition = Some(acquisition);
+    candidate.content = content.map(|content| content.0.clone());
     capture_pending.set_nested_acquisition(Some(acquisition));
     candidate.epochs = pending.snapshot();
 }
@@ -1404,6 +1434,7 @@ fn complete_nested_security_presentation(
     completion: Res<NestedPresentationCompletion>,
     render_device: Res<RenderDevice>,
     windows: Res<ExtractedWindows>,
+    frames: Option<Res<FramePresentationReporter>>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     let Some(acquisition) = candidate.acquisition.take() else {
@@ -1411,16 +1442,21 @@ fn complete_nested_security_presentation(
     };
     let epochs = mem::take(&mut candidate.epochs);
     let captures = mem::take(&mut candidate.captures);
+    let content = candidate.content.take();
     let acquisition_consumed = nested_swapchain_acquisition_was_consumed(acquisition, &windows);
+    let timestamp = acquisition_consumed
+        .then(monotonic_capture_timestamp)
+        .flatten();
     complete_nested_capture_presentations(
         &completion.capture_reporter,
         captures,
         acquisition,
         acquisition_consumed,
-        acquisition_consumed
-            .then(monotonic_capture_timestamp)
-            .flatten(),
+        timestamp,
     );
+    if let (Some(frames), Some(content), Some(timestamp)) = (frames, content, timestamp) {
+        frames.presented(nested_presented_frame(timestamp), content);
+    }
     if !acquisition_consumed {
         return;
     }

@@ -265,7 +265,9 @@ impl Plugin for CompositorScenePlugin {
             .add_systems(Last, refresh_retained_capture_cursor)
             .add_systems(Last, log_settled_client_sampling_contracts)
             .add_plugins(ClientSurfaceMaterialPlugin)
-            .add_plugins(DecorationPlugin);
+            .add_plugins(DecorationPlugin)
+            .add_plugins(crate::content_source::ContentSourcePlugin)
+            .add_plugins(crate::frame_content::FrameContentPlugin);
         if self.cursor_mode == SceneCursorMode::HostCursor {
             app.add_systems(Last, project_host_cursor);
         }
@@ -511,6 +513,14 @@ pub(crate) struct SurfaceEntity {
     pub(crate) material: Handle<ClientSurfaceMaterial>,
     pub(crate) renderer_z: f32,
     pub(crate) decoration: Option<DecorationEntities>,
+    /// The protocol commit whose buffer this entity's image now holds.
+    pub(crate) applied_commit: u64,
+}
+
+impl SurfaceEntity {
+    pub(crate) fn image_id(&self) -> bevy::asset::AssetId<Image> {
+        self.image.id()
+    }
 }
 
 #[derive(Resource)]
@@ -2354,6 +2364,7 @@ fn upsert_surface_with_kind(
         world,
         id,
         SurfaceSceneSnapshot {
+            commit_seq: 0,
             layout,
             kind,
             title: None,
@@ -2392,6 +2403,9 @@ fn upsert_surface_snapshot(
         .surfaces
         .get(&id)
         .map(|surface| (surface.entity, surface.image.clone(), surface.buffer_kind));
+    // Only an applied buffer advances the content commit; a rejected
+    // DMA-BUF leaves the previous content (and its commit) on screen.
+    let mut applied = true;
 
     let z_changed = match frame {
         SurfaceFrame::Shm(frame) => {
@@ -2441,6 +2455,7 @@ fn upsert_surface_snapshot(
                     }
                     Err(error) => {
                         error!(surface_id = id.0, %error, "rejected replacement DMA-BUF");
+                        applied = false;
                         false
                     }
                 }
@@ -2470,6 +2485,7 @@ fn upsert_surface_snapshot(
                     }
                     Err(error) => {
                         error!(surface_id = id.0, %error, "rejected committed DMA-BUF");
+                        applied = false;
                         false
                     }
                 }
@@ -2483,6 +2499,9 @@ fn upsert_surface_snapshot(
     {
         surface.title = scene.title;
         surface.kind = kind;
+        if applied {
+            surface.applied_commit = surface.applied_commit.max(scene.commit_seq);
+        }
     }
     z_changed
 }
@@ -2574,6 +2593,7 @@ fn replace_surface_image(
             material,
             renderer_z: CLIENT_CONTENT_Z_MIN,
             decoration: None,
+            applied_commit: 0,
         },
     );
     world
@@ -3515,6 +3535,7 @@ mod tests {
 
     fn scene(layout: SurfaceLayout) -> SurfaceSceneSnapshot {
         SurfaceSceneSnapshot {
+            commit_seq: 0,
             layout,
             kind: if layout.toplevel.is_some() {
                 SceneSurfaceKind::Toplevel
@@ -4845,6 +4866,7 @@ mod tests {
             }),
         };
         let snapshot = |title: &'static str| SurfaceSceneSnapshot {
+            commit_seq: 0,
             layout,
             kind: SceneSurfaceKind::Toplevel,
             title: Some(Arc::from(title)),

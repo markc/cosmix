@@ -2277,6 +2277,7 @@ mod tests {
         ProtocolEvent::SurfaceUpserted {
             id,
             scene: SurfaceSceneSnapshot {
+                commit_seq: 0,
                 layout,
                 kind,
                 title: None,
@@ -2287,6 +2288,7 @@ mod tests {
 
     fn scene(layout: SurfaceLayout) -> SurfaceSceneSnapshot {
         SurfaceSceneSnapshot {
+            commit_seq: 0,
             layout,
             kind: if layout.toplevel.is_some() {
                 SceneSurfaceKind::Toplevel
@@ -2299,6 +2301,7 @@ mod tests {
 
     fn titled_scene(layout: SurfaceLayout, title: impl Into<Arc<str>>) -> SurfaceSceneSnapshot {
         SurfaceSceneSnapshot {
+            commit_seq: 0,
             layout,
             kind: if layout.toplevel.is_some() {
                 SceneSurfaceKind::Toplevel
