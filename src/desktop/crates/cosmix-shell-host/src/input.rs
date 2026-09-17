@@ -999,8 +999,11 @@ impl PointerBridge {
                 ShellCommandKind::Resize {
                     edge: resize.edge,
                     thickness_px: resize.thickness(raw, extent).min(
-                        app.world().resource::<cosmix_shell::runtime::ShellFrameState>()
-                            .0.panel(resize.edge).max_thickness_px,
+                        app.world()
+                            .resource::<cosmix_shell::runtime::ShellFrameState>()
+                            .0
+                            .panel(resize.edge)
+                            .max_thickness_px,
                     ),
                 },
             );

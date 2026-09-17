@@ -48,7 +48,10 @@ fn memory_probe(
     }
     let bytes = atlases.total_bytes(&images);
     if bytes != previous.1 {
-        eprintln!("SCENE_MEMORY_GATE atlas_bytes={bytes} keys={:?}", atlases.keys().collect::<Vec<_>>());
+        eprintln!(
+            "SCENE_MEMORY_GATE atlas_bytes={bytes} keys={:?}",
+            atlases.keys().collect::<Vec<_>>()
+        );
     }
     *previous = (time.elapsed_secs_f64(), bytes);
 }

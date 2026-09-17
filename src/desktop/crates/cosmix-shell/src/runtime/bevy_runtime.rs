@@ -148,9 +148,16 @@ fn update_model(
     effects.1.clear();
     for command in commands.read() {
         if command.output != *runtime.model.output() {
-            if let ShellCommandKind::ResizeChecked { edge, thickness_px, request_id } = command.kind {
+            if let ShellCommandKind::ResizeChecked {
+                edge,
+                thickness_px,
+                request_id,
+            } = command.kind
+            {
                 resize_results.write(super::ShellResizeResult {
-                    request_id, edge, requested: thickness_px,
+                    request_id,
+                    edge,
+                    requested: thickness_px,
                     max: runtime.model.max_thickness(edge),
                     result: Err("output changed before resize application".into()),
                 });
@@ -168,7 +175,9 @@ fn update_model(
                 }
             }
             ShellCommandKind::ResizeCommit { edge, thickness_px }
-            | ShellCommandKind::ResizeChecked { edge, thickness_px, .. } => {
+            | ShellCommandKind::ResizeChecked {
+                edge, thickness_px, ..
+            } => {
                 // Atomic scripted resize: start records the pre-resize
                 // thickness (so settled_thickness_px is correct if the apply
                 // is rejected), apply, then complete — which settles the new
@@ -180,7 +189,9 @@ fn update_model(
                 let result = runtime.model.resize_thickness(*edge, *thickness_px);
                 if let ShellCommandKind::ResizeChecked { request_id, .. } = command.kind {
                     resize_results.write(super::ShellResizeResult {
-                        request_id, edge: *edge, requested: *thickness_px,
+                        request_id,
+                        edge: *edge,
+                        requested: *thickness_px,
                         max: runtime.model.max_thickness(*edge),
                         result: result.map_err(|error| error.to_string()),
                     });
@@ -309,22 +320,42 @@ mod tests {
             let model = &mut runtime.model;
             model.set_geometry(LogicalSize::new(600.0, 600.0).unwrap());
             model.restore_thickness(Edge::Right, 350.0).unwrap();
-            model.panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin).unwrap();
+            model
+                .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+                .unwrap();
             assert_eq!(model.max_thickness(Edge::Left), 249.0);
             model.output().clone()
         };
         app.world_mut().write_message(ShellCommand {
-            output: output.clone(), at: Duration::ZERO,
-            kind: ShellCommandKind::Resize { edge: Edge::Left, thickness_px: 500.0 },
+            output: output.clone(),
+            at: Duration::ZERO,
+            kind: ShellCommandKind::Resize {
+                edge: Edge::Left,
+                thickness_px: 500.0,
+            },
         });
         app.update();
-        assert_eq!(app.world().resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px, 249.0);
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .thickness_px,
+            249.0
+        );
         app.world_mut().write_message(ShellCommand {
-            output, at: Duration::ZERO,
-            kind: ShellCommandKind::ResizeChecked { edge: Edge::Left, thickness_px: 300.0, request_id: 42 },
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::ResizeChecked {
+                edge: Edge::Left,
+                thickness_px: 300.0,
+                request_id: 42,
+            },
         });
         app.update();
-        let mut results = app.world_mut().resource_mut::<bevy::ecs::message::Messages<super::super::ShellResizeResult>>();
+        let mut results = app
+            .world_mut()
+            .resource_mut::<bevy::ecs::message::Messages<super::super::ShellResizeResult>>();
         let result = results.drain().next().unwrap();
         assert_eq!(result.request_id, 42);
         assert!(result.result.is_err());
@@ -346,7 +377,11 @@ mod tests {
         assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
         assert_eq!(
             model.resize_thickness(Edge::Right, 120.0),
-            Err(crate::core::PanelConfigError::ThicknessBudget { edge: Edge::Right, requested: 120.0, max: 1.0 })
+            Err(crate::core::PanelConfigError::ThicknessBudget {
+                edge: Edge::Right,
+                requested: 120.0,
+                max: 1.0
+            })
         );
         assert_eq!(model.panel(Edge::Right).thickness_px, 1.0);
         assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);

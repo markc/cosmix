@@ -453,15 +453,26 @@ impl PanelStateMachine {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PanelConfigError {
     InvalidThickness(f32),
-    ThicknessBudget { edge: super::Edge, requested: f32, max: f32 },
+    ThicknessBudget {
+        edge: super::Edge,
+        requested: f32,
+        max: f32,
+    },
     Motion(MotionError),
 }
 
 impl Display for PanelConfigError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ThicknessBudget { edge, requested, max } => {
-                write!(formatter, "panel {edge:?} thickness {requested} exceeds output budget {max}")
+            Self::ThicknessBudget {
+                edge,
+                requested,
+                max,
+            } => {
+                write!(
+                    formatter,
+                    "panel {edge:?} thickness {requested} exceeds output budget {max}"
+                )
             }
             Self::InvalidThickness(value) => {
                 write!(

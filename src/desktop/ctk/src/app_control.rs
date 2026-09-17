@@ -55,8 +55,8 @@ use std::collections::HashMap;
 
 use bevy::app::{App, AppExit, Plugin, Update};
 use bevy::ecs::entity::Entity;
-use bevy::ecs::message::MessageWriter;
 use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageWriter;
 use bevy::ecs::query::{Added, Has};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
@@ -93,7 +93,9 @@ pub enum LocalCallerError {
 /// overwrites it from connection state on delivery. Absence fails closed, so
 /// CTK mutation requires the matching broker release.
 pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
-    let mut origins = request.headers.iter()
+    let mut origins = request
+        .headers
+        .iter()
         .filter(|(key, _)| key.eq_ignore_ascii_case("broker_origin"))
         .map(|(_, value)| value.as_str());
     if origins.next() == Some("mesh") && origins.next().is_none() {
@@ -861,17 +863,19 @@ fn get_control(entity: Entity, id: &str, controls: &Query<ControlQueryData>) -> 
         ControlClass::Bool => json!(checked),
         ControlClass::Action => return error_reply("control is not queryable"),
         ControlClass::Meter => match meter {
-            Some(meter) => json!(meter.lanes[..usize::from(meter.lane_count).min(2)]
-                .iter()
-                .map(|lane| {
-                    json!({
-                        "level": lane.level,
-                        "peak": lane.peak,
-                        "hold": lane.hold,
-                        "clipped": lane.clipped,
+            Some(meter) => json!(
+                meter.lanes[..usize::from(meter.lane_count).min(2)]
+                    .iter()
+                    .map(|lane| {
+                        json!({
+                            "level": lane.level,
+                            "peak": lane.peak,
+                            "hold": lane.hold,
+                            "clipped": lane.clipped,
+                        })
                     })
-                })
-                .collect::<Vec<_>>()),
+                    .collect::<Vec<_>>()
+            ),
             None => return error_reply("control has no value"),
         },
     };
@@ -999,8 +1003,8 @@ mod tests {
 
     use super::*;
     use crate::widgets::{
-        action_button, fader_sized, knob_sized, level_meter_sized, toggle_button_sized,
-        CtkWidgetsPlugin, NumericControlProps, ValueMapping,
+        CtkWidgetsPlugin, NumericControlProps, ValueMapping, action_button, fader_sized,
+        knob_sized, level_meter_sized, toggle_button_sized,
     };
 
     #[derive(Resource, Default)]
@@ -1108,10 +1112,12 @@ mod tests {
         anonymous.from.clear();
         let (rc, body) = call(&mut app, &anonymous);
         assert_eq!(rc, 10);
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("registered same-node caller"));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("registered same-node caller")
+        );
 
         let asserted = request("app.test", &[("signed_ident", "spoof")]);
         let (rc, body) = call(&mut app, &asserted);
@@ -1152,7 +1158,10 @@ mod tests {
             mesh.from.clear();
             mesh.headers.insert("broker_origin".into(), "mesh".into());
             let (rc, _) = call(&mut app, &mesh);
-            assert_eq!(rc, 0, "mesh membership admits {command} without a principal");
+            assert_eq!(
+                rc, 0,
+                "mesh membership admits {command} without a principal"
+            );
             let (rc, _) = call(&mut app, &attested_mesh(command, "alpha", "agent"));
             assert_eq!(rc, 0);
         }

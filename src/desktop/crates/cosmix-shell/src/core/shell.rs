@@ -136,7 +136,11 @@ impl ShellModel {
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
         let max = self.max_thickness(edge);
         if thickness > max {
-            return Err(PanelConfigError::ThicknessBudget { edge, requested: thickness, max });
+            return Err(PanelConfigError::ThicknessBudget {
+                edge,
+                requested: thickness,
+                max,
+            });
         }
         if max < *super::RESIZE_THICKNESS_RANGE.start() && thickness == max {
             return self.panels[edge.index()].restore_thickness(thickness);

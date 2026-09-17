@@ -226,9 +226,20 @@ fn service_bus(
         if let Some(request) = state.pending_resizes.remove(&result.request_id) {
             let (rc, body) = match &result.result {
                 Ok(()) => (0, json!({"accepted":true})),
-                Err(error) => (10, json!({"error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max})),
+                Err(error) => (
+                    10,
+                    json!({"error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
+                ),
             };
-            stash_or_respond(&bridge, &mut state, request, rc, body.to_string(), None, &mut dispatch);
+            stash_or_respond(
+                &bridge,
+                &mut state,
+                request,
+                rc,
+                body.to_string(),
+                None,
+                &mut dispatch,
+            );
         }
     }
 
@@ -271,14 +282,35 @@ fn service_bus(
         }
         // A snapshot check can become stale behind another queued command.
         // Only the model's application receipt may acknowledge a resize.
-        if let Some(ShellCommand { output, at, kind: ShellCommandKind::ResizeCommit { edge, thickness_px } }) = &command {
+        if let Some(ShellCommand {
+            output,
+            at,
+            kind: ShellCommandKind::ResizeCommit { edge, thickness_px },
+        }) = &command
+        {
             if state.pending_resizes.len() < MAX_PENDING_REPLIES {
                 state.next_request_id = state.next_request_id.saturating_add(1);
                 let request_id = state.next_request_id;
                 state.pending_resizes.insert(request_id, request);
-                dispatch(ShellCommand { output: output.clone(), at: *at, kind: ShellCommandKind::ResizeChecked { edge: *edge, thickness_px: *thickness_px, request_id } });
+                dispatch(ShellCommand {
+                    output: output.clone(),
+                    at: *at,
+                    kind: ShellCommandKind::ResizeChecked {
+                        edge: *edge,
+                        thickness_px: *thickness_px,
+                        request_id,
+                    },
+                });
             } else {
-                stash_or_respond(&bridge, &mut state, request, 11, json!({"error":"resize queue full"}).to_string(), None, &mut dispatch);
+                stash_or_respond(
+                    &bridge,
+                    &mut state,
+                    request,
+                    11,
+                    json!({"error":"resize queue full"}).to_string(),
+                    None,
+                    &mut dispatch,
+                );
             }
             continue;
         }
@@ -828,9 +860,12 @@ mod tests {
         let (rc, body, command) = dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
         assert_eq!(rc, 10);
         assert!(command.is_none());
-        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!({
-            "error":"panel thickness exceeds output budget", "edge":"left", "requested":240.0, "max":239.0
-        }));
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({
+                "error":"panel thickness exceeds output budget", "edge":"left", "requested":240.0, "max":239.0
+            })
+        );
         req.body = r#"{"edge":"left","thickness_px":239}"#.into();
         let (rc, _, command) = dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
         assert_eq!(rc, 0);

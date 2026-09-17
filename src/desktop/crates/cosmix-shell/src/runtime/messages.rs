@@ -40,7 +40,11 @@ pub enum ShellCommandKind {
         thickness_px: f32,
     },
     /// Resize with an application receipt, for request/reply transports.
-    ResizeChecked { edge: Edge, thickness_px: f32, request_id: u64 },
+    ResizeChecked {
+        edge: Edge,
+        thickness_px: f32,
+        request_id: u64,
+    },
     Corner(CornerEvent),
     Panel {
         edge: Edge,

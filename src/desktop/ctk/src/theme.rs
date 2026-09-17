@@ -26,7 +26,7 @@ use bevy::log::warn;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::{App, Entity, Plugin, Update};
 use bevy::text::{
-    detect_text_needs_rerender, FontCx, FontSize, FontSource, TextFont, TextPipeline,
+    FontCx, FontSize, FontSource, TextFont, TextPipeline, detect_text_needs_rerender,
 };
 use bevy::ui::UiSystems;
 #[cfg(feature = "theme")]
@@ -1289,27 +1289,44 @@ fn configure_typography(
 /// sources rather than theme revisions: collection replacement and monospace
 /// remapping can happen independently of a theme change.
 fn retain_managed_faces(typography: &mut CtkTypography, font_cx: &mut FontCx) {
-    let families: Vec<_> = [fontique::GenericFamily::SansSerif, fontique::GenericFamily::Monospace]
-        .into_iter()
-        .flat_map(|generic| font_cx.collection.generic_families(generic).collect::<Vec<_>>())
-        .collect();
+    let families: Vec<_> = [
+        fontique::GenericFamily::SansSerif,
+        fontique::GenericFamily::Monospace,
+    ]
+    .into_iter()
+    .flat_map(|generic| {
+        font_cx
+            .collection
+            .generic_families(generic)
+            .collect::<Vec<_>>()
+    })
+    .collect();
     let mut sources = Vec::new();
     for id in families {
         if let Some(family) = font_cx.collection.family(id) {
             for face in family.fonts() {
                 let source = face.source();
-                if !sources.iter().any(|entry: &fontique::SourceInfo| entry.id() == source.id()) {
+                if !sources
+                    .iter()
+                    .any(|entry: &fontique::SourceInfo| entry.id() == source.id())
+                {
                     sources.push(source.clone());
                 }
             }
         }
     }
-    typography.retained_faces.retain(|(id, _)| sources.iter().any(|source| source.id() == *id));
+    typography
+        .retained_faces
+        .retain(|(id, _)| sources.iter().any(|source| source.id() == *id));
     for source in sources {
-        if !typography.retained_faces.iter().any(|(id, _)| *id == source.id())
-            && let Some(blob) = font_cx.source_cache.get(&source)
+        if !typography
+            .retained_faces
+            .iter()
+            .any(|(id, _)| *id == source.id())
         {
-            typography.retained_faces.push((source.id(), blob));
+            if let Some(blob) = font_cx.source_cache.get(&source) {
+                typography.retained_faces.push((source.id(), blob));
+            }
         }
     }
 }
@@ -2458,8 +2475,8 @@ pub(crate) fn theme_file_watcher(
 
 #[cfg(feature = "theme")]
 fn theme_event_requests_reload(event: &notify::Event, paths: &ThemeWatchPaths) -> bool {
-    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
     use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
 
     if theme_event_rechecks_watches(event, paths) {
         return true;
@@ -2499,8 +2516,8 @@ fn theme_event_rechecks_watches(event: &notify::Event, paths: &ThemeWatchPaths) 
 #[cfg(feature = "theme")]
 mod file {
     use super::{
-        contrast_checked, dimmed_on, legible_away, Color, CtkThemeMetrics, Mode, Scheme, ThemeSpec,
-        TypographyProvenance, MAX_BODY_PX, MIN_BODY_PX,
+        Color, CtkThemeMetrics, MAX_BODY_PX, MIN_BODY_PX, Mode, Scheme, ThemeSpec,
+        TypographyProvenance, contrast_checked, dimmed_on, legible_away,
     };
     use std::fs::{File, OpenOptions};
     use std::path::Path;
@@ -2951,8 +2968,9 @@ mod file {
 
 #[cfg(feature = "theme")]
 pub use file::{
-    load_theme_file, resolve_app_theme, resolve_app_theme_with_selection, resolve_theme,
-    resolve_theme_with_selection, shared_theme_path, ThemeFile, TypographyFile, THEME_FILE,
+    THEME_FILE, ThemeFile, TypographyFile, load_theme_file, resolve_app_theme,
+    resolve_app_theme_with_selection, resolve_theme, resolve_theme_with_selection,
+    shared_theme_path,
 };
 
 #[cfg(test)]
@@ -3256,9 +3274,11 @@ mod tests {
         // The capture layer installs lazily on the first `warnings_from`. Without
         // this the worker's warnings reach no subscriber at all and the probe
         // proves nothing — which is exactly how it first passed against `with`.
-        assert!(warnings_from(|| warn!("install the global capture layer"))
-            .iter()
-            .any(|line| line.contains("install the global capture layer")));
+        assert!(
+            warnings_from(|| warn!("install the global capture layer"))
+                .iter()
+                .any(|line| line.contains("install the global capture layer"))
+        );
 
         std::thread::spawn(|| {
             // Initialised BEFORE any warning, so `SINK` — first touched by the
@@ -4097,27 +4117,56 @@ mod tests {
             .insert_resource(CtkTypography::with_environment(Some(&family), None))
             .add_plugins(CtkThemePlugin::default());
         app.update();
-        for generic in [parley::GenericFamily::SansSerif, parley::GenericFamily::Monospace] {
+        for generic in [
+            parley::GenericFamily::SansSerif,
+            parley::GenericFamily::Monospace,
+        ] {
             let mut layouts = parley::LayoutContext::<()>::new();
             let mut layout = parley::Layout::<()>::new();
             let mut identity = None;
             for _ in 0..120 {
                 let mut fonts = app.world_mut().resource_mut::<FontCx>();
                 fonts.source_cache.prune(0, false);
-                let mut builder = layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
-                builder.push_default(parley::StyleProperty::FontFamily(parley::FontFamily::Generic(generic).into()));
+                let mut builder =
+                    layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
+                builder.push_default(parley::StyleProperty::FontFamily(
+                    parley::FontFamily::Generic(generic).into(),
+                ));
                 builder.build_into(&mut layout, "sole label");
                 layout.break_all_lines(None);
-                let id = layout.lines().next().unwrap().runs().next().unwrap().font().data.id();
-                assert_eq!(*identity.get_or_insert(id), id, "sole layout font atlas identity drifted");
+                let id = layout
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .runs()
+                    .next()
+                    .unwrap()
+                    .font()
+                    .data
+                    .id();
+                assert_eq!(
+                    *identity.get_or_insert(id),
+                    id,
+                    "sole layout font atlas identity drifted"
+                );
             }
         }
-        assert!(!app.world().resource::<CtkTypography>().retained_faces.is_empty());
+        assert!(
+            !app.world()
+                .resource::<CtkTypography>()
+                .retained_faces
+                .is_empty()
+        );
         // Replacing the mappings releases the old sources; the retention set
         // is bounded by current mappings, never by the number of rebuilds.
         app.world_mut().resource_mut::<FontCx>().collection.clear();
         app.update();
-        assert!(app.world().resource::<CtkTypography>().retained_faces.is_empty());
+        assert!(
+            app.world()
+                .resource::<CtkTypography>()
+                .retained_faces
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4657,8 +4706,8 @@ mod tests {
 mod theme_file_tests {
     use super::*;
     use cosmix_design::{
-        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, InteractionState,
-        EMBEDDED_DEFAULT_SOURCE,
+        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, EMBEDDED_DEFAULT_SOURCE,
+        InteractionState,
     };
     use tempfile::TempDir;
 
