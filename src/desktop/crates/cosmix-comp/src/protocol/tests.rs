@@ -29039,7 +29039,7 @@ fn minimized_prop_round_trips_and_restores_that_window() {
     let state = &harness.server.state;
     assert!(!state.surfaces[&alpha].minimized);
     assert!(state.surfaces[&beta].minimized, "the LIFO top stays hidden");
-    assert_eq!(state.minimized_toplevels, [beta.clone()]);
+    assert_eq!(state.minimized_toplevels, std::slice::from_ref(&beta));
     assert!(state.surfaces[&alpha].focused);
     assert_eq!(
         focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
