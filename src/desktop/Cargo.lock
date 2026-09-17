@@ -3334,6 +3334,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-wl-app"
+version = "0.1.0"
+dependencies = [
+ "calloop 0.13.0",
+ "log",
+ "rustix 1.1.4",
+ "smithay-client-toolkit",
+ "wayland-client",
+ "wayland-protocols",
+ "xkbcommon 0.7.0",
+]
+
+[[package]]
 name = "cosmix-wl-dnd"
 version = "0.4.2"
 dependencies = [
@@ -3344,6 +3357,15 @@ dependencies = [
  "smithay-client-toolkit",
  "wayland-backend",
  "wayland-client",
+]
+
+[[package]]
+name = "cosmix-wl-iced-demo"
+version = "0.1.0"
+dependencies = [
+ "cosmix-wl-app",
+ "rustix 1.1.4",
+ "swash",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "cosmix-wl-app"
+version = "0.1.0"
+description = "Widget-free raw Wayland client runtime: toplevels, popups, shm buffers, input, IME, clipboard"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+calloop = "=0.13.0"
+log = "0.4"
+rustix = { version = "1", features = ["fs", "pipe"] }
+smithay-client-toolkit = { version = "=0.19.2", default-features = false, features = ["calloop", "xkbcommon"] }
+wayland-client = "=0.31.14"
+wayland-protocols = { version = "=0.32.13", default-features = false, features = ["client", "staging", "unstable"] }
+xkbcommon = "=0.7.0"

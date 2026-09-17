@@ -16,6 +16,7 @@ members = [
     "apps/capture",
     "apps/media",
     "apps/term",
+    "apps/wl-iced-demo",
     "crates/cosmix-design",
     "crates/cosmix-scene",
     "crates/cosmix-scene-bevy",
@@ -27,6 +28,7 @@ members = [
     "crates/cosmix-bg-boing",
     "crates/cosmix-wgpu-dmabuf",
     "crates/cosmix-wl-dnd",
+    "crates/cosmix-wl-app",
     "spike/wl-dnd",
 ]
 # Everything under vendor/ is a patch source, not a member: it must resolve as

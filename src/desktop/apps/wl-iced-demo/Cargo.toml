@@ -1,0 +1,31 @@
+# desktop/apps/wl-iced-demo — test B of the one-GUI-toolkit ADR.
+#
+# Two binaries from one package: `wl-raw-demo` is cosmix-wl-app alone (a
+# plain grid, a popup menu, IME and clipboard); `wl-iced-demo` adds iced
+# chrome on top of the same raw code. The difference between the two is what
+# iced costs term.
+[package]
+name = "cosmix-wl-iced-demo"
+version = "0.1.0"
+description = "Raw Wayland demo client for cosmix-wl-app (and, later, its iced-chrome twin)"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wl-raw-demo"
+path = "src/bin/wl-raw-demo.rs"
+
+# The iced twin goes here, reusing `cosmix_wl_iced_demo::raw`:
+# [[bin]]
+# name = "wl-iced-demo"
+# path = "src/bin/wl-iced-demo.rs"
+
+[dependencies]
+cosmix-wl-app = { path = "../../crates/cosmix-wl-app" }
+rustix = { version = "1", features = ["param", "time"] }
+swash = "0.2.10"
