@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-scene-iced"
-version = "0.2.4"
+version = "0.2.5"
 description = "Mix Scenes adapter drawing through a CPU surface renderer into a persistent Bevy texture"
 edition = "2024"
 rust-version = "1.95"

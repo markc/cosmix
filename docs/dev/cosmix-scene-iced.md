@@ -110,6 +110,18 @@ A captured pointer that reports from another window is not given that
 position: the surface loses hover, and a release there still ends the
 capture.
 
+A host that does not speak Bevy's messages pushes onto `SceneIcedInput`
+instead: one queue, drained in push order after each update's messages, so a
+host whose keys, IME and focus share one stream (comp's `NativeInput`) keeps
+that interleave. `note_dropped` counts what the host lost, clears any open
+composition and repaints the surface.
+
+The bridge tracks the keys it forwarded as pressed and releases them when
+focus goes — the seat's own releases follow the keyboard to whoever has it
+next — and again if the surface unmounts first, because a host's focus edge
+can arrive later than the unmount. Whichever comes first releases them; the
+other finds nothing to release.
+
 `SceneIcedWake` is the earliest renderer wake time. The host registers what
 to do with it on `SceneIcedWaker` (`set(|world, at| …)`, called every update
 while a wake is pending, so a host that consumes its deadline re-arms):
