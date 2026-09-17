@@ -10,8 +10,10 @@ Dependencies are the iced component crates pinned exactly (`iced_core`,
 `iced_runtime`, `iced_graphics`, `iced_renderer` with only `tiny-skia`,
 `iced_tiny_skia` without default features, `iced_widget`). The `iced`
 umbrella crate is not used because it always depends on `iced_winit`. The
-graph contains no winit and no wgpu; `softbuffer` is compiled in by
-`iced_tiny_skia` but has no platform backend enabled and is never called.
+graph contains no winit and no wgpu. `iced_tiny_skia` always compiles
+`softbuffer`, which does not build on Linux without a backend, so its
+dlopen'd Wayland backend is enabled (`wayland-client` joins the graph,
+libwayland is not linked). This crate never calls softbuffer.
 
 ## Driving a surface
 
