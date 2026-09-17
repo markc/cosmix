@@ -3234,16 +3234,27 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "bevy",
  "cosmix-actions",
  "cosmix-app-identity",
  "cosmix-lib-buildinfo",
+ "cosmix-lib-config",
+ "cosmix-term-core",
+ "ctk",
+ "serde_json",
+ "term-native-test-broker",
+ "tokio",
+]
+
+[[package]]
+name = "cosmix-term-core"
+version = "0.1.0"
+dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
- "ctk",
  "ed25519-dalek",
  "libc",
  "rio-vt",
