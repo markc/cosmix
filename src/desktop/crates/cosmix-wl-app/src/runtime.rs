@@ -211,11 +211,33 @@ pub struct SourceToken(RegistrationToken);
 const SCALE_WAIT: Duration = Duration::from_millis(50);
 /// Retry delay after a failed buffer allocation.
 const ALLOC_RETRY: Duration = Duration::from_millis(250);
-/// Retry delay for a redraw asked for on a surface that is not mapped and
-/// so gets no frame callback.
-const UNMAPPED_RETRY: Duration = Duration::from_millis(16);
-/// Draw passes per loop iteration before yielding to other sources.
+/// Draw passes per loop iteration before the rest is left to the display.
 const FLUSH_PASSES: usize = 8;
+
+/// One iteration's drawing, as plain steps over whatever holds the
+/// surfaces, so the pass budget can be tested without a compositor.
+pub(crate) trait FlushOps {
+    /// Surfaces that could draw right now, in draw order.
+    fn ready(&mut self) -> Vec<SurfaceId>;
+    fn draw_one(&mut self, id: SurfaceId);
+}
+
+/// Draw until nothing is left ready, at most [`FLUSH_PASSES`] passes.
+/// Returns what was still ready when the budget ran out: an app that
+/// dirties itself from every event would otherwise commit forever, so the
+/// caller throttles those to the display instead of drawing them again.
+pub(crate) fn flush_passes<T: FlushOps>(ops: &mut T) -> Vec<SurfaceId> {
+    for _ in 0..FLUSH_PASSES {
+        let ready = ops.ready();
+        if ready.is_empty() {
+            return Vec::new();
+        }
+        for id in ready {
+            ops.draw_one(id);
+        }
+    }
+    ops.ready()
+}
 
 enum Role {
     Window(Window),
@@ -228,7 +250,6 @@ enum Role {
     PendingPopup {
         parent: SurfaceId,
         spec: PopupSpec,
-        serial: Option<u32>,
     },
 }
 
@@ -240,12 +261,10 @@ impl Role {
         }
     }
 
+    /// Holds a live grab. A popup with no `xdg_popup` yet holds nothing,
+    /// so it cannot keep a chain's serial alive.
     fn grabbing(&self) -> bool {
-        match self {
-            Role::Window(_) => false,
-            Role::Popup { grab, .. } => *grab,
-            Role::PendingPopup { spec, serial, .. } => spec.grab && serial.is_some(),
-        }
+        matches!(self, Role::Popup { grab: true, .. })
     }
 }
 
@@ -775,6 +794,19 @@ impl Ctx<'_> {
     }
 }
 
+impl FlushOps for State {
+    fn ready(&mut self) -> Vec<SurfaceId> {
+        let _ = self.rt.open_pending_popups(None);
+        self.drain();
+        self.rt.ready_surfaces(Instant::now())
+    }
+
+    fn draw_one(&mut self, id: SurfaceId) {
+        self.draw(id);
+        self.drain();
+    }
+}
+
 impl State {
     pub(crate) fn emit(&mut self, event: Event) {
         self.rt.queue.push_back(event);
@@ -796,23 +828,8 @@ impl State {
         for s in self.rt.surfaces.values_mut() {
             s.stalled = false;
         }
-        let mut settled = false;
-        for _ in 0..FLUSH_PASSES {
-            self.rt.open_pending_popups();
-            self.drain();
-            let ready = self.rt.ready_surfaces(Instant::now());
-            if ready.is_empty() {
-                settled = true;
-                break;
-            }
-            for id in ready {
-                self.draw(id);
-                self.drain();
-            }
-        }
-        if !settled {
-            // Let other sources run, then come straight back.
-            self.rt.ping.ping();
+        for id in flush_passes(self) {
+            self.rt.throttle(id);
         }
         let grabbing = self.rt.surfaces.values().any(|s| s.role.grabbing());
         self.rt.grabs.settle(grabbing);
@@ -820,6 +837,22 @@ impl State {
             self.rt.signal.stop();
         }
         let _ = self.rt.conn.flush();
+    }
+
+    /// Ask the display when to draw next, instead of drawing again now.
+    fn throttle(&mut self, id: SurfaceId) {
+        let Some(surface) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        if surface.applied.is_some() {
+            surface.wl.frame(&self.qh, surface.wl.clone());
+            surface.frame_pending = true;
+            surface.wl.commit();
+        } else {
+            // Nothing is mapped to get a callback from; come back after the
+            // other sources have run.
+            self.ping.ping();
+        }
     }
 
     fn draw(&mut self, id: SurfaceId) {
@@ -880,8 +913,10 @@ impl State {
                     surface.frame_pending = true;
                     surface.wl.commit();
                 } else {
+                    // Not mapped, so no callback can come. Leave it dirty
+                    // and stalled: the app's own next wakeup draws it, and
+                    // nothing here wakes the loop on a clock.
                     surface.stalled = true;
-                    rt.arm_retry(Instant::now() + UNMAPPED_RETRY);
                 }
             }
             return;
@@ -910,7 +945,12 @@ impl State {
             surface.applied = Some(info);
         }
         if let Err(e) = chain.buffer(index).attach_to(wl) {
-            log::error!("attach: {e:?}");
+            // The frame is lost, but the surface still wants one: keep it
+            // dirty for the next wakeup rather than dropping it silently.
+            log::error!("surface {id:?}: attach: {e:?}");
+            surface.dirty = true;
+            surface.stalled = true;
+            chain.discard(index, touched);
             surface.chain = Some(chain);
             return;
         }
@@ -992,10 +1032,15 @@ impl State {
                 };
                 key.time = key.time.wrapping_add(interval.as_millis() as u32);
                 key.surface = self.rt.keyboard_focus;
-                // Like X autorepeat and sctk's own repeat, a repeat reads the
-                // key with the modifiers held now: hold `a`, press Shift, and
-                // the repeats become `A`. Keysym, text and modifiers stay
-                // consistent with each other.
+                // Like X autorepeat and sctk's own repeat, a repeat reads
+                // the key with the modifiers held now, so its keysym, text
+                // and modifiers agree. Only a modifiers event with no key
+                // press behind it can change them mid-repeat: pressing a
+                // modifier ends the repeat (a non-repeating key disarms it),
+                // but releasing one does not, so holding Shift and `a` gives
+                // `A`s that become `a`s when Shift is let go. Compose is not
+                // applied to a repeat: a dead key never repeats into a
+                // sequence, so the text is the plain key.
                 key.modifiers = self.rt.modifiers;
                 if let Some(xkb) = &self.rt.xkb {
                     let t = xkb.translate(raw);
@@ -1115,23 +1160,12 @@ impl Runtime {
         self.by_wl.insert(wl.id(), id);
         let scale_objects = self.scale_objects(&wl, id);
         let scale = self.initial_scale(scale_objects.0.is_some(), Some(parent_scale));
-        // The grab serial is fixed now, while the input that asked for the
-        // popup is still the latest.
-        let serial = if spec.grab {
-            self.grabs.for_grab()
-        } else {
-            None
-        };
-        if spec.grab && serial.is_none() {
-            log::warn!("popup {id:?}: no press to grab with; opening without a grab");
-        }
         self.surfaces.insert(
             id,
             Surface::new(
                 Role::PendingPopup {
                     parent,
                     spec: spec.clone(),
-                    serial,
                 },
                 wl,
                 scale_objects,
@@ -1139,13 +1173,18 @@ impl Runtime {
                 None,
             ),
         );
-        self.open_pending_popups();
+        // Usually the parent is mapped and this opens the popup right here.
+        self.open_pending_popups(Some(id))?;
         Ok(id)
     }
 
     /// Make the `xdg_popup` of every pending popup whose parent is mapped,
-    /// parents before children.
-    pub(crate) fn open_pending_popups(&mut self) {
+    /// parents before children. A failure closes that popup: for `report`
+    /// (the one the caller is creating, whose id it has not returned yet)
+    /// the error goes back to the caller, for any other one the app hears
+    /// [`Event::PopupDone`].
+    pub(crate) fn open_pending_popups(&mut self, report: Option<SurfaceId>) -> Result<(), Error> {
+        let mut reported = Ok(());
         loop {
             let next = self
                 .surfaces
@@ -1160,26 +1199,26 @@ impl Runtime {
                 break;
             };
             if let Err(e) = self.open_popup(id) {
-                log::error!("popup {id:?}: {e}");
                 self.close_tree(id);
-                self.queue.push_back(Event::PopupDone { surface: id });
+                if report == Some(id) {
+                    reported = Err(e);
+                } else {
+                    log::error!("popup {id:?}: {e}");
+                    self.queue.push_back(Event::PopupDone { surface: id });
+                }
             }
         }
+        reported
     }
 
     fn open_popup(&mut self, id: SurfaceId) -> Result<(), Error> {
         let Some(surface) = self.surfaces.get(&id) else {
             return Ok(());
         };
-        let Role::PendingPopup {
-            parent,
-            spec,
-            serial,
-        } = &surface.role
-        else {
+        let Role::PendingPopup { parent, spec } = &surface.role else {
             return Ok(());
         };
-        let (parent, serial, wl) = (*parent, *serial, surface.wl.clone());
+        let (parent, grab_wanted, wl) = (*parent, spec.grab, surface.wl.clone());
         let positioner = self
             .positioner(spec)
             .ok_or_else(|| Error::Global("xdg_positioner".into()))?;
@@ -1196,12 +1235,21 @@ impl Runtime {
             &self.xdg,
         )
         .map_err(|e| Error::Global(format!("xdg_popup: {e}")))?;
+        // The serial is taken here, where the grab is actually sent: a
+        // serial picked when the popup was asked for could have been
+        // invalidated by a release while the popup waited for its parent.
+        let serial = grab_wanted.then(|| self.grabs.for_grab()).flatten();
         let grab = match (serial, &self.seat.seat) {
             (Some(serial), Some(seat)) => {
                 popup.xdg_popup().grab(seat, serial);
                 true
             }
-            _ => false,
+            _ => {
+                if grab_wanted {
+                    log::warn!("popup {id:?}: no press to grab with; opening without a grab");
+                }
+                false
+            }
         };
         wl.commit();
         if let Some(surface) = self.surfaces.get_mut(&id) {
@@ -2042,3 +2090,83 @@ delegate_noop!(State: ignore WpFractionalScaleManagerV1);
 delegate_noop!(State: ignore WpViewporter);
 delegate_noop!(State: ignore WpViewport);
 delegate_noop!(State: ignore ZwpTextInputManagerV3);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A surface whose app asks for another redraw from an event delivered
+    /// after each draw, which is exactly the case the "dirty during draw"
+    /// frame-callback rule does not catch.
+    #[derive(Default)]
+    struct Greedy {
+        dirty: bool,
+        frame_pending: bool,
+        commits: u32,
+    }
+
+    impl FlushOps for Greedy {
+        fn ready(&mut self) -> Vec<SurfaceId> {
+            if self.dirty && !self.frame_pending {
+                vec![SurfaceId::from_raw(1)]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn draw_one(&mut self, _: SurfaceId) {
+            self.commits += 1;
+            // The drain after the draw dirties it again, so `dirty` stays
+            // set and the surface is ready in the next pass.
+        }
+    }
+
+    #[test]
+    fn a_greedy_app_is_bounded_and_handed_to_the_display() {
+        let mut app = Greedy {
+            dirty: true,
+            ..Greedy::default()
+        };
+        let left = flush_passes(&mut app);
+        assert_eq!(app.commits, FLUSH_PASSES as u32);
+        assert_eq!(
+            left,
+            vec![SurfaceId::from_raw(1)],
+            "still ready: the caller throttles it instead of drawing again"
+        );
+        // Throttling means a frame callback; the next iteration draws
+        // nothing until the compositor answers.
+        app.frame_pending = true;
+        app.commits = 0;
+        assert!(flush_passes(&mut app).is_empty());
+        assert_eq!(app.commits, 0, "one commit per frame callback");
+    }
+
+    #[test]
+    fn a_settled_app_costs_one_pass() {
+        #[derive(Default)]
+        struct Once {
+            dirty: bool,
+            draws: u32,
+        }
+        impl FlushOps for Once {
+            fn ready(&mut self) -> Vec<SurfaceId> {
+                if self.dirty {
+                    vec![SurfaceId::from_raw(1)]
+                } else {
+                    Vec::new()
+                }
+            }
+            fn draw_one(&mut self, _: SurfaceId) {
+                self.draws += 1;
+                self.dirty = false;
+            }
+        }
+        let mut app = Once {
+            dirty: true,
+            draws: 0,
+        };
+        assert!(flush_passes(&mut app).is_empty());
+        assert_eq!(app.draws, 1);
+    }
+}

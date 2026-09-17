@@ -20,7 +20,8 @@ test B (iced chrome in a raw window).
   positioner and the grab flag. The id is returned at once, but the
   `xdg_popup` is only created once the parent has shown a buffer, so a
   submenu asked for before its parent menu is configured (F10 then Right)
-  still opens. Popups can be repositioned and closed; closing a surface
+  still opens; if that creation fails for a popup the app has already been
+  given the id of, it hears `Event::PopupDone`. Popups can be repositioned and closed; closing a surface
   closes the popups above it first.
 - **Grab serials.** A grab must carry a serial the compositor still counts
   as a live input action: a button press that started the current pointer
@@ -29,8 +30,12 @@ test B (iced chrome in a raw window).
   while the popup grab holds. So the first grabbing popup takes the latest
   press serial, and every popup opened while that chain is open (a
   submenu, or the next root menu when the pointer moves along the bar)
-  reuses it. The chain ends when the compositor dismisses it or when an
-  iteration ends with no grabbing popup open (`serial.rs`).
+  reuses it. The serial is taken at the moment the grab is sent, not when
+  the popup was asked for, so a popup that waited for its parent grabs with
+  input that is still live; a popup with no `xdg_popup` yet holds no grab
+  and so cannot keep a chain open. The chain ends when the compositor
+  dismisses it or when an iteration ends with no grabbing popup open
+  (`serial.rs`).
 
 ## Drawing and pacing
 
@@ -39,8 +44,10 @@ configured, the app asked for a redraw (or a configure or scale change did),
 no frame callback is pending, and it has a buffer to draw into. After each
 loop dispatch the runtime draws in passes until no surface is left in that
 state, so a redraw requested by an event that a draw caused (an IME focus
-event, say) is drawn at once rather than lost; after eight passes it pings
-the loop and continues on the next iteration. `Frame::buffer_mut()` returns
+event, say) is drawn at once rather than lost. The budget is eight passes;
+what is still ready after that is given a frame callback instead of another
+commit, which bounds an app that dirties itself from every event to one
+commit per display frame. `Frame::buffer_mut()` returns
 `(pixels, width, height, stride)` at physical size, ARGB8888 in B, G, R, A
 byte order. `Frame::commit_with_damage(&[Rect])` records physical damage;
 the runtime then clips and merges it, sends `damage_buffer` and commits. A
@@ -55,15 +62,18 @@ of changes (terminal output) draws at most once per display frame.
 
 A draw that commits nothing leaves the surface as it was. If the app
 requested another redraw during such a draw, the runtime commits a frame
-callback without a buffer (or, before the surface is mapped, retries after
-16 ms) instead of spinning. If the app took the buffer with
+callback without a buffer, so the next draw waits for the display. Before
+the surface is mapped there is nothing to get a callback from, so it stays
+dirty and is drawn on the app's own next wakeup — the runtime arms no timer
+for it. If the app took the buffer with
 `Frame::buffer_mut` and did not commit, the slot's contents count as unknown
 and the next frame is a full one, unless it called `Frame::keep_contents`.
 
 The runtime's own timers are all armed only while needed: key repeat while
 a key is held, a selection read's timeout while it runs, and a retry timer
 after a failed buffer allocation (250 ms) or while the first frame waits
-for its scale.
+for its scale. Nothing else is on a clock; a surface that cannot draw waits
+for the compositor or for the app's own next wakeup.
 
 Each surface has up to three `wl_shm` slots. The runtime reuses the newest
 committed slot once the compositor releases it, so a steady-state frame
@@ -101,9 +111,14 @@ surface is mapped gets a first frame at 1.0 followed by a full redraw.
   produce the keysym, and `Pressed`/`Released`/`Repeated`. The runtime
   keeps its own xkb state beside sctk's, fed the raw modifier masks, for the
   base keysym and consumed modifiers. Repeats are translated with the
-  modifiers held at repeat time, as X autorepeat and sctk's own repeat do:
-  hold `a`, press Shift, and the repeats read `A`. Keysym, text and
-  modifiers of a repeat always agree; compose is not applied to repeats.
+  modifiers held at repeat time, as X autorepeat and sctk's own repeat do,
+  so a repeat's keysym, text and modifiers agree. Pressing a modifier ends
+  a repeat (any non-repeating key disarms it), so the case this covers is a
+  modifiers event with no key press behind it — releasing one: hold Shift
+  and `a` for `A`s, let Shift go and the repeats become `a`s. Compose is
+  not applied to a repeat, since a dead key does not repeat into a
+  sequence; a terminal encoding keys should take a repeat's keysym and text
+  as they come and not feed them through its own compose state.
 - **Pointer:** enter, leave, motion, button and axis. Axis events carry
   pixel values and 120ths per wheel step. sctk binds `wl_seat` v7, so the
   120ths are derived from `axis_discrete`; true `value120` is not available.

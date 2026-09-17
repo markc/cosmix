@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wl-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "calloop 0.13.0",
  "log",
