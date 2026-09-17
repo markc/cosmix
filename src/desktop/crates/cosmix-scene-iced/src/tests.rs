@@ -865,3 +865,40 @@ fn leaving_a_surface_does_not_clobber_another_sources_cursor() {
         }
     );
 }
+
+#[derive(Resource, Default)]
+struct Wakes(u32);
+
+fn count_wakes(mut reader: MessageReader<bevy::window::RequestRedraw>, mut wakes: ResMut<Wakes>) {
+    wakes.0 += reader.read().count() as u32;
+}
+
+/// A texture that never prepares must not keep an idle desktop rendering.
+#[test]
+fn keeping_the_host_awake_for_staged_uploads_is_bounded() {
+    use std::sync::atomic::Ordering;
+    let mut h = Harness::new();
+    let channel = crate::gpu::GpuChannel::default();
+    h.app
+        .insert_resource(channel.clone())
+        .add_message::<bevy::window::RequestRedraw>()
+        .init_resource::<Wakes>()
+        .add_systems(Last, count_wakes);
+    channel.0.waiting.store(true, Ordering::Relaxed);
+    h.run(crate::bridge::MAX_KEEP_AWAKE_FRAMES as usize * 2);
+    assert_eq!(
+        h.app.world().resource::<Wakes>().0,
+        crate::bridge::MAX_KEEP_AWAKE_FRAMES,
+        "the keep-awake path must stop"
+    );
+
+    // An upload that lands clears the flag and rearms the budget.
+    channel.0.waiting.store(false, Ordering::Relaxed);
+    h.run(2);
+    channel.0.waiting.store(true, Ordering::Relaxed);
+    h.run(5);
+    assert_eq!(
+        h.app.world().resource::<Wakes>().0,
+        crate::bridge::MAX_KEEP_AWAKE_FRAMES + 5
+    );
+}

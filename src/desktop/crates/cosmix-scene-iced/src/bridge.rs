@@ -832,6 +832,10 @@ fn cursor_shape(icon: CursorIcon) -> CursorShape {
     }
 }
 
+/// Frames the host is kept awake for staged uploads before the wait is
+/// abandoned: twice the render world's own `MAX_WAIT_FRAMES`.
+pub const MAX_KEEP_AWAKE_FRAMES: u32 = 240;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn frame(
     mut renderers: NonSendMut<Renderers>,
@@ -848,17 +852,31 @@ pub(crate) fn frame(
     mut wake: ResMut<SceneIcedWake>,
     mut cursor_request: ResMut<CursorShapeRequest>,
     mut redraw: MessageWriter<RequestRedraw>,
+    mut keeping_awake: Local<u32>,
     channel: Option<Res<GpuChannel>>,
     time: Res<Time<Real>>,
 ) {
     let now = time.elapsed();
+    // `waiting` is set by the render world with a Relaxed store, so this read
+    // is one frame stale under pipelined rendering; it only gates a redraw
+    // request, never correctness.
     if channel
         .as_ref()
         .is_some_and(|channel| channel.0.waiting.load(Ordering::Relaxed))
     {
         // Uploads are staged for a texture Bevy has not prepared yet; an
-        // idle host would otherwise never render them.
-        redraw.write(RequestRedraw);
+        // idle host would otherwise never render them. A texture that never
+        // prepares (device loss) must not keep the desktop at full frame
+        // rate for ever: give up after twice the render world's own wait,
+        // leaving the surface blank until something else wakes the host.
+        *keeping_awake += 1;
+        if *keeping_awake <= MAX_KEEP_AWAKE_FRAMES {
+            redraw.write(RequestRedraw);
+        } else if *keeping_awake == MAX_KEEP_AWAKE_FRAMES + 1 {
+            warn!("scene-iced: a surface texture never prepared; stopped waking the host");
+        }
+    } else {
+        *keeping_awake = 0;
     }
     let repaints = channel
         .as_ref()
