@@ -4089,62 +4089,68 @@ mod tests {
     }
 
     #[test]
-    fn sole_layout_named_and_fallback_identity_survives_pruning() {
-        for fallback in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("test-font.ttf");
-            std::fs::write(&path, bevy::text::DEFAULT_FONT_DATA).unwrap();
-            let mut fonts = FontCx::default();
-            fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
-                system_fonts: false,
-                ..Default::default()
-            });
-            fonts.collection.load_fonts_from_paths([&path]);
-            let family = fonts.collection.family_names().next().unwrap().to_string();
-            let id = fonts.collection.family_id(&family).unwrap();
-            fonts
-                .collection
-                .set_fallbacks(fontique::FallbackKey::new(*b"Latn", None), [id].into_iter());
-            fonts.source_cache.make_shared();
-            let mut sources = UsedFontSources::default();
-            let mut layouts = parley::LayoutContext::<()>::new();
-            let mut layout = parley::Layout::<()>::new();
-            let mut identity = None;
-            for _ in 0..120 {
-                fonts.source_cache.prune(0, false);
-                let mut builder =
-                    layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
-                builder.push_default(parley::StyleProperty::FontFamily(
-                    parley::FontFamily::Single(parley::FontFamilyName::Named(
-                        if fallback {
-                            "Nonexistent fixture family"
-                        } else {
-                            &family
-                        }
-                        .into(),
-                    )),
-                ));
-                builder.build_into(&mut layout, "sole label");
-                layout.break_all_lines(None);
-                let id = layout
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .runs()
-                    .next()
-                    .unwrap()
-                    .font()
-                    .data
-                    .id();
-                assert_eq!(
-                    *identity.get_or_insert(id),
-                    id,
-                    "sole layout font atlas identity drifted (fallback={fallback})"
-                );
-                sources.retain_layout(&layout);
-            }
-            assert_eq!(sources.blobs.len(), 1);
+    fn sole_layout_named_identity_survives_pruning() {
+        assert_sole_layout_identity(false);
+    }
+
+    #[test]
+    fn sole_layout_fallback_identity_survives_pruning() {
+        assert_sole_layout_identity(true);
+    }
+
+    fn assert_sole_layout_identity(fallback: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-font.ttf");
+        std::fs::write(&path, bevy::text::DEFAULT_FONT_DATA).unwrap();
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            system_fonts: false,
+            ..Default::default()
+        });
+        fonts.collection.load_fonts_from_paths([&path]);
+        let family = fonts.collection.family_names().next().unwrap().to_string();
+        let id = fonts.collection.family_id(&family).unwrap();
+        fonts
+            .collection
+            .set_fallbacks(fontique::FallbackKey::new(*b"Latn", None), [id].into_iter());
+        fonts.source_cache.make_shared();
+        let mut sources = UsedFontSources::default();
+        let mut layouts = parley::LayoutContext::<()>::new();
+        let mut layout = parley::Layout::<()>::new();
+        let mut identity = None;
+        for _ in 0..120 {
+            fonts.source_cache.prune(0, false);
+            let mut builder = layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
+            builder.push_default(parley::StyleProperty::FontFamily(
+                parley::FontFamily::Single(parley::FontFamilyName::Named(
+                    if fallback {
+                        "Nonexistent fixture family"
+                    } else {
+                        &family
+                    }
+                    .into(),
+                )),
+            ));
+            builder.build_into(&mut layout, "sole label");
+            layout.break_all_lines(None);
+            let id = layout
+                .lines()
+                .next()
+                .unwrap()
+                .runs()
+                .next()
+                .unwrap()
+                .font()
+                .data
+                .id();
+            assert_eq!(
+                *identity.get_or_insert(id),
+                id,
+                "sole layout font atlas identity drifted (fallback={fallback})"
+            );
+            sources.retain_layout(&layout);
         }
+        assert_eq!(sources.blobs.len(), 1);
     }
 
     #[test]
