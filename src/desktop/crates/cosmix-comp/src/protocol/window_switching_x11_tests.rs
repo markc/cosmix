@@ -275,3 +275,43 @@ fn x11_surface_destroy_discards_pending_presentation_feedback() {
     let events = harness.sync();
     assert_eq!(feedback_opcodes(&events, callback), [2], "{events:?}");
 }
+
+/// `close {force}` on an X11 window sends the polite close and refuses the
+/// kill at once (Xwayland is the Wayland client), without waiting out the
+/// timeout and without disconnecting anything.
+#[cfg(feature = "bus")]
+#[test]
+fn x11_forced_close_is_refused_immediately() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let (surface_id, _, _window, object) = associate_normal_window(&mut harness, 907);
+    commit_dmabuf(&mut harness, surface_id, 32, 24);
+    let record = &harness.server.state.surfaces[&object];
+    let (id, generation) = (record.id.0, record.generation);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    let started = std::time::Instant::now();
+    let admission = ingress
+        .request_long(crate::port::LongOp::ForceClose {
+            id,
+            generation,
+            timeout: Duration::from_secs(30),
+        })
+        .expect("admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("service cycle");
+    let reply = runtime
+        .block_on(admission.receive())
+        .expect("reply")
+        .wire_json();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(reply["error"], "still_open", "{reply}");
+    assert_eq!(reply["error_code"], "still_open");
+    assert_eq!(reply["reason"], "x11_kill_unsupported");
+    assert_eq!(reply["polite_close_sent"], true);
+    assert!(harness.server.state.window_waiters.waiters.is_empty());
+    harness.assert_client_connected("the X11 refusal kills nothing");
+}

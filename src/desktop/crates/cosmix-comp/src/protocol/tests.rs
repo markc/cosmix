@@ -27828,19 +27828,32 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
     map_initial_test_toplevel(&mut harness);
     port_observation::service_observations(&mut harness.server.state);
     let mapped = drain_observations(&observations);
-    let (id, foreign_id, mapped_sequence) = mapped
+    let (id, foreign_id, mapped_sequence, mapped_window) = mapped
         .iter()
         .find_map(|record| match record {
             port_observation::ObservationRecord::SurfaceMapped {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
-            } if role == "toplevel" => Some((*id, foreign_id.clone(), *event_seq)),
+            } if role == "toplevel" => {
+                Some((*id, foreign_id.clone(), *event_seq, window.clone()))
+            }
             _ => None,
         })
         .expect("one converged toplevel map edge");
     assert!(foreign_id.is_some());
+    // The map edge names the window without a props read.
+    let record = test_toplevel_record(&harness);
+    assert_eq!(
+        mapped_window,
+        port_observation::SurfaceEdgeWindow {
+            generation: record.generation,
+            app_id: record.app_id.clone(),
+            title: record.title.clone(),
+        }
+    );
 
     send_request(
         &mut harness.client,
@@ -27858,8 +27871,10 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
             id: observed,
             role,
             foreign_id: Some(observed_foreign),
+            window,
             event_seq,
         } if *observed == id
+            && *window == mapped_window
             && role == "toplevel"
             && Some(observed_foreign) == foreign_id.as_ref()
             && *event_seq > mapped_sequence
@@ -41318,4 +41333,16 @@ mod x11 {
         use super::*;
         include!("x11_placement_tests.rs");
     }
+}
+
+#[cfg(feature = "bus")]
+mod injection_tests {
+    use super::*;
+    include!("input_injection_tests.rs");
+}
+
+#[cfg(feature = "bus")]
+mod window_control_tests {
+    use super::*;
+    include!("window_control_tests.rs");
 }

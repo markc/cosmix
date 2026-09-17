@@ -823,7 +823,6 @@ impl WaylandState {
     /// source's update that names `input_seq` does the same. `input_seq`
     /// must increase across all injections: an old or repeated one is
     /// refused (returns false).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn note_injected_input(
         &mut self,
         target: Option<SurfaceId>,

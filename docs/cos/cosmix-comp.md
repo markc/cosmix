@@ -137,7 +137,7 @@ instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid `from`
 with Bus rc 10.
 
-The control plane exposes twelve verbs:
+The control plane exposes these verbs:
 
 - `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
 - `comp.info` returns service/build/backend provenance plus output and surface
@@ -155,8 +155,8 @@ The control plane exposes twelve verbs:
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
 - `comp.props.set {path,value,generation?}` mutates the four corner
-  properties, `windows.s<id>.band`, `windows.s<id>.minimized`, or
-  `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
+  properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
+  `input.host.passthrough`, or `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
   `xwayland.enabled` the reply also carries `persisted` — `false` means the
   in-memory change and the changed event stand but the write to disk failed
   and the value will not survive restart. The optional `generation` fences a
@@ -176,6 +176,13 @@ The control plane exposes twelve verbs:
 - `comp.window.stats {id,generation | source}` and
   `comp.window.stats.reset {id,generation | source | nothing}` read and zero
   presentation statistics (see Presentation statistics below).
+- `comp.window.focus`, `comp.window.raise`, `comp.window.close`,
+  `comp.window.place` and `comp.window.wait` act on or wait for one window
+  (see Window control below). `comp.windows.list` lists window rows.
+- `comp.input.pointer.move`, `comp.input.pointer.button`,
+  `comp.input.pointer.scroll`, `comp.input.key`, `comp.input.release_all` and
+  `comp.input.sequence` inject input through the real seat (see Input
+  injection below).
 
 Minimise and restore reply `{id,generation,title,app_id,minimized,changed}`;
 `changed:false` means the window was already in the requested state.
@@ -223,6 +230,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
@@ -283,6 +291,206 @@ reserved for layer-shell and session-lock roles. Corner activation takes
 priority over client pointer constraints; reactivation waits for physical
 pointer motion out of the corner.
 
+### Window control
+
+Every verb here names its window with `{id, generation}`, refuses a stale or
+missing target as described under Window identity, and replies
+`{"error":"locked"}` while a session lock is active. Each is recorded in the
+frame trace as `comp_window_control` (subject the id; detail 1 minimize,
+2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close).
+
+- `comp.window.focus {id,generation,raise?}` gives the window keyboard focus.
+  With `raise` (the default) it also raises it and re-targets the pointer,
+  exactly like Alt+Tab. The reply is `{id,generation,focused}`. When
+  `focused` is false, `reason` says why: `exclusive_layer` (an exclusive
+  layer surface holds the keyboard), `minimized`, `not_visible`,
+  `not_presentable`, or `refused`.
+- `comp.window.raise {id,generation}` raises the window within its band
+  without focusing it. The reply is `{id,generation,raised}`.
+- `comp.window.close {id,generation}` asks the client to close (xdg `close`,
+  or X11 `WM_DELETE_WINDOW`) and replies `{closed:"polite"}` at once.
+  - With `force:true` (and optional `timeout_ms`, default 3000, at most
+    60000) the reply waits. The deadline runs from when the port admitted
+    the request.
+  - If the window's role ends first (the client destroyed it, or the id now
+    names another role), the reply is `{closed:"gone",waited_ms}`.
+  - A window that is only unmapped is still alive: an app that hides to a
+    tray on close is not gone. If the same `{id,generation}` is still alive
+    at the deadline, mapped or not, comp disconnects its client and replies
+    `{closed:"killed",window:"mapped"|"unmapped",scope:"client",pid,windows,waited_ms}`.
+  - The kill ends the whole client connection, so every window in
+    `windows` goes with it. No kill happens if the caller has stopped
+    waiting, or while a session lock is active (the reply is then `locked`).
+  - An X11 window is never killed this way: its Wayland client is XWayland,
+    and the window manager has no per-client kill. The polite close is sent
+    and the verb replies at once with
+    `{"error":"still_open","reason":"x11_kill_unsupported",polite_close_sent:true}`.
+- `comp.window.place {id,generation,output?,x?,y?,width?,height?}` moves
+  and/or resizes the window, with at least one field given.
+  - `x`/`y` are output-local logical coordinates of the window-geometry
+    origin (`window_x`/`window_y`). `output` is an `outputs` key or output
+    name, and defaults to the window's own output. An absent coordinate
+    keeps the window's offset within its output.
+  - `width`/`height` request a window-geometry size, clamped to the client's
+    minimum and maximum. An absent one keeps the window's current
+    window-geometry size (what the client committed, not what comp last
+    asked for), so a width-only or height-only place re-sends the current
+    size for the other axis in the configure. For an xdg window this is a configure, so the size
+    changes when the client answers: wait with `comp.window.wait
+    {until:"size"}`.
+  - The reply is
+    `{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}`.
+  - A maximised or fullscreen window is refused with
+    `{"error":"invalid_state",maximized,fullscreen}`. An unknown output is
+    `unknown_output`. A place that would leave the window wholly outside
+    every output is refused with `{"error":"off_output",x,y,width,height}`.
+- `comp.window.wait {match,until,width?,height?,timeout_ms?}` replies when a
+  window reaches a state.
+  - `match` is either `{id,generation?}` or
+    `{app_id?,title?,title_contains?}` with at least one field. Name filters
+    are at most 4096 bytes. With `id`, the wait is about that window; an id
+    comp never handed out is refused with `unknown_window`. Without it, the
+    wait is about the lowest-id mapped window whose names match.
+  - `until` is `mapped`, `visible`, `presented` (a frame presented at or
+    after the current mapping began; a late report of an earlier frame does
+    not count), `size` (needs `width` and `height`, compared with the
+    window-geometry size), `focused`, `unmapped` or `gone`. For a match
+    without `id`, `unmapped` and `gone` mean no mapped window matches.
+  - `timeout_ms` defaults to 10000 and is at most 60000, counted from when
+    the port admitted the request.
+  - While a session lock is active a wait learns nothing it could not read
+    from the (redacted) tree: only `gone` and `unmapped` for a named `id` can
+    resolve; everything else waits for the unlock or the deadline, so a
+    name-based wait that spans the whole lock ends with `timeout`.
+  - A condition that already holds is answered at once. Otherwise comp
+    checks after each dispatch cycle and sets one timer for the deadline;
+    nothing polls.
+  - The reply is `{window:<row>|null,until,waited_ms}`. `window` is the
+    `windows.s<id>` row, or null for `unmapped` and `gone`. On the deadline
+    the reply is `{"error":"timeout",until,waited_ms}`.
+  - Waits and forced closes use the same eight-permit pool as
+    `comp.input.sequence`.
+- `comp.windows.list {app_id?,title?,title_contains?,visible?}` returns
+  `{windows:[<row>...]}` in id order, filtered by every given field (text
+  filters at most 4096 bytes). The
+  rows are the `windows.s<id>` rows. Like that tree, the list has no X11
+  windows and is empty while a session lock is active.
+
+Every argument object is checked for unknown fields
+(`{"error":"invalid_args",field,allowed}`).
+
+### Input injection
+
+The `comp.input.*` verbs feed the seat exactly as a device does. Every event
+enters the one seat entry point with user activity on, so these all apply
+unchanged: bindings (an injected `Super+Shift+M` restores a window, and the
+client never sees the M), pointer grabs and constraints, click-to-focus and
+raise, idle notification, and the session lock. Under a session lock,
+injected input reaches only the lock surface.
+
+Event timestamps are CLOCK_MONOTONIC milliseconds, wrapping at 32 bits. That
+is the clock `wp_presentation` reports, so a client can subtract an input
+event time from a presentation time. Real input from the nested host window
+uses the same clock.
+
+| Verb | Arguments |
+| --- | --- |
+| `comp.input.pointer.move` | One of three forms. `{x,y,output?}`: output-local absolute; `output` is an `outputs` key or output name, and defaults to the default output. `{dx,dy}`: relative. `{window:{id,generation},x,y,require_hit?}`: relative to the window-geometry origin. Any form takes `corners?` (default `true`); `false` keeps the move from arming a hot corner. |
+| `comp.input.pointer.button` | `{button?,action?}`. `button`: `left` (default), `right`, `middle`, or an evdev code `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
+| `comp.input.pointer.scroll` | `{dx?,dy?,source?,v120?}`. At least one axis is required; an omitted axis stays absent. Positive `dy` scrolls down. `source`: `wheel` (default), `finger` or `continuous`; a zero on `finger` or `continuous` is an axis stop. `v120:{dx?,dy?}` sets wheel detents; without it, a wheel derives 120 per 15 units. |
+| `comp.input.key` | `{key,action?,modifiers?}`. `key`: an XKB keysym name (`Return`, `a`, `F5`, `Super_L`) or an evdev code. `action`: `press`, `release` or `tap` (default). `modifiers`: any of `shift`, `ctrl`, `alt`, `super`, `altgr`, held around the key. A keysym that needs Shift gets Shift added. **Or** `{text}`, at most 256 characters. |
+| `comp.input.release_all` | `{}` |
+| `comp.input.sequence` | `{steps:[{verb,args?,delay_ms?}],interval_ms?}` |
+
+Each single verb replies:
+
+```text
+{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null}
+```
+
+- `input_seq` increases by one per verb.
+- `injected_at_us` is CLOCK_MONOTONIC microseconds.
+- `pointer` is the cursor after the verb, in output-local coordinates.
+- `target` is the root surface the seat now delivers to: pointer focus for
+  pointer verbs, keyboard focus for key verbs. It can be a layer or lock
+  surface, not only a window.
+
+`text` maps each character through the live seat keymap, honouring Caps Lock
+and the active layout. Only characters on the first two shift levels map; each
+is typed as press and release, with Shift where needed. A newline types
+Return. Characters that need AltGr (the third and fourth levels), a dead
+key or a compose sequence are refused as unmappable. If any character cannot
+be typed, nothing is sent and the reply is
+`{"error":"unmappable","char","index"}`. While an input method holds the
+keyboard, `text` is refused with `{"error":"ime_active"}`, because the IME
+would turn the keys into something other than the text sent. Some input
+methods hold that grab whenever a text field has focus; with one of those,
+every `text` call is refused, so type with `comp.input.key` instead. An unknown key
+name replies `{"error":"unknown_key","key"}`.
+
+An absolute or window-relative move is real pointer motion, so moving into an
+output corner arms the hot corner exactly as a mouse would; pass
+`corners:false` to move without arming one. Such a move still leaves an
+engaged corner and cancels a pending dwell.
+
+One verb injects at most 4096 seat events (a whole sequence included; a text
+character counts four, a key with modifiers two per key). A larger request is
+refused before anything is sent with `invalid_value` naming the limit.
+
+Every refusal is decided before anything is sent:
+- `stale_target`, or another window-target error, for the `window` form;
+- `occluded` when `require_hit` is true and the point is not on that window or
+  its frame. `under` names the window actually at that point, or is null;
+- `off_output` when `require_hit` is true and no output shows the point;
+- `unknown_output`;
+- `out_of_bounds`, with the output size, for a point outside the output.
+
+The verbs are not refused while the session is locked; the seat decides where
+the input goes.
+
+`release_all` releases the keys and buttons that injection pressed and has not
+released. It never releases anything a physical device holds. Taps and clicks
+never leave a key or button down; only `action: press` holds one.
+
+`comp.input.sequence` runs up to 256 steps in order:
+- Each step is one of the single input verbs above, with its usual arguments.
+- `delay_ms` is a wait before that step, on a compositor timer. It defaults to
+  `interval_ms`, which defaults to 0. The delays together may total at most 60
+  seconds.
+- A drag is a `press`, some moves, and a `release`.
+- The reply is `{steps:[<each step's reply>],elapsed_ms}`.
+- A run yields to the event loop after every 256 injected events, so a long
+  zero-delay stretch cannot fill a client's socket in one pass. A run is
+  therefore not atomic even without delays: other runs and single verbs can
+  interleave at those yields (and at every delay).
+- If a step is refused, the run stops and gives up the keys and buttons it
+  pressed. A hold is released only when no other owner (another run, or a
+  single verb that pressed the same key) still holds it; an explicit release
+  by anyone lets the key go for every owner.
+  The reply is rc 10
+  `{"error":"step_failed",index,verb,step:<the refusal>,completed:[...],released:true}`.
+- If the caller stops waiting, the run also stops and releases its own holds.
+
+Sequences use their own pool of eight permits. Each waits for its own delays
+plus one second, not the two-second budget of other verbs. When all eight
+permits are in use, a new sequence gets `busy`.
+
+`input.host.passthrough` exists only on the nested backend; on KMS the path is
+`unknown_path`. Setting it to `false` stops the host window's pointer motion,
+buttons, scroll and keys reaching the seat, so the host cursor cannot
+overwrite an injected position. Output resize and scale, pointer leave and
+touch still pass. A host key or button pressed before the switch still gets
+its release. A host focus loss releases only those host keys, never an
+injected hold, and still resets compositor chrome state (a title-bar drag,
+hover, cursor override). The value persists until it is set back to `true`
+or the compositor exits; a script that turns it off should turn it on again.
+
+The frame trace records each injected verb as `comp_input_injected`:
+- subject: `input_seq`;
+- detail: the verb kind (1 move, 2 button, 3 scroll, 4 key, 5 text,
+  6 release_all);
+- aux: the target id, or 0.
+
 The compositor publishes non-retained messages under the registered service
 namespace. The seat instance therefore uses `comp.*`, the default nested
 instance uses `comp-nested.*`, and `--bus-service NAME` moves the complete
@@ -292,14 +500,29 @@ below, so handlers do not depend on the instance name.
 | Topic | Inner command | Exact body |
 | --- | --- | --- |
 | `<service>.props.changed` | `props.changed` | `{path,old,new,ts,cause,event_seq}` |
-| `<service>.surface.mapped` | `surface.mapped` | `{id,role,foreign_id?,event_seq}` |
-| `<service>.surface.unmapped` | `surface.unmapped` | `{id,role,foreign_id?,event_seq}` |
+| `<service>.surface.mapped` | `surface.mapped` | `{id,role,generation,app_id,title,foreign_id?,event_seq}` |
+| `<service>.surface.unmapped` | `surface.unmapped` | `{id,role,generation,app_id,title,foreign_id?,event_seq}` |
 | `<service>.focus.changed` | `focus.changed` | `{keyboard,previous,exclusive_latch,event_seq}` |
 | `<service>.output.changed` | `output.changed` | `{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}` |
 | `<service>.corner.entered` | `corner.entered` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.left` | `corner.left` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.clicked` | `corner.clicked` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.pointer.changed` | `pointer.changed` | `{version:1,instance,output,position,valid,timestamp_ms,event_seq}` |
+
+Map edges carry the surface's role `generation` and its `app_id` and `title`
+(null when the client set none, and null while a session lock is active). A
+map edge reports the values at the end of the cycle; an unmap edge reports the
+values from before the unmap. A window unmapped and mapped again under a new
+role within one cycle emits both edges (unmap with the old generation, then
+map with the new one). An XWayland window whose buffer arrived before
+its map request now emits its map edge too.
+
+For a stream of window changes (moves, resizes, state, focus), hold a
+`comp.props.watch` and read the `windows.s<id>.*` `props.changed` frames, plus
+`focus.changed`. There is no separate window topic. To wait for one
+condition, use `comp.window.wait` rather than subscribing and hoping: the
+topics are not retained, so an edge that happened before the subscription is
+never delivered.
 
 `corner.clicked` observes a left-button press while a corner is engaged, carrying
 the same engagement dwell as entered/left. It does not consume the button event;
@@ -477,7 +700,8 @@ ranges are:
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
 The mutable leaves are the four corner leaves, `windows.s<id>.band`,
-`windows.s<id>.minimized` and `xwayland.enabled`. The corner and window
+`windows.s<id>.minimized`, `input.host.passthrough` (nested only) and
+`xwayland.enabled`. The corner and window
 descriptors say `mutable:true` and
 `persistence:"none"` (numeric leaves also carry the range above) and those
 values live for the compositor process only. `xwayland.enabled` is the one
@@ -506,7 +730,10 @@ tree stays redacted with `focus.session_lock="unlocking"` until the
 compositor's own presentation predicate lifts, at the same moment the renderer
 resumes. Unlock then restores the ordinary projection.
 
-All application errors use Bus rc 10. In addition to the write errors above,
+All application errors use Bus rc 10. Every refusal body carries
+`error_code` with the same value as `error` (`error` is kept as an alias for
+0.58.x), so a Mix `send` receives the whole object: `$result.error_code`,
+`$result.under` and so on. In addition to the write errors above,
 read/dispatch errors include `unknown_path`, `busy` and `unknown_verb`, plus
 `{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}` when a
 serialised reply would exceed the effective broker-path ceiling. `N` is
@@ -553,8 +780,8 @@ multiplication.
 
 Absent by design after P-1:
 
-- `comp.surface.*` control verbs, because focus/raise/close operations arrive in P-2 and
-  move/resize in P-3;
+- `comp.surface.*` control verbs: focus, raise, close, move and resize are
+  `comp.window.*` verbs on managed windows only;
 - render timings, because they are metrics rather than properties; and
 - a Bus screenshot verb, because it is a later control-plane slice; Arc 4's
   capture service is available through the Wayland protocol described below.

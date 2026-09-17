@@ -861,6 +861,11 @@ pub(crate) enum HostInput {
         time: u32,
     },
     KeyboardFocusLost,
+    /// The focus-loss reset without the key release: the nested host
+    /// window lost focus while `input.host.passthrough` is off, so held keys
+    /// belong to injection and stay down (host-held ones are released
+    /// individually first).
+    KeyboardFocusLostKeepingKeys,
     /// A device reporting a touch capability was attached.
     ///
     /// Unlike the keyboard and the pointer, the touch capability is *not*
@@ -3237,6 +3242,10 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             #[cfg(feature = "bus")]
+            injection: input_injection::InjectionState::default(),
+            #[cfg(feature = "bus")]
+            window_waiters: window_control::WindowWaiters::default(),
+            #[cfg(feature = "bus")]
             observations: port_observation::ObservationState::new(
                 observation_producer,
                 observation_event_seq,
@@ -3397,6 +3406,16 @@ impl ProtocolServer {
                             state
                                 .pending_port_controls
                                 .push(PortControl::Window(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Input(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Input(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Long(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Long(request));
                         }
                     }
                     ChannelEvent::Msg(PortCommand::WatchState { active, order }) => {
@@ -6050,6 +6069,12 @@ struct WaylandState {
     pending_port_requests: Vec<PortRequest>,
     #[cfg(feature = "bus")]
     pending_port_controls: Vec<PortControl>,
+    /// Bus-injected input: held keys/buttons, sequences, host passthrough.
+    #[cfg(feature = "bus")]
+    injection: input_injection::InjectionState,
+    /// `comp.window.wait` / `close {force}` waiters.
+    #[cfg(feature = "bus")]
+    window_waiters: window_control::WindowWaiters,
     #[cfg(feature = "bus")]
     observations: port_observation::ObservationState,
     events: Vec<ProtocolEvent>,
@@ -8501,6 +8526,8 @@ impl WaylandState {
     }
 
     fn handle_frame(&mut self, inputs: Vec<HostInput>) {
+        #[cfg(feature = "bus")]
+        let inputs = self.filter_host_passthrough(inputs);
         for input in inputs {
             self.handle_host_input(input);
         }
@@ -8678,6 +8705,11 @@ impl WaylandState {
                 self.update_chrome_hover(None);
                 self.set_chrome_cursor_override(None);
                 self.release_pressed_keys();
+            }
+            HostInput::KeyboardFocusLostKeepingKeys => {
+                self.cancel_chrome_pointer_grab(true);
+                self.update_chrome_hover(None);
+                self.set_chrome_cursor_override(None);
             }
             HostInput::TouchDeviceAdded => self.add_touch_device(),
             HostInput::TouchDeviceRemoved => self.remove_touch_device(),
@@ -11334,11 +11366,17 @@ impl WaylandState {
         let clamped = clamp_point_to_seat((x, y), &self.backend.seat_regions());
         let (x, y) = clamped.position;
         #[cfg(feature = "bus")]
-        self.sample_corner_motion(
-            clamped.position,
-            clamped.region_index,
-            clamped.attempted_motion,
-        );
+        if self.injection.suppress_corners {
+            // `corners: false` suppresses arming only: an engaged or
+            // dwelling corner is still left (and its dwell timer dropped).
+            self.reset_corner_detector();
+        } else {
+            self.sample_corner_motion(
+                clamped.position,
+                clamped.region_index,
+                clamped.attempted_motion,
+            );
+        }
         {
             let mut snapshot = self
                 .cursor_position_snapshot
@@ -13940,53 +13978,15 @@ impl WaylandState {
                 start_pointer,
                 start_origin,
             } => {
-                let Some(record) = self.surfaces.get_mut(&surface.id()) else {
-                    self.interactive_pointer = None;
-                    return false;
-                };
-                let old_origin = record.window_origin;
-                record.window_origin = (
+                let origin = (
                     start_origin.0 + (x - start_pointer.0) as f32,
                     start_origin.1 + (y - start_pointer.1) as f32,
                 );
-                let offset = record
-                    .committed_window_geometry
-                    .map(|geometry| (geometry.x, geometry.y))
-                    .unwrap_or_default();
-                record.layout.x = record.window_origin.0 - offset.0;
-                record.layout.y = record.window_origin.1 - offset.1;
-                let delta = (
-                    record.window_origin.0 - old_origin.0,
-                    record.window_origin.1 - old_origin.1,
-                );
-                let id = record.id;
-                let scene = record.scene_snapshot();
-                // An X11 window must learn its new position through an X
-                // configure (there is no xdg configure for it), or the client
-                // keeps stale global coordinates.
-                #[cfg(feature = "xwayland")]
-                if delta != (0.0, 0.0)
-                    && let SurfaceRole::X11(role) = &mut record.role
-                {
-                    let rect = Rectangle::new(
-                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
-                        (
-                            record.configured_size.0.max(1),
-                            record.configured_size.1.max(1),
-                        )
-                            .into(),
-                    );
-                    role.granted_geometry = rect;
-                    if let Err(error) = role.surface.configure(Some(rect)) {
-                        tracing::debug!(%error, "failed to send X11 move configure");
-                    }
-                }
-                self.events
-                    .push(ProtocolEvent::SurfaceRelayout { id, scene });
-                #[cfg(feature = "bus")]
-                self.mark_surface_dirty(id, "wayland.map");
-                self.shift_surface_descendants(id, delta);
-                delta != (0.0, 0.0)
+                self.move_window_to(&surface, origin, "wayland.map")
+                    .unwrap_or_else(|| {
+                        self.interactive_pointer = None;
+                        false
+                    })
             }
             InteractivePointer::Resize {
                 surface,
@@ -14035,31 +14035,14 @@ impl WaylandState {
                 } else {
                     0
                 };
-                let (min_size, max_size) =
-                    clamped_toplevel_constraints(self.managed_size_constraints(&surface));
-                let min_width = min_size.0;
-                let min_height = min_size.1;
-                let max_width = max_size.0;
-                let max_height = max_size.1;
-                let new_size = (
-                    start_size
-                        .0
-                        .saturating_add(width_delta)
-                        .clamp(min_width, max_width),
-                    start_size
-                        .1
-                        .saturating_add(height_delta)
-                        .clamp(min_height, max_height),
+                let new_size = self.clamp_window_size(
+                    &surface,
+                    (
+                        start_size.0.saturating_add(width_delta),
+                        start_size.1.saturating_add(height_delta),
+                    ),
                 );
-                let Some(record) = self.surfaces.get_mut(&surface.id()) else {
-                    self.interactive_pointer = None;
-                    return false;
-                };
-                if new_size == record.configured_size {
-                    return false;
-                }
-                let old_origin = record.window_origin;
-                record.window_origin = (
+                let origin = (
                     if left {
                         start_origin.0 + (start_size.0 - new_size.0) as f32
                     } else {
@@ -14071,45 +14054,131 @@ impl WaylandState {
                         start_origin.1
                     },
                 );
-                let offset = record
-                    .committed_window_geometry
-                    .map(|geometry| (geometry.x, geometry.y))
-                    .unwrap_or_default();
-                record.layout.x = record.window_origin.0 - offset.0;
-                record.layout.y = record.window_origin.1 - offset.1;
-                record.configured_size = new_size;
-                let toplevel = record.role.toplevel().cloned();
-                let id = record.id;
-                let scene = record.scene_snapshot();
-                let delta = (
-                    record.window_origin.0 - old_origin.0,
-                    record.window_origin.1 - old_origin.1,
-                );
-                // X11 interactive resize is granted through X configures; the
-                // committed buffer remains the presentation authority.
-                #[cfg(feature = "xwayland")]
-                if let SurfaceRole::X11(role) = &mut record.role {
-                    let rect = Rectangle::new(
-                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
-                        (new_size.0.max(1), new_size.1.max(1)).into(),
-                    );
-                    role.granted_geometry = rect;
-                    if let Err(error) = role.surface.configure(Some(rect)) {
-                        tracing::debug!(%error, "failed to send X11 resize configure");
-                    }
-                }
-                if let Some(toplevel) = toplevel {
-                    set_toplevel_configuration(&toplevel, new_size);
-                    let _ = self.send_pending_toplevel_configure(&surface, true);
-                }
-                self.events
-                    .push(ProtocolEvent::SurfaceRelayout { id, scene });
-                #[cfg(feature = "bus")]
-                self.mark_surface_dirty(id, "wayland.map");
-                self.shift_surface_descendants(id, delta);
-                true
+                self.resize_window_to(&surface, origin, new_size, "wayland.map")
+                    .unwrap_or_else(|| {
+                        self.interactive_pointer = None;
+                        false
+                    })
             }
         }
+    }
+
+    /// A window size inside the client's (clamped) min/max constraints.
+    fn clamp_window_size(&self, surface: &WlSurface, size: (i32, i32)) -> (i32, i32) {
+        let (min_size, max_size) =
+            clamped_toplevel_constraints(self.managed_size_constraints(surface));
+        (
+            size.0.clamp(min_size.0, max_size.0),
+            size.1.clamp(min_size.1, max_size.1),
+        )
+    }
+
+    /// Put a window's geometry origin at `origin` (global logical), moving
+    /// its descendants with it; an X11 window hears it through a configure.
+    /// `None` when the surface has no record; otherwise whether it moved.
+    fn move_window_to(
+        &mut self,
+        surface: &WlSurface,
+        origin: (f32, f32),
+        #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
+    ) -> Option<bool> {
+        let record = self.surfaces.get_mut(&surface.id())?;
+        let old_origin = record.window_origin;
+        record.window_origin = origin;
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        record.layout.x = record.window_origin.0 - offset.0;
+        record.layout.y = record.window_origin.1 - offset.1;
+        let delta = (
+            record.window_origin.0 - old_origin.0,
+            record.window_origin.1 - old_origin.1,
+        );
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        // An X11 window must learn its new position through an X
+        // configure (there is no xdg configure for it), or the client
+        // keeps stale global coordinates.
+        #[cfg(feature = "xwayland")]
+        if delta != (0.0, 0.0)
+            && let SurfaceRole::X11(role) = &mut record.role
+        {
+            let rect = Rectangle::new(
+                (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
+                (
+                    record.configured_size.0.max(1),
+                    record.configured_size.1.max(1),
+                )
+                    .into(),
+            );
+            role.granted_geometry = rect;
+            if let Err(error) = role.surface.configure(Some(rect)) {
+                tracing::debug!(%error, "failed to send X11 move configure");
+            }
+        }
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, cause);
+        self.shift_surface_descendants(id, delta);
+        Some(delta != (0.0, 0.0))
+    }
+
+    /// Ask a window for `size` (already clamped) with its geometry origin at
+    /// `origin`. xdg windows get a configure and answer asynchronously; X11
+    /// windows get an X configure. `None` when the surface has no record;
+    /// `Some(false)`, changing nothing, when `size` is already configured.
+    fn resize_window_to(
+        &mut self,
+        surface: &WlSurface,
+        origin: (f32, f32),
+        size: (i32, i32),
+        #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
+    ) -> Option<bool> {
+        let record = self.surfaces.get_mut(&surface.id())?;
+        if size == record.configured_size {
+            return Some(false);
+        }
+        let old_origin = record.window_origin;
+        record.window_origin = origin;
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        record.layout.x = record.window_origin.0 - offset.0;
+        record.layout.y = record.window_origin.1 - offset.1;
+        record.configured_size = size;
+        let toplevel = record.role.toplevel().cloned();
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        let delta = (
+            record.window_origin.0 - old_origin.0,
+            record.window_origin.1 - old_origin.1,
+        );
+        // X11 resize is granted through X configures; the committed buffer
+        // remains the presentation authority.
+        #[cfg(feature = "xwayland")]
+        if let SurfaceRole::X11(role) = &mut record.role {
+            let rect = Rectangle::new(
+                (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
+                (size.0.max(1), size.1.max(1)).into(),
+            );
+            role.granted_geometry = rect;
+            if let Err(error) = role.surface.configure(Some(rect)) {
+                tracing::debug!(%error, "failed to send X11 resize configure");
+            }
+        }
+        if let Some(toplevel) = toplevel {
+            set_toplevel_configuration(&toplevel, size);
+            let _ = self.send_pending_toplevel_configure(surface, true);
+        }
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, cause);
+        self.shift_surface_descendants(id, delta);
+        Some(true)
     }
 
     fn shift_surface_descendants(&mut self, parent: SurfaceId, delta: (f32, f32)) {
@@ -15608,6 +15677,8 @@ pub(crate) mod presentation;
 pub(crate) mod presentation_stats;
 mod release_use;
 #[cfg(feature = "bus")]
+mod input_injection;
+#[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;
 #[cfg(feature = "xwayland")]
@@ -15837,10 +15908,28 @@ fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> ClampRes
     }
 }
 
+/// Event time in milliseconds on CLOCK_MONOTONIC, wrapping at `u32`.
+///
+/// The Wayland base is unspecified, but CLOCK_MONOTONIC is the clock
+/// `wp_presentation` reports, so a client can subtract an input event time
+/// from a presentation time without a second clock.
 pub(crate) fn monotonic_millis() -> u32 {
-    // Wayland timestamps have an unspecified monotonic base and wrap naturally.
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u32
+    (monotonic_micros() / 1_000) as u32
+}
+
+/// CLOCK_MONOTONIC in microseconds.
+pub(crate) fn monotonic_micros() -> u64 {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value points to a valid, writable timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return 0;
+    }
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(value.tv_nsec as u64 / 1_000)
 }
 
 fn root_compositor_surface(surface: &WlSurface) -> WlSurface {
