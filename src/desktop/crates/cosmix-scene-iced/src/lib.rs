@@ -23,7 +23,7 @@ use cosmix_scene_bevy::{SceneReconcile, SceneStore};
 use cosmix_shell::runtime::ShellRuntimeSet;
 
 pub use bridge::{
-    FrameCounters, IcedSurface, IcedSurfaceGeometry, ImeOutput, SceneIcedCounters,
+    FrameCounters, IcedSurface, IcedSurfaceGeometry, ImeOutput, RendererFactory, SceneIcedCounters,
     SceneIcedFactory, SceneIcedFocus, SceneIcedStats, SceneIcedWake,
 };
 

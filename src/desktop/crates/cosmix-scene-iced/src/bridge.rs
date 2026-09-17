@@ -59,7 +59,9 @@ pub(crate) struct SurfaceState {
 }
 
 /// Builds the renderer for a newly mounted scene.
-pub struct SceneIcedFactory(pub Box<dyn Fn(&ResolvedScene) -> Box<dyn SurfaceRenderer>>);
+pub struct SceneIcedFactory(pub RendererFactory);
+
+pub type RendererFactory = Box<dyn Fn(&ResolvedScene) -> Box<dyn SurfaceRenderer>>;
 
 impl Default for SceneIcedFactory {
     fn default() -> Self {
