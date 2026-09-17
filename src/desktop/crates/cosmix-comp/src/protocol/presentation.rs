@@ -881,8 +881,12 @@ impl WaylandState {
         else {
             tracing::debug!(
                 connector = key.connector_name,
-                "KMS flip on an output with no client output; not reported"
+                "KMS flip on an output with no client output; no surface is presented on it"
             );
+            // The flip happened and the renderer already handed over this
+            // frame's content-source costs, so account for them; only
+            // surface feedback needs an output to name.
+            self.content_sources_presented(&frame, &content);
             return;
         };
         self.frame_presented(
@@ -992,6 +996,21 @@ impl WaylandState {
                 refresh_us,
             );
         }
+        self.content_sources_presented(&frame, &content);
+    }
+
+    /// Fold this frame's in-process content sources into their ledger. They
+    /// name no output, so this is the same work whether or not the frame
+    /// could be presented to clients.
+    fn content_sources_presented(&mut self, frame: &PresentedFrame, content: &FrameContent) {
+        if content.sources.is_empty() {
+            return;
+        }
+        let time_us = u64::try_from(frame.time.as_micros()).unwrap_or(u64::MAX);
+        let refresh_us = match frame.refresh {
+            Refresh::Fixed(refresh) => u64::try_from(refresh.as_micros()).ok(),
+            Refresh::Unknown | Refresh::Variable(_) => None,
+        };
         let PresentationRuntime { sources, stats, .. } = &mut self.presentation;
         for source in &content.sources {
             sources.resolve(source, time_us, refresh_us, |input_seq, at_us| {

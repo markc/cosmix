@@ -191,18 +191,21 @@ fn flip_time_on_monotonic(
     (placed.unwrap_or(monotonic_now), false)
 }
 
-fn clock_now(clock: libc::clockid_t) -> Duration {
+/// `None` when the clock cannot be read: a zero reading would look like a
+/// stamp seconds in the future and demote a healthy clock.
+fn clock_now(clock: libc::clockid_t) -> Option<Duration> {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // Both clocks always exist on Linux; a failure leaves zero, which the
-    // placement treats as "cannot place".
-    unsafe { libc::clock_gettime(clock, &mut now) };
-    Duration::new(
-        u64::try_from(now.tv_sec).unwrap_or(0),
-        u32::try_from(now.tv_nsec).unwrap_or(0),
-    )
+    // SAFETY: `now` is valid writable storage for one timespec.
+    if unsafe { libc::clock_gettime(clock, &mut now) } != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(now.tv_sec).ok()?,
+        u32::try_from(now.tv_nsec).ok()?,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +336,11 @@ pub(crate) trait AtomicIo: Send + 'static {
         absolute_deadline: Instant,
     ) -> Result<AtomicWaitReady, String>;
     fn decode_pageflips(&mut self, crtc_id: u32) -> Result<Vec<AtomicPageFlip>, String>;
+    /// Whether the CRTC counts vblanks. Only a live DRM device can answer;
+    /// everything else leaves the question open.
+    fn vblank_support(&mut self, _crtc_id: u32) -> VblankSupport {
+        VblankSupport::Unknown
+    }
 }
 
 /// Generation-aware cancellation publication plus the non-blocking eventfd
@@ -493,6 +501,9 @@ pub(crate) struct AtomicPresenter<I: AtomicIo> {
     skewed_flips: u32,
     skew_warned: bool,
     vblank: VblankSupport,
+    vblank_reprobed: bool,
+    /// Consecutive zero sequences while support is unknown; a non-zero one
+    /// clears it, so this never latches.
     zero_sequences: u32,
     pub(crate) cursor: cursor::HardwareCursorBridge,
 }
@@ -523,6 +534,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             skew_warned: false,
             // Likewise for vblank support, probed by the production constructor.
             vblank: VblankSupport::Supported,
+            vblank_reprobed: false,
             zero_sequences: 0,
             cursor: cursor::HardwareCursorBridge::default(),
         }
@@ -631,8 +643,24 @@ impl<I: AtomicIo> AtomicPresenter<I> {
     }
 
     fn place_flip(&mut self, stamp: Duration, sequence: u32) -> DisplayedFlip {
-        let realtime_now = clock_now(libc::CLOCK_REALTIME);
-        let monotonic_now = clock_now(libc::CLOCK_MONOTONIC);
+        let vblank = self.classify_sequence(sequence);
+        let (Some(realtime_now), Some(monotonic_now)) =
+            (clock_now(libc::CLOCK_REALTIME), clock_now(libc::CLOCK_MONOTONIC))
+        else {
+            // No clock to place the stamp against: report what the kernel
+            // said and judge nothing, rather than inventing a skew.
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                "CLOCK_MONOTONIC/CLOCK_REALTIME unreadable; the flip stamp is reported unplaced"
+            );
+            return DisplayedFlip {
+                seconds: stamp.as_secs(),
+                nanoseconds: stamp.subsec_nanos(),
+                sequence,
+                hw_clock: self.flip_clock == PageFlipClock::Monotonic,
+                vblank,
+            };
+        };
         // Without a mode period, the longest frame the render path paces.
         let period = self
             .refresh_nanos()
@@ -646,7 +674,6 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                 self.note_skewed_flip(stamp.saturating_sub(monotonic_now));
             }
         }
-        let vblank = self.note_sequence(sequence);
         DisplayedFlip {
             seconds: time.as_secs(),
             nanoseconds: time.subsec_nanos(),
@@ -654,6 +681,26 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             hw_clock,
             vblank,
         }
+    }
+
+    /// Whether this flip's sequence counts vblanks. The constructor's probe
+    /// runs before the first modeset, where a disabled CRTC answers EINVAL,
+    /// so an inconclusive probe is retried once the first flip proves the
+    /// CRTC active.
+    fn classify_sequence(&mut self, sequence: u32) -> bool {
+        if self.vblank == VblankSupport::Unknown && !self.vblank_reprobed {
+            self.vblank_reprobed = true;
+            let probed = self.io.vblank_support(self.selection.crtc_id);
+            if probed != VblankSupport::Unknown {
+                tracing::info!(
+                    crtc = self.selection.crtc_id,
+                    ?probed,
+                    "CRTC vblank support re-probed once it was active"
+                );
+                self.vblank = probed;
+            }
+        }
+        self.note_sequence(sequence)
     }
 
     /// One MONOTONIC stamp too far ahead is reported at read time; a gross
@@ -682,22 +729,32 @@ impl<I: AtomicIo> AtomicPresenter<I> {
     /// Whether this flip's sequence counts vblanks. A CRTC the probe could
     /// not classify proves a counter with a non-zero sequence, and proves
     /// the lack of one with a run of zeros; a zero is never trusted.
+    /// Only `EOPNOTSUPP` (`VblankSupport::Unsupported`) settles the question
+    /// for good. While it is unknown, a run of zero sequences is reported as
+    /// no counter — i915 resets the pipe counter across a modeset, so early
+    /// zeros are expected — but a later non-zero sequence proves one and
+    /// takes over.
     fn note_sequence(&mut self, sequence: u32) -> bool {
         match self.vblank {
             VblankSupport::Supported => true,
             VblankSupport::Unsupported => false,
             VblankSupport::Unknown if sequence != 0 => {
+                tracing::info!(
+                    crtc = self.selection.crtc_id,
+                    sequence,
+                    "CRTC counts vblanks (a non-zero sequence)"
+                );
+                self.zero_sequences = 0;
                 self.vblank = VblankSupport::Supported;
                 true
             }
             VblankSupport::Unknown => {
                 self.zero_sequences = self.zero_sequences.saturating_add(1);
-                if self.zero_sequences >= ZERO_SEQUENCES_BEFORE_NO_VBLANK {
+                if self.zero_sequences == ZERO_SEQUENCES_BEFORE_NO_VBLANK {
                     tracing::warn!(
                         crtc = self.selection.crtc_id,
-                        "CRTC reports no vblank counter; presentation claims neither VSYNC nor HW_CLOCK"
+                        "CRTC has reported no vblank counter so far; presentation claims neither VSYNC nor HW_CLOCK until one appears"
                     );
-                    self.vblank = VblankSupport::Unsupported;
                 }
                 false
             }
@@ -1371,7 +1428,7 @@ impl AtomicPresenter<ProductionAtomicIo> {
             cancellation,
         );
         presenter.set_flip_clock(flip_clock);
-        let vblank = presenter.io.vblank_support(selection.crtc_id);
+        let vblank = presenter.io.probe_vblank_support(selection.crtc_id);
         if vblank != VblankSupport::Supported {
             tracing::info!(?vblank, crtc = selection.crtc_id, "CRTC vblank support");
         }
@@ -1671,7 +1728,7 @@ impl ProductionAtomicIo {
 
     /// `DRM_IOCTL_CRTC_GET_SEQUENCE`: EOPNOTSUPP means the device has no
     /// vblank support; other errors (a CRTC not yet enabled) decide nothing.
-    pub(crate) fn vblank_support(&self, crtc_id: u32) -> VblankSupport {
+    fn probe_vblank_support(&self, crtc_id: u32) -> VblankSupport {
         let mut request = DrmCrtcGetSequence {
             crtc_id,
             active: 0,
@@ -1958,6 +2015,10 @@ fn decode_raw_pageflips(
 }
 
 impl AtomicIo for ProductionAtomicIo {
+    fn vblank_support(&mut self, crtc_id: u32) -> VblankSupport {
+        self.probe_vblank_support(crtc_id)
+    }
+
     fn add_framebuffer(
         &mut self,
         _slot: ScanoutSlotId,
@@ -2108,6 +2169,7 @@ mod tests {
         cancel_on_decode: Option<(Arc<AtomicCancellation>, CancelScope)>,
         remove_results: VecDeque<Result<(), String>>,
         removed_framebuffers: Vec<u32>,
+        vblank_probes: VecDeque<VblankSupport>,
     }
 
     #[test]
@@ -2258,6 +2320,12 @@ mod tests {
                 cancellation.cancel(scope);
             }
             Ok(self.waits.pop_front().unwrap_or(AtomicWaitReady::Deadline))
+        }
+
+        fn vblank_support(&mut self, _crtc_id: u32) -> VblankSupport {
+            self.vblank_probes
+                .pop_front()
+                .unwrap_or(VblankSupport::Unknown)
         }
 
         fn decode_pageflips(&mut self, _crtc_id: u32) -> Result<Vec<AtomicPageFlip>, String> {
@@ -2470,8 +2538,8 @@ mod tests {
     fn a_realtime_flip_clock_is_converted_and_never_claims_hw_clock() {
         let mut presenter = presenter(FakeAtomicIo::default());
         presenter.set_flip_clock(PageFlipClock::Realtime);
-        let realtime = clock_now(libc::CLOCK_REALTIME);
-        let before = clock_now(libc::CLOCK_MONOTONIC);
+        let realtime = clock_now(libc::CLOCK_REALTIME).expect("the test host has a readable clock");
+        let before = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock");
         let flip = present_one_flip(
             &mut presenter,
             7,
@@ -2480,7 +2548,7 @@ mod tests {
             9,
         )
         .expect("displayed");
-        let after = clock_now(libc::CLOCK_MONOTONIC);
+        let after = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock");
         let time = Duration::new(flip.seconds, flip.nanoseconds);
         assert!(!flip.hw_clock);
         assert_eq!(flip.sequence, 9);
@@ -2533,7 +2601,7 @@ mod tests {
         // vblank helpers stamp the start of scanout, which the event can
         // precede by a blanking interval: ~1 ms ahead is the kernel's answer.
         for sequence in 1..=5 {
-            let stamp = clock_now(libc::CLOCK_MONOTONIC) + Duration::from_millis(1);
+            let stamp = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_millis(1);
             let flip = present_flip_at(&mut presenter, stamp, sequence);
             assert!(flip.hw_clock, "flip {sequence}");
             assert_eq!(
@@ -2547,23 +2615,23 @@ mod tests {
     #[test]
     fn a_gross_monotonic_skew_demotes_the_clock() {
         let mut presenter = presenter(FakeAtomicIo::default());
-        let ahead = clock_now(libc::CLOCK_MONOTONIC) + Duration::from_secs(5);
+        let ahead = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_secs(5);
         let flip = present_flip_at(&mut presenter, ahead, 1);
         assert!(!flip.hw_clock);
         assert!(stamp_of(flip) < ahead, "reported at read time");
         assert_eq!(presenter.flip_clock, PageFlipClock::Unknown);
-        let later = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC), 2);
+        let later = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"), 2);
         assert!(!later.hw_clock, "no longer trusted");
     }
 
     #[test]
     fn one_modest_skew_is_forgiven_but_a_run_demotes() {
         // 100 ms is beyond the 16.7 ms period but not gross.
-        let modest = || clock_now(libc::CLOCK_MONOTONIC) + Duration::from_millis(100);
+        let modest = || clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_millis(100);
         let mut presenter = presenter(FakeAtomicIo::default());
         assert!(!present_flip_at(&mut presenter, modest(), 1).hw_clock);
         assert_eq!(presenter.flip_clock, PageFlipClock::Monotonic);
-        let good = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC), 2);
+        let good = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"), 2);
         assert!(good.hw_clock, "a plausible stamp after one skew is trusted");
         for sequence in 3..=5 {
             assert!(!present_flip_at(&mut presenter, modest(), sequence).hw_clock);
@@ -2573,18 +2641,21 @@ mod tests {
 
     #[test]
     fn vblank_support_decides_the_counter() {
-        let now = || clock_now(libc::CLOCK_MONOTONIC);
+        let now = || clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock");
         let mut probed_absent = presenter(FakeAtomicIo::default());
         probed_absent.set_vblank_support(VblankSupport::Unsupported);
         assert!(!present_flip_at(&mut probed_absent, now(), 7).vblank);
 
-        // Unknown: zeros are never trusted, a run of them means no counter.
+        // Unknown: zeros are reported as no counter, but nothing latches —
+        // i915 resets the pipe counter on a modeset, so a later non-zero
+        // sequence proves the counter after all.
         let mut unknown = presenter(FakeAtomicIo::default());
         unknown.set_vblank_support(VblankSupport::Unknown);
         assert!(!present_flip_at(&mut unknown, now(), 0).vblank);
         assert!(!present_flip_at(&mut unknown, now(), 0).vblank);
-        assert_eq!(unknown.vblank, VblankSupport::Unsupported);
-        assert!(!present_flip_at(&mut unknown, now(), 9).vblank);
+        assert_eq!(unknown.vblank, VblankSupport::Unknown, "never latched");
+        assert!(present_flip_at(&mut unknown, now(), 9).vblank);
+        assert_eq!(unknown.vblank, VblankSupport::Supported);
 
         // Unknown: a counting sequence proves one.
         let mut counting = presenter(FakeAtomicIo::default());
@@ -2605,6 +2676,33 @@ mod tests {
         // _IOWR('d', 0x3b, struct drm_crtc_get_sequence), a 24-byte struct.
         assert_eq!(std::mem::size_of::<DrmCrtcGetSequence>(), 24);
         assert_eq!(drm_ioctl_crtc_get_sequence(), 0xc018_643b);
+    }
+
+    #[test]
+    fn an_inconclusive_vblank_probe_is_retried_once_the_crtc_is_active() {
+        let now = || clock_now(libc::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC");
+        // The constructor's probe hit a disabled CRTC (EINVAL -> Unknown);
+        // the first flip proves it active, so the answer is asked again.
+        let mut io = FakeAtomicIo::default();
+        io.vblank_probes.push_back(VblankSupport::Supported);
+        let mut presenter = presenter(io);
+        presenter.set_vblank_support(VblankSupport::Unknown);
+        assert!(
+            present_flip_at(&mut presenter, now(), 0).vblank,
+            "a re-probed CRTC counts vblanks even while its counter reads 0"
+        );
+        assert_eq!(presenter.vblank, VblankSupport::Supported);
+        // Asked once only.
+        assert!(present_flip_at(&mut presenter, now(), 0).vblank);
+
+        // EOPNOTSUPP is the one answer that settles it for good.
+        let mut io = FakeAtomicIo::default();
+        io.vblank_probes.push_back(VblankSupport::Unsupported);
+        let mut absent = presenter_with_cancellation(io, AtomicCancellation::new().expect("eventfd"));
+        absent.set_vblank_support(VblankSupport::Unknown);
+        assert!(!present_flip_at(&mut absent, now(), 4).vblank);
+        assert_eq!(absent.vblank, VblankSupport::Unsupported);
+        assert!(!present_flip_at(&mut absent, now(), 5).vblank);
     }
 
     #[test]

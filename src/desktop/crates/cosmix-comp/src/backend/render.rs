@@ -973,6 +973,11 @@ pub(crate) fn install_live_frame_reporter(
 ) {
     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
         render_app.insert_resource(reporter.clone());
+    } else {
+        // Without it the render world cannot deliver a refused commit, and
+        // clients would wait on feedback nothing resolves.
+        debug_assert!(false, "the live App has a render sub-app");
+        tracing::error!("no render sub-app for the frame reporter; refusals cannot be sent");
     }
     app.insert_resource(reporter);
 }

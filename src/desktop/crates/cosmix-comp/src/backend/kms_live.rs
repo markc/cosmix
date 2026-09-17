@@ -385,6 +385,8 @@ struct PreparedLiveOperation {
     security_reporter: Option<crate::protocol::SecurityPresentationReporter>,
     /// `wp_presentation` reports; client-content scenes only.
     frame_sink: KmsPresentationSink,
+    /// Kept across re-prepare: see [`KmsPresentationSink::new`].
+    frame_sequences: Arc<Mutex<BTreeMap<OutputKey, VblankSequence>>>,
     scene_mode: LiveSceneMode,
     scene_feed: Option<crate::protocol::ClientSceneFeed>,
     decoration: DecorationStartup,
@@ -4162,6 +4164,7 @@ fn prepare_live_operation(
         frame_clock: None,
         security_reporter: None,
         frame_sink: KmsPresentationSink::default(),
+        frame_sequences: Arc::default(),
         scene_mode: grant.scene_mode,
         scene_feed: None,
         decoration: grant.decoration.clone(),
@@ -5398,11 +5401,27 @@ fn kms_presented_frame(
 #[derive(Default)]
 struct VblankSequence {
     last: Option<(u32, u64)>,
+    /// Raw counters that did not move forward, for the rate-limited warning.
+    anomalies: u64,
 }
+
+/// Warn on the first anomalous raw counter, then every this many.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+const VBLANK_ANOMALY_WARN_EVERY: u64 = 64;
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl VblankSequence {
-    fn extend(&mut self, raw: u32) -> u64 {
+    /// The reported sequence for one raw counter reading.
+    ///
+    /// Forward (including a wrap) is the real step. Otherwise the counter
+    /// did not advance, and the two cases are answered differently:
+    /// - the same raw value repeats: report the same sequence, because two
+    ///   flips on one vblank are one vblank, not two;
+    /// - it went backwards: a different CRTC, or one reset across a resume,
+    ///   so continue one past the last reported value. The protocol
+    ///   contract is that a client's `seq` never goes backwards, and the
+    ///   new counter's own numbering cannot honour that.
+    fn extend(&mut self, raw: u32, key: &OutputKey) -> u64 {
         let extended = match self.last {
             None => u64::from(raw),
             Some((last_raw, last)) => {
@@ -5410,12 +5429,30 @@ impl VblankSequence {
                 if forward != 0 && forward <= u32::MAX / 2 {
                     last.saturating_add(u64::from(forward))
                 } else {
-                    last.saturating_add(1)
+                    self.note_anomaly(key, raw, last_raw);
+                    if raw == last_raw {
+                        last
+                    } else {
+                        last.saturating_add(1)
+                    }
                 }
             }
         };
         self.last = Some((raw, extended));
         extended
+    }
+
+    fn note_anomaly(&mut self, key: &OutputKey, raw: u32, last_raw: u32) {
+        self.anomalies = self.anomalies.saturating_add(1);
+        if self.anomalies == 1 || self.anomalies.is_multiple_of(VBLANK_ANOMALY_WARN_EVERY) {
+            tracing::warn!(
+                connector = key.connector_name,
+                raw,
+                last_raw,
+                anomalies = self.anomalies,
+                "vblank counter did not advance; the reported sequence continues from the last one"
+            );
+        }
     }
 }
 
@@ -5431,10 +5468,16 @@ struct KmsPresentationSink {
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl KmsPresentationSink {
-    fn new(reporter: Option<crate::protocol::FramePresentationReporter>) -> Self {
+    /// `sequences` is owned by the coordinator, not by the sink: a full
+    /// re-prepare builds a new sink while clients keep their `wl_output`,
+    /// and a sequence must never go backwards under them.
+    fn new(
+        reporter: Option<crate::protocol::FramePresentationReporter>,
+        sequences: Arc<Mutex<BTreeMap<OutputKey, VblankSequence>>>,
+    ) -> Self {
         Self {
             reporter,
-            sequences: Arc::default(),
+            sequences,
         }
     }
 
@@ -5456,7 +5499,7 @@ impl KmsPresentationSink {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry(presented.key.clone())
                 .or_default()
-                .extend(raw);
+                .extend(raw, &presented.key);
         }
         reporter.kms_presented(presented.key, presented.frame, presented.content);
     }
@@ -6128,6 +6171,7 @@ fn await_external_pause_attribution_for_completed_update<M: LiveCoordinatorMailb
             reconcile_pause_updated_frame_events(
                 vec![KmsRenderFrameEvent::TerminalFailure(failure)],
                 LivePauseCause::External,
+                None,
                 &mut |_| {},
             )?;
             Ok(LiveSupervisionEnd::PauseRequested {
@@ -6499,7 +6543,12 @@ fn reconcile_outstanding_pump_command<M: LiveCoordinatorMailbox>(
         (OutstandingPumpCommand::Update(token), PumpReply::Updated(result)) => {
             let report = result?;
             validate_update_report(&report, &token, &mut None)?;
-            reconcile_pause_updated_frame_events(report.frame_events, pause_cause, frame_presented)
+            reconcile_pause_updated_frame_events(
+                report.frame_events,
+                pause_cause,
+                Some(&token),
+                frame_presented,
+            )
         }
         (
             OutstandingPumpCommand::DrainScene {
@@ -6515,18 +6564,33 @@ fn reconcile_outstanding_pump_command<M: LiveCoordinatorMailbox>(
 fn reconcile_pause_updated_frame_events(
     events: Vec<KmsRenderFrameEvent>,
     pause_cause: LivePauseCause,
+    expected: Option<&LiveUpdateToken>,
     frame_presented: &mut impl FnMut(KmsFramePresented),
 ) -> Result<(), KmsLiveError> {
     for event in events {
         match event {
             // The flip completed before the pause and its content-source
-            // costs were consumed with it: report it like any other.
+            // costs were consumed with it, so report it like any other —
+            // but only when it is this update's own frame, the identity the
+            // active path requires through `require_update_frame_identity`.
             KmsRenderFrameEvent::FrameSubmitted {
+                generation,
                 key,
                 timestamp,
                 content,
                 ..
-            } => forward_frame_presented(&mut *frame_presented, &key, timestamp, content),
+            } => match expected {
+                Some(token) if token.generation == generation && token.key == key => {
+                    forward_frame_presented(&mut *frame_presented, &key, timestamp, content);
+                }
+                _ => tracing::debug!(
+                    generation,
+                    connector = key.connector_name,
+                    cause = ?pause_cause,
+                    "not reporting a flip that does not match the reconciled update"
+                ),
+            },
+
             KmsRenderFrameEvent::PresentationCancelled { .. } => {}
             KmsRenderFrameEvent::TerminalFailure(failure)
                 if pause_cause == LivePauseCause::External
@@ -8325,6 +8389,7 @@ impl LiveActPlatform for PreparedLiveOperation {
         self.frame_sink = KmsPresentationSink::new(
             (self.scene_mode == LiveSceneMode::ClientContent)
                 .then(|| runtime.frame_presentation_reporter()),
+            Arc::clone(&self.frame_sequences),
         );
         self.scene_feed = Some(
             runtime
@@ -12372,25 +12437,29 @@ mod tests {
 
     #[test]
     fn vblank_sequences_only_ever_increase() {
+        let key = pump_key();
         let mut sequence = VblankSequence::default();
-        assert_eq!(sequence.extend(10), 10);
-        assert_eq!(sequence.extend(12), 12);
+        assert_eq!(sequence.extend(10, &key), 10);
+        assert_eq!(sequence.extend(12, &key), 12);
         // Wrap: 0xffff_fffe -> 1 is three vblanks on.
         let mut wrapping = VblankSequence::default();
-        assert_eq!(wrapping.extend(u32::MAX - 1), u64::from(u32::MAX - 1));
-        assert_eq!(wrapping.extend(1), u64::from(u32::MAX) + 2);
-        assert_eq!(wrapping.extend(5), u64::from(u32::MAX) + 6);
-        // A counter that restarts (another CRTC after resume) or repeats
-        // continues upward instead of going back.
-        assert_eq!(sequence.extend(3), 13);
-        assert_eq!(sequence.extend(3), 14);
-        assert_eq!(sequence.extend(8), 19);
+        assert_eq!(wrapping.extend(u32::MAX - 1, &key), u64::from(u32::MAX - 1));
+        assert_eq!(wrapping.extend(1, &key), u64::from(u32::MAX) + 2);
+        assert_eq!(wrapping.extend(5, &key), u64::from(u32::MAX) + 6);
+        // A counter that restarted (another CRTC after resume) cannot go
+        // back under a client, so it continues one past the last sequence.
+        assert_eq!(sequence.extend(3, &key), 13);
+        // The same vblank twice is one vblank: the sequence repeats.
+        assert_eq!(sequence.extend(3, &key), 13);
+        assert_eq!(sequence.extend(8, &key), 18);
+        assert_eq!(sequence.anomalies, 2);
     }
 
     #[test]
     fn the_production_sink_extends_sequences_per_output_and_reports_by_key() {
         let (reporter, _probe) = crate::protocol::FramePresentationReporter::test_channel();
-        let sink = KmsPresentationSink::new(Some(reporter));
+        let sequences = Arc::new(Mutex::new(BTreeMap::new()));
+        let sink = KmsPresentationSink::new(Some(reporter), Arc::clone(&sequences));
         assert!(sink.reporter().is_some());
         let shared = sink.clone();
         let flip = |key: OutputKey, raw| KmsFramePresented {
@@ -12410,10 +12479,20 @@ mod tests {
         // A clone shares the state: the resumed coordinator continues.
         shared.report(flip(pump_key(), 4));
         sink.report(flip(other.clone(), 7));
-        let sequences = sink.sequences.lock().expect("sequence state");
-        assert_eq!(sequences[&pump_key()].last, Some((4, 101)));
-        assert_eq!(sequences[&other].last, Some((7, 7)));
-        drop(sequences);
+        let locked = sink.sequences.lock().expect("sequence state");
+        assert_eq!(locked[&pump_key()].last, Some((4, 101)));
+        assert_eq!(locked[&other].last, Some((7, 7)));
+        drop(locked);
+        // K-N4: a re-prepare builds a new sink around the same map, so the
+        // sequence a client already saw is never repeated or rewound.
+        let (fresh_reporter, _fresh_probe) =
+            crate::protocol::FramePresentationReporter::test_channel();
+        let reprepared = KmsPresentationSink::new(Some(fresh_reporter), Arc::clone(&sequences));
+        reprepared.report(flip(pump_key(), 5));
+        assert_eq!(
+            sequences.lock().expect("sequence state")[&pump_key()].last,
+            Some((5, 102))
+        );
         // Without a reporter (first-light) nothing is tracked or sent.
         let silent = KmsPresentationSink::default();
         silent.report(flip(pump_key(), 9));
@@ -12429,6 +12508,7 @@ mod tests {
                 presentation_cancelled_event(1),
             ],
             LivePauseCause::External,
+            Some(&update_token(1, 1)),
             &mut |presented| reports.push(presented),
         )
         .expect("a completed flip and a cancellation reconcile");
@@ -12436,6 +12516,39 @@ mod tests {
         assert_eq!(reports[0].frame.seq, 12);
         assert_eq!(reports[0].content, frame_content_for_test(3));
         assert_eq!(reports[0].key, pump_key());
+    }
+
+    /// K-N3: the pause path owes the same identity check as the active one.
+    #[test]
+    fn a_pause_path_flip_from_another_generation_or_output_is_not_reported() {
+        let stale_generation = |generation, key: OutputKey| {
+            let mut event = presented_flip(Some(frame_content_for_test(4)), 3);
+            if let KmsRenderFrameEvent::FrameSubmitted {
+                generation: event_generation,
+                key: event_key,
+                ..
+            } = &mut event
+            {
+                *event_generation = generation;
+                *event_key = key;
+            }
+            event
+        };
+        let other = OutputKey {
+            connector_name: "Other-2".into(),
+            ..pump_key()
+        };
+        for event in [stale_generation(2, pump_key()), stale_generation(1, other)] {
+            let mut reports = Vec::new();
+            reconcile_pause_updated_frame_events(
+                vec![event],
+                LivePauseCause::SelfSwitch,
+                Some(&update_token(1, 1)),
+                &mut |presented| reports.push(presented),
+            )
+            .expect("a mismatched flip is ignored, not fatal");
+            assert!(reports.is_empty());
+        }
     }
 
     #[test]

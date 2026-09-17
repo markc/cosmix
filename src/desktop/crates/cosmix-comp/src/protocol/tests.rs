@@ -30047,6 +30047,10 @@ fn kms_frame_reports_name_their_own_output() {
     let callback = request_presentation_feedback(&mut harness, presentation);
     commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     harness.dispatch_client();
+    harness
+        .server
+        .state
+        .content_source_registered("scene", None);
     let content = presentation::FrameContent {
         surfaces: vec![presentation::FrameSurface {
             id,
@@ -30054,7 +30058,14 @@ fn kms_frame_reports_name_their_own_output() {
             shown: true,
             waiting: false,
         }],
-        sources: Vec::new(),
+        sources: vec![presentation::FrameSource {
+            id: "scene".into(),
+            revision: 1,
+            shown: true,
+            upload_bytes: 64,
+            damage_px: 16,
+            ..Default::default()
+        }],
     };
     let flip = |seq| presentation::PresentedFrame {
         output: None,
@@ -30079,8 +30090,23 @@ fn kms_frame_reports_name_their_own_output() {
         harness.server.state.presentation.ledger.pending_count(id),
         1
     );
+    // K-N1: the renderer already handed over this frame's content-source
+    // costs, so a report no surface can be presented on still spends them.
+    let scene = harness
+        .server
+        .state
+        .presentation
+        .sources
+        .get("scene")
+        .expect("registered source");
+    assert_eq!(
+        (scene.upload_bytes_total, scene.damage_px_total, scene.frames),
+        (64, 16, 1)
+    );
 
-    reporter.kms_presented(key, flip(91), content);
+    let mut second = content.clone();
+    second.sources[0].revision = 2;
+    reporter.kms_presented(key, flip(91), second);
     assert_eq!(probe.deliver(&mut harness.server.state), 1);
     let events = harness.sync();
     let outcome = feedback_outcome(&events, callback);
