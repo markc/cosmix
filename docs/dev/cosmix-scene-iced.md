@@ -22,6 +22,10 @@ hands it back to CTK. Naming an adapter the binary was built without is an
 error and changes nothing. `patch`, `get`, `watch` and `unload` work as for
 CTK scenes.
 
+Both adapters use the page id `scene-<name>`, and `mount_page` treats an
+existing id as already mounted. The iced adapter therefore releases pages
+before the CTK pass (`SceneReconcile`) and registers pages after it.
+
 ## Renderer seam
 
 `surface::SurfaceRenderer` has no Bevy types:
