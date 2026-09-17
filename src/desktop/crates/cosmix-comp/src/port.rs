@@ -930,14 +930,6 @@ fn handle_incoming(
         return;
     }
     if command.command == "comp.props.watch" || command.command == "comp.pointer.watch" {
-        if command.command == "comp.pointer.watch" && authorize_set(&command).is_err() {
-            queue_reply(
-                reply_sender,
-                reply_timeouts,
-                PendingReply::new(command, error("not_local")),
-            );
-            return;
-        }
         if malformed {
             queue_reply(
                 reply_sender,
@@ -984,14 +976,6 @@ fn handle_incoming(
         return;
     }
     if command.command == "comp.props.set" {
-        if authorize_set(&command).is_err() {
-            queue_reply(
-                reply_sender,
-                reply_timeouts,
-                PendingReply::new(command, error("not_local")),
-            );
-            return;
-        }
         let parsed = if malformed {
             Err(invalid_set_shape(None))
         } else {
@@ -1145,29 +1129,6 @@ pub(crate) fn inject_topic_lifecycle_notice_for_test(
         },
     );
     debug_assert!(responders.is_empty());
-}
-
-fn authorize_set(command: &cosmix_client::IncomingCommand) -> Result<(), ()> {
-    if command.from == "anonymous"
-        || validate_service_name(&command.from).is_err()
-        || command.headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("source_peer")
-                || name.eq_ignore_ascii_case("permissions")
-                || name.eq_ignore_ascii_case("signed_ident")
-        })
-    {
-        return Err(());
-    }
-    let origins = command
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
-        .collect::<Vec<_>>();
-    if origins.len() == 1 && origins[0].1 == "local" {
-        Ok(())
-    } else {
-        Err(())
-    }
 }
 
 fn parse_set(args: &Value) -> Result<(String, Value), (u8, Arc<str>)> {
@@ -2075,37 +2036,58 @@ mod tests {
         command
     }
 
-    #[test]
-    fn set_authorisation_requires_one_local_stamp_and_canonical_caller() {
-        assert!(authorize_set(&local_set_command(1, "input.corners.enabled", json!(true))).is_ok());
-
-        let mut missing = local_set_command(1, "input.corners.enabled", json!(true));
-        missing.headers.clear();
-        assert!(authorize_set(&missing).is_err());
-
-        let mut duplicate = local_set_command(1, "input.corners.enabled", json!(true));
-        duplicate
+    /// Mesh law (2026-09-15): being on the mesh is the whole authorization.
+    /// A mesh-stamped caller with peer/identity headers, a caller with no
+    /// origin stamp at all, and one with an unusual name all reach the
+    /// calloop exactly like a local one, for writes and pointer watches.
+    #[tokio::test]
+    async fn mesh_and_unstamped_callers_reach_set_and_pointer_watch() {
+        let mut mesh = local_set_command(1, "input.corners.enabled", json!(true));
+        mesh.headers.insert("broker_origin".into(), "mesh".into());
+        mesh.headers
+            .insert("source_peer".into(), "beta.example".into());
+        mesh.headers.insert("signed_ident".into(), "opaque".into());
+        let mut unstamped = local_set_command(2, "input.corners.enabled", json!(false));
+        unstamped.headers.clear();
+        let mut odd_caller = local_set_command(3, "input.corners.dwell_ms", json!(250));
+        odd_caller.from = "anonymous".into();
+        let mut mesh_pointer = command("comp.pointer.watch", 4);
+        mesh_pointer
             .headers
-            .insert("Broker_Origin".into(), "local".into());
-        assert!(authorize_set(&duplicate).is_err());
+            .insert("broker_origin".into(), "mesh".into());
+        mesh_pointer
+            .headers
+            .insert("source_peer".into(), "beta.example".into());
 
-        let mut remote = local_set_command(1, "input.corners.enabled", json!(true));
-        remote.headers.insert("broker_origin".into(), "mesh".into());
-        assert!(authorize_set(&remote).is_err());
-
-        for caller in ["", "anonymous", "Bad-Caller", "a"] {
-            let mut command = local_set_command(1, "input.corners.enabled", json!(true));
-            command.from = caller.into();
-            assert!(authorize_set(&command).is_err(), "caller {caller:?}");
-        }
-    }
-
-    #[test]
-    fn set_authorisation_rejects_every_wire_identity_claim() {
-        for claim in ["source_peer", "permissions", "signed_ident"] {
-            let mut command = local_set_command(1, "input.corners.enabled", json!(true));
-            command.headers.insert(claim.into(), "forged".into());
-            assert!(authorize_set(&command).is_err(), "claim {claim}");
+        for command in [mesh, unstamped, odd_caller, mesh_pointer] {
+            let (ingress, source, _) = test_ingress();
+            let mut responders = JoinSet::new();
+            let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+            let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+            let reply_timeouts = Arc::new(AtomicU64::new(0));
+            let verb = command.command.clone();
+            let id = command.id.clone();
+            handle_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                command,
+            );
+            match source.try_recv() {
+                Ok(PortCommand::Set(_)) => assert_eq!(verb, "comp.props.set", "{id:?}"),
+                Ok(PortCommand::PointerWatch(_)) => {
+                    assert_eq!(verb, "comp.pointer.watch", "{id:?}")
+                }
+                _ => panic!("{verb} {id:?} was not admitted"),
+            }
+            assert!(
+                replies.try_recv().is_err(),
+                "{verb} {id:?} got an early refusal"
+            );
+            responders.abort_all();
         }
     }
 
@@ -2151,30 +2133,6 @@ mod tests {
         assert_eq!(reply.id.as_deref(), Some("37"));
         assert_eq!(reply.command, "comp.props.set");
         assert_eq!(reply.rc, 0);
-    }
-
-    #[tokio::test]
-    async fn unauthorised_set_is_rejected_before_admission() {
-        let (ingress, source, _) = test_ingress();
-        let mut responders = JoinSet::new();
-        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
-        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
-        let reply_timeouts = Arc::new(AtomicU64::new(0));
-        let mut command = local_set_command(2, "input.corners.enabled", json!(false));
-        command.headers.clear();
-        handle_incoming(
-            &ingress,
-            &mut responders,
-            &permits,
-            &reply_sender,
-            &reply_timeouts,
-            "comp-nested",
-            command,
-        );
-        let reply = replies.recv().await.expect("not-local reply");
-        assert_eq!(reply.rc, 10);
-        assert_eq!(reply.body.as_ref(), "{\"error\":\"not_local\"}");
-        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     #[tokio::test]
