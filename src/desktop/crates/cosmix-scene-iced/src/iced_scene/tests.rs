@@ -815,3 +815,63 @@ fn the_renderer_plugin_mounts_the_bridge_itself() {
     assert!(counters.totals.draws >= 1, "the iced renderer never drew");
     assert!(counters.totals.bytes_queued >= 600 * 450 * 4);
 }
+
+#[test]
+fn the_theme_follows_the_resolved_scheme() {
+    use super::renderer::iced_theme;
+    assert_eq!(iced_theme(true), cosmix_iced_host::Theme::Dark);
+    assert_eq!(iced_theme(false), cosmix_iced_host::Theme::Light);
+    assert!(is_dark(cosmix_iced_host::core::Color::from_rgb8(
+        16, 18, 22
+    )));
+    assert!(!is_dark(cosmix_iced_host::core::Color::WHITE));
+}
+
+#[test]
+fn a_column_template_does_not_steal_the_lists_click() {
+    // Only the `row` arm builds a handler for a template's own click, so a
+    // `column` template must leave the list's row click in place.
+    let source = "---\nscene: 1\nname: colrows\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 4, children: [\"list\"]}\nlist: {widget: \"list\", rows: [{id: \"r1\", cells: [\"one\"]}], row: \"entry\", row_height: 30, on_click: \"pick\"}\nentry: {widget: \"column\", children: [\"cell\"], on_click: \"open\"}\ncell: {widget: \"text\", text: \"{cells[0]}\"}\n```\n";
+    let mut rig = Rig::new(source, 300, 200, 1.0);
+    rig.settle();
+    rig.click("entry@r1");
+    let actions = rig.actions();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0].node, "list");
+    assert_eq!(actions[0].handler, "pick");
+    assert_eq!(actions[0].item, Some(json!({"id": "r1", "cells": ["one"]})));
+}
+
+#[test]
+fn a_pointer_scale_change_alone_reaches_the_renderer() {
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 2.5);
+    rig.settle();
+    let button = rig.bounds("button").center();
+    // Same render scale, pointer scale halved: the same physical point is now
+    // a different logical one, and the click must follow it.
+    rig.renderer.set_pointer_scale(1.25);
+    rig.renderer.queue(SurfaceEvent::PointerMoved {
+        x: button.x * 1.25,
+        y: button.y * 1.25,
+    });
+    for pressed in [true, false] {
+        rig.renderer.queue(SurfaceEvent::PointerButton {
+            button: PointerButton::Primary,
+            pressed,
+        });
+    }
+    rig.settle();
+    assert_eq!(rig.actions(), vec![action("click", "go", "button", None)]);
+}
+
+#[test]
+fn the_pre_bridge_queue_is_bounded() {
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 1.0);
+    rig.settle();
+    for _ in 0..(MAX_QUEUED_ACTIONS + 20) {
+        rig.click("button");
+    }
+    let actions = rig.actions();
+    assert_eq!(actions.len(), MAX_QUEUED_ACTIONS);
+    assert!(actions.iter().all(|action| action.handler == "go"));
+}

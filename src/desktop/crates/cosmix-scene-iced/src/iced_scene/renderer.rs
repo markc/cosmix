@@ -166,6 +166,10 @@ impl SurfaceRenderer for IcedSceneRenderer {
         self.surface.invalidate();
     }
 
+    fn undrawn_nodes(&self) -> usize {
+        self.surface.program().undrawn_nodes()
+    }
+
     fn set_pointer_scale(&mut self, scale: f32) {
         if scale > 0.0 {
             self.pointer_scale = scale;
@@ -360,7 +364,7 @@ impl SurfaceRenderer for IcedSceneRenderer {
     }
 }
 
-fn iced_theme(dark: bool) -> cosmix_iced_host::Theme {
+pub(crate) fn iced_theme(dark: bool) -> cosmix_iced_host::Theme {
     if dark {
         cosmix_iced_host::Theme::Dark
     } else {

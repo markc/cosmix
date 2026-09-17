@@ -142,10 +142,14 @@ pub fn named_font(family: &str) -> Font {
             name
         }
         None => {
-            bevy::log::warn!(
-                "scene-iced: more than {MAX_INTERNED_FAMILIES} font families requested; \
-                 {family:?} falls back to the default family"
-            );
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                bevy::log::warn!(
+                    "scene-iced: more than {MAX_INTERNED_FAMILIES} font families requested; \
+                     {family:?} and any later one fall back to the default family"
+                );
+            }
             return Font::DEFAULT;
         }
     };

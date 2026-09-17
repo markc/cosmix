@@ -227,6 +227,10 @@ pub trait SurfaceRenderer {
     fn set_pointer_scale(&mut self, _scale: f32) {}
     /// A new accepted scene revision.
     fn set_scene(&mut self, _scene: &ResolvedScene) {}
+    /// Scene nodes this renderer leaves blank, for the host's stats.
+    fn undrawn_nodes(&self) -> usize {
+        0
+    }
     fn queue(&mut self, event: SurfaceEvent);
     fn process(&mut self, now: Duration) -> Processed;
     fn draw(&mut self, buffer: &mut [u8], width: u32, height: u32, stride: u32) -> Vec<Rect>;

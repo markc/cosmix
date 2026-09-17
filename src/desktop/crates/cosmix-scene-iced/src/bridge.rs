@@ -77,6 +77,9 @@ pub(crate) struct SurfaceState {
     /// The geometry the give-up count belongs to. A repaint cycle zeroes
     /// `size`, so the count cannot be keyed on that.
     last_geometry: (UVec2, f32),
+    /// The pointer scale last handed to the renderer. The camera can resolve
+    /// it a frame after the size, so it is tracked on its own.
+    pointer_scale: f32,
     last: Processed,
 }
 
@@ -232,6 +235,8 @@ pub struct SceneIcedCounters {
     /// The rectangles of the most recent upload plan.
     pub last_rects: Vec<Rect>,
     pub surfaces: usize,
+    /// Scene nodes the renderers leave blank.
+    pub undrawn: usize,
     own: HashSet<AssetId<Image>>,
 }
 
@@ -241,6 +246,8 @@ pub struct SceneIcedStats {
     pub last: FrameCounters,
     pub totals: FrameCounters,
     pub surfaces: usize,
+    /// Scene nodes the renderers leave blank (`image`, by decision).
+    pub undrawn: usize,
     pub focus: Option<String>,
 }
 
@@ -250,6 +257,7 @@ impl SceneIcedStats {
             "frames": self.frames,
             "surfaces": self.surfaces,
             "focus": self.focus,
+            "undrawn": self.undrawn,
             "last": self.last.json(),
             "totals": self.totals.json(),
         })
@@ -263,6 +271,7 @@ impl SceneIcedCounters {
             last: self.last,
             totals: self.totals,
             surfaces: self.surfaces,
+            undrawn: self.undrawn,
             focus: focus.scene.clone(),
         }
     }
@@ -454,6 +463,7 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
             repaint: false,
             giveups: 0,
             last_geometry: (UVec2::ZERO, 0.0),
+            pointer_scale: 0.0,
             last: Processed::default(),
         },
     ));
@@ -957,6 +967,7 @@ pub(crate) fn frame(
     let mut next_wake: Option<Duration> = None;
     let mut cursor = None;
     counters.surfaces = surfaces.iter().count();
+    let mut undrawn = 0;
     for (entity, geometry, mut state, mut ime_target) in &mut surfaces {
         if let Some(image) = state.image.as_ref().map(|image| image.id()) {
             if written.contains(&image) {
@@ -1038,11 +1049,15 @@ pub(crate) fn frame(
             state.scale = geometry.scale;
             state.repaint = true;
             renderer.resize(size.x, size.y, geometry.scale);
+        }
+        if state.pointer_scale != geometry.pointer_scale {
+            state.pointer_scale = geometry.pointer_scale;
             renderer.set_pointer_scale(geometry.pointer_scale);
         }
         for event in std::mem::take(&mut state.events) {
             renderer.queue(event);
         }
+        undrawn += renderer.undrawn_nodes();
         let processed = renderer.process(now);
         if let Some(at) = processed.wake_at {
             next_wake = Some(next_wake.map_or(at, |next| next.min(at)));
@@ -1096,12 +1111,14 @@ pub(crate) fn frame(
         state.repaint = false;
         let rects = upload::plan(&damage, size.x, size.y);
         counters.current.draws += 1;
-        counters.current.rects_queued += rects.len() as u64;
-        counters.current.bytes_queued += upload::byte_len(&rects);
         if let Some(channel) = channel.as_ref()
             && !rects.is_empty()
             && state.giveups < MAX_GIVEUPS
         {
+            // Only what actually reaches the render world is counted: an
+            // abandoned surface still draws, and must not report uploads.
+            counters.current.rects_queued += rects.len() as u64;
+            counters.current.bytes_queued += upload::byte_len(&rects);
             channel.0.push(SurfaceUpload {
                 image: state.image.as_ref().unwrap().id(),
                 texture: state.texture,
@@ -1132,6 +1149,7 @@ pub(crate) fn frame(
                 }
             }
         }
+        counters.undrawn = undrawn;
         focus.cursor = cursor;
         focus.cursor_owner = owner;
     }

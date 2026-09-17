@@ -37,6 +37,10 @@ pub struct SceneAction {
 
 pub type Outbox = Arc<Mutex<Vec<SceneAction>>>;
 
+/// Handler calls held while no Bus bridge exists. Past this the oldest is
+/// dropped, so a long bus-less mount cannot replay a session at once.
+pub const MAX_QUEUED_ACTIONS: usize = 128;
+
 #[derive(Clone, Debug)]
 pub enum Msg {
     Click { node: String, item: Option<Value> },
@@ -75,7 +79,7 @@ pub struct SceneProgram {
     /// Where a relative `image` src is resolved from, as CTK resolves it
     /// against Bevy's asset root.
     assets: Arc<Path>,
-    /// Nodes whose file is missing, logged once each.
+    /// Nodes this renderer leaves blank (every `image`), logged once each.
     undrawn: BTreeSet<String>,
 }
 
@@ -115,7 +119,7 @@ impl SceneProgram {
         }
     }
 
-    /// Nodes this renderer cannot draw (an `image`, today).
+    /// Nodes left blank in the current scene (every `image`, by decision).
     pub fn undrawn_nodes(&self) -> usize {
         self.undrawn.len()
     }
@@ -175,12 +179,13 @@ impl SceneProgram {
             if self.undrawn.insert(id.clone()) {
                 bevy::log::warn!(
                     "scene {}: image node {id} is not drawn by the iced adapter (src {src:?}, \
-                     which CTK would load from {:?})",
+                     which CTK would load through the asset server from {:?})",
                     tree.name,
                     self.image_path(src)
                 );
             }
         }
+        self.undrawn.retain(|id| tree.nodes.contains_key(id));
         let live = live_keys(tree);
         self.hovered.retain(|key| live.contains(key));
         self.tree = tree.clone();
@@ -197,7 +202,17 @@ impl SceneProgram {
         let Some(handler) = self.tree.nodes.get(base).and_then(|n| string(n, port)) else {
             return;
         };
-        self.outbox.lock().unwrap().push(SceneAction {
+        let mut outbox = self.outbox.lock().unwrap();
+        if outbox.len() >= MAX_QUEUED_ACTIONS {
+            let dropped = outbox.remove(0);
+            bevy::log::warn!(
+                "scene-iced: handler queue full; dropped {} {} for node {}",
+                dropped.kind,
+                dropped.handler,
+                dropped.node
+            );
+        }
+        outbox.push(SceneAction {
             scene: self.tree.name.clone(),
             citizen: self.tree.citizen.clone(),
             node: node.to_owned(),
@@ -405,11 +420,12 @@ impl SceneProgram {
                     Length::Fixed(list_height(node))
                 };
                 let template = text_port(node, "row");
-                let row_click = self
-                    .tree
-                    .nodes
-                    .get(template)
-                    .is_some_and(|row| row.ports.contains_key("on_click"));
+                // Only the `row` arm builds a handler for a template's own
+                // click, so only a `row` template takes it from the list.
+                let row_click =
+                    self.tree.nodes.get(template).is_some_and(|row| {
+                        row.family == "row" && row.ports.contains_key("on_click")
+                    });
                 let instances = rows(node).iter().map(|row_item| {
                     let content =
                         container(self.node_view(template, Axis::Column, false, Some(row_item)))

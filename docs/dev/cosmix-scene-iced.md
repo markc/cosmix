@@ -150,7 +150,7 @@ Scene families map as the CTK adapter maps them:
 | `toggle` | toggler | |
 | `list` | scrollable keyed column of template instances, row click with `item` | `{cells[n]}` substitution, `max_rows`, `hidden_if_empty` |
 | `spacer`, `window` | space | as CTK's sizes |
-| `image` | space of `w` x `h` | not drawn; logged once per node (with the path CTK would load) and counted by `undrawn_nodes()`. iced can draw it, but `iced_graphics/image` needs `kamadak-exif`, which the workspace does not carry |
+| `image` | space of `w` x `h` | not drawn; logged once per node (with the path CTK would load) and counted in `shell.debug.status` as `scene_iced.undrawn`. iced can draw it, but `iced_graphics/image` needs `kamadak-exif`, which the workspace does not carry |
 
 Handler ports produce `{scene, node, kind, value?, item?}` calls. The
 renderer queues them; `IcedRendererPlugin` sends them with
