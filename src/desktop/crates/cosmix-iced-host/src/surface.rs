@@ -1,5 +1,6 @@
 use crate::clipboard::{Adapter, Clipboard, NullClipboard};
 use crate::damage::{DamageRect, PixelFormat, swap_red_blue};
+use crate::diff::{self, union};
 use crate::ime::{ImeRequest, PreeditOverlay};
 use crate::{Program, Renderer, Theme};
 use iced_core::event::Status;
@@ -546,19 +547,15 @@ impl<P: Program> Surface<P> {
                 height,
             }]
         } else {
-            let logical = iced_graphics::damage::diff(
-                self.last_layers.as_deref().unwrap_or_default(),
-                layers,
-                |layer| vec![layer.bounds],
-                Layer::damage,
-            );
-            let grouped = iced_graphics::damage::group(logical, Rectangle::with_size(size));
-            disjoint(
-                grouped
+            let logical = diff::layers(self.last_layers.as_deref().unwrap_or_default(), layers);
+            let viewport = Rectangle::with_size(size);
+            disjoint(diff::coalesce(
+                logical
                     .into_iter()
+                    .filter_map(|rect| rect.intersection(&viewport))
                     .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
                     .collect(),
-            )
+            ))
         };
         let current = layers.to_vec();
 
@@ -654,17 +651,6 @@ fn disjoint(mut rects: Vec<DamageRect>) -> Vec<DamageRect> {
 
 fn overlaps(a: &DamageRect, b: &DamageRect) -> bool {
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
-}
-
-fn union(a: &DamageRect, b: &DamageRect) -> DamageRect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    DamageRect {
-        x,
-        y,
-        width: (a.x + a.width).max(b.x + b.width) - x,
-        height: (a.y + a.height).max(b.y + b.height) - y,
-    }
 }
 
 #[cfg(test)]
