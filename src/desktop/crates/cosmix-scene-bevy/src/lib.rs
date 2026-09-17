@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(rc, 10);
         let published = peer.drain_publishes();
         assert_eq!(published.len(), 1);
-        assert_eq!(published[0].command, "shell.scene.changed");
+        assert!(published[0].body.contains("command: shell.scene.changed"));
     }
 
     #[test]
