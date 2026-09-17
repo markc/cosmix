@@ -12,6 +12,13 @@ use iced::{Element, Fill, Theme};
 
 const STRIPS: usize = 8;
 const ROLL_NOTES: usize = 131_072;
+/// One colour per track, so a dense roll reads as separate parts.
+const TRACK_COLOURS: [iced::Color; 4] = [
+    iced::Color::from_rgb(0.35, 0.72, 0.55),
+    iced::Color::from_rgb(0.40, 0.62, 0.86),
+    iced::Color::from_rgb(0.85, 0.63, 0.35),
+    iced::Color::from_rgb(0.76, 0.45, 0.72),
+];
 
 fn main() -> iced::Result {
     iced::application(Gallery::new, Gallery::update, Gallery::view)
@@ -29,6 +36,8 @@ struct Gallery {
     mute: [bool; STRIPS],
     solo: [bool; STRIPS],
     level: [f32; STRIPS],
+    peak: [Option<f32>; STRIPS],
+    hold: [Option<f32>; STRIPS],
     peaks: WaveformPeaks,
     playhead: f32,
     notes: RollNotes,
@@ -72,6 +81,7 @@ fn song() -> (WaveformPeaks, RollNotes) {
             length: 0.1 + (next() % 2000) as f32 / 1000.0,
             pitch: 24 + (next() % 84) as u8,
             velocity: (next() % 128) as u8,
+            track: (next() % 8) as u16,
         })
         .collect();
     (
@@ -111,6 +121,8 @@ impl Gallery {
             mute: [false; STRIPS],
             solo: [false; STRIPS],
             level: [f32::NEG_INFINITY; STRIPS],
+            peak: [None; STRIPS],
+            hold: [None; STRIPS],
             peaks,
             playhead: 0.0,
             notes,
@@ -131,12 +143,17 @@ impl Gallery {
             // No timer: the meters only change on these buttons, so an idle
             // gallery schedules nothing once the peak lines have fallen.
             Message::Levels(loud) => {
-                for (strip, level) in self.level.iter_mut().enumerate() {
-                    *level = if loud {
+                for strip in 0..STRIPS {
+                    let level = if loud {
                         -1.0 - strip as f32 * 4.0
                     } else {
                         -48.0
                     };
+                    self.level[strip] = level;
+                    // A host tracks its own peak and hold; here the buttons
+                    // stand in for a meter feed.
+                    self.peak[strip] = Some(level + 2.0);
+                    self.hold[strip] = Some(self.hold[strip].unwrap_or(level).max(level + 2.0));
                 }
             }
             Message::Seek(fraction) => self.playhead = fraction,
@@ -156,7 +173,11 @@ impl Gallery {
                 Fader::new(self.gain[strip])
                     .on_change(move |db| Message::Gain(strip, db))
                     .style(style),
-                LevelMeter::new(self.level[strip]).style(style),
+                LevelMeter::new(self.level[strip])
+                    .peak(self.peak[strip])
+                    .hold(self.hold[strip])
+                    .clipped(self.level[strip] > -1.0)
+                    .style(style),
             ]
             .spacing(4),
             text(format_db(self.gain[strip])).size(11),
@@ -238,6 +259,7 @@ impl Gallery {
             ))
             .size(24),
             PianoRoll::new(&self.notes, self.view)
+                .track_colours(&TRACK_COLOURS)
                 .playhead(Some(self.playhead * end))
                 .on_view(Message::View)
                 .on_note(Message::Pick)
