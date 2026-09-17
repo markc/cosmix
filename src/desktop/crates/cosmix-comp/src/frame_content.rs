@@ -296,6 +296,7 @@ fn frame_content(
                 id: surface.id,
                 commit_seq: commit,
                 shown: true,
+                waiting: false,
             },
             // Hidden or off the output: nothing committed so far will be
             // shown as committed.
@@ -303,13 +304,17 @@ fn frame_content(
                 id: surface.id,
                 commit_seq: surface.commit,
                 shown: false,
+                waiting: false,
             },
-            // Visible but its newest content is not sampled yet: resolve
-            // nothing new; newer commits keep waiting.
+            // Visible but its newest content is not sampled yet (an SHM
+            // texture still preparing, a DMA-BUF request not installed or
+            // aged out of the history): resolve nothing new; newer commits
+            // keep waiting, and the stats see a stall, not a hide.
             (true, None) => FrameSurface {
                 id: surface.id,
                 commit_seq: remembered.matched.unwrap_or(0),
                 shown: false,
+                waiting: true,
             },
         });
     }
@@ -346,8 +351,17 @@ mod tests {
         })
     }
 
+    /// Visible, newest content not sampled yet.
+    fn waiting(id: u64, commit_seq: u64) -> FrameSurface {
+        FrameSurface {
+            waiting: true,
+            ..shown(id, commit_seq, false)
+        }
+    }
+
     fn shown(id: u64, commit_seq: u64, shown: bool) -> FrameSurface {
         FrameSurface {
+            waiting: false,
             id: SurfaceId(id),
             commit_seq,
             shown,
@@ -369,7 +383,7 @@ mod tests {
         );
         assert_eq!(
             frame.surfaces,
-            [shown(1, 3, true), shown(2, 5, false), shown(3, 0, false)]
+            [shown(1, 3, true), shown(2, 5, false), waiting(3, 0)]
         );
     }
 
@@ -388,7 +402,7 @@ mod tests {
             &mut memory,
             |_| true,
         );
-        assert_eq!(frame.surfaces, [shown(1, 3, false)]);
+        assert_eq!(frame.surfaces, [waiting(1, 3)]);
         let frame = frame_content(
             &[(surface(1, 4, true), true, None)],
             Vec::new(),
@@ -453,7 +467,7 @@ mod tests {
             &mut memory,
             |_| true,
         );
-        assert_eq!(frame.surfaces, [shown(2, 0, false)]);
+        assert_eq!(frame.surfaces, [waiting(2, 0)]);
         // Installed: commit 2 is shown.
         let frame = frame_content(
             &[(dmabuf(1, 2, &requests), true, progress(11, Some(11), false))],
@@ -501,7 +515,7 @@ mod tests {
                 true
             },
         );
-        assert_eq!(frame.surfaces, [shown(2, 0, false)]);
+        assert_eq!(frame.surfaces, [waiting(2, 0)]);
         assert_eq!(sent.last(), Some(&refusal(2, 0, 1)));
     }
 

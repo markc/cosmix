@@ -220,7 +220,9 @@ pub(crate) struct WindowSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct OutputPresentationSnapshot {
     pub(crate) clock_id: u32,
-    pub(crate) flags: Option<u32>,
+    /// Kind flag names of the newest frame; null before the first frame.
+    pub(crate) flags: Option<Vec<&'static str>>,
+    pub(crate) flags_mask: Option<u32>,
     pub(crate) refresh_us: Option<u64>,
     pub(crate) frames: u64,
     pub(crate) interval_p50_us: Option<u64>,
@@ -960,7 +962,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
     // (`surface_is_session_presentable`). Do not derive it from visibility.
     let session_lock_active = state.session_lock_active();
     let OutputProjection {
-        rows: mut outputs,
+        rows: outputs,
         keys: output_keys,
         slug_collisions,
     } = project_outputs(state)?;
@@ -978,7 +980,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         );
     }
 
-    let mut windows = if session_lock_active {
+    let windows = if session_lock_active {
         BTreeMap::new()
     } else {
         surfaces
@@ -987,40 +989,6 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             .map(|(key, surface)| (key.clone(), project_window_row(surface)))
             .collect()
     };
-
-    let stats = &state.presentation.stats;
-    for window in windows.values_mut() {
-        window.presentation = Some(stats.window(window.id, window.generation).map_or_else(
-            || PresentationLeaves {
-                since_us: stats.epoch_us,
-                ..PresentationLeaves::default()
-            },
-            |window| window.leaves(),
-        ));
-    }
-    for output in outputs.values_mut() {
-        output.presentation = Some(output_presentation(
-            stats.output(&output.name),
-            stats.epoch_us,
-        ));
-    }
-    let sources = state
-        .presentation
-        .sources
-        .iter()
-        .map(|(id, counters)| {
-            (
-                id.clone(),
-                SourceSnapshot {
-                    output: counters.output.clone(),
-                    registered_at_us: counters.registered_at_us,
-                    revision: counters.revision,
-                    registration: counters.registration,
-                    presentation: counters.leaves(),
-                },
-            )
-        })
-        .collect();
 
     let stack = project_stack(state);
 
@@ -1038,7 +1006,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         outputs,
         surfaces,
         windows,
-        sources,
+        sources: BTreeMap::new(),
         stack,
         focus: project_focus(state),
         decoration: DecorationSnapshot {
@@ -1087,16 +1055,127 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
     })
 }
 
+/// Which read paths a batch of reads can reach. Volatile presentation
+/// leaves are computed only for those (and never for diff baselines).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadScopes {
+    All,
+    Paths(Vec<String>),
+}
+
+impl ReadScopes {
+    /// Merge one request's scope (`None` = the whole tree).
+    pub(crate) fn add(&mut self, scope: Option<&str>) {
+        match (&mut *self, scope) {
+            (Self::All, _) => {}
+            (Self::Paths(_), None) => *self = Self::All,
+            (Self::Paths(paths), Some(path)) => paths.push(path.to_string()),
+        }
+    }
+
+    /// Whether a read under one of the scopes can include `path`: the scope
+    /// is `path`, an ancestor of it, or a descendant of it.
+    pub(crate) fn wants(&self, path: &str) -> bool {
+        let related = |scope: &str| {
+            scope == path
+                || path
+                    .strip_prefix(scope)
+                    .is_some_and(|rest| rest.starts_with('.'))
+                || scope
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        };
+        match self {
+            Self::All => true,
+            Self::Paths(paths) => paths.iter().any(|scope| related(scope)),
+        }
+    }
+}
+
+/// A read snapshot: the diff snapshot plus the volatile presentation leaves
+/// the scopes can reach.
+pub(super) fn read_snapshot(
+    state: &WaylandState,
+    context: &SnapshotContext,
+    scopes: &ReadScopes,
+) -> Option<CompSnapshot> {
+    let mut snapshot = snapshot(state, context)?;
+    let stats = &state.presentation.stats;
+    for (key, window) in &mut snapshot.windows {
+        if !scopes.wants(&format!("windows.{key}.presentation")) {
+            continue;
+        }
+        window.presentation = Some(stats.window(window.id, window.generation).map_or_else(
+            || PresentationLeaves {
+                since_us: stats.epoch_us,
+                ..PresentationLeaves::default()
+            },
+            |window| window.leaves(),
+        ));
+    }
+    for (key, output) in &mut snapshot.outputs {
+        if !scopes.wants(&format!("outputs.{key}.presentation")) {
+            continue;
+        }
+        output.presentation = Some(output_presentation(
+            stats.output(&output.name),
+            stats.epoch_us,
+        ));
+    }
+    if scopes.wants("sources") {
+        snapshot.sources = state
+            .presentation
+            .sources
+            .iter()
+            .filter(|(id, _)| scopes.wants(&format!("sources.{id}")))
+            .map(|(id, counters)| {
+                (
+                    id.clone(),
+                    SourceSnapshot {
+                        output: counters.output.clone(),
+                        registered_at_us: counters.registered_at_us,
+                        revision: counters.revision,
+                        registration: counters.registration,
+                        presentation: counters.leaves(),
+                    },
+                )
+            })
+            .collect();
+    }
+    Some(snapshot)
+}
+
+/// `wp_presentation_feedback` kind bits by name (design C3).
+const PRESENTATION_FLAG_NAMES: [(u32, &str); 4] = [
+    (0x1, "vsync"),
+    (0x2, "hw_clock"),
+    (0x4, "hw_completion"),
+    (0x8, "zero_copy"),
+];
+
+pub(crate) fn presentation_flag_names(mask: u32) -> Vec<&'static str> {
+    PRESENTATION_FLAG_NAMES
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
 fn output_presentation(stats: Option<&OutputStats>, epoch_us: u64) -> OutputPresentationSnapshot {
+    let intervals = stats
+        .map(|stats| stats.intervals_us.summary())
+        .unwrap_or_default();
+    let flags_mask = stats
+        .filter(|stats| stats.frames > 0)
+        .map(|stats| stats.flags);
     OutputPresentationSnapshot {
         clock_id: libc::CLOCK_MONOTONIC as u32,
-        flags: stats
-            .filter(|stats| stats.frames > 0)
-            .map(|stats| stats.flags),
+        flags: flags_mask.map(presentation_flag_names),
+        flags_mask,
         refresh_us: stats.and_then(|stats| stats.refresh_us),
         frames: stats.map_or(0, |stats| stats.frames),
-        interval_p50_us: stats.and_then(|stats| stats.intervals_us.percentile(50)),
-        interval_p99_us: stats.and_then(|stats| stats.intervals_us.percentile(99)),
+        interval_p50_us: intervals.p50,
+        interval_p99_us: intervals.p99,
         since_us: stats.map_or(epoch_us, |stats| stats.since_us),
     }
 }
@@ -1860,13 +1939,18 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     ),
     volatile!(
         [L("outputs"), O, L("presentation"), L("flags")],
+        List,
+        "Kind flags of the newest frame (vsync, hw_clock, hw_completion, zero_copy), or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("flags_mask")],
         Number,
         "wp_presentation_feedback kind bits of the newest frame, or null"
     ),
     volatile!(
         [L("outputs"), O, L("presentation"), L("refresh_us")],
         Number,
-        "Fixed refresh reported with the newest frame, or null (unknown or variable)"
+        "Fixed refresh reported with the newest frame, or null (unknown or variable; never 0)"
     ),
     volatile!(
         [L("outputs"), O, L("presentation"), L("frames")],
@@ -2141,7 +2225,11 @@ pub(super) fn service_requests(state: &mut WaylandState) {
         state.pending_port_requests.clear();
         return;
     };
-    let Some(snapshot) = snapshot(state, &context).map(Arc::new) else {
+    let mut scopes = ReadScopes::Paths(Vec::new());
+    for request in &state.pending_port_requests {
+        scopes.add(request.scope.as_deref());
+    }
+    let Some(snapshot) = read_snapshot(state, &context, &scopes).map(Arc::new) else {
         tracing::warn!(
             "compositor Bus snapshot contains coordinates not exactly representable as f32"
         );
@@ -2436,7 +2524,8 @@ mod tests {
                 },
                 presentation: Some(OutputPresentationSnapshot {
                     clock_id: 1,
-                    flags: Some(0),
+                    flags: Some(vec!["vsync"]),
+                    flags_mask: Some(1),
                     refresh_us: None,
                     frames: 3,
                     interval_p50_us: Some(16_000),
@@ -2715,6 +2804,55 @@ mod tests {
                 descriptor.pattern
             );
         }
+    }
+
+    /// S14: the descriptor table's `volatile` flag and the path rule
+    /// `props.changed` filters on never disagree.
+    #[test]
+    fn descriptor_volatility_matches_the_path_rule() {
+        let mut volatile = 0;
+        for descriptor in DESCRIPTORS {
+            let path = descriptor
+                .pattern
+                .iter()
+                .map(|segment| match segment {
+                    PatternSegment::Literal(literal) => *literal,
+                    PatternSegment::OutputKey => "o_dp_1",
+                    PatternSegment::SurfaceKey => "s2",
+                    PatternSegment::SourceKey => "scene",
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
+            volatile += usize::from(descriptor.volatile);
+        }
+        assert_eq!(volatile, 13 + 8 + 4 + 19);
+    }
+
+    #[test]
+    fn scopes_reach_ancestors_and_descendants_only() {
+        let scopes = ReadScopes::Paths(vec!["windows.s2".into(), "outputs".into()]);
+        assert!(scopes.wants("windows.s2.presentation"));
+        assert!(scopes.wants("outputs.o_dp_1.presentation"));
+        assert!(!scopes.wants("windows.s20.presentation"));
+        assert!(!scopes.wants("sources"));
+        assert!(ReadScopes::Paths(vec!["sources.scene.revision".into()]).wants("sources"));
+        let mut merged = ReadScopes::Paths(Vec::new());
+        assert!(!merged.wants("sources"));
+        merged.add(Some("info"));
+        assert!(!merged.wants("sources"));
+        merged.add(None);
+        assert_eq!(merged, ReadScopes::All);
+    }
+
+    #[test]
+    fn flag_names_follow_the_kind_bits() {
+        assert_eq!(presentation_flag_names(0), Vec::<&str>::new());
+        assert_eq!(
+            presentation_flag_names(0x7),
+            ["vsync", "hw_clock", "hw_completion"]
+        );
+        assert_eq!(presentation_flag_names(0x8), ["zero_copy"]);
     }
 
     #[test]

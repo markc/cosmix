@@ -198,7 +198,7 @@ The complete L2 read tree is:
 info.{service,version,backend,engine,instance}
 outputs.o_<slug>.{name,default,x,y,width,height,scale,refresh_mhz,
                   usable.{x,y,width,height},
-                  presentation.{clock_id,flags,refresh_us,frames,
+                  presentation.{clock_id,flags,flags_mask,refresh_us,frames,
                     interval_p50_us,interval_p99_us,since_us}}  (presentation: volatile)
 surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
@@ -647,19 +647,42 @@ the updates it skipped count as `discarded`.
 - **Windows:** `windows.s<id>.presentation.*`. Subsurface updates count for
   their window; a frame that shows several surfaces of one window counts
   once. A new role (a new `generation`) starts from zero.
+- **Shown, stalled, hidden.** A frame that samples a newer update presents
+  it. A visible window whose newest update is not sampled yet (a texture
+  still uploading) is stalled: its run continues, and the eventual
+  presentation measures the whole gap and counts the vblanks it missed. A
+  frame that hides a window (minimised, off the output, locked away, or not
+  in the frame at all) discards the updates it did not show, as the feedback
+  protocol does; showing the same content again later is not a new
+  presentation.
 - **Intervals** are measured only between two presentations while the window
-  stays shown, so a minimised or hidden stretch is not one long interval.
-- **`commit_to_present`** is the time from the buffer's commit to the frame
-  that showed it. For a content source it starts when comp first sees the
-  revision.
+  stays shown, so a minimised or hidden stretch is not one long interval. An
+  idle client's gaps are included, so the interval leaves describe cadence
+  only for a client that updates steadily.
+- **`commit_to_present`** runs from the moment the compositor publishes the
+  buffer to the renderer (inside the client's commit, after it is accepted)
+  to the frame that showed it. For a content source it starts when comp
+  first sees the revision.
 - **`missed`** counts vblanks skipped while an update was waiting: for a
   fixed refresh `R`, a gap of `round(interval / R)` vblanks counts the skipped
   ones at or after the moment the oldest waiting update was committed. An
   idle client that commits late misses nothing. With an unknown or variable
   refresh (nested) `missed` is null, never 0: unmeasured is not perfect.
 - **`input_to_present`** is the time from an injected input to the first
-  presented update committed after it (a comp-side upper bound). A content
-  source's update records it when it names the input's `input_seq`.
+  presented update committed after it, within one second (a comp-side upper
+  bound; a hide or reset drops the wait). The input goes to the window that
+  owns the target surface, through subsurfaces and popups. A content
+  source's update records it when it names the input's `input_seq`. These
+  leaves stay null until the `comp.input.*` injection verbs record marks;
+  every injection has its own increasing `input_seq`.
+- **Outputs:** `outputs.o_<slug>.presentation.*` counts presented frames.
+  `flags` names the newest frame's kind flags (`vsync`, `hw_clock`,
+  `hw_completion`, `zero_copy`) and `flags_mask` is the same as a number;
+  both are null before the first frame. `refresh_us` is null when the
+  refresh is unknown (nested) or variable, never 0.
+- **Single output for now:** a frame report names one output and a surface
+  is either shown by it or not; per-output accounting of a window shown on
+  two outputs is not split yet.
 - **Rings** keep the newest 512 samples; `_p50`/`_p99` are nearest-rank
   percentiles over them, null without samples.
 - All times are CLOCK_MONOTONIC microseconds; `since_us` is when counting
@@ -670,7 +693,12 @@ The presentation leaves and the whole `sources` subtree are **volatile**:
 `get`, `list` and `describe` serve them (`describe` says `volatile: true`),
 but `props.changed` never reports them, so a watched client presenting at
 60 Hz does not flood the topic. Row add and remove events carry no
-presentation leaves either.
+presentation leaves either. Reads compute these leaves only for the paths
+they can reach, and property-change diffs never compute them.
+
+Counts saturate. Updates are assumed to be numbered one apart (a surface's
+buffers, a source's revisions); a jump counts every skipped number as
+discarded.
 
 `comp.window.stats {id, generation, samples?}` returns the window's leaves
 plus the newest `samples` (default and maximum 512) of `intervals_us`,

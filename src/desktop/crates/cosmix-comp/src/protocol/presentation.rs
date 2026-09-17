@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use super::presentation_stats::{
     InputMark, PresentSample, PresentationLeaves, PresentationStats, Ring, StatsRegistry,
-    WindowFrame,
+    SurfaceShown, WindowFrame,
 };
 use super::*;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
@@ -310,6 +310,10 @@ pub(crate) struct FrameSurface {
     pub(crate) commit_seq: u64,
     /// Visible, on the output, and sampling that commit's content.
     pub(crate) shown: bool,
+    /// Not shown only because the newest content is not sampled yet (the
+    /// surface is visible): the feedback ledger treats it as not shown, the
+    /// statistics as a stall rather than a hide.
+    pub(crate) waiting: bool,
 }
 
 /// What one presented frame contained.
@@ -354,14 +358,16 @@ impl SourceCounters {
 
     /// The `sources.<id>.presentation.*` leaves.
     pub(crate) fn leaves(&self) -> SourcePresentationLeaves {
+        let upload = self.upload_bytes.summary();
+        let damage = self.damage_px.summary();
         SourcePresentationLeaves {
             common: self.stats.leaves(),
             upload_bytes_total: self.upload_bytes_total,
             damage_px_total: self.damage_px_total,
-            upload_bytes_p50: self.upload_bytes.percentile(50),
-            upload_bytes_p99: self.upload_bytes.percentile(99),
-            damage_px_p50: self.damage_px.percentile(50),
-            damage_px_p99: self.damage_px.percentile(99),
+            upload_bytes_p50: upload.p50,
+            upload_bytes_p99: upload.p99,
+            damage_px_p50: damage.p50,
+            damage_px_p99: damage.p99,
         }
     }
 
@@ -421,6 +427,7 @@ impl SourceLedger {
     pub(crate) fn unregister(&mut self, id: &str, revision: u64) -> Option<SourceCounters> {
         let mut counters = self.sources.remove(id)?;
         counters.revision = counters.revision.max(revision);
+        // Revisions are assumed to be +1 per update (not checked).
         counters.stats.record_discarded(
             counters
                 .revision
@@ -436,12 +443,12 @@ impl SourceLedger {
         source: &FrameSource,
         tv_us: u64,
         refresh_us: Option<u64>,
-        input_mark: impl Fn(u64) -> Option<InputMark>,
+        input_mark: impl Fn(u64, u64) -> Option<InputMark>,
     ) {
         let Some(counters) = self.sources.get_mut(&source.id) else {
             return;
         };
-        counters.frames += 1;
+        counters.frames = counters.frames.saturating_add(1);
         counters.upload_bytes_total = counters
             .upload_bytes_total
             .saturating_add(source.upload_bytes);
@@ -466,8 +473,8 @@ impl SourceLedger {
                 pending_since_us: counters.pending_since_us.take(),
                 answered_input_us: source
                     .consumed_input
-                    .and_then(&input_mark)
-                    .map(|mark| mark.at_us),
+                    .and_then(|input_seq| input_mark(input_seq, tv_us))
+                    .map(|mark| mark.injected_at_us),
             });
             counters.last_presented_revision = source.revision;
         } else if !source.shown {
@@ -799,19 +806,33 @@ impl WaylandState {
             .note_published(id, window, seq, crate::frame_trace::monotonic_us());
     }
 
-    /// Injected input was delivered to `target` as `input_seq`. The first
-    /// update its window commits afterwards records `input_to_present`; a
-    /// content source's update that names `input_seq` does the same.
+    /// THE hook for injected input (the `comp.input.*` verbs call it once
+    /// per injection, with their own `input_seq` counter): `target` is the
+    /// surface the input was delivered to, or none. Its window (the root
+    /// toplevel, through subsurfaces and popups) records `input_to_present`
+    /// for the first update committed afterwards, within a second; a content
+    /// source's update that names `input_seq` does the same. `input_seq`
+    /// must increase across all injections: an old or repeated one is
+    /// refused (returns false).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn note_injected_input(&mut self, target: Option<SurfaceId>, input_seq: u64) {
+    pub(crate) fn note_injected_input(
+        &mut self,
+        target: Option<SurfaceId>,
+        mark: InputMark,
+    ) -> bool {
         let window = target
             .and_then(|id| self.surface_objects.get(&id))
             .and_then(|object| self.surfaces.get(object))
-            .map(|record| record.role.wl_surface().clone())
-            .and_then(|surface| self.stats_window(&surface));
-        self.presentation
-            .stats
-            .mark_input(window, input_seq, crate::frame_trace::monotonic_us());
+            .map(|record| canonical_root_surface(&self.popup_manager, record.role.wl_surface()))
+            .and_then(|root| self.stats_window(&root));
+        let accepted = self.presentation.stats.mark_input(window, mark);
+        if !accepted {
+            tracing::warn!(
+                input_seq = mark.input_seq,
+                "injected input mark refused: input_seq is not newer than the last one"
+            );
+        }
+        accepted
     }
 
     pub(super) fn commit_refused(&mut self, id: SurfaceId, sampled: Option<u64>, seq: u64) {
@@ -850,6 +871,13 @@ impl WaylandState {
                     && (!lock_active || self.surface_is_session_presentable(record))
             });
             let shown = surface.shown && presentable;
+            let state = if shown {
+                SurfaceShown::Shown
+            } else if surface.waiting && presentable {
+                SurfaceShown::Waiting
+            } else {
+                SurfaceShown::Hidden
+            };
             if let Some((window, generation)) = record
                 .map(|record| record.role.wl_surface().clone())
                 .and_then(|wl_surface| self.stats_window(&wl_surface))
@@ -861,7 +889,7 @@ impl WaylandState {
                     surface.id.0,
                     window == surface.id.0,
                     surface.commit_seq,
-                    shown,
+                    state,
                     fold,
                 );
             }
@@ -897,6 +925,9 @@ impl WaylandState {
                 self.discard_presentation_feedback(id, DiscardReason::NotPresentable);
             }
         }
+        self.presentation
+            .stats
+            .hide_unlisted(|window| windows.contains_key(&window));
         for (window, (generation, fold)) in windows {
             self.presentation
                 .stats
@@ -912,8 +943,8 @@ impl WaylandState {
         }
         let PresentationRuntime { sources, stats, .. } = &mut self.presentation;
         for source in &content.sources {
-            sources.resolve(source, time_us, refresh_us, |input_seq| {
-                stats.input_mark(input_seq)
+            sources.resolve(source, time_us, refresh_us, |input_seq, at_us| {
+                stats.input_mark(input_seq, at_us)
             });
         }
     }

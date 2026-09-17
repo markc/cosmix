@@ -29454,6 +29454,7 @@ fn test_frame_report(
                 id,
                 commit_seq,
                 shown,
+                waiting: false,
             }],
             sources: Vec::new(),
         },
@@ -29513,18 +29514,57 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
     assert_eq!(runtime.block_on(watch.receive()).unwrap().into_wire().0, 0);
     drain_observations(&observations);
 
-    // A client committing every frame, without asking for feedback.
+    // A client committing every frame, without asking for feedback, on the
+    // real clock (publish stamps are CLOCK_MONOTONIC). A second window maps
+    // and unmaps inside the watched loop, so row events are covered too.
     let mapped_seq = content_seq(&harness, &object);
+    let start = crate::frame_trace::monotonic_us();
     let mut changed = Vec::new();
+    let mut second = None;
     for frame in 1..=6_u64 {
         commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
         harness.dispatch_client();
-        let (report, content) =
-            test_frame_report(id, frame * 16_667, content_seq(&harness, &object), true);
+        if frame == 2 {
+            second = Some(map_named_test_toplevel(
+                &mut harness,
+                "Second",
+                "dev.cosmix.Second",
+            ));
+        }
+        if frame == 4
+            && let Some((surface, ..)) = second
+        {
+            send_request(&mut harness.client, surface, 1, &words(&[0, 0, 0]));
+            send_request(&mut harness.client, surface, 6, &[]);
+            harness.dispatch_client();
+        }
+        let (report, content) = test_frame_report(
+            id,
+            start + frame * 16_667,
+            content_seq(&harness, &object),
+            true,
+        );
         harness.server.state.frame_presented(report, content);
         port_observation::service_observations(&mut harness.server.state);
         changed.extend(drain_observations(&observations));
     }
+    let (_, _, _, second_object) = second.expect("second window mapped");
+    let second_key = format!(
+        "windows.s{}",
+        harness.server.state.surfaces[&second_object].id.0
+    );
+    let row_events = changed
+        .iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if *path == second_key =>
+            {
+                Some(new.wire_value().is_null())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row_events, [false, true], "row added then removed");
     // Force the full-snapshot diff too.
     harness.server.state.mark_session_observation_dirty();
     port_observation::service_observations(&mut harness.server.state);
@@ -29543,16 +29583,28 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
     assert!(volatile.is_empty(), "{volatile:?}");
 
     let context = harness.server.state.port_context.clone().unwrap();
-    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let all = port_snapshot::ReadScopes::All;
+    // Diff snapshots never carry volatile leaves; read snapshots do.
     let key = format!("s{}", id.0);
+    let diff = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    assert!(diff.windows[&key].presentation.is_none() && diff.sources.is_empty());
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
     let leaves = snapshot.windows[&key].presentation.clone().unwrap();
-    // Only buffers published before the first reported frame (the mapping
-    // content) can have been superseded.
+    // The mapping content was never in a reported frame: superseded.
     assert_eq!(leaves.presented, 6);
-    assert!(leaves.discarded <= mapped_seq, "{leaves:?}");
+    assert_eq!(leaves.discarded, mapped_seq, "{leaves:?}");
     assert_eq!(leaves.interval_p50_us, Some(16_667));
     assert_eq!(leaves.missed, None, "nested refresh is unknown");
-    assert!(leaves.commit_to_present_p50_us.is_some());
+    assert!(leaves.commit_to_present_p50_us.unwrap() > 0, "{leaves:?}");
+    let scoped = port_snapshot::ReadScopes::Paths(vec!["outputs".into()]);
+    let narrow = port_snapshot::read_snapshot(&harness.server.state, &context, &scoped).unwrap();
+    assert!(narrow.windows[&key].presentation.is_none(), "out of scope");
+    assert!(
+        narrow
+            .outputs
+            .values()
+            .all(|row| row.presentation.is_some())
+    );
     let tree = serde_json::to_value(&snapshot).unwrap();
     assert_eq!(tree["windows"][&key]["presentation"]["presented"], 6);
     let output = snapshot
@@ -29592,7 +29644,15 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
     assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
 
     // Injected input: the next update committed after it answers it.
-    harness.server.state.note_injected_input(Some(id), 1);
+    let mark = presentation_stats::InputMark {
+        input_seq: 1,
+        injected_at_us: crate::frame_trace::monotonic_us(),
+    };
+    assert!(harness.server.state.note_injected_input(Some(id), mark));
+    assert!(
+        !harness.server.state.note_injected_input(Some(id), mark),
+        "an input_seq names one injection"
+    );
     commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     harness.dispatch_client();
     let tv = crate::frame_trace::monotonic_us() + 1_000;
@@ -29648,7 +29708,7 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
         content.sources.push(source(revision, upload));
         harness.server.state.frame_presented(report, content);
     }
-    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
     let scene = &snapshot.sources["scene"];
     assert_eq!(
         (scene.revision, scene.registration, scene.output.as_deref()),
@@ -29686,7 +29746,7 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
     assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
     let (rc, _) = stats_reply(&mut harness, WindowOp::StatsReset { target: None });
     assert_eq!(rc, 0);
-    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
     assert_eq!(snapshot.sources["scene"].presentation.upload_bytes_total, 0);
     let window_leaves = snapshot.windows[&key].presentation.as_ref().unwrap();
     assert_eq!(window_leaves.presented, 0);
@@ -29701,7 +29761,7 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
     );
 
     harness.server.state.content_source_unregistered("scene", 3);
-    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
     assert!(snapshot.sources.is_empty());
     let (rc, body) = stats_reply(
         &mut harness,

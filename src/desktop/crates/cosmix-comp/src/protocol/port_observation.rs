@@ -2872,6 +2872,7 @@ mod tests {
             presentation: Some(crate::protocol::port_snapshot::OutputPresentationSnapshot {
                 clock_id: 1,
                 flags: None,
+                flags_mask: None,
                 refresh_us: None,
                 frames: 9,
                 interval_p50_us: None,

@@ -256,7 +256,7 @@ fn source(revision: u64, shown: bool, upload: u64) -> FrameSource {
     }
 }
 
-fn no_marks(_: u64) -> Option<InputMark> {
+fn no_marks(_: u64, _: u64) -> Option<InputMark> {
     None
 }
 
@@ -328,11 +328,13 @@ fn source_timing_input_and_reset() {
         consumed_input: input,
         ..source(revision, shown, 8)
     };
-    let marks = |seq: u64| {
-        (seq == 42).then_some(InputMark {
-            input_seq: 42,
-            at_us: 1_000,
-        })
+    let marks = |seq: u64, at_us: u64| {
+        (seq == 42)
+            .then_some(InputMark {
+                input_seq: 42,
+                injected_at_us: 1_000,
+            })
+            .filter(|mark| mark.live_at(at_us))
     };
     // 60 Hz: a revision written at 1_000 and shown at 16_000.
     ledger.resolve(

@@ -62,6 +62,9 @@ pub(crate) enum PortCommand {
 
 pub(crate) struct PortRequest {
     pub(crate) reply: tokio::sync::oneshot::Sender<Arc<CompSnapshot>>,
+    /// The path the read can reach (`None` = the whole tree), so volatile
+    /// leaves are computed only where they can be read.
+    pub(crate) scope: Option<String>,
 }
 
 pub(crate) struct PortReply {
@@ -338,9 +341,17 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
+    #[cfg(test)]
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
+        self.request_scoped_snapshot(None)
+    }
+
+    pub(crate) fn request_scoped_snapshot(
+        &self,
+        scope: Option<String>,
+    ) -> Result<SnapshotAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.admit(PortCommand::Snapshot(PortRequest { reply }), receive)
+        self.admit(PortCommand::Snapshot(PortRequest { reply, scope }), receive)
             .map(SnapshotAdmission)
     }
 
@@ -1287,7 +1298,8 @@ fn handle_incoming(
             return;
         }
     };
-    let admission = match ingress.request_snapshot() {
+    let scope = read_scope(&command.command, &command.args);
+    let admission = match ingress.request_scoped_snapshot(scope) {
         Ok(admission) => admission,
         Err(()) => {
             queue_reply(
@@ -1568,6 +1580,16 @@ fn parse_stats_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
         }
     };
     Ok(WindowOp::Stats { target, samples })
+}
+
+/// The tree path a read verb can reach; `None` for the whole tree.
+fn read_scope(verb: &str, args: &Value) -> Option<String> {
+    let key = match verb {
+        "comp.info" => return Some("info".to_string()),
+        "comp.props.list" => "prefix",
+        _ => "path",
+    };
+    args.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
