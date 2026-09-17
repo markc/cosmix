@@ -995,8 +995,12 @@ enum ProtocolCommand {
         id: String,
         revision: u64,
     },
+    /// A committed buffer will never be shown. With `sampled`, every
+    /// pending commit in `(sampled, commit_seq]` is gone too (requests the
+    /// failed one superseded); without it, only `commit_seq`.
     CommitRefused {
         id: SurfaceId,
+        sampled: Option<u64>,
         commit_seq: u64,
     },
     /// A backend wired its frame reporter: advertise `wp_presentation`.
@@ -1343,7 +1347,11 @@ impl ClientSceneFeed {
     pub(crate) fn commit_refused(&self, id: SurfaceId, commit_seq: u64) {
         if self
             .commands
-            .send(ProtocolCommand::CommitRefused { id, commit_seq })
+            .send(ProtocolCommand::CommitRefused {
+                id,
+                sampled: None,
+                commit_seq,
+            })
             .is_err()
         {
             tracing::debug!(
@@ -1544,6 +1552,25 @@ impl FramePresentationReporter {
             .is_err()
         {
             tracing::debug!("protocol thread gone before a frame presentation report");
+        }
+    }
+
+    /// A DMA-BUF import failed for good (see `frame_content::Refusal`).
+    /// Sent as soon as the renderer sees it, not with a frame report.
+    pub(crate) fn commit_refused(&self, id: SurfaceId, sampled: Option<u64>, commit_seq: u64) {
+        if self
+            .commands
+            .send(ProtocolCommand::CommitRefused {
+                id,
+                sampled,
+                commit_seq,
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                surface_id = id.0,
+                "protocol thread gone before a refused commit"
+            );
         }
     }
 
@@ -3458,8 +3485,12 @@ impl ProtocolServer {
                 ChannelEvent::Msg(ProtocolCommand::ContentSourceUnregistered { id, revision }) => {
                     state.content_source_unregistered(&id, revision);
                 }
-                ChannelEvent::Msg(ProtocolCommand::CommitRefused { id, commit_seq }) => {
-                    state.commit_refused(id, commit_seq);
+                ChannelEvent::Msg(ProtocolCommand::CommitRefused {
+                    id,
+                    sampled,
+                    commit_seq,
+                }) => {
+                    state.commit_refused(id, sampled, commit_seq);
                 }
                 ChannelEvent::Msg(ProtocolCommand::EnablePresentation) => {
                     state.enable_presentation();

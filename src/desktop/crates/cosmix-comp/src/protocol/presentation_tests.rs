@@ -180,13 +180,18 @@ fn a_refused_commit_is_discarded_and_others_keep_waiting() {
     // A bufferless commit after 2 inherits its sequence.
     ledger.take_on_commit(S, 2, vec![Fake::new(3, &log)]);
     ledger.take_on_commit(S, 3, vec![Fake::new(4, &log)]);
-    assert_eq!(ledger.discard_commit(S, 2).discarded, [(2, 2)]);
+    assert_eq!(ledger.discard_range(S, 2, 2).discarded, [(2, 2)]);
     assert_eq!(
         *log.borrow(),
         [Resolved::Discarded(2), Resolved::Discarded(3)]
     );
     assert_eq!(ledger.pending_count(S), 2);
-    assert_eq!(ledger.discard_commit(S, 9), Resolution::default());
+    assert_eq!(ledger.discard_range(S, 9, 9), Resolution::default());
+    // A range takes superseded requests too, and nothing outside it.
+    ledger.take_on_commit(S, 4, vec![Fake::new(5, &log)]);
+    ledger.take_on_commit(S, 5, vec![Fake::new(6, &log)]);
+    assert_eq!(ledger.discard_range(S, 2, 4).discarded, [(3, 1), (4, 1)]);
+    assert_eq!(ledger.pending_count(S), 2, "seq 1 and 5 remain");
     ledger.discard_surface(S);
 }
 

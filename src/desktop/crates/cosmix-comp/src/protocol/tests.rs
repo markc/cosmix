@@ -29454,7 +29454,6 @@ fn test_frame_report(
                 shown,
             }],
             sources: Vec::new(),
-            refused: Vec::new(),
         },
     )
 }
@@ -29748,7 +29747,7 @@ fn presentation_feedback_of_refused_buffers_is_discarded() {
     let kept = request_presentation_feedback(&mut harness, presentation);
     commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     harness.dispatch_client();
-    harness.server.state.commit_refused(id, seq);
+    harness.server.state.commit_refused(id, None, seq);
     let events = harness.sync();
     assert_eq!(feedback_opcodes(&events, direct), [2], "{events:?}");
     assert!(
@@ -29756,13 +29755,74 @@ fn presentation_feedback_of_refused_buffers_is_discarded() {
         "a later commit keeps waiting"
     );
 
+    // M1(a): a bufferless commit on top of refused content is discarded at
+    // once instead of waiting for content that will never be sampled.
     let reported = content_seq(&harness, &object);
-    let (frame, mut content) = test_frame_report(id, 9, 0, false);
-    content.surfaces.clear();
-    content.refused.push((id, reported));
-    harness.server.state.frame_presented(frame, content);
+    harness
+        .server
+        .state
+        .commit_refused(id, Some(seq.saturating_sub(1)), reported);
     let events = harness.sync();
     assert_eq!(feedback_opcodes(&events, kept), [2], "{events:?}");
+    let on_refused = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, on_refused), [2], "{events:?}");
+    // New content lifts the block.
+    let after = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    let (frame, content) = test_frame_report(id, 11, content_seq(&harness, &object), true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, after), [1], "{events:?}");
+}
+
+/// M1(b): a DMA-BUF import that failed after superseding a still-pending
+/// request takes that request's feedback with it, since neither will ever
+/// be installed.
+#[test]
+fn a_render_refusal_discards_the_requests_it_superseded() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let sampled = content_seq(&harness, &object);
+    let superseded = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let failed = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let later = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let newest = content_seq(&harness, &object);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        3
+    );
+    // The renderer still samples `sampled`; the import for newest - 1 failed.
+    harness
+        .server
+        .state
+        .commit_refused(id, Some(sampled), newest - 1);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, superseded), [2], "{events:?}");
+    assert_eq!(feedback_opcodes(&events, failed), [2], "{events:?}");
+    assert!(feedback_opcodes(&events, later).is_empty());
+    let (frame, content) = test_frame_report(id, 12, newest, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, later), [1], "{events:?}");
 }
 
 /// A role change (the xdg_toplevel is destroyed) discards what waits.

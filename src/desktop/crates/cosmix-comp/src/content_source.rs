@@ -48,7 +48,7 @@ impl ContentSourceId {
 #[component(
     immutable,
     on_insert = content_source_inserted,
-    on_discard = content_source_discarded
+    on_remove = content_source_removed
 )]
 pub(crate) struct ContentSource {
     pub(crate) id: ContentSourceId,
@@ -95,10 +95,34 @@ pub(crate) struct ContentSourceRejected(pub(crate) String);
 struct ContentSourceRegistry {
     by_id: HashMap<ContentSourceId, Entity>,
     by_entity: HashMap<Entity, ContentSourceId>,
-    /// Refused duplicates, in arrival order, per id.
+    /// Refused duplicates, in arrival order, per id (never empty).
     waiting: HashMap<ContentSourceId, VecDeque<Entity>>,
+    waiting_by_entity: HashMap<Entity, ContentSourceId>,
     /// Newest revision seen per registered source, for unregister's count.
     revisions: HashMap<ContentSourceId, u64>,
+}
+
+impl ContentSourceRegistry {
+    fn remove_waiter(&mut self, id: &ContentSourceId, entity: Entity) {
+        if let Some(queue) = self.waiting.get_mut(id) {
+            queue.retain(|waiter| *waiter != entity);
+            if queue.is_empty() {
+                self.waiting.remove(id);
+            }
+        }
+    }
+
+    fn next_waiter(&mut self, id: &ContentSourceId) -> Option<Entity> {
+        let queue = self.waiting.get_mut(id)?;
+        let next = queue.pop_front();
+        if queue.is_empty() {
+            self.waiting.remove(id);
+        }
+        if let Some(next) = next {
+            self.waiting_by_entity.remove(&next);
+        }
+        next
+    }
 }
 
 /// This frame's per-source snapshot, taken after visibility is computed.
@@ -124,6 +148,8 @@ impl ExtractedContentSources {
                 Some(previous) => FrameSource {
                     upload_bytes: previous.upload_bytes.saturating_add(source.upload_bytes),
                     damage_px: previous.damage_px.saturating_add(source.damage_px),
+                    // One slot: only the newest answered input is kept
+                    // between reports.
                     consumed_input: source.consumed_input.or(previous.consumed_input),
                     ..source.clone()
                 },
@@ -132,7 +158,10 @@ impl ExtractedContentSources {
             .collect();
     }
 
-    /// A presented frame report took the accumulated costs.
+    /// A presented frame report took the accumulated costs. Every backend
+    /// that reports frames must call this after sending a report (nested
+    /// does in main.rs; kms-live must in Step 5), or the totals it reports
+    /// keep growing until they saturate.
     pub(crate) fn consume(&mut self) {
         for source in &mut self.0 {
             source.upload_bytes = 0;
@@ -170,20 +199,72 @@ fn register(world: &mut DeferredWorld, entity: Entity, id: ContentSourceId) {
     }
 }
 
+/// Take `entity` out of the registry (registered or waiting). A registered
+/// id passes to the oldest waiter still carrying it.
+fn forget_entity(world: &mut DeferredWorld, entity: Entity) {
+    let reporter = world.get_resource::<FramePresentationReporter>().cloned();
+    let Some(mut registry) = world.get_resource_mut::<ContentSourceRegistry>() else {
+        return;
+    };
+    if let Some(id) = registry.waiting_by_entity.remove(&entity) {
+        registry.remove_waiter(&id, entity);
+    }
+    let Some(id) = registry.by_entity.remove(&entity) else {
+        return;
+    };
+    registry.by_id.remove(&id);
+    let revision = registry.revisions.remove(&id).unwrap_or(0);
+    let successor = registry.next_waiter(&id);
+    if let Some(reporter) = &reporter {
+        reporter.source_unregistered(id.as_str().to_string(), revision);
+    }
+    let Some(successor) = successor else {
+        return;
+    };
+    world
+        .commands()
+        .entity(successor)
+        .try_remove::<ContentSourceRejected>();
+    register(world, successor, id);
+}
+
 fn content_source_inserted(mut world: DeferredWorld, context: HookContext) {
     let entity = context.entity;
     let Some(source) = world.get::<ContentSource>(entity).cloned() else {
         return;
     };
-    let refusal = match ContentSourceId::new(source.id.as_str()) {
-        Err(error) => Some(error),
-        Ok(id) => world
-            .get_resource::<ContentSourceRegistry>()
-            .and_then(|registry| registry.by_id.get(&id).copied())
-            .filter(|holder| *holder != entity)
-            .map(|_| format!("content source id {:?} is already registered", id.as_str())),
-    };
-    if let Some(reason) = refusal {
+    let (registered, waiting) = world
+        .get_resource::<ContentSourceRegistry>()
+        .map(|registry| {
+            (
+                registry.by_entity.get(&entity).cloned(),
+                registry.waiting_by_entity.get(&entity).cloned(),
+            )
+        })
+        .unwrap_or_default();
+    // Re-inserting the same id keeps the registration (and its stats) or
+    // the place in the queue.
+    if registered.as_ref() == Some(&source.id) || waiting.as_ref() == Some(&source.id) {
+        return;
+    }
+    forget_entity(&mut world, entity);
+    if let Err(reason) = ContentSourceId::new(source.id.as_str()) {
+        // Invalid ids never become valid: refused, not queued.
+        warn!(%reason, "content source refused");
+        world
+            .commands()
+            .entity(entity)
+            .try_insert(ContentSourceRejected(reason));
+        return;
+    }
+    let holder = world
+        .get_resource::<ContentSourceRegistry>()
+        .and_then(|registry| registry.by_id.get(&source.id).copied());
+    if holder.is_some() {
+        let reason = format!(
+            "content source id {:?} is already registered",
+            source.id.as_str()
+        );
         warn!(%reason, "content source refused");
         if let Some(mut registry) = world.get_resource_mut::<ContentSourceRegistry>() {
             registry
@@ -191,64 +272,23 @@ fn content_source_inserted(mut world: DeferredWorld, context: HookContext) {
                 .entry(source.id.clone())
                 .or_default()
                 .push_back(entity);
+            registry.waiting_by_entity.insert(entity, source.id.clone());
         }
         world
             .commands()
             .entity(entity)
-            .insert(ContentSourceRejected(reason));
+            .try_insert(ContentSourceRejected(reason));
         return;
     }
     world
         .commands()
         .entity(entity)
-        .remove::<ContentSourceRejected>();
+        .try_remove::<ContentSourceRejected>();
     register(&mut world, entity, source.id);
 }
 
-fn content_source_discarded(mut world: DeferredWorld, context: HookContext) {
-    let entity = context.entity;
-    let Some(source) = world.get::<ContentSource>(entity).cloned() else {
-        return;
-    };
-    let reporter = world.get_resource::<FramePresentationReporter>().cloned();
-    let Some(mut registry) = world.get_resource_mut::<ContentSourceRegistry>() else {
-        return;
-    };
-    if let Some(waiting) = registry.waiting.get_mut(&source.id) {
-        waiting.retain(|waiter| *waiter != entity);
-    }
-    if registry.by_entity.get(&entity) != Some(&source.id) {
-        return;
-    }
-    registry.by_entity.remove(&entity);
-    registry.by_id.remove(&source.id);
-    let revision = registry.revisions.remove(&source.id).unwrap_or(0);
-    // The next refused duplicate that still carries this id takes over.
-    let successor = registry
-        .waiting
-        .get_mut(&source.id)
-        .and_then(|waiting| waiting.pop_front());
-    if registry
-        .waiting
-        .get(&source.id)
-        .is_some_and(VecDeque::is_empty)
-    {
-        registry.waiting.remove(&source.id);
-    }
-    if let Some(reporter) = &reporter {
-        reporter.source_unregistered(source.id.as_str().to_string(), revision);
-    }
-    if let Some(successor) = successor
-        && world
-            .get::<ContentSource>(successor)
-            .is_some_and(|candidate| candidate.id == source.id)
-    {
-        world
-            .commands()
-            .entity(successor)
-            .remove::<ContentSourceRejected>();
-        register(&mut world, successor, source.id);
-    }
+fn content_source_removed(mut world: DeferredWorld, context: HookContext) {
+    forget_entity(&mut world, context.entity);
 }
 
 fn snapshot_content_sources(
@@ -387,7 +427,49 @@ mod tests {
         app.update();
         assert!(registered(&app).is_empty());
         let registry = app.world().resource::<ContentSourceRegistry>();
-        assert!(registry.by_entity.is_empty() && registry.waiting.len() <= 1);
+        assert!(registry.by_entity.is_empty());
+        assert!(
+            registry.waiting.is_empty() && registry.waiting_by_entity.is_empty(),
+            "invalid ids are not queued and empty queues are dropped"
+        );
+    }
+
+    #[test]
+    fn re_inserting_the_same_id_keeps_the_registration() {
+        let mut app = app();
+        let holder = app.world_mut().spawn(source("scene")).id();
+        let waiter = app.world_mut().spawn(source("scene")).id();
+        app.update();
+        app.world_mut()
+            .resource_mut::<ContentSourceRegistry>()
+            .revisions
+            .insert(ContentSourceId("scene".into()), 9);
+        // Same id on the holder: no unregister, no hand-over, stats kept.
+        app.world_mut().entity_mut(holder).insert(source("scene"));
+        app.update();
+        assert_eq!(registered(&app), [("scene".to_string(), holder)]);
+        assert!(rejected(&app, waiter));
+        assert_eq!(
+            app.world()
+                .resource::<ContentSourceRegistry>()
+                .revisions
+                .get(&ContentSourceId("scene".into())),
+            Some(&9)
+        );
+        // Same id on the waiter: it keeps its place.
+        app.world_mut().entity_mut(waiter).insert(source("scene"));
+        app.update();
+        assert!(rejected(&app, waiter));
+        // The waiter moves to another id: it leaves the queue and registers.
+        app.world_mut().entity_mut(waiter).insert(source("other"));
+        app.update();
+        assert!(!rejected(&app, waiter));
+        let registry = app.world().resource::<ContentSourceRegistry>();
+        assert!(registry.waiting.is_empty());
+        assert_eq!(
+            registered(&app),
+            [("other".to_string(), waiter), ("scene".to_string(), holder)]
+        );
     }
 
     #[test]

@@ -208,9 +208,10 @@ impl<F: Feedback> PresentationLedger<F> {
         resolution
     }
 
-    /// The renderer refused this commit's buffer: its feedback (and that of
-    /// bufferless commits that inherited its sequence) is never shown.
-    pub(crate) fn discard_commit(&mut self, id: SurfaceId, seq: u64) -> Resolution {
+    /// Commits in `from..=to` will never be shown (a refused buffer, the
+    /// bufferless commits that inherited its sequence, and requests it
+    /// superseded while they were pending).
+    pub(crate) fn discard_range(&mut self, id: SurfaceId, from: u64, to: u64) -> Resolution {
         let mut resolution = Resolution::default();
         let Some(queue) = self.pending.get_mut(&id) else {
             return resolution;
@@ -218,7 +219,7 @@ impl<F: Feedback> PresentationLedger<F> {
         let counters = self.counters.entry(id).or_default();
         let (refused, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(queue)
             .into_iter()
-            .partition(|entry| entry.seq == seq);
+            .partition(|entry| (from..=to).contains(&entry.seq));
         *queue = kept;
         for entry in refused {
             discard_entry(entry, counters, &mut resolution);
@@ -307,9 +308,6 @@ pub(crate) struct FrameSurface {
 pub(crate) struct FrameContent {
     pub(crate) surfaces: Vec<FrameSurface>,
     pub(crate) sources: Vec<FrameSource>,
-    /// Commits whose buffer the renderer failed to import after accepting
-    /// them: `(surface, content sequence)`.
-    pub(crate) refused: Vec<(SurfaceId, u64)>,
 }
 
 /// Accounting for one registered content source.
@@ -401,6 +399,9 @@ pub(crate) struct PresentationRuntime {
     global: Option<PresentationState>,
     pub(crate) ledger: PresentationLedger<PresentationFeedbackCallback>,
     pub(crate) sources: SourceLedger,
+    /// Per surface, the newest content sequence the renderer refused. A
+    /// bufferless commit that still carries it can never be shown.
+    refused: HashMap<SurfaceId, u64>,
     /// Surfaces committed in the transaction being applied, with what the
     /// commit path needs to judge whether the commit became content.
     applied_commits: Vec<AppliedCommit>,
@@ -536,6 +537,22 @@ impl WaylandState {
             return;
         };
         let (id, seq) = (record.id, record.content_seq);
+        match self.presentation.refused.get(&id) {
+            Some(refused) if *refused == seq => {
+                // A bufferless commit on top of refused content.
+                for callback in callbacks {
+                    callback.discarded();
+                }
+                crate::frame_trace::event("comp_presentation_discarded", || {
+                    (id.0, seq, DiscardReason::Refused as u64)
+                });
+                return;
+            }
+            Some(refused) if *refused < seq => {
+                self.presentation.refused.remove(&id);
+            }
+            _ => {}
+        }
         let overflow = self.presentation.ledger.take_on_commit(id, seq, callbacks);
         trace_discards(id, &overflow, DiscardReason::Overflow);
     }
@@ -551,11 +568,15 @@ impl WaylandState {
     pub(super) fn forget_presentation_surface(&mut self, id: SurfaceId) {
         self.discard_presentation_feedback(id, DiscardReason::Destroy);
         self.presentation.ledger.forget_counters(id);
+        self.presentation.refused.remove(&id);
     }
 
-    pub(super) fn commit_refused(&mut self, id: SurfaceId, seq: u64) {
-        let resolution = self.presentation.ledger.discard_commit(id, seq);
+    pub(super) fn commit_refused(&mut self, id: SurfaceId, sampled: Option<u64>, seq: u64) {
+        let from = sampled.map_or(seq, |sampled| sampled.saturating_add(1));
+        let resolution = self.presentation.ledger.discard_range(id, from, seq);
         trace_discards(id, &resolution, DiscardReason::Refused);
+        let refused = self.presentation.refused.entry(id).or_default();
+        *refused = (*refused).max(seq);
     }
 
     /// Session lock needs no discard of its own: a report during the lock
@@ -567,9 +588,6 @@ impl WaylandState {
         };
         let lock_active = self.session_lock_active();
         let time_us = u64::try_from(frame.time.as_micros()).unwrap_or(u64::MAX);
-        for (id, seq) in &content.refused {
-            self.commit_refused(*id, *seq);
-        }
         let mut reported = HashSet::new();
         for surface in &content.surfaces {
             reported.insert(surface.id);

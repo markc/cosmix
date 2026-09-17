@@ -714,6 +714,20 @@ impl ImportedDmabufImages {
         Some(import_progress(imports.active.get(&id)?, latest))
     }
 
+    /// [`Self::progress`] for many images under one registry lock.
+    pub fn progress_batch(&self, ids: &[AssetId<Image>]) -> Vec<Option<ImportProgress>> {
+        let imports = self
+            .0
+            .lock()
+            .expect("DMA-BUF import registry mutex poisoned");
+        ids.iter()
+            .map(|id| {
+                let latest = *imports.latest_requests.get(id)?;
+                Some(import_progress(imports.active.get(id)?, latest))
+            })
+            .collect()
+    }
+
     /// Evict one destroyed `wl_buffer` from the strong import cache.
     ///
     /// Active render uses retain their backing until normal replacement or
@@ -3086,6 +3100,14 @@ mod tests {
             let registry = imports.0.lock().expect("registry mutex");
             assert_eq!(registry.pending_requests.get(&first.id()), Some(&3));
         }
+        assert_eq!(
+            imports.progress_batch(&[second.id(), AssetId::<Image>::default(), first.id()]),
+            [
+                imports.progress(second.id()),
+                None,
+                imports.progress(first.id())
+            ]
+        );
         imports.unregister(&first);
         assert_eq!(imports.progress(first.id()), None);
         assert!(imports.progress(AssetId::<Image>::default()).is_none());

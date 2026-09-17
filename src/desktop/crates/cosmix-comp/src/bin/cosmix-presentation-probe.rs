@@ -349,7 +349,12 @@ fn run() -> Result<bool, String> {
     let mut presented = Vec::new();
     let mut shown_discarded = 0;
     let mut superseded_discarded = 0;
-    let mut superseded_presented = 0;
+    // A superseded commit may legitimately be presented if a frame showed
+    // it before the next commit arrived; presenting it at or after that
+    // commit's time would be a lie.
+    let mut superseded_presented_early = 0;
+    let mut superseded_presented_late = 0;
+    let mut shown_presented = 0;
     let mut tv_before_commit = 0;
     let mut unsynced = 0;
     for (commit, slot) in probe.feedback.iter().enumerate() {
@@ -365,8 +370,15 @@ fn run() -> Result<bool, String> {
                 flags,
                 synced,
             }) => {
-                if !last {
-                    superseded_presented += 1;
+                if last {
+                    shown_presented += 1;
+                } else if commit_times
+                    .get(commit + 1)
+                    .is_some_and(|superseded_at| time >= *superseded_at)
+                {
+                    superseded_presented_late += 1;
+                } else {
+                    superseded_presented_early += 1;
                 }
                 if time < commit_times[commit] {
                     tv_before_commit += 1;
@@ -404,10 +416,15 @@ fn run() -> Result<bool, String> {
     // At least 90% of the shown commits, and never zero.
     let min_presented = options.frames.saturating_mul(9).div_ceil(10).max(1);
     let clock_ok = probe.clock_id == Some(libc::CLOCK_MONOTONIC as u32);
-    let superseded_expected = if burst > 1 { options.frames } else { 0 };
-    let pass = presented.len() >= min_presented
-        && superseded_presented == 0
-        && superseded_discarded == superseded_expected
+    // At least 90% of the superseded commits are discarded when bursting.
+    let min_superseded_discarded = if burst > 1 {
+        options.frames.saturating_mul(9).div_ceil(10)
+    } else {
+        0
+    };
+    let pass = shown_presented >= min_presented
+        && superseded_presented_late == 0
+        && superseded_discarded >= min_superseded_discarded
         && tv_before_commit == 0
         && unsynced == 0
         && !probe.outputs.is_empty()
@@ -419,7 +436,8 @@ fn run() -> Result<bool, String> {
         && clock_ok;
     println!(
         "COSMIX_PRESENTATION_PROBE {} frames={} burst={} commits={} presented={} \
-         shown_discarded={} superseded_discarded={} superseded_presented={} \
+         shown_presented={} shown_discarded={} superseded_discarded={} \
+         superseded_presented_early={} superseded_presented_late={} \
          min_presented={} clock_id={} outputs={} unsynced={} tv_before_commit={} \
          tv_first_us={} tv_last_us={} window_start_us={} commits_done_us={} \
          window_end_us={} increasing={} in_window={} flags_zero={} seq_zero={} \
@@ -429,9 +447,11 @@ fn run() -> Result<bool, String> {
         burst,
         commits,
         presented.len(),
+        shown_presented,
         shown_discarded,
         superseded_discarded,
-        superseded_presented,
+        superseded_presented_early,
+        superseded_presented_late,
         min_presented,
         probe
             .clock_id

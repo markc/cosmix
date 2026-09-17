@@ -30,7 +30,7 @@ use crate::{
     compositor_scene::{LogicalCanvasSize, SurfaceEntities},
     content_source::ExtractedContentSources,
     protocol::{
-        SurfaceId,
+        FramePresentationReporter, SurfaceId,
         presentation::{FrameContent, FrameSurface},
     },
 };
@@ -141,14 +141,36 @@ pub(crate) fn extract_for_test(main: &mut World) -> Vec<(SurfaceId, bool, u64)> 
     extracted
 }
 
+/// A DMA-BUF commit whose import failed for good. `sampled` is the newest
+/// commit the surface's frames sample (0 when none): every pending commit
+/// in `(sampled, refused]` will never be shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub(crate) id: SurfaceId,
+    pub(crate) sampled: u64,
+    pub(crate) refused: u64,
+}
+
 fn resolve_frame_content(
     extracted: Res<ExtractedFrameSurfaces>,
     sources: Option<Res<ExtractedContentSources>>,
     images: Option<Res<RenderAssets<GpuImage>>>,
     imports: Option<Res<ImportedDmabufImages>>,
+    reporter: Option<Res<FramePresentationReporter>>,
     mut memory: ResMut<FrameContentMemory>,
     mut content: ResMut<RenderFrameContent>,
 ) {
+    // One registry lock for every DMA-BUF surface in the frame.
+    let dmabuf_images = extracted
+        .0
+        .iter()
+        .filter(|surface| surface.dmabuf_requests.is_some())
+        .map(|surface| surface.image)
+        .collect::<Vec<_>>();
+    let mut progress = match (&imports, dmabuf_images.is_empty()) {
+        (Some(imports), false) => imports.progress_batch(&dmabuf_images).into_iter(),
+        _ => Vec::new().into_iter(),
+    };
     let surfaces = extracted
         .0
         .iter()
@@ -156,18 +178,27 @@ fn resolve_frame_content(
             let gpu_ready = images
                 .as_ref()
                 .is_some_and(|images| images.get(surface.image).is_some());
-            let progress = surface
-                .dmabuf_requests
-                .as_ref()
-                .and(imports.as_ref())
-                .and_then(|imports| imports.progress(surface.image));
+            let progress = if surface.dmabuf_requests.is_some() {
+                progress.next().flatten()
+            } else {
+                None
+            };
             (surface.clone(), gpu_ready, progress)
         })
         .collect::<Vec<_>>();
+    // Refusals do not wait for a presented frame: a frame that is never
+    // reported must not strand them. They are marked delivered only once
+    // sent (without a reporter nothing is advertised, so nothing waits).
     content.0 = frame_content(
         &surfaces,
         sources.map(|sources| sources.0.clone()).unwrap_or_default(),
         &mut memory.0,
+        |refusal| {
+            reporter.as_ref().is_some_and(|reporter| {
+                reporter.commit_refused(refusal.id, Some(refusal.sampled), refusal.refused);
+                true
+            })
+        },
     );
 }
 
@@ -186,6 +217,10 @@ fn sampled_commit(
     match &surface.dmabuf_requests {
         // SHM: a prepared image holds the newest extracted buffer.
         None => Some(surface.commit),
+        // Relies on the bridge's `installed` matching the GpuImage: if Bevy
+        // re-prepared the uninitialised placeholder over an imported view
+        // (see `set_client_image_linear` in compositor_scene.rs) while the
+        // registry still says Applied, this reports the import as sampled.
         // DMA-BUF: the bridge swaps images in place and keeps the previous
         // one while a replacement is pending or after it failed, so only
         // the installed request names what is sampled.
@@ -220,6 +255,7 @@ fn frame_content(
     surfaces: &[(ExtractedFrameSurface, bool, Option<ImportProgress>)],
     sources: Vec<crate::protocol::presentation::FrameSource>,
     memory: &mut HashMap<SurfaceId, SurfaceMemory>,
+    mut deliver_refusal: impl FnMut(Refusal) -> bool,
 ) -> FrameContent {
     let live = surfaces
         .iter()
@@ -229,19 +265,22 @@ fn frame_content(
     let mut frame = FrameContent {
         surfaces: Vec::with_capacity(surfaces.len()),
         sources,
-        refused: Vec::new(),
     };
     for (surface, gpu_ready, progress) in surfaces {
         let remembered = memory.entry(surface.id).or_default();
-        if let Some(refused) = refused_commit(surface, *progress)
-            && remembered.refused.is_none_or(|previous| previous < refused)
-        {
-            remembered.refused = Some(refused);
-            frame.refused.push((surface.id, refused));
-        }
         let sampled = sampled_commit(surface, *gpu_ready, *progress);
         if let Some(commit) = sampled {
             remembered.matched = Some(remembered.matched.map_or(commit, |old| old.max(commit)));
+        }
+        if let Some(refused) = refused_commit(surface, *progress)
+            && remembered.refused.is_none_or(|previous| previous < refused)
+            && deliver_refusal(Refusal {
+                id: surface.id,
+                sampled: remembered.matched.unwrap_or(0),
+                refused,
+            })
+        {
+            remembered.refused = Some(refused);
         }
         frame.surfaces.push(match (surface.visible, sampled) {
             (true, Some(commit)) => FrameSurface {
@@ -317,12 +356,12 @@ mod tests {
             ],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         assert_eq!(
             frame.surfaces,
             [shown(1, 3, true), shown(2, 5, false), shown(3, 0, false)]
         );
-        assert!(frame.refused.is_empty());
     }
 
     #[test]
@@ -332,21 +371,24 @@ mod tests {
             &[(surface(1, 3, true), true, None)],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         let frame = frame_content(
             &[(surface(1, 4, true), false, None)],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         assert_eq!(frame.surfaces, [shown(1, 3, false)]);
         let frame = frame_content(
             &[(surface(1, 4, true), true, None)],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         assert_eq!(frame.surfaces, [shown(1, 4, true)]);
         // A surface that left the scene is forgotten.
-        frame_content(&[], Vec::new(), &mut memory);
+        frame_content(&[], Vec::new(), &mut memory, |_| true);
         assert!(memory.is_empty());
     }
 
@@ -359,6 +401,7 @@ mod tests {
             &[(dmabuf(1, 2, &requests), true, progress(11, Some(10), true))],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         assert_eq!(frame.surfaces, [shown(1, 1, true)]);
         // Nothing installed yet (first import pending): not shown, even
@@ -367,6 +410,7 @@ mod tests {
             &[(dmabuf(2, 1, &[(20, 1)]), true, progress(20, None, true))],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         assert_eq!(frame.surfaces, [shown(2, 0, false)]);
         // Installed: commit 2 is shown.
@@ -374,29 +418,77 @@ mod tests {
             &[(dmabuf(1, 2, &requests), true, progress(11, Some(11), false))],
             Vec::new(),
             &mut memory,
+            |_| true,
         );
         assert_eq!(frame.surfaces, [shown(1, 2, true)]);
-        assert!(frame.refused.is_empty());
+    }
+
+    fn refusal(id: u64, sampled: u64, refused: u64) -> Refusal {
+        Refusal {
+            id: SurfaceId(id),
+            sampled,
+            refused,
+        }
     }
 
     #[test]
     fn a_failed_dmabuf_import_is_refused_once_and_never_shown() {
         let mut memory = HashMap::new();
-        let requests = [(10, 1), (11, 2)];
-        let failed = || (dmabuf(1, 2, &requests), true, progress(11, Some(10), false));
-        let frame = frame_content(&[failed()], Vec::new(), &mut memory);
+        let requests = [(10, 1), (11, 2), (12, 3)];
+        // Request 12 (commit 3) failed; 10 (commit 1) is still installed and
+        // 11 (commit 2) was superseded while pending: (1, 3] is refused.
+        let failed = || (dmabuf(1, 3, &requests), true, progress(12, Some(10), false));
+        let mut sent = Vec::new();
+        let frame = frame_content(&[failed()], Vec::new(), &mut memory, |refusal| {
+            sent.push(refusal);
+            true
+        });
         assert_eq!(frame.surfaces, [shown(1, 1, true)]);
-        assert_eq!(frame.refused, [(SurfaceId(1), 2)]);
-        let frame = frame_content(&[failed()], Vec::new(), &mut memory);
-        assert!(frame.refused.is_empty(), "reported once");
+        assert_eq!(sent, [refusal(1, 1, 3)]);
+        frame_content(&[failed()], Vec::new(), &mut memory, |refusal| {
+            sent.push(refusal);
+            true
+        });
+        assert_eq!(sent.len(), 1, "delivered once");
         // A failed first import leaves nothing installed: refused, not shown.
         let frame = frame_content(
             &[(dmabuf(2, 1, &[(20, 1)]), true, progress(20, None, false))],
             Vec::new(),
             &mut memory,
+            |refusal| {
+                sent.push(refusal);
+                true
+            },
         );
         assert_eq!(frame.surfaces, [shown(2, 0, false)]);
-        assert_eq!(frame.refused, [(SurfaceId(2), 1)]);
+        assert_eq!(sent.last(), Some(&refusal(2, 0, 1)));
+    }
+
+    /// NEW-1: a refusal that could not be delivered is offered again on the
+    /// next frame, whatever happened to the first frame's report.
+    #[test]
+    fn an_undelivered_refusal_is_offered_again() {
+        let mut memory = HashMap::new();
+        let failed = (
+            dmabuf(1, 2, &[(10, 1), (11, 2)]),
+            true,
+            progress(11, Some(10), false),
+        );
+        let mut offered = 0;
+        frame_content(&[failed.clone()], Vec::new(), &mut memory, |_| {
+            offered += 1;
+            false
+        });
+        let mut sent = Vec::new();
+        frame_content(&[failed.clone()], Vec::new(), &mut memory, |refusal| {
+            sent.push(refusal);
+            true
+        });
+        assert_eq!(offered, 1);
+        assert_eq!(sent, [refusal(1, 1, 2)]);
+        frame_content(&[failed], Vec::new(), &mut memory, |_| {
+            panic!("delivered already")
+        });
     }
 
     #[test]
