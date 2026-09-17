@@ -238,14 +238,26 @@ pub(crate) fn unclipped(previous: &Snapshot, current: &Snapshot) -> Vec<Unclippe
 }
 
 impl Unclipped {
-    /// Whether the damage reaches this candidate.
-    pub(crate) fn reached(&self, rects: &[DamageRect], scale: f32) -> bool {
-        let physical = |r: Rectangle| to_physical(r, scale);
-        let trigger = physical(self.trigger);
+    /// The rectangles that make the renderer paint this candidate: empty
+    /// when the damage does not reach it. Text needs one rectangle to
+    /// contain its measured bounds; a shadow is painted once per rectangle
+    /// its quad body meets, so more than one index means the renderer would
+    /// blend it twice and the caller has to merge them.
+    pub(crate) fn triggered_by(&self, rects: &[DamageRect], scale: f32) -> Vec<usize> {
+        let trigger = to_physical(self.trigger, scale);
         if self.containment {
-            covers(rects, &trigger)
+            rects
+                .iter()
+                .position(|r| trigger.is_within(r))
+                .into_iter()
+                .collect()
         } else {
-            rects.iter().any(|r| meets(r, &trigger))
+            rects
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| meets(r, &trigger))
+                .map(|(i, _)| i)
+                .collect()
         }
     }
 

@@ -707,17 +707,33 @@ impl<P: Program> Surface<P> {
                     let mut index = 0;
                     while index < candidates.len() {
                         let candidate = candidates[index];
-                        if candidate.reached(&rects, scale) {
-                            candidates.swap_remove(index);
-                            let paint = candidate.paint_rect(scale);
-                            if let Some(paint) = clamp(paint, width, height)
-                                && !diff::covers(&rects, &paint)
+                        let hits = candidate.triggered_by(&rects, scale);
+                        if hits.is_empty() {
+                            index += 1;
+                            continue;
+                        }
+                        candidates.swap_remove(index);
+                        // A shadow is drawn once for every damage rectangle
+                        // its body meets, so two rectangles would blend it
+                        // twice; merging them leaves one.
+                        if hits.len() > 1 {
+                            let union = hits
+                                .iter()
+                                .map(|i| rects[*i])
+                                .reduce(|a, b| diff::union(&a, &b));
+                            if let Some(union) = union
+                                && !diff::covers(&rects, &union)
                             {
-                                rects.push(paint);
+                                rects.push(union);
                                 added = true;
                             }
-                        } else {
-                            index += 1;
+                        }
+                        let paint = candidate.paint_rect(scale);
+                        if let Some(paint) = clamp(paint, width, height)
+                            && !diff::covers(&rects, &paint)
+                        {
+                            rects.push(paint);
+                            added = true;
                         }
                     }
                     if !added {

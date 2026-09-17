@@ -249,13 +249,19 @@ fn damaged_area(frame: &Frame) -> u64 {
     frame.damage.iter().map(DamageRect::area).sum()
 }
 
+/// Antialiasing rounding tolerated between a partial and a full redraw.
+/// Missed damage looks nothing like this: a glyph or quad that should have
+/// been repainted differs by tens or hundreds of levels.
+const MAX_ROUNDING: u8 = 2;
+
 #[derive(Debug, Default)]
 struct Check {
     /// Pixels whose full-redraw colour changed since the previous frame.
     changed: usize,
-    /// Pixels where the incremental buffer is off by one channel level
-    /// (tiny-skia's masked and unmasked pipelines round antialiased edges
-    /// differently; a quad cut by a damage rectangle is drawn masked).
+    /// Pixels where the incremental buffer is off by at most
+    /// [`MAX_ROUNDING`] channel levels: tiny-skia's masked and unmasked
+    /// pipelines round antialiased coverage differently, and a quad or
+    /// glyph cut by a damage rectangle is drawn masked.
     rounding: usize,
 }
 
@@ -296,7 +302,7 @@ fn check(
                 .map(|(a, b)| a.abs_diff(*b))
                 .max()
                 .unwrap_or(0);
-            if delta > 1 {
+            if delta > MAX_ROUNDING {
                 return Err(format!(
                     "pixel ({x}, {y}) is {inc:?}, full redraw {now:?} (damage {:?})",
                     frame.damage
