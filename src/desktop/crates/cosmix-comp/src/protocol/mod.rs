@@ -3192,6 +3192,8 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             injection: input_injection::InjectionState::default(),
             #[cfg(feature = "bus")]
+            window_waiters: window_control::WindowWaiters::default(),
+            #[cfg(feature = "bus")]
             observations: port_observation::ObservationState::new(
                 observation_producer,
                 observation_event_seq,
@@ -6008,6 +6010,9 @@ struct WaylandState {
     /// Bus-injected input: held keys/buttons, sequences, host passthrough.
     #[cfg(feature = "bus")]
     injection: input_injection::InjectionState,
+    /// `comp.window.wait` / `close {force}` waiters.
+    #[cfg(feature = "bus")]
+    window_waiters: window_control::WindowWaiters,
     #[cfg(feature = "bus")]
     observations: port_observation::ObservationState,
     events: Vec<ProtocolEvent>,
@@ -13897,53 +13902,15 @@ impl WaylandState {
                 start_pointer,
                 start_origin,
             } => {
-                let Some(record) = self.surfaces.get_mut(&surface.id()) else {
-                    self.interactive_pointer = None;
-                    return false;
-                };
-                let old_origin = record.window_origin;
-                record.window_origin = (
+                let origin = (
                     start_origin.0 + (x - start_pointer.0) as f32,
                     start_origin.1 + (y - start_pointer.1) as f32,
                 );
-                let offset = record
-                    .committed_window_geometry
-                    .map(|geometry| (geometry.x, geometry.y))
-                    .unwrap_or_default();
-                record.layout.x = record.window_origin.0 - offset.0;
-                record.layout.y = record.window_origin.1 - offset.1;
-                let delta = (
-                    record.window_origin.0 - old_origin.0,
-                    record.window_origin.1 - old_origin.1,
-                );
-                let id = record.id;
-                let scene = record.scene_snapshot();
-                // An X11 window must learn its new position through an X
-                // configure (there is no xdg configure for it), or the client
-                // keeps stale global coordinates.
-                #[cfg(feature = "xwayland")]
-                if delta != (0.0, 0.0)
-                    && let SurfaceRole::X11(role) = &mut record.role
-                {
-                    let rect = Rectangle::new(
-                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
-                        (
-                            record.configured_size.0.max(1),
-                            record.configured_size.1.max(1),
-                        )
-                            .into(),
-                    );
-                    role.granted_geometry = rect;
-                    if let Err(error) = role.surface.configure(Some(rect)) {
-                        tracing::debug!(%error, "failed to send X11 move configure");
-                    }
-                }
-                self.events
-                    .push(ProtocolEvent::SurfaceRelayout { id, scene });
-                #[cfg(feature = "bus")]
-                self.mark_surface_dirty(id, "wayland.map");
-                self.shift_surface_descendants(id, delta);
-                delta != (0.0, 0.0)
+                self.move_window_to(&surface, origin, "wayland.map")
+                    .unwrap_or_else(|| {
+                        self.interactive_pointer = None;
+                        false
+                    })
             }
             InteractivePointer::Resize {
                 surface,
@@ -13992,31 +13959,14 @@ impl WaylandState {
                 } else {
                     0
                 };
-                let (min_size, max_size) =
-                    clamped_toplevel_constraints(self.managed_size_constraints(&surface));
-                let min_width = min_size.0;
-                let min_height = min_size.1;
-                let max_width = max_size.0;
-                let max_height = max_size.1;
-                let new_size = (
-                    start_size
-                        .0
-                        .saturating_add(width_delta)
-                        .clamp(min_width, max_width),
-                    start_size
-                        .1
-                        .saturating_add(height_delta)
-                        .clamp(min_height, max_height),
+                let new_size = self.clamp_window_size(
+                    &surface,
+                    (
+                        start_size.0.saturating_add(width_delta),
+                        start_size.1.saturating_add(height_delta),
+                    ),
                 );
-                let Some(record) = self.surfaces.get_mut(&surface.id()) else {
-                    self.interactive_pointer = None;
-                    return false;
-                };
-                if new_size == record.configured_size {
-                    return false;
-                }
-                let old_origin = record.window_origin;
-                record.window_origin = (
+                let origin = (
                     if left {
                         start_origin.0 + (start_size.0 - new_size.0) as f32
                     } else {
@@ -14028,45 +13978,131 @@ impl WaylandState {
                         start_origin.1
                     },
                 );
-                let offset = record
-                    .committed_window_geometry
-                    .map(|geometry| (geometry.x, geometry.y))
-                    .unwrap_or_default();
-                record.layout.x = record.window_origin.0 - offset.0;
-                record.layout.y = record.window_origin.1 - offset.1;
-                record.configured_size = new_size;
-                let toplevel = record.role.toplevel().cloned();
-                let id = record.id;
-                let scene = record.scene_snapshot();
-                let delta = (
-                    record.window_origin.0 - old_origin.0,
-                    record.window_origin.1 - old_origin.1,
-                );
-                // X11 interactive resize is granted through X configures; the
-                // committed buffer remains the presentation authority.
-                #[cfg(feature = "xwayland")]
-                if let SurfaceRole::X11(role) = &mut record.role {
-                    let rect = Rectangle::new(
-                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
-                        (new_size.0.max(1), new_size.1.max(1)).into(),
-                    );
-                    role.granted_geometry = rect;
-                    if let Err(error) = role.surface.configure(Some(rect)) {
-                        tracing::debug!(%error, "failed to send X11 resize configure");
-                    }
-                }
-                if let Some(toplevel) = toplevel {
-                    set_toplevel_configuration(&toplevel, new_size);
-                    let _ = self.send_pending_toplevel_configure(&surface, true);
-                }
-                self.events
-                    .push(ProtocolEvent::SurfaceRelayout { id, scene });
-                #[cfg(feature = "bus")]
-                self.mark_surface_dirty(id, "wayland.map");
-                self.shift_surface_descendants(id, delta);
-                true
+                self.resize_window_to(&surface, origin, new_size, "wayland.map")
+                    .unwrap_or_else(|| {
+                        self.interactive_pointer = None;
+                        false
+                    })
             }
         }
+    }
+
+    /// A window size inside the client's (clamped) min/max constraints.
+    fn clamp_window_size(&self, surface: &WlSurface, size: (i32, i32)) -> (i32, i32) {
+        let (min_size, max_size) =
+            clamped_toplevel_constraints(self.managed_size_constraints(surface));
+        (
+            size.0.clamp(min_size.0, max_size.0),
+            size.1.clamp(min_size.1, max_size.1),
+        )
+    }
+
+    /// Put a window's geometry origin at `origin` (global logical), moving
+    /// its descendants with it; an X11 window hears it through a configure.
+    /// `None` when the surface has no record; otherwise whether it moved.
+    fn move_window_to(
+        &mut self,
+        surface: &WlSurface,
+        origin: (f32, f32),
+        #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
+    ) -> Option<bool> {
+        let record = self.surfaces.get_mut(&surface.id())?;
+        let old_origin = record.window_origin;
+        record.window_origin = origin;
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        record.layout.x = record.window_origin.0 - offset.0;
+        record.layout.y = record.window_origin.1 - offset.1;
+        let delta = (
+            record.window_origin.0 - old_origin.0,
+            record.window_origin.1 - old_origin.1,
+        );
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        // An X11 window must learn its new position through an X
+        // configure (there is no xdg configure for it), or the client
+        // keeps stale global coordinates.
+        #[cfg(feature = "xwayland")]
+        if delta != (0.0, 0.0)
+            && let SurfaceRole::X11(role) = &mut record.role
+        {
+            let rect = Rectangle::new(
+                (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
+                (
+                    record.configured_size.0.max(1),
+                    record.configured_size.1.max(1),
+                )
+                    .into(),
+            );
+            role.granted_geometry = rect;
+            if let Err(error) = role.surface.configure(Some(rect)) {
+                tracing::debug!(%error, "failed to send X11 move configure");
+            }
+        }
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, cause);
+        self.shift_surface_descendants(id, delta);
+        Some(delta != (0.0, 0.0))
+    }
+
+    /// Ask a window for `size` (already clamped) with its geometry origin at
+    /// `origin`. xdg windows get a configure and answer asynchronously; X11
+    /// windows get an X configure. `None` when the surface has no record;
+    /// `Some(false)`, changing nothing, when `size` is already configured.
+    fn resize_window_to(
+        &mut self,
+        surface: &WlSurface,
+        origin: (f32, f32),
+        size: (i32, i32),
+        #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
+    ) -> Option<bool> {
+        let record = self.surfaces.get_mut(&surface.id())?;
+        if size == record.configured_size {
+            return Some(false);
+        }
+        let old_origin = record.window_origin;
+        record.window_origin = origin;
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        record.layout.x = record.window_origin.0 - offset.0;
+        record.layout.y = record.window_origin.1 - offset.1;
+        record.configured_size = size;
+        let toplevel = record.role.toplevel().cloned();
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        let delta = (
+            record.window_origin.0 - old_origin.0,
+            record.window_origin.1 - old_origin.1,
+        );
+        // X11 resize is granted through X configures; the committed buffer
+        // remains the presentation authority.
+        #[cfg(feature = "xwayland")]
+        if let SurfaceRole::X11(role) = &mut record.role {
+            let rect = Rectangle::new(
+                (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
+                (size.0.max(1), size.1.max(1)).into(),
+            );
+            role.granted_geometry = rect;
+            if let Err(error) = role.surface.configure(Some(rect)) {
+                tracing::debug!(%error, "failed to send X11 resize configure");
+            }
+        }
+        if let Some(toplevel) = toplevel {
+            set_toplevel_configuration(&toplevel, size);
+            let _ = self.send_pending_toplevel_configure(surface, true);
+        }
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, cause);
+        self.shift_surface_descendants(id, delta);
+        Some(true)
     }
 
     fn shift_surface_descendants(&mut self, parent: SurfaceId, delta: (f32, f32)) {

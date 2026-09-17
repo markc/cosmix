@@ -592,6 +592,9 @@ recently minimised window, exactly like the <code>Super+Shift+M</code> binding; 
 <code>{id,generation}</code> (both required together) it restores that window. If the
 window is minimised, either form un-minimises, raises and focuses it; if it
 is not, nothing happens and the reply says <code>changed:false</code>.</li>
+<li><code>comp.window.focus</code>, <code>comp.window.raise</code>, <code>comp.window.close</code>,
+<code>comp.window.place</code> and <code>comp.window.wait</code> act on or wait for one window
+(see Window control below). <code>comp.windows.list</code> lists window rows.</li>
 <li><code>comp.input.pointer.move</code>, <code>comp.input.pointer.button</code>,
 <code>comp.input.pointer.scroll</code>, <code>comp.input.key</code>, <code>comp.input.release_all</code> and
 <code>comp.input.sequence</code> inject input through the real seat (see Input
@@ -683,6 +686,81 @@ Assignments last for the current session. Use the canonical ID returned by
 reserved for layer-shell and session-lock roles. Corner activation takes
 priority over client pointer constraints; reactivation waits for physical
 pointer motion out of the corner.</p>
+<h3 id="window-control">Window control</h3>
+<p>Every verb here names its window with <code>{id, generation}</code>, refuses a stale or
+missing target as described under Window identity, and replies
+<code>{"error":"locked"}</code> while a session lock is active. Each is recorded in the
+frame trace as <code>comp_window_control</code> (subject the id; detail 1 minimize,
+2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close).</p>
+<ul>
+<li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
+With <code>raise</code> (the default) it also raises it and re-targets the pointer,
+exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
+<code>focused</code> is false, <code>reason</code> says why: <code>exclusive_layer</code> (an exclusive
+layer surface holds the keyboard), <code>minimized</code>, <code>not_visible</code>,
+<code>not_presentable</code>, or <code>refused</code>.</li>
+<li><code>comp.window.raise {id,generation}</code> raises the window within its band
+without focusing it. The reply is <code>{id,generation,raised}</code>.</li>
+<li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
+or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
+<ul>
+<li>With <code>force:true</code> (and optional <code>timeout_ms</code>, default 3000, at most
+60000) the reply waits. If the window goes first, it is
+<code>{closed:"gone",waited_ms}</code>. If the same <code>{id,generation}</code> is still
+alive at the deadline, comp disconnects its client and replies
+<code>{closed:"killed",scope:"client",pid,windows,waited_ms}</code>.</li>
+<li>The kill ends the whole client connection, so every window in
+<code>windows</code> goes with it.</li>
+<li>An X11 window is never killed this way (its client is XWayland); at the
+deadline it replies <code>{"error":"still_open","reason":"x11_kill_unsupported"}</code>.</li>
+</ul>
+</li>
+<li><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
+and/or resizes the window, with at least one field given.
+<ul>
+<li><code>x</code>/<code>y</code> are output-local logical coordinates of the window-geometry
+origin (<code>window_x</code>/<code>window_y</code>). <code>output</code> is an <code>outputs</code> key or output
+name, and defaults to the window's own output. An absent coordinate
+keeps the window's offset within its output.</li>
+<li><code>width</code>/<code>height</code> request a window-geometry size, clamped to the client's
+minimum and maximum. For an xdg window this is a configure, so the size
+changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
+<li>The reply is
+<code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
+<li>A maximised or fullscreen window is refused with
+<code>{"error":"invalid_state",maximized,fullscreen}</code>. An unknown output is
+<code>unknown_output</code>.</li>
+</ul>
+</li>
+<li><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
+window reaches a state.
+<ul>
+<li><code>match</code> is <code>{id?,generation?,app_id?,title?,title_contains?}</code> with at
+least one field; <code>generation</code> needs <code>id</code>. With <code>id</code>, the wait is about
+that window. Without it, the wait is about the lowest-id mapped window
+whose names match.</li>
+<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (at least one frame
+presented), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
+window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
+without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.</li>
+<li><code>timeout_ms</code> defaults to 10000 and is at most 60000.</li>
+<li>A condition that already holds is answered at once. Otherwise comp
+checks after each dispatch cycle and sets one timer for the deadline;
+nothing polls.</li>
+<li>The reply is <code>{window:&lt;row&gt;|null,until,waited_ms}</code>. <code>window</code> is the
+<code>windows.s&lt;id&gt;</code> row, or null for <code>unmapped</code> and <code>gone</code>. On the deadline
+the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
+<li>Waits and forced closes use the same eight-permit pool as
+<code>comp.input.sequence</code>.</li>
+</ul>
+</li>
+<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?}</code> returns
+<code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field. The
+rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
+windows and is empty while a session lock is active.</li>
+</ul>
+<p>Every argument object is checked for unknown fields
+(<code>{"error":"invalid_args",field,allowed}</code>).</p>
 <h3 id="input-injection">Input injection</h3>
 <p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply
@@ -770,8 +848,8 @@ namespace to <code>NAME.*</code>. Every inner command is the unprefixed suffix s
 below, so handlers do not depend on the instance name.</p>
 <table><thead><tr><th>Topic</th><th>Inner command</th><th>Exact body</th></tr></thead><tbody>
 <tr><td><code>&lt;service&gt;.props.changed</code></td><td><code>props.changed</code></td><td><code>{path,old,new,ts,cause,event_seq}</code></td></tr>
-<tr><td><code>&lt;service&gt;.surface.mapped</code></td><td><code>surface.mapped</code></td><td><code>{id,role,foreign_id?,event_seq}</code></td></tr>
-<tr><td><code>&lt;service&gt;.surface.unmapped</code></td><td><code>surface.unmapped</code></td><td><code>{id,role,foreign_id?,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.surface.mapped</code></td><td><code>surface.mapped</code></td><td><code>{id,role,generation,app_id,title,foreign_id?,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.surface.unmapped</code></td><td><code>surface.unmapped</code></td><td><code>{id,role,generation,app_id,title,foreign_id?,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.focus.changed</code></td><td><code>focus.changed</code></td><td><code>{keyboard,previous,exclusive_latch,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.output.changed</code></td><td><code>output.changed</code></td><td><code>{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.entered</code></td><td><code>corner.entered</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
@@ -779,6 +857,17 @@ below, so handlers do not depend on the instance name.</p>
 <tr><td><code>&lt;service&gt;.corner.clicked</code></td><td><code>corner.clicked</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.pointer.changed</code></td><td><code>pointer.changed</code></td><td><code>{version:1,instance,output,position,valid,timestamp_ms,event_seq}</code></td></tr>
 </tbody></table>
+<p>Map edges carry the surface's role <code>generation</code> and its <code>app_id</code> and <code>title</code>
+(null when the client set none, and null while a session lock is active). A
+map edge reports the values at the end of the cycle; an unmap edge reports the
+values from before the unmap. An XWayland window whose buffer arrived before
+its map request now emits its map edge too.</p>
+<p>For a stream of window changes (moves, resizes, state, focus), hold a
+<code>comp.props.watch</code> and read the <code>windows.s&lt;id&gt;.*</code> <code>props.changed</code> frames, plus
+<code>focus.changed</code>. There is no separate window topic. To wait for one
+condition, use <code>comp.window.wait</code> rather than subscribing and hoping: the
+topics are not retained, so an edge that happened before the subscription is
+never delivered.</p>
 <p><code>corner.clicked</code> observes a left-button press while a corner is engaged, carrying
 the same engagement dwell as entered/left. It does not consume the button event;
 clients can map it to a panel pin toggle.</p>
@@ -1006,8 +1095,8 @@ from the same snapshot. Single-flight serialisation prevents same-snapshot
 multiplication.</p>
 <p>Absent by design after P-1:</p>
 <ul>
-<li><code>comp.surface.*</code> control verbs, because focus/raise/close operations arrive in P-2 and
-move/resize in P-3;</li>
+<li><code>comp.surface.*</code> control verbs: focus, raise, close, move and resize are
+<code>comp.window.*</code> verbs on managed windows only;</li>
 <li>render timings, because they are metrics rather than properties; and</li>
 <li>a Bus screenshot verb, because it is a later control-plane slice; Arc 4's
 capture service is available through the Wayland protocol described below.</li>

@@ -20,8 +20,9 @@ use smithay::{
 use super::{
     ChromePointerGrabKind, InteractivePointer, LayerOutputBinding, LockLifecycle,
     LogicalOutputRect, SceneDecorationMode, StackBand, SurfaceId, SurfaceRecord, SurfaceRole,
-    WaylandState, corner::CornerConfig, surface_stack_cmp,
+    WaylandState, corner::CornerConfig, port_observation::SetValidationError, surface_stack_cmp,
 };
+use crate::port::ControlReply;
 
 pub(crate) const BROKER_RETRYING: u8 = 0;
 pub(crate) const BROKER_CONNECTED: u8 = 1;
@@ -1797,6 +1798,9 @@ async fn dispatch_read_with_limit(
             limit_bytes,
         );
     }
+    if command == "comp.windows.list" {
+        return enforce_reply_limit(windows_list(&snapshot, &args), limit_bytes);
+    }
     if !matches!(
         command.as_str(),
         "comp.props.get" | "comp.props.list" | "comp.props.describe"
@@ -1820,6 +1824,67 @@ async fn dispatch_read_with_limit(
             .await
             .unwrap_or_else(|_| error("busy"));
     enforce_reply_limit(reply, limit_bytes)
+}
+
+fn list_argument(path: &str, expected: &'static str, range: &'static str) -> (u8, Arc<str>) {
+    ControlReply::Validation(SetValidationError::InvalidValue {
+        path: path.into(),
+        expected,
+        range,
+    })
+    .into_wire()
+}
+
+/// `comp.windows.list {app_id?, title?, title_contains?, visible?}`: the
+/// window rows matching every given filter, in id order.
+fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
+    const ALLOWED: &[&str] = &["app_id", "title", "title_contains", "visible"];
+    let empty = serde_json::Map::new();
+    let object = match args {
+        Value::Null => &empty,
+        Value::Object(object) => object,
+        _ => return list_argument("args", "JSON object", "filter object"),
+    };
+    if let Some(field) = object.keys().find(|field| !ALLOWED.contains(&field.as_str())) {
+        return ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed: ALLOWED,
+        }
+        .into_wire();
+    }
+    let mut texts = [None; 3];
+    for (slot, name) in texts.iter_mut().zip(["app_id", "title", "title_contains"]) {
+        match object.get(name) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) => *slot = Some(value.as_str()),
+            Some(_) => return list_argument(name, "string", "any string"),
+        }
+    }
+    let [app_id, title, title_contains] = texts;
+    let visible = match object.get("visible") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(visible)) => Some(*visible),
+        Some(_) => return list_argument("visible", "bool", "true|false"),
+    };
+    let mut rows = snapshot
+        .windows
+        .values()
+        .filter(|row| {
+            app_id.is_none_or(|app_id| row.app_id.as_deref() == Some(app_id))
+                && title.is_none_or(|title| row.title.as_deref() == Some(title))
+                && title_contains.is_none_or(|needle| {
+                    row.title
+                        .as_deref()
+                        .is_some_and(|title| title.contains(needle))
+                })
+                && visible.is_none_or(|visible| row.visible == visible)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.id);
+    match serde_json::to_string(&json!({ "windows": rows })) {
+        Ok(body) => (0, Arc::from(body)),
+        Err(_) => error("busy"),
+    }
 }
 
 async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<SerialisedReply, ()> {

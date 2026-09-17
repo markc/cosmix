@@ -1378,6 +1378,17 @@ impl WaylandState {
             return;
         }
         if record.buffer_dimensions.is_some() {
+            // The map edge (`surface.mapped`) needs the unmapped start
+            // recorded before the flag flips; a buffer committed in an
+            // earlier dispatch left no pending edge to carry it.
+            #[cfg(feature = "bus")]
+            {
+                let surface = record.role.wl_surface().clone();
+                self.mark_surface_mapped(&surface);
+            }
+            let Some(record) = self.x11_role_record_mut(xid) else {
+                return;
+            };
             record.mapped = true;
             let id = record.id;
             self.pending_full_upserts.insert(id);

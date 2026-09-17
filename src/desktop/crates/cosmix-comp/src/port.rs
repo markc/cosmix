@@ -90,10 +90,96 @@ pub(crate) struct PortSetRequest {
 
 /// A window-addressed verb. `{id, generation}` is always required when a
 /// window is named; only `restore` may name none (most recently minimised).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WindowOp {
-    Minimize { id: u64, generation: u64 },
-    Restore { target: Option<(u64, u64)> },
+    Minimize {
+        id: u64,
+        generation: u64,
+    },
+    Restore {
+        target: Option<(u64, u64)>,
+    },
+    /// Keyboard focus; `raise` also raises and retargets the pointer (the
+    /// Alt+Tab activation).
+    Focus {
+        id: u64,
+        generation: u64,
+        raise: bool,
+    },
+    Raise {
+        id: u64,
+        generation: u64,
+    },
+    /// The polite close (xdg `close` / X11 `WM_DELETE_WINDOW`).
+    Close {
+        id: u64,
+        generation: u64,
+    },
+    Place(PlaceSpec),
+}
+
+/// `comp.window.place`: output-local logical window-geometry coordinates.
+/// An absent field keeps its current value.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PlaceSpec {
+    pub(crate) id: u64,
+    pub(crate) generation: u64,
+    pub(crate) output: Option<String>,
+    pub(crate) x: Option<f64>,
+    pub(crate) y: Option<f64>,
+    pub(crate) width: Option<i32>,
+    pub(crate) height: Option<i32>,
+}
+
+/// What `comp.window.wait` waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitUntil {
+    Mapped,
+    Visible,
+    Presented,
+    Size { width: i32, height: i32 },
+    Focused,
+    Unmapped,
+    Gone,
+}
+
+impl WaitUntil {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Mapped => "mapped",
+            Self::Visible => "visible",
+            Self::Presented => "presented",
+            Self::Size { .. } => "size",
+            Self::Focused => "focused",
+            Self::Unmapped => "unmapped",
+            Self::Gone => "gone",
+        }
+    }
+}
+
+/// Which window a wait is about: one `{id, generation?}`, or the first
+/// window matching the name filters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WindowMatch {
+    pub(crate) id: Option<u64>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) app_id: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) title_contains: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WaitSpec {
+    pub(crate) window: WindowMatch,
+    pub(crate) until: WaitUntil,
+    pub(crate) timeout: Duration,
+}
+
+/// A parsed `comp.window.*` verb: answered in one pass, or long.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum WindowVerb {
+    Op(WindowOp),
+    Long(LongOp),
 }
 
 pub(crate) struct PortWindowRequest {
@@ -189,6 +275,14 @@ pub(crate) struct SequenceStep {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LongOp {
     Sequence(Vec<SequenceStep>),
+    Wait(WaitSpec),
+    /// Polite close now; if the same `{id, generation}` is still alive at
+    /// the deadline, kill its client.
+    ForceClose {
+        id: u64,
+        generation: u64,
+        timeout: Duration,
+    },
 }
 
 impl LongOp {
@@ -196,6 +290,8 @@ impl LongOp {
     fn budget(&self) -> Duration {
         match self {
             Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
+            Self::Wait(spec) => spec.timeout,
+            Self::ForceClose { timeout, .. } => *timeout,
         }
     }
 }
@@ -1377,14 +1473,26 @@ fn dispatch_incoming(
         );
         return;
     }
-    if command.command == "comp.window.minimize" || command.command == "comp.window.restore" {
+    if let Some(verb) = window_verb(&command.command) {
         let parsed = if malformed {
             Err(invalid_argument("args", "JSON object", "{id, generation}"))
         } else {
-            parse_window_op(&command.command, &command.args)
+            parse_window_verb(verb, &command.args)
         };
         let op = match parsed {
-            Ok(op) => op,
+            Ok(WindowVerb::Op(op)) => op,
+            Ok(WindowVerb::Long(op)) => {
+                spawn_long_verb(
+                    ingress,
+                    responders,
+                    long_permits,
+                    reply_sender,
+                    reply_timeouts,
+                    command,
+                    op,
+                );
+                return;
+            }
             Err(reply) => {
                 queue_reply(
                     reply_sender,
@@ -1432,54 +1540,22 @@ fn dispatch_incoming(
         } else {
             parse_sequence(&command.args)
         };
-        let op = match parsed {
-            Ok(op) => op,
-            Err(reply) => {
-                queue_reply(
-                    reply_sender,
-                    reply_timeouts,
-                    PendingReply::new(command, reply.into_wire()),
-                );
-                return;
-            }
-        };
-        let permit = match Arc::clone(long_permits).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                queue_reply(
-                    reply_sender,
-                    reply_timeouts,
-                    PendingReply::new(command, error("busy")),
-                );
-                return;
-            }
-        };
-        let admission = match ingress.request_long(op) {
-            Ok(admission) => admission,
-            Err(()) => {
-                queue_reply(
-                    reply_sender,
-                    reply_timeouts,
-                    PendingReply::new(command, error("busy")),
-                );
-                return;
-            }
-        };
-        let reply_sender = reply_sender.clone();
-        let reply_timeouts = Arc::clone(reply_timeouts);
-        responders.spawn(async move {
-            let _permit = permit;
-            let reply = admission
-                .receive()
-                .await
-                .unwrap_or(ControlReply::Busy)
-                .into_wire();
-            queue_reply(
-                &reply_sender,
-                &reply_timeouts,
-                PendingReply::new(command, reply),
-            );
-        });
+        match parsed {
+            Ok(op) => spawn_long_verb(
+                ingress,
+                responders,
+                long_permits,
+                reply_sender,
+                reply_timeouts,
+                command,
+                op,
+            ),
+            Err(reply) => queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, reply.into_wire()),
+            ),
+        }
         return;
     }
     if let Some(verb) = input_verb(&command.command) {
@@ -1533,7 +1609,11 @@ fn dispatch_incoming(
     }
     let needs_snapshot = matches!(
         command.command.as_str(),
-        "comp.info" | "comp.props.get" | "comp.props.list" | "comp.props.describe"
+        "comp.info"
+            | "comp.props.get"
+            | "comp.props.list"
+            | "comp.props.describe"
+            | "comp.windows.list"
     );
     if !needs_snapshot {
         queue_reply(
@@ -1731,6 +1811,256 @@ fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
         Ok(WindowOp::Minimize { id, generation })
     } else {
         Ok(WindowOp::Restore { target })
+    }
+}
+
+const WINDOW_VERBS: &[&str] = &[
+    "comp.window.minimize",
+    "comp.window.restore",
+    "comp.window.focus",
+    "comp.window.raise",
+    "comp.window.close",
+    "comp.window.place",
+    "comp.window.wait",
+];
+
+fn window_verb(verb: &str) -> Option<&'static str> {
+    WINDOW_VERBS.iter().copied().find(|known| *known == verb)
+}
+
+/// The default and the ceiling for `comp.window.wait` and
+/// `comp.window.close {force}`.
+const WINDOW_WAIT_DEFAULT: Duration = Duration::from_secs(10);
+const CLOSE_FORCE_DEFAULT: Duration = Duration::from_secs(3);
+
+fn required_target(object: &serde_json::Map<String, Value>) -> Result<(u64, u64), ControlReply> {
+    let id = window_arg(object, "id")?
+        .ok_or_else(|| invalid_argument("id", "unsigned integer", "required"))?;
+    let generation = window_arg(object, "generation")?.ok_or_else(|| {
+        invalid_argument(
+            "generation",
+            "unsigned integer",
+            "required (read windows.s<id>.generation)",
+        )
+    })?;
+    Ok((id, generation))
+}
+
+fn bool_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ControlReply> {
+    match present(object, name) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(invalid_argument(name, "bool", "true|false")),
+    }
+}
+
+fn size_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<i32>, ControlReply> {
+    match present(object, name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|size| (1..=32_767).contains(size))
+            .map(|size| Some(size as i32))
+            .ok_or_else(|| invalid_argument(name, "integer", "1..=32767")),
+    }
+}
+
+fn string_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<String>, ControlReply> {
+    match present(object, name) {
+        None => Ok(None),
+        Some(Value::String(value)) if value.len() <= 4096 => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_argument(name, "string", "at most 4096 bytes")),
+    }
+}
+
+fn timeout_arg(
+    object: &serde_json::Map<String, Value>,
+    default: Duration,
+) -> Result<Duration, ControlReply> {
+    match present(object, "timeout_ms") {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| (1..=LONG_VERB_MAX.as_millis() as u64).contains(ms))
+            .map(Duration::from_millis)
+            .ok_or_else(|| invalid_argument("timeout_ms", "unsigned integer", "1..=60000")),
+    }
+}
+
+/// Every `comp.window.*` verb. Minimise and restore keep their own parser.
+pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, ControlReply> {
+    let empty = serde_json::Map::new();
+    match verb {
+        "comp.window.minimize" | "comp.window.restore" => {
+            parse_window_op(verb, args).map(WindowVerb::Op)
+        }
+        "comp.window.focus" => {
+            const ALLOWED: &[&str] = &["id", "generation", "raise"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            Ok(WindowVerb::Op(WindowOp::Focus {
+                id,
+                generation,
+                raise: bool_arg(object, "raise", true)?,
+            }))
+        }
+        "comp.window.raise" => {
+            const ALLOWED: &[&str] = &["id", "generation"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            Ok(WindowVerb::Op(WindowOp::Raise { id, generation }))
+        }
+        "comp.window.close" => {
+            const ALLOWED: &[&str] = &["id", "generation", "force", "timeout_ms"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            if bool_arg(object, "force", false)? {
+                Ok(WindowVerb::Long(LongOp::ForceClose {
+                    id,
+                    generation,
+                    timeout: timeout_arg(object, CLOSE_FORCE_DEFAULT)?,
+                }))
+            } else if present(object, "timeout_ms").is_some() {
+                Err(invalid_argument(
+                    "timeout_ms",
+                    "absent",
+                    "timeout_ms applies with force:true only",
+                ))
+            } else {
+                Ok(WindowVerb::Op(WindowOp::Close { id, generation }))
+            }
+        }
+        "comp.window.place" => {
+            const ALLOWED: &[&str] = &["id", "generation", "output", "x", "y", "width", "height"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            let output = match present(object, "output") {
+                None => None,
+                Some(Value::String(output)) if !output.is_empty() => Some(output.clone()),
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "output",
+                        "string",
+                        "outputs.<key> key or output name",
+                    ));
+                }
+            };
+            let spec = PlaceSpec {
+                id,
+                generation,
+                x: finite_arg(object, "x")?,
+                y: finite_arg(object, "y")?,
+                width: size_arg(object, "width")?,
+                height: size_arg(object, "height")?,
+                output,
+            };
+            if spec.output.is_none()
+                && spec.x.is_none()
+                && spec.y.is_none()
+                && spec.width.is_none()
+                && spec.height.is_none()
+            {
+                return Err(invalid_argument(
+                    "x",
+                    "finite number",
+                    "place needs at least one of output, x, y, width, height",
+                ));
+            }
+            Ok(WindowVerb::Op(WindowOp::Place(spec)))
+        }
+        "comp.window.wait" => {
+            const ALLOWED: &[&str] = &["match", "until", "width", "height", "timeout_ms"];
+            const MATCH: &[&str] = &["id", "generation", "app_id", "title", "title_contains"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let filters = match present(object, "match") {
+                Some(Value::Object(filters)) => filters,
+                _ => {
+                    return Err(invalid_argument(
+                        "match",
+                        "object",
+                        "{id?, generation?, app_id?, title?, title_contains?}",
+                    ));
+                }
+            };
+            if let Some(field) = filters.keys().find(|field| !MATCH.contains(&field.as_str())) {
+                return Err(ControlReply::InvalidArgs {
+                    field: format!("match.{field}"),
+                    allowed: MATCH,
+                });
+            }
+            let window = WindowMatch {
+                id: window_arg(filters, "id")?,
+                generation: window_arg(filters, "generation")?,
+                app_id: string_arg(filters, "app_id")?,
+                title: string_arg(filters, "title")?,
+                title_contains: string_arg(filters, "title_contains")?,
+            };
+            if window.generation.is_some() && window.id.is_none() {
+                return Err(invalid_argument(
+                    "match.id",
+                    "unsigned integer",
+                    "required with generation",
+                ));
+            }
+            if window == WindowMatch::default() {
+                return Err(invalid_argument(
+                    "match",
+                    "object",
+                    "at least one of id, app_id, title, title_contains",
+                ));
+            }
+            let width = size_arg(object, "width")?;
+            let height = size_arg(object, "height")?;
+            let until = match present(object, "until").and_then(Value::as_str) {
+                Some("mapped") => WaitUntil::Mapped,
+                Some("visible") => WaitUntil::Visible,
+                Some("presented") => WaitUntil::Presented,
+                Some("size") => match (width, height) {
+                    (Some(width), Some(height)) => WaitUntil::Size { width, height },
+                    _ => {
+                        return Err(invalid_argument(
+                            "width",
+                            "integer",
+                            "until:size needs width and height",
+                        ));
+                    }
+                },
+                Some("focused") => WaitUntil::Focused,
+                Some("unmapped") => WaitUntil::Unmapped,
+                Some("gone") => WaitUntil::Gone,
+                _ => {
+                    return Err(invalid_argument(
+                        "until",
+                        "string",
+                        "mapped|visible|presented|size|focused|unmapped|gone",
+                    ));
+                }
+            };
+            if !matches!(until, WaitUntil::Size { .. }) && (width.is_some() || height.is_some())
+            {
+                return Err(invalid_argument(
+                    "width",
+                    "absent",
+                    "width and height apply to until:size only",
+                ));
+            }
+            Ok(WindowVerb::Long(LongOp::Wait(WaitSpec {
+                window,
+                until,
+                timeout: timeout_arg(object, WINDOW_WAIT_DEFAULT)?,
+            })))
+        }
+        _ => Err(invalid_argument("verb", "window verb", "comp.window.*")),
     }
 }
 
@@ -2206,6 +2536,56 @@ fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
             .to_string(),
         ),
     )
+}
+
+/// Admit a long verb under the long pool and reply when it resolves.
+#[allow(clippy::too_many_arguments)]
+fn spawn_long_verb(
+    ingress: &PortIngress,
+    responders: &mut JoinSet<()>,
+    long_permits: &Arc<Semaphore>,
+    reply_sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &Arc<AtomicU64>,
+    command: cosmix_client::IncomingCommand,
+    op: LongOp,
+) {
+    let permit = match Arc::clone(long_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("busy")),
+            );
+            return;
+        }
+    };
+    let admission = match ingress.request_long(op) {
+        Ok(admission) => admission,
+        Err(()) => {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("busy")),
+            );
+            return;
+        }
+    };
+    let reply_sender = reply_sender.clone();
+    let reply_timeouts = Arc::clone(reply_timeouts);
+    responders.spawn(async move {
+        let _permit = permit;
+        let reply = admission
+            .receive()
+            .await
+            .unwrap_or(ControlReply::Busy)
+            .into_wire();
+        queue_reply(
+            &reply_sender,
+            &reply_timeouts,
+            PendingReply::new(command, reply),
+        );
+    });
 }
 
 fn spawn_control_responder(
@@ -3204,6 +3584,217 @@ mod tests {
                 "{verb}"
             );
         }
+    }
+
+    #[test]
+    fn step_eight_window_verbs_parse_and_refuse_by_field() {
+        assert_eq!(
+            parse_window_verb("comp.window.focus", &json!({"id": 7, "generation": 3})),
+            Ok(WindowVerb::Op(WindowOp::Focus {
+                id: 7,
+                generation: 3,
+                raise: true
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.focus",
+                &json!({"id": 7, "generation": 3, "raise": false})
+            ),
+            Ok(WindowVerb::Op(WindowOp::Focus {
+                id: 7,
+                generation: 3,
+                raise: false
+            }))
+        );
+        assert_eq!(
+            parse_window_verb("comp.window.raise", &json!({"id": 7, "generation": 3})),
+            Ok(WindowVerb::Op(WindowOp::Raise {
+                id: 7,
+                generation: 3
+            }))
+        );
+        assert_eq!(
+            parse_window_verb("comp.window.close", &json!({"id": 7, "generation": 3})),
+            Ok(WindowVerb::Op(WindowOp::Close {
+                id: 7,
+                generation: 3
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.close",
+                &json!({"id": 7, "generation": 3, "force": true})
+            ),
+            Ok(WindowVerb::Long(LongOp::ForceClose {
+                id: 7,
+                generation: 3,
+                timeout: CLOSE_FORCE_DEFAULT
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.close",
+                &json!({"id": 7, "generation": 3, "force": true, "timeout_ms": 250})
+            ),
+            Ok(WindowVerb::Long(LongOp::ForceClose {
+                id: 7,
+                generation: 3,
+                timeout: Duration::from_millis(250)
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.place",
+                &json!({"id": 7, "generation": 3, "output": "o_x", "x": 10, "height": 300})
+            ),
+            Ok(WindowVerb::Op(WindowOp::Place(PlaceSpec {
+                id: 7,
+                generation: 3,
+                output: Some("o_x".into()),
+                x: Some(10.0),
+                y: None,
+                width: None,
+                height: Some(300),
+            })))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.wait",
+                &json!({"match": {"app_id": "a", "title_contains": "b"}, "until": "presented"})
+            ),
+            Ok(WindowVerb::Long(LongOp::Wait(WaitSpec {
+                window: WindowMatch {
+                    app_id: Some("a".into()),
+                    title_contains: Some("b".into()),
+                    ..WindowMatch::default()
+                },
+                until: WaitUntil::Presented,
+                timeout: WINDOW_WAIT_DEFAULT,
+            })))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.wait",
+                &json!({
+                    "match": {"id": 7},
+                    "until": "size",
+                    "width": 500,
+                    "height": 300,
+                    "timeout_ms": 60_000,
+                })
+            ),
+            Ok(WindowVerb::Long(LongOp::Wait(WaitSpec {
+                window: WindowMatch {
+                    id: Some(7),
+                    ..WindowMatch::default()
+                },
+                until: WaitUntil::Size {
+                    width: 500,
+                    height: 300
+                },
+                timeout: LONG_VERB_MAX,
+            })))
+        );
+
+        for (verb, args, path) in [
+            ("comp.window.focus", json!({"id": 7}), "generation"),
+            ("comp.window.focus", json!({"id": 7, "generation": 3, "raise": 1}), "raise"),
+            ("comp.window.raise", json!({"generation": 3}), "id"),
+            ("comp.window.close", json!({"id": 7, "generation": 3, "timeout_ms": 5}), "timeout_ms"),
+            (
+                "comp.window.close",
+                json!({"id": 7, "generation": 3, "force": true, "timeout_ms": 60_001}),
+                "timeout_ms",
+            ),
+            ("comp.window.place", json!({"id": 7, "generation": 3}), "x"),
+            ("comp.window.place", json!({"id": 7, "generation": 3, "width": 0}), "width"),
+            ("comp.window.place", json!({"id": 7, "generation": 3, "y": "1"}), "y"),
+            ("comp.window.wait", json!({"until": "mapped"}), "match"),
+            ("comp.window.wait", json!({"match": {}, "until": "mapped"}), "match"),
+            ("comp.window.wait", json!({"match": {"generation": 3}, "until": "mapped"}), "match.id"),
+            ("comp.window.wait", json!({"match": {"id": 7}}), "until"),
+            ("comp.window.wait", json!({"match": {"id": 7}, "until": "resized"}), "until"),
+            ("comp.window.wait", json!({"match": {"id": 7}, "until": "size", "width": 5}), "width"),
+            ("comp.window.wait", json!({"match": {"id": 7}, "until": "mapped", "height": 5}), "width"),
+            ("comp.window.wait", json!({"match": {"id": 7}, "until": "mapped", "timeout_ms": 0}), "timeout_ms"),
+        ] {
+            let body = refusal(parse_window_verb(verb, &args).expect_err("refused"));
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}: {body}");
+            assert_eq!(body["path"], path, "{verb} {args}: {body}");
+        }
+        for (verb, args, field) in [
+            ("comp.window.focus", json!({"id": 7, "generation": 3, "rise": true}), "rise"),
+            ("comp.window.close", json!({"id": 7, "generation": 3, "kill": true}), "kill"),
+            ("comp.window.place", json!({"id": 7, "generation": 3, "w": 5}), "w"),
+            ("comp.window.wait", json!({"match": {"appid": "x"}, "until": "mapped"}), "match.appid"),
+            ("comp.window.wait", json!({"match": {"id": 1}, "until": "mapped", "for": 1}), "for"),
+        ] {
+            let body = refusal(parse_window_verb(verb, &args).expect_err("typo refused"));
+            assert_eq!(body["error"], "invalid_args", "{verb}");
+            assert_eq!(body["field"], field, "{verb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn window_wait_and_forced_close_take_the_long_pool() {
+        let (ingress, source, depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, _replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        for (index, (verb, args)) in [
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 7}, "until": "gone", "timeout_ms": 30_000}),
+            ),
+            (
+                "comp.window.close",
+                json!({"id": 7, "generation": 3, "force": true}),
+            ),
+            ("comp.window.close", json!({"id": 7, "generation": 3})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut incoming = command(verb, index);
+            incoming.body = args.to_string();
+            incoming.args = args;
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                incoming,
+            );
+        }
+        let Ok(PortCommand::Long(wait)) = source.try_recv() else {
+            panic!("wait is long");
+        };
+        let Ok(PortCommand::Long(close)) = source.try_recv() else {
+            panic!("forced close is long");
+        };
+        let Ok(PortCommand::Window(polite)) = source.try_recv() else {
+            panic!("polite close is a window op");
+        };
+        assert!(matches!(wait.op, Some(LongOp::Wait(_))));
+        assert!(matches!(close.op, Some(LongOp::ForceClose { .. })));
+        assert_eq!(
+            polite.op,
+            WindowOp::Close {
+                id: 7,
+                generation: 3
+            }
+        );
+        assert_eq!(long_permits.available_permits(), LONG_VERB_PERMITS - 2);
+        assert_eq!(depth.load(Ordering::Acquire), 3);
+        drop((wait, close));
+        assert_eq!(depth.load(Ordering::Acquire), 1);
+        responders.abort_all();
     }
 
     #[test]
@@ -4246,6 +4837,7 @@ mod tests {
                 id: event_seq,
                 role: "toplevel".into(),
                 foreign_id: None,
+                window: Default::default(),
                 event_seq,
             });
         }

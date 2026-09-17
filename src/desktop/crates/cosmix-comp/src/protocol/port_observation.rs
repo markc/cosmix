@@ -119,12 +119,14 @@ pub(crate) enum ObservationRecord {
         id: u64,
         role: String,
         foreign_id: Option<String>,
+        window: SurfaceEdgeWindow,
         event_seq: u64,
     },
     SurfaceUnmapped {
         id: u64,
         role: String,
         foreign_id: Option<String>,
+        window: SurfaceEdgeWindow,
         event_seq: u64,
     },
     FocusChanged {
@@ -221,17 +223,22 @@ impl ObservationRecord {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
             }
             | Self::SurfaceUnmapped {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
             } => {
                 let mut body = json!({
                     "id": id,
                     "role": role,
+                    "generation": window.generation,
+                    "app_id": window.app_id.as_deref(),
+                    "title": window.title.as_deref(),
                     "event_seq": event_seq,
                 });
                 if let Some(foreign_id) = foreign_id {
@@ -524,6 +531,17 @@ struct SurfaceEdgeStart {
     mapped: bool,
     role: String,
     foreign_id: Option<String>,
+    window: SurfaceEdgeWindow,
+}
+
+/// Identity fields a map edge carries, so a streaming observer can match
+/// the window without a props read. Title and app id are null while a
+/// session lock is active, as in the read tree.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceEdgeWindow {
+    pub(crate) generation: u64,
+    pub(crate) app_id: Option<std::sync::Arc<str>>,
+    pub(crate) title: Option<std::sync::Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -655,14 +673,13 @@ impl WaylandState {
         let Some(record) = self.surfaces.get(object) else {
             return;
         };
-        self.observations.pending_surface_edges.insert(
-            id.0,
-            SurfaceEdgeStart {
-                mapped: record.mapped,
-                role: record.role.kind().to_string(),
-                foreign_id: self.foreign_toplevel_identifiers.get(&id).cloned(),
-            },
-        );
+        let start = SurfaceEdgeStart {
+            mapped: record.mapped,
+            role: record.role.kind().to_string(),
+            foreign_id: self.foreign_toplevel_identifiers.get(&id).cloned(),
+            window: edge_window(self, record),
+        };
+        self.observations.pending_surface_edges.insert(id.0, start);
     }
 
     pub(crate) fn mark_surface_mapped(
@@ -1065,6 +1082,7 @@ pub(super) fn service_observations(state: &mut WaylandState) {
         service_output_edges(state);
         service_property_diffs(state);
     }
+    state.service_window_waiters();
     service_pointer(state);
 }
 
@@ -1158,6 +1176,15 @@ fn service_pointer(state: &mut WaylandState) {
     }
 }
 
+fn edge_window(state: &WaylandState, record: &super::SurfaceRecord) -> SurfaceEdgeWindow {
+    let redact = state.session_lock_active();
+    SurfaceEdgeWindow {
+        generation: record.generation,
+        app_id: (!redact).then(|| record.app_id.clone()).flatten(),
+        title: (!redact).then(|| record.title.clone()).flatten(),
+    }
+}
+
 fn service_surface_edges(state: &mut WaylandState) {
     let pending = std::mem::take(&mut state.observations.pending_surface_edges);
     for (raw_id, old) in pending {
@@ -1182,12 +1209,17 @@ fn service_surface_edges(state: &mut WaylandState) {
             .get(&id)
             .cloned()
             .or(old.foreign_id);
+        let window = match final_record {
+            Some(record) if final_mapped => edge_window(state, record),
+            _ => old.window,
+        };
         state.observations.offer(|event_seq| {
             if final_mapped {
                 ObservationRecord::SurfaceMapped {
                     id: raw_id,
                     role,
                     foreign_id,
+                    window,
                     event_seq,
                 }
             } else {
@@ -1195,6 +1227,7 @@ fn service_surface_edges(state: &mut WaylandState) {
                     id: raw_id,
                     role,
                     foreign_id,
+                    window,
                     event_seq,
                 }
             }
@@ -3095,6 +3128,11 @@ mod tests {
             id: 7,
             role: "toplevel".into(),
             foreign_id: Some("f_7".into()),
+            window: SurfaceEdgeWindow {
+                generation: 3,
+                app_id: Some("dev.cosmix.Probe".into()),
+                title: None,
+            },
             event_seq: 9,
         };
         let wire = record.wire();
@@ -3109,6 +3147,9 @@ mod tests {
             json!({
                 "id": 7,
                 "role": "toplevel",
+                "generation": 3,
+                "app_id": "dev.cosmix.Probe",
+                "title": null,
                 "foreign_id": "f_7",
                 "event_seq": 9,
             })
@@ -3187,12 +3228,14 @@ mod tests {
                 id: 1,
                 role: "toplevel".into(),
                 foreign_id: None,
+                window: SurfaceEdgeWindow::default(),
                 event_seq: 2,
             },
             ObservationRecord::SurfaceUnmapped {
                 id: 1,
                 role: "toplevel".into(),
                 foreign_id: None,
+                window: SurfaceEdgeWindow::default(),
                 event_seq: 3,
             },
             ObservationRecord::FocusChanged {

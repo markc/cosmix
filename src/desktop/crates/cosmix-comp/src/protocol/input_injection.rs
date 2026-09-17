@@ -637,6 +637,12 @@ impl WaylandState {
                 );
                 self.advance_sequence(id);
             }
+            LongOp::Wait(spec) => self.start_window_wait(spec, reply),
+            LongOp::ForceClose {
+                id,
+                generation,
+                timeout,
+            } => self.start_force_close(id, generation, timeout, reply),
         }
     }
 

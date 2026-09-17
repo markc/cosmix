@@ -27828,19 +27828,32 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
     map_initial_test_toplevel(&mut harness);
     port_observation::service_observations(&mut harness.server.state);
     let mapped = drain_observations(&observations);
-    let (id, foreign_id, mapped_sequence) = mapped
+    let (id, foreign_id, mapped_sequence, mapped_window) = mapped
         .iter()
         .find_map(|record| match record {
             port_observation::ObservationRecord::SurfaceMapped {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
-            } if role == "toplevel" => Some((*id, foreign_id.clone(), *event_seq)),
+            } if role == "toplevel" => {
+                Some((*id, foreign_id.clone(), *event_seq, window.clone()))
+            }
             _ => None,
         })
         .expect("one converged toplevel map edge");
     assert!(foreign_id.is_some());
+    // The map edge names the window without a props read.
+    let record = test_toplevel_record(&harness);
+    assert_eq!(
+        mapped_window,
+        port_observation::SurfaceEdgeWindow {
+            generation: record.generation,
+            app_id: record.app_id.clone(),
+            title: record.title.clone(),
+        }
+    );
 
     send_request(
         &mut harness.client,
@@ -27858,8 +27871,10 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
             id: observed,
             role,
             foreign_id: Some(observed_foreign),
+            window,
             event_seq,
         } if *observed == id
+            && *window == mapped_window
             && role == "toplevel"
             && Some(observed_foreign) == foreign_id.as_ref()
             && *event_seq > mapped_sequence
@@ -29156,7 +29171,7 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         (alpha_id, alpha_generation, &alpha, &beta),
     ] {
         let admission = ingress
-            .request_window(restore_any)
+            .request_window(restore_any.clone())
             .expect("restore admitted");
         let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
         assert_eq!(rc, 0, "{body}");
@@ -29233,7 +29248,7 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         target: Some((alpha_id, alpha_generation)),
     };
     for expected_change in [true, false] {
-        let admission = ingress.request_window(restore_alpha).expect("admitted");
+        let admission = ingress.request_window(restore_alpha.clone()).expect("admitted");
         let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
         assert_eq!(rc, 0, "{body}");
         assert_eq!(body["changed"], expected_change);
@@ -40916,4 +40931,10 @@ mod x11 {
 mod injection_tests {
     use super::*;
     include!("input_injection_tests.rs");
+}
+
+#[cfg(feature = "bus")]
+mod window_control_tests {
+    use super::*;
+    include!("window_control_tests.rs");
 }
