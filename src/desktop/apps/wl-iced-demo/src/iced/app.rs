@@ -383,6 +383,13 @@ impl IcedDemo {
         let Some(window) = self.raw.window() else {
             return;
         };
+        let focused = self.chrome.requests().ime.is_enabled();
+        if focused != self.field_ime {
+            // A driver waits on this edge instead of a settle delay. It
+            // follows the input method, which iced enables exactly while an
+            // editable field holds focus in a focused window.
+            self.raw.log(format_args!("field focus={focused}"));
+        }
         match ime::to_wl(&self.chrome.requests().ime, window, (0, 0)) {
             Some(mut state) => {
                 state.target = IME_FIELD;
@@ -438,7 +445,7 @@ impl IcedDemo {
             self.dumped = true;
             if let Some(path) = std::env::var_os("WL_DEMO_DUMP") {
                 let (pixels, width, height, _) = frame.buffer_mut();
-                match crate::paint::dump_ppm(path.as_ref(), pixels, width, height) {
+                match crate::paint::dump_png(path.as_ref(), pixels, width, height) {
                     Ok(()) => eprintln!("wl-iced-demo: dumped {width}x{height} to {path:?}"),
                     Err(e) => eprintln!("wl-iced-demo: dump: {e}"),
                 }

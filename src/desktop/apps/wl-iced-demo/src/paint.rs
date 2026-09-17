@@ -75,28 +75,129 @@ impl Canvas<'_> {
     }
 }
 
-/// Writes an ARGB8888 buffer as a binary PPM, for a measurement that needs
-/// the pixels the client actually committed (a screen capture of a scaled
-/// output would show the compositor's resampling instead). `WL_DEMO_DUMP`
-/// names the file; the demo writes its first committed frame and stops.
-pub fn dump_ppm(
+/// Writes an ARGB8888 buffer as an 8-bit RGB PNG, for a measurement that
+/// needs the pixels the client actually committed: a screen capture of a
+/// scaled output is resampled by the compositor (and this compositor's
+/// screencopy hands back a logical-size image), so it cannot answer whether
+/// the client drew at physical size. `WL_DEMO_DUMP` names the file; the demo
+/// writes its first committed frame and stops.
+///
+/// The PNG is written by hand rather than with an image crate: the demo
+/// should not carry an encoder dependency for a diagnostic. Rows are stored
+/// uncompressed (deflate stored blocks), so the file is large but valid.
+pub fn dump_png(
     path: &std::path::Path,
     pixels: &[u8],
     width: u32,
     height: u32,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut out = Vec::with_capacity(pixels.len() / 4 * 3 + 32);
-    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
-    for pixel in pixels.chunks_exact(4) {
-        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+    let mut raw = Vec::with_capacity((width as usize * 3 + 1) * height as usize);
+    for row in pixels
+        .chunks_exact(width as usize * 4)
+        .take(height as usize)
+    {
+        raw.push(0); // filter: none
+        for pixel in row.chunks_exact(4) {
+            raw.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        }
     }
-    std::fs::File::create(path)?.write_all(&out)
+    let mut png = Vec::with_capacity(raw.len() + 4096);
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolour
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+    chunk(&mut png, b"IEND", &[]);
+    std::fs::File::create(path)?.write_all(&png)
+}
+
+fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let crc = crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// A zlib stream of deflate "stored" blocks: no compression, always valid.
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    let mut chunks = data.chunks(0xffff).peekable();
+    if data.is_empty() {
+        out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
+    }
+    while let Some(block) = chunks.next() {
+        out.push(u8::from(chunks.peek().is_none()));
+        let len = block.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in data {
+        a = (a + u32::from(*byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_dump_is_a_valid_truecolour_image() {
+        let dir = std::env::temp_dir().join(format!("wl-demo-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.png");
+        // Two rows of two ARGB pixels: red, green / blue, white.
+        let pixels: Vec<u8> = vec![
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+        ];
+        dump_png(&path, &pixels, 2, 2).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        assert_eq!(&bytes[8..16], &[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        assert_eq!(&bytes[16..24], &[0, 0, 0, 2, 0, 0, 0, 2]);
+        assert_eq!(&bytes[24..29], &[8, 2, 0, 0, 0]);
+        assert!(bytes.ends_with(&[b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]));
+        // The stored deflate stream carries each row with a filter byte, in
+        // R, G, B order.
+        let idat = bytes.windows(4).position(|w| w == b"IDAT").unwrap() + 4;
+        assert_eq!(&bytes[idat..idat + 2], &[0x78, 0x01]);
+        let raw = &bytes[idat + 7..idat + 7 + 14];
+        assert_eq!(raw, &[0, 255, 0, 0, 0, 255, 0, 0, 0, 0, 255, 255, 255, 255]);
+        assert_eq!(crc32(b"IEND"), 0xae42_6082);
+        assert_eq!(adler32(b"abc"), 0x024d_0127);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn fill_clips_and_writes_bgra() {
