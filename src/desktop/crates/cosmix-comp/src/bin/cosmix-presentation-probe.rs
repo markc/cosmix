@@ -152,6 +152,9 @@ struct Options {
     width: u32,
     height: u32,
     timeout: Duration,
+    /// Keep the window mapped this long after the result line, so a gate
+    /// can read the compositor's stats for it (G1+).
+    hold: Duration,
 }
 
 fn options() -> Result<Options, String> {
@@ -161,6 +164,7 @@ fn options() -> Result<Options, String> {
         width: 256,
         height: 256,
         timeout: Duration::from_secs(60),
+        hold: Duration::ZERO,
     };
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -193,6 +197,13 @@ fn options() -> Result<Options, String> {
                     value()?
                         .parse()
                         .map_err(|error| format!("--timeout-s: {error}"))?,
+                );
+            }
+            "--hold-s" => {
+                options.hold = Duration::from_secs(
+                    value()?
+                        .parse()
+                        .map_err(|error| format!("--hold-s: {error}"))?,
                 );
             }
             other => return Err(format!("unknown argument {other}")),
@@ -473,6 +484,12 @@ fn run() -> Result<bool, String> {
         percentile(99),
         sorted.last().copied().unwrap_or(0),
     );
+    if !options.hold.is_zero() {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let _ = connection.flush();
+        std::thread::sleep(options.hold);
+    }
     toplevel.destroy();
     Ok(pass)
 }
