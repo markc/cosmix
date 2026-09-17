@@ -119,7 +119,7 @@ fn reply_resizes(
                 Ok(()) => (0, json!({"accepted":true})),
                 Err(error) => (
                     10,
-                    json!({"error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
+                    json!({"error_code":"PANEL_RESIZE_REJECTED", "error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
                 ),
             };
             stash_or_respond(
@@ -502,7 +502,7 @@ fn dispatch_shell_request(
         if thickness_px > max {
             return (
                 10,
-                json!({"error":"panel thickness exceeds output budget", "edge":argument(request, "edge"), "requested":thickness_px, "max":max}).to_string(),
+                json!({"error_code":"PANEL_THICKNESS_BUDGET", "error":"panel thickness exceeds output budget", "edge":argument(request, "edge"), "requested":thickness_px, "max":max}).to_string(),
                 None,
             );
         }
@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap(),
             json!({
-                "error":"panel thickness exceeds output budget", "edge":"left", "requested":240.0, "max":239.0
+                "error_code":"PANEL_THICKNESS_BUDGET", "error":"panel thickness exceeds output budget", "edge":"left", "requested":240.0, "max":239.0
             })
         );
         req.body = r#"{"edge":"left","thickness_px":239}"#.into();

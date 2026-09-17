@@ -8,7 +8,9 @@ the mappings releases sources no longer used by either managed family.
 Panel drags stop at the available output budget, including when one pointer
 event crosses the limit. `shell.panel.resize` returns rc 10 with `error`,
 `edge`, `requested`, and `max` when the requested thickness exceeds that
-budget. Successful Bus replies follow model application, so queued geometry
+budget. `error_code: PANEL_THICKNESS_BUDGET` preserves the structured refusal
+for Mix callers; a refusal at model application uses `PANEL_RESIZE_REJECTED`.
+Successful Bus replies follow model application, so queued geometry
 or opposing-panel changes cannot produce a false acceptance.
 
 Broker-stamped mesh callers can use every CTK app-control verb without
