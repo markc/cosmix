@@ -29156,7 +29156,7 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         (alpha_id, alpha_generation, &alpha, &beta),
     ] {
         let admission = ingress
-            .request_window(restore_any)
+            .request_window(restore_any.clone())
             .expect("restore admitted");
         let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
         assert_eq!(rc, 0, "{body}");
@@ -29196,7 +29196,7 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
     }
 
     let admission = ingress
-        .request_window(restore_any)
+        .request_window(restore_any.clone())
         .expect("restore admitted");
     let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
     assert_eq!(rc, 10);
@@ -29233,7 +29233,7 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         target: Some((alpha_id, alpha_generation)),
     };
     for expected_change in [true, false] {
-        let admission = ingress.request_window(restore_alpha).expect("admitted");
+        let admission = ingress.request_window(restore_alpha.clone()).expect("admitted");
         let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
         assert_eq!(rc, 0, "{body}");
         assert_eq!(body["changed"], expected_change);

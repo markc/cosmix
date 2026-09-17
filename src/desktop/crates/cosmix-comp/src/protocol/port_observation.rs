@@ -2900,7 +2900,7 @@ mod tests {
         let wire = ObservationRecord::PropsChanged {
             path: "outputs.o_nested".into(),
             old: PropValue::null(),
-            new: PropValue::OutputRow(Box::new(row)),
+            new: PropValue::OutputRow(Box::new(row.clone())),
             unix_ms: 0,
             cause: "output.geometry",
             event_seq: 1,

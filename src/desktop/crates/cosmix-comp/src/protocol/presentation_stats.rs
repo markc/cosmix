@@ -315,6 +315,7 @@ pub(crate) struct StatsRegistry {
 }
 
 impl StatsRegistry {
+    #[cfg(test)]
     pub(crate) fn new(epoch_us: u64) -> Self {
         Self {
             epoch_us,
