@@ -587,7 +587,7 @@ pub(crate) fn route_pointer(
         }
         let local = |surfaces: &Query<(&IcedSurfaceGeometry, &mut SurfaceState)>, entity| {
             surfaces.get(entity).ok().map(|(geometry, _)| {
-                let at = input.location.position * geometry.pointer_scale - geometry.origin;
+                let at = input.location.position * geometry.scale - geometry.origin;
                 SurfaceEvent::PointerMoved { x: at.x, y: at.y }
             })
         };
