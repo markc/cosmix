@@ -7446,6 +7446,7 @@ pub(crate) mod tests {
         ProtocolEvent::SurfaceUpserted {
             id,
             scene: crate::protocol::SurfaceSceneSnapshot {
+                commit_seq: 0,
                 layout: SurfaceLayout {
                     x: 24.0,
                     y: 18.0,

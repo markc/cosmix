@@ -1856,7 +1856,7 @@ impl WaylandState {
         }));
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
-        let role_generation = self.next_role_generation();
+        let role_generation = self.role_change_generation(&object);
         let id = if let Some(record) = self.surfaces.get_mut(&object) {
             let id = record.id;
             record.generation = role_generation;

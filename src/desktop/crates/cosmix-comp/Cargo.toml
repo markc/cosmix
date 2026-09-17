@@ -50,6 +50,10 @@ required-features = ["kms-live"]
 name = "cosmix-screencopy-probe"
 path = "src/bin/cosmix-screencopy-probe.rs"
 
+[[bin]]
+name = "cosmix-presentation-probe"
+path = "src/bin/cosmix-presentation-probe.rs"
+
 [dependencies]
 cosmix-quoin = { path = "../../apps/quoin", optional = true }
 cosmix-shell = { path = "../cosmix-shell", features = ["chrome"], optional = true }

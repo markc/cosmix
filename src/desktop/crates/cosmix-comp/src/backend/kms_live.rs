@@ -11337,6 +11337,7 @@ mod tests {
             vec![crate::protocol::ProtocolEvent::SurfaceUpserted {
                 id: surface,
                 scene: crate::protocol::SurfaceSceneSnapshot {
+                    commit_seq: 0,
                     layout,
                     kind: crate::protocol::SceneSurfaceKind::Toplevel,
                     title: None,
