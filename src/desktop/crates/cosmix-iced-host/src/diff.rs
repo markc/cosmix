@@ -1,17 +1,24 @@
-//! Primitive-level damage between two frames' layers.
+//! Primitive-level damage between two frames.
 //!
 //! `iced_tiny_skia`'s own `Layer::damage` pairs primitives by index, so
 //! inserting or removing one (a caret blinking off) misaligns everything
 //! after it and damages all of it; it also treats every live primitive as
-//! changed, and compares paragraphs by metrics only. Here each primitive list
-//! is aligned by its common prefix and suffix and only the differing middle
-//! is damaged. That is exact for draw order: every item outside the middle
-//! is unchanged and keeps its relative order, so pixels outside the middle
-//! items' bounds cannot change.
+//! changed. Here each primitive list is aligned by its common prefix and
+//! suffix and only the differing middle is damaged. That is exact for draw
+//! order: every item outside the middle is unchanged and keeps its relative
+//! order, so pixels outside the middle items' bounds cannot change.
+//!
+//! Paragraphs are compared through a snapshot taken when the frame was
+//! drawn. A layer only holds weak paragraph references, and a widget that
+//! re-lays out a paragraph (`Arc::make_mut`) detaches the previous frame's
+//! reference even when nothing visible changed, so comparing weak
+//! references damages every label on every rebuild.
 
 use crate::damage::DamageRect;
-use iced_core::Rectangle;
+use iced_core::text::Alignment;
+use iced_core::{Color, Point, Rectangle, Size, Transformation, alignment};
 use iced_graphics::text::Text;
+use iced_graphics::text::cosmic_text::AttrsList;
 use iced_tiny_skia::Layer;
 
 /// Glyph ink can leave a paragraph's measured bounds (overhang, hinting,
@@ -19,12 +26,125 @@ use iced_tiny_skia::Layer;
 const TEXT_MARGIN: f32 = 2.0;
 const QUAD_MARGIN: f32 = 1.0;
 
+/// What a drawn frame looked like, for diffing against the next one.
+pub(crate) struct Snapshot {
+    layers: Vec<Layer>,
+    /// Per layer, per text item.
+    text: Vec<Vec<TextItem>>,
+}
+
+struct TextItem {
+    clip: Rectangle,
+    transformation: Transformation,
+    texts: Vec<TextKey>,
+    /// Logical damage bounds of the item.
+    bounds: Vec<Rectangle>,
+}
+
+#[derive(PartialEq)]
+enum TextKey {
+    Paragraph {
+        position: Point,
+        color: Color,
+        clip: Rectangle,
+        transformation: Transformation,
+        min_bounds: Size,
+        align: (Alignment, alignment::Vertical),
+        /// `None` if the paragraph was already gone: never equal.
+        content: Option<Content>,
+    },
+    Other(Text),
+}
+
+#[derive(PartialEq)]
+struct Content {
+    lines: Vec<(String, AttrsList)>,
+    metrics: (f32, f32),
+    size: (Option<f32>, Option<f32>),
+}
+
+fn key(text: &Text) -> TextKey {
+    match text {
+        Text::Paragraph {
+            paragraph,
+            position,
+            color,
+            clip_bounds,
+            transformation,
+        } => TextKey::Paragraph {
+            position: *position,
+            color: *color,
+            clip: *clip_bounds,
+            transformation: *transformation,
+            min_bounds: paragraph.min_bounds,
+            align: (paragraph.align_x, paragraph.align_y),
+            content: paragraph.upgrade().map(|p| {
+                let buffer = p.buffer();
+                let metrics = buffer.metrics();
+                Content {
+                    lines: buffer
+                        .lines
+                        .iter()
+                        .map(|l| (l.text().to_owned(), l.attrs_list().clone()))
+                        .collect(),
+                    metrics: (metrics.font_size, metrics.line_height),
+                    size: buffer.size(),
+                }
+            }),
+        },
+        other => TextKey::Other(other.clone()),
+    }
+}
+
+fn key_eq(a: &TextKey, b: &TextKey) -> bool {
+    match (a, b) {
+        (TextKey::Paragraph { content: None, .. }, _)
+        | (_, TextKey::Paragraph { content: None, .. }) => false,
+        _ => a == b,
+    }
+}
+
+impl Snapshot {
+    pub(crate) fn new(layers: &[Layer]) -> Self {
+        // `layer::Item` is not exported, so items are read through its public
+        // methods: the slice, the clip bounds and the transformation.
+        let text = layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .text
+                    .iter()
+                    .map(|item| {
+                        let t = item.transformation();
+                        TextItem {
+                            clip: item.clip_bounds(),
+                            transformation: t,
+                            texts: item.as_slice().iter().map(key).collect(),
+                            bounds: item
+                                .as_slice()
+                                .iter()
+                                .filter_map(Text::visible_bounds)
+                                .map(|r| r.expand(TEXT_MARGIN) * t)
+                                .collect(),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            layers: layers.to_vec(),
+            text,
+        }
+    }
+}
+
 /// Logical rectangles that changed between `previous` and `current`.
-pub(crate) fn layers(previous: &[Layer], current: &[Layer]) -> Vec<Rectangle> {
+pub(crate) fn damage(previous: &Snapshot, current: &Snapshot) -> Vec<Rectangle> {
     let mut out = Vec::new();
-    for i in 0..previous.len().max(current.len()) {
-        match (previous.get(i), current.get(i)) {
-            (Some(a), Some(b)) => layer(a, b, &mut out),
+    let (pl, cl) = (&previous.layers, &current.layers);
+    for i in 0..pl.len().max(cl.len()) {
+        match (pl.get(i), cl.get(i)) {
+            (Some(a), Some(b)) => layer(a, b, &previous.text[i], &current.text[i], &mut out),
             (Some(only), None) | (None, Some(only)) => {
                 if !is_empty(only) {
                     out.push(only.bounds);
@@ -43,7 +163,7 @@ fn is_empty(layer: &Layer) -> bool {
         && layer.images.is_empty()
 }
 
-fn layer(a: &Layer, b: &Layer, out: &mut Vec<Rectangle>) {
+fn layer(a: &Layer, b: &Layer, at: &[TextItem], bt: &[TextItem], out: &mut Vec<Rectangle>) {
     if a.bounds != b.bounds {
         for l in [a, b] {
             if !is_empty(l) {
@@ -60,25 +180,14 @@ fn layer(a: &Layer, b: &Layer, out: &mut Vec<Rectangle>) {
         |x, y| x == y,
         out,
     );
-    // `layer::Item` is not exported, so items are handled through its
-    // public methods: the slice, the clip bounds (infinite for a live item)
-    // and the transformation.
     middle(
-        &a.text,
-        &b.text,
-        |item| {
-            let t = item.transformation();
-            item.as_slice()
-                .iter()
-                .filter_map(Text::visible_bounds)
-                .map(|r| r.expand(TEXT_MARGIN) * t)
-                .filter_map(clip)
-                .collect()
-        },
+        at,
+        bt,
+        |item| item.bounds.iter().copied().filter_map(clip).collect(),
         |x, y| {
-            x.clip_bounds() == y.clip_bounds()
-                && x.transformation() == y.transformation()
-                && slices_eq(x.as_slice(), y.as_slice(), text_eq)
+            x.clip == y.clip
+                && x.transformation == y.transformation
+                && slices_eq(&x.texts, &y.texts, key_eq)
         },
         out,
     );
@@ -148,26 +257,6 @@ pub(crate) fn changed_span<T>(
         .take_while(|(x, y)| eq(x, y))
         .count();
     (prefix, a.len() - suffix, b.len() - suffix)
-}
-
-fn text_eq(a: &Text, b: &Text) -> bool {
-    if a != b {
-        return false;
-    }
-    // Paragraph equality compares layout metrics only; the text itself can
-    // change at identical metrics (one monospace glyph for another).
-    match (a, b) {
-        (Text::Paragraph { paragraph: pa, .. }, Text::Paragraph { paragraph: pb, .. }) => {
-            match (pa.upgrade(), pb.upgrade()) {
-                (Some(pa), Some(pb)) => {
-                    let (la, lb) = (&pa.buffer().lines, &pb.buffer().lines);
-                    la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| x.text() == y.text())
-                }
-                _ => false,
-            }
-        }
-        _ => true,
-    }
 }
 
 /// Physical rectangles, merged where their union wastes at most

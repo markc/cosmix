@@ -13,7 +13,6 @@ use iced_core::widget::operation::Outcome;
 use iced_core::{Color, Event, Font, InputMethod, Pixels, Point, Rectangle, Size, window};
 use iced_graphics::Viewport;
 use iced_runtime::user_interface::{self, UserInterface};
-use iced_tiny_skia::Layer;
 
 /// Initial state of a [`Surface`].
 #[derive(Debug, Clone)]
@@ -152,7 +151,7 @@ pub struct Surface<P: Program> {
     cursor: Cursor,
     drawn_cursor: Cursor,
     clip_mask: tiny_skia::Mask,
-    last_layers: Option<Vec<Layer>>,
+    last_layers: Option<diff::Snapshot>,
     last_background: Color,
     invalid: bool,
     dirty: bool,
@@ -538,26 +537,27 @@ impl<P: Program> Surface<P> {
 
         let background = self.background.unwrap_or(base.background_color);
         let full = self.invalid || self.last_layers.is_none() || self.last_background != background;
-        let layers = self.renderer.layers();
-        let damage = if full {
-            vec![DamageRect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            }]
-        } else {
-            let logical = diff::layers(self.last_layers.as_deref().unwrap_or_default(), layers);
-            let viewport = Rectangle::with_size(size);
-            disjoint(diff::coalesce(
-                logical
-                    .into_iter()
-                    .filter_map(|rect| rect.intersection(&viewport))
-                    .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
-                    .collect(),
-            ))
+        let current = diff::Snapshot::new(self.renderer.layers());
+        let damage = match self.last_layers.as_ref().filter(|_| !full) {
+            None => {
+                vec![DamageRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }]
+            }
+            Some(previous) => {
+                let viewport = Rectangle::with_size(size);
+                disjoint(diff::coalesce(
+                    diff::damage(previous, &current)
+                        .into_iter()
+                        .filter_map(|rect| rect.intersection(&viewport))
+                        .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
+                        .collect(),
+                ))
+            }
         };
-        let current = layers.to_vec();
 
         if !damage.is_empty() {
             let pixels = &mut buffer[..needed];

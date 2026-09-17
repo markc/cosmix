@@ -354,11 +354,28 @@ fn random_small_edits_match_a_full_redraw() {
                     .position(|(a, b)| a != b)
                     .unwrap();
                 let pixel = first as u32 / 4;
+                let o = pixel as usize * 4;
+                let differing = t
+                    .buffer
+                    .chunks_exact(4)
+                    .zip(full.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let max_delta = t
+                    .buffer
+                    .iter()
+                    .zip(&full)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
                 panic!(
                     "scale {scale} step {step} op {op}: incremental draw differs from a full \
-                     redraw at ({}, {}); damage was {:?}",
+                     redraw at ({}, {}) {:?} vs {:?}; {differing} pixels differ, max channel \
+                     delta {max_delta}; damage was {:?}",
                     pixel % t.width,
                     pixel / t.width,
+                    &t.buffer[o..o + 4],
+                    &full[o..o + 4],
                     frame.damage
                 );
             }
