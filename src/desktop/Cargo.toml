@@ -19,6 +19,7 @@ members = [
     "apps/bench-mixer-bevy",
     "crates/cosmix-bench-feed",
     "crates/cosmix-design",
+    "crates/cosmix-iced-widgets",
     "crates/cosmix-scene",
     "crates/cosmix-scene-bevy",
     "crates/cosmix-comp",
