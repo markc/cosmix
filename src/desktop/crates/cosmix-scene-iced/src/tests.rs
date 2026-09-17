@@ -663,8 +663,13 @@ fn frame_is_ordered_before_asset_events() {
             .map_err(|error| format!("{error:?}"))
     };
     assert_eq!(build(false), Ok(()));
-    let error = build(true).unwrap_err();
-    assert!(error.contains("Cycle"), "{error}");
+    // Bevy reports the contradiction as a cycle or as a cross dependency with
+    // the set, depending on where it detects it; either proves the ordering.
+    let error = build(true).expect_err("the opposite order must contradict frame");
+    assert!(
+        error.contains("Cycle") || error.contains("CrossDependency"),
+        "{error}"
+    );
 }
 
 #[test]
