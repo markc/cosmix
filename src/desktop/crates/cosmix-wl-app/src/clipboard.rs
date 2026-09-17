@@ -193,6 +193,32 @@ impl Runtime {
     }
 }
 
+impl State {
+    fn selection_changed(&mut self, selection: Selection) {
+        // The compositor echoes our own selection back; that is not news.
+        if self.rt.sources.contains_key(&selection) {
+            return;
+        }
+        let offered = match selection {
+            Selection::Clipboard => self
+                .rt
+                .seat
+                .data_device
+                .as_ref()
+                .is_some_and(|d| d.data().selection_offer().is_some()),
+            Selection::Primary => self
+                .rt
+                .seat
+                .primary_device
+                .as_ref()
+                .is_some_and(|d| d.data().selection_offer().is_some()),
+        };
+        if offered {
+            self.emit(Event::SelectionChanged { selection });
+        }
+    }
+}
+
 impl DataDeviceHandler for State {
     fn enter(
         &mut self,
@@ -206,7 +232,9 @@ impl DataDeviceHandler for State {
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
     fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        self.selection_changed(Selection::Clipboard);
+    }
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
 }
 
@@ -274,6 +302,7 @@ impl PrimarySelectionDeviceHandler for State {
         _: &QueueHandle<Self>,
         _: &ZwpPrimarySelectionDeviceV1,
     ) {
+        self.selection_changed(Selection::Primary);
     }
 }
 

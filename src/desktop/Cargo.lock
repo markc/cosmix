@@ -3474,6 +3474,8 @@ dependencies = [
 name = "cosmix-wl-iced-demo"
 version = "0.1.0"
 dependencies = [
+ "cosmix-iced-host",
+ "cosmix-iced-widgets",
  "cosmix-wl-app",
  "rustix 1.1.4",
  "swash",

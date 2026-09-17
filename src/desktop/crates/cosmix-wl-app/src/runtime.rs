@@ -270,6 +270,7 @@ pub(crate) struct Runtime {
     // selections
     pub(crate) sources: HashMap<Selection, (OwnedSource, String)>,
     exit: bool,
+    timers: HashMap<u64, RegistrationToken>,
     stats: Stats,
     waker: Sender<u64>,
 }
@@ -388,6 +389,7 @@ pub fn run(app: impl App + 'static) -> Result<Stats, Error> {
         ime_surface: None,
         sources: HashMap::new(),
         exit: false,
+        timers: HashMap::new(),
         stats: Stats::default(),
         waker,
         signal: event_loop.get_signal(),
@@ -524,6 +526,37 @@ impl Ctx<'_> {
 
     pub fn keyboard_focus(&self) -> Option<SurfaceId> {
         self.rt.keyboard_focus
+    }
+
+    /// Arm (or re-arm) one-shot timer `token` to fire at `at`; it arrives
+    /// as [`Event::Timer`]. Timers only exist while armed.
+    pub fn set_timer(&mut self, token: u64, at: Instant) {
+        self.cancel_timer(token);
+        let delay = at.saturating_duration_since(Instant::now());
+        let inserted = self.rt.handle.insert_source(
+            Timer::from_duration(delay),
+            move |_, _, state: &mut State| {
+                state.rt.timers.remove(&token);
+                state.emit(Event::Timer(token));
+                TimeoutAction::Drop
+            },
+        );
+        match inserted {
+            Ok(t) => {
+                self.rt.timers.insert(token, t);
+            }
+            Err(e) => log::error!("timer: {e}"),
+        }
+    }
+
+    pub fn cancel_timer(&mut self, token: u64) {
+        if let Some(t) = self.rt.timers.remove(&token) {
+            self.rt.handle.remove(t);
+        }
+    }
+
+    pub fn timer_armed(&self, token: u64) -> bool {
+        self.rt.timers.contains_key(&token)
     }
 
     pub fn waker(&self) -> Waker {

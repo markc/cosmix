@@ -85,8 +85,13 @@ pub struct RawDemo {
     font: Option<Font>,
     cols: usize,
     rows: usize,
-    text: String,
+    /// The grid's text (the embedding app swaps it per tab).
+    pub text: String,
     preedit: String,
+    header: u32,
+    embedded: bool,
+    ime_blocked: bool,
+    name: &'static str,
     drawn: Vec<Cell>,
     force_full: bool,
     alt_bg: bool,
@@ -117,6 +122,71 @@ impl RawDemo {
             menus: Vec::new(),
             printed_startup: false,
             frames: 0,
+            header: HEADER,
+            embedded: false,
+            ime_blocked: false,
+            name: "wl-raw-demo",
+        }
+    }
+
+    /// A grid under `header` logical pixels of someone else's chrome: no
+    /// title band, no raw popup menu, and the embedder commits.
+    pub fn embedded(clock: Clock, name: &'static str, header: u32) -> Self {
+        Self {
+            header,
+            embedded: true,
+            name,
+            ..Self::new(clock)
+        }
+    }
+
+    pub fn window(&self) -> Option<SurfaceId> {
+        self.window
+    }
+
+    pub fn info(&self) -> Option<SurfaceInfo> {
+        self.info
+    }
+
+    pub fn trace(&self) -> bool {
+        self.trace
+    }
+
+    pub fn clock(&self) -> Clock {
+        self.clock
+    }
+
+    /// Repaint the whole grid on the next draw.
+    pub fn invalidate(&mut self, cx: &mut Ctx<'_>) {
+        self.force_full = true;
+        self.redraw(cx);
+    }
+
+    /// While blocked (a chrome text field owns the input method), the grid
+    /// neither enables nor updates the IME.
+    pub fn set_ime_blocked(&mut self, cx: &mut Ctx<'_>, blocked: bool) {
+        if self.ime_blocked == blocked {
+            return;
+        }
+        self.ime_blocked = blocked;
+        self.ime_rect = None;
+        if !blocked {
+            self.sync_ime(cx);
+        }
+    }
+
+    /// Count a frame committed by the embedder (for the startup line).
+    pub fn note_frame(&mut self) {
+        self.frames += 1;
+        if !self.printed_startup {
+            self.printed_startup = true;
+            let now = std::time::Instant::now();
+            eprintln!(
+                "{}: startup_ms={:.1} (process start to first commit; main to commit {:.1} ms)",
+                self.name,
+                self.clock.startup_ms(now),
+                self.clock.main_to_ms(now)
+            );
         }
     }
 
@@ -124,9 +194,9 @@ impl RawDemo {
         self.frames
     }
 
-    fn log(&self, msg: std::fmt::Arguments<'_>) {
+    pub fn log(&self, msg: std::fmt::Arguments<'_>) {
         if self.trace {
-            eprintln!("wl-raw-demo: {msg}");
+            eprintln!("{}: {msg}", self.name);
         }
     }
 
@@ -136,7 +206,7 @@ impl RawDemo {
 
     fn grid_origin(&self, info: &SurfaceInfo) -> (i32, i32) {
         let pad = info.scale.to_physical(PAD) as i32;
-        (pad, info.scale.to_physical(HEADER) as i32 + pad)
+        (pad, info.scale.to_physical(self.header) as i32 + pad)
     }
 
     fn relayout(&mut self, info: SurfaceInfo) {
@@ -175,7 +245,7 @@ impl RawDemo {
         (cells, at)
     }
 
-    fn insert(&mut self, cx: &mut Ctx<'_>, s: &str) {
+    pub fn insert(&mut self, cx: &mut Ctx<'_>, s: &str) {
         let clean: String = s
             .chars()
             .filter(|c| *c == '\n' || !c.is_control())
@@ -197,6 +267,9 @@ impl RawDemo {
         let (Some(window), Some(info), Some(font)) = (self.window, self.info, &self.font) else {
             return;
         };
+        if self.ime_blocked {
+            return;
+        }
         if !self.focused {
             if self.ime_rect.take().is_some() {
                 cx.set_ime(None);
@@ -319,14 +392,33 @@ impl RawDemo {
     }
 
     fn draw_window(&mut self, frame: &mut Frame<'_>) {
+        let Some((full, damage)) = self.paint_window(frame) else {
+            return;
+        };
+        if full {
+            frame.commit_full();
+        } else if !damage.is_empty() {
+            frame.commit_with_damage(&damage);
+        }
+        if full || !damage.is_empty() {
+            self.note_frame();
+            self.log(format_args!(
+                "frame {} window full={full} damage_rects={}",
+                self.frames,
+                damage.len()
+            ));
+        }
+    }
+
+    /// Paint changed grid cells (everything when `full`) without committing.
+    /// Returns whether the whole buffer was painted and the damaged cells.
+    pub fn paint_window(&mut self, frame: &mut Frame<'_>) -> Option<(bool, Vec<Rect>)> {
         let info = frame.info();
         let full = frame.needs_full_redraw() || self.force_full;
         let bg = self.bg();
         let (ox, oy) = self.grid_origin(&info);
         let (cells, _) = self.wanted();
-        let Some(font) = self.font.as_mut() else {
-            return;
-        };
+        let font = self.font.as_mut()?;
         let (pixels, width, height, stride) = frame.buffer_mut();
         let mut canvas = Canvas {
             pixels,
@@ -338,6 +430,9 @@ impl RawDemo {
         let mut damage = Vec::new();
         if full {
             canvas.fill(Rect::new(0, 0, width as i32, height as i32), bg);
+            self.drawn.clear();
+        }
+        if full && !self.embedded {
             let header = info.scale.to_physical(HEADER) as i32;
             canvas.fill(Rect::new(0, 0, width as i32, header), HEADER_BG);
             let title = format!(
@@ -349,7 +444,6 @@ impl RawDemo {
                 self.rows
             );
             canvas.text(font, ox, (header - ch) / 2, &title, ACCENT);
-            self.drawn.clear();
         }
         self.drawn.resize(cells.len(), (' ', Style::Normal));
         for (i, cell) in cells.iter().enumerate() {
@@ -384,21 +478,8 @@ impl RawDemo {
                 damage.push(r);
             }
         }
-        if full {
-            frame.commit_full();
-        } else if !damage.is_empty() {
-            frame.commit_with_damage(&damage);
-        }
         self.force_full = false;
-        let committed = full || !damage.is_empty();
-        if committed {
-            self.frames += 1;
-            self.log(format_args!(
-                "frame {} window full={full} damage_rects={}",
-                self.frames,
-                damage.len()
-            ));
-        }
+        Some((full, damage))
     }
 
     fn draw_menu(&mut self, level: usize, frame: &mut Frame<'_>) {
@@ -452,8 +533,8 @@ impl RawDemo {
             frame.commit_with_damage(&damage);
         }
         if full || !damage.is_empty() {
-            self.frames += 1;
             let id = menu.id;
+            self.note_frame();
             self.log(format_args!(
                 "frame {} popup {id:?} full={full} damage_rects={}",
                 self.frames,
@@ -471,8 +552,8 @@ impl RawDemo {
 
 impl App for RawDemo {
     fn init(&mut self, cx: &mut Ctx<'_>) {
-        let mut spec = WindowSpec::new("wl-raw-demo", (800, 500));
-        spec.app_id = "cosmix-wl-raw-demo".into();
+        let mut spec = WindowSpec::new(self.name, (800, 500));
+        spec.app_id = format!("cosmix-{}", self.name);
         spec.min_size = Some((200, 120));
         self.window = Some(cx.create_window(spec));
         cx.set_cursor(CursorShape::Text);
@@ -623,7 +704,7 @@ impl App for RawDemo {
                         state: ButtonState::Pressed,
                     } => {
                         self.log(format_args!("button 0x{button:x} at={:?}", p.position));
-                        if button == BTN_RIGHT {
+                        if button == BTN_RIGHT && !self.embedded {
                             self.close_menus(cx, 0);
                             let (x, y) = (p.position.0 as i32, p.position.1 as i32);
                             if let Some(w) = self.window {
@@ -698,15 +779,6 @@ impl App for RawDemo {
             self.draw_window(frame);
         } else if let Some(level) = self.menu_index(id) {
             self.draw_menu(level, frame);
-        }
-        if !self.printed_startup && self.frames > 0 {
-            self.printed_startup = true;
-            let now = std::time::Instant::now();
-            eprintln!(
-                "wl-raw-demo: startup_ms={:.1} (process start to first commit; main to commit {:.1} ms)",
-                self.clock.startup_ms(now),
-                self.clock.main_to_ms(now)
-            );
         }
     }
 }

@@ -58,6 +58,11 @@ impl SurfaceId {
     pub fn raw(&self) -> u64 {
         self.0
     }
+
+    /// An id not issued by a runtime, for tests of app logic.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 /// The app side of the runtime. All callbacks run on the loop thread.

@@ -7,7 +7,7 @@
 [package]
 name = "cosmix-wl-iced-demo"
 version = "0.1.0"
-description = "Raw Wayland demo client for cosmix-wl-app (and, later, its iced-chrome twin)"
+description = "Raw Wayland demo clients for cosmix-wl-app, without and with iced chrome"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -20,12 +20,19 @@ path = "src/lib.rs"
 name = "wl-raw-demo"
 path = "src/bin/wl-raw-demo.rs"
 
-# The iced twin goes here, reusing `cosmix_wl_iced_demo::raw`:
-# [[bin]]
-# name = "wl-iced-demo"
-# path = "src/bin/wl-iced-demo.rs"
+# Build it in its own cargo invocation with `--features iced`; building
+# wl-raw-demo without the feature keeps iced out of its graph.
+[[bin]]
+name = "wl-iced-demo"
+path = "src/bin/wl-iced-demo.rs"
+required-features = ["iced"]
+
+[features]
+iced = ["dep:cosmix-iced-host", "dep:cosmix-iced-widgets"]
 
 [dependencies]
+cosmix-iced-host = { path = "../../crates/cosmix-iced-host", features = ["xkb"], optional = true }
+cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets", features = ["tiny-skia"], optional = true }
 cosmix-wl-app = { path = "../../crates/cosmix-wl-app" }
 rustix = { version = "1", features = ["param", "time"] }
 swash = "0.2.10"

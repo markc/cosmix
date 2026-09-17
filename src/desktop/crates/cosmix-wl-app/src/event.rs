@@ -154,4 +154,10 @@ pub enum Event {
     },
     /// Delivered for [`crate::Waker::wake`].
     Wake(u64),
+    /// A one-shot timer set with [`crate::Ctx::set_timer`] fired.
+    Timer(u64),
+    /// Another client set `selection`; request it to read the text.
+    SelectionChanged {
+        selection: Selection,
+    },
 }
