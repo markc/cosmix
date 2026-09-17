@@ -33,6 +33,7 @@ pub(crate) struct Snapshot {
     text: Vec<Vec<TextItem>>,
 }
 
+#[derive(Debug)]
 struct TextItem {
     clip: Rectangle,
     transformation: Transformation,
@@ -41,7 +42,7 @@ struct TextItem {
     bounds: Vec<Rectangle>,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum TextKey {
     Paragraph {
         position: Point,
@@ -56,7 +57,7 @@ enum TextKey {
     Other(Text),
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 struct Content {
     lines: Vec<(String, AttrsList)>,
     metrics: (f32, f32),
@@ -227,7 +228,7 @@ fn slices_eq<T>(a: &[T], b: &[T], eq: impl Fn(&T, &T) -> bool) -> bool {
 }
 
 /// Pushes the bounds of every item between the common prefix and suffix.
-fn middle<T>(
+fn middle<T: std::fmt::Debug>(
     a: &[T],
     b: &[T],
     bounds: impl Fn(&T) -> Vec<Rectangle>,
@@ -235,6 +236,9 @@ fn middle<T>(
     out: &mut Vec<Rectangle>,
 ) {
     let (lo, a_hi, b_hi) = changed_span(a, b, eq);
+    if std::env::var_os("COSMIX_ICED_DAMAGE_DEBUG").is_some() && (lo < a_hi || lo < b_hi) {
+        eprintln!("DAMAGE_DEBUG span lo={lo} a_hi={a_hi} b_hi={b_hi} a={:#?} b={:#?}", &a[lo..a_hi], &b[lo..b_hi]);
+    }
     for item in a[lo..a_hi].iter().chain(&b[lo..b_hi]) {
         out.extend(bounds(item));
     }
