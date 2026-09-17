@@ -657,6 +657,7 @@ fn frame_is_ordered_before_asset_events() {
                 .get_mut(PostUpdate)
                 .unwrap()
                 .initialize(world)
+                .map(|_| ())
                 .map_err(|error| format!("{error:?}"))
         })
     };
