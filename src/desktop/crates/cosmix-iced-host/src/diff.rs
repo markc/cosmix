@@ -138,6 +138,82 @@ impl Snapshot {
     }
 }
 
+/// A quad's damage bounds: its border is drawn inside the bounds, but a
+/// wide stroke and antialiasing at fractional scale reach a little further.
+fn quad_bounds(quad: &iced_core::renderer::Quad) -> Rectangle {
+    quad.bounds.expand(QUAD_MARGIN + quad.border.width.max(0.0))
+}
+
+/// The area a quad's shadow can cover, as `iced_tiny_skia` computes it.
+fn shadow_bounds(quad: &iced_core::renderer::Quad) -> Option<Rectangle> {
+    let shadow = quad.shadow;
+    (shadow.color.a > 0.0).then(|| {
+        Rectangle {
+            x: quad.bounds.x + shadow.offset.x - shadow.blur_radius,
+            y: quad.bounds.y + shadow.offset.y - shadow.blur_radius,
+            width: quad.bounds.width + shadow.blur_radius * 2.0,
+            height: quad.bounds.height + shadow.blur_radius * 2.0,
+        }
+        .expand(QUAD_MARGIN)
+    })
+}
+
+/// Grows the damage to cover what the renderer paints without the clip mask.
+///
+/// `iced_tiny_skia` draws a quad's shadow pixmap unmasked whenever the quad
+/// body meets the damage, and skips the mask for a paragraph whose measured
+/// bounds lie inside it, so glyph ink overhanging those bounds also escapes.
+/// Those pixels are rewritten, so they have to be inside the damage: the
+/// caller is told what changed, and a format swap covers them exactly once.
+pub(crate) fn expand_unclipped(
+    rects: &mut Vec<Rectangle>,
+    previous: &Snapshot,
+    current: &Snapshot,
+) {
+    // Growing the damage can reach another shadow or text run, so this
+    // repeats until nothing new is added (bounded: each pass either adds a
+    // rectangle that then contains its candidate, or stops).
+    for _ in 0..8 {
+        let before = rects.len();
+        for snapshot in [previous, current] {
+            for (index, layer) in snapshot.layers.iter().enumerate() {
+                for (quad, _) in &layer.quads {
+                    let Some(shadow) = shadow_bounds(quad) else {
+                        continue;
+                    };
+                    let body = quad_bounds(quad);
+                    if touches(rects, &body) && !covered(rects, &shadow) {
+                        rects.push(shadow);
+                    }
+                }
+                for item in &snapshot.text[index] {
+                    for ink in &item.bounds {
+                        if touches(rects, ink) && !covered(rects, ink) {
+                            rects.push(*ink);
+                        }
+                    }
+                }
+            }
+        }
+        if rects.len() == before {
+            return;
+        }
+    }
+}
+
+fn touches(rects: &[Rectangle], other: &Rectangle) -> bool {
+    rects.iter().any(|r| r.intersects(other))
+}
+
+fn covered(rects: &[Rectangle], other: &Rectangle) -> bool {
+    rects.iter().any(|r| {
+        r.x <= other.x
+            && r.y <= other.y
+            && r.x + r.width >= other.x + other.width
+            && r.y + r.height >= other.y + other.height
+    })
+}
+
 /// Logical rectangles that changed between `previous` and `current`.
 pub(crate) fn damage(previous: &Snapshot, current: &Snapshot) -> Vec<Rectangle> {
     let mut out = Vec::new();
@@ -176,7 +252,7 @@ fn layer(a: &Layer, b: &Layer, at: &[TextItem], bt: &[TextItem], out: &mut Vec<R
     middle(
         &a.quads,
         &b.quads,
-        |(quad, _)| clip(quad.bounds.expand(QUAD_MARGIN)).into_iter().collect(),
+        |(quad, _)| clip(quad_bounds(quad)).into_iter().collect(),
         |x, y| x == y,
         out,
     );
