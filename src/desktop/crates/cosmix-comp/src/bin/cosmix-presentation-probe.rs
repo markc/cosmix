@@ -2,6 +2,10 @@
 //!
 //! Maps one xdg toplevel and, for each of `--frames` frame callbacks,
 //! commits `--burst` buffers back to back. Every commit of a single-commit
+//! `--callbacks-only` measures just the compositor frame-callback cadence,
+//! the one measurement that also works against a compositor without
+//! wp_presentation (a host, for the nested pacing work).
+//!
 //! frame asks for presentation feedback; in burst mode the first and the
 //! last commit of each burst ask, so superseded commits are exercised too.
 //! Prints one `COSMIX_PRESENTATION_PROBE` summary line and exits non-zero

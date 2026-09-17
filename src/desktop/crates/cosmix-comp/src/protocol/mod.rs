@@ -1004,6 +1004,10 @@ enum ProtocolCommand {
         sampled: Option<u64>,
         commit_seq: u64,
     },
+    /// Host input without a frame boundary (the nested backend's input lane).
+    HostInput {
+        inputs: Vec<HostInput>,
+    },
     /// A backend wired its frame reporter: advertise `wp_presentation`.
     EnablePresentation,
     CapturePixels(CapturePixels),
@@ -1484,9 +1488,11 @@ pub(crate) enum CaptureTestOutcome {
 ///
 /// Unlike [`WaylandRuntime`], this cloneable seam can send only an empty frame
 /// boundary. The live coordinator owns it; render Apps cannot inject input or
-/// gain topology and shutdown authority through it.
-#[cfg(any(all(feature = "kms-live", not(test)), test))]
-#[derive(Clone)]
+/// gain topology and shutdown authority through it. Both backends pulse it
+/// once a frame has reached the screen (kms-live from the page flip, nested
+/// from the swapchain hand-off), so a client that draws on its callback is
+/// committing into the frame comp extracts next, not the one it just sent.
+#[derive(Clone, bevy::prelude::Resource)]
 pub(crate) struct ClientFrameClock {
     commands: CommandSender<ProtocolCommand>,
 }
@@ -1674,7 +1680,6 @@ impl CaptureCompletionReporter {
     }
 }
 
-#[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl ClientFrameClock {
     pub(crate) fn pulse(&self) -> Result<(), String> {
         self.commands
@@ -2383,9 +2388,15 @@ impl WaylandRuntime {
         drain_kms_render_commands(&self.kms_render_commands)
     }
 
-    pub(crate) fn finish_frame(&self, inputs: Vec<HostInput>) -> Result<(), String> {
+    /// Host input for this frame. Frame callbacks are NOT sent here: the
+    /// nested backend pulses them from the post-present schedule, once the
+    /// frame is with the host.
+    pub(crate) fn deliver_host_input(&self, inputs: Vec<HostInput>) -> Result<(), String> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
         self.commands
-            .send(ProtocolCommand::Frame { inputs })
+            .send(ProtocolCommand::HostInput { inputs })
             .map_err(|_| "Wayland protocol thread disconnected".to_string())
     }
 
@@ -3492,6 +3503,11 @@ impl ProtocolServer {
                     commit_seq,
                 }) => {
                     state.commit_refused(id, sampled, commit_seq);
+                }
+                ChannelEvent::Msg(ProtocolCommand::HostInput { inputs }) => {
+                    for input in inputs {
+                        state.handle_host_input(input);
+                    }
                 }
                 ChannelEvent::Msg(ProtocolCommand::EnablePresentation) => {
                     state.enable_presentation();

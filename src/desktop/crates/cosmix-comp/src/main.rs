@@ -335,7 +335,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
             primary_window: Some(Window {
                 title: WINDOW_TITLE.into(),
                 resolution: (INITIAL_WIDTH, INITIAL_HEIGHT).into(),
-                present_mode: PresentMode::AutoNoVsync,
+                present_mode: PresentMode::AutoVsync,
                 ..default()
             }),
             ..default()
@@ -414,6 +414,13 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         capture_reporter.clone(),
     );
     install_nested_frame_presentation(&mut app, runtime.frame_presentation_reporter());
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.insert_resource(runtime.client_frame_clock());
+        render_app.add_systems(
+            NestedPostPresent,
+            pulse_nested_client_frames.after(complete_nested_security_presentation),
+        );
+    }
     // Opt-in (COSMIX_FRAME_TRACE): render phases and wgpu acquire/present.
     frame_trace::install_render_phases(&mut app);
     #[cfg(feature = "content-source-probe")]
@@ -1619,8 +1626,20 @@ fn finish_wayland_frame(world: &mut World) {
         return;
     }
     let inputs = mem::take(&mut world.resource_mut::<HostInputQueue>().pending);
-    if let Err(error) = world.resource::<WaylandRuntime>().finish_frame(inputs) {
+    if let Err(error) = world
+        .resource::<WaylandRuntime>()
+        .deliver_host_input(inputs)
+    {
         panic!("{error}");
+    }
+}
+
+/// The nested frame boundary: clients are told to draw once this frame is
+/// with the host, so their commit lands in the next extract rather than
+/// just missing the one that already happened.
+fn pulse_nested_client_frames(clock: Res<protocol::ClientFrameClock>) {
+    if let Err(error) = clock.pulse() {
+        error!(%error, "nested client frame pulse failed");
     }
 }
 
