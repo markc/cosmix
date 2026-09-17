@@ -30158,6 +30158,49 @@ fn synchronised_subsurface_feedback_is_taken_when_the_parent_applies() {
     assert_eq!(feedback_opcodes(&events, callback), [1], "{events:?}");
 }
 
+/// G3: several cached commits applied in one transaction keep their own
+/// feedback. A commit whose buffer a later cached commit replaced is
+/// discarded even when the later commit asked for no feedback; a bufferless
+/// commit after the last buffer is presented with that buffer's frame.
+#[test]
+fn interior_cached_commits_are_superseded_not_presented_late() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let interior = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    // A later cached commit replaces the buffer without asking for feedback.
+    commit_test_buffer(&mut harness, child_surface);
+    // A bufferless commit after it asks for feedback: it shows that buffer.
+    let trailing = request_surface_feedback(&mut harness, presentation, child_surface);
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    harness.dispatch_client();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let events = harness.sync();
+    assert_eq!(
+        feedback_opcodes(&events, interior),
+        [2],
+        "the superseded interior commit is discarded at apply: {events:?}"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        1
+    );
+    let seq = content_seq(&harness, &child.id());
+    let (frame, content) = test_frame_report(child_id, 42, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, trailing), [1], "{events:?}");
+}
+
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
 /// event, no-op dedup, validation, and the startup gate it feeds. The
 /// PERSISTED half (the etc-tree file) is deliberately not driven here —

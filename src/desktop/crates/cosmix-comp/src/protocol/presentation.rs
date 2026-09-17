@@ -524,8 +524,48 @@ pub(crate) struct PresentationRuntime {
 
 struct AppliedCommit {
     surface: WlSurface,
-    buffer_attached: bool,
     content_seq_before: Option<u64>,
+}
+
+/// One `wl_surface.commit`'s feedback, staged by the pre-commit hook before
+/// Smithay caches the commit. A transaction can apply several cached
+/// commits at once (a pending blocker, a synchronised parent); Smithay's own
+/// feedback state keeps an interior commit's callbacks when a later commit
+/// had none, so they would be presented with the later commit's content.
+/// Staging keeps each commit's callbacks with what that commit did.
+struct StagedCommit {
+    callbacks: Vec<PresentationFeedbackCallback>,
+    /// The commit attached or removed a buffer: every earlier commit's
+    /// content is superseded.
+    supersedes: bool,
+    /// The commit attached a new buffer.
+    new_buffer: bool,
+}
+
+impl Drop for StagedCommit {
+    fn drop(&mut self) {
+        // A surface destroyed with commits still cached.
+        for callback in self.callbacks.drain(..) {
+            callback.discarded();
+        }
+    }
+}
+
+/// Double-buffered staged feedback: the commits a transaction applied,
+/// oldest first.
+#[derive(Default)]
+pub(super) struct StagedFeedback {
+    commits: Vec<StagedCommit>,
+}
+
+impl Cacheable for StagedFeedback {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+        mem::take(self)
+    }
+
+    fn merge_into(mut self, into: &mut Self, _dh: &DisplayHandle) {
+        into.commits.append(&mut self.commits);
+    }
 }
 
 /// `frame_trace` reason codes (the `aux` field of
@@ -567,23 +607,12 @@ impl WaylandState {
     /// First thing in the commit hook, before the commit path consumes the
     /// buffer: remember what this commit tried to do.
     pub(super) fn note_presentation_commit(&mut self, surface: &WlSurface) {
-        let buffer_attached = compositor::with_states(surface, |states| {
-            matches!(
-                states
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .current()
-                    .buffer,
-                Some(BufferAssignment::NewBuffer(_))
-            )
-        });
         let content_seq_before = self
             .surfaces
             .get(&surface.id())
             .map(|record| record.content_seq);
         self.presentation.applied_commits.push(AppliedCommit {
             surface: surface.clone(),
-            buffer_attached,
             content_seq_before,
         });
     }
@@ -594,11 +623,7 @@ impl WaylandState {
     pub(super) fn take_presentation_commits(&mut self) {
         for commit in mem::take(&mut self.presentation.applied_commits) {
             if commit.surface.is_alive() {
-                self.take_presentation_feedback(
-                    &commit.surface,
-                    commit.buffer_attached,
-                    commit.content_seq_before,
-                );
+                self.take_presentation_feedback(&commit.surface, commit.content_seq_before);
             }
         }
     }
@@ -606,28 +631,58 @@ impl WaylandState {
     /// Move one applied commit's feedback out of Smithay's cache (a later
     /// commit would otherwise discard it while this commit is still in
     /// flight) into the ledger.
-    fn take_presentation_feedback(
-        &mut self,
-        surface: &WlSurface,
-        buffer_attached: bool,
-        content_seq_before: Option<u64>,
-    ) {
-        let callbacks = compositor::with_states(surface, |states| {
-            mem::take(
-                &mut states
-                    .cached_state
-                    .get::<PresentationFeedbackCachedState>()
-                    .current()
-                    .callbacks,
+    fn take_presentation_feedback(&mut self, surface: &WlSurface, content_seq_before: Option<u64>) {
+        let (commits, unstaged) = compositor::with_states(surface, |states| {
+            (
+                mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<StagedFeedback>()
+                        .current()
+                        .commits,
+                ),
+                mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<PresentationFeedbackCachedState>()
+                        .current()
+                        .callbacks,
+                ),
             )
         });
-        if callbacks.is_empty() {
-            return;
+        // Only the last commit that replaced the buffer (and the bufferless
+        // commits after it) can be shown; earlier ones were superseded
+        // inside the transaction.
+        let last_content = commits.iter().rposition(|commit| commit.supersedes);
+        let buffer_attached = last_content.is_some_and(|index| commits[index].new_buffer);
+        let mut callbacks = Vec::new();
+        let mut superseded = 0;
+        for (index, mut commit) in commits.into_iter().enumerate() {
+            let taken = mem::take(&mut commit.callbacks);
+            if last_content.is_some_and(|last| index < last) {
+                superseded += taken.len();
+                for callback in taken {
+                    callback.discarded();
+                }
+            } else {
+                callbacks.extend(taken);
+            }
         }
+        // Feedback requested before the staging hook existed rides along.
+        callbacks.extend(unstaged);
         let record = self
             .surfaces
             .get(&surface.id())
             .filter(|record| !matches!(record.role, SurfaceRole::Dormant(_)));
+        if superseded > 0 {
+            let (id, seq) = record.map_or((0, 0), |record| (record.id.0, record.content_seq));
+            crate::frame_trace::event("comp_presentation_discarded", || {
+                (id, seq, DiscardReason::Superseded as u64)
+            });
+        }
+        if callbacks.is_empty() {
+            return;
+        }
         // A commit becomes content only when it is mapped and, if it
         // attached a buffer, that buffer was published to the renderer
         // (`content_seq` advanced). Everything else (no scene record, a
@@ -671,6 +726,41 @@ impl WaylandState {
         }
         let overflow = self.presentation.ledger.take_on_commit(id, seq, callbacks);
         trace_discards(id, &overflow, DiscardReason::Overflow);
+    }
+
+    /// Pre-commit hook: move this commit's feedback out of Smithay's pending
+    /// state, tagged with whether the commit replaced the buffer.
+    pub(super) fn stage_presentation_feedback(&self, surface: &WlSurface) {
+        compositor::with_states(surface, |states| {
+            let callbacks = mem::take(
+                &mut states
+                    .cached_state
+                    .get::<PresentationFeedbackCachedState>()
+                    .pending()
+                    .callbacks,
+            );
+            let (supersedes, new_buffer) = {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let buffer = &attributes.pending().buffer;
+                (
+                    buffer.is_some(),
+                    matches!(buffer, Some(BufferAssignment::NewBuffer(_))),
+                )
+            };
+            if callbacks.is_empty() && !supersedes {
+                return;
+            }
+            states
+                .cached_state
+                .get::<StagedFeedback>()
+                .pending()
+                .commits
+                .push(StagedCommit {
+                    callbacks,
+                    supersedes,
+                    new_buffer,
+                });
+        });
     }
 
     /// A lifecycle edge after which nothing pending can be shown as

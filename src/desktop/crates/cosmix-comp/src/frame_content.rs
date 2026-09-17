@@ -235,7 +235,9 @@ fn sampled_commit(
 }
 
 /// A DMA-BUF commit whose import failed for good: nothing is pending and the
-/// installed request is not the latest one.
+/// installed request is not the latest one. A failed re-upload of the
+/// content already installed (a rebuilt upsert) refuses nothing: that
+/// commit is still on screen.
 fn refused_commit(
     surface: &ExtractedFrameSurface,
     progress: Option<ImportProgress>,
@@ -245,10 +247,17 @@ fn refused_commit(
     if progress.pending || progress.installed == Some(progress.latest) {
         return None;
     }
-    requests
-        .iter()
-        .find(|(request, _)| *request == progress.latest)
-        .map(|(_, commit)| *commit)
+    let commit_of = |wanted: u64| {
+        requests
+            .iter()
+            .find(|(request, _)| *request == wanted)
+            .map(|(_, commit)| *commit)
+    };
+    let refused = commit_of(progress.latest)?;
+    let installed = progress.installed.and_then(commit_of);
+    installed
+        .is_none_or(|installed| refused > installed)
+        .then_some(refused)
 }
 
 fn frame_content(
@@ -390,6 +399,38 @@ mod tests {
         // A surface that left the scene is forgotten.
         frame_content(&[], Vec::new(), &mut memory, |_| true);
         assert!(memory.is_empty());
+    }
+
+    /// G2: a rebuilt upsert re-uploads the installed commit under a new
+    /// request; if that import fails, the commit is still on screen.
+    #[test]
+    fn a_failed_re_upload_of_installed_content_refuses_nothing() {
+        let mut memory = HashMap::new();
+        let requests = [(10, 4), (11, 4)];
+        let mut sent = Vec::new();
+        let frame = frame_content(
+            &[(dmabuf(1, 4, &requests), true, progress(11, Some(10), false))],
+            Vec::new(),
+            &mut memory,
+            |refusal| {
+                sent.push(refusal);
+                true
+            },
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(frame.surfaces, [shown(1, 4, true)]);
+        // A newer commit that fails is still refused.
+        let requests = [(10, 4), (11, 4), (12, 5)];
+        frame_content(
+            &[(dmabuf(1, 5, &requests), true, progress(12, Some(10), false))],
+            Vec::new(),
+            &mut memory,
+            |refusal| {
+                sent.push(refusal);
+                true
+            },
+        );
+        assert_eq!(sent, [refusal(1, 4, 5)]);
     }
 
     #[test]

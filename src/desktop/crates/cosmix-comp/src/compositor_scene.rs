@@ -2416,6 +2416,11 @@ fn upsert_surface_snapshot(
         .surfaces
         .get(&id)
         .map(|surface| (surface.entity, surface.image.clone(), surface.buffer_kind));
+    let shown_commit = world
+        .resource::<SurfaceEntities>()
+        .surfaces
+        .get(&id)
+        .map_or(0, |surface| surface.applied_commit);
     // Only an applied buffer advances the content commit; a rejected
     // DMA-BUF leaves the previous content (and its commit) on screen, and
     // the protocol thread is told so the commit's feedback is discarded.
@@ -2535,10 +2540,20 @@ fn upsert_surface_snapshot(
             }
         }
     }
-    if !applied && let Some(feed) = world.get_resource::<ClientSceneFeed>() {
+    if !applied
+        && rejection_refuses(shown_commit, scene_commit)
+        && let Some(feed) = world.get_resource::<ClientSceneFeed>()
+    {
         feed.commit_refused(id, scene_commit);
     }
     z_changed
+}
+
+/// A rejected upsert refuses its commit only when it would have replaced
+/// the content on screen with a newer commit. A rebuilt upsert (relayout,
+/// dirty recovery) carries the commit the installed texture still shows.
+fn rejection_refuses(shown_commit: u64, scene_commit: u64) -> bool {
+    scene_commit > shown_commit
 }
 
 fn dmabuf_release_mode(use_id: Option<DmabufUseId>, callback: ReleaseCallback) -> DmabufRelease {
@@ -3970,6 +3985,16 @@ mod tests {
             .send(events)
             .expect("shared scene protocol channel remains connected");
         app.update();
+    }
+
+    /// G2: a rejected rebuilt upsert (same commit as on screen, or older)
+    /// refuses nothing; a rejected new commit is refused.
+    #[test]
+    fn only_a_rejected_new_commit_is_refused() {
+        assert!(!rejection_refuses(4, 4), "rebuilt upsert of shown content");
+        assert!(!rejection_refuses(4, 3));
+        assert!(rejection_refuses(4, 5));
+        assert!(rejection_refuses(0, 1), "a first import that fails");
     }
 
     /// Through the real extract system: a minimised (hidden) surface and a

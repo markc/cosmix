@@ -591,7 +591,16 @@ client waits on feedback nothing will resolve.
   is `presented`. Commits older than it were replaced before any frame showed
   them, so they are `discarded`. Newer commits keep waiting. A commit without
   a new buffer carries the sequence of the content it leaves on screen, so it
-  is presented with the next frame that shows that content.
+  is presented with the next frame that shows that content. When one
+  transaction applies several commits at once (a synchronised subsurface
+  waiting for its parent, or a commit held by a blocker), each commit keeps
+  its own feedback: a commit whose buffer a later commit in the same
+  transaction replaced is `discarded`, even if the later commit asked for no
+  feedback.
+- **Re-uploads are not refusals:** when the compositor re-sends a surface's
+  current content (a relayout or recovery) and that upload fails, the content
+  already on screen stays shown and its feedback is not discarded. Only a
+  failed newer commit is.
 - **What "shown" means:** the surface is mapped and visible, lies at least
   partly on the output, and the frame samples that commit's texture.
   Occlusion by other windows is not checked, so a fully covered window still
