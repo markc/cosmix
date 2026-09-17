@@ -267,7 +267,7 @@ fn presented_discarded(counters: &SourceCounters) -> (u64, u64) {
 #[test]
 fn source_revisions_skipped_between_frames_count_as_discarded() {
     let mut ledger = SourceLedger::default();
-    assert_eq!(ledger.register("scene", Some("DP-1".into()), 5), 1);
+    assert_eq!(ledger.register("scene", Some("DP-1".into()), 1), 1);
     ledger.resolve(&source(1, true, 10), 1, None, no_marks);
     ledger.resolve(&source(1, true, 0), 2, None, no_marks);
     ledger.resolve(&source(4, true, 30), 3, None, no_marks);
@@ -282,7 +282,7 @@ fn source_revisions_skipped_between_frames_count_as_discarded() {
     assert_eq!(counters.leaves().upload_bytes_p50, Some(10));
     assert_eq!(
         (counters.output.as_deref(), counters.registered_at_us),
-        (Some("DP-1"), 5)
+        (Some("DP-1"), 1)
     );
     assert_eq!(
         counters.leaves().common.missed,

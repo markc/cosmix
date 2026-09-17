@@ -29703,7 +29703,8 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
         ..presentation::FrameSource::default()
     };
     for (frame, revision, upload) in [(7_u64, 1, 10), (8, 3, 20)] {
-        let (report, mut content) = test_frame_report(id, frame * 16_667, 0, false);
+        let tv = crate::frame_trace::monotonic_us() + frame * 16_667;
+        let (report, mut content) = test_frame_report(id, tv, 0, false);
         content.surfaces.clear();
         content.sources.push(source(revision, upload));
         harness.server.state.frame_presented(report, content);
