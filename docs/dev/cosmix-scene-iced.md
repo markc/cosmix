@@ -75,9 +75,12 @@ updates.
 
 Pointer input is read from Bevy's `PointerInput` messages, routed to the
 surface under the pointer (`HoverMap`) and captured from press to release,
-per pointer. Positions are converted to surface physical pixels using the
-window scale; this assumes `UiScale` is 1. The capture window check needs the
-UI camera to target `WindowRef::Entity`, as Quoin's panels do.
+per pointer. Positions are converted to surface pixels with the camera's
+target scale, which is what Bevy's UI picking uses; the surface itself
+renders at the UI target scale (window scale x `UiScale`). The two are equal
+under Quoin and differ in comp, whose native shell already multiplies
+`UiScale` into pointer positions. The capture window check needs the UI
+camera to target `WindowRef::Entity`, as Quoin's panels do.
 A press on a surface sets `InputFocus`; a press on no surface clears it if a
 surface held it. `SceneIcedFocus` records the owning surface, its IME request
 (caret in window-logical coordinates) and the hovered cursor shape. Keys and
@@ -104,5 +107,13 @@ A captured pointer that reports from another window is not given that
 position: the surface loses hover, and a release there still ends the
 capture.
 
-`SceneIcedWake` is the earliest renderer wake time; Quoin copies it into
-`LayerHostDeadline` so a caret can blink on an otherwise idle host.
+`SceneIcedWake` is the earliest renderer wake time. The host registers what
+to do with it on `SceneIcedWaker` (`set(|world, at| …)`, called every update
+while a wake is pending, so a host that consumes its deadline re-arms):
+Quoin folds it into `LayerHostDeadline` so a caret can blink on an otherwise
+idle host, and a host that mounts the bridge in-process registers its own.
+
+A natively mounted Quoin registers on the Bus as `shell`, or as
+`COSMIX_NATIVE_SHELL_SERVICE`, or as `NativeQuoin::with_service(..)`. One
+node holds one `shell`, so a second mount beside a live desktop must be
+given another name.

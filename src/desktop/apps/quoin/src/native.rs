@@ -52,63 +52,115 @@ struct NativeHost {
 #[derive(Resource, Default)]
 struct GripDrag(Option<(Edge, f32)>);
 
+/// The default Bus registration for a natively mounted shell. One node can
+/// hold one `shell`, so a second mount (a nested comp beside a live desktop)
+/// must be told another name.
+pub const DEFAULT_SHELL_SERVICE: &str = "shell";
+/// Overrides [`DEFAULT_SHELL_SERVICE`] when no name is set programmatically.
+pub const SHELL_SERVICE_ENV: &str = "COSMIX_NATIVE_SHELL_SERVICE";
+
+/// The name the native mount registers on the Bus: the builder's name, else
+/// the environment, else the default. An unusable name falls back rather
+/// than failing the mount, and says so.
+fn shell_service(configured: Option<&str>, environment: Option<&str>) -> String {
+    for (source, name) in [("service", configured), (SHELL_SERVICE_ENV, environment)] {
+        let Some(name) = name else { continue };
+        if crate::valid_service_name(name) {
+            return name.to_owned();
+        }
+        tracing::warn!(
+            source,
+            name,
+            "not a canonical Bus service name; using {DEFAULT_SHELL_SERVICE}"
+        );
+    }
+    DEFAULT_SHELL_SERVICE.to_owned()
+}
+
+/// Mounts Quoin's panels in the host's own Bevy app. `NativeQuoin::default()`
+/// takes the service name from the environment; `with_service` pins it.
+#[derive(Default)]
+pub struct NativeQuoin {
+    service: Option<String>,
+}
+
+impl NativeQuoin {
+    #[must_use]
+    pub fn with_service(mut self, service: impl Into<String>) -> Self {
+        self.service = Some(service.into());
+        self
+    }
+}
+
+impl Plugin for NativeQuoin {
+    fn build(&self, app: &mut App) {
+        build_native(app, self.service.as_deref());
+    }
+}
+
+/// The unit-struct form hosts already add.
 pub struct NativeQuoinPlugin;
 
 impl Plugin for NativeQuoinPlugin {
     fn build(&self, app: &mut App) {
-        let registry = crate::page_registry();
-        let store = crate::state::StateStore::startup(false);
-        let mut model = model("primary", Vec2::new(1920.0, 1080.0), &registry);
-        store.snapshot().restore(&mut model);
-        model.start_intro(Duration::from_secs(2));
-        app.add_plugins(ShellRuntimePlugin::new(model));
-        let mounts: [Entity; 4] = std::array::from_fn(|i| {
-            app.world_mut()
-                .spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        display: Display::None,
-                        ..default()
-                    },
-                    GlobalZIndex(110 + i as i32 * 10),
-                ))
-                .id()
-        });
-        app.insert_resource(NativePanelMounts(QuoinPanelMounts::new(
-            mounts[0], mounts[1], mounts[2], mounts[3],
-        )))
-        .init_resource::<NativeOutput>()
-        .init_resource::<NativePanelRegions>()
-        .init_resource::<NativeWorkArea>()
-        .init_resource::<GripDrag>()
-        .insert_resource(NativeHost {
-            detector: CornerDetector::new(
-                CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
-                    .expect("valid corner tuning"),
-            ),
-            name: "primary".into(),
-            size: Vec2::new(1920.0, 1080.0),
-        });
-        let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
-        bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
-        bus.inbound_prefixes.push("shell.".into());
-        bus.subscriptions.extend(
-            [
-                "power.props.changed",
-                "wallpaper.props.changed",
-                "bg-showcase.props.changed",
-            ]
-            .map(str::to_owned),
-        );
-        crate::configure_content(app, bus, registry, store, false, false);
-        app.add_systems(Update, prepare.in_set(ShellRuntimeSet::Input))
-            .add_systems(Update, present.in_set(ShellRuntimeSet::Host))
-            .add_observer(grip_start)
-            .add_observer(grip_move)
-            .add_observer(grip_end)
-            .add_observer(grip_cancel);
-        tracing_notice();
+        build_native(app, None);
     }
+}
+
+fn build_native(app: &mut App, service: Option<&str>) {
+    let registry = crate::page_registry();
+    let store = crate::state::StateStore::startup(false);
+    let mut model = model("primary", Vec2::new(1920.0, 1080.0), &registry);
+    store.snapshot().restore(&mut model);
+    model.start_intro(Duration::from_secs(2));
+    app.add_plugins(ShellRuntimePlugin::new(model));
+    let mounts: [Entity; 4] = std::array::from_fn(|i| {
+        app.world_mut()
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    display: Display::None,
+                    ..default()
+                },
+                GlobalZIndex(110 + i as i32 * 10),
+            ))
+            .id()
+    });
+    app.insert_resource(NativePanelMounts(QuoinPanelMounts::new(
+        mounts[0], mounts[1], mounts[2], mounts[3],
+    )))
+    .init_resource::<NativeOutput>()
+    .init_resource::<NativePanelRegions>()
+    .init_resource::<NativeWorkArea>()
+    .init_resource::<GripDrag>()
+    .insert_resource(NativeHost {
+        detector: CornerDetector::new(
+            CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
+                .expect("valid corner tuning"),
+        ),
+        name: "primary".into(),
+        size: Vec2::new(1920.0, 1080.0),
+    });
+    let service = shell_service(service, std::env::var(SHELL_SERVICE_ENV).ok().as_deref());
+    let mut bus = BusBridgeConfig::new(&service, resolve_noded_url());
+    bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
+    bus.inbound_prefixes.push("shell.".into());
+    bus.subscriptions.extend(
+        [
+            "power.props.changed",
+            "wallpaper.props.changed",
+            "bg-showcase.props.changed",
+        ]
+        .map(str::to_owned),
+    );
+    crate::configure_content(app, bus, registry, store, false, false);
+    app.add_systems(Update, prepare.in_set(ShellRuntimeSet::Input))
+        .add_systems(Update, present.in_set(ShellRuntimeSet::Host))
+        .add_observer(grip_start)
+        .add_observer(grip_move)
+        .add_observer(grip_end)
+        .add_observer(grip_cancel);
+    tracing_notice();
 }
 
 fn command(frame: &ShellFrameState, time: &Time<Real>, kind: ShellCommandKind) -> ShellCommand {
@@ -334,6 +386,36 @@ fn present(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_shell_service_name_prefers_the_builder_then_the_environment() {
+        assert_eq!(shell_service(None, None), DEFAULT_SHELL_SERVICE);
+        assert_eq!(shell_service(None, Some("shell-nested")), "shell-nested");
+        assert_eq!(shell_service(Some("shell-a"), Some("shell-b")), "shell-a");
+        // An unusable name never becomes a registration.
+        assert_eq!(
+            shell_service(Some("Not A Name"), None),
+            DEFAULT_SHELL_SERVICE
+        );
+        assert_eq!(
+            shell_service(None, Some("")),
+            DEFAULT_SHELL_SERVICE,
+            "an empty environment override is not a name"
+        );
+        assert_eq!(
+            shell_service(Some("Not A Name"), Some("shell-env")),
+            "shell-env",
+            "a bad builder name falls through to the environment"
+        );
+        assert!(NativeQuoin::default().service.is_none());
+        assert_eq!(
+            NativeQuoin::default()
+                .with_service("shell-x")
+                .service
+                .as_deref(),
+            Some("shell-x")
+        );
+    }
+
     #[test]
     fn stable_mounts_do_not_relayout_and_deactivation_clears_hit_regions() {
         let mut app = App::new();

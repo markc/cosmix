@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::{NormalizedRenderTarget, RenderTarget};
+use bevy::camera::{Camera, NormalizedRenderTarget, RenderTarget};
 use bevy::image::ImageSampler;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key as BevyKey, KeyCode, KeyboardInput};
@@ -47,7 +47,12 @@ pub struct IcedSurface {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct IcedSurfaceGeometry {
     pub size: UVec2,
+    /// UI target scale (window scale x `UiScale`): the surface's own pixels.
     pub scale: f32,
+    /// The camera's target scale, which is what pointer positions are in.
+    /// A host that pre-multiplies `UiScale` into pointer positions (comp's
+    /// native shell does) would otherwise have it counted twice.
+    pub pointer_scale: f32,
     pub origin: Vec2,
     /// The window the surface is shown in; pointer events from other windows
     /// are in another coordinate space.
@@ -98,6 +103,35 @@ pub(crate) struct Mounts(BTreeMap<String, Mount>);
 /// `Time<Real>::elapsed()` domain. Hosts turn this into a timer wake.
 #[derive(Resource, Default, Debug, PartialEq, Eq)]
 pub struct SceneIcedWake(pub Option<Duration>);
+
+/// What a host does with a pending wake: the layer host folds it into its
+/// one-shot deadline, comp arms its own. Called every update while a wake is
+/// pending, so a host that consumes its deadline re-arms on the next one.
+pub type SceneIcedWakeHook = Box<dyn Fn(&mut World, Duration) + Send + Sync>;
+
+#[derive(Resource, Default)]
+pub struct SceneIcedWaker(pub Option<SceneIcedWakeHook>);
+
+impl SceneIcedWaker {
+    pub fn set(&mut self, hook: impl Fn(&mut World, Duration) + Send + Sync + 'static) {
+        self.0 = Some(Box::new(hook));
+    }
+}
+
+/// Hands a pending wake to the host hook. Exclusive so the hook can reach
+/// whatever the host keeps its deadline in.
+pub(crate) fn apply_wake(world: &mut World) {
+    let Some(at) = world.resource::<SceneIcedWake>().0 else {
+        return;
+    };
+    let Some(waker) = world.remove_resource::<SceneIcedWaker>() else {
+        return;
+    };
+    if let Some(hook) = &waker.0 {
+        hook(world, at);
+    }
+    world.insert_resource(waker);
+}
 
 /// What the input method should do for the focused surface.
 #[derive(Clone, Debug, PartialEq)]
@@ -412,11 +446,20 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
     page.id()
 }
 
-/// Surface placement from UI layout. Assumes `UiScale` is 1: the target's
-/// scale factor is then the window's, which is also what pointer positions
-/// (window-logical) must be multiplied by. The window is resolved only for
-/// cameras targeting `WindowRef::Entity`, as Quoin's panels do; a primary-
-/// window camera leaves `window` unset and disables the capture window check.
+/// The surface's own scale and the scale pointer positions arrive in.
+///
+/// UI layout works in window scale x `UiScale` (`bevy_ui`'s
+/// `ui_layout_system`), which is what the surface renders at. Bevy's UI
+/// picking backend converts pointer positions with the camera's target scale
+/// alone, so that is what the bridge must use for hit coordinates: with
+/// `UiScale` 1 they are equal, and where they differ the camera's is right.
+pub fn scales(target_scale: f32, camera_scale: Option<f32>) -> (f32, f32) {
+    (target_scale, camera_scale.unwrap_or(target_scale))
+}
+
+/// Surface placement from UI layout. The window is resolved only for cameras
+/// targeting `WindowRef::Entity`, as Quoin's panels do; a primary-window
+/// camera leaves `window` unset and disables the capture window check.
 pub(crate) fn geometry(
     mut surfaces: Query<
         (
@@ -428,16 +471,18 @@ pub(crate) fn geometry(
         ),
         With<IcedSurface>,
     >,
-    cameras: Query<&RenderTarget>,
+    cameras: Query<(&RenderTarget, &Camera)>,
 ) {
     for (node, transform, target, camera, mut geometry) in &mut surfaces {
-        let window = camera
-            .get()
-            .and_then(|camera| cameras.get(camera).ok())
-            .and_then(|target| match target {
-                RenderTarget::Window(WindowRef::Entity(window)) => Some(*window),
-                _ => None,
-            });
+        let camera = camera.get().and_then(|camera| cameras.get(camera).ok());
+        let window = camera.and_then(|(target, _)| match target {
+            RenderTarget::Window(WindowRef::Entity(window)) => Some(*window),
+            _ => None,
+        });
+        let (scale, pointer_scale) = scales(
+            target.scale_factor(),
+            camera.and_then(|(_, camera)| camera.target_scaling_factor()),
+        );
         let size = node.size();
         if size.x < 1.0 || size.y < 1.0 {
             // Not laid out (or collapsed): keep the last texture.
@@ -445,7 +490,8 @@ pub(crate) fn geometry(
         }
         geometry.set_if_neq(IcedSurfaceGeometry {
             size: size.round().as_uvec2(),
-            scale: target.scale_factor(),
+            scale,
+            pointer_scale,
             origin: transform.affine().translation - size / 2.0,
             window,
         });
@@ -541,7 +587,7 @@ pub(crate) fn route_pointer(
         }
         let local = |surfaces: &Query<(&IcedSurfaceGeometry, &mut SurfaceState)>, entity| {
             surfaces.get(entity).ok().map(|(geometry, _)| {
-                let at = input.location.position * geometry.scale - geometry.origin;
+                let at = input.location.position * geometry.pointer_scale - geometry.origin;
                 SurfaceEvent::PointerMoved { x: at.x, y: at.y }
             })
         };

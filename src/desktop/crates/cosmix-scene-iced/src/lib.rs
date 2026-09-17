@@ -24,7 +24,8 @@ use cosmix_shell::runtime::{CursorShapeRequest, ExternalImeEvent};
 
 pub use bridge::{
     FrameCounters, IcedSurface, IcedSurfaceGeometry, ImeOutput, RendererFactory, SceneIcedCounters,
-    SceneIcedFactory, SceneIcedFocus, SceneIcedStats, SceneIcedWake,
+    SceneIcedFactory, SceneIcedFocus, SceneIcedStats, SceneIcedWake, SceneIcedWakeHook,
+    SceneIcedWaker, scales,
 };
 
 /// The `adapter` argument of `shell.scene.load` that selects this adapter.
@@ -53,6 +54,7 @@ impl Plugin for SceneIcedPlugin {
             .init_resource::<SceneIcedCounters>()
             .init_resource::<SceneIcedFocus>()
             .init_resource::<SceneIcedWake>()
+            .init_resource::<SceneIcedWaker>()
             .add_systems(First, bridge::roll_counters)
             .add_systems(
                 Update,
@@ -79,7 +81,7 @@ impl Plugin for SceneIcedPlugin {
                     // may never run (bevy_ui's text_system does the same).
                     .before(bevy::asset::AssetEventSystems),
             )
-            .add_systems(Last, bridge::count_asset_events);
+            .add_systems(Last, (bridge::apply_wake, bridge::count_asset_events));
     }
 
     fn finish(&self, app: &mut App) {
