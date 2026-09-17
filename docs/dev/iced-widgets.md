@@ -59,6 +59,8 @@ Navigator::bar(&items) | Navigator::context(&items)   // Copy
     .click(&mut state, level, Option<row>)  // None: press outside every panel
     .hover_root(&mut state, index) .click_root(&mut state, index)   // bar titles
     .validate(&mut state)                   // close if the items changed under it
+    .open_panels(&state) -> Vec<PanelSpec { level, items, selected, anchor }>
+state.anchor(level) -> Option<Rectangle>
     // each returns NavOutcome::{None, Changed, Activated(Message), Closed}
 menu::Panel::new(&items, selected: Option<usize>)   // one panel, fills its surface
     .style(MenuStyle)
@@ -163,13 +165,20 @@ Contracts a host must honour:
   `MenuState` whose `anchors` are filled in: `anchors[0]` is the open title
   in the bar widget's window coordinates (a 1 x 1 rectangle at the pointer
   for a context menu), `anchors[n]` the parent row inside panel `n - 1`,
-  relative to that panel. Store it and pass it back with `.state(&state)`.
-  For each `n` in `0..state.path.len()`, show a popup of
-  `panel_size(renderer, navigator.panel(&state, n), style)` anchored at
-  `anchors[n]`, containing `Panel::new(navigator.panel(&state, n),
-  state.path[n])`. Map its `on_hover(row)` to `navigator.hover(&mut state,
-  n, row)`, its `on_press(row)` to `navigator.click(&mut state, n,
-  Some(row))`, and keys on a popup surface to `navigator.key`. Publish the
+  relative to that panel. Store it exactly as received and pass it back with
+  `.state(&state)` every view. This is required: without it the host cannot
+  close the menu, and a host that edits or drops anchors makes the bar
+  republish on every event. For each `spec` in
+  `navigator.open_panels(&state)`, show a popup of
+  `panel_size(renderer, spec.items, style)` anchored at `spec.anchor`,
+  containing `Panel::new(spec.items, spec.selected)`. `open_panels` skips
+  panels with no rows (a popup cannot have zero size). It also skips levels
+  whose anchor is not known yet: a navigator step that adds or changes a
+  level drops the stale anchors, and the bar refills them on its next event,
+  which is the redraw after your update. Map a panel's `on_hover(row)` to
+  `navigator.hover(&mut state, spec.level, row)`, its `on_press(row)` to
+  `navigator.click(&mut state, spec.level, Some(row))`, and keys on a popup
+  surface to `navigator.key`. Publish the
   message of `NavOutcome::Activated`. Map a compositor dismissal
   (`popup_done`) to `navigator.close`. Pass the new state back to the bar,
   which republishes it with fresh anchors. The bar itself still handles

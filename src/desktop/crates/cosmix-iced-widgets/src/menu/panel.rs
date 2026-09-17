@@ -201,6 +201,12 @@ impl<'a, Message> Panel<'a, Message> {
 struct PanelState {
     // The last hover reported; `None` until the first report.
     hovered: Option<Option<usize>>,
+    // Identity of the items shown, to forget the hover when they change.
+    items: (usize, usize),
+}
+
+fn identity<Message>(items: &[Item<Message>]) -> (usize, usize) {
+    (items.as_ptr() as usize, items.len())
 }
 
 impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
@@ -211,7 +217,20 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(PanelState::default())
+        tree::State::new(PanelState {
+            hovered: None,
+            items: identity(self.items),
+        })
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<PanelState>();
+        if state.items != identity(self.items) {
+            *state = PanelState {
+                hovered: None,
+                items: identity(self.items),
+            };
+        }
     }
 
     fn size(&self) -> Size<Length> {
@@ -254,7 +273,11 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
                     _ => cursor.position(),
                 };
                 let row = row_under(point);
-                if state.hovered != Some(row) {
+                // Also re-report a row that keyboard navigation moved the
+                // selection away from, as the in-surface overlay reselects it.
+                let reselect =
+                    row != self.selected && row.is_some_and(|row| self.items[row].selectable());
+                if state.hovered != Some(row) || reselect {
                     state.hovered = Some(row);
                     if let Some(on_hover) = &self.on_hover {
                         shell.publish(on_hover(row));
@@ -309,13 +332,12 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        let bounds = layout.bounds();
-        match cursor
-            .position_in(bounds)
-            .and_then(|point| row_at(self.items, point.y, self.style))
-        {
+        let Some(point) = cursor.position_in(layout.bounds()) else {
+            return mouse::Interaction::None;
+        };
+        match row_at(self.items, point.y, self.style) {
             Some(row) if self.items[row].selectable() => mouse::Interaction::Pointer,
-            _ => mouse::Interaction::None,
+            _ => mouse::Interaction::Idle,
         }
     }
 }
@@ -377,7 +399,7 @@ mod tests {
     #[test]
     fn panel_reports_hover_changes_once_and_presses() {
         let items = items();
-        let mut panel = Panel::new(&items, None)
+        let mut panel = Panel::new(&items, Some(2))
             .on_hover(|row| row.map_or(99, |row| row as u8))
             .on_press(|row| 100 + row as u8);
         let mut tree = Tree {
@@ -410,6 +432,9 @@ mod tests {
         assert_eq!(send(moved(5.0, 40.0), Some(Point::new(5.0, 40.0))), [2]);
         assert!(send(moved(6.0, 41.0), Some(Point::new(6.0, 41.0))).is_empty());
         assert_eq!(send(moved(5.0, 5.0), Some(Point::new(5.0, 5.0))), [0]);
+        // The host has not selected row 0 yet (it still passes Some(2)), so
+        // further motion over row 0 asks again, as the overlay would.
+        assert_eq!(send(moved(6.0, 6.0), Some(Point::new(6.0, 6.0))), [0]);
         assert_eq!(send(Event::Mouse(mouse::Event::CursorLeft), None), [99]);
         assert_eq!(
             send(
