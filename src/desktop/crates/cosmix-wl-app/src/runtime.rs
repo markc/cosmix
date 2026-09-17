@@ -829,7 +829,7 @@ impl State {
             s.stalled = false;
         }
         for id in flush_passes(self) {
-            self.rt.throttle(id);
+            self.throttle(id);
         }
         let grabbing = self.rt.surfaces.values().any(|s| s.role.grabbing());
         self.rt.grabs.settle(grabbing);
@@ -841,17 +841,18 @@ impl State {
 
     /// Ask the display when to draw next, instead of drawing again now.
     fn throttle(&mut self, id: SurfaceId) {
-        let Some(surface) = self.surfaces.get_mut(&id) else {
+        let rt = &mut self.rt;
+        let Some(surface) = rt.surfaces.get_mut(&id) else {
             return;
         };
         if surface.applied.is_some() {
-            surface.wl.frame(&self.qh, surface.wl.clone());
+            surface.wl.frame(&rt.qh, surface.wl.clone());
             surface.frame_pending = true;
             surface.wl.commit();
         } else {
             // Nothing is mapped to get a callback from; come back after the
             // other sources have run.
-            self.ping.ping();
+            rt.ping.ping();
         }
     }
 
