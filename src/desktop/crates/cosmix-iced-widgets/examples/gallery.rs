@@ -1,4 +1,7 @@
 //! Launch only inside a test compositor; see docs/dev/iced-widgets.md.
+#[cfg(not(any(feature = "wgpu", feature = "tiny-skia")))]
+compile_error!("Select gallery-wgpu or gallery-tiny-skia to build the gallery.");
+
 use cosmix_iced_widgets::{Item, Menu, TextField, Tokens};
 use iced::widget::{column, container, text};
 use iced::{Element, Fill, Theme};

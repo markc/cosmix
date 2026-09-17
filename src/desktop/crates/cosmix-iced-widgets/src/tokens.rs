@@ -28,6 +28,9 @@ pub fn colour(value: LinearRgba) -> Color {
     Color::from_rgba8(r, g, b, f32::from(a) / 255.0)
 }
 
+/// Widget colours and radius in iced terms, taken from a resolved design.
+/// Pair fields use the rendered (composited) values; `border`, `input` and
+/// `ring` are the non-text colours of the same names.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tokens {
     pub surface: Color,
@@ -45,6 +48,8 @@ pub struct Tokens {
 }
 
 impl Tokens {
+    /// Maps the `base`, `popover`, `muted` and `accent` pairs plus the
+    /// `border`, `input` and `ring` colours. Radius is 6 px.
     pub fn from_colours(colours: &ResolvedColours) -> Result<Self, TokenError> {
         let pair = |name| colours.pairs.get(name).ok_or(TokenError(name));
         let non_text = |name| {
@@ -74,6 +79,7 @@ impl Tokens {
         })
     }
 
+    /// As `from_colours`, with the radius from the `radius.md` px metric.
     pub fn from_dictionary(dictionary: &ResolvedDictionary) -> Result<Self, TokenError> {
         let mut tokens = Self::from_colours(&dictionary.colours)?;
         let radius = dictionary
@@ -91,6 +97,7 @@ impl Tokens {
         Ok(tokens)
     }
 
+    /// Style for `TextField::style` (or a plain iced `text_input`).
     pub fn text_input(self, status: text_input::Status) -> text_input::Style {
         let disabled = matches!(status, text_input::Status::Disabled);
         text_input::Style {
@@ -116,6 +123,7 @@ impl Tokens {
         }
     }
 
+    /// Style for `Menu::style`, keeping the default row metrics.
     pub fn menu_style(self) -> MenuStyle {
         MenuStyle {
             background: self.popover,

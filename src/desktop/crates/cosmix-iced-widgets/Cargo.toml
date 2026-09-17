@@ -18,6 +18,9 @@ gallery-tiny-skia = ["gallery", "tiny-skia"]
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "wayland", "thread-pool"] }
 cosmix-design = { path = "../cosmix-design", default-features = false }
 
+[dev-dependencies]
+iced_runtime = { version = "=0.14.0", default-features = false }
+
 [[example]]
 name = "gallery"
 required-features = ["gallery"]

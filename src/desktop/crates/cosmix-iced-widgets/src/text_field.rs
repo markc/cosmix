@@ -279,17 +279,21 @@ impl<Message, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
             && self.on_input.is_some()
             && !history.composing
             && let Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(key),
+                key,
+                physical_key,
                 modifiers,
                 ..
             }) = event
             && modifiers.control()
             && !modifiers.alt()
             && !modifiers.logo()
-            && (key.eq_ignore_ascii_case("z") || key.eq_ignore_ascii_case("y"))
+            // Match iced's clipboard shortcuts across non-Latin layouts while
+            // respecting logical keys on remapped Latin layouts.
+            && let Some(shortcut) = key.to_latin(*physical_key)
+            && matches!(shortcut.to_ascii_lowercase(), 'z' | 'y')
         {
             if let Some(snapshot) =
-                history.restore(key.eq_ignore_ascii_case("y") || modifiers.shift())
+                history.restore(shortcut.eq_ignore_ascii_case(&'y') || modifiers.shift())
             {
                 match snapshot.selection {
                     Selection::Index(index) => state.move_cursor_to(index),
@@ -600,6 +604,97 @@ mod widget_tests {
             send(&mut field, &mut tree, key("y", keyboard::Modifiers::CTRL))
                 .0
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn non_latin_layout_undo_and_both_redo_shortcuts_use_physical_keys() {
+        let (mut field, mut tree) = field("");
+        send(
+            &mut field,
+            &mut tree,
+            key("a", keyboard::Modifiers::empty()),
+        );
+        let physical_key = |character: &str, code, modifiers| {
+            let mut event = key(character, modifiers);
+            if let Event::Keyboard(keyboard::Event::KeyPressed { physical_key, .. }) = &mut event {
+                *physical_key = keyboard::key::Physical::Code(code);
+            }
+            event
+        };
+        let undo = || physical_key("я", keyboard::key::Code::KeyZ, keyboard::Modifiers::CTRL);
+        assert_eq!(send(&mut field, &mut tree, undo()).0, [""]);
+        assert_eq!(
+            send(
+                &mut field,
+                &mut tree,
+                physical_key(
+                    "Я",
+                    keyboard::key::Code::KeyZ,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT
+                )
+            )
+            .0,
+            ["a"]
+        );
+        assert_eq!(send(&mut field, &mut tree, undo()).0, [""]);
+        assert_eq!(
+            send(
+                &mut field,
+                &mut tree,
+                physical_key("υ", keyboard::key::Code::KeyY, keyboard::Modifiers::CTRL)
+            )
+            .0,
+            ["a"]
+        );
+        // A remapped Latin logical key takes precedence over physical position,
+        // matching iced's native clipboard policy.
+        assert!(
+            send(
+                &mut field,
+                &mut tree,
+                physical_key("q", keyboard::key::Code::KeyZ, keyboard::Modifiers::CTRL)
+            )
+            .0
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn ime_closed_clears_composition_and_reenables_undo() {
+        let (mut field, mut tree) = field("");
+        send(
+            &mut field,
+            &mut tree,
+            key("a", keyboard::Modifiers::empty()),
+        );
+        send(
+            &mut field,
+            &mut tree,
+            Event::InputMethod(input_method::Event::Preedit("界".into(), Some(0..3))),
+        );
+        assert!(
+            send(&mut field, &mut tree, key("z", keyboard::Modifiers::CTRL))
+                .0
+                .is_empty()
+        );
+        send(
+            &mut field,
+            &mut tree,
+            Event::InputMethod(input_method::Event::Closed),
+        );
+        let (_, ime) = send(
+            &mut field,
+            &mut tree,
+            Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+        );
+        assert!(matches!(
+            ime,
+            input_method::InputMethod::Enabled { preedit: None, .. }
+        ));
+        assert_eq!(
+            send(&mut field, &mut tree, key("z", keyboard::Modifiers::CTRL)).0,
+            [""]
         );
     }
 
