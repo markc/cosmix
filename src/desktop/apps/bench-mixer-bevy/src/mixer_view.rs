@@ -321,13 +321,14 @@ fn apply_feed_tick(
             }
         }
     }
-    if bench.config.scripted_drag && !first {
-        if let Some(drag) = feed.drag_sample(tick) {
-            commands.trigger(SetControlValue {
-                source: mixer.faders[drag.strip],
-                value: drag.db,
-            });
-        }
+    if bench.config.scripted_drag
+        && !first
+        && let Some(drag) = feed.drag_sample(tick)
+    {
+        commands.trigger(SetControlValue {
+            source: mixer.faders[drag.strip],
+            value: drag.db,
+        });
     }
 }
 
