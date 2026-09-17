@@ -540,6 +540,10 @@ struct AppliedCommit {
 /// feedback state keeps an interior commit's callbacks when a later commit
 /// had none, so they would be presented with the later commit's content.
 /// Staging keeps each commit's callbacks with what that commit did.
+///
+/// Commits cached under one role and applied after a role change enter the
+/// ledger with the new role's content sequence (rare; the role change
+/// itself discards what was already taken).
 struct StagedCommit {
     callbacks: Vec<PresentationFeedbackCallback>,
     /// The commit attached or removed a buffer: every earlier commit's
@@ -675,7 +679,12 @@ impl WaylandState {
                 callbacks.extend(taken);
             }
         }
-        // Feedback requested before the staging hook existed rides along.
+        // Unstaged feedback rides along with the kept commits: a surface
+        // created before the hook, and a synchronised child whose pending
+        // state its parent's commit pushed into the cache without running
+        // the child's pre-commit hooks (vendored smithay
+        // `commit_sync_surface_tree`, tree.rs). The latter is the same
+        // Smithay-only handling as before staging existed.
         callbacks.extend(unstaged);
         let record = self
             .surfaces

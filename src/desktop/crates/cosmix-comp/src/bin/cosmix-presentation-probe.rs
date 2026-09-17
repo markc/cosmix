@@ -361,8 +361,15 @@ fn run() -> Result<bool, String> {
     let mut shown_discarded = 0;
     let mut superseded_discarded = 0;
     // A superseded commit may legitimately be presented if a frame showed
-    // it before the next commit arrived; presenting it at or after that
-    // commit's time would be a lie.
+    // it before the rest of its burst arrived. Commit times cannot tell
+    // (the next commit follows within microseconds, the host hand-off is
+    // milliseconds later), so compare presentation times: presenting it at
+    // or after its burst's shown commit would be a lie.
+    let presented_at =
+        |commit: usize| match probe.feedback.get(commit).and_then(|slot| slot.outcome) {
+            Some(Outcome::Presented { time, .. }) => Some(time),
+            _ => None,
+        };
     let mut superseded_presented_early = 0;
     let mut superseded_presented_late = 0;
     let mut shown_presented = 0;
@@ -383,9 +390,8 @@ fn run() -> Result<bool, String> {
             }) => {
                 if last {
                     shown_presented += 1;
-                } else if commit_times
-                    .get(commit + 1)
-                    .is_some_and(|superseded_at| time >= *superseded_at)
+                } else if presented_at(commit - commit % burst + burst - 1)
+                    .is_some_and(|shown_at| time >= shown_at)
                 {
                     superseded_presented_late += 1;
                 } else {
