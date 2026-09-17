@@ -582,9 +582,12 @@ restart.</li>
 <li><code>comp.pointer.watch</code> renews a three-second local pointer observation lease
 and returns <code>{version:1,topic:"&lt;service&gt;.pointer.changed",lease_ms:3000}</code>.
 Subscribe before calling; renew about once per second while observation is
-wanted. This verb uses the same broker-proven local caller requirement as
-property writes. The acknowledgement contains no pointer coordinates.</li>
+wanted. The acknowledgement contains no pointer coordinates.</li>
 </ul>
+<p>No verb checks who the caller is. Any caller that noded delivers, local or from
+the WireGuard mesh, can read, write and watch; being on the mesh is the whole
+authorization. What the port still refuses is a malformed or mis-aimed request
+(unknown path, wrong type, out-of-range value, a window that is not there).</p>
 <p>The complete L2 read tree is:</p>
 <pre><code class="language-text">info.{service,version,backend,engine,instance}
 outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
@@ -795,10 +798,11 @@ ranges are:</p>
 <tr><td><code>input.corners.dwell_ms</code></td><td style="text-align: right"><code>200</code></td><td style="text-align: right"><code>0..=5000</code> ms</td></tr>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
 </tbody></table>
-<p>The corner leaves and <code>xwayland.enabled</code> are the only mutable leaves. The
-corner descriptors say <code>mutable:true</code> and <code>persistence:"none"</code> (numeric
-leaves also carry the range above) and those values live for the compositor
-process only. <code>xwayland.enabled</code> is the one exception: its descriptor says
+<p>The mutable leaves are the four corner leaves, <code>windows.s&lt;id&gt;.band</code> and
+<code>xwayland.enabled</code>. The corner and band descriptors say <code>mutable:true</code> and
+<code>persistence:"none"</code> (numeric leaves also carry the range above) and those
+values live for the compositor process only. <code>xwayland.enabled</code> is the one
+exception: its descriptor says
 <code>persistence:"file"</code> — the value is read once at compositor startup (whether
 to spawn XWayland at all; there is no live toggle) and a write persists it
 for the NEXT startup into a per-socket file under the COSMIX etc tree, whose
@@ -806,11 +810,7 @@ resolved absolute path the read-only <code>xwayland.persist_path</code> leaf rep
 and the compositor logs at startup. The <code>COSMIX_COMP_XWAYLAND</code> environment
 variable (<code>0/false/off/no</code> or <code>1/true/on/yes</code>) overrides both the file and
 the default at launch — the no-rebuild back-out that works even when the
-props surface is unreachable. Writes are admitted only when noded supplied
-exactly one case-insensitive <code>broker_origin</code> header whose value is <code>local</code>,
-the caller has a canonical registered service name, and the wire contains no
-<code>source_peer</code>, <code>permissions</code> or <code>signed_ident</code> claim. Otherwise the reply is
-rc 10 <code>{"error":"not_local"}</code> before calloop admission. Unknown and immutable
+props surface is unreachable. Unknown and immutable
 paths return <code>unknown_path</code> and <code>read_only</code>; type/range failures return
 <code>{error:"invalid_value",path,expected,range}</code>. All four path/type/range checks
 run on the worker before admission and are repeated on calloop as
@@ -871,7 +871,7 @@ capture service is available through the Wayland protocol described below.</li>
 <h2 id="supported-wayland-protocols">Supported Wayland protocols</h2>
 <p>The compositor advertises the core compositor, subcompositor, seat, output,
 shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
-presentation-time, XDG shell and XDG decoration globals needed by its desktop
+XDG shell and XDG decoration globals needed by its desktop
 clients.</p>
 <table><thead><tr><th>Protocol</th><th style="text-align: right">Version</th><th>Current support</th></tr></thead><tbody>
 <tr><td><code>zwlr_layer_shell_v1</code></td><td style="text-align: right">4</td><td>Layer surfaces and layer popups map, arrange and configure through Smithay's <code>LayerMap</code>; protocol strata, keyboard interactivity, input regions and exclusive usable-area effects are supported.</td></tr>

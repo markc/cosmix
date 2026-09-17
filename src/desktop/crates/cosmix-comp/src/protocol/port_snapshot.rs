@@ -1402,7 +1402,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         String,
         "Output key or null"
     ),
-    descriptor!(&[L("windows"), S, L("band")], String, "Compositor stack band; writable as bottom|normal to demote a window behind all normal windows or restore it", enum = &["background", "bottom", "normal", "top", "overlay", "lock"]),
+    // Writable (bottom|normal) and process-lifetime; the enum still lists
+    // every band a read can report.
+    DescribeEntry {
+        mutable: true,
+        persistence: Some("none"),
+        ..descriptor!(&[L("windows"), S, L("band")], String, "Compositor stack band; writable as bottom|normal to demote a window behind all normal windows or restore it", enum = &["background", "bottom", "normal", "top", "overlay", "lock"])
+    },
     descriptor!(
         &[L("stack")],
         List,
@@ -2053,25 +2059,27 @@ mod tests {
     }
 
     #[test]
-    fn corner_descriptors_are_the_only_mutable_process_lifetime_leaves() {
+    fn mutable_descriptors_match_the_writable_leaves() {
         let snapshot = fixture();
         let mutable = DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.mutable)
             .collect::<Vec<_>>();
-        // The corner leaves are process-lifetime (persistence "none");
-        // `xwayland.enabled` is deliberately the surface's ONE
-        // file-persisted mutable leaf (startup-read — a non-persisted
-        // startup switch would be unreachable from its own surface).
+        // The corner leaves and the window band are process-lifetime
+        // (persistence "none"); `xwayland.enabled` is deliberately the
+        // surface's ONE file-persisted mutable leaf (startup-read — a
+        // non-persisted startup switch would be unreachable from its own
+        // surface).
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 5);
+        assert_eq!(mutable.len(), 6);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 4);
+        assert_eq!(mutable.len(), 5);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
             "input.corners.velocity_max_px_s",
+            "windows.s2.band",
         ] {
             let path = PropPath::new(path).unwrap();
             let body = describe(&snapshot, &path).expect("mutable descriptor");

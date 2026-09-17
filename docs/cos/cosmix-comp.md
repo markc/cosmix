@@ -163,8 +163,12 @@ The control plane exposes eight verbs:
 - `comp.pointer.watch` renews a three-second local pointer observation lease
   and returns `{version:1,topic:"<service>.pointer.changed",lease_ms:3000}`.
   Subscribe before calling; renew about once per second while observation is
-  wanted. This verb uses the same broker-proven local caller requirement as
-  property writes. The acknowledgement contains no pointer coordinates.
+  wanted. The acknowledgement contains no pointer coordinates.
+
+No verb checks who the caller is. Any caller that noded delivers, local or from
+the WireGuard mesh, can read, write and watch; being on the mesh is the whole
+authorization. What the port still refuses is a malformed or mis-aimed request
+(unknown path, wrong type, out-of-range value, a window that is not there).
 
 The complete L2 read tree is:
 
@@ -402,10 +406,11 @@ ranges are:
 | `input.corners.dwell_ms` | `200` | `0..=5000` ms |
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
-The corner leaves and `xwayland.enabled` are the only mutable leaves. The
-corner descriptors say `mutable:true` and `persistence:"none"` (numeric
-leaves also carry the range above) and those values live for the compositor
-process only. `xwayland.enabled` is the one exception: its descriptor says
+The mutable leaves are the four corner leaves, `windows.s<id>.band` and
+`xwayland.enabled`. The corner and band descriptors say `mutable:true` and
+`persistence:"none"` (numeric leaves also carry the range above) and those
+values live for the compositor process only. `xwayland.enabled` is the one
+exception: its descriptor says
 `persistence:"file"` — the value is read once at compositor startup (whether
 to spawn XWayland at all; there is no live toggle) and a write persists it
 for the NEXT startup into a per-socket file under the COSMIX etc tree, whose
@@ -413,11 +418,7 @@ resolved absolute path the read-only `xwayland.persist_path` leaf reports
 and the compositor logs at startup. The `COSMIX_COMP_XWAYLAND` environment
 variable (`0/false/off/no` or `1/true/on/yes`) overrides both the file and
 the default at launch — the no-rebuild back-out that works even when the
-props surface is unreachable. Writes are admitted only when noded supplied
-exactly one case-insensitive `broker_origin` header whose value is `local`,
-the caller has a canonical registered service name, and the wire contains no
-`source_peer`, `permissions` or `signed_ident` claim. Otherwise the reply is
-rc 10 `{"error":"not_local"}` before calloop admission. Unknown and immutable
+props surface is unreachable. Unknown and immutable
 paths return `unknown_path` and `read_only`; type/range failures return
 `{error:"invalid_value",path,expected,range}`. All four path/type/range checks
 run on the worker before admission and are repeated on calloop as
@@ -485,7 +486,7 @@ Absent by design after P-1:
 
 The compositor advertises the core compositor, subcompositor, seat, output,
 shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
-presentation-time, XDG shell and XDG decoration globals needed by its desktop
+XDG shell and XDG decoration globals needed by its desktop
 clients.
 
 | Protocol | Version | Current support |
