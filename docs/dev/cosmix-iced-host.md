@@ -17,7 +17,9 @@ libwayland is not linked). This crate never calls softbuffer.
 
 ## Driving a surface
 
-1. `Surface::new(program, Settings)` with the physical size and scale.
+1. `Surface::new(program, Settings)` with the physical size and scale (a
+   scale that is not finite and positive becomes 1.0; `resize` keeps the
+   current one instead). A surface is not `Send`: keep it on its thread.
 2. Input: `cursor_moved` / `cursor_left` (logical points), `queue_event`
    for anything else. Hosts must deliver `Event::InputMethod`
    (Opened/Preedit/Commit/Closed), `keyboard::Event::ModifiersChanged` and
@@ -29,8 +31,16 @@ libwayland is not linked). This crate never calls softbuffer.
    `view()` with the retained cache. It returns `needs_redraw`, the cursor
    shape, per-event capture status and `redraw`: `NextFrame` when a draw
    is due, otherwise the pending deadline (a focused field's 500 ms caret
-   blink, `At`) or `Wait`. With nothing queued it does no work and repeats
-   the last known deadline.
+   blink, `At`) or `Wait`. With nothing queued it builds nothing, but still
+   reports pending work: a deadline that has passed, `program_mut`,
+   `operate`, `invalidate`, `set_background`. `process_at(now)` takes the
+   time; `needs_redraw()` asks without processing.
+
+   A rebuilt tree has lost the widgets' remembered status, so `process`
+   first replays the last draw's redraw pass (its time and cursor) before
+   the events. Time-based widgets see no elapsed time in that pass; a
+   widget that counts redraw passes sees one extra. Messages from the
+   replay are applied before the events, as iced_winit does.
 4. `draw(buffer, width, height, stride, format)` on the next frame. The
    result lists the physical rectangles rewritten, whether the draw was a
    full repaint, and the `Requests` to act on: cursor shape, IME state and
@@ -114,6 +124,8 @@ cargo clippy --manifest-path desktop/Cargo.toml --release -p cosmix-iced-host --
 cargo test   --manifest-path desktop/Cargo.toml --release -p cosmix-iced-host --all-features --locked
 ```
 
-The tests render into buffers and need no compositor. They load
+Run from `src/` (the build workers' working directory); from the repository
+root the manifest is `src/desktop/Cargo.toml`. The tests render into
+buffers and need no compositor. They load
 `DejaVuSans.ttf` from `cosmix-comp`'s assets so text does not depend on
 installed fonts.

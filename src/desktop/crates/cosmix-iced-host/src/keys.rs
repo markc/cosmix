@@ -48,7 +48,7 @@ pub fn key_pressed(input: KeyInput<'_>) -> keyboard::Event {
         key: key(input.unmodified_keysym.unwrap_or(input.keysym)),
         modified_key: key(input.keysym),
         physical_key: physical_key(input.keycode),
-        location: location(input.keysym),
+        location: location_for(input.keysym, input.keycode),
         modifiers: input.modifiers,
         text,
         repeat: input.repeat,
@@ -60,7 +60,7 @@ pub fn key_released(input: KeyInput<'_>) -> keyboard::Event {
         key: key(input.unmodified_keysym.unwrap_or(input.keysym)),
         modified_key: key(input.keysym),
         physical_key: physical_key(input.keycode),
-        location: location(input.keysym),
+        location: location_for(input.keysym, input.keycode),
         modifiers: input.modifiers,
     }
 }
@@ -107,7 +107,9 @@ pub fn location(keysym: Keysym) -> Location {
         | k::KEY_Meta_R
         | k::KEY_Alt_R
         | k::KEY_Super_R
-        | k::KEY_Hyper_R => Location::Right,
+        | k::KEY_Hyper_R
+        // AltGr is the right Alt key on the layouts that have it.
+        | k::KEY_ISO_Level3_Shift => Location::Right,
         raw if (k::KEY_KP_Space..=k::KEY_KP_Equal).contains(&raw) => Location::Numpad,
         _ => Location::Standard,
     }
@@ -259,6 +261,37 @@ fn named(raw: u32) -> Option<Named> {
     })
 }
 
+/// The location from the physical key where it tells sides and the keypad
+/// apart, otherwise from the keysym.
+pub fn location_for(keysym: Keysym, keycode: u32) -> Location {
+    use Code as C;
+    match evdev_code(keycode.saturating_sub(8)) {
+        Some(C::ShiftLeft | C::ControlLeft | C::AltLeft | C::SuperLeft) => Location::Left,
+        Some(C::ShiftRight | C::ControlRight | C::AltRight | C::SuperRight) => Location::Right,
+        Some(
+            C::Numpad0
+            | C::Numpad1
+            | C::Numpad2
+            | C::Numpad3
+            | C::Numpad4
+            | C::Numpad5
+            | C::Numpad6
+            | C::Numpad7
+            | C::Numpad8
+            | C::Numpad9
+            | C::NumpadAdd
+            | C::NumpadSubtract
+            | C::NumpadMultiply
+            | C::NumpadDivide
+            | C::NumpadDecimal
+            | C::NumpadEnter
+            | C::NumpadEqual
+            | C::NumpadComma,
+        ) => Location::Numpad,
+        _ => location(keysym),
+    }
+}
+
 /// Physical key for a raw xkb keycode (Linux evdev scancode + 8).
 pub fn physical_key(keycode: u32) -> Physical {
     let scancode = keycode.saturating_sub(8);
@@ -394,7 +427,7 @@ fn evdev_code(scancode: u32) -> Option<Code> {
         125 => C::SuperLeft,
         126 => C::SuperRight,
         127 => C::ContextMenu,
-        128 => C::MediaStop,
+        128 => C::BrowserStop,
         129 => C::Again,
         130 => C::Props,
         131 => C::Undo,
@@ -635,6 +668,26 @@ mod tests {
         assert_eq!(key_of(0), Key::Unidentified);
         let (_, _, _, _, _, text) = pressed(key_pressed(input(0x1008_ff00, 700, Some("\u{E000}"))));
         assert_eq!(text, None);
+    }
+
+    #[test]
+    fn altgr_and_sided_modifiers_follow_the_physical_key() {
+        let altgr = pressed(key_pressed(input(k::KEY_ISO_Level3_Shift, 100 + 8, None)));
+        assert_eq!(altgr.0, Key::Named(Named::AltGraph));
+        assert_eq!(altgr.2, Physical::Code(Code::AltRight));
+        assert_eq!(altgr.3, Location::Right);
+        assert_eq!(location_of(k::KEY_ISO_Level3_Shift), Location::Right);
+        // A left Alt remapped to AltGr is still on the left.
+        assert_eq!(
+            pressed(key_pressed(input(k::KEY_ISO_Level3_Shift, 56 + 8, None))).3,
+            Location::Left
+        );
+        // Keypad keys with NumLock off still sit on the keypad.
+        assert_eq!(
+            pressed(key_pressed(input(k::KEY_Home, 71 + 8, None))).3,
+            Location::Numpad
+        );
+        assert_eq!(physical_key(128 + 8), Physical::Code(Code::BrowserStop));
     }
 
     #[test]
