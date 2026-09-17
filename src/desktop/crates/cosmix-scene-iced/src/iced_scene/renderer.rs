@@ -15,8 +15,8 @@ use cosmix_scene::ResolvedScene;
 use super::program::{Look, Outbox, SceneProgram};
 use super::submit::FocusProbe;
 use crate::surface::{
-    CursorIcon, ImeEvent, ImeRequest, Key, Modifiers, NamedKey, PointerButton, Processed, Rect,
-    ScrollUnit, SurfaceEvent, SurfaceRenderer,
+    CursorIcon, ImeEvent, ImePurpose, ImeRequest, Key, Modifiers, NamedKey, PointerButton,
+    Processed, Rect, ScrollUnit, SurfaceEvent, SurfaceRenderer,
 };
 
 /// The look every iced scene uses, replaced when the CTK design or
@@ -298,8 +298,15 @@ impl SurfaceRenderer for IcedSceneRenderer {
         let ime = match &requests.ime {
             cosmix_iced_host::ImeRequest::Disabled => ImeRequest::Disabled,
             cosmix_iced_host::ImeRequest::Enabled {
-                physical_cursor, ..
+                physical_cursor,
+                purpose,
+                ..
             } => ImeRequest::Enabled {
+                purpose: match purpose {
+                    input_method::Purpose::Normal => ImePurpose::Normal,
+                    input_method::Purpose::Secure => ImePurpose::Secure,
+                    input_method::Purpose::Terminal => ImePurpose::Terminal,
+                },
                 cursor: Rect::new(
                     physical_cursor.x,
                     physical_cursor.y,

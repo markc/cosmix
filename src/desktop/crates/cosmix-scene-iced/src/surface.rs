@@ -186,7 +186,18 @@ pub enum ImeRequest {
     Enabled {
         /// The caret, in surface physical pixels.
         cursor: Rect,
+        purpose: ImePurpose,
     },
+}
+
+/// The kind of text being edited, for the input method's content type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImePurpose {
+    #[default]
+    Normal,
+    /// A password: no prediction or learning.
+    Secure,
+    Terminal,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -305,11 +305,12 @@ fn field_edits_submit_undo_and_survive_reloads() {
     rig.settle();
     rig.click("field");
     let processed = rig.settle();
-    let ImeRequest::Enabled { cursor } = processed.ime else {
+    let ImeRequest::Enabled { cursor, purpose } = processed.ime else {
         panic!("focused field requested no IME: {processed:?}");
     };
     let field = rig.physical("field", 0.0);
     assert!(field.contains(cursor.x as f32 + 0.5, cursor.y as f32 + 0.5));
+    assert_eq!(purpose, crate::surface::ImePurpose::Normal);
     assert!(processed.wake_at.is_some(), "caret blink not scheduled");
 
     rig.type_text("ab");
@@ -516,5 +517,19 @@ fn font_faces_resolve_to_the_same_family_in_both_stacks() {
     println!("FONT_CHECK family={ctk_family:?} bevy={bevy_has:?} iced={iced_has:?}");
     if let (Some(bevy), Some(iced)) = (&bevy_has, &iced_has) {
         assert_eq!(bevy, iced);
+    }
+}
+
+#[test]
+fn password_fields_ask_for_a_secure_input_method() {
+    let source = "---\nscene: 1\nname: secret\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 8, children: [\"field\"]}\nfield: {widget: \"field\", value: \"\", password: true, width: 120}\n```\n";
+    let mut rig = Rig::new(source, 300, 100, 2.0);
+    rig.settle();
+    rig.click("field");
+    match rig.settle().ime {
+        ImeRequest::Enabled { purpose, .. } => {
+            assert_eq!(purpose, crate::surface::ImePurpose::Secure)
+        }
+        other => panic!("no IME request: {other:?}"),
     }
 }

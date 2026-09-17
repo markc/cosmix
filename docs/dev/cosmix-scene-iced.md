@@ -34,7 +34,8 @@ before the CTK pass (`SceneReconcile`) and registers pages after it.
 - `set_scene(&ResolvedScene)`: a new accepted revision;
 - `queue(SurfaceEvent)`: pointer (surface physical pixels), keys, focus, IME;
 - `process(now) -> Processed`: `needs_redraw`, cursor shape, IME request
-  (caret rectangle in surface pixels), `wake_at`;
+  (caret rectangle in surface pixels and purpose: normal, secure, terminal;
+  the bridge forwards secure as the host's password purpose), `wake_at`;
 - `draw(buffer, width, height, stride) -> Vec<Rect>`: paints only damage into
   the caller's persistent RGBA8 premultiplied buffer and returns it.
 

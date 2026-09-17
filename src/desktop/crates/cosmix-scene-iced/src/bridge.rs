@@ -102,6 +102,7 @@ pub struct SceneIcedWake(pub Option<Duration>);
 /// What the input method should do for the focused surface.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImeOutput {
+    pub purpose: ImePurpose,
     pub window_scale: f32,
     /// The caret in window-logical coordinates, which is what
     /// text-input-v3's `set_cursor_rectangle` takes for a layer surface.
@@ -917,11 +918,16 @@ pub(crate) fn frame(
         }
         let owner = focus.owner == Some(entity);
         let request = match (&processed.ime, owner) {
-            (ImeRequest::Enabled { cursor }, true) => {
+            (ImeRequest::Enabled { cursor, purpose }, true) => {
                 let min = (geometry.origin + Vec2::new(cursor.x as f32, cursor.y as f32))
                     / geometry.scale;
                 let extent = Vec2::new(cursor.w as f32, cursor.h as f32) / geometry.scale;
                 Some(ImeOutput {
+                    purpose: match purpose {
+                        crate::surface::ImePurpose::Normal => ImePurpose::Normal,
+                        crate::surface::ImePurpose::Secure => ImePurpose::Password,
+                        crate::surface::ImePurpose::Terminal => ImePurpose::Terminal,
+                    },
                     window_scale: geometry.scale,
                     cursor: bevy::math::Rect::from_corners(min, min + extent),
                 })
@@ -930,7 +936,9 @@ pub(crate) fn frame(
         };
         ime_target.set_if_neq(ExternalImeTarget {
             enabled: request.is_some(),
-            purpose: ImePurpose::Normal,
+            purpose: request
+                .as_ref()
+                .map_or(ImePurpose::Normal, |ime| ime.purpose),
             cursor: request.as_ref().map(|ime| ime.cursor),
         });
         if owner {

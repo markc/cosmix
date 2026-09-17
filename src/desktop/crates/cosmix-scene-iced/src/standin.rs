@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use crate::surface::{
-    CursorIcon, ImeEvent, ImeRequest, Key, NamedKey, Processed, Rect, SurfaceEvent, SurfaceRenderer,
+    CursorIcon, ImeEvent, ImePurpose, ImeRequest, Key, NamedKey, Processed, Rect, SurfaceEvent,
+    SurfaceRenderer,
 };
 
 const PANEL: [u8; 4] = [0x20, 0x24, 0x2c, 0xff];
@@ -137,6 +138,7 @@ impl SurfaceRenderer for StandIn {
             ime: if self.focused {
                 ImeRequest::Enabled {
                     cursor: self.caret(),
+                    purpose: ImePurpose::Normal,
                 }
             } else {
                 ImeRequest::Disabled
