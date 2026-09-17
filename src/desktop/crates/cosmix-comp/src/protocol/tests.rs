@@ -30160,8 +30160,8 @@ fn synchronised_subsurface_feedback_is_taken_when_the_parent_applies() {
 
 /// G3: several cached commits applied in one transaction keep their own
 /// feedback. A commit whose buffer a later cached commit replaced is
-/// discarded even when the later commit asked for no feedback; a bufferless
-/// commit after the last buffer is presented with that buffer's frame.
+/// discarded even when the later commit asked for no feedback; a commit
+/// followed only by bufferless commits is presented with its own buffer.
 #[test]
 fn interior_cached_commits_are_superseded_not_presented_late() {
     let mut harness = KeybindingHarness::new(true);
@@ -30169,13 +30169,20 @@ fn interior_cached_commits_are_superseded_not_presented_late() {
     let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
     let child_id = harness.server.state.surfaces[&child.id()].id;
     let (presentation, _) = bind_test_presentation(&mut harness);
+    let pending = |harness: &KeybindingHarness| {
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id)
+    };
+    // Transaction 1: a commit with feedback, then a cached commit that
+    // replaces its buffer and asks for none. (Smithay alone would keep the
+    // first commit's callbacks, since the later commit had none.)
     let interior = request_surface_feedback(&mut harness, presentation, child_surface);
     commit_test_buffer(&mut harness, child_surface);
-    // A later cached commit replaces the buffer without asking for feedback.
     commit_test_buffer(&mut harness, child_surface);
-    // A bufferless commit after it asks for feedback: it shows that buffer.
-    let trailing = request_surface_feedback(&mut harness, presentation, child_surface);
-    send_request(&mut harness.client, child_surface, 6, &[]);
     harness.dispatch_client();
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
     harness.dispatch_client();
@@ -30185,20 +30192,23 @@ fn interior_cached_commits_are_superseded_not_presented_late() {
         [2],
         "the superseded interior commit is discarded at apply: {events:?}"
     );
-    assert_eq!(
-        harness
-            .server
-            .state
-            .presentation
-            .ledger
-            .pending_count(child_id),
-        1
-    );
+    assert_eq!(pending(&harness), 0);
+
+    // Transaction 2: a buffer with feedback, then a bufferless commit
+    // without feedback. The first commit's buffer is what is shown.
+    let shown = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    harness.dispatch_client();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert!(feedback_opcodes(&harness.sync(), shown).is_empty());
+    assert_eq!(pending(&harness), 1);
     let seq = content_seq(&harness, &child.id());
     let (frame, content) = test_frame_report(child_id, 42, seq, true);
     harness.server.state.frame_presented(frame, content);
     let events = harness.sync();
-    assert_eq!(feedback_opcodes(&events, trailing), [1], "{events:?}");
+    assert_eq!(feedback_opcodes(&events, shown), [1], "{events:?}");
 }
 
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
