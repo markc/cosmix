@@ -16,6 +16,7 @@ members = [
     "apps/capture",
     "apps/media",
     "apps/term",
+    "apps/bench-mixer-bevy",
     "crates/cosmix-bench-feed",
     "crates/cosmix-design",
     "crates/cosmix-scene",

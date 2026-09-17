@@ -1,0 +1,30 @@
+# desktop/apps/bench-mixer-bevy — the Bevy/CTK arm of the mixer + roll
+# bake-off (ADR 2026-09-17 test C). A measurement fixture, not an installable
+# app: it carries no [package.metadata.cosmix] and is never deployed.
+[package]
+name = "cosmix-bench-mixer-bevy"
+version = "0.1.0"
+description = "Mixer + roll bake-off, Bevy/CTK arm: 64 CTK strips with animated meters and a pooled piano roll fed by cosmix-bench-feed"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "cosmix-bench-mixer-bevy"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+] }
+cosmix-bench-feed = { path = "../../crates/cosmix-bench-feed" }
+# `mixer` only for the fader taper and channel colours the arm shares with
+# Studio; no mixer plugin, transport or Bus port is installed.
+ctk = { path = "../../ctk", features = ["mixer"] }
+
+[dev-dependencies]
+# Tests build small songs in memory instead of reading the generated fixture.
+cosmix-song = { path = "../../../crates/cosmix-song" }

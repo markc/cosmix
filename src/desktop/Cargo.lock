@@ -2792,6 +2792,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-bench-mixer-bevy"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "cosmix-bench-feed",
+ "cosmix-song",
+ "ctk",
+]
+
+[[package]]
 name = "cosmix-bg-boing"
 version = "0.1.0"
 dependencies = [
