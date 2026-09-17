@@ -68,10 +68,10 @@ impl DamageRect {
     }
 }
 
-/// Swaps the R and B channels of every pixel in `rect`. The buffer is tight
-/// (`stride == width * 4`).
-pub(crate) fn swap_red_blue(buffer: &mut [u8], width: u32, rect: DamageRect) {
-    let stride = width as usize * 4;
+/// Swaps the R and B channels of every pixel in `rect`; rows are
+/// `row_pixels` wide.
+pub(crate) fn swap_red_blue(buffer: &mut [u8], row_pixels: u32, rect: DamageRect) {
+    let stride = row_pixels as usize * 4;
     for row in rect.y..rect.y + rect.height {
         let start = row as usize * stride + rect.x as usize * 4;
         let end = start + rect.width as usize * 4;

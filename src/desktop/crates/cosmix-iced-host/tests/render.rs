@@ -569,3 +569,63 @@ fn independent_surfaces_share_one_process() {
         assert!(target.draw().damage.is_empty());
     }
 }
+
+#[test]
+fn padded_rows_match_tight_rows_and_padding_is_untouched() {
+    const TEXTURE_WIDTH: u32 = 256;
+    for format in [PixelFormat::Rgba8, PixelFormat::Argb8888] {
+        let mut tight = Target::new(1.0, format);
+        let mut padded = Target::new(1.0, format);
+        let stride = TEXTURE_WIDTH * 4;
+        padded.buffer = vec![0xab; stride as usize * padded.height as usize];
+        let draw_padded = |target: &mut Target| {
+            target
+                .surface
+                .draw(
+                    &mut target.buffer,
+                    target.width,
+                    target.height,
+                    stride,
+                    target.format,
+                )
+                .expect("padded draw")
+        };
+        tight.draw();
+        assert!(draw_padded(&mut padded).full);
+        let button = tight.bounds("button");
+        for target in [&mut tight, &mut padded] {
+            target.surface.cursor_moved(button.center());
+            target.surface.process();
+        }
+        tight.draw();
+        let frame = draw_padded(&mut padded);
+        assert!(!frame.full && !frame.damage.is_empty());
+        for y in 0..tight.height as usize {
+            let row = &padded.buffer[y * stride as usize..(y + 1) * stride as usize];
+            let visible = tight.width as usize * 4;
+            assert_eq!(
+                &row[..visible],
+                &tight.buffer[y * visible..(y + 1) * visible],
+                "{format:?} row {y}"
+            );
+            assert!(
+                row[visible..].iter().all(|b| *b == 0xab),
+                "{format:?} padding row {y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn narrow_or_ragged_strides_are_refused() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    let mut buffer = vec![0; 200 * 120 * 8];
+    for stride in [796, 802] {
+        assert_eq!(
+            target
+                .surface
+                .draw(&mut buffer, 200, 120, stride, PixelFormat::Rgba8),
+            Err(cosmix_iced_host::DrawError::UnsupportedStride { stride, width: 200 })
+        );
+    }
+}
