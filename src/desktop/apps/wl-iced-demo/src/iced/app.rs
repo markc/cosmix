@@ -225,7 +225,10 @@ impl IcedDemo {
             Action::Quit => cx.exit(),
             Action::Undo => {}
             Action::Copy => self.copy(cx),
-            Action::Paste => cx.request_selection(Selection::Clipboard),
+            Action::Paste => {
+                // An explicit paste: its answer goes to the grid, not the cache.
+                cx.request_selection(Selection::Clipboard);
+            }
             Action::SelectTab(i) => {
                 self.chrome.program_mut().active = i;
                 self.apply_tab(cx);
