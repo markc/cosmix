@@ -60,7 +60,7 @@ fn spawn_mixer(mut commands: Commands, bench: Res<Bench>) {
         last_tick: None,
     };
     let mut rows = Vec::new();
-    for slots in strip_rows(config.strips) {
+    for slots in strip_rows(config.strips, config.size.0 as f32) {
         let strips: Vec<Entity> = slots
             .map(|slot| spawn_strip(&mut commands, &feed, slot, &mut entities))
             .collect();
@@ -352,6 +352,7 @@ mod tests {
                 strips,
                 seed: DEFAULT_SEED,
                 song: None,
+                size: (1024, 576),
                 scripted_drag: true,
             },
             None,

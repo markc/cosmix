@@ -1,9 +1,9 @@
 //! Shared geometry. Both arms lay the surface out from these numbers so the
 //! parity screenshots compare like with like. Sizes are logical pixels.
 //!
-//! The mixer is 64 compact strips plus the master, wrapped into rows of
-//! [`STRIPS_PER_ROW`] so every strip and meter is on screen at the fixed
-//! window size (no scrolled-off meters that one toolkit could skip drawing).
+//! The mixer is 64 compact strips plus the master, wrapped into as many rows
+//! as the window width needs ([`strip_rows`]) so every strip and meter is on
+//! screen — no scrolled-off meters that one toolkit could skip drawing.
 //! One strip, top to bottom: channel number, a two-line name box, the pan
 //! knob, the meter and fader side by side (this row takes the spare height),
 //! then mute over solo. The master strip keeps the same skeleton with the
@@ -11,12 +11,12 @@
 
 use std::ops::Range;
 
-/// Fixed window size for every run.
-pub const WINDOW_WIDTH: u32 = 1600;
-pub const WINDOW_HEIGHT: u32 = 900;
-
-/// Strip slots per mixer row (the master takes the slot after the last strip).
-pub const STRIPS_PER_ROW: usize = 33;
+/// Default window size: the nested harness's logical output (1105x622),
+/// rounded down to a 16:9 size that fits inside it. Both arms take the same
+/// size on the command line, so a run can measure at another size as long as
+/// both arms use it.
+pub const WINDOW_WIDTH: u32 = 1024;
+pub const WINDOW_HEIGHT: u32 = 576;
 /// Vertical gap between mixer rows.
 pub const ROW_GAP: f32 = 4.0;
 /// Horizontal gap between strips.
@@ -60,13 +60,20 @@ pub fn is_black_key(key: u8) -> bool {
     matches!(key % 12, 1 | 3 | 6 | 8 | 10)
 }
 
-/// The strip slots in each mixer row. Slots `0..strips` are channel strips;
-/// slot `strips` is the master.
-pub fn strip_rows(strips: usize) -> Vec<Range<usize>> {
+/// Strip slots that fit one row of a `width`-pixel board.
+pub fn strips_per_row(width: f32) -> usize {
+    ((width / (STRIP_WIDTH + STRIP_GAP)).floor() as usize).max(1)
+}
+
+/// The strip slots in each mixer row of a `width`-pixel board. Slots
+/// `0..strips` are channel strips; slot `strips` is the master. Every slot is
+/// on screen: the board wraps into as many rows as it needs.
+pub fn strip_rows(strips: usize, width: f32) -> Vec<Range<usize>> {
     let slots = strips + 1;
+    let per_row = strips_per_row(width);
     (0..slots)
-        .step_by(STRIPS_PER_ROW)
-        .map(|start| start..(start + STRIPS_PER_ROW).min(slots))
+        .step_by(per_row)
+        .map(|start| start..(start + per_row).min(slots))
         .collect()
 }
 
@@ -75,19 +82,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_board_fits_the_window_in_two_rows() {
-        let rows = strip_rows(crate::DEFAULT_STRIPS);
-        assert_eq!(rows, vec![0..33, 33..65]);
+    fn default_board_wraps_into_rows_that_fit() {
+        let width = WINDOW_WIDTH as f32;
+        let rows = strip_rows(crate::DEFAULT_STRIPS, width);
+        assert_eq!(rows, vec![0..22, 22..44, 44..65]);
         let widest = rows.iter().map(|row| row.len()).max().unwrap() as f32;
-        assert!(widest * (STRIP_WIDTH + STRIP_GAP) <= WINDOW_WIDTH as f32);
+        assert!(widest * (STRIP_WIDTH + STRIP_GAP) <= width);
+        // A wider board uses fewer, longer rows.
+        assert_eq!(
+            strip_rows(crate::DEFAULT_STRIPS, 1600.0),
+            vec![0..35, 35..65]
+        );
     }
 
     #[test]
     fn rows_cover_every_slot_once() {
-        for strips in [0, 1, 32, 33, 64, 100] {
-            let slots: Vec<usize> = strip_rows(strips).into_iter().flatten().collect();
-            assert_eq!(slots, (0..=strips).collect::<Vec<_>>());
+        for width in [80.0, 1024.0, 1600.0] {
+            for strips in [0, 1, 32, 33, 64, 100] {
+                let slots: Vec<usize> = strip_rows(strips, width).into_iter().flatten().collect();
+                assert_eq!(slots, (0..=strips).collect::<Vec<_>>(), "width {width}");
+            }
         }
+        // A board too narrow for even one strip still shows one per row.
+        assert_eq!(strips_per_row(10.0), 1);
     }
 
     #[test]

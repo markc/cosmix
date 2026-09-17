@@ -38,6 +38,7 @@ usage: cosmix-bench-mixer-bevy [options]
   --strips N                     channel strips, plus the master (default 64)
   --seed S                       feed seed, decimal or 0x hex (default 0x5eed1234)
   --song PATH                    roll song (default ~/.cache/cosmix-bench/studio-s0/dense-32-track.mid)
+  --size WxH                     window size in logical pixels (default 1024x576)
   --drag-by script|pointer       drag mode: the feed moves the fader, or an external
                                  pointer does while meters animate (default script)";
 
@@ -54,8 +55,24 @@ pub struct Config {
     pub strips: usize,
     pub seed: u64,
     pub song: Option<PathBuf>,
+    /// Window size, logical pixels. The mixer wraps its strips to fit it.
+    pub size: (u32, u32),
     /// Drag mode only: whether the feed script moves the fader.
     pub scripted_drag: bool,
+}
+
+/// `WxH`, both between 200 and 8000 logical pixels.
+fn parse_size(text: &str) -> Result<(u32, u32), String> {
+    let bad = || format!("--size must be WxH, e.g. 1024x576, got {text:?}");
+    let (width, height) = text.split_once(['x', 'X']).ok_or_else(bad)?;
+    let parse = |value: &str| {
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (200..=8000).contains(n))
+            .ok_or_else(bad)
+    };
+    Ok((parse(width)?, parse(height)?))
 }
 
 fn parse_seed(text: &str) -> Result<u64, String> {
@@ -72,6 +89,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut strips = DEFAULT_STRIPS;
     let mut seed = DEFAULT_SEED;
     let mut song = None;
+    let mut size = (WINDOW_WIDTH, WINDOW_HEIGHT);
     let mut scripted_drag = true;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -99,6 +117,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             }
             "--seed" => seed = parse_seed(value)?,
             "--song" => song = Some(PathBuf::from(value)),
+            "--size" => size = parse_size(value)?,
             "--drag-by" => {
                 scripted_drag = match value.as_str() {
                     "script" => true,
@@ -138,6 +157,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         strips,
         seed,
         song,
+        size,
         scripted_drag,
     })
 }
@@ -239,11 +259,13 @@ fn main() {
         std::process::exit(2);
     });
     eprintln!(
-        "bench-mixer-bevy: mode={} view={:?} strips={} seed={:#x} song={}",
+        "bench-mixer-bevy: mode={} view={:?} strips={} seed={:#x} size={}x{} song={}",
         config.mode,
         config.view,
         config.strips,
         config.seed,
+        config.size.0,
+        config.size.1,
         config
             .song
             .as_ref()
@@ -278,7 +300,7 @@ fn main() {
         primary_window: Some(Window {
             title,
             name: Some(APP_ID.to_owned()),
-            resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
+            resolution: (config.size.0, config.size.1).into(),
             resizable: false,
             ..default()
         }),
@@ -305,6 +327,7 @@ mod tests {
         assert_eq!(config.strips, 64);
         assert_eq!(config.seed, DEFAULT_SEED);
         assert_eq!(config.song, None);
+        assert_eq!(config.size, (1024, 576));
         assert!(config.scripted_drag);
     }
 
@@ -334,7 +357,9 @@ mod tests {
         assert_eq!(config.strips, 8);
         assert_eq!(config.seed, 0xdead_beef);
         assert!(!config.scripted_drag);
+        assert_eq!(config.size, (1600, 900));
         assert_eq!(parse_seed("42"), Ok(42));
+        assert_eq!(parse_size("800X600"), Ok((800, 600)));
     }
 
     #[test]
@@ -350,6 +375,9 @@ mod tests {
             &["--mode", "meters", "--view", "roll"],
             &["--mode", "roll", "--view", "mixer"],
             &["--drag-by", "wind"],
+            &["--size", "1024"],
+            &["--size", "100x100"],
+            &["--size", "1024x"],
             &["--help"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?} must be refused");
