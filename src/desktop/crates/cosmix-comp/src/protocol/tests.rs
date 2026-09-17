@@ -30006,6 +30006,125 @@ fn presentation_sweep_discards_unlisted_surfaces_that_cannot_be_presented() {
     assert_eq!(feedback_opcodes(&events, pending), [2], "{events:?}");
 }
 
+/// A KMS harness with its selected output registered as a client output;
+/// returns that output's key.
+fn register_test_kms_output(harness: &mut KeybindingHarness) -> OutputKey {
+    harness.admit_kms_4k_at_250_percent();
+    let display = harness.server.state.display_handle.clone();
+    harness
+        .server
+        .state
+        .backend
+        .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+    let key = OutputKey {
+        device: 226,
+        connector_name: "Fractional-1".into(),
+    };
+    assert!(
+        harness
+            .server
+            .state
+            .backend
+            .kms_registered_outputs()
+            .iter()
+            .any(|(registered, _)| *registered == key)
+    );
+    key
+}
+
+/// Step 5: a KMS flip is presented on the client output of its own key,
+/// with its own timing; a flip on an output that is not a client output
+/// resolves nothing.
+#[test]
+fn kms_frame_reports_name_their_own_output() {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let key = register_test_kms_output(&mut harness);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let callback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let content = presentation::FrameContent {
+        surfaces: vec![presentation::FrameSurface {
+            id,
+            commit_seq: content_seq(&harness, &object),
+            shown: true,
+        }],
+        sources: Vec::new(),
+    };
+    let flip = |seq| presentation::PresentedFrame {
+        output: None,
+        time: Duration::new(5, 250),
+        refresh: smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(16_666_666)),
+        seq,
+        flags: Kind::Vsync | Kind::HwCompletion | Kind::HwClock,
+    };
+    let (reporter, probe) = FramePresentationReporter::test_channel();
+
+    reporter.kms_presented(
+        OutputKey {
+            device: 226,
+            connector_name: "Other-2".into(),
+        },
+        flip(90),
+        content.clone(),
+    );
+    assert_eq!(probe.deliver(&mut harness.server.state), 1);
+    assert!(feedback_outcome(&harness.sync(), callback).is_empty());
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+
+    reporter.kms_presented(key, flip(91), content);
+    assert_eq!(probe.deliver(&mut harness.server.state), 1);
+    let events = harness.sync();
+    let outcome = feedback_outcome(&events, callback);
+    assert_eq!(outcome.len(), 1, "{events:?}");
+    assert_eq!(outcome[0].0, 1, "presented");
+    let body = &outcome[0].1;
+    assert_eq!((word(body, 0), word(body, 1), word(body, 2)), (0, 5, 250));
+    assert_eq!(word(body, 3), 16_666_666, "refresh");
+    assert_eq!((word(body, 4), word(body, 5)), (0, 91), "seq");
+    assert_eq!(word(body, 6), 0x7, "vsync | hw_clock | hw_completion");
+}
+
+/// Step 5 (K3): on KMS the render world holds the frame reporter, so a
+/// refusal it sees reaches the ledger at once, without riding a flip.
+#[test]
+fn kms_render_world_refusals_reach_the_ledger() {
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    register_test_kms_output(&mut harness);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let refused = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+
+    let mut app = bevy::app::App::new();
+    app.insert_sub_app(bevy::render::RenderApp, bevy::app::SubApp::new());
+    let (reporter, probe) = FramePresentationReporter::test_channel();
+    crate::backend::render::install_live_frame_reporter(&mut app, reporter);
+    assert!(app.world().contains_resource::<FramePresentationReporter>());
+    app.sub_app(bevy::render::RenderApp)
+        .world()
+        .resource::<FramePresentationReporter>()
+        .commit_refused(id, None, seq);
+    assert_eq!(probe.deliver(&mut harness.server.state), 1);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, refused), [2], "{events:?}");
+}
+
 /// A buffer the commit path counted but never published (here: the client
 /// vanished mid-import, a test hook) is not content: its feedback is
 /// discarded at once and the content sequence does not move. A buffer the

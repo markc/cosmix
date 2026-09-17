@@ -384,7 +384,7 @@ struct PreparedLiveOperation {
     frame_clock: Option<crate::protocol::ClientFrameClock>,
     security_reporter: Option<crate::protocol::SecurityPresentationReporter>,
     /// `wp_presentation` reports; client-content scenes only.
-    frame_reporter: Option<crate::protocol::FramePresentationReporter>,
+    frame_sink: KmsPresentationSink,
     scene_mode: LiveSceneMode,
     scene_feed: Option<crate::protocol::ClientSceneFeed>,
     decoration: DecorationStartup,
@@ -4161,7 +4161,7 @@ fn prepare_live_operation(
         topology_client: None,
         frame_clock: None,
         security_reporter: None,
-        frame_reporter: None,
+        frame_sink: KmsPresentationSink::default(),
         scene_mode: grant.scene_mode,
         scene_feed: None,
         decoration: grant.decoration.clone(),
@@ -5346,26 +5346,34 @@ where
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 #[derive(Debug)]
 pub(crate) struct KmsFramePresented {
+    /// The output this flip was scanned out on.
+    pub(crate) key: OutputKey,
     pub(crate) frame: crate::protocol::presentation::PresentedFrame,
     pub(crate) content: crate::protocol::presentation::FrameContent,
 }
 
 /// The report for one displayed flip: the kernel's flip time and vblank
 /// counter, the mode's refresh, and only the flags a completed page flip
-/// proves. Never ZERO_COPY: client buffers are composited into scanout
-/// buffers, not scanned out directly.
+/// proves. A CRTC without vblank support (virtio-gpu, simpledrm) completes
+/// flips on no vblank grid and stamps them at completion, so it claims
+/// neither VSYNC nor HW_CLOCK and reports sequence 0. Never ZERO_COPY:
+/// client buffers are composited into scanout buffers, not scanned out
+/// directly.
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn kms_presented_frame(
     timestamp: super::render::KmsPresentationTimestamp,
 ) -> crate::protocol::presentation::PresentedFrame {
     use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
     use smithay::wayland::presentation::Refresh;
-    let mut flags = Kind::Vsync | Kind::HwCompletion;
-    if timestamp.hw_clock {
-        flags |= Kind::HwClock;
+    let mut flags = Kind::HwCompletion;
+    if timestamp.vblank {
+        flags |= Kind::Vsync;
+        if timestamp.hw_clock {
+            flags |= Kind::HwClock;
+        }
     }
     crate::protocol::presentation::PresentedFrame {
-        // The protocol thread names the selected client output.
+        // The protocol thread names the client output for the flip's key.
         output: None,
         time: Duration::new(timestamp.seconds, timestamp.nanoseconds),
         refresh: if timestamp.refresh_nanos > 0 {
@@ -5373,8 +5381,84 @@ fn kms_presented_frame(
         } else {
             Refresh::Unknown
         },
-        seq: timestamp.sequence,
+        seq: if timestamp.vblank {
+            timestamp.sequence
+        } else {
+            0
+        },
         flags,
+    }
+}
+
+/// One output's 32-bit vblank counter, extended so the reported sequence
+/// only ever increases: a wrap adds 2^32, and a counter that goes backwards
+/// (a different CRTC, or a reset across resume) continues from the last
+/// reported value.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Default)]
+struct VblankSequence {
+    last: Option<(u32, u64)>,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+impl VblankSequence {
+    fn extend(&mut self, raw: u32) -> u64 {
+        let extended = match self.last {
+            None => u64::from(raw),
+            Some((last_raw, last)) => {
+                let forward = raw.wrapping_sub(last_raw);
+                if forward != 0 && forward <= u32::MAX / 2 {
+                    last.saturating_add(u64::from(forward))
+                } else {
+                    last.saturating_add(1)
+                }
+            }
+        };
+        self.last = Some((raw, extended));
+        extended
+    }
+}
+
+/// Where the coordinators send displayed flips in production: sequences are
+/// extended per output, then the report goes to the protocol thread. Clones
+/// share the sequence state, so it survives pause/resume supervision.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Default)]
+struct KmsPresentationSink {
+    reporter: Option<crate::protocol::FramePresentationReporter>,
+    sequences: Arc<Mutex<BTreeMap<OutputKey, VblankSequence>>>,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+impl KmsPresentationSink {
+    fn new(reporter: Option<crate::protocol::FramePresentationReporter>) -> Self {
+        Self {
+            reporter,
+            sequences: Arc::default(),
+        }
+    }
+
+    fn reporter(&self) -> Option<crate::protocol::FramePresentationReporter> {
+        self.reporter.clone()
+    }
+
+    fn report(&self, mut presented: KmsFramePresented) {
+        use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+        let Some(reporter) = &self.reporter else {
+            return;
+        };
+        if presented.frame.flags.contains(Kind::Vsync) {
+            // The kernel counter is 32 bits; anything above is our extension.
+            let raw = presented.frame.seq as u32;
+            presented.frame.seq = self
+                .sequences
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(presented.key.clone())
+                .or_default()
+                .extend(raw);
+        }
+        reporter.kms_presented(presented.key, presented.frame, presented.content);
     }
 }
 
@@ -5383,11 +5467,13 @@ fn kms_presented_frame(
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn forward_frame_presented(
     frame_presented: &mut impl FnMut(KmsFramePresented),
+    key: &OutputKey,
     timestamp: super::render::KmsPresentationTimestamp,
     content: Option<crate::protocol::presentation::FrameContent>,
 ) {
     if let Some(content) = content {
         frame_presented(KmsFramePresented {
+            key: key.clone(),
             frame: kms_presented_frame(timestamp),
             content,
         });
@@ -5628,7 +5714,7 @@ where
                     for presentation_epoch in security_epochs {
                         security_presented(presentation_epoch, generation, key.clone())?;
                     }
-                    forward_frame_presented(&mut *frame_presented, timestamp, content);
+                    forward_frame_presented(&mut *frame_presented, &key, timestamp, content);
                     submissions = submissions.saturating_add(1);
                 }
                 KmsRenderFrameEvent::PresentationCancelled { .. } => {}
@@ -5777,7 +5863,7 @@ where
                     for presentation_epoch in security_epochs {
                         security_presented(presentation_epoch, generation, key.clone())?;
                     }
-                    forward_frame_presented(&mut frame_presented, timestamp, content);
+                    forward_frame_presented(&mut frame_presented, &key, timestamp, content);
                     submissions = submissions.saturating_add(1);
                 }
                 KmsRenderFrameEvent::PresentationCancelled { generation, .. } => {
@@ -6042,6 +6128,7 @@ fn await_external_pause_attribution_for_completed_update<M: LiveCoordinatorMailb
             reconcile_pause_updated_frame_events(
                 vec![KmsRenderFrameEvent::TerminalFailure(failure)],
                 LivePauseCause::External,
+                &mut |_| {},
             )?;
             Ok(LiveSupervisionEnd::PauseRequested {
                 generation,
@@ -6399,6 +6486,7 @@ fn reconcile_outstanding_pump_command<M: LiveCoordinatorMailbox>(
     pause_cause: LivePauseCause,
     deadline: Duration,
     now: &mut impl FnMut() -> Duration,
+    frame_presented: &mut impl FnMut(KmsFramePresented),
 ) -> Result<(), KmsLiveError> {
     let phase = "pre-transition outstanding-command reconcile";
     let reply = wait_for_transition_reply(mailbox, deadline, now, phase)?;
@@ -6411,7 +6499,7 @@ fn reconcile_outstanding_pump_command<M: LiveCoordinatorMailbox>(
         (OutstandingPumpCommand::Update(token), PumpReply::Updated(result)) => {
             let report = result?;
             validate_update_report(&report, &token, &mut None)?;
-            reconcile_pause_updated_frame_events(report.frame_events, pause_cause)
+            reconcile_pause_updated_frame_events(report.frame_events, pause_cause, frame_presented)
         }
         (
             OutstandingPumpCommand::DrainScene {
@@ -6427,10 +6515,18 @@ fn reconcile_outstanding_pump_command<M: LiveCoordinatorMailbox>(
 fn reconcile_pause_updated_frame_events(
     events: Vec<KmsRenderFrameEvent>,
     pause_cause: LivePauseCause,
+    frame_presented: &mut impl FnMut(KmsFramePresented),
 ) -> Result<(), KmsLiveError> {
     for event in events {
         match event {
-            KmsRenderFrameEvent::FrameSubmitted { .. } => {}
+            // The flip completed before the pause and its content-source
+            // costs were consumed with it: report it like any other.
+            KmsRenderFrameEvent::FrameSubmitted {
+                key,
+                timestamp,
+                content,
+                ..
+            } => forward_frame_presented(&mut *frame_presented, &key, timestamp, content),
             KmsRenderFrameEvent::PresentationCancelled { .. } => {}
             KmsRenderFrameEvent::TerminalFailure(failure)
                 if pause_cause == LivePauseCause::External
@@ -7764,6 +7860,7 @@ impl PreparedLiveOperation {
         )?;
         self.capture_last_active_scanout(now());
         let suspend_deadline = now().saturating_add(LIVE_RESUME_TIMEOUT);
+        let frame_sink = self.frame_sink.clone();
         let suspended = (|| -> Result<u64, KmsLiveError> {
             if let Some(outstanding_command) = outstanding_command {
                 let mut mailbox = ExternalPauseMailbox::new(
@@ -7778,6 +7875,7 @@ impl PreparedLiveOperation {
                     LivePauseCause::External,
                     suspend_deadline,
                     now,
+                    &mut |presented| frame_sink.report(presented),
                 )?;
             }
             let commands = self.submit_topology_transition(
@@ -7886,6 +7984,7 @@ impl PreparedLiveOperation {
         )?;
         self.capture_last_active_scanout(now());
         let suspend_deadline = now().saturating_add(LIVE_RESUME_TIMEOUT);
+        let frame_sink = self.frame_sink.clone();
         let mut external_pause = None;
         let prepared = (|| -> Result<u64, KmsLiveError> {
             if let Some(outstanding_command) = outstanding_command {
@@ -7901,6 +8000,7 @@ impl PreparedLiveOperation {
                     LivePauseCause::SelfSwitch,
                     suspend_deadline,
                     now,
+                    &mut |presented| frame_sink.report(presented),
                 )?;
             }
             let commands = self.submit_topology_transition(
@@ -8222,8 +8322,10 @@ impl LiveActPlatform for PreparedLiveOperation {
         self.security_reporter = Some(runtime.security_presentation_reporter());
         // Asking for the reporter advertises `wp_presentation`. First-light
         // never draws client content, so it would only ever discard.
-        self.frame_reporter = (self.scene_mode == LiveSceneMode::ClientContent)
-            .then(|| runtime.frame_presentation_reporter());
+        self.frame_sink = KmsPresentationSink::new(
+            (self.scene_mode == LiveSceneMode::ClientContent)
+                .then(|| runtime.frame_presentation_reporter()),
+        );
         self.scene_feed = Some(
             runtime
                 .take_client_scene_feed()
@@ -8309,7 +8411,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                 .clone()
                 .expect("protocol startup installs the topology client"),
             self.scene_feed.take(),
-            self.frame_reporter.clone(),
+            self.frame_sink.reporter(),
         )?;
         Ok(pump)
     }
@@ -8340,7 +8442,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                     KmsLiveError::Setup("security presentation reporter is unavailable".into())
                 })?;
                 let topology_client = self.topology_client()?.clone();
-                let frame_reporter = self.frame_reporter.clone();
+                let frame_sink = self.frame_sink.clone();
                 match supervise_resumed_live_render(
                     self.session
                         .as_mut()
@@ -8359,11 +8461,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                             .kms_presented(presentation_epoch, generation, output)
                             .map_err(KmsLiveError::Setup)
                     },
-                    move |presented: KmsFramePresented| {
-                        if let Some(reporter) = &frame_reporter {
-                            reporter.presented(presented.frame, presented.content);
-                        }
-                    },
+                    move |presented: KmsFramePresented| frame_sink.report(presented),
                 )? {
                     LiveSupervisionEnd::Revocation(revocation) => {
                         adapter.begin_stop();
@@ -8405,7 +8503,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                 let security_reporter = self.security_reporter.clone().ok_or_else(|| {
                     KmsLiveError::Setup("security presentation reporter is unavailable".into())
                 })?;
-                let frame_reporter = self.frame_reporter.clone();
+                let frame_sink = self.frame_sink.clone();
                 supervise_active_live_operation_after_output_ready(
                     session,
                     adapter,
@@ -8424,11 +8522,7 @@ impl LiveActPlatform for PreparedLiveOperation {
                             .kms_presented(presentation_epoch, generation, output)
                             .map_err(KmsLiveError::Setup)
                     },
-                    move |presented: KmsFramePresented| {
-                        if let Some(reporter) = &frame_reporter {
-                            reporter.presented(presented.frame, presented.content);
-                        }
-                    },
+                    move |presented: KmsFramePresented| frame_sink.report(presented),
                 )?
             };
             match end {
@@ -10024,6 +10118,7 @@ mod tests {
                 LivePauseCause::External,
                 Duration::from_secs(30),
                 &mut now,
+                &mut |_| {},
             )
             .unwrap_err();
             assert!(error.to_string().contains("kms-live-stale-"), "{error}");
@@ -10431,6 +10526,7 @@ mod tests {
             LivePauseCause::SelfSwitch,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect("the pending Updated reply is drained before transition commands");
         let outcome = drive_live_transition(
@@ -10535,6 +10631,7 @@ mod tests {
             LivePauseCause::SelfSwitch,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect("the pending Registration reply is drained before transition commands");
         let outcome = drive_live_transition(
@@ -10610,6 +10707,7 @@ mod tests {
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect("authority-class atomic failure is attributable to established pause");
         assert_eq!(
@@ -10895,6 +10993,7 @@ mod tests {
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect("cancelled pageflip update reconciles without a submitted frame");
         assert_eq!(
@@ -10934,6 +11033,7 @@ mod tests {
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect("typed cancellation is an empty successful reconciliation");
     }
@@ -10952,6 +11052,7 @@ mod tests {
             LivePauseCause::SelfSwitch,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect_err("pure self-switch still owns DRM authority");
         assert!(matches!(error, KmsLiveError::TerminalFrame(_)));
@@ -10992,6 +11093,7 @@ mod tests {
                 LivePauseCause::SelfSwitch,
                 Duration::from_secs(30),
                 &mut now,
+                &mut |_| {},
             )
             .expect("a collected racing external pause proves authority revocation");
         }
@@ -11042,6 +11144,7 @@ mod tests {
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect_err("EINVAL is independent evidence of a broken commit path");
         assert!(matches!(error, KmsLiveError::TerminalFrame(_)));
@@ -11073,6 +11176,7 @@ mod tests {
             LivePauseCause::External,
             Duration::from_secs(30),
             &mut now,
+            &mut |_| {},
         )
         .expect_err("worker failure remains terminal during pause reconciliation");
         assert!(matches!(error, KmsLiveError::TerminalFrame(_)));
@@ -12149,6 +12253,7 @@ mod tests {
                 nanoseconds: 5,
                 sequence,
                 hw_clock: true,
+                vblank: true,
                 refresh_nanos: 16_666_666,
             };
             *slot = content;
@@ -12244,8 +12349,92 @@ mod tests {
                     Refresh::fixed(Duration::from_nanos(16_666_666))
                 );
                 assert!(report.frame.output.is_none());
+                assert_eq!(report.key, pump_key(), "the flip names its output");
             }
         }
+    }
+
+    #[test]
+    fn a_crtc_without_vblanks_claims_neither_vsync_nor_hw_clock() {
+        use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+        let frame = kms_presented_frame(super::super::render::KmsPresentationTimestamp {
+            seconds: 7,
+            nanoseconds: 1,
+            sequence: 33,
+            hw_clock: true,
+            vblank: false,
+            refresh_nanos: 16_666_666,
+        });
+        assert_eq!(frame.flags, Kind::HwCompletion);
+        assert_eq!(frame.seq, 0);
+    }
+
+    #[test]
+    fn vblank_sequences_only_ever_increase() {
+        let mut sequence = VblankSequence::default();
+        assert_eq!(sequence.extend(10), 10);
+        assert_eq!(sequence.extend(12), 12);
+        // Wrap: 0xffff_fffe -> 1 is three vblanks on.
+        let mut wrapping = VblankSequence::default();
+        assert_eq!(wrapping.extend(u32::MAX - 1), u64::from(u32::MAX - 1));
+        assert_eq!(wrapping.extend(1), u64::from(u32::MAX) + 2);
+        assert_eq!(wrapping.extend(5), u64::from(u32::MAX) + 6);
+        // A counter that restarts (another CRTC after resume) or repeats
+        // continues upward instead of going back.
+        assert_eq!(sequence.extend(3), 13);
+        assert_eq!(sequence.extend(3), 14);
+        assert_eq!(sequence.extend(8), 19);
+    }
+
+    #[test]
+    fn the_production_sink_extends_sequences_per_output_and_reports_by_key() {
+        let (reporter, _probe) = crate::protocol::FramePresentationReporter::test_channel();
+        let sink = KmsPresentationSink::new(Some(reporter));
+        assert!(sink.reporter().is_some());
+        let shared = sink.clone();
+        let flip = |key: OutputKey, raw| KmsFramePresented {
+            key,
+            frame: kms_presented_frame(super::super::render::KmsPresentationTimestamp {
+                sequence: raw,
+                vblank: true,
+                ..Default::default()
+            }),
+            content: frame_content_for_test(1),
+        };
+        let other = OutputKey {
+            connector_name: "Other-2".into(),
+            ..pump_key()
+        };
+        sink.report(flip(pump_key(), 100));
+        // A clone shares the state: the resumed coordinator continues.
+        shared.report(flip(pump_key(), 4));
+        sink.report(flip(other.clone(), 7));
+        let sequences = sink.sequences.lock().expect("sequence state");
+        assert_eq!(sequences[&pump_key()].last, Some((4, 101)));
+        assert_eq!(sequences[&other].last, Some((7, 7)));
+        drop(sequences);
+        // Without a reporter (first-light) nothing is tracked or sent.
+        let silent = KmsPresentationSink::default();
+        silent.report(flip(pump_key(), 9));
+        assert!(silent.sequences.lock().expect("state").is_empty());
+    }
+
+    #[test]
+    fn a_flip_completed_before_a_pause_is_still_reported() {
+        let mut reports = Vec::new();
+        reconcile_pause_updated_frame_events(
+            vec![
+                presented_flip(Some(frame_content_for_test(3)), 12),
+                presentation_cancelled_event(1),
+            ],
+            LivePauseCause::External,
+            &mut |presented| reports.push(presented),
+        )
+        .expect("a completed flip and a cancellation reconcile");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].frame.seq, 12);
+        assert_eq!(reports[0].content, frame_content_for_test(3));
+        assert_eq!(reports[0].key, pump_key());
     }
 
     #[test]
@@ -12292,6 +12481,7 @@ mod tests {
             nanoseconds: 999_999_999,
             sequence: u64::from(u32::MAX),
             hw_clock: false,
+            vblank: true,
             refresh_nanos: 0,
         });
         assert_eq!(frame.time, Duration::new(3, 999_999_999));

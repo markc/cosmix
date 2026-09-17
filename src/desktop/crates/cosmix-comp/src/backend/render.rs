@@ -425,6 +425,9 @@ pub(crate) struct KmsPresentationTimestamp {
     pub(crate) sequence: u64,
     /// The time is the kernel's own CLOCK_MONOTONIC flip stamp.
     pub(crate) hw_clock: bool,
+    /// The CRTC counts vblanks: the flip landed on one and `sequence`
+    /// counts them.
+    pub(crate) vblank: bool,
     /// The scanned-out mode's refresh period; 0 when unknown.
     pub(crate) refresh_nanos: u64,
 }
@@ -958,6 +961,20 @@ fn live_debug_switch(name: &'static str) -> bool {
 #[cfg(all(feature = "kms-live", not(test)))]
 fn live_instrumentation_switch_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|value| value == "1")
+}
+
+/// Content sources register through the main-world reporter; the render
+/// world sends refused commits through its copy the moment it sees them.
+/// Presented frames go back through the coordinator instead.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+pub(crate) fn install_live_frame_reporter(
+    app: &mut App,
+    reporter: crate::protocol::FramePresentationReporter,
+) {
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.insert_resource(reporter.clone());
+    }
+    app.insert_resource(reporter);
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -3121,9 +3138,7 @@ fn run_live_render_pump(
                     return Ok(());
                 }
                 if let Some(reporter) = frame_reporter {
-                    // Content sources register through it; presented frames
-                    // go back through the coordinator.
-                    starting_app.insert_resource(reporter);
+                    install_live_frame_reporter(&mut starting_app, reporter);
                 }
                 let result = LiveRenderEngine::start(
                     starting_app,
@@ -4128,6 +4143,7 @@ impl LiveAtomicOwnership {
                                     nanoseconds: flip.nanoseconds,
                                     sequence: u64::from(flip.sequence),
                                     hw_clock: flip.hw_clock,
+                                    vblank: flip.vblank,
                                     refresh_nanos,
                                 },
                             );
@@ -5938,9 +5954,7 @@ impl FrameContentReport<'_> {
         let content = self.content.as_mut()?;
         let report = content.clone();
         for source in &mut content.sources {
-            source.upload_bytes = 0;
-            source.damage_px = 0;
-            source.consumed_input = None;
+            source.clear_costs();
         }
         if let Some(sources) = self.sources.as_deref_mut() {
             sources.consume();
@@ -9715,6 +9729,7 @@ pub(crate) mod tests {
                         nanoseconds: 8,
                         sequence: 77,
                         hw_clock: true,
+                        vblank: true,
                         refresh_nanos: 16_666_666,
                     });
                 }
@@ -9818,6 +9833,7 @@ pub(crate) mod tests {
             nanoseconds: 8,
             sequence: 77,
             hw_clock: true,
+            vblank: true,
             refresh_nanos: 16_666_666,
         };
         assert_eq!(

@@ -137,23 +137,52 @@ pub(crate) struct DisplayedFlip {
     /// The time is the kernel's own CLOCK_MONOTONIC stamp. Otherwise it was
     /// converted from CLOCK_REALTIME, or taken when the event was read.
     pub(crate) hw_clock: bool,
+    /// The CRTC has a vblank counter, so the flip landed on a vblank and
+    /// `sequence` counts them.
+    pub(crate) vblank: bool,
 }
+
+/// Whether a CRTC counts vblanks (`DRM_IOCTL_CRTC_GET_SEQUENCE`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VblankSupport {
+    Supported,
+    /// The device has no vblank support (virtio-gpu, simpledrm): flips
+    /// complete on no vblank grid and are stamped at completion.
+    Unsupported,
+    /// The probe could not tell (for example a CRTC not yet enabled).
+    Unknown,
+}
+
+/// A MONOTONIC stamp this far ahead of the clock is not a vblank-helper
+/// stamp that runs ahead of the event; the capability cannot be trusted.
+const GROSS_FLIP_SKEW: Duration = Duration::from_secs(1);
+/// Consecutive stamps ahead by more than a period before HW_CLOCK is dropped
+/// for good.
+const SKEWED_FLIPS_BEFORE_DEMOTION: u32 = 3;
+/// Consecutive flips with sequence 0 before a CRTC of unknown vblank support
+/// is taken to have no counter.
+const ZERO_SEQUENCES_BEFORE_NO_VBLANK: u32 = 2;
 
 /// Place a kernel flip stamp on CLOCK_MONOTONIC. `realtime_now` and
 /// `monotonic_now` are sampled together, after the event was read.
 ///
-/// A MONOTONIC stamp is used as is unless it lies in the future (then the
-/// capability lied and the stamp is not trusted). A REALTIME stamp is moved
-/// by the sampled clock offset. Anything that cannot be placed falls back to
-/// `monotonic_now`, without claiming a hardware clock.
+/// vblank-helper drivers stamp the start of active scanout, which the flip
+/// event can precede by up to a blanking interval, so a MONOTONIC stamp up to
+/// `ahead_tolerance` (one refresh period) in the future is the kernel's real
+/// answer and is kept. Further ahead it is not trusted for this flip. A
+/// REALTIME stamp is moved by the sampled clock offset. Anything that cannot
+/// be placed falls back to `monotonic_now`, without claiming a hardware clock.
 fn flip_time_on_monotonic(
     clock: PageFlipClock,
     stamp: Duration,
     realtime_now: Duration,
     monotonic_now: Duration,
+    ahead_tolerance: Duration,
 ) -> (Duration, bool) {
     let placed = match clock {
-        PageFlipClock::Monotonic if stamp <= monotonic_now => return (stamp, true),
+        PageFlipClock::Monotonic if stamp <= monotonic_now.saturating_add(ahead_tolerance) => {
+            return (stamp, true);
+        }
         PageFlipClock::Realtime => realtime_now
             .checked_sub(stamp)
             .and_then(|age| monotonic_now.checked_sub(age)),
@@ -460,6 +489,11 @@ pub(crate) struct AtomicPresenter<I: AtomicIo> {
     pending_commit: Option<PendingAtomicCommit>,
     displayed_timestamp: Option<DisplayedFlip>,
     flip_clock: PageFlipClock,
+    /// Consecutive MONOTONIC stamps more than a period ahead of the clock.
+    skewed_flips: u32,
+    skew_warned: bool,
+    vblank: VblankSupport,
+    zero_sequences: u32,
     pub(crate) cursor: cursor::HardwareCursorBridge,
 }
 
@@ -485,6 +519,11 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             // Supported kernels stamp flips on CLOCK_MONOTONIC; the production
             // constructor replaces this with the queried answer.
             flip_clock: PageFlipClock::Monotonic,
+            skewed_flips: 0,
+            skew_warned: false,
+            // Likewise for vblank support, probed by the production constructor.
+            vblank: VblankSupport::Supported,
+            zero_sequences: 0,
             cursor: cursor::HardwareCursorBridge::default(),
         }
     }
@@ -587,26 +626,81 @@ impl<I: AtomicIo> AtomicPresenter<I> {
         (millihz > 0).then(|| 1_000_000_000_000 / millihz)
     }
 
+    pub(crate) fn set_vblank_support(&mut self, vblank: VblankSupport) {
+        self.vblank = vblank;
+    }
+
     fn place_flip(&mut self, stamp: Duration, sequence: u32) -> DisplayedFlip {
         let realtime_now = clock_now(libc::CLOCK_REALTIME);
         let monotonic_now = clock_now(libc::CLOCK_MONOTONIC);
+        // Without a mode period, the longest frame the render path paces.
+        let period = self
+            .refresh_nanos()
+            .map_or(Duration::from_millis(50), Duration::from_nanos);
         let (time, hw_clock) =
-            flip_time_on_monotonic(self.flip_clock, stamp, realtime_now, monotonic_now);
-        if !hw_clock && self.flip_clock == PageFlipClock::Monotonic {
-            // Stop trusting a capability whose stamps run ahead of the clock.
-            tracing::warn!(
-                crtc = self.selection.crtc_id,
-                ?stamp,
-                ?monotonic_now,
-                "page-flip stamp is ahead of CLOCK_MONOTONIC; presentation times lose HW_CLOCK"
-            );
-            self.flip_clock = PageFlipClock::Unknown;
+            flip_time_on_monotonic(self.flip_clock, stamp, realtime_now, monotonic_now, period);
+        if self.flip_clock == PageFlipClock::Monotonic {
+            if hw_clock {
+                self.skewed_flips = 0;
+            } else {
+                self.note_skewed_flip(stamp.saturating_sub(monotonic_now));
+            }
         }
+        let vblank = self.note_sequence(sequence);
         DisplayedFlip {
             seconds: time.as_secs(),
             nanoseconds: time.subsec_nanos(),
             sequence,
             hw_clock,
+            vblank,
+        }
+    }
+
+    /// One MONOTONIC stamp too far ahead is reported at read time; a gross
+    /// skew or a run of them means the stamps are not MONOTONIC at all.
+    fn note_skewed_flip(&mut self, ahead: Duration) {
+        self.skewed_flips = self.skewed_flips.saturating_add(1);
+        if !self.skew_warned {
+            self.skew_warned = true;
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                ?ahead,
+                "page-flip stamp is more than a refresh period ahead of CLOCK_MONOTONIC; reporting that flip at read time"
+            );
+        }
+        if ahead >= GROSS_FLIP_SKEW || self.skewed_flips >= SKEWED_FLIPS_BEFORE_DEMOTION {
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                ?ahead,
+                skewed_flips = self.skewed_flips,
+                "page-flip stamps are not CLOCK_MONOTONIC; presentation times lose HW_CLOCK"
+            );
+            self.flip_clock = PageFlipClock::Unknown;
+        }
+    }
+
+    /// Whether this flip's sequence counts vblanks. A CRTC the probe could
+    /// not classify proves a counter with a non-zero sequence, and proves
+    /// the lack of one with a run of zeros; a zero is never trusted.
+    fn note_sequence(&mut self, sequence: u32) -> bool {
+        match self.vblank {
+            VblankSupport::Supported => true,
+            VblankSupport::Unsupported => false,
+            VblankSupport::Unknown if sequence != 0 => {
+                self.vblank = VblankSupport::Supported;
+                true
+            }
+            VblankSupport::Unknown => {
+                self.zero_sequences = self.zero_sequences.saturating_add(1);
+                if self.zero_sequences >= ZERO_SEQUENCES_BEFORE_NO_VBLANK {
+                    tracing::warn!(
+                        crtc = self.selection.crtc_id,
+                        "CRTC reports no vblank counter; presentation claims neither VSYNC nor HW_CLOCK"
+                    );
+                    self.vblank = VblankSupport::Unsupported;
+                }
+                false
+            }
         }
     }
 
@@ -1277,6 +1371,11 @@ impl AtomicPresenter<ProductionAtomicIo> {
             cancellation,
         );
         presenter.set_flip_clock(flip_clock);
+        let vblank = presenter.io.vblank_support(selection.crtc_id);
+        if vblank != VblankSupport::Supported {
+            tracing::info!(?vblank, crtc = selection.crtc_id, "CRTC vblank support");
+        }
+        presenter.set_vblank_support(vblank);
         let probe_slot = pool.slot_ids().next().ok_or_else(|| {
             AtomicPresenterSetupError::new(
                 "kms-live-atomic-scanout-pool-empty",
@@ -1570,6 +1669,29 @@ impl ProductionAtomicIo {
         }
     }
 
+    /// `DRM_IOCTL_CRTC_GET_SEQUENCE`: EOPNOTSUPP means the device has no
+    /// vblank support; other errors (a CRTC not yet enabled) decide nothing.
+    pub(crate) fn vblank_support(&self, crtc_id: u32) -> VblankSupport {
+        let mut request = DrmCrtcGetSequence {
+            crtc_id,
+            active: 0,
+            sequence: 0,
+            sequence_ns: 0,
+        };
+        let result = unsafe {
+            libc::ioctl(
+                self.card.as_fd().as_raw_fd(),
+                drm_ioctl_crtc_get_sequence(),
+                &mut request,
+            )
+        };
+        classify_vblank_probe(if result < 0 {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(())
+        })
+    }
+
     pub(crate) fn flip_clock(&self) -> PageFlipClock {
         PageFlipClock::from_capability(
             self.card
@@ -1681,6 +1803,35 @@ struct DrmEventVblank {
 }
 
 const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmCrtcGetSequence {
+    crtc_id: u32,
+    active: u32,
+    sequence: u64,
+    sequence_ns: i64,
+}
+
+const fn drm_ioctl_crtc_get_sequence() -> libc::c_ulong {
+    const IOC_WRITE: u64 = 1;
+    const IOC_READ: u64 = 2;
+    const IOC_TYPESHIFT: u64 = 8;
+    const IOC_SIZESHIFT: u64 = 16;
+    const IOC_DIRSHIFT: u64 = 30;
+    (((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT)
+        | ((std::mem::size_of::<DrmCrtcGetSequence>() as u64) << IOC_SIZESHIFT)
+        | ((b'd' as u64) << IOC_TYPESHIFT)
+        | 0x3b) as libc::c_ulong
+}
+
+fn classify_vblank_probe(result: Result<(), i32>) -> VblankSupport {
+    match result {
+        Ok(()) => VblankSupport::Supported,
+        Err(errno) if errno == libc::EOPNOTSUPP => VblankSupport::Unsupported,
+        Err(_) => VblankSupport::Unknown,
+    }
+}
 
 const fn drm_ioctl_mode_atomic() -> libc::c_ulong {
     const IOC_WRITE: u64 = 1;
@@ -2252,6 +2403,7 @@ mod tests {
                 nanoseconds: 456_789_000,
                 sequence: 0,
                 hw_clock: true,
+                vblank: true,
             })
         );
     }
@@ -2344,44 +2496,154 @@ mod tests {
         );
     }
 
+    /// Present one flip whose kernel stamp is `stamp` (microsecond precision).
+    fn present_flip_at(
+        presenter: &mut AtomicPresenter<FakeAtomicIo>,
+        stamp: Duration,
+        sequence: u32,
+    ) -> DisplayedFlip {
+        presenter.io.waits.push_back(AtomicWaitReady::Ready {
+            drm: true,
+            cancel: false,
+        });
+        presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: u32::try_from(stamp.as_secs()).expect("stamp fits the kernel field"),
+            tv_usec: stamp.subsec_micros(),
+            sequence,
+            ..matching_flip(7)
+        }]);
+        assert_eq!(
+            presenter.present(
+                ScanoutSlotId(0),
+                7,
+                PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+            ),
+            Ok(PresentOutcome::Displayed)
+        );
+        presenter.take_displayed_timestamp().expect("displayed")
+    }
+
+    fn stamp_of(flip: DisplayedFlip) -> Duration {
+        Duration::new(flip.seconds, flip.nanoseconds)
+    }
+
     #[test]
-    fn a_monotonic_stamp_from_the_future_demotes_the_clock_for_good() {
+    fn an_in_blanking_monotonic_stamp_is_kept_with_hw_clock() {
         let mut presenter = presenter(FakeAtomicIo::default());
-        let flip = present_one_flip(&mut presenter, 7, u32::MAX, 1).expect("displayed");
+        // vblank helpers stamp the start of scanout, which the event can
+        // precede by a blanking interval: ~1 ms ahead is the kernel's answer.
+        for sequence in 1..=5 {
+            let stamp = clock_now(libc::CLOCK_MONOTONIC) + Duration::from_millis(1);
+            let flip = present_flip_at(&mut presenter, stamp, sequence);
+            assert!(flip.hw_clock, "flip {sequence}");
+            assert_eq!(
+                stamp_of(flip),
+                Duration::new(stamp.as_secs(), stamp.subsec_micros() * 1_000)
+            );
+        }
+        assert_eq!(presenter.flip_clock, PageFlipClock::Monotonic);
+    }
+
+    #[test]
+    fn a_gross_monotonic_skew_demotes_the_clock() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        let ahead = clock_now(libc::CLOCK_MONOTONIC) + Duration::from_secs(5);
+        let flip = present_flip_at(&mut presenter, ahead, 1);
         assert!(!flip.hw_clock);
-        assert!(flip.seconds < u64::from(u32::MAX));
-        // A later, plausible stamp is no longer trusted either.
-        let next = present_one_flip(&mut presenter, 7, 5, 2).expect("displayed");
-        assert!(!next.hw_clock);
+        assert!(stamp_of(flip) < ahead, "reported at read time");
+        assert_eq!(presenter.flip_clock, PageFlipClock::Unknown);
+        let later = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC), 2);
+        assert!(!later.hw_clock, "no longer trusted");
+    }
+
+    #[test]
+    fn one_modest_skew_is_forgiven_but_a_run_demotes() {
+        // 100 ms is beyond the 16.7 ms period but not gross.
+        let modest = || clock_now(libc::CLOCK_MONOTONIC) + Duration::from_millis(100);
+        let mut presenter = presenter(FakeAtomicIo::default());
+        assert!(!present_flip_at(&mut presenter, modest(), 1).hw_clock);
+        assert_eq!(presenter.flip_clock, PageFlipClock::Monotonic);
+        let good = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC), 2);
+        assert!(good.hw_clock, "a plausible stamp after one skew is trusted");
+        for sequence in 3..=5 {
+            assert!(!present_flip_at(&mut presenter, modest(), sequence).hw_clock);
+        }
+        assert_eq!(presenter.flip_clock, PageFlipClock::Unknown);
+    }
+
+    #[test]
+    fn vblank_support_decides_the_counter() {
+        let now = || clock_now(libc::CLOCK_MONOTONIC);
+        let mut probed_absent = presenter(FakeAtomicIo::default());
+        probed_absent.set_vblank_support(VblankSupport::Unsupported);
+        assert!(!present_flip_at(&mut probed_absent, now(), 7).vblank);
+
+        // Unknown: zeros are never trusted, a run of them means no counter.
+        let mut unknown = presenter(FakeAtomicIo::default());
+        unknown.set_vblank_support(VblankSupport::Unknown);
+        assert!(!present_flip_at(&mut unknown, now(), 0).vblank);
+        assert!(!present_flip_at(&mut unknown, now(), 0).vblank);
+        assert_eq!(unknown.vblank, VblankSupport::Unsupported);
+        assert!(!present_flip_at(&mut unknown, now(), 9).vblank);
+
+        // Unknown: a counting sequence proves one.
+        let mut counting = presenter(FakeAtomicIo::default());
+        counting.set_vblank_support(VblankSupport::Unknown);
+        assert!(present_flip_at(&mut counting, now(), 12).vblank);
+        assert_eq!(counting.vblank, VblankSupport::Supported);
+        assert!(present_flip_at(&mut counting, now(), 0).vblank);
+
+        assert_eq!(classify_vblank_probe(Ok(())), VblankSupport::Supported);
+        assert_eq!(
+            classify_vblank_probe(Err(libc::EOPNOTSUPP)),
+            VblankSupport::Unsupported
+        );
+        assert_eq!(
+            classify_vblank_probe(Err(libc::EINVAL)),
+            VblankSupport::Unknown
+        );
+        // _IOWR('d', 0x3b, struct drm_crtc_get_sequence), a 24-byte struct.
+        assert_eq!(std::mem::size_of::<DrmCrtcGetSequence>(), 24);
+        assert_eq!(drm_ioctl_crtc_get_sequence(), 0xc018_643b);
     }
 
     #[test]
     fn flip_time_placement_rules() {
         let secs = Duration::from_secs;
+        let period = Duration::from_millis(16);
+        let place = |clock, stamp, realtime, monotonic| {
+            flip_time_on_monotonic(clock, stamp, realtime, monotonic, period)
+        };
         assert_eq!(
-            flip_time_on_monotonic(PageFlipClock::Monotonic, secs(90), secs(5000), secs(100)),
+            place(PageFlipClock::Monotonic, secs(90), secs(5000), secs(100)),
             (secs(90), true)
         );
+        // Up to one period ahead is kept; beyond it is not.
+        let in_blanking = secs(100) + Duration::from_millis(15);
         assert_eq!(
-            flip_time_on_monotonic(PageFlipClock::Monotonic, secs(101), secs(5000), secs(100)),
+            place(PageFlipClock::Monotonic, in_blanking, secs(5000), secs(100)),
+            (in_blanking, true)
+        );
+        assert_eq!(
+            place(PageFlipClock::Monotonic, secs(101), secs(5000), secs(100)),
             (secs(100), false)
         );
         // REALTIME 4990 is 10 s old at REALTIME 5000, so MONOTONIC 90.
         assert_eq!(
-            flip_time_on_monotonic(PageFlipClock::Realtime, secs(4990), secs(5000), secs(100)),
+            place(PageFlipClock::Realtime, secs(4990), secs(5000), secs(100)),
             (secs(90), false)
         );
         // Older than boot, or from a clock stepped backwards: not placeable.
         assert_eq!(
-            flip_time_on_monotonic(PageFlipClock::Realtime, secs(1), secs(5000), secs(100)),
+            place(PageFlipClock::Realtime, secs(1), secs(5000), secs(100)),
             (secs(100), false)
         );
         assert_eq!(
-            flip_time_on_monotonic(PageFlipClock::Realtime, secs(5001), secs(5000), secs(100)),
+            place(PageFlipClock::Realtime, secs(5001), secs(5000), secs(100)),
             (secs(100), false)
         );
         assert_eq!(
-            flip_time_on_monotonic(PageFlipClock::Unknown, secs(90), secs(5000), secs(100)),
+            place(PageFlipClock::Unknown, secs(90), secs(5000), secs(100)),
             (secs(100), false)
         );
         assert_eq!(

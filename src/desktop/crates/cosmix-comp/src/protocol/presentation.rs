@@ -301,6 +301,17 @@ pub(crate) struct FrameSource {
     pub(crate) first_revised_us: Option<u64>,
 }
 
+impl FrameSource {
+    /// Forget the costs a report already carried.
+    pub(crate) fn clear_costs(&mut self) {
+        self.upload_bytes = 0;
+        self.damage_px = 0;
+        self.consumed_input = None;
+        self.revised_us = None;
+        self.first_revised_us = None;
+    }
+}
+
 /// One client surface's state in a renderer report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameSurface {
@@ -850,6 +861,37 @@ impl WaylandState {
         trace_discards(id, &resolution, DiscardReason::Refused);
         let refused = self.presentation.refused.entry(id).or_default();
         *refused = (*refused).max(seq);
+    }
+
+    /// A KMS flip is presented on the client output registered for its key.
+    /// A key without one (not yet, or no longer, a client output) cannot
+    /// name a presentation, so the report is dropped and feedback waits.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(super) fn kms_frame_presented(
+        &mut self,
+        key: &crate::backend::kms::OutputKey,
+        frame: PresentedFrame,
+        content: FrameContent,
+    ) {
+        let Some(output) = self
+            .backend
+            .kms_registered_outputs()
+            .into_iter()
+            .find_map(|(registered, output)| (registered == *key).then_some(output))
+        else {
+            tracing::debug!(
+                connector = key.connector_name,
+                "KMS flip on an output with no client output; not reported"
+            );
+            return;
+        };
+        self.frame_presented(
+            PresentedFrame {
+                output: Some(output),
+                ..frame
+            },
+            content,
+        );
     }
 
     /// Session lock needs no discard of its own: a report during the lock

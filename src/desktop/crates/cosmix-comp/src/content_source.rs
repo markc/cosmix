@@ -167,11 +167,7 @@ impl ExtractedContentSources {
     /// keep growing until they saturate.
     pub(crate) fn consume(&mut self) {
         for source in &mut self.0 {
-            source.upload_bytes = 0;
-            source.damage_px = 0;
-            source.consumed_input = None;
-            source.revised_us = None;
-            source.first_revised_us = None;
+            source.clear_costs();
         }
     }
 }

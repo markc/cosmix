@@ -623,17 +623,33 @@ client waits on feedback nothing will resolve.
     those stamps are CLOCK_MONOTONIC (`DRM_CAP_TIMESTAMP_MONOTONIC`). If they
     are not, each stamp is moved from CLOCK_REALTIME by the offset between
     the two clocks sampled when the event is read. If the capability query
-    fails, or a claimed MONOTONIC stamp lies in the future (after which the
-    capability is not trusted again), `tv` is the time the event was read.
+    fails, `tv` is the time the event was read.
+  - A MONOTONIC stamp may lie up to one refresh period in the future:
+    vblank-helper drivers stamp the start of scanout, which the flip event
+    can precede. Such a stamp is kept. A stamp further ahead is reported at
+    read time without `hw_clock`; a second ahead, or three such flips in a
+    row, and the capability is not trusted for the rest of the run.
   - `flags` are `vsync` (there are no async flips) and `hw_completion` (the
     flip-complete event), plus `hw_clock` only when `tv` is the kernel's own
     MONOTONIC stamp. Never `zero_copy`: client buffers are composited into
     scanout buffers, not scanned out directly.
-  - `seq` is the CRTC's vblank counter at the flip.
+  - A device without vblank support (virtio-gpu, simpledrm; probed with
+    `DRM_IOCTL_CRTC_GET_SEQUENCE`, or seen as a sequence stuck at 0)
+    completes flips on no vblank grid, so its frames carry only
+    `hw_completion` and `seq` 0.
+  - `seq` is the CRTC's vblank counter at the flip, extended per output
+    beyond 32 bits so it only ever increases (across wraps, and across a
+    counter that restarts on resume).
   - `refresh` is the scanned-out mode's period, `1e12 / refresh_mHz` ns.
+  - Each flip is reported on the client output registered for its
+    connector; a flip on an output that is not a client output resolves
+    nothing. A flip that completed just before a VT switch is still
+    reported.
   - With several outputs, each flip carries the frame's content and the first
-    presented one wins; content-source costs are counted with the first flip
-    only.
+    presented one wins (content is not yet tracked per output); content-source
+    costs are counted with the first flip only.
+  - A buffer the renderer fails to import is discarded as soon as the render
+    world sees it, as on the nested backend.
 - **SHM clients:** a surface counts as sampling its newest buffer once the
   GPU image is prepared. Bevy drops the old GPU image while a replacement is
   pending, so a pending upload is reported as not shown rather than stale.

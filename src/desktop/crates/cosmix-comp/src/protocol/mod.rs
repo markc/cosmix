@@ -988,6 +988,13 @@ enum ProtocolCommand {
         frame: presentation::PresentedFrame,
         content: presentation::FrameContent,
     },
+    /// A displayed KMS flip, named by the output it was scanned out on.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    KmsFramePresented {
+        output: crate::backend::kms::OutputKey,
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    },
     ContentSourceRegistered {
         id: String,
         output: Option<String>,
@@ -1562,6 +1569,34 @@ impl FramePresentationReporter {
         }
     }
 
+    /// A displayed KMS flip on `output`; the protocol thread names the
+    /// client output for that key.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn kms_presented(
+        &self,
+        output: crate::backend::kms::OutputKey,
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    ) {
+        if self
+            .commands
+            .send(ProtocolCommand::KmsFramePresented {
+                output,
+                frame,
+                content,
+            })
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before a KMS frame presentation report");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, PresentationCommandProbe) {
+        let (commands, source) = channel::channel();
+        (Self { commands }, PresentationCommandProbe(source))
+    }
+
     /// A DMA-BUF import failed for good (see `frame_content::Refusal`).
     /// Sent as soon as the renderer sees it, not with a frame report.
     pub(crate) fn commit_refused(&self, id: SurfaceId, sampled: Option<u64>, commit_seq: u64) {
@@ -1591,6 +1626,39 @@ impl FramePresentationReporter {
         let _ = self
             .commands
             .send(ProtocolCommand::ContentSourceUnregistered { id, revision });
+    }
+}
+
+/// The protocol end of a test `FramePresentationReporter`.
+#[cfg(test)]
+pub(crate) struct PresentationCommandProbe(channel::Channel<ProtocolCommand>);
+
+#[cfg(test)]
+impl PresentationCommandProbe {
+    /// Hand every queued report to `state` as the protocol loop does, and
+    /// return how many there were.
+    pub(crate) fn deliver(&self, state: &mut WaylandState) -> usize {
+        let mut delivered = 0;
+        while let Ok(command) = self.0.try_recv() {
+            delivered += 1;
+            match command {
+                ProtocolCommand::CommitRefused {
+                    id,
+                    sampled,
+                    commit_seq,
+                } => state.commit_refused(id, sampled, commit_seq),
+                ProtocolCommand::KmsFramePresented {
+                    output,
+                    frame,
+                    content,
+                } => state.kms_frame_presented(&output, frame, content),
+                ProtocolCommand::FramePresented { frame, content } => {
+                    state.frame_presented(frame, content);
+                }
+                _ => panic!("a presentation reporter sent another command"),
+            }
+        }
+        delivered
     }
 }
 
@@ -3498,6 +3566,14 @@ impl ProtocolServer {
                 }
                 ChannelEvent::Msg(ProtocolCommand::FramePresented { frame, content }) => {
                     state.frame_presented(frame, content);
+                }
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                ChannelEvent::Msg(ProtocolCommand::KmsFramePresented {
+                    output,
+                    frame,
+                    content,
+                }) => {
+                    state.kms_frame_presented(&output, frame, content);
                 }
                 ChannelEvent::Msg(ProtocolCommand::ContentSourceRegistered { id, output }) => {
                     state.content_source_registered(&id, output);
