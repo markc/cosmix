@@ -1788,6 +1788,11 @@ fn diff_surface_row(
             prop_opt_string(old.foreign_id.as_deref()),
             prop_opt_string(new.foreign_id.as_deref()),
         ),
+        (
+            "generation",
+            PropValue::U64(old.generation),
+            PropValue::U64(new.generation),
+        ),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -2903,6 +2908,7 @@ mod tests {
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("f_7".into()),
+            generation: 1,
             window: Default::default(),
         };
         let window = project_window_row(&surface);

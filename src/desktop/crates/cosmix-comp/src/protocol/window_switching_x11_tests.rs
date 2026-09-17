@@ -191,3 +191,59 @@ fn minimized_prop_suspends_and_resumes_x11_windows() {
     }
     assert!(harness.server.state.minimized_toplevels.is_empty());
 }
+
+/// X11 windows have no `windows.*` row, so their fence comes from
+/// `surfaces.s<id>.generation`; the id form of the window verbs then works
+/// on them, and `focus.window` names a focused X11 window.
+#[cfg(feature = "bus")]
+#[test]
+fn x11_generation_is_readable_and_fences_window_verbs() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let (surface_id, _, window, object) = associate_normal_window(&mut harness, 906);
+    commit_dmabuf(&mut harness, surface_id, 32, 24);
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+    let id = harness.server.state.surfaces[&object].id.0;
+    let key = format!("s{id}");
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    let row = &snapshot.surfaces[&key];
+    assert_eq!(row.role, "x11-toplevel");
+    assert!(!snapshot.windows.contains_key(&key), "no X11 window rows yet");
+    let generation = row.generation;
+    assert_eq!(generation, harness.server.state.surfaces[&object].generation);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    for op in [
+        crate::port::WindowOp::Minimize { id, generation },
+        crate::port::WindowOp::Restore {
+            target: Some((id, generation)),
+        },
+    ] {
+        let admission = ingress.request_window(op).expect("verb admitted");
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .expect("verb service cycle");
+        let (rc, body) = runtime
+            .block_on(admission.receive())
+            .expect("verb reply")
+            .into_wire();
+        assert_eq!(rc, 0, "{op:?}: {body}");
+        let minimized = matches!(op, crate::port::WindowOp::Minimize { .. });
+        assert_eq!(harness.server.state.surfaces[&object].minimized, minimized);
+        assert_eq!(window.is_minimized(), minimized);
+    }
+
+    // The restore focused it: focus.window names the X11 window.
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert!(harness.server.state.surfaces[&object].focused);
+    assert_eq!(snapshot.focus.window.id, Some(id));
+    assert_eq!(snapshot.focus.window.generation, Some(generation));
+}
