@@ -1,7 +1,8 @@
 # Shared iced widgets
 
 `cosmix-iced-widgets` 0.1.0 provides a single-line `TextField`, a menu bar,
-context menus and a `cosmix-design` colour/metric adapter. It uses upstream
+context menus, pro-audio controls (fader, pan knob, level meter, toggle), a
+waveform and a piano roll, and a `cosmix-design` colour/metric adapter. It uses upstream
 iced exactly 0.14.0, with defaults disabled and Wayland enabled. Neither
 renderer is selected by the library's defaults. Hosts select `wgpu` or
 `tiny-skia`; renderer-generic widgets can also be embedded in a host's UI.
@@ -41,9 +42,59 @@ Tokens::from_colours(&ResolvedColours) -> Result<Tokens, TokenError>
 Tokens::default()                           // preview palette only
 tokens.text_input(status) -> text_input::Style
 tokens.menu_style() -> MenuStyle
+tokens.audio_style() -> AudioStyle
 tokens::colour(LinearRgba) -> iced::Color   // linear -> encoded sRGB
-Tokens { surface, text, popover, popover_text, muted_surface, muted_text,
-         selection, selection_text, border, input, ring, radius }  // pub fields
+Tokens { surface, text, popover, popover_text, card, card_text, primary,
+         primary_text, destructive, destructive_text, muted_surface,
+         muted_text, selection, selection_text, border, input, ring,
+         radius }                            // pub fields
+
+// Pro-audio controls. All are controlled: store each published value and
+// pass it back. Generic over Theme; Fader and Knob need Message: Clone.
+scale::{db_to_position, position_to_db, format_db, FLOOR_DB, MAX_DB}
+    // shared gain scale: -inf..=+6 dB <-> 0..=1, 0 dB at 0.8, -60 dB floor
+Fader::new(value_db: f32)                   // vertical, 28 x 160 by default
+    .on_change(impl Fn(f32) -> Message)     // dB; NEG_INFINITY at the bottom
+    .on_release(Message)                    // once per gesture
+    .default_db(f32)                        // double-click value, default 0
+    .width(f32) .height(impl Into<Length>) .style(AudioStyle)
+Knob::new(value: f32)                       // pan, -1..=1, 28 px
+    .on_change(impl Fn(f32) -> Message) .on_release(Message)
+    .size(f32) .style(AudioStyle)
+LevelMeter::new(level_db: f32)              // 8 x 160, same scale as Fader
+    .width(f32) .height(impl Into<Length>) .style(AudioStyle)
+    // meter::{PEAK_HOLD, PEAK_FALL_DB_PER_SEC, PEAK_FRAME}
+Toggle::new(label, on: bool)                // mute/solo, 24 x 20
+    .on_toggle(impl Fn(bool) -> Message)
+    .alert(bool)                            // alert (mute) vs active (solo) colour
+    .size(width, height) .style(AudioStyle)
+
+// Canvases. Renderer: advanced::graphics::geometry::Renderer + 'static.
+WaveformPeaks::from_samples(&[f32], samples_per_bucket)
+WaveformPeaks::from_min_max(impl IntoIterator<Item = (f32, f32)>)
+    .len() .is_empty()
+Waveform::new(&WaveformPeaks)               // fill x 64
+    .playhead(Option<f32>)                  // 0..=1
+    .on_seek(impl Fn(f32) -> Message)       // 0..=1 under a left press
+    .width(..) .height(..) .style(AudioStyle)
+Note { start: f32, length: f32, pitch: u8, velocity: u8 }   // beats
+RollNotes::new(Vec<Note>)                   // sorts; drops invalid notes
+    .notes() .len() .is_empty() .end_beat()
+    .visible(from, to) -> impl Iterator<Item = (usize, &Note)>
+RollView { scroll_beats, scroll_y, pixels_per_beat, row_height }  // Default
+    .x_of(beat) .beat_at(x) .y_of(pitch) .pitch_at(y)
+    .zoomed(factor, anchor_x) .scrolled(dx, dy, viewport_height, end_beat)
+    .note_at(&RollNotes, Point) .is_valid()
+PianoRoll::new(&RollNotes, RollView)        // fill x fill
+    .playhead(Option<f32>)                  // beats
+    .on_view(impl Fn(RollView) -> Message)  // wheel, Shift+wheel, Ctrl+wheel zoom
+    .on_note(impl Fn(usize) -> Message)     // index into RollNotes::notes()
+    .width(..) .height(..) .style(AudioStyle)
+    // piano_roll::{TILE_WIDTH, MAX_TILES, MIN_PIXELS_PER_BEAT, MAX_PIXELS_PER_BEAT}
+AudioStyle { background, track, fill, thumb, text, muted_text, border,
+             meter_low, meter_high, meter_clip, peak, active, active_text,
+             alert, alert_text, grid, lane, note, waveform, playhead,
+             radius }                       // Default = Tokens::default()
 ```
 
 Contracts a host must honour:
@@ -74,6 +125,25 @@ Contracts a host must honour:
   no focusable child remembers a click as focus until the next press, so if
   keyboard focus then moves into another context target's field, Shift+F10
   can open the clicked one instead.
+- **Pro-audio gestures.** Fader and knob drags are relative (a press never
+  jumps the value). Shift divides travel by ten and rebases, so toggling it
+  mid-drag never jumps. A double-click resets (fader: `default_db`, knob: 0).
+  Toggles flip on press. Each change is published at once; hosts that record
+  automation or undo should group on `on_release`.
+- **Idle is zero redraws.** No widget subscribes to time. Only `LevelMeter`
+  schedules redraws, and only while its peak line is above the level: it
+  waits for `PEAK_HOLD`, then redraws every `PEAK_FRAME` until the line
+  lands. A silent or steady meter schedules nothing. A host animating meters
+  re-renders at its own meter rate.
+- **Canvas caching.** `Waveform` tessellates its body once per peaks value,
+  size and style (build `WaveformPeaks` once; a clone keeps its identity).
+  `PianoRoll` draws 512 px tiles cached per zoom level (pixels per beat and
+  row height), keeps up to 64 tiles across zoom levels, and scrolling only
+  translates them. Only notes overlapping the view are visited, found by
+  binary search on start time. Sub-pixel notes collapse to one rectangle per
+  pixel per row, so a 131k-note song zoomed right out stays bounded. A new
+  `RollNotes` value (or style) drops the tiles. Grid, notes and playhead are
+  separate layers; moving the playhead touches no note geometry.
 - **Popup clamping** uses the overlay bounds the host passes to
   `UserInterface::build`, so a popup never leaves the surface.
 
