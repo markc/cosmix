@@ -257,8 +257,8 @@ fn older_buffers_with_shadows_catch_up_exactly() {
             target.focus_first_card();
         }
         let start = Instant::now();
-        let mut buffers = vec![t.buffer.clone(), t.buffer.clone(), t.buffer.clone()];
-        let mut drawn_at: Vec<Option<u64>> = vec![Some(0), None, None];
+        let mut buffers = [t.buffer.clone(), t.buffer.clone(), t.buffer.clone()];
+        let mut drawn_at: [Option<u64>; 3] = [Some(0), None, None];
         for index in 1..=9u64 {
             let now = start + Duration::from_millis(550 * index);
             t.now = now;
