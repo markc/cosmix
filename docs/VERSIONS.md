@@ -108,7 +108,8 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
 | `cosmix-flock` | 0.1.0 |
-| `cosmix-imeprobe` | 0.1.1 |
+| `cosmix-iced-widgets` | 0.1.0 |
+| `cosmix-imeprobe` | 0.2.0 |
 | `cosmix-interactgui` | 0.1.2 |
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
@@ -132,4 +133,4 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 
 ---
 
-52 crates in `$COSMIX/src` and 30 in the separate `$COSMIX/src/desktop` workspace.
+52 crates in `$COSMIX/src` and 31 in the separate `$COSMIX/src/desktop` workspace.
