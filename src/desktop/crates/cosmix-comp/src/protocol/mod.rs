@@ -2387,6 +2387,15 @@ impl WaylandRuntime {
         drain_kms_render_commands(&self.kms_render_commands)
     }
 
+    /// Input plus a frame boundary in one command: how the test harnesses
+    /// drive a frame (production splits the two, see below).
+    #[cfg(test)]
+    pub(crate) fn finish_frame(&self, inputs: Vec<HostInput>) -> Result<(), String> {
+        self.commands
+            .send(ProtocolCommand::Frame { inputs })
+            .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
+
     /// Host input for this frame. Frame callbacks are NOT sent here: the
     /// nested backend pulses them from the post-present schedule, once the
     /// frame is with the host.
