@@ -447,7 +447,8 @@ fn plugin_mounts_iced_and_sends_handlers_on_the_scene_bus_path() {
     app.world_mut()
         .entity_mut(surface)
         .insert(crate::IcedSurfaceGeometry {
-            size: UVec2::new(640, 480),
+            // Not a texture bucket multiple: draw gets a padded stride.
+            size: UVec2::new(600, 450),
             scale: 1.0,
             origin: Vec2::ZERO,
             window: None,
@@ -459,7 +460,7 @@ fn plugin_mounts_iced_and_sends_handlers_on_the_scene_bus_path() {
     assert_eq!(counters.totals.allocations, 1);
     assert!(counters.totals.draws >= 1);
     assert!(
-        counters.totals.bytes_queued >= 640 * 480 * 4,
+        counters.totals.bytes_queued >= 600 * 450 * 4,
         "{:?}",
         counters.totals
     );
@@ -532,4 +533,25 @@ fn password_fields_ask_for_a_secure_input_method() {
         }
         other => panic!("no IME request: {other:?}"),
     }
+}
+
+#[test]
+fn bucketed_texture_stride_is_drawn() {
+    let (width, height) = (600, 450);
+    let texture = crate::bridge::texture_size(UVec2::new(width, height), None).unwrap();
+    assert!(texture.x > width, "size must not be a bucket multiple");
+    let mut rig = Rig::new(CONFORMANCE, width, height, 1.0);
+    let stride = texture.x * 4;
+    let mut buffer = vec![0u8; (stride * texture.y) as usize];
+    rig.renderer.process(Duration::from_secs(1));
+    let damage = rig.renderer.draw(&mut buffer, width, height, stride);
+    assert_eq!(damage, vec![Rect::new(0, 0, width, height)]);
+    let row = |y: u32| &buffer[(y * stride) as usize..((y + 1) * stride) as usize];
+    // Visible pixels are painted (opaque surface), padding is untouched.
+    assert!(
+        row(10)[..(width * 4) as usize]
+            .chunks_exact(4)
+            .all(|p| p[3] == 255)
+    );
+    assert!(row(10)[(width * 4) as usize..].iter().all(|b| *b == 0));
 }
