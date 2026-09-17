@@ -2928,7 +2928,7 @@ version = "0.1.0"
 
 [[package]]
 name = "cosmix-iced-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "iced_core",
  "iced_graphics",

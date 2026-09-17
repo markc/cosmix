@@ -87,26 +87,44 @@ instance costs its widget state, layer list and tiny-skia glyph cache.
   `Rgba8` bytes left unswapped): a quad's **shadow**, drawn whole whenever
   the quad body meets the damage, and the **ink of text that lies wholly
   inside** the damage, which can overhang its measured bounds. Text that
-  crosses a damage edge is clipped, so only fully covered text is expanded.
-  A shadow spanning the surface therefore turns every partial redraw into a
-  full one: keep shadows off large containers, or draw them yourself.
-- `draw_aged(.., age)` draws into a buffer that is `age` frames old: 1 is
-  the buffer of the last frame (what `draw` assumes), `n` one holding the
-  contents of `n` frames ago, and 0 unknown contents. The damage of the
-  frames in between is added from an eight-frame history, so a client
-  cycling `wl_shm` buffers does not repaint everything. An age past the
-  history repaints everything. (`cosmix-wl-app` does not need this: its
-  pool copies damage forward, so every buffer it hands over is one frame
+  crosses a damage edge is clipped, so only fully covered text is expanded;
+  the margin is a quarter of the run's line height, at least 2 px, since ink
+  overhangs more the larger the text. A shadow whose quad body meets two
+  damage rectangles would be blended twice, so those rectangles are merged.
+  (Live primitives and images take the same mask-skip path, but this crate
+  builds with `image`, `svg` and `geometry` off, so no layer can hold any.)
+  A shadow spanning the surface turns every partial redraw into a full one:
+  keep shadows off large containers, or draw them yourself.
+- Rounding, coalescing, the bounding-box collapse and an older buffer's
+  history only ever grow rectangles, and the renderer applies its mask-skip
+  rule to the final list, so growing can reach a shadow or text run that was
+  not reached before. Growth and expansion therefore run to a fixpoint: each
+  candidate is added at most once, so it ends.
+- `draw_aged(.., age)` (and `draw_aged_at`) draws into a buffer that is
+  `age` **draws** old — draws of this surface, not compositor commits, so a
+  host that skips a commit must still count the draw. 1 is the buffer of the
+  last draw (what `draw` assumes), `n` one holding the contents of `n` draws
+  ago, and 0 unknown contents. The damage of the draws in between is added
+  from an eight-draw history, so a client cycling `wl_shm` buffers does not
+  repaint everything. An age past the history repaints everything, as does a
+  resize, which drops the history. (`cosmix-wl-app` does not need this: its
+  pool copies damage forward, so every buffer it hands over is one draw
   old.)
 - A buffer of the same size but a different `stride` or `PixelFormat` is
   not the previous frame's buffer, and repaints everything.
-- Partial redraws match a full redraw except for occasional one-level
-  channel differences on antialiased edges. A quad cut by a damage
-  rectangle is drawn through tiny-skia's masked pipeline, which rounds
-  differently from the unmasked path used when the quad lies wholly
-  inside. `tests/damage.rs` checks damage coverage exactly (every pixel
-  whose full redraw changed lies in the damage) and bounds the rest to one
-  level.
+- Outside the damage a partial redraw matches a full one exactly. Inside it,
+  a repainted pixel can land a few channel levels off: a quad or glyph cut
+  by a damage rectangle goes through tiny-skia's masked pipeline, which
+  rounds coverage differently from the unmasked path taken when it lies
+  wholly inside. `tests/damage.rs` checks all three (coverage exactly, no
+  difference outside the damage, at most four levels inside) over blinks,
+  edits and 240 random small changes; `tests/shadows.rs` drives stacked
+  shadowed cards, a twelve-card chain and three rotating buffers in both
+  pixel formats, and there every frame matches byte for byte.
+- The per-frame snapshot clones the text of every run on screen (its lines
+  and attributes) so paragraphs can be compared by content. That is a copy
+  of the visible text per draw: fine for chrome and furniture, worth
+  measuring before hosting a wall of text.
 
 ## IME
 
