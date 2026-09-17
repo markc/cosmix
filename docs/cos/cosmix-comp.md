@@ -549,7 +549,7 @@ Absent by design after P-1:
 
 The compositor advertises the core compositor, subcompositor, seat, output,
 shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
-XDG shell and XDG decoration globals needed by its desktop
+presentation-time (nested only, see below), XDG shell and XDG decoration globals needed by its desktop
 clients.
 
 | Protocol | Version | Current support |
@@ -559,6 +559,39 @@ clients.
 | `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
 | `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
+| `wp_presentation` | 2 | Nested mode only for now (see Presentation feedback below); the KMS backend does not advertise it until it reports page flips. |
+
+### Presentation feedback
+
+`wp_presentation` reports when a client's commit was actually shown.
+
+- **Clock:** CLOCK_MONOTONIC (`clock_id` 1), the same clock `frame_trace`
+  uses.
+- **Which commit a frame showed:** feedback is taken when the commit is
+  applied, so a later commit cannot discard it while the earlier one is still
+  on its way to the screen. A presented frame reports, per surface, the newest
+  commit whose texture was ready and whether the surface was visible. The
+  newest waiting commit at or below that is `presented`, older ones are
+  `discarded` (superseded), newer ones keep waiting. A commit without a new
+  buffer is presented with the content it left on screen.
+- **Discarded without a frame:** unmap, minimise, destroy, a new role, or a
+  surface that can no longer be drawn. At most 8 commits per surface wait; a
+  faster client loses the oldest as `discarded`.
+- **Nested backend:** the host compositor gives no presentation timing, so
+  `tv` is CLOCK_MONOTONIC when the frame was handed to the host (not first
+  photon), `flags` is 0, `seq` is 0 and `refresh` is 0 (unknown). It is
+  reported only after the swapchain image was actually presented.
+- **KMS backend:** not advertised yet. It will report the page-flip time,
+  vblank sequence and the flags the kernel proves.
+- **DMA-BUF clients:** a frame counts a surface as shown when its GPU image
+  is prepared; comp does not yet prove that an asynchronously imported
+  DMA-BUF replacement had landed in that frame.
+
+In-process scene content (a Bevy plugin inside comp, not a Wayland client)
+can be measured the same way: the plugin puts a `ContentSource` component on
+its root entity and bumps `ContentSourceFrame.revision` for every content
+update. Revisions shown in a presented frame count as presented, skipped ones
+as discarded. The Bus stats surface for these counters is not published yet.
 
 ## XWayland
 
