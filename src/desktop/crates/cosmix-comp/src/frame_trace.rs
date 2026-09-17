@@ -216,12 +216,14 @@ impl Drop for Span {
 
 // These markers measure schedule-boundary intervals, including scheduler
 // overhead. CPU belongs to the marker/caller thread, not parallel render tasks.
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 #[derive(Default)]
 struct RenderPhases {
     active: Option<(&'static str, Span)>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 impl RenderPhases {
     fn start(&mut self, stage: &'static str) {
         self.active.take();
@@ -229,22 +231,28 @@ impl RenderPhases {
     }
 }
 
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn graph_render_begin(mut phases: bevy::prelude::NonSendMut<RenderPhases>) {
     phases.start("comp_graph_render");
 }
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn graph_submit_begin(mut phases: bevy::prelude::NonSendMut<RenderPhases>) {
     phases.start("comp_graph_submit");
 }
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn graph_submit_end(mut phases: bevy::prelude::NonSendMut<RenderPhases>) {
     phases.active.take();
 }
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn finalize_begin(mut phases: bevy::prelude::NonSendMut<RenderPhases>) {
     phases.start("comp_render_finalize");
 }
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn finalize_end(mut phases: bevy::prelude::NonSendMut<RenderPhases>) {
     phases.active.take();
 }
 
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn install_graph_markers(render: &mut bevy::app::SubApp) {
     use bevy::{
         prelude::*,
@@ -270,6 +278,7 @@ fn install_graph_markers(render: &mut bevy::app::SubApp) {
 
 /// Opt-in only, installed after Bevy finishes configuring its renderer. The
 /// original render_system and RenderGraph executors remain untouched.
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 pub(crate) fn install_render_phases(app: &mut bevy::prelude::App) {
     use bevy::{
         prelude::*,
@@ -308,11 +317,13 @@ pub(crate) fn install_render_phases(app: &mut bevy::prelude::App) {
 
 // Bound callback nesting without allocating for every public GPU API call.
 // Suppressed nested calls still balance their ends and never pop an outer span.
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 #[derive(Default)]
 struct GpuCalls {
     stack: Vec<(wgpu::diagnostics::Operation, u64, u64, Span)>,
     suppressed: usize,
 }
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 impl GpuCalls {
     fn fields(&self, event: wgpu::diagnostics::Event) -> (u64, u64) {
         use wgpu::diagnostics::Operation;
@@ -386,6 +397,7 @@ impl GpuCalls {
         }
     }
 }
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
 fn wgpu_event(event: wgpu::diagnostics::Event) {
     std::thread_local! {
         static CALLS: std::cell::RefCell<GpuCalls> = std::cell::RefCell::new(GpuCalls::default());
