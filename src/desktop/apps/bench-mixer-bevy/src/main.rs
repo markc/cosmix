@@ -18,8 +18,8 @@ use bevy::winit::{UpdateMode, WinitSettings};
 use cosmix_bench_feed::layout::{WINDOW_HEIGHT, WINDOW_WIDTH};
 use cosmix_bench_feed::{BenchSong, DEFAULT_SEED, DEFAULT_STRIPS, Mode, TICK_HZ, tick_at};
 use ctk::prelude::{
-    CtkThemeMetrics, CtkThemePlugin, CtkWidgetsPlugin, FeathersPlugins, Mode as ThemeMode,
-    Scheme, ThemeSpec, ThemeState, apply_theme,
+    CtkThemeMetrics, CtkThemePlugin, CtkWidgetsPlugin, FeathersPlugins, Mode as ThemeMode, Scheme,
+    ThemeSpec, ThemeState, apply_theme,
 };
 
 const APP_ID: &str = "dev.cosmix.bench-mixer-bevy";
@@ -116,7 +116,9 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     });
     match (mode, view) {
         (Mode::Meters | Mode::Drag, View::Roll) => {
-            return Err(format!("--mode {mode} animates the mixer; use --view mixer"));
+            return Err(format!(
+                "--mode {mode} animates the mixer; use --view mixer"
+            ));
         }
         (Mode::Roll, View::Mixer) => {
             return Err("--mode roll animates the roll; use --view roll".to_owned());
@@ -163,7 +165,8 @@ impl Bench {
 
     /// The feed tick this frame shows.
     pub fn tick(&self) -> u64 {
-        self.forced_tick.unwrap_or_else(|| tick_at(self.frame_elapsed))
+        self.forced_tick
+            .unwrap_or_else(|| tick_at(self.frame_elapsed))
     }
 }
 
@@ -317,7 +320,14 @@ mod tests {
     #[test]
     fn options_parse() {
         let config = parse_args(&args(&[
-            "--mode", "drag", "--strips", "8", "--seed", "0xdead_beef", "--drag-by", "pointer",
+            "--mode",
+            "drag",
+            "--strips",
+            "8",
+            "--seed",
+            "0xdead_beef",
+            "--drag-by",
+            "pointer",
         ]))
         .unwrap();
         assert_eq!(config.mode, Mode::Drag);

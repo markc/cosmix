@@ -280,7 +280,11 @@ mod tests {
             let strip = feed.strip(slot);
             assert_eq!(strip.number, Some(slot + 1));
             assert!(names.insert(strip.name.clone()), "names are unique");
-            assert!(strip.name.len() <= 9, "{} fits the compact name box", strip.name);
+            assert!(
+                strip.name.len() <= 9,
+                "{} fits the compact name box",
+                strip.name
+            );
             assert!((-24.0..=3.0).contains(&strip.fader_db));
             assert!(strip.fader_db == 0.0 || strip.fader_db.abs() >= FADER_DETENT_BAND_DB);
             let tenths = strip.fader_db * 10.0;

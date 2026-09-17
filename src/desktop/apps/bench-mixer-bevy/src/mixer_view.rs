@@ -169,7 +169,9 @@ fn spawn_strip(
 
     let number = commands
         .spawn(text(
-            state.number.map_or_else(|| " ".to_owned(), |n| n.to_string()),
+            state
+                .number
+                .map_or_else(|| " ".to_owned(), |n| n.to_string()),
             NUMBER_FONT,
             tokens::TEXT_DIM,
         ))
@@ -239,11 +241,8 @@ fn spawn_strip(
 
     let mute = toggle(commands, format!("strip-{slot}-mute"), "M", state.mute);
     let solo = (!master).then(|| toggle(commands, format!("strip-{slot}-solo"), "S", state.solo));
-    let solo_slot = solo.unwrap_or_else(|| {
-        commands
-            .spawn(spacer(BUTTON_MIN_WIDTH, BUTTON_HEIGHT))
-            .id()
-    });
+    let solo_slot =
+        solo.unwrap_or_else(|| commands.spawn(spacer(BUTTON_MIN_WIDTH, BUTTON_HEIGHT)).id());
     let buttons = commands
         .spawn(Node {
             flex_direction: FlexDirection::Column,

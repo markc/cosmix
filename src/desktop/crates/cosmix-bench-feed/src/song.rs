@@ -82,22 +82,21 @@ impl BenchSong {
             .extension()
             .and_then(|ext| ext.to_str())
             .map(str::to_ascii_lowercase);
-        let song = match extension.as_deref() {
-            Some("mid" | "midi") => {
-                Song::import_smf(path).map_err(|e| LoadError::Parse(path.into(), e.to_string()))?
-            }
-            Some("asc") => {
-                Song::import_asc(path).map_err(|e| LoadError::Parse(path.into(), e.to_string()))?
-            }
-            Some("json") => Song::load_from_file(path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidData {
-                    LoadError::Parse(path.into(), e.to_string())
-                } else {
-                    LoadError::Io(path.into(), e)
-                }
-            })?,
-            _ => return Err(LoadError::UnknownFormat(path.into())),
-        };
+        let song =
+            match extension.as_deref() {
+                Some("mid" | "midi") => Song::import_smf(path)
+                    .map_err(|e| LoadError::Parse(path.into(), e.to_string()))?,
+                Some("asc") => Song::import_asc(path)
+                    .map_err(|e| LoadError::Parse(path.into(), e.to_string()))?,
+                Some("json") => Song::load_from_file(path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        LoadError::Parse(path.into(), e.to_string())
+                    } else {
+                        LoadError::Io(path.into(), e)
+                    }
+                })?,
+                _ => return Err(LoadError::UnknownFormat(path.into())),
+            };
         Ok(Self::from_song(&song))
     }
 
@@ -132,9 +131,9 @@ impl BenchSong {
         let length_ticks = last_end.div_ceil(measure).max(1) * measure;
         let max_note_length = notes.iter().map(|n| n.length).max().unwrap_or(0);
 
-        let (lo, hi) = notes
-            .iter()
-            .fold((127u8, 0u8), |(lo, hi), n| (lo.min(n.pitch), hi.max(n.pitch)));
+        let (lo, hi) = notes.iter().fold((127u8, 0u8), |(lo, hi), n| {
+            (lo.min(n.pitch), hi.max(n.pitch))
+        });
         let (key_lo, key_hi) = pad_key_range(if lo > hi { (48, 72) } else { (lo, hi) });
 
         Self {

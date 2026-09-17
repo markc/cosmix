@@ -179,7 +179,14 @@ fn roll_input(
     mut wheel: MessageReader<MouseWheel>,
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    canvas: Query<(&ComputedNode, &UiGlobalTransform, &ComputedUiRenderTargetInfo), With<RollCanvas>>,
+    canvas: Query<
+        (
+            &ComputedNode,
+            &UiGlobalTransform,
+            &ComputedUiRenderTargetInfo,
+        ),
+        With<RollCanvas>,
+    >,
     ui_scale: Res<UiScale>,
 ) {
     if bench.config.mode == Mode::Roll {
@@ -328,17 +335,9 @@ fn draw_roll(
     let (width, height) = (size.x, size.y);
 
     let shade = ink.with_alpha(ROLL_BLACK_KEY_ALPHA);
-    let rows = view.black_key_rows(height).map(|(_, y, h)| {
-        (
-            rect_node(Rect {
-                x: 0.0,
-                y,
-                w: width,
-                h,
-            }),
-            shade,
-        )
-    });
+    let rows = view
+        .black_key_rows(width, height)
+        .map(|(_, rect)| (rect_node(rect), shade));
     sync_pool(&mut layers.rows, rows, &mut commands, &mut items);
 
     view.gridlines_into(song, grid);
@@ -349,12 +348,7 @@ fn draw_roll(
             ROLL_BEAT_ALPHA
         };
         (
-            rect_node(Rect {
-                x: view.tick_x(f64::from(line.tick), width).floor(),
-                y: 0.0,
-                w: 1.0,
-                h: height,
-            }),
+            rect_node(view.gridline_rect(line, width, height)),
             ink.with_alpha(alpha),
         )
     });
@@ -389,7 +383,12 @@ mod tests {
         for track in 0..2u8 {
             let mut t = cosmix_song::Track::new(format!("T{track}"), track);
             for step in 0..64u32 {
-                t.add_note(cosmix_song::Note::new(50 + (step % 12) as u8, 100, step * 240, 200));
+                t.add_note(cosmix_song::Note::new(
+                    50 + (step % 12) as u8,
+                    100,
+                    step * 240,
+                    200,
+                ));
             }
             doc.add_track(t);
         }

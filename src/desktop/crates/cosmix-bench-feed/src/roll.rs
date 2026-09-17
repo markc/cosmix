@@ -290,11 +290,40 @@ mod tests {
             velocity: 100,
         };
         let rect = view.note_rect(&note, 1000.0, 100.0);
-        assert_eq!(rect, Rect { x: 250.0, y: 21.0, w: 250.0, h: 8.0 });
+        assert_eq!(
+            rect,
+            Rect {
+                x: 250.0,
+                y: 21.0,
+                w: 250.0,
+                h: 8.0
+            }
+        );
         let tiny = BenchNote { length: 1, ..note };
         assert_eq!(view.note_rect(&tiny, 1000.0, 100.0).w, ROLL_NOTE_MIN_WIDTH);
-        let rows: Vec<u8> = view.black_key_rows(100.0).map(|(key, _, _)| key).collect();
-        assert_eq!(rows, vec![49, 46, 44, 42]);
+        let rows: Vec<(u8, Rect)> = view.black_key_rows(1000.0, 100.0).collect();
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![49, 46, 44, 42]
+        );
+        let row = Rect {
+            x: 0.0,
+            y: 30.0,
+            w: 1000.0,
+            h: 10.0,
+        };
+        assert_eq!(rows[1].1, row);
+        let line = GridLine {
+            tick: 1920 + 700,
+            measure: false,
+        };
+        let expected = Rect {
+            x: 364.0,
+            y: 0.0,
+            w: 1.0,
+            h: 100.0,
+        };
+        assert_eq!(view.gridline_rect(&line, 1000.0, 100.0), expected);
         let mut visible = Vec::new();
         assert_eq!(view.visible_notes_into(&song, &mut visible), 0);
         assert!(visible.iter().all(|i| {
