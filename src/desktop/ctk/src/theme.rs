@@ -9,7 +9,7 @@
 
 #[cfg(feature = "theme")]
 use bevy::app::{AppExit, PreStartup};
-use bevy::app::{PostUpdate, PropagateSet};
+use bevy::app::{Last, PostUpdate, PropagateSet};
 use bevy::color::Color;
 use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
