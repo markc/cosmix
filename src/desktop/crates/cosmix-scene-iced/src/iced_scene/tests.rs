@@ -452,6 +452,7 @@ fn plugin_mounts_iced_and_sends_handlers_on_the_scene_bus_path() {
             scale: 1.0,
             origin: Vec2::ZERO,
             window: None,
+            pointer_scale: 1.0,
         });
     for _ in 0..4 {
         app.update();
