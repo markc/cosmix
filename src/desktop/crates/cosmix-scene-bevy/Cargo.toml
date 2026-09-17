@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-scene-bevy"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -16,3 +16,6 @@ cosmix-shell = { path = "../cosmix-shell", features = ["chrome"] }
 ctk = { path = "../../ctk", default-features = false, features = ["bus", "virtual-list"] }
 serde_json = "1"
 sha2 = "0.10"
+
+[dev-dependencies]
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "virtual-list", "test-support"] }

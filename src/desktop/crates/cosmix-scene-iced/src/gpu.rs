@@ -2,7 +2,7 @@
 //! created once for each surface. The image asset itself is never mutated.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
@@ -36,6 +36,9 @@ pub struct Shared {
     pending: Mutex<Vec<SurfaceUpload>>,
     /// Images whose texture must be repainted in full (lost or replaced).
     repaint: Mutex<HashSet<AssetId<Image>>>,
+    /// Uploads are staged for a texture that does not exist yet: the main
+    /// world must keep updating until they land or are given up.
+    pub waiting: AtomicBool,
     pub bytes_written: AtomicU64,
     pub rects_written: AtomicU64,
 }
@@ -46,6 +49,9 @@ impl Shared {
     }
     pub fn take_repaints(&self) -> HashSet<AssetId<Image>> {
         std::mem::take(&mut *self.repaint.lock().unwrap())
+    }
+    pub(crate) fn request_repaint(&self, image: AssetId<Image>) {
+        self.repaint.lock().unwrap().insert(image);
     }
 }
 
@@ -77,7 +83,11 @@ pub fn install(app: &mut App, channel: GpuChannel) {
 }
 
 fn extract(channel: Extract<Res<GpuChannel>>, mut staged: ResMut<Staged>) {
-    let uploads = std::mem::take(&mut *channel.0.pending.lock().unwrap());
+    stage(&channel.0, &mut staged);
+}
+
+fn stage(shared: &Shared, staged: &mut Staged) {
+    let uploads = std::mem::take(&mut *shared.pending.lock().unwrap());
     staged.uploads.extend(uploads.into_iter().map(|u| (u, 0)));
 }
 
@@ -94,7 +104,7 @@ fn write(
             if waited < MAX_WAIT_FRAMES {
                 waiting.push((upload, waited + 1));
             } else {
-                channel.0.repaint.lock().unwrap().insert(upload.image);
+                channel.0.request_repaint(upload.image);
             }
             continue;
         };
@@ -114,7 +124,7 @@ fn write(
             .is_some_and(|old| old != id)
             && !full
         {
-            channel.0.repaint.lock().unwrap().insert(upload.image);
+            channel.0.request_repaint(upload.image);
         }
         for op in &upload.ops {
             queue.write_texture(
@@ -147,6 +157,202 @@ fn write(
             channel.0.rects_written.fetch_add(1, Ordering::Relaxed);
         }
     }
+    channel
+        .0
+        .waiting
+        .store(!waiting.is_empty(), Ordering::Relaxed);
     staged.uploads = waiting;
     staged.written.retain(|id, _| images.get(*id).is_some());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::render::render_resource::{
+        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    };
+    use bevy::render::renderer::WgpuWrapper;
+
+    use crate::upload::extract as copy_rect;
+
+    struct Gpu {
+        world: World,
+        device: wgpu::Device,
+        shared: Arc<Shared>,
+    }
+
+    impl Gpu {
+        fn new() -> Self {
+            let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+            let mut world = World::new();
+            let shared = Arc::new(Shared::default());
+            world.insert_resource(RenderQueue(Arc::new(WgpuWrapper::new(queue))));
+            world.insert_resource(RenderAssets::<GpuImage>::default());
+            world.insert_resource(GpuChannel(shared.clone()));
+            world.init_resource::<Staged>();
+            Self {
+                world,
+                device,
+                shared,
+            }
+        }
+
+        /// Stands in for Bevy's `prepare_assets`: a real (noop-backend)
+        /// texture, validated by wgpu on every write.
+        fn texture(&mut self, image: AssetId<Image>, size: UVec2) -> TextureId {
+            let descriptor = TextureDescriptor {
+                label: None,
+                size: Extent3d {
+                    width: size.x,
+                    height: size.y,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            };
+            let texture = self.device.create_texture(&descriptor);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let sampler = self
+                .device
+                .create_sampler(&wgpu::SamplerDescriptor::default());
+            let texture: bevy::render::render_resource::Texture = texture.into();
+            let id = texture.id();
+            self.world.resource_mut::<RenderAssets<GpuImage>>().insert(
+                image,
+                GpuImage {
+                    texture,
+                    texture_view: view.into(),
+                    sampler: sampler.into(),
+                    texture_descriptor: descriptor,
+                    texture_view_descriptor: None,
+                    had_data: false,
+                },
+            );
+            id
+        }
+
+        fn frame(&mut self) {
+            let world = &mut self.world;
+            world.resource_scope(|_, mut staged: Mut<Staged>| stage(&self.shared, &mut staged));
+            world.run_system_once(write).unwrap();
+        }
+
+        fn written(&self) -> (u64, u64) {
+            (
+                self.shared.bytes_written.swap(0, Ordering::Relaxed),
+                self.shared.rects_written.swap(0, Ordering::Relaxed),
+            )
+        }
+    }
+
+    fn image(n: u32) -> AssetId<Image> {
+        let mut assets = Assets::<Image>::default();
+        let mut id = None;
+        for _ in 0..=n {
+            id = Some(assets.add(Image::default()).id());
+        }
+        id.unwrap()
+    }
+
+    fn upload(
+        image: AssetId<Image>,
+        texture: UVec2,
+        visible: UVec2,
+        rects: &[Rect],
+    ) -> SurfaceUpload {
+        let buffer = vec![0x80u8; (texture.x * texture.y * 4) as usize];
+        SurfaceUpload {
+            image,
+            texture,
+            visible,
+            ops: rects
+                .iter()
+                .map(|rect| copy_rect(&buffer, texture.x * 4, *rect))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn damage_rects_are_written_into_the_bucketed_texture() {
+        let mut gpu = Gpu::new();
+        let a = image(0);
+        let tex = UVec2::new(256, 128);
+        gpu.texture(a, tex);
+        let rects = [Rect::new(0, 0, 200, 100), Rect::new(250, 120, 6, 8)];
+        gpu.shared
+            .push(upload(a, tex, UVec2::new(200, 100), &rects));
+        gpu.frame();
+        assert_eq!(gpu.written(), (200 * 100 * 4 + 6 * 8 * 4, 2));
+        assert!(!gpu.shared.waiting.load(Ordering::Relaxed));
+        assert!(gpu.shared.take_repaints().is_empty());
+        // Nothing staged: nothing written.
+        gpu.frame();
+        assert_eq!(gpu.written(), (0, 0));
+    }
+
+    #[test]
+    fn uploads_wait_for_their_texture_then_give_up_with_a_repaint() {
+        let mut gpu = Gpu::new();
+        let (a, b) = (image(0), image(1));
+        let tex = UVec2::new(128, 128);
+        let full = [Rect::new(0, 0, 64, 64)];
+        gpu.shared.push(upload(a, tex, UVec2::splat(64), &full));
+        gpu.frame();
+        assert_eq!(gpu.written(), (0, 0));
+        assert!(
+            gpu.shared.waiting.load(Ordering::Relaxed),
+            "host must keep updating"
+        );
+        // The texture appears: the staged upload lands.
+        gpu.texture(a, tex);
+        gpu.frame();
+        assert_eq!(gpu.written(), (64 * 64 * 4, 1));
+        assert!(!gpu.shared.waiting.load(Ordering::Relaxed));
+
+        // One that never gets a texture is dropped after the wait budget.
+        gpu.shared.push(upload(b, tex, UVec2::splat(64), &full));
+        for _ in 0..=MAX_WAIT_FRAMES {
+            gpu.frame();
+        }
+        assert_eq!(gpu.written(), (0, 0));
+        assert!(!gpu.shared.waiting.load(Ordering::Relaxed));
+        assert_eq!(gpu.shared.take_repaints(), HashSet::from([b]));
+    }
+
+    #[test]
+    fn stale_plans_are_dropped_and_replaced_textures_ask_for_a_repaint() {
+        let mut gpu = Gpu::new();
+        let a = image(0);
+        let tex = UVec2::new(128, 128);
+        let first = gpu.texture(a, tex);
+        let partial = [Rect::new(4, 4, 8, 8)];
+        gpu.shared.push(upload(a, tex, UVec2::splat(100), &partial));
+        gpu.frame();
+        assert_eq!(gpu.written(), (8 * 8 * 4, 1));
+
+        // A plan for a different texture size is not written.
+        gpu.shared
+            .push(upload(a, UVec2::new(256, 128), UVec2::splat(100), &partial));
+        gpu.frame();
+        assert_eq!(gpu.written(), (0, 0));
+
+        // Bevy re-created the texture: a partial write asks for a full repaint.
+        let second = gpu.texture(a, tex);
+        assert_ne!(first, second);
+        gpu.shared.push(upload(a, tex, UVec2::splat(100), &partial));
+        gpu.frame();
+        assert_eq!(gpu.shared.take_repaints(), HashSet::from([a]));
+        // A full repaint of the visible part does not.
+        gpu.texture(a, tex);
+        let full = [Rect::new(0, 0, 100, 100)];
+        gpu.shared.push(upload(a, tex, UVec2::splat(100), &full));
+        gpu.frame();
+        assert!(gpu.shared.take_repaints().is_empty());
+        assert_eq!(gpu.written(), (8 * 8 * 4 + 100 * 100 * 4, 2));
+    }
 }

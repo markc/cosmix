@@ -47,6 +47,7 @@ impl Plugin for SceneIcedPlugin {
         app.add_message::<PointerInput>()
             .add_message::<KeyboardInput>()
             .add_message::<ExternalImeEvent>()
+            .add_message::<bevy::window::RequestRedraw>()
             .init_resource::<CursorShapeRequest>()
             .add_message::<AssetEvent<Image>>()
             .init_resource::<InputFocus>()
@@ -74,7 +75,11 @@ impl Plugin for SceneIcedPlugin {
                 PostUpdate,
                 (bridge::geometry, bridge::frame)
                     .chain()
-                    .after(bevy::ui::UiSystems::Layout),
+                    .after(bevy::ui::UiSystems::Layout)
+                    // A texture added after this frame's asset events is not
+                    // extracted until the next update, which an idle host
+                    // may never run (bevy_ui's text_system does the same).
+                    .before(bevy::asset::AssetEventSystems),
             )
             .add_systems(Last, bridge::count_asset_events);
     }

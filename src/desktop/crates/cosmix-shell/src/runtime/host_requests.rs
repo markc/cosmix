@@ -48,11 +48,31 @@ pub enum ExternalImeKind {
     },
 }
 
-/// The shape the pointer should show. Content that owns the hovered area sets
-/// it and resets it to `Default` when the pointer leaves; the host applies it
-/// on change and again after each pointer enter.
+/// The shape the pointer should show; the host applies it on change and again
+/// after each pointer enter. Content that owns the hovered area writes it with
+/// itself as `owner`, and clears it (back to the default) only while it is
+/// still the owner, so it never undoes another source's request.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CursorShapeRequest(pub CursorShape);
+pub struct CursorShapeRequest {
+    pub shape: CursorShape,
+    pub owner: Option<Entity>,
+}
+
+impl CursorShapeRequest {
+    pub fn set(&mut self, owner: Entity, shape: CursorShape) {
+        *self = Self {
+            shape,
+            owner: Some(owner),
+        };
+    }
+
+    /// Resets to the default shape if `owner` made the current request.
+    pub fn clear(&mut self, owner: Entity) {
+        if self.owner == Some(owner) {
+            *self = Self::default();
+        }
+    }
+}
 
 /// The subset of the CSS cursor names that content asks for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

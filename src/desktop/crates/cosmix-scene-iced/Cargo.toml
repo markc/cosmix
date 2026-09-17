@@ -25,3 +25,4 @@ ctk = { path = "../../ctk", default-features = false, features = ["bus"], option
 [dev-dependencies]
 parley = { version = "=0.9.0", default-features = false }
 ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }
+wgpu = { version = "=29.0.4", features = ["noop"] }

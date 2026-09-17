@@ -302,7 +302,7 @@ fn service_bus(
                 let mut args = parse_args(&request).unwrap_or(Value::Null);
                 // A load's body is the scene document, so its adapter rides a header.
                 if verb == cosmix_shell::runtime::SceneVerb::Load
-                    && let Some(adapter) = request.headers.get("adapter")
+                    && let Some(adapter) = argument(&request, "adapter")
                 {
                     args = json!({"adapter": adapter});
                 }

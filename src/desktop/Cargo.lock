@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.12.5"
+version = "0.12.6"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3270,7 +3270,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bevy",
  "cosmix-scene",
@@ -3294,11 +3294,12 @@ dependencies = [
  "ctk",
  "parley",
  "serde_json",
+ "wgpu 29.0.4",
 ]
 
 [[package]]
 name = "cosmix-shell"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3308,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "bevy",
  "bevy_winit",
