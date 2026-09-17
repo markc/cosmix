@@ -167,24 +167,23 @@ fn configure_content(
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
     #[cfg(feature = "scene-iced-standin")]
-    app.add_plugins(cosmix_scene_iced::SceneIcedPlugin)
-        .add_systems(Last, scene_iced_wake);
+    {
+        app.add_plugins(cosmix_scene_iced::SceneIcedPlugin);
+        // Caret blink and other renderer timers become the layer host's
+        // one-shot application wake; the earliest pending deadline wins.
+        app.world_mut()
+            .resource_mut::<cosmix_scene_iced::SceneIcedWaker>()
+            .set(|world, at| {
+                if let Some(mut deadline) =
+                    world.get_resource_mut::<cosmix_shell_host::LayerHostDeadline>()
+                    && deadline.0.is_none_or(|current| at < current)
+                {
+                    deadline.0 = Some(at);
+                }
+            });
+    }
     #[cfg(feature = "scene-iced")]
     app.add_plugins(cosmix_scene_iced::iced_scene::IcedRendererPlugin);
-}
-
-/// Caret blink and other renderer timers become the layer host's one-shot
-/// application wake; the earliest pending deadline wins.
-#[cfg(feature = "scene-iced-standin")]
-fn scene_iced_wake(
-    wake: Res<cosmix_scene_iced::SceneIcedWake>,
-    mut deadline: ResMut<cosmix_shell_host::LayerHostDeadline>,
-) {
-    if let Some(at) = wake.0
-        && deadline.0.is_none_or(|current| at < current)
-    {
-        deadline.0 = Some(at);
-    }
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
@@ -246,7 +245,7 @@ fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, S
     Ok(CliAction::Run(cli))
 }
 
-fn valid_service_name(name: &str) -> bool {
+pub(crate) fn valid_service_name(name: &str) -> bool {
     (2..=31).contains(&name.len())
         && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
         && name

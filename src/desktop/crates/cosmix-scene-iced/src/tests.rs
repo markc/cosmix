@@ -71,12 +71,17 @@ impl Harness {
     }
 
     fn geometry(&mut self, width: u32, height: u32, scale: f32) {
+        self.geometry_scales(width, height, scale, scale);
+    }
+
+    fn geometry_scales(&mut self, width: u32, height: u32, scale: f32, pointer_scale: f32) {
         self.app
             .world_mut()
             .entity_mut(self.surface)
             .insert(IcedSurfaceGeometry {
                 size: UVec2::new(width, height),
                 scale,
+                pointer_scale,
                 origin: Vec2::new(10.0, 20.0),
                 window: self.window,
             });
@@ -901,4 +906,77 @@ fn keeping_the_host_awake_for_staged_uploads_is_bounded() {
         h.app.world().resource::<Wakes>().0,
         crate::bridge::MAX_KEEP_AWAKE_FRAMES + 5
     );
+}
+
+// ---- host-agnostic seams ----
+
+#[test]
+fn pointer_positions_use_the_camera_scale_not_the_ui_scale() {
+    use crate::scales;
+    // Quoin: UiScale 1, so the UI target scale is the camera's.
+    assert_eq!(scales(1.0, Some(1.0)), (1.0, 1.0));
+    assert_eq!(scales(1.5, Some(1.5)), (1.5, 1.5));
+    // comp: UiScale 1.5 on a scale-1 output. The surface renders at 1.5;
+    // pointer positions arrive already multiplied by UiScale, so they are in
+    // the camera's scale.
+    assert_eq!(scales(1.5, Some(1.0)), (1.5, 1.0));
+    // No camera information: the target scale is the only answer there is.
+    assert_eq!(scales(2.0, None), (2.0, 2.0));
+
+    // End to end: a surface rendering at 1.5 whose pointer arrives at 1.0.
+    let mut h = Harness::new();
+    h.geometry_scales(200, 100, 1.5, 1.0);
+    h.run(3);
+    let before = h.totals();
+    // Logical (60, 90) at pointer scale 1.0, minus the origin (10, 20).
+    h.pointer(
+        true,
+        Vec2::new(60.0, 90.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    // The hover square is 36 px (the surface's own 1.5 scale) at (50, 70).
+    assert_eq!(
+        h.app.world().resource::<SceneIcedCounters>().last_rects,
+        vec![Rect::new(32, 52, 36, 36)]
+    );
+    assert_eq!(h.totals().bytes_queued - before.bytes_queued, 36 * 36 * 4);
+}
+
+#[test]
+fn a_pending_wake_reaches_the_host_hook() {
+    use crate::SceneIcedWaker;
+    #[derive(Resource, Default)]
+    struct Woken(Vec<Duration>);
+    let mut h = Harness::new();
+    h.app.init_resource::<Woken>();
+    h.app
+        .world_mut()
+        .resource_mut::<SceneIcedWaker>()
+        .set(|world, at| world.resource_mut::<Woken>().0.push(at));
+    h.run(3);
+    // Nothing is pending while no surface is focused.
+    assert!(h.app.world().resource::<Woken>().0.is_empty());
+
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(2);
+    let wake = h.app.world().resource::<SceneIcedWake>().0;
+    assert!(wake.is_some());
+    let woken = &h.app.world().resource::<Woken>().0;
+    assert!(
+        !woken.is_empty(),
+        "the hook must be called while a wake is pending"
+    );
+    assert_eq!(woken.last().copied(), wake, "with the pending deadline");
+
+    // Focus leaves: the wake clears and the hook stops being called.
+    h.app.world_mut().resource_mut::<InputFocus>().clear();
+    h.run(2);
+    assert_eq!(h.app.world().resource::<SceneIcedWake>().0, None);
+    let calls = h.app.world().resource::<Woken>().0.len();
+    h.run(5);
+    assert_eq!(h.app.world().resource::<Woken>().0.len(), calls);
 }
