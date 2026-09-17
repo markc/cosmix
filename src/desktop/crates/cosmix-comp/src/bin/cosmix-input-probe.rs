@@ -235,6 +235,9 @@ fn run() -> Result<(), String> {
     let mut frame = 0_u32;
     probe.frame_done = true;
     let mut hidden = false;
+    // After a remap nothing may be attached until the new configure is
+    // acknowledged.
+    let mut awaiting_configure = false;
     let mut remap_at: Option<Instant> = None;
     let mut remap_left = options.remap_once;
     while Instant::now() < deadline && !(probe.closed && !options.hide_on_close) {
@@ -251,6 +254,7 @@ fn run() -> Result<(), String> {
         if hidden && remap_at.is_some_and(|at| Instant::now() >= at) {
             remap_at = None;
             hidden = false;
+            awaiting_configure = true;
             // A fresh initial commit; the configure it earns re-attaches.
             surface.commit();
             say("remapped");
@@ -279,9 +283,10 @@ fn run() -> Result<(), String> {
                 say(&format!("configure {width} {height}"));
             }
             dirty = true;
+            awaiting_configure = false;
         }
         if let Some(canvas) = current.as_ref()
-            && (dirty || probe.frame_done)
+            && (dirty || (probe.frame_done && !awaiting_configure))
         {
             frame = frame.wrapping_add(1);
             let shade = (frame % 256) as u8;
