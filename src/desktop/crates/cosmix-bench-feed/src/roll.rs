@@ -177,7 +177,7 @@ impl RollViewport {
             return;
         }
         for index in first..last {
-            let measure = index % u64::from(per_measure) == 0;
+            let measure = index.is_multiple_of(u64::from(per_measure));
             if measures_only && !measure {
                 continue;
             }

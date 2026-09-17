@@ -119,7 +119,7 @@ impl MixerFeed {
                 solo: false,
             };
         }
-        let h = hash(&[self.seed, slot as u64, 0x7374_7269_70]);
+        let h = hash(&[self.seed, slot as u64, 0x0073_7472_6970]);
         let name = format!("{} {}", NAMES[(h % NAMES.len() as u64) as usize], slot + 1);
         // -24..=+3 dB in 0.1 dB steps.
         let fader_db = ((h >> 8) % 271) as f32 / 10.0 - 24.0;
@@ -130,8 +130,8 @@ impl MixerFeed {
             name,
             fader_db,
             pan,
-            mute: (h >> 32) % 9 == 0,
-            solo: (h >> 40) % 13 == 0,
+            mute: (h >> 32).is_multiple_of(9),
+            solo: (h >> 40).is_multiple_of(13),
         }
     }
 
@@ -211,7 +211,7 @@ impl MixerFeed {
 /// Instantaneous level of one lane, dB, clamped to the meter scale.
 fn level_db(seed: u64, slot: usize, lane: usize, tick: u64) -> f32 {
     const PERIODS: [u64; 5] = [10, 12, 15, 20, 24];
-    let strip = hash(&[seed, slot as u64, 0x6d65_7465_72]);
+    let strip = hash(&[seed, slot as u64, 0x006d_6574_6572]);
     let base = -30.0 + 24.0 * unit(strip);
     let period = PERIODS[((strip >> 8) % PERIODS.len() as u64) as usize];
     let offset = (strip >> 16) % period;
@@ -224,7 +224,7 @@ fn level_db(seed: u64, slot: usize, lane: usize, tick: u64) -> f32 {
         0.0
     };
     // Occasional hot half-seconds, so clip latches appear.
-    let burst = if hash(&[seed, slot as u64, tick / 15, 0x686f_74]) % 53 == 0 {
+    let burst = if hash(&[seed, slot as u64, tick / 15, 0x0068_6f74]).is_multiple_of(53) {
         9.0
     } else {
         0.0
