@@ -59,6 +59,27 @@ pub fn choose_slot(slots: &[SlotView], newest: Option<u64>, max: usize) -> SlotC
     }
 }
 
+/// What a draw that committed nothing leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discard {
+    /// Nothing was written: the slot still holds what it held.
+    Keep,
+    /// This slot's contents are unknown now.
+    Forget(usize),
+    /// The newest contents are gone: everything must be redrawn.
+    ForgetAll,
+}
+
+pub fn discard_choice(newest: Option<usize>, index: usize, touched: bool) -> Discard {
+    if !touched {
+        Discard::Keep
+    } else if newest != Some(index) {
+        Discard::Forget(index)
+    } else {
+        Discard::ForgetAll
+    }
+}
+
 /// Damage of recent commits, for bringing an older slot up to date.
 #[derive(Debug, Default)]
 pub struct DamageHistory {
@@ -258,18 +279,16 @@ impl Swapchain {
     /// pixels, the slot's contents are unknown and are forgotten; otherwise
     /// the slot still holds what it held.
     pub fn discard(&mut self, index: usize, touched: bool) {
-        if !touched {
-            return;
-        }
-        if self.newest != Some(index) {
-            self.slots[index].seq = None;
-        } else {
-            // The newest contents are gone too; everything must be redrawn.
-            for s in &mut self.slots {
-                s.seq = None;
+        match discard_choice(self.newest, index, touched) {
+            Discard::Keep => {}
+            Discard::Forget(index) => self.slots[index].seq = None,
+            Discard::ForgetAll => {
+                for s in &mut self.slots {
+                    s.seq = None;
+                }
+                self.newest = None;
+                self.history.clear();
             }
-            self.newest = None;
-            self.history.clear();
         }
     }
 }
@@ -339,6 +358,17 @@ mod tests {
             newest = Some(seq);
         }
         assert_eq!(slots.len(), 1);
+    }
+
+    #[test]
+    fn a_no_op_draw_only_forgets_what_was_written() {
+        // Took the buffer, committed nothing: its contents are unknown, and
+        // it held the newest frame, so every slot is stale.
+        assert_eq!(discard_choice(Some(1), 1, true), Discard::ForgetAll);
+        assert_eq!(discard_choice(Some(0), 1, true), Discard::Forget(1));
+        // Wrote nothing: the slot is still the newest frame and the next
+        // draw stays partial.
+        assert_eq!(discard_choice(Some(1), 1, false), Discard::Keep);
     }
 
     #[test]
