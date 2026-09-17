@@ -9763,6 +9763,8 @@ pub(crate) mod tests {
                 upload_bytes: 40,
                 damage_px: 9,
                 consumed_input: Some(2),
+                revised_us: Some(5),
+                first_revised_us: Some(4),
             }],
             ..Default::default()
         };
@@ -9825,9 +9827,15 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         let mut costless = content.clone();
-        costless.sources[0].upload_bytes = 0;
-        costless.sources[0].damage_px = 0;
-        costless.sources[0].consumed_input = None;
+        costless.sources[0].clear_costs();
+        assert_eq!(
+            (
+                costless.sources[0].upload_bytes,
+                costless.sources[0].revised_us,
+                costless.sources[0].first_revised_us,
+            ),
+            (0, None, None)
+        );
         let stamp = KmsPresentationTimestamp {
             seconds: 4,
             nanoseconds: 8,
