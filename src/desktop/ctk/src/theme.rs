@@ -4127,7 +4127,7 @@ mod tests {
                 let mut builder =
                     layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
                 builder.push_default(parley::StyleProperty::FontFamily(
-                    parley::FontFamily::Generic(generic).into(),
+                    parley::FontFamily::Single(generic.into()),
                 ));
                 builder.build_into(&mut layout, "sole label");
                 layout.break_all_lines(None);
