@@ -208,6 +208,7 @@ fn main() -> iced::Result {
             song.length_ticks,
             started.elapsed().as_secs_f64() * 1000.0
         );
+        roll::report_note_cap(&song);
         song
     });
     let tokens = theme::tokens().unwrap_or_else(|error| {

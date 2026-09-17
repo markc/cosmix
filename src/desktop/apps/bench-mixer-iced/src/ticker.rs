@@ -5,12 +5,13 @@
 //! an async runtime (`iced::time::every` needs the `tokio` or `smol` feature,
 //! whose threads would land in the wakeup measurement), so the clock is a
 //! widget instead: on each `RedrawRequested` it asks the shell for the next
-//! redraw at the next tick boundary, and publishes the tick when it changes.
-//! That is the same mechanism `LevelMeter` uses for its peak line, and the
-//! counterpart of the Bevy arm's `WinitSettings::reactive_low_power`.
+//! redraw and publishes the tick when it changes. That is the same mechanism
+//! `LevelMeter` uses for its peak line, and the counterpart of the Bevy arm's
+//! `WinitSettings` modes.
 //!
-//! When nothing animates it schedules nothing, so the window is drawn once
-//! and the process then sleeps until input arrives.
+//! The schedule matches the Bevy arm's exactly: continuous for [`WARMUP`],
+//! then one wake per feed tick in an animated mode, and none at all in an
+//! idle one — the window is drawn and the process sleeps until input arrives.
 
 use std::time::{Duration, Instant};
 
@@ -24,11 +25,21 @@ use iced_core::{
 /// Wake this long after a tick boundary, so the woken frame sees the new tick
 /// (the Bevy arm's `TICK_SLACK`).
 pub const TICK_SLACK: Duration = Duration::from_micros(500);
-/// One further redraw is scheduled this long after the first, so a run whose
-/// very first frame drew before fonts and layout settled is not left showing
-/// it forever in a mode that never redraws again. One wake, not the Bevy
-/// arm's second of continuous drawing.
+/// The run redraws continuously for this long before the reactive schedule
+/// takes over, so fonts, layout and the first tile pass settle the same way
+/// they do in the Bevy arm (whose `WARMUP` is the same second). Measurement
+/// starts after it.
 pub const WARMUP: Duration = Duration::from_secs(1);
+
+/// What the next redraw should be after a frame drawn at `elapsed` into the
+/// run. `Wait` leaves the window asleep until input arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Still warming up: draw again as soon as the compositor will take it.
+    Frame,
+    At(Instant),
+    Wait,
+}
 
 /// The instant tick `tick` starts, counted from `started`.
 fn tick_start(started: Instant, tick: u64) -> Instant {
@@ -36,11 +47,17 @@ fn tick_start(started: Instant, tick: u64) -> Instant {
 }
 
 /// When the next redraw is wanted after a frame drawn at `elapsed` into the
-/// run, and the tick that frame shows. `None` leaves the window asleep.
-fn schedule(started: Instant, elapsed: Duration, animated: bool, warmed: bool) -> Option<Instant> {
-    let animation = animated.then(|| tick_start(started, tick_at(elapsed) + 1) + TICK_SLACK);
-    let warmup = (!warmed).then(|| started + WARMUP);
-    [animation, warmup].into_iter().flatten().min()
+/// run. Continuous while warming up; then one wake per feed tick in an
+/// animated mode, and nothing at all in an idle one.
+fn schedule(started: Instant, elapsed: Duration, animated: bool) -> Next {
+    if elapsed < WARMUP {
+        return Next::Frame;
+    }
+    if animated {
+        Next::At(tick_start(started, tick_at(elapsed) + 1) + TICK_SLACK)
+    } else {
+        Next::Wait
+    }
 }
 
 /// Run clock, per widget tree.
@@ -48,7 +65,6 @@ fn schedule(started: Instant, elapsed: Duration, animated: bool, warmed: bool) -
 struct Clock {
     /// Set by the first frame; the run's time origin.
     started: Option<Instant>,
-    warmed: bool,
 }
 
 /// Publishes the feed tick and schedules the redraw that carries the next one.
@@ -111,10 +127,10 @@ impl<Message, Theme, Renderer: renderer::Renderer> Widget<Message, Theme, Render
         let clock = tree.state.downcast_mut::<Clock>();
         let started = *clock.started.get_or_insert(*now);
         let elapsed = now.saturating_duration_since(started);
-        let warmed = clock.warmed;
-        clock.warmed = warmed || elapsed >= WARMUP;
-        if let Some(at) = schedule(started, elapsed, self.animated, warmed) {
-            shell.request_redraw_at(at);
+        match schedule(started, elapsed, self.animated) {
+            Next::Frame => shell.request_redraw(),
+            Next::At(at) => shell.request_redraw_at(at),
+            Next::Wait => {}
         }
         let tick = tick_at(elapsed);
         if tick != self.current {
@@ -151,21 +167,27 @@ mod tests {
     fn an_idle_warmed_run_schedules_nothing() {
         let started = Instant::now();
         assert_eq!(
-            schedule(started, Duration::from_secs(5), false, true),
-            None,
+            schedule(started, Duration::from_secs(5), false),
+            Next::Wait,
             "an idle arm must let the window sleep"
         );
     }
 
     #[test]
-    fn warmup_is_scheduled_once_even_when_idle() {
+    fn warmup_is_continuous_in_every_mode_and_ends_on_time() {
         let started = Instant::now();
-        assert_eq!(
-            schedule(started, Duration::ZERO, false, false),
-            Some(started + WARMUP)
-        );
-        // ...and never again once it has passed.
-        assert_eq!(schedule(started, WARMUP, false, true), None);
+        for animated in [false, true] {
+            for elapsed in [Duration::ZERO, Duration::from_millis(500), WARMUP - TICK_SLACK] {
+                assert_eq!(
+                    schedule(started, elapsed, animated),
+                    Next::Frame,
+                    "animated {animated} at {elapsed:?}"
+                );
+            }
+        }
+        // The instant it closes, the reactive schedule takes over.
+        assert_eq!(schedule(started, WARMUP, false), Next::Wait);
+        assert!(matches!(schedule(started, WARMUP, true), Next::At(_)));
     }
 
     #[test]
@@ -174,7 +196,9 @@ mod tests {
         // 1.5 s in: tick 45 is showing, so the next wake carries tick 46.
         let elapsed = Duration::from_millis(1500);
         assert_eq!(tick_at(elapsed), 45);
-        let at = schedule(started, elapsed, true, true).unwrap();
+        let Next::At(at) = schedule(started, elapsed, true) else {
+            panic!("an animated run past warm-up must schedule a wake");
+        };
         assert_eq!(at, tick_start(started, 46) + TICK_SLACK);
         assert!(at > started + elapsed, "the wake must be in the future");
         // The slack puts the wake past the boundary, so the frame it draws
@@ -183,16 +207,22 @@ mod tests {
     }
 
     #[test]
-    fn the_nearer_of_the_two_wakes_wins() {
+    fn an_animated_run_wakes_once_per_tick_and_no_more() {
         let started = Instant::now();
-        // Early on the next tick is nearer, so an animated run never stalls
-        // waiting for the warm-up wake.
-        let early = schedule(started, Duration::ZERO, true, false).unwrap();
-        assert_eq!(early, tick_start(started, 1) + TICK_SLACK);
-        assert!(early < started + WARMUP);
-        // Just before the warm-up window closes, that wake is the nearer one
-        // and takes the slot; the tick after it is asked for on the next frame.
-        let late = schedule(started, Duration::from_millis(990), true, false).unwrap();
-        assert_eq!(late, started + WARMUP);
+        // Walk the wakes the way the widget does and count the ticks they
+        // land on: one wake per tick, strictly increasing, no repeats.
+        let mut elapsed = WARMUP;
+        let mut ticks = Vec::new();
+        for _ in 0..90 {
+            let Next::At(at) = schedule(started, elapsed, true) else {
+                panic!("expected a scheduled wake");
+            };
+            elapsed = at.saturating_duration_since(started);
+            ticks.push(tick_at(elapsed));
+        }
+        assert!(ticks.windows(2).all(|w| w[1] == w[0] + 1), "{ticks:?}");
+        // 90 ticks at 30 Hz is three seconds of run time, not more.
+        let span = elapsed.saturating_sub(WARMUP).as_secs_f64();
+        assert!((span - 3.0).abs() < 0.01, "90 wakes spanned {span} s");
     }
 }

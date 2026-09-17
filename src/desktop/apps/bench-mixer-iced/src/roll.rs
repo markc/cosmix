@@ -15,6 +15,9 @@
 //! left off on purpose: the Bevy arm draws none, so drawing one here would be
 //! the parity difference.
 
+use cosmix_bench_feed::roll::{
+    ROLL_MAX_VISIBLE_NOTES, ROLL_SCRIPT_SWEEP_TICKS, ROLL_SCRIPT_ZOOM_TICKS, roll_script,
+};
 use cosmix_bench_feed::{BenchSong, RollViewport};
 use cosmix_iced_widgets::piano_roll::{MAX_PIXELS_PER_BEAT, MIN_PIXELS_PER_BEAT};
 use cosmix_iced_widgets::{Note, PianoRoll, RollNotes, RollView, Tokens};
@@ -60,6 +63,47 @@ pub fn roll_view(viewport: RollViewport, song: &BenchSong, width: f32, height: f
     }
 }
 
+/// The most notes any scripted viewport puts on screen at once.
+///
+/// The Bevy arm caps its draw at [`ROLL_MAX_VISIBLE_NOTES`] and warns when it
+/// drops any; `PianoRoll` has no such cap, so the arms would silently draw
+/// different note counts if the cap ever bound. Rather than fake a cap — a
+/// per-frame filter would rebuild `RollNotes` and throw away the widget's
+/// tile cache on every frame, which is the very thing being measured — the
+/// run walks the deterministic script once at startup and says so.
+///
+/// Stride is one tick in 7: the zoom and sweep periods are 600 and 1800
+/// ticks, so a coprime stride visits every part of both without evaluating
+/// all 3600 viewports.
+fn peak_visible_notes(song: &BenchSong) -> usize {
+    let mut visible = Vec::new();
+    let mut peak = 0;
+    let period = ROLL_SCRIPT_ZOOM_TICKS.max(2 * ROLL_SCRIPT_SWEEP_TICKS);
+    for tick in (0..period).step_by(7) {
+        roll_script(song, tick).visible_notes_into(song, &mut visible);
+        peak = peak.max(visible.len());
+    }
+    peak
+}
+
+/// Warns, once per run, if the roll's note cap would bind — in which case the
+/// two arms no longer draw the same thing and the comparison is void.
+pub fn report_note_cap(song: &BenchSong) {
+    let peak = peak_visible_notes(song);
+    if peak >= ROLL_MAX_VISIBLE_NOTES {
+        eprintln!(
+            "bench-mixer-iced: PARITY: the scripted roll shows up to {peak} notes, at or over \
+             the {ROLL_MAX_VISIBLE_NOTES}-note cap the Bevy arm drops at; PianoRoll has no cap, \
+             so the arms draw different note counts and this roll run is not comparable"
+        );
+    } else {
+        eprintln!(
+            "bench-mixer-iced: roll peaks at {peak} visible notes, under the \
+             {ROLL_MAX_VISIBLE_NOTES}-note cap; neither arm drops any"
+        );
+    }
+}
+
 pub fn view<'a>(bench: &'a Bench, tokens: Tokens) -> Element<'a, Message> {
     let style = tokens.audio_style();
     container(
@@ -82,7 +126,6 @@ pub fn view<'a>(bench: &'a Bench, tokens: Tokens) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmix_bench_feed::roll::roll_script;
     use cosmix_song::{Note as SongNote, Song, Track};
 
     /// A small multi-track song with the dense fixture's shape: 4/4 bars,
@@ -159,6 +202,24 @@ mod tests {
             assert!(view.pixels_per_beat <= MAX_PIXELS_PER_BEAT);
             assert!(view.scroll_beats >= 0.0);
         }
+    }
+
+    #[test]
+    fn the_note_cap_is_measured_against_the_whole_script() {
+        let song = song();
+        let peak = peak_visible_notes(&song);
+        // The stride must not miss the widest zoom: the peak it finds has to
+        // be at least what the widest scripted viewport actually shows.
+        let widest = roll_script(&song, ROLL_SCRIPT_ZOOM_TICKS / 2);
+        let mut visible = Vec::new();
+        widest.visible_notes_into(&song, &mut visible);
+        assert!(
+            peak >= visible.len(),
+            "peak {peak} missed the widest zoom's {}",
+            visible.len()
+        );
+        assert!(peak > 0, "the script must show notes at all");
+        assert!(peak <= song.notes.len());
     }
 
     #[test]
