@@ -1162,7 +1162,7 @@ mod tests {
         fn feed(&mut self, bytes: &[u8], parsed: impl Fn(&Crosswords<Listener>) -> bool) {
             self.child.write_all(bytes).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
-            while !parsed(&*self.terminal.grid.lock()) {
+            while !parsed(&self.terminal.grid.lock()) {
                 assert!(Instant::now() < deadline, "PTY bytes were never parsed");
                 std::thread::sleep(Duration::from_millis(5));
             }
