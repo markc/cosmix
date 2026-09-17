@@ -162,7 +162,7 @@ The control plane exposes ten verbs:
   and the value will not survive restart. The optional `generation` fences a
   `windows.s<id>.*` write (see Window identity below); it is refused on any
   other path.
-- `comp.pointer.watch` renews a three-second local pointer observation lease
+- `comp.pointer.watch` renews a three-second pointer observation lease
   and returns `{version:1,topic:"<service>.pointer.changed",lease_ms:3000}`.
   Subscribe before calling; renew about once per second while observation is
   wanted. The acknowledgement contains no pointer coordinates.
@@ -170,15 +170,19 @@ The control plane exposes ten verbs:
   title-bar button. Both fields are required.
 - `comp.window.restore {id?,generation?}` with no arguments restores the most
   recently minimised window, exactly like the `Super+Shift+M` binding; with
-  `{id,generation}` (both required together) it restores that window. Either
-  form un-minimises, raises and focuses the window.
+  `{id,generation}` (both required together) it restores that window. If the
+  window is minimised, either form un-minimises, raises and focuses it; if it
+  is not, nothing happens and the reply says `changed:false`.
 
 Both window verbs reply `{id,generation,title,app_id,minimized,changed}`;
 `changed:false` means the window was already in the requested state.
 `comp.window.restore {}` with nothing to restore replies rc 10
 `{"error":"not_found","minimized_count":N}`. While a session lock is active
 both verbs, and writes to `windows.s<id>.minimized`, reply
-`{"error":"locked"}`.
+`{"error":"locked"}`. An argument other than `id` or `generation` is refused
+with `{"error":"invalid_args","field":"<name>","allowed":["id","generation"]}`,
+so a typo such as `gen` cannot silently turn a fenced call into an unfenced
+one.
 
 No verb checks who the caller is. Any caller that noded delivers, local or from
 the WireGuard mesh, can read, write and watch; being on the mesh is the whole
@@ -194,7 +198,8 @@ outputs.o_<slug>.{name,default,x,y,width,height,scale,refresh_mhz,
 surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
                 maximized,fullscreen,minimized,decoration,
-                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
+                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id,
+                generation}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
                window_x,window_y,visible,pid}
@@ -226,14 +231,22 @@ Window rows add five read-only leaves. `generation` is the window's role
 generation (below). `window_x`/`window_y` are the window-geometry origin; `x`/`y`
 stay the buffer origin, which includes any client-side shadow. `visible` is
 effective on-screen visibility: use it to ask "is this on screen", and
-`minimized` for the user's minimise state. `pid` is the client's process id,
-or null when the compositor cannot read it. `focus.window.{id,generation}`
-names the window row that holds keyboard focus, both null when none does.
+`minimized` for the user's minimise state. `pid` is the process id of the
+client's socket peer, or null when the compositor cannot read it. A client
+reached through a proxy (waypipe, a sandbox, a PID namespace) reports the
+proxy's or namespace's view, which may not be the application's own pid.
+`focus.window.{id,generation}` names the managed window (xdg or X11) that
+holds keyboard focus, both null when none does.
 
 **Window identity.** A `wl_surface` keeps its `s<id>` when a client gives it a
 new role, so an id alone can name a different window than the one a script
 read. Every role assignment (including the role ending) takes a new,
-never-reused `generation`. Treat `{id, generation}` as the window's identity:
+never-reused `generation`. Unmapping and remapping the same role (a null
+buffer, then a new one) keeps it; an X11 window that is associated again
+counts as a new role.
+Every surface row publishes it as `surfaces.s<id>.generation`, and window rows
+repeat it. X11 windows have no `windows.*` row yet, so read their generation
+from `surfaces.s<id>`. Treat `{id, generation}` as the window's identity:
 the window verbs require both, and `comp.props.set` accepts `generation` on
 any `windows.s<id>.*` path. A mismatch replies rc 10
 `{"error":"stale_target","id","generation","current"}` and changes nothing.
@@ -487,7 +500,13 @@ serialised reply would exceed the effective broker-path ceiling. `N` is
 4 KiB of documented header/framing headroom. Immediately before sending, comp
 also measures the actual canonical response headers, correlation id and
 framing with the body and refuses any reply whose complete wire size would
-exceed that ceiling. Replies are never truncated. An absent broker never
+exceed that ceiling. Replies are never truncated.
+
+A `busy` reply to `comp.props.set` or a window verb means the reply missed its
+two-second budget or the queue was full at admission. If the request had
+already been queued, it can still be applied when the compositor drains the
+queue. A caller that gets `busy` should read the state again (for example
+`windows.s<id>.minimized`) before retrying, not retry blindly. An absent broker never
 delays compositor startup: the port thread reports `retrying` and reconnects
 independently. A registration rejection (collision, invalid SPEC 10 name or
 admission) is logged once, ends the port worker without renaming, and leaves

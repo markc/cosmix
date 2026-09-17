@@ -581,7 +581,7 @@ in-memory change and the changed event stand but the write to disk failed
 and the value will not survive restart. The optional <code>generation</code> fences a
 <code>windows.s&lt;id&gt;.*</code> write (see Window identity below); it is refused on any
 other path.</li>
-<li><code>comp.pointer.watch</code> renews a three-second local pointer observation lease
+<li><code>comp.pointer.watch</code> renews a three-second pointer observation lease
 and returns <code>{version:1,topic:"&lt;service&gt;.pointer.changed",lease_ms:3000}</code>.
 Subscribe before calling; renew about once per second while observation is
 wanted. The acknowledgement contains no pointer coordinates.</li>
@@ -589,15 +589,19 @@ wanted. The acknowledgement contains no pointer coordinates.</li>
 title-bar button. Both fields are required.</li>
 <li><code>comp.window.restore {id?,generation?}</code> with no arguments restores the most
 recently minimised window, exactly like the <code>Super+Shift+M</code> binding; with
-<code>{id,generation}</code> (both required together) it restores that window. Either
-form un-minimises, raises and focuses the window.</li>
+<code>{id,generation}</code> (both required together) it restores that window. If the
+window is minimised, either form un-minimises, raises and focuses it; if it
+is not, nothing happens and the reply says <code>changed:false</code>.</li>
 </ul>
 <p>Both window verbs reply <code>{id,generation,title,app_id,minimized,changed}</code>;
 <code>changed:false</code> means the window was already in the requested state.
 <code>comp.window.restore {}</code> with nothing to restore replies rc 10
 <code>{"error":"not_found","minimized_count":N}</code>. While a session lock is active
 both verbs, and writes to <code>windows.s&lt;id&gt;.minimized</code>, reply
-<code>{"error":"locked"}</code>.</p>
+<code>{"error":"locked"}</code>. An argument other than <code>id</code> or <code>generation</code> is refused
+with <code>{"error":"invalid_args","field":"&lt;name&gt;","allowed":["id","generation"]}</code>,
+so a typo such as <code>gen</code> cannot silently turn a fenced call into an unfenced
+one.</p>
 <p>No verb checks who the caller is. Any caller that noded delivers, local or from
 the WireGuard mesh, can read, write and watch; being on the mesh is the whole
 authorization. What the port still refuses is a malformed or mis-aimed request
@@ -609,7 +613,8 @@ outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
 surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
                 maximized,fullscreen,minimized,decoration,
-                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
+                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id,
+                generation}
 windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
                window_x,window_y,visible,pid}
@@ -639,13 +644,21 @@ separate bounded lanes; both abandon a sink wait after two seconds.</p>
 generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin; <code>x</code>/<code>y</code>
 stay the buffer origin, which includes any client-side shadow. <code>visible</code> is
 effective on-screen visibility: use it to ask "is this on screen", and
-<code>minimized</code> for the user's minimise state. <code>pid</code> is the client's process id,
-or null when the compositor cannot read it. <code>focus.window.{id,generation}</code>
-names the window row that holds keyboard focus, both null when none does.</p>
+<code>minimized</code> for the user's minimise state. <code>pid</code> is the process id of the
+client's socket peer, or null when the compositor cannot read it. A client
+reached through a proxy (waypipe, a sandbox, a PID namespace) reports the
+proxy's or namespace's view, which may not be the application's own pid.
+<code>focus.window.{id,generation}</code> names the managed window (xdg or X11) that
+holds keyboard focus, both null when none does.</p>
 <p><strong>Window identity.</strong> A <code>wl_surface</code> keeps its <code>s&lt;id&gt;</code> when a client gives it a
 new role, so an id alone can name a different window than the one a script
 read. Every role assignment (including the role ending) takes a new,
-never-reused <code>generation</code>. Treat <code>{id, generation}</code> as the window's identity:
+never-reused <code>generation</code>. Unmapping and remapping the same role (a null
+buffer, then a new one) keeps it; an X11 window that is associated again
+counts as a new role.
+Every surface row publishes it as <code>surfaces.s&lt;id&gt;.generation</code>, and window rows
+repeat it. X11 windows have no <code>windows.*</code> row yet, so read their generation
+from <code>surfaces.s&lt;id&gt;</code>. Treat <code>{id, generation}</code> as the window's identity:
 the window verbs require both, and <code>comp.props.set</code> accepts <code>generation</code> on
 any <code>windows.s&lt;id&gt;.*</code> path. A mismatch replies rc 10
 <code>{"error":"stale_target","id","generation","current"}</code> and changes nothing.
@@ -873,7 +886,12 @@ serialised reply would exceed the effective broker-path ceiling. <code>N</code> 
 4 KiB of documented header/framing headroom. Immediately before sending, comp
 also measures the actual canonical response headers, correlation id and
 framing with the body and refuses any reply whose complete wire size would
-exceed that ceiling. Replies are never truncated. An absent broker never
+exceed that ceiling. Replies are never truncated.</p>
+<p>A <code>busy</code> reply to <code>comp.props.set</code> or a window verb means the reply missed its
+two-second budget or the queue was full at admission. If the request had
+already been queued, it can still be applied when the compositor drains the
+queue. A caller that gets <code>busy</code> should read the state again (for example
+<code>windows.s&lt;id&gt;.minimized</code>) before retrying, not retry blindly. An absent broker never
 delays compositor startup: the port thread reports <code>retrying</code> and reconnects
 independently. A registration rejection (collision, invalid SPEC 10 name or
 admission) is logged once, ends the port worker without renaming, and leaves

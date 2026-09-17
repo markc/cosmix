@@ -28876,6 +28876,20 @@ fn serviced_control_reply(
     (rc, serde_json::from_str(&body).expect("control reply JSON"))
 }
 
+/// Service a props watch so the window-row diff lane runs.
+#[cfg(feature = "bus")]
+fn serviced_watch(
+    harness: &mut KeybindingHarness,
+    runtime: &tokio::runtime::Runtime,
+    admission: crate::port::ControlAdmission,
+) {
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    runtime.block_on(admission.receive()).expect("watch reply");
+}
+
 #[cfg(feature = "bus")]
 fn window_id_and_generation(harness: &KeybindingHarness, object: &ObjectId) -> (u64, u64) {
     let record = &harness.server.state.surfaces[object];
@@ -29114,13 +29128,15 @@ fn minimized_prop_round_trips_and_restores_that_window() {
 #[cfg(feature = "bus")]
 #[test]
 fn window_restore_verb_pops_lifo_then_reports_not_found() {
-    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
     let alpha = test_toplevel_record(&harness).role.wl_surface().id();
     let beta = map_test_undecorated_toplevel(&mut harness);
     let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
     let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
     let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
     for object in [&alpha, &beta] {
         let surface = harness.server.state.surfaces[object]
             .role
@@ -29128,11 +29144,13 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
             .clone();
         harness.server.state.minimize_toplevel(&surface);
     }
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
     let restore_any = crate::port::WindowOp::Restore { target: None };
 
-    for (expected_id, expected_generation, object) in [
-        (beta_id, beta_generation, &beta),
-        (alpha_id, alpha_generation, &alpha),
+    for (expected_id, expected_generation, object, other) in [
+        (beta_id, beta_generation, &beta, &alpha),
+        (alpha_id, alpha_generation, &alpha, &beta),
     ] {
         let admission = ingress
             .request_window(restore_any)
@@ -29149,6 +29167,28 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
             focused_surface(harness.server.state.keyboard.current_focus())
                 .map(|surface| surface.id()),
             Some(object.clone())
+        );
+        // Restore raises: the restored window ends above the other normal
+        // window (Alpha starts below Beta, so the second pass is the real
+        // check).
+        let surfaces = &harness.server.state.surfaces;
+        assert_eq!(surfaces[object].layout.z.band, StackBand::Normal);
+        assert!(surfaces[object].layout.z > surfaces[other].layout.z);
+        // The LIFO form attributes its changes to the verb, like the named
+        // forms.
+        port_observation::service_observations(&mut harness.server.state);
+        let changed = drain_observations(&observations);
+        let minimized_path = format!("windows.s{expected_id}.minimized");
+        assert!(
+            changed.iter().any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::PropsChanged {
+                    path,
+                    cause: "comp.window",
+                    ..
+                } if *path == minimized_path
+            )),
+            "restore {{}} reports cause comp.window: {changed:?}"
         );
     }
 
@@ -29197,6 +29237,57 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         assert_eq!(body["minimized"], false);
     }
     assert!(harness.server.state.minimized_toplevels.is_empty());
+}
+
+/// A Bus minimise that lands mid-drag ends the client-started move, as an
+/// unmap does: pointer motion while hidden, and after restore, never moves
+/// the window.
+#[cfg(feature = "bus")]
+#[test]
+fn mesh_minimise_cancels_a_client_move_in_progress() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let origin = harness.server.state.surfaces[&object].window_origin;
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Move {
+        surface,
+        start_pointer: (0.0, 0.0),
+        start_origin: origin,
+    });
+    let runtime = control_reply_runtime();
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Minimize { id, generation })
+        .expect("minimize admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.interactive_pointer.is_none());
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(150.0, 120.0)
+    );
+    assert_eq!(harness.server.state.surfaces[&object].window_origin, origin);
+
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Restore {
+            target: Some((id, generation)),
+        })
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(300.0, 240.0)
+    );
+    assert_eq!(harness.server.state.surfaces[&object].window_origin, origin);
 }
 
 /// The XWayland runtime switch as a props leaf: set round-trip, changed

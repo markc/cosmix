@@ -13208,6 +13208,13 @@ impl WaylandState {
         }) else {
             return;
         };
+        // A client-started move/resize must not keep steering a hidden
+        // window (a Bus minimise can land mid-drag), as on unmap.
+        if interactive_surface(self.interactive_pointer.as_ref())
+            .is_some_and(|interactive| interactive == surface)
+        {
+            self.interactive_pointer = None;
+        }
         // X11 windows also learn the state through EWMH so the client can
         // stop rendering.
         #[cfg(feature = "xwayland")]
