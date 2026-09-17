@@ -12,7 +12,7 @@
 mod nav;
 mod panel;
 
-pub use nav::{MenuState, NavOutcome, Navigator};
+pub use nav::{MenuState, NavOutcome, Navigator, PanelSpec};
 pub use panel::{MIN_PANEL_WIDTH, Panel, SEPARATOR_HEIGHT, panel_size, row_at, row_bounds};
 
 use iced_core::{
@@ -222,13 +222,22 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
         self
     }
 
-    /// The host's current state, for a host that also changes it (from its
-    /// popup surfaces or a compositor dismissal). Pass the last published or
-    /// host-updated value every view. Anchors in it are recomputed and
-    /// republished if they differ.
+    /// The host's current state, with `external_popups` (ignored without it).
+    /// A host that changes the state (popup surfaces, compositor dismissal)
+    /// must pass it: store every published value exactly as received, apply
+    /// your own changes to that copy, and pass it here every view. Anchors
+    /// that differ from the widget's are recomputed and republished, so a
+    /// host that drops or edits them makes the widget republish on every
+    /// event.
     pub fn state(mut self, state: &MenuState) -> Self {
         self.host_state = Some(state.clone());
         self
+    }
+
+    // Host state counts only in external mode: an overlay menu never
+    // publishes, so a host copy would keep closing it.
+    fn host_state(&self) -> Option<&MenuState> {
+        self.host_state.as_ref().filter(|_| self.external.is_some())
     }
 
     fn navigator(&self) -> Navigator<'_, Message> {
@@ -458,7 +467,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Menu<'_, Message, Theme, R
             return;
         };
         state.nav.anchors = self.anchors(renderer, state, bounds);
-        let believed = self.host_state.as_ref().unwrap_or(&state.reported);
+        let believed = self.host_state().unwrap_or(&state.reported);
         if *believed != state.nav {
             state.reported = state.nav.clone();
             shell.publish(on_change(state.nav.clone()));
@@ -476,6 +485,17 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Menu<'_, Message, Theme, R
         cursor: mouse::Cursor,
         shell: &mut Shell<'_, Message>,
     ) {
+        let touch_event;
+        let (event, cursor) =
+            if let Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) = event {
+                touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+                (
+                    &touch_event,
+                    mouse::Cursor::Available(*position - state.translation),
+                )
+            } else {
+                (event, cursor)
+            };
         let nav = self.navigator();
         let outcome = match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
@@ -496,6 +516,9 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Menu<'_, Message, Theme, R
             _ => NavOutcome::None,
         };
         let pressed = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)));
+        if !state.nav.is_open() {
+            state.hovered = None;
+        }
         self.finish(outcome, shell);
         if pressed || modal_input(event) {
             shell.capture_event();
@@ -548,9 +571,14 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         tree::Tag::of::<State>()
     }
     fn state(&self) -> tree::State {
-        let mut nav = self.host_state.clone().unwrap_or_default();
+        let mut nav = self.host_state().cloned().unwrap_or_default();
         self.navigator().validate(&mut nav);
         tree::State::new(State {
+            // A rebuilt context menu keeps its origin (translation is not
+            // known yet, so this is exact outside scrollables).
+            position: nav
+                .anchor(0)
+                .map_or(Point::ORIGIN, |anchor| anchor.position()),
             nav,
             ..State::default()
         })
@@ -565,7 +593,8 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             tree.children.clear();
         }
         let state = tree.state.downcast_mut::<State>();
-        if let Some(host) = &self.host_state
+        let was_open = state.nav.is_open();
+        if let Some(host) = self.host_state()
             && (host.root != state.nav.root || host.path != state.nav.path)
         {
             state.nav = host.clone();
@@ -573,6 +602,9 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         // Rebuilt/dynamic menu models must never retain an invalid navigation
         // path. External mode republishes the closed state on its next event.
         self.navigator().validate(&mut state.nav);
+        if was_open && !state.nav.is_open() {
+            state.hovered = None;
+        }
     }
     fn layout(
         &mut self,
@@ -739,6 +771,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             // A popup surface taking focus must not close an external menu.
             if state.nav.is_open() && !external {
                 self.navigator().close(&mut state.nav);
+                state.hovered = None;
                 shell.request_redraw();
             }
         }
@@ -1078,6 +1111,11 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         };
         if modal_input(event) || matches!(event, Event::Mouse(_)) {
             shell.capture_event();
+        }
+        if !self.state.nav.is_open() {
+            // As before the navigator refactor: a closed bar shows no stale
+            // title highlight.
+            self.state.hovered = None;
         }
         match outcome {
             NavOutcome::None => {}
@@ -1663,6 +1701,51 @@ mod tests {
             iced_core::window::RedrawRequest::NextFrame
         );
         assert_eq!(harness.tree.state.downcast_ref::<State>().hovered, None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn closing_clears_the_title_highlight_and_host_state_needs_external_mode() {
+        let mut harness = Harness::new(Menu::bar(vec![Item::submenu("menu", items())]));
+        let at = Point::new(5.0, 5.0);
+        harness.event(
+            Event::Mouse(mouse::Event::CursorMoved { position: at }),
+            mouse::Cursor::Available(at),
+            false,
+        );
+        harness.event(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            mouse::Cursor::Available(at),
+            false,
+        );
+        let state = harness.tree.state.downcast_ref::<State>();
+        assert!(state.nav.is_open());
+        assert_eq!(state.hovered, Some(0));
+        harness.event(
+            key_event(Named::Escape, keyboard::Modifiers::empty()),
+            mouse::Cursor::Unavailable,
+            true,
+        );
+        let state = harness.tree.state.downcast_ref::<State>();
+        assert!(!state.nav.is_open());
+        assert_eq!(state.hovered, None);
+
+        let open = MenuState {
+            root: Some(0),
+            path: vec![None],
+            anchors: Vec::new(),
+        };
+        let overlay_menu = Harness::new(
+            Menu::context(iced_widget::Space::new().width(200).height(100), items()).state(&open),
+        );
+        assert!(
+            !overlay_menu
+                .tree
+                .state
+                .downcast_ref::<State>()
+                .nav
+                .is_open()
+        );
     }
 
     #[test]

@@ -29,6 +29,24 @@ impl MenuState {
     pub fn is_open(&self) -> bool {
         self.root.is_some()
     }
+
+    /// The anchor of panel `level`, once the menu widget has computed it.
+    pub fn anchor(&self, level: usize) -> Option<Rectangle> {
+        self.anchors.get(level).copied()
+    }
+}
+
+/// A panel a host should show on its own surface; see `Navigator::open_panels`.
+#[derive(Debug)]
+pub struct PanelSpec<'a, Message> {
+    /// Panel depth: 0 is the first popup.
+    pub level: usize,
+    /// The rows to show (never empty).
+    pub items: &'a [Item<Message>],
+    /// The selected row.
+    pub selected: Option<usize>,
+    /// Where to anchor the popup (see `MenuState::anchors`).
+    pub anchor: Rectangle,
 }
 
 /// What a navigation step did.
@@ -112,6 +130,31 @@ impl<'a, Message: Clone> Navigator<'a, Message> {
                 .unwrap_or(&[]);
         }
         items
+    }
+
+    /// The panels to show, outermost first: every open level that has rows
+    /// and an anchor. A panel with no rows (a top-level action or an empty
+    /// submenu) is skipped, since a popup surface cannot have zero size; so is
+    /// a level whose anchor the menu widget has not supplied yet (it does so on
+    /// its next event), and everything below it.
+    pub fn open_panels(&self, state: &MenuState) -> Vec<PanelSpec<'a, Message>> {
+        let mut panels = Vec::new();
+        for (level, selected) in state.path.iter().enumerate() {
+            let Some(anchor) = state.anchor(level) else {
+                break;
+            };
+            let items = self.panel(state, level);
+            if items.is_empty() {
+                break;
+            }
+            panels.push(PanelSpec {
+                level,
+                items,
+                selected: *selected,
+                anchor,
+            });
+        }
+        panels
     }
 
     /// Opens `root` (ignored for context menus). A keyboard open selects the
@@ -307,7 +350,8 @@ impl<'a, Message: Clone> Navigator<'a, Message> {
     }
 
     /// Closes a menu whose state no longer fits the items (after the app
-    /// rebuilt them): a vanished or disabled root or selected row.
+    /// rebuilt them): a vanished or disabled root or selected row, or an open
+    /// state with no panel.
     pub fn validate(&self, state: &mut MenuState) -> NavOutcome<Message> {
         let Some(root) = state.root else {
             return NavOutcome::None;
@@ -320,7 +364,7 @@ impl<'a, Message: Clone> Navigator<'a, Message> {
                     .is_none_or(|item| !item.selectable())
             })
         });
-        if bad_root || bad_row {
+        if bad_root || bad_row || state.path.is_empty() {
             self.close(state)
         } else {
             NavOutcome::None
@@ -356,11 +400,30 @@ fn close(state: &mut MenuState) {
     state.anchors.clear();
 }
 
+// Also drops anchors the step made stale: all of them when the root changed,
+// otherwise those below the first changed selection. The menu widget refills
+// them; until then a host shows only anchored panels (`open_panels`).
 fn outcome<Message>(
     before: &MenuState,
-    after: &MenuState,
+    after: &mut MenuState,
     activated: Option<Message>,
 ) -> NavOutcome<Message> {
+    if before.root != after.root {
+        after.anchors.clear();
+    } else {
+        let unchanged = before
+            .path
+            .iter()
+            .zip(&after.path)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let keep = if before.path == after.path {
+            after.path.len()
+        } else {
+            unchanged + 1
+        };
+        after.anchors.truncate(keep.min(after.path.len()));
+    }
     if let Some(message) = activated {
         NavOutcome::Activated(message)
     } else if before.is_open() && !after.is_open() {
@@ -572,6 +635,53 @@ mod tests {
         // Context navigators ignore root entry calls.
         let context = Navigator::context(&menus);
         assert_eq!(context.click_root(&mut state, 0), NavOutcome::None);
+    }
+
+    #[test]
+    fn stale_anchors_are_dropped_and_open_panels_skip_unshowable_levels() {
+        let menus = vec![
+            Item::submenu("file", items()),
+            Item::submenu("edit", items()),
+            Item::action("go", 9),
+        ];
+        let nav = Navigator::bar(&menus);
+        let anchor = |n: f32| Rectangle::new(iced_core::Point::new(n, n), iced_core::Size::UNIT);
+        let mut state = MenuState {
+            root: Some(0),
+            path: vec![Some(3), Some(1)],
+            anchors: vec![anchor(0.0), anchor(1.0)],
+        };
+        let panels = nav.open_panels(&state);
+        assert_eq!(panels.len(), 2);
+        assert_eq!((panels[1].level, panels[1].selected), (1, Some(1)));
+        assert_eq!(panels[1].items.len(), 2);
+        assert_eq!(panels[1].anchor, anchor(1.0));
+        // Moving within the deepest panel keeps every anchor.
+        nav.key(&mut state, &key(Named::ArrowUp));
+        assert_eq!(state.path, [Some(3), Some(1)]);
+        assert_eq!(state.anchors.len(), 2);
+        // Changing panel 0's selection invalidates the submenu's anchor.
+        nav.hover(&mut state, 0, Some(2));
+        assert_eq!(state.anchors, [anchor(0.0)]);
+        // Opening a submenu adds a level with no anchor yet: not shown.
+        nav.hover(&mut state, 0, Some(3));
+        assert_eq!(state.path.len(), 2);
+        assert_eq!(nav.open_panels(&state).len(), 1);
+        // Switching roots drops every anchor.
+        nav.hover_root(&mut state, 1);
+        assert!(state.anchors.is_empty());
+        assert!(nav.open_panels(&state).is_empty());
+        // A top-level action's empty panel is never shown.
+        nav.open(&mut state, 2, true);
+        state.anchors = vec![anchor(0.0)];
+        assert!(nav.open_panels(&state).is_empty());
+        // An open state with no panel is closed by validation.
+        let mut empty = MenuState {
+            root: Some(0),
+            path: Vec::new(),
+            anchors: Vec::new(),
+        };
+        assert_eq!(nav.validate(&mut empty), NavOutcome::Closed);
     }
 
     #[test]
