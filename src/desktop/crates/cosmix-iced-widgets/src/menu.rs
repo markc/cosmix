@@ -198,14 +198,16 @@ impl Operation for ChildFocus {
 }
 
 // State-only events that content must see even while a menu is open. IME
-// preedit and commit are input, so the open menu blocks them like key presses.
+// preedit text and commits are input, so the open menu blocks them like key
+// presses; an empty preedit only clears a composition in flight, so it passes.
 fn housekeeping(event: &Event) -> bool {
-    matches!(
-        event,
+    match event {
         Event::Window(_)
-            | Event::InputMethod(input_method::Event::Opened | input_method::Event::Closed)
-            | Event::Keyboard(keyboard::Event::ModifiersChanged(_))
-    )
+        | Event::InputMethod(input_method::Event::Opened | input_method::Event::Closed)
+        | Event::Keyboard(keyboard::Event::ModifiersChanged(_)) => true,
+        Event::InputMethod(input_method::Event::Preedit(content, _)) => content.is_empty(),
+        _ => false,
+    }
 }
 
 fn next<Message>(items: &[Item<Message>], selected: Option<usize>, forward: bool) -> Option<usize> {
@@ -1047,9 +1049,10 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
             Event::Keyboard(
                 keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. },
             )
-            | Event::InputMethod(
-                input_method::Event::Preedit(..) | input_method::Event::Commit(_),
-            ) => shell.capture_event(),
+            | Event::InputMethod(input_method::Event::Commit(_)) => shell.capture_event(),
+            Event::InputMethod(input_method::Event::Preedit(..)) if !housekeeping(event) => {
+                shell.capture_event()
+            }
             Event::Mouse(mouse::Event::CursorMoved { .. })
             | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let clicked = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)));
@@ -1332,6 +1335,17 @@ mod tests {
             "an open menu blocks key presses and IME text from the app behind it"
         );
         assert!(messages.is_empty());
+        // A clearing preedit is state, not input: it reaches the field.
+        let (_, statuses) = ui.update(
+            &[Event::InputMethod(
+                iced::advanced::input_method::Event::Preedit(String::new(), None),
+            )],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [iced::event::Status::Ignored]);
         let (_, statuses) = ui.update(
             &[
                 Event::Keyboard(keyboard::Event::ModifiersChanged(
