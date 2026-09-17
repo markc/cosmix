@@ -56,10 +56,13 @@ pub fn iced_theme(tokens: Tokens) -> Theme {
     )
 }
 
-/// Background of a channel strip; the master strip is lifted the way CTK's
-/// `MASTER_PANEL` token is.
+/// Background of a channel strip. The Bevy arm takes the channel panel from
+/// the design's second background rung and the master's from the third
+/// (`ctk.panel` = bg2, `ctk.master.panel` = bg3); the iced token set names its
+/// raised surfaces instead, so `card` carries the channel strips and
+/// `popover` the master's lift.
 pub fn strip_background(tokens: Tokens, master: bool) -> Color {
-    if master { tokens.muted_surface } else { tokens.card }
+    if master { tokens.popover } else { tokens.card }
 }
 
 #[cfg(test)]
@@ -77,9 +80,17 @@ mod tests {
         let audio = tokens.audio_style();
         assert_eq!(audio.background, tokens.card);
         assert_ne!(audio.meter_clip, audio.meter_low);
+        // The master strip must be visibly lifted off the channel strips, as
+        // CTK's bg3-over-bg2 is; if the design ever collapses those rungs the
+        // arm needs a different pair, not a silent flat board.
         assert_ne!(
             strip_background(tokens, true),
-            strip_background(tokens, false)
+            strip_background(tokens, false),
+            "master/channel panels collapsed; surface={:?} card={:?} popover={:?} muted={:?}",
+            tokens.surface,
+            tokens.card,
+            tokens.popover,
+            tokens.muted_surface
         );
     }
 

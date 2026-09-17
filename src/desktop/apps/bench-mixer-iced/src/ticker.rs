@@ -183,14 +183,16 @@ mod tests {
     }
 
     #[test]
-    fn the_warmup_wake_wins_while_it_is_still_the_nearer_one() {
+    fn the_nearer_of_the_two_wakes_wins() {
         let started = Instant::now();
+        // Early on the next tick is nearer, so an animated run never stalls
+        // waiting for the warm-up wake.
         let early = schedule(started, Duration::ZERO, true, false).unwrap();
         assert_eq!(early, tick_start(started, 1) + TICK_SLACK);
         assert!(early < started + WARMUP);
-        // Late in the warm-up window the tick wake is still the nearer one,
-        // so scheduling never stalls waiting for warm-up.
+        // Just before the warm-up window closes, that wake is the nearer one
+        // and takes the slot; the tick after it is asked for on the next frame.
         let late = schedule(started, Duration::from_millis(990), true, false).unwrap();
-        assert!(late < started + WARMUP);
+        assert_eq!(late, started + WARMUP);
     }
 }
