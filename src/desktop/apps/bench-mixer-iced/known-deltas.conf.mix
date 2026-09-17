@@ -30,6 +30,11 @@ known_deltas: {
       arm: "iced",
       item: "roll-playhead",
       reason: "PianoRoll can draw a playhead on its own layer but the Bevy arm draws none, so the iced arm passes None: the absence is the parity choice, not a missing feature"
+    },
+    {
+      arm: "iced",
+      item: "panel-rung-colours",
+      reason: "CTK reads the design's three background rungs (palette.background.1/2/3) for the window, strip and master panels; cosmix_iced_widgets::Tokens maps colour pairs instead, and in Ocean/Dark base, card, popover and muted all resolve to #020709, so the iced arm takes its two lifts from border and selection - three separated rungs in the same order, different exact values"
     }
   ]
 }

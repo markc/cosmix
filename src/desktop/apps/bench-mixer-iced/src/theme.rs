@@ -56,13 +56,30 @@ pub fn iced_theme(tokens: Tokens) -> Theme {
     )
 }
 
-/// Background of a channel strip. The Bevy arm takes the channel panel from
-/// the design's second background rung and the master's from the third
-/// (`ctk.panel` = bg2, `ctk.master.panel` = bg3); the iced token set names its
-/// raised surfaces instead, so `card` carries the channel strips and
-/// `popover` the master's lift.
+/// Background of a channel strip.
+///
+/// The Bevy arm has three background rungs to work with — `ctk.surface`,
+/// `ctk.panel` and `ctk.master.panel` are the design's `palette.background.1`,
+/// `.2` and `.3`, which CTK's `web_anchor_verbatim` test pins to the compiled
+/// design. `cosmix_iced_widgets::Tokens` maps colour *pairs* instead, and in
+/// the Ocean/Dark design `base`, `card`, `popover` and `muted` all resolve to
+/// the same near-black (#020709), so taking the panels from there would draw a
+/// single flat board with no strip edges at all.
+///
+/// So the two lifts come from the next two colours this design does separate:
+/// `border` for the channel panels and `selection` for the master's further
+/// lift. The exact values are not CTK's bg2/bg3 — that is an accepted parity
+/// delta (`known-deltas.conf.mix`, `panel-rung-colours`) and it goes away when
+/// `Tokens` exposes the background rungs. [`the_panels_are_three_distinct_rungs`]
+/// fails rather than letting the board go flat if the design ever moves.
 pub fn strip_background(tokens: Tokens, master: bool) -> Color {
-    if master { tokens.popover } else { tokens.card }
+    if master { tokens.selection } else { tokens.border }
+}
+
+/// Perceptual-ish ordering key; only used to assert the rungs stay separated.
+#[cfg(test)]
+fn luma(colour: Color) -> f32 {
+    0.2126 * colour.r + 0.7152 * colour.g + 0.0722 * colour.b
 }
 
 #[cfg(test)]
@@ -74,12 +91,30 @@ mod tests {
         let tokens = tokens().expect("the embedded Ocean/Dark design compiles");
         // A dark scheme: the surface must be darker than the text on it,
         // which also proves the linear -> sRGB conversion did not invert.
-        let luma = |c: Color| c.r + c.g + c.b;
         assert!(luma(tokens.surface) < luma(tokens.text));
         assert!(tokens.radius > 0.0);
         let audio = tokens.audio_style();
         assert_eq!(audio.background, tokens.card);
         assert_ne!(audio.meter_clip, audio.meter_low);
+    }
+
+    /// The board must read as window, strip, master: three separated rungs,
+    /// each lighter than the last, with the fader and meter wells sunk back
+    /// into the darkest of them. If a design change collapses any of that,
+    /// this fails instead of the arm quietly drawing a flat rectangle.
+    #[test]
+    fn the_panels_are_three_distinct_rungs() {
+        let tokens = tokens().unwrap();
+        let window = tokens.surface;
+        let channel = strip_background(tokens, false);
+        let master = strip_background(tokens, true);
+        assert!(
+            luma(window) < luma(channel) && luma(channel) < luma(master),
+            "window {window:?} < channel {channel:?} < master {master:?} must hold"
+        );
+        // The fader and meter wells have to stay visible inside a strip.
+        let well = tokens.audio_style().track;
+        assert!(luma(well) < luma(channel), "well {well:?} in {channel:?}");
     }
 
     /// Not an assertion: the resolved palette, so a reader can see which
