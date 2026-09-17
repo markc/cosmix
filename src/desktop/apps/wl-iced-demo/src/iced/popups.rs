@@ -59,9 +59,28 @@ impl Program for PanelProgram {
     }
 }
 
+/// Identifies which rows a panel shows: the bar root it hangs off, and the
+/// rows selected above it. Two panels with equal keys show the same thing, so
+/// the popup can stay open across a state change.
+type PanelKey = (Option<usize>, Vec<Option<usize>>);
+
+/// The key of the panel at `level` of `state`.
+fn panel_key(root: Option<usize>, path: &[Option<usize>], level: usize) -> PanelKey {
+    (root, path[..level].to_vec())
+}
+
+/// How many already-open popups survive a move to `wanted`: the length of the
+/// common prefix. Everything above is closed by closing the popup at `keep`,
+/// which takes its children with it, and `wanted[keep..]` is then opened.
+fn keep_count<'a>(open: impl IntoIterator<Item = &'a PanelKey>, wanted: &[PanelKey]) -> usize {
+    open.into_iter()
+        .zip(wanted)
+        .take_while(|(open, wanted)| open == wanted)
+        .count()
+}
+
 struct OpenPanel {
-    /// The rows leading to this panel; equal keys mean the same popup.
-    key: (usize, Vec<Option<usize>>),
+    key: PanelKey,
     id: SurfaceId,
     surface: Surface<PanelProgram>,
 }
@@ -158,13 +177,11 @@ impl MenuPopups {
     ) {
         self.fill_anchors(nav, state);
         let specs = nav.open_panels(state);
-        let key = |level: usize| (state.root.unwrap_or(0), state.path[..level].to_vec());
-        let keep = self
-            .panels
+        let wanted: Vec<PanelKey> = specs
             .iter()
-            .zip(&specs)
-            .take_while(|(panel, spec)| panel.key == key(spec.level))
-            .count();
+            .map(|spec| panel_key(state.root, &state.path, spec.level))
+            .collect();
+        let keep = keep_count(self.panels.iter().map(|panel| &panel.key), &wanted);
         if keep < self.panels.len() {
             cx.close_popup(self.panels[keep].id);
             self.panels.truncate(keep);
@@ -200,7 +217,7 @@ impl MenuPopups {
                 },
             );
             self.panels.push(OpenPanel {
-                key: key(spec.level),
+                key: panel_key(state.root, &state.path, spec.level),
                 id,
                 surface,
             });
@@ -302,6 +319,53 @@ mod tests {
         assert_eq!(spec.anchor_rect, Rect::new(116, 0, 56, 28));
         assert_eq!(spec.anchor, Anchor::BottomLeft);
         assert!(spec.grab);
+    }
+
+    /// The open panel chain for a menu rooted at `root` whose selected rows
+    /// are `rows`: one key per open panel, as `sync` keys them.
+    fn chain(root: usize, rows: &[Option<usize>]) -> Vec<PanelKey> {
+        (0..rows.len())
+            .map(|level| panel_key(Some(root), rows, level))
+            .collect()
+    }
+
+    /// What `sync` does with these two chains: (kept, closed, opened).
+    fn reconcile(open: &[PanelKey], wanted: &[PanelKey]) -> (usize, usize, usize) {
+        let keep = keep_count(open.iter(), wanted);
+        (keep, open.len() - keep, wanted.len() - keep)
+    }
+
+    #[test]
+    fn a_hover_onto_another_bar_root_reopens_from_scratch() {
+        // Even panel 0 shows a different root menu, so nothing survives.
+        let open = chain(0, &[Some(2)]);
+        let wanted = chain(1, &[Some(0)]);
+        assert_eq!(reconcile(&open, &wanted), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_growing_submenu_chain_keeps_every_open_panel() {
+        let open = chain(2, &[Some(0)]);
+        let wanted = chain(2, &[Some(0), Some(1)]);
+        assert_eq!(reconcile(&open, &wanted), (1, 0, 1));
+    }
+
+    #[test]
+    fn a_shrinking_chain_closes_from_the_first_level_that_differs() {
+        let open = chain(2, &[Some(0), Some(1), Some(3)]);
+        // Walking back out of the deepest submenu closes just that popup;
+        // close_tree(panels[keep]) is what takes any children with it.
+        assert_eq!(reconcile(&open, &chain(2, &[Some(0), Some(1)])), (2, 1, 0));
+        // Hovering a different row at level 0 invalidates everything under it.
+        assert_eq!(reconcile(&open, &chain(2, &[Some(5), Some(1)])), (1, 2, 1));
+        // Closing the menu outright closes the lot.
+        assert_eq!(reconcile(&open, &[]), (0, 3, 0));
+    }
+
+    #[test]
+    fn an_unchanged_chain_is_a_no_op() {
+        let open = chain(1, &[Some(4), None, Some(2)]);
+        assert_eq!(reconcile(&open, &open.clone()), (3, 0, 0));
     }
 
     #[test]
