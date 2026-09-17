@@ -21,10 +21,28 @@ use iced_graphics::text::Text;
 use iced_graphics::text::cosmic_text::AttrsList;
 use iced_tiny_skia::Layer;
 
-/// Glyph ink can leave a paragraph's measured bounds (overhang, hinting,
-/// antialiasing); quads antialias one pixel out.
-const TEXT_MARGIN: f32 = 2.0;
+/// Glyph ink can leave a run's measured bounds (overhang, hinting,
+/// antialiasing), by more the larger the text is: the margin is this
+/// fraction of the line height, and never less than [`TEXT_MARGIN_MIN`].
+const TEXT_MARGIN_RATIO: f32 = 0.25;
+const TEXT_MARGIN_MIN: f32 = 2.0;
+/// Quads antialias one pixel out.
 const QUAD_MARGIN: f32 = 1.0;
+
+/// Room for ink overhang around a text run's measured bounds.
+fn text_margin(text: &Text) -> f32 {
+    let line_height = match text {
+        Text::Paragraph { paragraph, .. } => paragraph
+            .upgrade()
+            .map_or(0.0, |p| p.buffer().metrics().line_height),
+        Text::Editor { editor, .. } => editor
+            .upgrade()
+            .map_or(0.0, |e| e.buffer().metrics().line_height),
+        Text::Cached { line_height, .. } => line_height.0,
+        Text::Raw { .. } => 0.0,
+    };
+    (line_height * TEXT_MARGIN_RATIO).max(TEXT_MARGIN_MIN)
+}
 
 /// What a drawn frame looked like, for diffing against the next one.
 pub(crate) struct Snapshot {
@@ -125,8 +143,9 @@ impl Snapshot {
                             bounds: item
                                 .as_slice()
                                 .iter()
-                                .filter_map(Text::visible_bounds)
-                                .map(|r| r.expand(TEXT_MARGIN) * t)
+                                .filter_map(|text| {
+                                    Some(text.visible_bounds()?.expand(text_margin(text)) * t)
+                                })
                                 .collect(),
                             measured: item
                                 .as_slice()
@@ -166,63 +185,107 @@ fn shadow_bounds(quad: &iced_core::renderer::Quad) -> Option<Rectangle> {
     })
 }
 
-/// Grows the damage to cover what the renderer paints without the clip mask.
+/// Something the renderer paints without the clip mask once the damage
+/// reaches `trigger`, covering `paint`.
 ///
 /// `iced_tiny_skia` draws a quad's shadow pixmap unmasked whenever the quad
-/// body meets the damage, and skips the mask for a paragraph whose measured
-/// bounds lie inside it, so glyph ink overhanging those bounds also escapes.
-/// Those pixels are rewritten, so they have to be inside the damage: the
-/// caller is told what changed, and a format swap covers them exactly once.
-pub(crate) fn expand_unclipped(
-    rects: &mut Vec<Rectangle>,
-    previous: &Snapshot,
-    current: &Snapshot,
-) {
-    // Growing the damage can reach another shadow or text run, so this
-    // repeats until nothing new is added (bounded: each pass either adds a
-    // rectangle that then contains its candidate, or stops).
-    for _ in 0..8 {
-        let before = rects.len();
-        for snapshot in [previous, current] {
-            for (index, layer) in snapshot.layers.iter().enumerate() {
-                for (quad, _) in &layer.quads {
-                    let Some(shadow) = shadow_bounds(quad) else {
-                        continue;
-                    };
-                    let body = quad_bounds(quad);
-                    if touches(rects, &body) && !covered(rects, &shadow) {
-                        rects.push(shadow);
-                    }
+/// body meets the damage, and skips the mask for text whose measured bounds
+/// lie inside it, so glyph ink overhanging those bounds escapes too. Those
+/// pixels are rewritten, so they have to be inside the damage: the caller is
+/// told what really changed, and a format swap covers them exactly once.
+///
+/// (Live primitives and images take the same mask-skip path in
+/// `iced_tiny_skia`'s engine, but this crate builds with the `image`, `svg`
+/// and `geometry` features off, so no layer can hold any. Add them here
+/// before turning one on.)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Unclipped {
+    /// The damage must cover this (text), or merely meet it (a shadow).
+    pub trigger: Rectangle,
+    /// What gets painted, mask or no mask.
+    pub paint: Rectangle,
+    pub containment: bool,
+}
+
+/// Everything in either frame that can paint outside the damage.
+pub(crate) fn unclipped(previous: &Snapshot, current: &Snapshot) -> Vec<Unclipped> {
+    let mut out = Vec::new();
+    for snapshot in [previous, current] {
+        for (index, layer) in snapshot.layers.iter().enumerate() {
+            for (quad, _) in &layer.quads {
+                if let Some(shadow) = shadow_bounds(quad) {
+                    out.push(Unclipped {
+                        trigger: quad_bounds(quad),
+                        paint: shadow,
+                        containment: false,
+                    });
                 }
-                for item in &snapshot.text[index] {
-                    // The mask is skipped only for text wholly inside the
-                    // clip; anything crossing a damage edge is clipped, so
-                    // only fully covered text can paint ink outside.
-                    for (ink, measured) in item.bounds.iter().zip(&item.measured) {
-                        if covered(rects, measured) && !covered(rects, ink) {
-                            rects.push(*ink);
-                        }
+            }
+            for item in &snapshot.text[index] {
+                for (ink, measured) in item.bounds.iter().zip(&item.measured) {
+                    if ink != measured {
+                        out.push(Unclipped {
+                            trigger: *measured,
+                            paint: *ink,
+                            containment: true,
+                        });
                     }
                 }
             }
         }
-        if rects.len() == before {
-            return;
+    }
+    out
+}
+
+impl Unclipped {
+    /// The rectangles that make the renderer paint this candidate: empty
+    /// when the damage does not reach it. Text needs one rectangle to
+    /// contain its measured bounds; a shadow is painted once per rectangle
+    /// its quad body meets, so more than one index means the renderer would
+    /// blend it twice and the caller has to merge them.
+    pub(crate) fn triggered_by(&self, rects: &[DamageRect], scale: f32) -> Vec<usize> {
+        let trigger = to_physical(self.trigger, scale);
+        if self.containment {
+            rects
+                .iter()
+                .position(|r| trigger.is_within(r))
+                .into_iter()
+                .collect()
+        } else {
+            rects
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| meets(r, &trigger))
+                .map(|(i, _)| i)
+                .collect()
         }
+    }
+
+    pub(crate) fn paint_rect(&self, scale: f32) -> DamageRect {
+        to_physical(self.paint, scale)
     }
 }
 
-fn touches(rects: &[Rectangle], other: &Rectangle) -> bool {
-    rects.iter().any(|r| r.intersects(other))
+/// A logical rectangle as the whole physical pixels it can touch.
+fn to_physical(r: Rectangle, scale: f32) -> DamageRect {
+    let x0 = (r.x * scale).floor().max(0.0);
+    let y0 = (r.y * scale).floor().max(0.0);
+    let x1 = ((r.x + r.width) * scale).ceil().max(x0);
+    let y1 = ((r.y + r.height) * scale).ceil().max(y0);
+    DamageRect {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    }
 }
 
-fn covered(rects: &[Rectangle], other: &Rectangle) -> bool {
-    rects.iter().any(|r| {
-        r.x <= other.x
-            && r.y <= other.y
-            && r.x + r.width >= other.x + other.width
-            && r.y + r.height >= other.y + other.height
-    })
+fn meets(a: &DamageRect, b: &DamageRect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+pub(crate) fn covers(rects: &[DamageRect], other: &DamageRect) -> bool {
+    rects.iter().any(|r| other.is_within(r))
 }
 
 /// Logical rectangles that changed between `previous` and `current`.

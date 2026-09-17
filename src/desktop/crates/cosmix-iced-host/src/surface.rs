@@ -166,7 +166,8 @@ pub struct Surface<P: Program> {
     cursor: Cursor,
     drawn_cursor: Cursor,
     drawn_at: Option<Instant>,
-    clip_mask: tiny_skia::Mask,
+    /// Built on the first draw that needs it, for the buffer's row width.
+    clip_mask: Option<tiny_skia::Mask>,
     last_layers: Option<diff::Snapshot>,
     last_background: Color,
     /// Row stride and byte order of the buffer the last frame went into.
@@ -201,7 +202,7 @@ impl<P: Program> Surface<P> {
             cursor: Cursor::Unavailable,
             drawn_cursor: Cursor::Unavailable,
             drawn_at: None,
-            clip_mask: tiny_skia::Mask::new(size.width, size.height).expect("clip mask"),
+            clip_mask: None,
             last_layers: None,
             last_buffer: None,
             history: std::collections::VecDeque::new(),
@@ -256,9 +257,10 @@ impl<P: Program> Surface<P> {
             return;
         }
         if physical_size != self.viewport.physical_size() {
-            self.clip_mask =
-                tiny_skia::Mask::new(physical_size.width, physical_size.height).expect("clip mask");
+            self.clip_mask = None;
         }
+        // Recorded damage describes pixels of the old geometry.
+        self.history.clear();
         self.viewport = Viewport::with_physical_size(physical_size, scale_factor);
         self.invalidate();
     }
@@ -282,8 +284,6 @@ impl<P: Program> Surface<P> {
     pub fn invalidate(&mut self) {
         self.invalid = true;
         self.dirty = true;
-        // Older frames' damage describes contents that no longer exist.
-        self.history.clear();
     }
 
     pub fn queue_event(&mut self, event: Event) {
@@ -498,7 +498,22 @@ impl<P: Program> Surface<P> {
         format: PixelFormat,
         age: u32,
     ) -> Result<Frame, DrawError> {
-        self.draw_inner(buffer, width, height, stride, format, Instant::now(), age)
+        self.draw_aged_at(buffer, width, height, stride, format, Instant::now(), age)
+    }
+
+    /// [`Surface::draw_aged`] at `now`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_aged_at(
+        &mut self,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: PixelFormat,
+        now: Instant,
+        age: u32,
+    ) -> Result<Frame, DrawError> {
+        self.draw_inner(buffer, width, height, stride, format, now, age)
     }
 
     /// Lays out and draws the program, diffs the result against the
@@ -673,41 +688,89 @@ impl<P: Program> Surface<P> {
             }
             Some(previous) => {
                 let viewport = Rectangle::with_size(size);
-                let mut logical = diff::damage(previous, &current);
-                diff::expand_unclipped(&mut logical, previous, &current);
-                let mut rects: Vec<DamageRect> = logical
+                let mut rects: Vec<DamageRect> = diff::damage(previous, &current)
                     .into_iter()
                     .filter_map(|rect| rect.intersection(&viewport))
                     .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
                     .collect();
                 rects.extend(older.into_iter().flatten());
-                disjoint(diff::coalesce(rects))
+                // Rounding, coalescing and the buffer age only ever grow
+                // rectangles, and the renderer applies its mask-skip rule to
+                // the final list, so a shadow or text run the damage did not
+                // reach before can be reached after. Grow and re-check until
+                // nothing new is painted outside: each candidate is added at
+                // most once, so this ends.
+                let mut candidates = diff::unclipped(previous, &current);
+                loop {
+                    rects = disjoint(diff::coalesce(rects));
+                    let mut added = false;
+                    let mut index = 0;
+                    while index < candidates.len() {
+                        let candidate = candidates[index];
+                        let hits = candidate.triggered_by(&rects, scale);
+                        if hits.is_empty() {
+                            index += 1;
+                            continue;
+                        }
+                        candidates.swap_remove(index);
+                        // A shadow is drawn once for every damage rectangle
+                        // its body meets, so two rectangles would blend it
+                        // twice; merging them leaves one.
+                        if hits.len() > 1 {
+                            let union = hits
+                                .iter()
+                                .map(|i| rects[*i])
+                                .reduce(|a, b| diff::union(&a, &b));
+                            if let Some(union) = union
+                                && !diff::covers(&rects, &union)
+                            {
+                                rects.push(union);
+                                added = true;
+                            }
+                        }
+                        let paint = candidate.paint_rect(scale);
+                        if let Some(paint) = clamp(paint, width, height)
+                            && !diff::covers(&rects, &paint)
+                        {
+                            rects.push(paint);
+                            added = true;
+                        }
+                    }
+                    if !added {
+                        break rects;
+                    }
+                }
             }
         };
 
         if !damage.is_empty() {
+            // Everything that can refuse this buffer is checked before the
+            // first byte swap, so a failure never leaves it half-converted.
+            let unsupported = DrawError::UnsupportedSize { width, height };
+            if self
+                .clip_mask
+                .as_ref()
+                .is_none_or(|mask| mask.width() != row_pixels || mask.height() != height)
+            {
+                self.clip_mask = Some(tiny_skia::Mask::new(row_pixels, height).ok_or(unsupported)?);
+            }
+            let clip_mask = self.clip_mask.as_mut().ok_or(unsupported)?;
+            if tiny_skia::IntSize::from_wh(row_pixels, height).is_none() {
+                return Err(unsupported);
+            }
             let pixels = &mut buffer[..needed];
             if format == PixelFormat::Rgba8 {
                 for rect in &damage {
                     swap_red_blue(pixels, row_pixels, *rect);
                 }
             }
-            if self.clip_mask.width() != row_pixels || self.clip_mask.height() != height {
-                self.clip_mask = tiny_skia::Mask::new(row_pixels, height)
-                    .ok_or(DrawError::UnsupportedSize { width, height })?;
-            }
             let logical: Vec<Rectangle> =
                 damage.iter().map(|rect| rect.to_logical(scale)).collect();
             {
                 let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixels, row_pixels, height)
-                    .ok_or(DrawError::UnsupportedSize { width, height })?;
-                self.renderer.draw(
-                    &mut pixmap,
-                    &mut self.clip_mask,
-                    &self.viewport,
-                    &logical,
-                    background,
-                );
+                    .ok_or(unsupported)?;
+                self.renderer
+                    .draw(&mut pixmap, clip_mask, &self.viewport, &logical, background);
             }
             if format == PixelFormat::Rgba8 {
                 for rect in &damage {
@@ -773,6 +836,20 @@ fn valid_scale(scale: f32) -> bool {
 
 fn non_zero(size: Size<u32>) -> Size<u32> {
     Size::new(size.width.max(1), size.height.max(1))
+}
+
+/// A rectangle clipped to the buffer, or `None` when nothing is left.
+fn clamp(rect: DamageRect, width: u32, height: u32) -> Option<DamageRect> {
+    let x = rect.x.min(width);
+    let y = rect.y.min(height);
+    let right = (rect.x + rect.width).min(width);
+    let bottom = (rect.y + rect.height).min(height);
+    (right > x && bottom > y).then_some(DamageRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
 }
 
 /// Merges overlapping rectangles so every damaged pixel is rewritten (and,
