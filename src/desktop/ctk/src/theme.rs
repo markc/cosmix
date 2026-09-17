@@ -225,6 +225,7 @@ pub struct CtkTypography {
     warned_families: HashSet<String>,
     environment_family: Option<String>,
     environment_body_px: Option<f32>,
+    retained_faces: Vec<(fontique::SourceId, fontique::Blob<u8>)>,
 }
 
 impl Default for CtkTypography {
@@ -260,6 +261,7 @@ impl CtkTypography {
             warned_families: HashSet::new(),
             environment_family,
             environment_body_px,
+            retained_faces: Vec::new(),
         }
     }
 }
@@ -1162,10 +1164,8 @@ fn configure_typography(
     typography: &mut CtkTypography,
     font_cx: &mut FontCx,
 ) -> bool {
-    // Bevy prunes the local font source cache after two frames. Keep a weak
-    // backing cache so fonts still held by text layouts retain their Blob ID
-    // when reused after an idle gap. Otherwise each reload gives the same face
-    // a new FontAtlasKey and leaves another atlas texture resident.
+    // The shared cache locates the strong handles retained by CTK even after
+    // Bevy prunes its local entries and Parley clears the sole text layout.
     font_cx.source_cache.make_shared();
     // An unresolved family is retried on every pass, not once per theme
     // revision: the font collection is built from the system at `FontCx`
@@ -1284,6 +1284,36 @@ fn configure_typography(
     changed
 }
 
+/// Retain exactly the sources in the current managed generic mappings. Keeping
+/// these blobs alive bridges build_into's clear-before-query interval. Reconcile
+/// sources rather than theme revisions: collection replacement and monospace
+/// remapping can happen independently of a theme change.
+fn retain_managed_faces(typography: &mut CtkTypography, font_cx: &mut FontCx) {
+    let families: Vec<_> = [fontique::GenericFamily::SansSerif, fontique::GenericFamily::Monospace]
+        .into_iter()
+        .flat_map(|generic| font_cx.collection.generic_families(generic).collect::<Vec<_>>())
+        .collect();
+    let mut sources = Vec::new();
+    for id in families {
+        if let Some(family) = font_cx.collection.family(id) {
+            for face in family.fonts() {
+                let source = face.source();
+                if !sources.iter().any(|entry: &fontique::SourceInfo| entry.id() == source.id()) {
+                    sources.push(source.clone());
+                }
+            }
+        }
+    }
+    typography.retained_faces.retain(|(id, _)| sources.iter().any(|source| source.id() == *id));
+    for source in sources {
+        if !typography.retained_faces.iter().any(|(id, _)| *id == source.id())
+            && let Some(blob) = font_cx.source_cache.get(&source)
+        {
+            typography.retained_faces.push((source.id(), blob));
+        }
+    }
+}
+
 fn apply_ctk_typography(
     mut commands: Commands,
     state: Res<ThemeState>,
@@ -1300,6 +1330,7 @@ fn apply_ctk_typography(
         if configure_typography(&state, typography, font_cx) {
             typography_changed = true;
         }
+        retain_managed_faces(typography, font_cx);
     }
     if typography_changed {
         typography.set_changed();
@@ -4044,6 +4075,49 @@ mod tests {
             let reloaded = fonts.source_cache.get(&source).unwrap();
             assert_eq!(reloaded.id(), retained.id(), "font atlas identity drifted");
         }
+    }
+
+    #[test]
+    fn sole_layout_font_identity_survives_rebuild_through_theme_plugin() {
+        // File-backed registration is essential: register_fonts(Blob) itself
+        // retains the data and would hide the sole-layout failure.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-font.ttf");
+        std::fs::write(&path, bevy::text::DEFAULT_FONT_DATA).unwrap();
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            system_fonts: false,
+            ..Default::default()
+        });
+        fonts.collection.load_fonts_from_paths([&path]);
+        let family = fonts.collection.family_names().next().unwrap().to_string();
+        fonts.set_monospace_family(&family).unwrap();
+        let mut app = App::new();
+        app.insert_resource(fonts)
+            .insert_resource(CtkTypography::with_environment(Some(&family), None))
+            .add_plugins(CtkThemePlugin::default());
+        app.update();
+        for generic in [parley::GenericFamily::SansSerif, parley::GenericFamily::Monospace] {
+            let mut layouts = parley::LayoutContext::<()>::new();
+            let mut layout = parley::Layout::<()>::new();
+            let mut identity = None;
+            for _ in 0..120 {
+                let mut fonts = app.world_mut().resource_mut::<FontCx>();
+                fonts.source_cache.prune(0, false);
+                let mut builder = layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
+                builder.push_default(parley::StyleProperty::FontFamily(parley::FontFamily::Generic(generic).into()));
+                builder.build_into(&mut layout, "sole label");
+                layout.break_all_lines(None);
+                let id = layout.lines().next().unwrap().runs().next().unwrap().font().data.id();
+                assert_eq!(*identity.get_or_insert(id), id, "sole layout font atlas identity drifted");
+            }
+        }
+        assert!(!app.world().resource::<CtkTypography>().retained_faces.is_empty());
+        // Replacing the mappings releases the old sources; the retention set
+        // is bounded by current mappings, never by the number of rebuilds.
+        app.world_mut().resource_mut::<FontCx>().collection.clear();
+        app.update();
+        assert!(app.world().resource::<CtkTypography>().retained_faces.is_empty());
     }
 
     #[test]

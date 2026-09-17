@@ -92,14 +92,15 @@ impl ShellModel {
         thickness: f32,
     ) -> Result<(), PanelConfigError> {
         let thickness = if thickness.is_finite() && thickness > 0.0 {
-            thickness.min(self.thickness_budget(edge))
+            thickness.min(self.max_thickness(edge))
         } else {
             thickness
         };
         self.panels[edge.index()].restore_thickness(thickness)
     }
 
-    fn thickness_budget(&self, edge: Edge) -> f32 {
+    /// Maximum thickness that leaves space for the opposite panel and work area.
+    pub fn max_thickness(&self, edge: Edge) -> f32 {
         let (opposite, extent) = match edge {
             Edge::Left => (Edge::Right, self.geometry.width()),
             Edge::Right => (Edge::Left, self.geometry.width()),
@@ -133,8 +134,12 @@ impl ShellModel {
     }
 
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
-        if thickness > self.thickness_budget(edge) {
-            return Err(PanelConfigError::InvalidThickness(thickness));
+        let max = self.max_thickness(edge);
+        if thickness > max {
+            return Err(PanelConfigError::ThicknessBudget { edge, requested: thickness, max });
+        }
+        if max < *super::RESIZE_THICKNESS_RANGE.start() && thickness == max {
+            return self.panels[edge.index()].restore_thickness(thickness);
         }
         self.panels[edge.index()].resize_thickness(thickness)
     }

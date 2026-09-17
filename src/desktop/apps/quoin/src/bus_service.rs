@@ -48,6 +48,7 @@ struct ShellBusState {
     /// work. Losing a reply outright would leave the peer hanging until its
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
+    pending_resizes: BTreeMap<u64, InboundRequest>,
 }
 
 impl Default for ShellBusState {
@@ -60,6 +61,7 @@ impl Default for ShellBusState {
             snapshot_retry: None,
             live_generation: None,
             pending_replies: Vec::new(),
+            pending_resizes: BTreeMap::new(),
         }
     }
 }
@@ -91,6 +93,7 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<crate::wallpaper::WallpaperState>()
             .init_resource::<crate::demos::DemoState>()
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
+            .add_message::<cosmix_shell::runtime::ShellResizeResult>()
             .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input));
     }
 }
@@ -100,6 +103,7 @@ struct SceneBus<'w, 's> {
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
+    resize_results: MessageReader<'w, 's, cosmix_shell::runtime::ShellResizeResult>,
 }
 
 fn service_bus(
@@ -218,6 +222,16 @@ fn service_bus(
         );
     }
 
+    for result in content.resize_results.read() {
+        if let Some(request) = state.pending_resizes.remove(&result.request_id) {
+            let (rc, body) = match &result.result {
+                Ok(()) => (0, json!({"accepted":true})),
+                Err(error) => (10, json!({"error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max})),
+            };
+            stash_or_respond(&bridge, &mut state, request, rc, body.to_string(), None, &mut dispatch);
+        }
+    }
+
     for request in bridge.drain_inbound() {
         let started = std::time::Instant::now();
         let (rc, body, command) =
@@ -254,6 +268,19 @@ fn service_bus(
                 pending_replies = state.pending_replies.len(),
                 "QUOIN_BUS_DISPATCH"
             );
+        }
+        // A snapshot check can become stale behind another queued command.
+        // Only the model's application receipt may acknowledge a resize.
+        if let Some(ShellCommand { output, at, kind: ShellCommandKind::ResizeCommit { edge, thickness_px } }) = &command {
+            if state.pending_resizes.len() < MAX_PENDING_REPLIES {
+                state.next_request_id = state.next_request_id.saturating_add(1);
+                let request_id = state.next_request_id;
+                state.pending_resizes.insert(request_id, request);
+                dispatch(ShellCommand { output: output.clone(), at: *at, kind: ShellCommandKind::ResizeChecked { edge: *edge, thickness_px: *thickness_px, request_id } });
+            } else {
+                stash_or_respond(&bridge, &mut state, request, 11, json!({"error":"resize queue full"}).to_string(), None, &mut dispatch);
+            }
+            continue;
         }
         stash_or_respond(
             &bridge,
@@ -431,6 +458,14 @@ fn dispatch_shell_request(
                 None,
             );
         };
+        let max = frame.panel(edge).max_thickness_px;
+        if thickness_px > max {
+            return (
+                10,
+                json!({"error":"panel thickness exceeds output budget", "edge":argument(request, "edge"), "requested":thickness_px, "max":max}).to_string(),
+                None,
+            );
+        }
         return (
             0,
             json!({"accepted":true}).to_string(),
@@ -739,7 +774,7 @@ mod tests {
             .insert("broker_origin".into(), "mesh".into());
         assert_eq!(
             dispatch_shell_request(&request, &frame, std::time::Duration::ZERO).0,
-            10
+            0
         );
     }
 
@@ -782,6 +817,24 @@ mod tests {
             assert_eq!(rc, 10, "rejected: {bad}");
             assert!(command.is_none(), "no command for: {bad}");
         }
+    }
+
+    #[test]
+    fn resize_rejects_output_budget_and_accepts_exact_limit() {
+        let mut frame = test_frame();
+        frame.panels[Edge::Left.index()].max_thickness_px = 239.0;
+        let mut req = local("shell.panel.resize");
+        req.body = r#"{"edge":"left","thickness_px":240}"#.into();
+        let (rc, body, command) = dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
+        assert_eq!(rc, 10);
+        assert!(command.is_none());
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!({
+            "error":"panel thickness exceeds output budget", "edge":"left", "requested":240.0, "max":239.0
+        }));
+        req.body = r#"{"edge":"left","thickness_px":239}"#.into();
+        let (rc, _, command) = dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
+        assert_eq!(rc, 0);
+        assert!(command.is_some());
     }
 
     /// A request shaped the way the LIVE wire delivers one: caller arguments

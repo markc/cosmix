@@ -321,6 +321,7 @@ mod tests {
 
     fn panel(edge: Edge, mode: PanelMode, mapped: bool, fraction: f32) -> PanelPresentation {
         PanelPresentation {
+            max_thickness_px: 500.0,
             edge,
             mode,
             mapped,

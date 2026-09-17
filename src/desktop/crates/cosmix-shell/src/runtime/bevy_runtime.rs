@@ -68,6 +68,7 @@ impl Plugin for ShellRuntimePlugin {
             })
             .insert_resource(ShellFrameState(ShellFrame::from_model(&self.model)))
             .init_resource::<ShellEffects>()
+            .add_message::<super::ShellResizeResult>()
             .configure_sets(
                 Update,
                 (
@@ -140,12 +141,20 @@ fn update_model(
     mut effects: ResMut<ShellEffects>,
     mut exit: MessageWriter<AppExit>,
     quit_handler: Option<Res<ShellQuitHandler>>,
+    mut resize_results: MessageWriter<super::ShellResizeResult>,
 ) {
     let now = time.elapsed();
     effects.0.clear();
     effects.1.clear();
     for command in commands.read() {
         if command.output != *runtime.model.output() {
+            if let ShellCommandKind::ResizeChecked { edge, thickness_px, request_id } = command.kind {
+                resize_results.write(super::ShellResizeResult {
+                    request_id, edge, requested: thickness_px,
+                    max: runtime.model.max_thickness(edge),
+                    result: Err("output changed before resize application".into()),
+                });
+            }
             continue;
         }
         let at = command.at.clamp(runtime.model.last_update(), now);
@@ -153,9 +162,13 @@ fn update_model(
             // Scene content is owned by the host adapter; it has no motion effect.
             ShellCommandKind::Scene(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
-                let _ = runtime.model.resize_thickness(*edge, *thickness_px);
+                let thickness_px = thickness_px.min(runtime.model.max_thickness(*edge));
+                if let Err(error) = runtime.model.resize_thickness(*edge, thickness_px) {
+                    bevy::log::warn!("panel drag rejected: {error}");
+                }
             }
-            ShellCommandKind::ResizeCommit { edge, thickness_px } => {
+            ShellCommandKind::ResizeCommit { edge, thickness_px }
+            | ShellCommandKind::ResizeChecked { edge, thickness_px, .. } => {
                 // Atomic scripted resize: start records the pre-resize
                 // thickness (so settled_thickness_px is correct if the apply
                 // is rejected), apply, then complete — which settles the new
@@ -164,7 +177,15 @@ fn update_model(
                 let _ = runtime
                     .model
                     .panel_input(*edge, at, PanelInput::ResizeStarted);
-                if runtime.model.resize_thickness(*edge, *thickness_px).is_ok()
+                let result = runtime.model.resize_thickness(*edge, *thickness_px);
+                if let ShellCommandKind::ResizeChecked { request_id, .. } = command.kind {
+                    resize_results.write(super::ShellResizeResult {
+                        request_id, edge: *edge, requested: *thickness_px,
+                        max: runtime.model.max_thickness(*edge),
+                        result: result.map_err(|error| error.to_string()),
+                    });
+                }
+                if result.is_ok()
                     && let Ok(update) =
                         runtime
                             .model
@@ -281,6 +302,35 @@ fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
 mod tests {
     use super::*;
     #[test]
+    fn fast_drag_lands_at_budget_and_checked_resize_reports_refusal() {
+        let mut app = app();
+        let output = {
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            let model = &mut runtime.model;
+            model.set_geometry(LogicalSize::new(600.0, 600.0).unwrap());
+            model.restore_thickness(Edge::Right, 350.0).unwrap();
+            model.panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin).unwrap();
+            assert_eq!(model.max_thickness(Edge::Left), 249.0);
+            model.output().clone()
+        };
+        app.world_mut().write_message(ShellCommand {
+            output: output.clone(), at: Duration::ZERO,
+            kind: ShellCommandKind::Resize { edge: Edge::Left, thickness_px: 500.0 },
+        });
+        app.update();
+        assert_eq!(app.world().resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px, 249.0);
+        app.world_mut().write_message(ShellCommand {
+            output, at: Duration::ZERO,
+            kind: ShellCommandKind::ResizeChecked { edge: Edge::Left, thickness_px: 300.0, request_id: 42 },
+        });
+        app.update();
+        let mut results = app.world_mut().resource_mut::<bevy::ecs::message::Messages<super::super::ShellResizeResult>>();
+        let result = results.drain().next().unwrap();
+        assert_eq!(result.request_id, 42);
+        assert!(result.result.is_err());
+        assert_eq!(result.max, 249.0);
+    }
+    #[test]
     fn resizing_pinned_panel_cannot_exceed_output_budget() {
         let mut app = app();
         let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
@@ -296,7 +346,7 @@ mod tests {
         assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
         assert_eq!(
             model.resize_thickness(Edge::Right, 120.0),
-            Err(crate::core::PanelConfigError::InvalidThickness(120.0))
+            Err(crate::core::PanelConfigError::ThicknessBudget { edge: Edge::Right, requested: 120.0, max: 1.0 })
         );
         assert_eq!(model.panel(Edge::Right).thickness_px, 1.0);
         assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);

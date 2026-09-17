@@ -657,6 +657,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Scene(_) => "scene",
         ShellCommandKind::Resize { .. } => "resize",
         ShellCommandKind::ResizeCommit { .. } => "resize-commit",
+        ShellCommandKind::ResizeChecked { .. } => "resize-checked",
         ShellCommandKind::Geometry(_) => "geometry",
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",
@@ -997,7 +998,10 @@ impl PointerBridge {
                 output.clone(),
                 ShellCommandKind::Resize {
                     edge: resize.edge,
-                    thickness_px: resize.thickness(raw, extent),
+                    thickness_px: resize.thickness(raw, extent).min(
+                        app.world().resource::<cosmix_shell::runtime::ShellFrameState>()
+                            .0.panel(resize.edge).max_thickness_px,
+                    ),
                 },
             );
         }

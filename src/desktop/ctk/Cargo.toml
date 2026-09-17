@@ -3,7 +3,7 @@
 # consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
 [package]
 name = "ctk"
-version = "0.55.1"
+version = "0.55.2"
 description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
 edition = "2021"
 rust-version = "1.95"
@@ -126,6 +126,7 @@ accesskit = "0.24"
 # system fonts instead of an app that cannot start. Cargo unifies features
 # across the graph, so declaring it here applies to Parley's copy.
 fontique = { version = "0.9", default-features = false, features = [
+    "std",
     "fontconfig-dlopen",
 ] }
 
@@ -163,6 +164,7 @@ zeroize = "1"
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../crates/cosmix-lib-buildinfo" }
 
 [dev-dependencies]
+parley = "=0.9.0"
 futures-util = "0.3"
 tempfile = "3"
 tokio-tungstenite = "0.26"

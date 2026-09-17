@@ -9,7 +9,7 @@ mod bevy_runtime;
 
 pub use messages::{
     CarouselInput, HostGeometry, KeyboardInteractivity, PanelPresentation, ShellCommand,
-    ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, WakePolicy,
+    ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, ShellResizeResult, WakePolicy,
 };
 pub use semantic::{SceneVerb, ShellSemanticVerb, semantic_shell_command};
 
