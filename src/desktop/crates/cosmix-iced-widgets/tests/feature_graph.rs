@@ -7,6 +7,20 @@ use std::path::Path;
 use std::process::Command;
 
 fn graph(edges: &str, features: Option<&str>, with_shell: bool) -> String {
+    cargo_tree(edges, None, features, with_shell)
+}
+
+/// Normal dependencies as `name vX.Y.Z feature,feature` lines.
+fn enabled_features(features: &str) -> String {
+    cargo_tree("normal", Some("{p} {f}"), Some(features), false)
+}
+
+fn cargo_tree(
+    edges: &str,
+    format: Option<&str>,
+    features: Option<&str>,
+    with_shell: bool,
+) -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut command = Command::new(env!("CARGO"));
     command.current_dir(root);
@@ -25,6 +39,9 @@ fn graph(edges: &str, features: Option<&str>, with_shell: bool) -> String {
         "-p",
         "cosmix-iced-widgets",
     ]);
+    if let Some(format) = format {
+        command.args(["--format", format]);
+    }
     if with_shell {
         command.args(["-p", "cosmix-quoin"]);
     }
@@ -93,7 +110,18 @@ fn renderer_features_select_one_backend_with_geometry_and_no_winit() {
         check_no_winit(&graph);
         assert!(has_package(&graph, renderer));
         assert!(!has_package(&graph, other));
-        assert!(graph.contains(&format!("{renderer} feature \"geometry\"")));
+        let prefix = format!("{renderer} v");
+        let enabled = enabled_features(feature);
+        assert!(
+            enabled.lines().any(|line| line.starts_with(&prefix)
+                && line
+                    .split_once(' ')
+                    .and_then(|(_, rest)| rest.split_once(' '))
+                    .is_some_and(|(_, features)| features
+                        .split(',')
+                        .any(|feature| feature.trim_end_matches(" (*)") == "geometry"))),
+            "{renderer} lacks geometry:\n{enabled}"
+        );
     }
 }
 
