@@ -655,6 +655,8 @@ fn tab_action(id: &str, core: &Core) {
         _ => {}
     }
 }
+// Bevy injects these independent resources/queries as observer parameters.
+#[allow(clippy::too_many_arguments)]
 fn keyboard(
     mut event: On<FocusedInput<KeyboardInput>>,
     mut modifiers: ResMut<Modifiers>,
