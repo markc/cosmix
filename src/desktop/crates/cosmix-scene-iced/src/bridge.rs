@@ -141,6 +141,12 @@ pub struct ImeOutput {
     /// The caret in window-logical coordinates, which is what
     /// text-input-v3's `set_cursor_rectangle` takes for a layer surface.
     pub cursor: bevy::math::Rect,
+    /// The same caret in the window's physical pixels, for a host whose
+    /// input method wants another space: dividing by
+    /// `IcedSurfaceGeometry::pointer_scale` gives output-logical
+    /// coordinates (what comp's native IME takes), and by `window_scale`
+    /// gives `cursor` back.
+    pub cursor_physical: bevy::math::Rect,
 }
 
 /// Keyboard focus and IME state of the iced surfaces.
@@ -1008,9 +1014,10 @@ pub(crate) fn frame(
         let owner = focus.owner == Some(entity);
         let request = match (&processed.ime, owner) {
             (ImeRequest::Enabled { cursor, purpose }, true) => {
-                let min = (geometry.origin + Vec2::new(cursor.x as f32, cursor.y as f32))
-                    / geometry.scale;
-                let extent = Vec2::new(cursor.w as f32, cursor.h as f32) / geometry.scale;
+                let at = geometry.origin + Vec2::new(cursor.x as f32, cursor.y as f32);
+                let size = Vec2::new(cursor.w as f32, cursor.h as f32);
+                let min = at / geometry.scale;
+                let extent = size / geometry.scale;
                 Some(ImeOutput {
                     purpose: match purpose {
                         crate::surface::ImePurpose::Normal => ImePurpose::Normal,
@@ -1019,6 +1026,7 @@ pub(crate) fn frame(
                     },
                     window_scale: geometry.scale,
                     cursor: bevy::math::Rect::from_corners(min, min + extent),
+                    cursor_physical: bevy::math::Rect::from_corners(at, at + size),
                 })
             }
             _ => None,

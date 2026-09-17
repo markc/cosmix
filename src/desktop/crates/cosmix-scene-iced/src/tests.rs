@@ -148,6 +148,20 @@ impl Harness {
         ));
     }
 
+    /// The stand-in's caret in surface pixels at the surface's own scale.
+    fn caret_rect(&self) -> Rect {
+        let unit = (8.0
+            * self
+                .app
+                .world()
+                .get::<IcedSurfaceGeometry>(self.surface)
+                .unwrap()
+                .scale
+                .max(1.0))
+        .round() as u32;
+        Rect::new(unit, unit, (unit / 4).max(1), 2 * unit)
+    }
+
     fn focus(&self) -> &SceneIcedFocus {
         self.app.world().resource::<SceneIcedFocus>()
     }
@@ -979,4 +993,59 @@ fn a_pending_wake_reaches_the_host_hook() {
     let calls = h.app.world().resource::<Woken>().0.len();
     h.run(5);
     assert_eq!(h.app.world().resource::<Woken>().0.len(), calls);
+}
+
+#[test]
+fn the_ime_caret_is_published_in_both_spaces() {
+    // A window at 2.5 with UiScale 1.5: the UI (and the surface) work in
+    // 3.75, pointer positions and the compositor's output space in 2.5.
+    let (window_scale, ui_scale) = (2.5, 1.5);
+    let surface_scale = window_scale * ui_scale;
+    let mut h = Harness::new();
+    h.geometry_scales(400, 200, surface_scale, window_scale);
+    h.run(3);
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(2);
+    let ime = h
+        .focus()
+        .ime
+        .clone()
+        .expect("a focused surface enables IME");
+    assert_eq!(ime.window_scale, surface_scale);
+
+    // The physical rectangle is the surface's own pixels, offset by where
+    // the surface sits; `cursor` is that divided by the surface scale.
+    let caret = h.caret_rect();
+    let at = Vec2::new(10.0, 20.0) + Vec2::new(caret.x as f32, caret.y as f32);
+    let size = Vec2::new(caret.w as f32, caret.h as f32);
+    assert_eq!(
+        ime.cursor_physical,
+        bevy::math::Rect::from_corners(at, at + size)
+    );
+    let close = |a: Vec2, b: Vec2| (a - b).abs().max_element() < 1e-3;
+    assert!(
+        close(ime.cursor.min, ime.cursor_physical.min / surface_scale)
+            && close(ime.cursor.max, ime.cursor_physical.max / surface_scale),
+        "cursor {:?} is cursor_physical {:?} over {surface_scale}",
+        ime.cursor,
+        ime.cursor_physical
+    );
+
+    // What a host with a different space gets: comp's native IME takes
+    // output-space logical pixels, which is the physical rectangle over the
+    // pointer scale — NOT `cursor`, which carries UiScale as well.
+    let output_logical = bevy::math::Rect::from_corners(
+        ime.cursor_physical.min / window_scale,
+        ime.cursor_physical.max / window_scale,
+    );
+    assert!(close(output_logical.min, at / window_scale));
+    assert!(
+        !close(output_logical.min, ime.cursor.min),
+        "with UiScale {ui_scale} the two spaces must differ"
+    );
+    // Exactly the UiScale factor apart, which is the double-count this field exists to avoid.
+    assert!(close(output_logical.min, ime.cursor.min * ui_scale));
 }
