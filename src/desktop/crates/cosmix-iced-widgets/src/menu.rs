@@ -551,8 +551,34 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if shell.is_event_captured() {
+            return;
+        }
         let state = tree.state.downcast_mut::<State>();
         if state.open {
+            // iced obtains overlays before processing a batch. If this batch
+            // opened the menu, subsequent events still arrive at the base
+            // widget. Dispatch through the same popup path until iced rebuilds
+            // the overlay. Events captured by an existing overlay never reach
+            // the base widget (and the guard above also protects composition).
+            let mut popup: overlay::Element<'_, Message, Theme, Renderer> =
+                overlay::Element::new(Box::new(Popup {
+                    items: &self.items,
+                    state,
+                    bar: self.content.is_none(),
+                    anchor: layout.bounds(),
+                    translation: Vector::ZERO,
+                    style: self.style,
+                }));
+            let node = popup.as_overlay_mut().layout(renderer, viewport.size());
+            popup.as_overlay_mut().update(
+                event,
+                Layout::new(&node),
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+            );
             return;
         }
         let bar = self.content.is_none();
@@ -1063,6 +1089,51 @@ mod tests {
         );
         assert!(captured);
         assert_eq!(messages, [1]);
+        assert!(!harness.tree.state.downcast_ref::<State>().open);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn newly_opened_menu_handles_rest_of_base_event_batch() {
+        let mut harness = Harness::new(Menu::bar(vec![Item::submenu("menu", items())]));
+        let cursor = mouse::Cursor::Unavailable;
+        harness.event(
+            key_event(Named::F10, keyboard::Modifiers::empty()),
+            cursor,
+            false,
+        );
+        // No overlay recreation between these base events, as in iced's batch.
+        let (messages, captured, _) = harness.event(
+            key_event(Named::Enter, keyboard::Modifiers::empty()),
+            cursor,
+            false,
+        );
+        assert_eq!(messages, [1]);
+        assert!(captured);
+        assert!(!harness.tree.state.downcast_ref::<State>().open);
+
+        harness.event(
+            key_event(Named::F10, keyboard::Modifiers::empty()),
+            cursor,
+            false,
+        );
+        harness.event(
+            key_event(Named::ArrowDown, keyboard::Modifiers::empty()),
+            cursor,
+            false,
+        );
+        harness.event(
+            key_event(Named::Enter, keyboard::Modifiers::empty()),
+            cursor,
+            false,
+        );
+        let (messages, captured, _) = harness.event(
+            key_event(Named::Enter, keyboard::Modifiers::empty()),
+            cursor,
+            false,
+        );
+        assert_eq!(messages, [2]);
+        assert!(captured);
         assert!(!harness.tree.state.downcast_ref::<State>().open);
     }
 
