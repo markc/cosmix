@@ -249,16 +249,13 @@ fn damaged_area(frame: &Frame) -> u64 {
     frame.damage.iter().map(DamageRect::area).sum()
 }
 
-/// Antialiasing rounding tolerated between a partial and a full redraw, in
-/// channel levels. tiny-skia's masked and unmasked pipelines round coverage
-/// differently, and a rounded border cut by a damage rectangle is blended
-/// twice over (fill then stroke), so the error is a few levels on the
-/// affected edge pixels. Missed damage looks nothing like this: a glyph or
-/// quad that should have been repainted differs by tens or hundreds of
-/// levels over a whole region, which is why [`MAX_ROUNDING_PIXELS`] also
-/// caps how many pixels may differ at all.
+/// Antialiasing rounding tolerated INSIDE the damage, in channel levels.
+/// tiny-skia's masked and unmasked pipelines round coverage differently, and
+/// a rounded border cut by a damage rectangle is blended twice over (fill
+/// then stroke), so a redrawn edge or glyph can land a few levels off. It is
+/// only tolerated where the pixel was repainted anyway; outside the damage
+/// any difference at all is a fault.
 const MAX_ROUNDING: u8 = 4;
-const MAX_ROUNDING_PIXELS: usize = 64;
 
 #[derive(Debug, Default)]
 struct Check {
@@ -275,8 +272,10 @@ struct Check {
 /// the previous one:
 /// - every pixel whose true colour changed lies inside the damage (too
 ///   little damage is a rendering bug);
-/// - the incremental buffer equals the full redraw everywhere, except for
-///   one-level rounding differences.
+/// - outside the damage the incremental buffer matches the full redraw
+///   exactly, so nothing was painted where the caller was not told (an
+///   unmasked shadow or glyph, or an unswapped `Rgba8` pixel);
+/// - inside it, only antialiasing rounding differs.
 fn check(
     t: &Target,
     frame: &Frame,
@@ -302,10 +301,10 @@ fn check(
             }
         }
         if inc != now {
-            if out.rounding == MAX_ROUNDING_PIXELS {
+            if !frame.full && !frame.damage.iter().any(|r| r.contains(x, y)) {
                 return Err(format!(
-                    "more than {MAX_ROUNDING_PIXELS} pixels differ from the full redraw \
-                     (damage {:?})",
+                    "pixel ({x}, {y}) is {inc:?}, full redraw {now:?}, and it is outside \
+                     the damage {:?}",
                     frame.damage
                 ));
             }
