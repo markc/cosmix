@@ -1,7 +1,7 @@
 [package]
 name = "cosmix-iced-widgets"
 version = "0.1.0"
-description = "Shared Cosmix iced text fields, menus and design token adapter"
+description = "Shared Cosmix iced widgets: text field, menus, pro-audio controls, waveform, piano roll, design tokens"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,7 +15,7 @@ gallery-wgpu = ["gallery", "wgpu"]
 gallery-tiny-skia = ["gallery", "tiny-skia"]
 
 [dependencies]
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "wayland", "thread-pool"] }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "canvas", "wayland", "thread-pool"] }
 cosmix-design = { path = "../cosmix-design", default-features = false }
 
 [dev-dependencies]
