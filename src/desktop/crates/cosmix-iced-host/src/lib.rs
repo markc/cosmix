@@ -37,10 +37,6 @@ pub type Renderer = iced_tiny_skia::Renderer;
 /// The theme every hosted program draws with.
 pub type Theme = iced_core::Theme;
 
-/// Raster images, when the `image` feature is on. iced decodes PNG here.
-#[cfg(feature = "image")]
-pub use iced_core::image::Handle as ImageHandle;
-
 /// A widget tree produced by [`Program::view`].
 pub type Element<'a, Message> = iced_core::Element<'a, Message, Theme, Renderer>;
 

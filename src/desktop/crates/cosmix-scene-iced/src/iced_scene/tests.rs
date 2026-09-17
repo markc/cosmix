@@ -813,32 +813,3 @@ fn the_renderer_plugin_mounts_the_bridge_itself() {
     assert!(counters.totals.draws >= 1, "the iced renderer never drew");
     assert!(counters.totals.bytes_queued >= 600 * 450 * 4);
 }
-
-#[test]
-fn image_nodes_draw_their_file_and_missing_ones_are_reported() {
-    // A file written next to the test, named absolutely: the asset root is
-    // only used for relative sources.
-    let dir = std::env::temp_dir().join(format!("ctl88-scene-iced-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("dot.png");
-    image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]))
-        .save(&path)
-        .unwrap();
-    let source = format!(
-        "---\nscene: 1\nname: pictures\ncitizen: test\n---\n```mix\nroot: {{widget: \"column\", padding: 4, children: [\"pic\", \"gone\"]}}\npic: {{widget: \"image\", src: {:?}, w: 32, h: 32}}\ngone: {{widget: \"image\", src: \"/nowhere/missing.png\", w: 8, h: 8}}\n```\n",
-        path.display().to_string()
-    );
-    let mut rig = Rig::new(&source, 200, 200, 1.0);
-    rig.settle();
-    let box_ = rig.physical("pic", 0.0);
-    let pixel = |rig: &Rig, x: u32, y: u32| {
-        let i = (y * rig.width + x) as usize * 4;
-        rig.buffer[i..i + 4].to_vec()
-    };
-    let at = pixel(&rig, box_.x + box_.w / 2, box_.y + box_.h / 2);
-    assert_eq!(at[0], 255, "image not drawn: {at:?}");
-    assert!(at[1] < 32 && at[2] < 32, "image not drawn: {at:?}");
-    // The missing one is counted and logged, never a silent blank.
-    assert_eq!(rig.renderer.program().undrawn_nodes(), 1);
-    std::fs::remove_dir_all(&dir).ok();
-}

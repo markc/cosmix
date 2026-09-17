@@ -11,9 +11,9 @@ use cosmix_iced_host::core::alignment::Vertical;
 use cosmix_iced_host::core::font::{Family, Weight};
 use cosmix_iced_host::core::text::Wrapping;
 use cosmix_iced_host::core::widget::Id;
-use cosmix_iced_host::core::{Background, Border, Color, ContentFit, Font, Length, mouse};
+use cosmix_iced_host::core::{Background, Border, Color, Font, Length, mouse};
 use cosmix_iced_host::widget::{
-    button, container, image, keyed_column, mouse_area, row, scrollable, space, text, toggler,
+    button, container, keyed_column, mouse_area, row, scrollable, space, text, toggler,
 };
 use cosmix_iced_host::{Element, Program, Theme};
 use cosmix_iced_widgets::{TextField, Tokens};
@@ -115,7 +115,7 @@ impl SceneProgram {
         }
     }
 
-    /// Nodes this renderer could not draw (a missing image file).
+    /// Nodes this renderer cannot draw (an `image`, today).
     pub fn undrawn_nodes(&self) -> usize {
         self.undrawn.len()
     }
@@ -172,9 +172,10 @@ impl SceneProgram {
                 continue;
             }
             let src = text_port(node, "src");
-            if !self.image_path(src).is_file() && self.undrawn.insert(id.clone()) {
+            if self.undrawn.insert(id.clone()) {
                 bevy::log::warn!(
-                    "scene {}: image node {id} has no file at {:?} (src {src:?})",
+                    "scene {}: image node {id} is not drawn by the iced adapter (src {src:?}, \
+                     which CTK would load from {:?})",
                     tree.name,
                     self.image_path(src)
                 );
@@ -434,21 +435,12 @@ impl SceneProgram {
                     .into()
             }
             "image" => {
-                // As CTK: the node's own box, the image stretched into it.
-                let w = number(node, "w").unwrap_or(16.0);
-                let h = number(node, "h").unwrap_or(16.0);
-                width = Length::Fixed(w);
-                height = Length::Fixed(h);
-                let path = self.image_path(text_port(node, "src"));
-                if path.is_file() {
-                    image(cosmix_iced_host::ImageHandle::from_path(path))
-                        .width(w)
-                        .height(h)
-                        .content_fit(ContentFit::Fill)
-                        .into()
-                } else {
-                    space().into()
-                }
+                // Not drawn: iced's image path needs `kamadak-exif`, a crate the
+                // workspace does not carry. The node keeps its box; `set_scene`
+                // logs it once and `undrawn_nodes` counts it.
+                width = Length::Fixed(number(node, "w").unwrap_or(16.0));
+                height = Length::Fixed(number(node, "h").unwrap_or(16.0));
+                space().into()
             }
             "spacer" => match number(node, "size") {
                 Some(size) => {
