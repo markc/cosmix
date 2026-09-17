@@ -4110,9 +4110,10 @@ mod tests {
         fonts.collection.load_fonts_from_paths([&path]);
         let family = fonts.collection.family_names().next().unwrap().to_string();
         let id = fonts.collection.family_id(&family).unwrap();
-        fonts
-            .collection
-            .set_fallbacks(fontique::FallbackKey::new(*b"Latn", None), [id].into_iter());
+        fonts.collection.set_fallbacks(
+            fontique::FallbackKey::new(fontique::Script::from_bytes(*b"Latn"), None),
+            [id].into_iter(),
+        );
         fonts.source_cache.make_shared();
         let mut sources = UsedFontSources::default();
         let mut layouts = parley::LayoutContext::<()>::new();

@@ -1223,7 +1223,6 @@ mod tests {
         }
     }
 
-    /// A `power.props.changed` delivery-gap notice on `generation`.
     #[test]
     fn missing_resize_receipts_expire_and_disconnect_clears_pending() {
         let (bridge, peer) = test_bridge("quoin");
@@ -1274,6 +1273,7 @@ mod tests {
         );
     }
 
+    /// A `power.props.changed` delivery-gap notice on `generation`.
     fn gap_change(generation: u64) -> BusMessage {
         let mut headers = BTreeMap::new();
         headers.insert("topic".to_owned(), "power.props.changed".to_owned());
