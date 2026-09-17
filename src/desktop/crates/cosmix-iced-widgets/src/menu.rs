@@ -27,6 +27,7 @@ enum Kind<Message> {
 }
 
 impl<Message> Item<Message> {
+    /// An entry that publishes `message` when activated, then closes the menu.
     pub fn action(label: impl Into<String>, message: Message) -> Self {
         Self {
             label: label.into(),
@@ -36,6 +37,7 @@ impl<Message> Item<Message> {
         }
     }
 
+    /// An entry that opens a nested panel of `items`.
     pub fn submenu(label: impl Into<String>, items: Vec<Self>) -> Self {
         Self {
             label: label.into(),
@@ -45,6 +47,7 @@ impl<Message> Item<Message> {
         }
     }
 
+    /// A horizontal rule; never selectable.
     pub fn separator() -> Self {
         Self {
             label: String::new(),
@@ -54,11 +57,13 @@ impl<Message> Item<Message> {
         }
     }
 
+    /// Right-aligned shortcut label, for display only. The app binds the key.
     pub fn accelerator(mut self, label: impl Into<String>) -> Self {
         self.accelerator = label.into();
         self
     }
 
+    /// A disabled entry is drawn muted and skipped by pointer and keyboard.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
@@ -79,15 +84,25 @@ impl<Message> Item<Message> {
 /// Renderer-independent colours and logical-pixel metrics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MenuStyle {
+    /// Bar and panel fill.
     pub background: Color,
+    /// Enabled label and accelerator colour.
     pub text: Color,
+    /// Disabled label colour.
     pub disabled: Color,
+    /// Highlight fill of the selected or hovered row.
     pub selected: Color,
+    /// Label colour on the highlight.
     pub selected_text: Color,
+    /// Panel outline and separator colour.
     pub border: Color,
+    /// Corner radius of panels and highlights.
     pub radius: f32,
+    /// Label size in logical pixels.
     pub text_size: f32,
+    /// Height of the bar and of each non-separator row.
     pub row_height: f32,
+    /// Horizontal padding around labels.
     pub padding: f32,
 }
 
@@ -116,6 +131,8 @@ pub struct Menu<'a, Message, Theme, Renderer> {
 }
 
 impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
+    /// A full-width bar whose top-level `items` are usually submenus. A
+    /// top-level action publishes directly. F10 activates the bar.
     pub fn bar(items: Vec<Item<Message>>) -> Self {
         Self {
             items,
@@ -124,6 +141,8 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
         }
     }
 
+    /// Wraps `content`; right-click on it, or Shift+F10 while it (or a
+    /// focusable child) has focus, opens `items` as a popup.
     pub fn context(
         content: impl Into<Element<'a, Message, Theme, Renderer>>,
         items: Vec<Item<Message>>,
@@ -135,6 +154,7 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
         }
     }
 
+    /// Replaces the default style; see `Tokens::menu_style`.
     pub fn style(mut self, style: MenuStyle) -> Self {
         self.style = style;
         self
@@ -150,6 +170,40 @@ struct State {
     // One selected row per visible panel. None means pointer-opened, unselected.
     path: Vec<Option<usize>>,
     position: Point,
+    // Set even by the inert closed overlay, before iced dispatches a batch.
+    overlay_bounds: Option<Size>,
+    translation: Vector,
+}
+
+#[derive(Default)]
+struct ChildFocus {
+    present: bool,
+    focused: bool,
+}
+
+impl Operation for ChildFocus {
+    fn focusable(
+        &mut self,
+        _id: Option<&iced::advanced::widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        self.present = true;
+        self.focused |= state.is_focused();
+    }
+
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+}
+
+fn housekeeping(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Window(_)
+            | Event::InputMethod(_)
+            | Event::Keyboard(keyboard::Event::ModifiersChanged(_))
+    )
 }
 
 fn next<Message>(items: &[Item<Message>], selected: Option<usize>, forward: bool) -> Option<usize> {
@@ -551,37 +605,106 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if shell.is_event_captured() {
-            return;
-        }
+        let previously_captured = shell.is_event_captured();
         let state = tree.state.downcast_mut::<State>();
-        if state.open {
+        if state.open && !housekeeping(event) {
+            if previously_captured {
+                return;
+            }
             // iced obtains overlays before processing a batch. If this batch
             // opened the menu, subsequent events still arrive at the base
             // widget. Dispatch through the same popup path until iced rebuilds
             // the overlay. Events captured by an existing overlay never reach
             // the base widget (and the guard above also protects composition).
+            let translation = state.translation;
+            let bounds = state.overlay_bounds.unwrap_or(viewport.size());
             let mut popup: overlay::Element<'_, Message, Theme, Renderer> =
                 overlay::Element::new(Box::new(Popup {
                     items: &self.items,
                     state,
                     bar: self.content.is_none(),
-                    anchor: layout.bounds(),
-                    translation: Vector::ZERO,
+                    anchor: layout.bounds() + translation,
+                    translation,
                     style: self.style,
                 }));
-            let node = popup.as_overlay_mut().layout(renderer, viewport.size());
+            let node = popup.as_overlay_mut().layout(renderer, bounds);
             popup.as_overlay_mut().update(
                 event,
                 Layout::new(&node),
-                cursor,
+                cursor + translation,
                 renderer,
                 clipboard,
                 shell,
             );
+            drop(popup);
+            if state.open && shell.is_event_captured() {
+                // A capture in iced's base pass clears its stored overlay,
+                // even for a key release that does not change our state.
+                shell.invalidate_layout();
+            }
             return;
         }
         let bar = self.content.is_none();
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(_))
+                | Event::Touch(iced::touch::Event::FingerPressed { .. })
+        ) {
+            state.focused = !previously_captured && cursor.is_over(layout.bounds());
+        } else if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+            state.focused = false;
+            if state.open {
+                state.close();
+                shell.request_redraw();
+            }
+        }
+        // Like iced containers, always forward lifecycle and focus-changing
+        // events, even when an earlier sibling captured the event. Children
+        // get first refusal on context triggers, so nested menus prefer inner.
+        if let Some(content) = &mut self.content {
+            content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout.children().next().unwrap(),
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            if matches!(
+                event,
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::F10),
+                    ..
+                })
+            ) {
+                let mut focus = ChildFocus::default();
+                content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout.children().next().unwrap(),
+                    renderer,
+                    &mut focus,
+                );
+                if focus.present {
+                    state.focused = focus.focused;
+                }
+            }
+        }
+        if shell.is_event_captured() || state.open {
+            return;
+        }
+        let touch_event;
+        let (event, cursor) =
+            if let Event::Touch(iced::touch::Event::FingerPressed { position, .. }) = event {
+                touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+                (
+                    &touch_event,
+                    mouse::Cursor::Available(*position - state.translation),
+                )
+            } else {
+                (event, cursor)
+            };
         let mut opened = false;
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) if bar => {
@@ -634,17 +757,6 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             shell.capture_event();
             shell.invalidate_layout();
             shell.request_redraw();
-        } else if let Some(content) = &mut self.content {
-            content.as_widget_mut().update(
-                &mut tree.children[0],
-                event,
-                layout.children().next().unwrap(),
-                cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
-            );
         }
     }
     fn mouse_interaction(
@@ -682,26 +794,34 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State>();
-        if state.open {
-            Some(overlay::Element::new(Box::new(Popup {
-                items: &self.items,
-                state,
-                bar: self.content.is_none(),
-                anchor: layout.bounds() + translation,
-                translation,
-                style: self.style,
-            })))
-        } else if let Some(content) = &mut self.content {
-            content.as_widget_mut().overlay(
+        state.translation = translation;
+        let open = state.open;
+        let bar = self.content.is_none();
+        let popup = overlay::Element::new(Box::new(Popup {
+            items: &self.items,
+            state,
+            bar,
+            anchor: layout.bounds() + translation,
+            translation,
+            style: self.style,
+        }));
+        let mut overlays = vec![popup];
+        if !open
+            && let Some(content) = &mut self.content
+            && let Some(child) = content.as_widget_mut().overlay(
                 &mut tree.children[0],
                 layout.children().next().unwrap(),
                 renderer,
                 viewport,
                 translation,
             )
-        } else {
-            None
+        {
+            overlays.push(child);
         }
+        // The closed popup is inert. Keeping it present lets iced finish its
+        // complete event batch on dismissal and supplies true window bounds
+        // for a menu opened during the subsequent base-widget pass.
+        Some(overlay::Group::with_children(overlays).overlay())
     }
 }
 
@@ -750,6 +870,10 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
     for Popup<'_, Message>
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        self.state.overlay_bounds = Some(bounds);
+        if !self.state.open {
+            return layout::Node::new(bounds);
+        }
         let mut panels = Vec::new();
         let mut position = if self.bar {
             bar_rects(renderer, self.items, self.anchor, self.style)
@@ -805,6 +929,9 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
     ) {
+        if !self.state.open {
+            return;
+        }
         for (depth, panel) in layout.children().enumerate() {
             let bounds = panel.bounds();
             quad(renderer, bounds, self.style.background, self.style);
@@ -872,6 +999,30 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
+        if !self.state.open || shell.is_event_captured() {
+            return;
+        }
+        let touch_event;
+        let (event, cursor) = match event {
+            Event::Touch(iced::touch::Event::FingerPressed { position, .. }) => {
+                touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+                (&touch_event, mouse::Cursor::Available(*position))
+            }
+            Event::Touch(iced::touch::Event::FingerMoved { position, .. }) => {
+                touch_event = Event::Mouse(mouse::Event::CursorMoved {
+                    position: *position,
+                });
+                (&touch_event, mouse::Cursor::Available(*position))
+            }
+            Event::Touch(
+                iced::touch::Event::FingerLifted { position, .. }
+                | iced::touch::Event::FingerLost { position, .. },
+            ) => {
+                touch_event = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+                (&touch_event, mouse::Cursor::Available(*position))
+            }
+            _ => (event, cursor),
+        };
         let before = self.state.clone();
         match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -883,7 +1034,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
                 }
                 shell.capture_event();
             }
-            Event::Keyboard(_) | Event::InputMethod(_) | Event::Touch(_) => shell.capture_event(),
+            Event::Keyboard(keyboard::Event::KeyReleased { .. }) => shell.capture_event(),
             Event::Mouse(mouse::Event::CursorMoved { .. })
             | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let clicked = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)));
@@ -936,7 +1087,9 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
             _ => {}
         }
         if *self.state != before {
-            shell.invalidate_layout();
+            if self.state.open {
+                shell.invalidate_layout();
+            }
             shell.request_redraw();
         }
     }
@@ -946,12 +1099,15 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         cursor: mouse::Cursor,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        if !self.state.open {
+            return mouse::Interaction::None;
+        }
         if self.hit(layout, cursor).is_some_and(|(depth, index)| {
             self.state.panel(self.items, self.bar, depth)[index].selectable()
         }) {
             mouse::Interaction::Pointer
         } else {
-            mouse::Interaction::None
+            mouse::Interaction::Idle
         }
     }
 }
@@ -960,6 +1116,406 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
 mod tests {
     use super::*;
     use keyboard::key::Named;
+
+    #[cfg(debug_assertions)]
+    #[derive(Default)]
+    struct Recorder {
+        quads: Vec<Rectangle>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl renderer::Renderer for Recorder {
+        fn start_layer(&mut self, _: Rectangle) {}
+        fn end_layer(&mut self) {}
+        fn start_transformation(&mut self, _: iced::Transformation) {}
+        fn end_transformation(&mut self) {}
+        fn fill_quad(&mut self, quad: renderer::Quad, _: impl Into<iced::Background>) {
+            self.quads.push(quad.bounds);
+        }
+        fn reset(&mut self, _: Rectangle) {
+            self.quads.clear();
+        }
+        fn allocate_image(
+            &mut self,
+            handle: &iced::advanced::image::Handle,
+            callback: impl FnOnce(
+                Result<iced::advanced::image::Allocation, iced::advanced::image::Error>,
+            ) + Send
+            + 'static,
+        ) {
+            renderer::Renderer::allocate_image(&mut (), handle, callback);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl text::Renderer for Recorder {
+        type Font = iced::Font;
+        type Paragraph = ();
+        type Editor = ();
+        const ICON_FONT: iced::Font = iced::Font::DEFAULT;
+        const CHECKMARK_ICON: char = 'x';
+        const ARROW_DOWN_ICON: char = 'v';
+        const SCROLL_UP_ICON: char = '^';
+        const SCROLL_DOWN_ICON: char = 'v';
+        const SCROLL_LEFT_ICON: char = '<';
+        const SCROLL_RIGHT_ICON: char = '>';
+        const ICED_LOGO: char = 'i';
+        fn default_font(&self) -> iced::Font {
+            iced::Font::DEFAULT
+        }
+        fn default_size(&self) -> iced::Pixels {
+            iced::Pixels(14.0)
+        }
+        fn fill_paragraph(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
+        fn fill_editor(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
+        fn fill_text(&mut self, _: text::Text<String>, _: Point, _: Color, _: Rectangle) {}
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn runtime_open_and_release_batch_keeps_drawn_overlay_and_close_keeps_tail() {
+        let mut renderer = Recorder::default();
+        let menu: Menu<'_, u8, iced::Theme, Recorder> =
+            Menu::bar(vec![Item::submenu("file", items())]);
+        let mut ui = iced_runtime::UserInterface::build(
+            menu,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let release = Event::Keyboard(keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(Named::F10),
+            modified_key: keyboard::Key::Named(Named::F10),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        });
+        let mut messages = vec![];
+        let (_, statuses) = ui.update(
+            &[key_event(Named::F10, keyboard::Modifiers::empty()), release],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses.len(), 2);
+        ui.draw(
+            &mut renderer,
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        assert!(
+            renderer
+                .quads
+                .iter()
+                .any(|rect| rect.y == 28.0 && rect.width == 160.0),
+            "popup must actually draw after captured key release"
+        );
+        let (_, statuses) = ui.update(
+            &[
+                key_event(Named::Escape, keyboard::Modifiers::empty()),
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::empty(),
+                )),
+                Event::Window(iced::window::Event::Unfocused),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            statuses.len(),
+            3,
+            "iced must not drop events following menu dismissal"
+        );
+        assert_eq!(statuses[1], iced::event::Status::Ignored);
+        ui.draw(
+            &mut renderer,
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        assert!(
+            !renderer
+                .quads
+                .iter()
+                .any(|rect| rect.y == 28.0 && rect.width == 160.0)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    fn character(value: &'static str) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(value.into()),
+            modified_key: keyboard::Key::Character(value.into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some(value.into()),
+            repeat: false,
+        })
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn runtime_focused_child_opens_context_and_receives_modifiers_and_ime() {
+        let id = iced::advanced::widget::Id::new("field");
+        let field = iced::widget::text_input("", "")
+            .id(id.clone())
+            .on_input(|value| value);
+        let menu: Menu<'_, String, iced::Theme, ()> =
+            Menu::context(field, vec![Item::action("action", "action".to_owned())]);
+        let mut ui = iced_runtime::UserInterface::build(
+            menu,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        );
+        ui.operate(
+            &(),
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+        );
+        let mut messages = vec![];
+        let (_, statuses) = ui.update(
+            &[
+                Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                key_event(Named::F10, keyboard::Modifiers::SHIFT),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            statuses[1],
+            iced::event::Status::Captured,
+            "keyboard-focused child enables context shortcut without click"
+        );
+        let (_, statuses) = ui.update(
+            &[
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::empty(),
+                )),
+                Event::InputMethod(iced::advanced::input_method::Event::Closed),
+                key_event(Named::Escape, keyboard::Modifiers::empty()),
+                character("c"),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses.len(), 4);
+        assert_eq!(statuses[0], iced::event::Status::Ignored);
+        assert_eq!(
+            messages,
+            ["c"],
+            "released Control must not turn typing into Copy, nor may Escape drop the tail"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn runtime_captured_sibling_click_unfocuses_context_child() {
+        let id = iced::advanced::widget::Id::new("field");
+        let menu: Menu<'_, String, iced::Theme, ()> = Menu::context(
+            iced::widget::text_input("", "")
+                .id(id.clone())
+                .on_input(|value| value),
+            vec![Item::action("action", "action".to_owned())],
+        );
+        let root = iced::widget::column![
+            iced::widget::button("button").on_press("button".to_owned()),
+            menu
+        ];
+        let mut ui = iced_runtime::UserInterface::build(
+            root,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        );
+        ui.operate(
+            &(),
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+        );
+        let mut messages = vec![];
+        ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(Point::new(5.0, 5.0)),
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        let (_, statuses) = ui.update(
+            &[
+                key_event(Named::F10, keyboard::Modifiers::SHIFT),
+                character("x"),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            statuses,
+            [iced::event::Status::Ignored, iced::event::Status::Ignored]
+        );
+        assert_eq!(messages, ["button"]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn runtime_nested_context_prefers_inner_and_touch_can_activate_it() {
+        let inner = Menu::context(
+            iced::widget::Space::new().width(200).height(100),
+            vec![Item::action("inner", 1)],
+        );
+        let outer: Menu<'_, u8, iced::Theme, ()> =
+            Menu::context(inner, vec![Item::action("outer", 2)]);
+        let mut ui = iced_runtime::UserInterface::build(
+            outer,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        );
+        let mut messages = vec![];
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Right,
+            ))],
+            mouse::Cursor::Available(Point::new(20.0, 20.0)),
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        ui.update(
+            &[Event::Touch(iced::touch::Event::FingerPressed {
+                id: iced::touch::Finger(0),
+                position: Point::new(25.0, 25.0),
+            })],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, [1]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn runtime_same_batch_popup_hit_testing_uses_scrolled_window_coordinates() {
+        let id = iced::advanced::widget::Id::new("scroll");
+        let menu: Menu<'_, u8, iced::Theme, ()> =
+            Menu::bar(vec![Item::submenu("file", vec![Item::action("run", 9)])]);
+        let root = iced::widget::scrollable(iced::widget::column![
+            iced::widget::Space::new().height(100),
+            menu,
+            iced::widget::Space::new().height(400)
+        ])
+        .id(id.clone())
+        .width(200)
+        .height(100);
+        let mut ui = iced_runtime::UserInterface::build(
+            root,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        );
+        ui.operate(
+            &(),
+            &mut iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+                id,
+                iced::advanced::widget::operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(80.0),
+                },
+            ),
+        );
+        let mut messages = vec![];
+        let (_, statuses) = ui.update(
+            &[
+                key_event(Named::F10, keyboard::Modifiers::empty()),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(Point::new(10.0, 50.0)),
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(
+            messages,
+            [9],
+            "bar at content y=100, scroll=80 has popup at window y=48"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn runtime_touch_opens_bar_and_dismisses_outside_without_hover_leak() {
+        let menu: Menu<'_, u8, iced::Theme, ()> = Menu::bar(vec![Item::submenu("file", items())]);
+        let mut ui = iced_runtime::UserInterface::build(
+            menu,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        );
+        let mut messages = vec![];
+        ui.update(
+            &[Event::Touch(iced::touch::Event::FingerPressed {
+                id: iced::touch::Finger(0),
+                position: Point::new(5.0, 5.0),
+            })],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        let (state, _) = ui.update(
+            &[],
+            mouse::Cursor::Available(Point::new(5.0, 35.0)),
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(
+                state,
+                iced_runtime::user_interface::State::Updated {
+                    mouse_interaction: mouse::Interaction::Idle,
+                    ..
+                }
+            ),
+            "disabled row must block hover through to underlying widgets"
+        );
+        let (_, statuses) = ui.update(
+            &[
+                Event::Touch(iced::touch::Event::FingerPressed {
+                    id: iced::touch::Finger(1),
+                    position: Point::new(390.0, 290.0),
+                }),
+                character("x"),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            statuses,
+            [iced::event::Status::Captured, iced::event::Status::Ignored]
+        );
+        assert!(messages.is_empty());
+    }
 
     #[cfg(debug_assertions)]
     struct Harness {

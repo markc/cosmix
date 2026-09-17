@@ -7,4 +7,4 @@ pub mod tokens;
 
 pub use menu::{Item, Menu, MenuStyle};
 pub use text_field::TextField;
-pub use tokens::Tokens;
+pub use tokens::{TokenError, Tokens};
