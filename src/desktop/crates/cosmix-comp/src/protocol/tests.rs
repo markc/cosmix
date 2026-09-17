@@ -15325,7 +15325,6 @@ fn mapped_decoration_request_reaches_renderer_only_after_ack_and_commit() {
             event,
             ProtocolEvent::SurfaceRelayout {
                 scene: SurfaceSceneSnapshot {
-                    commit_seq: 0,
                     layout: SurfaceLayout {
                         toplevel: Some(ToplevelSceneState {
                             decoration: SceneDecorationMode::ClientSide,
@@ -15350,7 +15349,6 @@ fn mapped_decoration_request_reaches_renderer_only_after_ack_and_commit() {
             event,
             ProtocolEvent::SurfaceRelayout {
                 scene: SurfaceSceneSnapshot {
-                    commit_seq: 0,
                     layout: SurfaceLayout {
                         toplevel: Some(ToplevelSceneState {
                             decoration: SceneDecorationMode::ClientSide,
@@ -15418,7 +15416,6 @@ fn queued_decoration_commits_adopt_each_acked_mode_at_its_own_commit() {
             ProtocolEvent::SurfaceRelayout {
                 scene:
                     SurfaceSceneSnapshot {
-                        commit_seq: 0,
                         layout:
                             SurfaceLayout {
                                 toplevel: Some(toplevel),
@@ -15708,7 +15705,6 @@ fn destroying_subsurface_role_refreshes_former_implicit_toplevel_bounds() {
             event,
             ProtocolEvent::SurfaceRelayout {
                 scene: SurfaceSceneSnapshot {
-                    commit_seq: 0,
                     layout: SurfaceLayout {
                         toplevel: Some(ToplevelSceneState {
                             window_geometry: SceneWindowGeometry { width: 64.0, .. },
