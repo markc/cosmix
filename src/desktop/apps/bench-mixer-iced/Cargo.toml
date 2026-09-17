@@ -1,0 +1,50 @@
+# desktop/apps/bench-mixer-iced — the iced arm of the mixer + roll bake-off
+# (ADR 2026-09-17 test C). Both renderers are measured, so the renderer is a
+# feature and exactly one must be selected; the binary refuses to compile
+# otherwise rather than silently picking one.
+#
+# Wayland only: no `x11` feature reaches iced or winit from here, and
+# `cargo tree -p cosmix-bench-mixer-iced -e normal | grep -i x11` must stay
+# empty (ADR §3.7).
+[package]
+name = "cosmix-bench-mixer-iced"
+version = "0.1.0"
+description = "Mixer + roll bake-off, iced arm: 64 cosmix-iced-widgets strips with animated meters and a piano-roll canvas fed by cosmix-bench-feed"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[package.metadata.cosmix]
+kind = "app"
+engine = "iced"
+
+[[bin]]
+name = "cosmix-bench-mixer-iced"
+path = "src/main.rs"
+
+[features]
+default = []
+wgpu = ["cosmix-iced-widgets/wgpu", "iced/wgpu"]
+tiny-skia = ["cosmix-iced-widgets/tiny-skia", "iced/tiny-skia"]
+
+[dependencies]
+cosmix-bench-feed = { path = "../../crates/cosmix-bench-feed" }
+cosmix-design = { path = "../../crates/cosmix-design" }
+cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets" }
+# `thread-pool`, not `tokio`/`smol`: the arm runs no async work and must not
+# carry a runtime's threads into the wakeup measurement. The 30 Hz feed clock
+# is a widget that schedules its own redraws (src/ticker.rs), the way the
+# Bevy arm uses winit's reactive update mode.
+iced = { version = "=0.14.0", default-features = false, features = [
+    "advanced",
+    "canvas",
+    "wayland",
+    "thread-pool",
+    "fira-sans",
+] }
+iced_core = { version = "=0.14.0", default-features = false, features = ["advanced"] }
+
+[dev-dependencies]
+# Tests build small songs in memory instead of reading the generated fixture.
+cosmix-song = { path = "../../../crates/cosmix-song" }
