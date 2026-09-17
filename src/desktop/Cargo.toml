@@ -18,6 +18,7 @@ members = [
     "apps/term",
     "apps/wl-iced-demo",
     "crates/cosmix-design",
+    "crates/cosmix-iced-widgets",
     "crates/cosmix-scene",
     "crates/cosmix-scene-bevy",
     "crates/cosmix-comp",
