@@ -59,7 +59,11 @@ with `RenderQueue::write_texture` after `PrepareAssets`. The texture is
 added before the frame's asset events (`AssetEventSystems`), so it is
 extracted in the same update. An upload waits up to 120 frames for its
 texture, requesting a redraw meanwhile so an idle host keeps updating; a
-texture Bevy re-created underneath us triggers a full repaint. A surface that
+texture Bevy re-created underneath us triggers a full repaint. Those redraw
+requests stop after 240 consecutive frames and rearm when an upload lands,
+so a texture that never prepares leaves a blank surface instead of holding
+the desktop at full frame rate. The `waiting` flag they read is a Relaxed
+cross-world store, so it can be one frame stale under pipelined rendering. A surface that
 cannot draw (no size yet) disables its IME target and keeps any repaint for
 its next draw.
 
