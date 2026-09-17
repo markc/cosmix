@@ -327,6 +327,15 @@ pub(crate) fn reconcile(world: &mut World) {
                 },
             );
         }
+    });
+}
+
+/// Runs after the CTK pass: `mount_page` reports an existing page id as
+/// mounted without attaching new content, so a CTK wrapper for the same scene
+/// must be gone before this registers (and `reconcile` releases ours before
+/// CTK registers).
+pub(crate) fn register(world: &mut World) {
+    world.resource_scope(|world, mut mounts: Mut<Mounts>| {
         for mount in mounts.0.values_mut().filter(|mount| !mount.registered) {
             mount.registered = register_scene_page(world, &mount.tree, mount.page);
         }

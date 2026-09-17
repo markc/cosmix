@@ -270,3 +270,115 @@ fn unload_and_adapter_switch_remove_the_surface() {
     h.run(1);
     assert_eq!(query.iter(h.app.world()).count(), 0);
 }
+
+// Stands in for the CTK adapter: owns a page with the same id whenever the
+// scene is not iced-backed, created and destroyed inside `SceneReconcile`.
+#[derive(Resource, Default)]
+struct FakeCtkPage(Option<Entity>);
+
+fn fake_ctk(world: &mut World) {
+    let iced = world
+        .resource::<SceneStore>()
+        .adapter_scenes(ADAPTER)
+        .any(|(tree, _)| tree.name == "probe");
+    let current = world.resource::<FakeCtkPage>().0;
+    match (iced, current) {
+        (true, Some(page)) => {
+            cosmix_shell::chrome::unmount_page(
+                world,
+                cosmix_shell::core::Edge::Left,
+                "scene-probe",
+            );
+            world.despawn(page);
+            world.resource_mut::<FakeCtkPage>().0 = None;
+        }
+        (false, None) => {
+            let page = world.spawn(Node::default()).id();
+            assert!(cosmix_shell::chrome::mount_page(
+                world,
+                cosmix_shell::core::Edge::Left,
+                "scene-probe",
+                "probe",
+                page
+            ));
+            world.resource_mut::<FakeCtkPage>().0 = Some(page);
+        }
+        _ => {}
+    }
+}
+
+fn wrapper_of(world: &World, page: Entity) -> Option<Entity> {
+    world.get::<ChildOf>(page).map(ChildOf::parent)
+}
+
+#[test]
+fn adapter_hand_over_attaches_the_new_page_in_both_directions() {
+    use cosmix_shell::chrome::{
+        QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts, spawn_quoin_chrome,
+    };
+    use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+    use cosmix_shell::runtime::{ShellFrameState, ShellRuntimePlugin};
+    let model = ShellModel::new(
+        OutputKey::new("test").unwrap(),
+        LogicalSize::new(800.0, 600.0).unwrap(),
+        Duration::ZERO,
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+        .init_asset::<Image>()
+        .add_plugins(ShellRuntimePlugin::new(model))
+        .add_plugins(SceneIcedPlugin)
+        .init_resource::<FakeCtkPage>()
+        .add_systems(Update, fake_ctk.in_set(cosmix_scene_bevy::SceneReconcile));
+    let world = app.world_mut();
+    let registry = QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap();
+    let props = registry
+        .bind(
+            &world.resource::<ShellFrameState>().0,
+            QuoinContentBindings::default(),
+        )
+        .unwrap();
+    let mounts = QuoinPanelMounts::new(
+        world.spawn_empty().id(),
+        world.spawn_empty().id(),
+        world.spawn_empty().id(),
+        world.spawn_empty().id(),
+    );
+    let mut queue = bevy::ecs::world::CommandQueue::default();
+    spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
+    queue.apply(world);
+    let (bridge, _peer) = ctk::bus::test_bridge("test");
+    let mut load = |app: &mut App, adapter: &str| {
+        let (rc, reply) = app.world_mut().resource_mut::<SceneStore>().dispatch(
+            SceneVerb::Load,
+            SCENE,
+            &json!({ "adapter": adapter }),
+            &bridge,
+        );
+        assert_eq!(rc, 0, "{reply}");
+        app.update();
+    };
+
+    // CTK first, then iced: the CTK page is released before ours registers.
+    load(&mut app, "bevy");
+    let ctk_page = app.world().resource::<FakeCtkPage>().0.unwrap();
+    assert!(wrapper_of(app.world(), ctk_page).is_some());
+    load(&mut app, ADAPTER);
+    let mut query = app
+        .world_mut()
+        .query_filtered::<Entity, With<IcedSurface>>();
+    let surface = query.single(app.world()).unwrap();
+    assert!(
+        wrapper_of(app.world(), surface).is_some(),
+        "iced page must be attached to a chrome wrapper"
+    );
+
+    // And back: ours is released before CTK registers its page.
+    load(&mut app, "bevy");
+    assert!(app.world().get_entity(surface).is_err());
+    let ctk_page = app.world().resource::<FakeCtkPage>().0.unwrap();
+    assert!(wrapper_of(app.world(), ctk_page).is_some());
+}

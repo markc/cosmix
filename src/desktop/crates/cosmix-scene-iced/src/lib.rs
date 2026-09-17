@@ -60,7 +60,10 @@ impl Plugin for SceneIcedPlugin {
                         .after(ShellRuntimeSet::Input),
                     bridge::reconcile
                         .before(SceneReconcile)
-                        .after(ShellRuntimeSet::Input)
+                        .after(ShellRuntimeSet::Input),
+                    bridge::register
+                        .after(SceneReconcile)
+                        .after(bridge::reconcile)
                         .before(ShellRuntimeSet::Model),
                 ),
             )
