@@ -3,6 +3,7 @@
 mod gate;
 mod render;
 pub use render::Events as SceneEvents;
+pub use render::{register_scene_page, scene_edge, scene_page_id};
 
 use bevy::prelude::*;
 use cosmix_scene::{ResolvedScene, SceneDocument, Severity};
@@ -10,7 +11,7 @@ use cosmix_shell::runtime::{SceneVerb, ShellRuntimeSet};
 use ctk::bus::BusBridge;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub struct ScenePlugin;
 impl Plugin for ScenePlugin {
@@ -22,17 +23,24 @@ impl Plugin for ScenePlugin {
         app.add_systems(
             Update,
             render::reconcile
+                .in_set(SceneReconcile)
                 .after(ShellRuntimeSet::Input)
                 .before(ShellRuntimeSet::Model),
         );
     }
 }
 
+/// The CTK adapter mount pass. Other adapters release pages before it.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SceneReconcile;
+
 pub(crate) struct SceneEntry {
     document: SceneDocument,
     pub tree: ResolvedScene,
     revision: u64,
     pub mounted: Option<render::Mounted>,
+    /// A non-Bevy adapter that owns this scene's mount; `None` is CTK.
+    adapter: Option<String>,
 }
 
 #[derive(Resource, Default)]
@@ -40,9 +48,26 @@ pub struct SceneStore {
     pub(crate) scenes: BTreeMap<String, SceneEntry>,
     pub(crate) removed: Vec<render::Mounted>,
     revisions: BTreeMap<String, u64>,
+    adapters: BTreeSet<String>,
 }
 
 impl SceneStore {
+    /// Makes `adapter` selectable by `shell.scene.load`'s `adapter` argument.
+    pub fn register_adapter(&mut self, adapter: &str) {
+        self.adapters.insert(adapter.to_owned());
+    }
+
+    /// Scenes owned by `adapter`, with their accepted revision.
+    pub fn adapter_scenes<'a>(
+        &'a self,
+        adapter: &'a str,
+    ) -> impl Iterator<Item = (&'a ResolvedScene, u64)> + 'a {
+        self.scenes
+            .values()
+            .filter(move |entry| entry.adapter.as_deref() == Some(adapter))
+            .map(|entry| (&entry.tree, entry.revision))
+    }
+
     /// Transactional Bus ingress: a rejected candidate never replaces last-good.
     pub fn dispatch(
         &mut self,
@@ -96,8 +121,29 @@ impl SceneStore {
         let name = args["scene"].as_str().unwrap_or_default();
         match verb {
             SceneVerb::Load => {
+                // Absent keeps the scene's current adapter; "bevy" selects CTK.
+                let adapter = match args["adapter"].as_str() {
+                    None => None,
+                    Some("bevy") => Some(None),
+                    Some(name) if self.adapters.contains(name) => Some(Some(name.to_owned())),
+                    Some(name) => {
+                        return Err(json!({"error":format!("scene adapter {name} is not built")}));
+                    }
+                };
                 let document = cosmix_scene::parse(body).map_err(|d| json!({"diagnostics":d}))?;
-                self.accept(document)
+                let name = document.name.clone();
+                let result = self.accept(document);
+                if result.is_ok()
+                    && let Some(adapter) = adapter
+                    && let Some(entry) = self.scenes.get_mut(&name)
+                    && entry.adapter != adapter
+                {
+                    if let Some(mounted) = entry.mounted.take() {
+                        self.removed.push(mounted);
+                    }
+                    entry.adapter = adapter;
+                }
+                result
             }
             SceneVerb::Describe => {
                 let families = [
@@ -209,7 +255,10 @@ impl SceneStore {
         let reply = json!({"scene":tree.name,"revision":revision,"digest":digest(&tree)});
         let summary =
             json!({"scene":tree.name,"revision":revision,"ops":ops,"diagnostics":diagnostics});
-        let mounted = self.scenes.remove(&tree.name).and_then(|old| old.mounted);
+        let (mounted, adapter) = self
+            .scenes
+            .remove(&tree.name)
+            .map_or((None, None), |old| (old.mounted, old.adapter));
         self.scenes.insert(
             tree.name.clone(),
             SceneEntry {
@@ -217,6 +266,7 @@ impl SceneStore {
                 tree,
                 revision,
                 mounted,
+                adapter,
             },
         );
         Ok((reply, Some(summary)))
@@ -308,6 +358,28 @@ mod tests {
             assert_eq!(node.ports, actual.nodes[id].ports);
         }
     }
+    #[test]
+    fn adapter_selection_is_explicit_and_sticky() {
+        let mut store = SceneStore::default();
+        let iced = json!({"adapter":"iced"});
+        let error = store.request(SceneVerb::Load, FIXTURE, &iced).unwrap_err();
+        assert!(error["error"].as_str().unwrap().contains("not built"));
+        assert!(store.scenes.is_empty());
+        store.register_adapter("iced");
+        store.request(SceneVerb::Load, FIXTURE, &iced).unwrap();
+        assert_eq!(store.adapter_scenes("iced").count(), 1);
+        // A reload without the argument keeps the owner; "bevy" returns it.
+        store
+            .request(SceneVerb::Load, FIXTURE, &Value::Null)
+            .unwrap();
+        assert_eq!(store.adapter_scenes("iced").count(), 1);
+        store
+            .request(SceneVerb::Load, FIXTURE, &json!({"adapter":"bevy"}))
+            .unwrap();
+        assert_eq!(store.adapter_scenes("iced").count(), 0);
+        assert_eq!(store.scenes["conformance"].revision, 3);
+    }
+
     #[test]
     fn conformance_and_last_good() {
         let expected = cosmix_scene::resolve(&cosmix_scene::parse(FIXTURE).unwrap()).unwrap();

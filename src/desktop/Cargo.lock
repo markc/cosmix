@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3138,6 +3138,7 @@ dependencies = [
  "cosmix-lib-props-core",
  "cosmix-scene",
  "cosmix-scene-bevy",
+ "cosmix-scene-iced",
  "cosmix-shell",
  "cosmix-shell-host",
  "ctk",
@@ -3158,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bevy",
  "cosmix-scene",
@@ -3166,6 +3167,18 @@ dependencies = [
  "ctk",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "cosmix-scene-iced"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "cosmix-scene",
+ "cosmix-scene-bevy",
+ "cosmix-shell",
+ "ctk",
+ "serde_json",
 ]
 
 [[package]]

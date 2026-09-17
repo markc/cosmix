@@ -19,6 +19,7 @@ members = [
     "crates/cosmix-design",
     "crates/cosmix-scene",
     "crates/cosmix-scene-bevy",
+    "crates/cosmix-scene-iced",
     "crates/cosmix-comp",
     "crates/cosmix-deco",
     "crates/cosmix-shell",

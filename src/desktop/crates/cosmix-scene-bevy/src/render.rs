@@ -237,12 +237,19 @@ pub(crate) fn reconcile(world: &mut World) {
             destroy(world, mounted);
         }
         for entry in store.scenes.values_mut() {
+            if entry.adapter.is_some() {
+                // Another adapter owns this scene; never keep a CTK page for it.
+                if let Some(mounted) = entry.mounted.take() {
+                    destroy(world, mounted);
+                }
+                continue;
+            }
             let edge = scene_edge(&entry.tree);
             if entry.mounted.as_ref().is_some_and(|m| m.edge != edge) {
                 // Reparent the existing page when its edge changes: fields survive.
                 let m = entry.mounted.as_mut().unwrap();
                 world.entity_mut(m.page).remove::<ChildOf>();
-                cosmix_shell::chrome::unmount_page(world, m.edge, &page_id(&m.tree));
+                cosmix_shell::chrome::unmount_page(world, m.edge, &scene_page_id(&m.tree));
                 m.edge = edge;
                 m.registered = false;
             }
@@ -274,65 +281,67 @@ pub(crate) fn reconcile(world: &mut World) {
                 debug_assert_eq!(mounted.tree, entry.tree);
             }
             if !mounted.registered {
-                let config = mount_config(&entry.tree);
-                let title = config
-                    .as_ref()
-                    .and_then(|w| w["title"].as_str())
-                    .unwrap_or(&entry.tree.name);
-                mounted.registered = cosmix_shell::chrome::mount_page(
-                    world,
-                    edge,
-                    &page_id(&entry.tree),
-                    title,
-                    mounted.page,
-                );
-                if mounted.registered {
-                    use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
-                    let output = world
-                        .resource::<ShellFrameState>()
-                        .0
-                        .geometry
-                        .output
-                        .clone();
-                    let at = world.resource::<Time<bevy::time::Real>>().elapsed();
-                    let dimension = if matches!(edge, Edge::Left | Edge::Right) {
-                        "w"
-                    } else {
-                        "h"
-                    };
-                    let default_size = cosmix_shell::core::seed_panel_thickness(
-                        edge,
-                        world.resource::<ShellFrameState>().0.geometry.logical_size,
-                    );
-                    let size = config
-                        .as_ref()
-                        .and_then(|window| window[dimension].as_f64())
-                        .map_or(default_size, |size| size.min(f32::MAX as f64) as f32);
-                    cosmix_shell::runtime::set_page_thickness(world, edge, size);
-                    world.write_message(ShellCommand {
-                        output,
-                        at,
-                        kind: ShellCommandKind::Panel {
-                            edge,
-                            input: cosmix_shell::core::PanelInput::Reveal,
-                        },
-                    });
-                }
+                mounted.registered = register_scene_page(world, &entry.tree, mounted.page);
             }
         }
     });
 }
 
+/// Registers `page` as the scene's panel page, applies its extent and reveals
+/// the panel. Returns false while the edge's chrome does not exist yet.
+pub fn register_scene_page(world: &mut World, tree: &ResolvedScene, page: Entity) -> bool {
+    let edge = scene_edge(tree);
+    let config = mount_config(tree);
+    let title = config
+        .as_ref()
+        .and_then(|w| w["title"].as_str())
+        .unwrap_or(&tree.name);
+    if !cosmix_shell::chrome::mount_page(world, edge, &scene_page_id(tree), title, page) {
+        return false;
+    }
+    use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
+    let output = world
+        .resource::<ShellFrameState>()
+        .0
+        .geometry
+        .output
+        .clone();
+    let at = world.resource::<Time<bevy::time::Real>>().elapsed();
+    let dimension = if matches!(edge, Edge::Left | Edge::Right) {
+        "w"
+    } else {
+        "h"
+    };
+    let default_size = cosmix_shell::core::seed_panel_thickness(
+        edge,
+        world.resource::<ShellFrameState>().0.geometry.logical_size,
+    );
+    let size = config
+        .as_ref()
+        .and_then(|window| window[dimension].as_f64())
+        .map_or(default_size, |size| size.min(f32::MAX as f64) as f32);
+    cosmix_shell::runtime::set_page_thickness(world, edge, size);
+    world.write_message(ShellCommand {
+        output,
+        at,
+        kind: ShellCommandKind::Panel {
+            edge,
+            input: cosmix_shell::core::PanelInput::Reveal,
+        },
+    });
+    true
+}
+
 fn destroy(world: &mut World, mounted: Mounted) {
-    cosmix_shell::chrome::unmount_page(world, mounted.edge, &page_id(&mounted.tree));
+    cosmix_shell::chrome::unmount_page(world, mounted.edge, &scene_page_id(&mounted.tree));
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
     }
 }
-fn page_id(tree: &ResolvedScene) -> String {
+pub fn scene_page_id(tree: &ResolvedScene) -> String {
     format!("scene-{}", tree.name)
 }
-fn scene_edge(tree: &ResolvedScene) -> Edge {
+pub fn scene_edge(tree: &ResolvedScene) -> Edge {
     match mount_config(tree)
         .as_ref()
         .and_then(|w| w["edge"].as_str())

@@ -107,6 +107,11 @@ struct SceneBus<'w, 's> {
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
+    #[cfg(feature = "scene-iced")]
+    iced: (
+        Option<Res<'w, cosmix_scene_iced::SceneIcedCounters>>,
+        Option<Res<'w, cosmix_scene_iced::SceneIcedFocus>>,
+    ),
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -294,13 +299,27 @@ fn service_bus(
         let started = std::time::Instant::now();
         let (rc, body, command) =
             if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
-                let args = parse_args(&request).unwrap_or(Value::Null);
+                let mut args = parse_args(&request).unwrap_or(Value::Null);
+                // A load's body is the scene document, so its adapter rides a header.
+                if verb == cosmix_shell::runtime::SceneVerb::Load
+                    && let Some(adapter) = request.headers.get("adapter")
+                {
+                    args = json!({"adapter": adapter});
+                }
                 let (rc, body) = content.scenes.dispatch(verb, &request.body, &args, &bridge);
                 (rc, body, None)
             } else if request.command == "shell.debug.status" {
+                #[cfg(feature = "scene-iced")]
+                let scene_iced = match &content.iced {
+                    (Some(counters), Some(focus)) => counters.snapshot(focus).json(),
+                    _ => Value::Null,
+                };
+                #[cfg(not(feature = "scene-iced"))]
+                let scene_iced = Value::Null;
                 (
                     0,
                     json!({
+                        "scene_iced":scene_iced,
                         "requests":state.diagnostics.requests,
                         "rejected":state.diagnostics.rejected,
                         "accepted_mutations":state.diagnostics.accepted_mutations,

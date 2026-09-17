@@ -464,7 +464,11 @@ a candidate before committing it; null clears an optional authored port.
 The complete serialised patch candidate must fit the same 256 KiB bound as
 loads. Rejected patches retain both the tree and its revision.
 <code>shell.scene.describe {family?}</code> reports the shared P1 registry.
-<code>shell.scene.unload {scene}</code> removes the page.</p>
+<code>shell.scene.unload {scene}</code> removes the page.
+An optional <code>adapter</code> header on <code>load</code> picks the renderer: <code>bevy</code> (CTK, the
+default) or another adapter compiled in, such as <code>iced</code> in a Quoin built with
+<code>scene-iced</code> (see <code>docs/dev/cosmix-scene-iced.md</code>). Without the header a reload
+keeps the current adapter.</p>
 <p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
 <code>shell.scene.changed</code> for summaries <code>{scene,revision,ops,diagnostics}</code>;
 fetch the complete tree with <code>get</code>. Revisions increase on accepted loads and

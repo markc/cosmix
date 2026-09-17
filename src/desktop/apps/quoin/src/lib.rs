@@ -166,6 +166,23 @@ fn configure_content(
             Update,
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
+    #[cfg(feature = "scene-iced")]
+    app.add_plugins(cosmix_scene_iced::SceneIcedPlugin)
+        .add_systems(Last, scene_iced_wake);
+}
+
+/// Caret blink and other renderer timers become the layer host's one-shot
+/// application wake; the earliest pending deadline wins.
+#[cfg(feature = "scene-iced")]
+fn scene_iced_wake(
+    wake: Res<cosmix_scene_iced::SceneIcedWake>,
+    mut deadline: ResMut<cosmix_shell_host::LayerHostDeadline>,
+) {
+    if let Some(at) = wake.0
+        && deadline.0.is_none_or(|current| at < current)
+    {
+        deadline.0 = Some(at);
+    }
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
