@@ -19,7 +19,7 @@ use std::{
 };
 
 use smithay::reexports::drm::{
-    Device as BasicDrmDevice,
+    Device as BasicDrmDevice, DriverCapability,
     buffer::PlanarBuffer,
     control::{self, Device as ControlDevice, ResourceHandle},
 };
@@ -104,6 +104,76 @@ pub(crate) struct AtomicPageFlip {
     pub(crate) tag: Option<AtomicPageFlipTag>,
     pub(crate) tv_sec: u32,
     pub(crate) tv_usec: u32,
+    /// The CRTC's vblank counter at the flip.
+    pub(crate) sequence: u32,
+}
+
+/// Which clock the kernel stamps page-flip events with
+/// (`DRM_CAP_TIMESTAMP_MONOTONIC`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageFlipClock {
+    Monotonic,
+    Realtime,
+    /// The capability query failed: the stamp's clock is not known.
+    Unknown,
+}
+
+impl PageFlipClock {
+    fn from_capability(capability: io::Result<u64>) -> Self {
+        match capability {
+            Ok(1) => Self::Monotonic,
+            Ok(_) => Self::Realtime,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+/// A completed flip, with its time on CLOCK_MONOTONIC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DisplayedFlip {
+    pub(crate) seconds: u64,
+    pub(crate) nanoseconds: u32,
+    pub(crate) sequence: u32,
+    /// The time is the kernel's own CLOCK_MONOTONIC stamp. Otherwise it was
+    /// converted from CLOCK_REALTIME, or taken when the event was read.
+    pub(crate) hw_clock: bool,
+}
+
+/// Place a kernel flip stamp on CLOCK_MONOTONIC. `realtime_now` and
+/// `monotonic_now` are sampled together, after the event was read.
+///
+/// A MONOTONIC stamp is used as is unless it lies in the future (then the
+/// capability lied and the stamp is not trusted). A REALTIME stamp is moved
+/// by the sampled clock offset. Anything that cannot be placed falls back to
+/// `monotonic_now`, without claiming a hardware clock.
+fn flip_time_on_monotonic(
+    clock: PageFlipClock,
+    stamp: Duration,
+    realtime_now: Duration,
+    monotonic_now: Duration,
+) -> (Duration, bool) {
+    let placed = match clock {
+        PageFlipClock::Monotonic if stamp <= monotonic_now => return (stamp, true),
+        PageFlipClock::Realtime => realtime_now
+            .checked_sub(stamp)
+            .and_then(|age| monotonic_now.checked_sub(age)),
+        PageFlipClock::Monotonic | PageFlipClock::Unknown => None,
+    };
+    (placed.unwrap_or(monotonic_now), false)
+}
+
+fn clock_now(clock: libc::clockid_t) -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // Both clocks always exist on Linux; a failure leaves zero, which the
+    // placement treats as "cannot place".
+    unsafe { libc::clock_gettime(clock, &mut now) };
+    Duration::new(
+        u64::try_from(now.tv_sec).unwrap_or(0),
+        u32::try_from(now.tv_nsec).unwrap_or(0),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,7 +458,8 @@ pub(crate) struct AtomicPresenter<I: AtomicIo> {
     cancellation: Arc<AtomicCancellation>,
     modeset_required: bool,
     pending_commit: Option<PendingAtomicCommit>,
-    displayed_timestamp: Option<(u64, u32)>,
+    displayed_timestamp: Option<DisplayedFlip>,
+    flip_clock: PageFlipClock,
     pub(crate) cursor: cursor::HardwareCursorBridge,
 }
 
@@ -411,6 +482,9 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             modeset_required: true,
             pending_commit: None,
             displayed_timestamp: None,
+            // Supported kernels stamp flips on CLOCK_MONOTONIC; the production
+            // constructor replaces this with the queried answer.
+            flip_clock: PageFlipClock::Monotonic,
             cursor: cursor::HardwareCursorBridge::default(),
         }
     }
@@ -499,8 +573,41 @@ impl<I: AtomicIo> AtomicPresenter<I> {
         self.modeset_required
     }
 
-    pub(crate) fn take_displayed_timestamp(&mut self) -> Option<(u64, u32)> {
+    pub(crate) fn take_displayed_timestamp(&mut self) -> Option<DisplayedFlip> {
         self.displayed_timestamp.take()
+    }
+
+    pub(crate) fn set_flip_clock(&mut self, clock: PageFlipClock) {
+        self.flip_clock = clock;
+    }
+
+    /// The scanned-out mode's refresh period, when the mode names one.
+    pub(crate) fn refresh_nanos(&self) -> Option<u64> {
+        let millihz = u64::from(self.selection.mode.refresh_millihz);
+        (millihz > 0).then(|| 1_000_000_000_000 / millihz)
+    }
+
+    fn place_flip(&mut self, stamp: Duration, sequence: u32) -> DisplayedFlip {
+        let realtime_now = clock_now(libc::CLOCK_REALTIME);
+        let monotonic_now = clock_now(libc::CLOCK_MONOTONIC);
+        let (time, hw_clock) =
+            flip_time_on_monotonic(self.flip_clock, stamp, realtime_now, monotonic_now);
+        if !hw_clock && self.flip_clock == PageFlipClock::Monotonic {
+            // Stop trusting a capability whose stamps run ahead of the clock.
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                ?stamp,
+                ?monotonic_now,
+                "page-flip stamp is ahead of CLOCK_MONOTONIC; presentation times lose HW_CLOCK"
+            );
+            self.flip_clock = PageFlipClock::Unknown;
+        }
+        DisplayedFlip {
+            seconds: time.as_secs(),
+            nanoseconds: time.subsec_nanos(),
+            sequence,
+            hw_clock,
+        }
     }
 
     /// Try the retained buffer as a same-mode plane flip. TEST_ONLY and the
@@ -673,7 +780,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                                     ),
                                 ));
                             }
-                            self.displayed_timestamp = Some((
+                            let stamp = Duration::new(
                                 u64::from(matching.tv_sec),
                                 matching.tv_usec.checked_mul(1_000).ok_or_else(|| {
                                     KmsRenderPlatformFailure::terminal(
@@ -681,7 +788,9 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                                         "kernel page-flip microseconds overflowed nanoseconds",
                                     )
                                 })?,
-                            ));
+                            );
+                            self.displayed_timestamp =
+                                Some(self.place_flip(stamp, matching.sequence));
                             // A retained same-mode flip deliberately does not
                             // establish the new generation's full property
                             // set. Keep the first fresh frame modeset-shaped so
@@ -1105,6 +1214,13 @@ impl AtomicPresenter<ProductionAtomicIo> {
     ) -> Result<Self, AtomicPresenterSetupError> {
         let selection = pool.selection();
         let mut io = ProductionAtomicIo::new(fd, events);
+        let flip_clock = io.flip_clock();
+        if flip_clock != PageFlipClock::Monotonic {
+            tracing::warn!(
+                ?flip_clock,
+                "DRM does not confirm CLOCK_MONOTONIC page-flip stamps; presentation times lose HW_CLOCK"
+            );
+        }
         let properties = io.property_ids(selection).map_err(|detail| {
             AtomicPresenterSetupError::new("kms-live-atomic-property-map-failed", detail)
         })?;
@@ -1160,6 +1276,7 @@ impl AtomicPresenter<ProductionAtomicIo> {
             framebuffers,
             cancellation,
         );
+        presenter.set_flip_clock(flip_clock);
         let probe_slot = pool.slot_ids().next().ok_or_else(|| {
             AtomicPresenterSetupError::new(
                 "kms-live-atomic-scanout-pool-empty",
@@ -1453,6 +1570,13 @@ impl ProductionAtomicIo {
         }
     }
 
+    pub(crate) fn flip_clock(&self) -> PageFlipClock {
+        PageFlipClock::from_capability(
+            self.card
+                .get_driver_capability(DriverCapability::MonotonicTimestamp),
+        )
+    }
+
     pub(crate) fn property_ids(
         &self,
         selection: AtomicOutputSelection,
@@ -1674,6 +1798,7 @@ fn decode_raw_pageflips(
                 tag,
                 tv_sec: event.tv_sec,
                 tv_usec: event.tv_usec,
+                sequence: event.sequence,
             });
         }
         offset += length;
@@ -2104,6 +2229,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 123,
             tv_usec: 456_789,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2121,14 +2247,170 @@ mod tests {
         );
         assert_eq!(
             presenter.take_displayed_timestamp(),
-            Some((123, 456_789_000))
+            Some(DisplayedFlip {
+                seconds: 123,
+                nanoseconds: 456_789_000,
+                sequence: 0,
+                hw_clock: true,
+            })
         );
+    }
+
+    fn present_one_flip(
+        presenter: &mut AtomicPresenter<FakeAtomicIo>,
+        generation: u64,
+        tv_sec: u32,
+        sequence: u32,
+    ) -> Option<DisplayedFlip> {
+        presenter.io.waits.push_back(AtomicWaitReady::Ready {
+            drm: true,
+            cancel: false,
+        });
+        presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec,
+            tv_usec: 250_000,
+            sequence,
+            ..matching_flip(generation)
+        }]);
+        assert_eq!(
+            presenter.present(
+                ScanoutSlotId(0),
+                generation,
+                PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+            ),
+            Ok(PresentOutcome::Displayed)
+        );
+        presenter.take_displayed_timestamp()
+    }
+
+    #[test]
+    fn displayed_flip_keeps_the_vblank_sequence_and_the_monotonic_stamp() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        let flip = present_one_flip(&mut presenter, 7, 5, 41).expect("displayed");
+        assert_eq!((flip.seconds, flip.nanoseconds), (5, 250_000_000));
+        assert_eq!(flip.sequence, 41);
+        assert!(flip.hw_clock);
+        let next = present_one_flip(&mut presenter, 7, 5, 42).expect("displayed");
+        assert_eq!(next.sequence, 42);
+        // Taking the stamp consumes it: nothing is reported twice.
+        assert_eq!(presenter.take_displayed_timestamp(), None);
+    }
+
+    #[test]
+    fn a_flip_that_never_completed_leaves_no_timestamp() {
+        let mut io = FakeAtomicIo::default();
+        // The commit lands, but no matching event arrives before the deadline.
+        io.waits.push_back(AtomicWaitReady::Deadline);
+        let mut presenter = presenter(io);
+        assert!(
+            presenter
+                .present(
+                    ScanoutSlotId(0),
+                    7,
+                    PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                )
+                .is_err()
+        );
+        assert_eq!(presenter.take_displayed_timestamp(), None);
+    }
+
+    #[test]
+    fn a_realtime_flip_clock_is_converted_and_never_claims_hw_clock() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        presenter.set_flip_clock(PageFlipClock::Realtime);
+        let realtime = clock_now(libc::CLOCK_REALTIME);
+        let before = clock_now(libc::CLOCK_MONOTONIC);
+        let flip = present_one_flip(
+            &mut presenter,
+            7,
+            // A whole second back, so the stamp is surely in the past.
+            u32::try_from(realtime.as_secs() - 1).expect("realtime fits the kernel field"),
+            9,
+        )
+        .expect("displayed");
+        let after = clock_now(libc::CLOCK_MONOTONIC);
+        let time = Duration::new(flip.seconds, flip.nanoseconds);
+        assert!(!flip.hw_clock);
+        assert_eq!(flip.sequence, 9);
+        // The stamp is 0.75-1.75 s before `realtime`, so on MONOTONIC it is
+        // that far before the sampled window, give or take the test's run time.
+        assert!(
+            time + Duration::from_millis(700) <= after,
+            "{time:?} not converted (after {after:?})"
+        );
+        assert!(
+            time + Duration::from_secs(3) >= before,
+            "{time:?} too far before {before:?}"
+        );
+    }
+
+    #[test]
+    fn a_monotonic_stamp_from_the_future_demotes_the_clock_for_good() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        let flip = present_one_flip(&mut presenter, 7, u32::MAX, 1).expect("displayed");
+        assert!(!flip.hw_clock);
+        assert!(flip.seconds < u64::from(u32::MAX));
+        // A later, plausible stamp is no longer trusted either.
+        let next = present_one_flip(&mut presenter, 7, 5, 2).expect("displayed");
+        assert!(!next.hw_clock);
+    }
+
+    #[test]
+    fn flip_time_placement_rules() {
+        let secs = Duration::from_secs;
+        assert_eq!(
+            flip_time_on_monotonic(PageFlipClock::Monotonic, secs(90), secs(5000), secs(100)),
+            (secs(90), true)
+        );
+        assert_eq!(
+            flip_time_on_monotonic(PageFlipClock::Monotonic, secs(101), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        // REALTIME 4990 is 10 s old at REALTIME 5000, so MONOTONIC 90.
+        assert_eq!(
+            flip_time_on_monotonic(PageFlipClock::Realtime, secs(4990), secs(5000), secs(100)),
+            (secs(90), false)
+        );
+        // Older than boot, or from a clock stepped backwards: not placeable.
+        assert_eq!(
+            flip_time_on_monotonic(PageFlipClock::Realtime, secs(1), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        assert_eq!(
+            flip_time_on_monotonic(PageFlipClock::Realtime, secs(5001), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        assert_eq!(
+            flip_time_on_monotonic(PageFlipClock::Unknown, secs(90), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        assert_eq!(
+            PageFlipClock::from_capability(Ok(1)),
+            PageFlipClock::Monotonic
+        );
+        assert_eq!(
+            PageFlipClock::from_capability(Ok(0)),
+            PageFlipClock::Realtime
+        );
+        assert_eq!(
+            PageFlipClock::from_capability(Err(io::Error::from_raw_os_error(libc::EINVAL))),
+            PageFlipClock::Unknown
+        );
+    }
+
+    #[test]
+    fn refresh_period_comes_from_the_scanned_out_mode() {
+        let presenter = presenter(FakeAtomicIo::default());
+        let millihz = u64::from(selection().mode.refresh_millihz);
+        assert!(millihz > 0);
+        assert_eq!(presenter.refresh_nanos(), Some(1_000_000_000_000 / millihz));
     }
 
     fn matching_flip(generation: u64) -> AtomicPageFlip {
         AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation,
@@ -2500,6 +2782,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2530,6 +2813,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2602,6 +2886,7 @@ mod tests {
             vec![AtomicPageFlip {
                 tv_sec: 0,
                 tv_usec: 0,
+                sequence: 0,
                 crtc_id: 999,
                 tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                     generation: 7,
@@ -2666,6 +2951,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2701,6 +2987,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2710,6 +2997,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2745,6 +3033,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2821,6 +3110,7 @@ mod tests {
         stale.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2878,6 +3168,7 @@ mod tests {
         presenter.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -3035,6 +3326,7 @@ mod tests {
         presenter.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -3063,6 +3355,7 @@ mod tests {
         presenter.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Disable),
         }]);
@@ -3123,12 +3416,14 @@ mod tests {
                 AtomicPageFlip {
                     tv_sec: 0,
                     tv_usec: 0,
+                    sequence: 1,
                     crtc_id: 202,
                     tag: Some(AtomicPageFlipTag::Presentation(second)),
                 },
                 AtomicPageFlip {
                     tv_sec: 0,
                     tv_usec: 0,
+                    sequence: 2,
                     crtc_id: 101,
                     tag: Some(AtomicPageFlipTag::Presentation(first)),
                 },
@@ -3147,12 +3442,14 @@ mod tests {
         let first = AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 101,
             tag: Some(AtomicPageFlipTag::Disable),
         };
         let second = AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 202,
             tag: Some(AtomicPageFlipTag::Disable),
         };

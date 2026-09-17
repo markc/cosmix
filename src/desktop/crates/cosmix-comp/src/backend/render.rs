@@ -415,10 +415,18 @@ pub(crate) struct AcquiredOutputFrame {
     pub(crate) presentation_timestamp: Arc<Mutex<Option<KmsPresentationTimestamp>>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What the kernel reported for one displayed flip.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct KmsPresentationTimestamp {
+    /// CLOCK_MONOTONIC.
     pub(crate) seconds: u64,
     pub(crate) nanoseconds: u32,
+    /// The CRTC's vblank counter at the flip.
+    pub(crate) sequence: u64,
+    /// The time is the kernel's own CLOCK_MONOTONIC flip stamp.
+    pub(crate) hw_clock: bool,
+    /// The scanned-out mode's refresh period; 0 when unknown.
+    pub(crate) refresh_nanos: u64,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -509,6 +517,9 @@ pub(crate) enum KmsRenderFrameEvent {
         pipeline_readiness: Option<crate::render_pipeline_readiness::PipelineReadinessSnapshot>,
         timestamp: KmsPresentationTimestamp,
         security_epochs: Vec<u64>,
+        /// What this displayed frame contained, for `wp_presentation`; None
+        /// when the scene records no content (first-light).
+        content: Option<crate::protocol::presentation::FrameContent>,
     },
     PresentationCancelled {
         generation: u64,
@@ -2407,6 +2418,7 @@ enum PumpCommand {
         initial_commands: Vec<super::kms::KmsRenderCommand>,
         topology_client: crate::protocol::KmsTopologyClient,
         scene_feed: Option<Box<ClientSceneFeed>>,
+        frame_reporter: Option<crate::protocol::FramePresentationReporter>,
     },
     PollRegistration,
     Update(LiveUpdateToken),
@@ -2732,6 +2744,7 @@ impl LiveRenderPump {
         initial_commands: Vec<super::kms::KmsRenderCommand>,
         topology_client: crate::protocol::KmsTopologyClient,
         scene_feed: Option<ClientSceneFeed>,
+        frame_reporter: Option<crate::protocol::FramePresentationReporter>,
     ) -> Result<(), super::kms_live::KmsLiveError> {
         self.nominal_refresh_interval =
             nominal_refresh_interval(output.display.mode.refresh_millihz);
@@ -2741,6 +2754,7 @@ impl LiveRenderPump {
             initial_commands,
             topology_client,
             scene_feed: scene_feed.map(Box::new),
+            frame_reporter,
         })
     }
 
@@ -3087,6 +3101,7 @@ fn run_live_render_pump(
                 initial_commands,
                 topology_client,
                 scene_feed,
+                frame_reporter,
             } => {
                 let mut starting_app = app.take().expect("live render App starts once");
                 let logical_extent = (
@@ -3104,6 +3119,11 @@ fn run_live_render_pump(
                 ) {
                     send_pump_reply(&coordinator, PumpReply::Started(Err(error)))?;
                     return Ok(());
+                }
+                if let Some(reporter) = frame_reporter {
+                    // Content sources register through it; presented frames
+                    // go back through the coordinator.
+                    starting_app.insert_resource(reporter);
                 }
                 let result = LiveRenderEngine::start(
                     starting_app,
@@ -4101,10 +4121,14 @@ impl LiveAtomicOwnership {
                         let outcome = state.presenter.present(slot, generation, deadline);
                         drop(trace);
                         if matches!(outcome, Ok(PresentOutcome::Displayed)) {
+                            let refresh_nanos = state.presenter.refresh_nanos().unwrap_or(0);
                             let timestamp = state.presenter.take_displayed_timestamp().map(
-                                |(seconds, nanoseconds)| KmsPresentationTimestamp {
-                                    seconds,
-                                    nanoseconds,
+                                |flip| KmsPresentationTimestamp {
+                                    seconds: flip.seconds,
+                                    nanoseconds: flip.nanoseconds,
+                                    sequence: u64::from(flip.sequence),
+                                    hw_clock: flip.hw_clock,
+                                    refresh_nanos,
                                 },
                             );
                             *reported_timestamp
@@ -5859,6 +5883,8 @@ fn present_output_frames(
     security_presentations: Option<bevy::prelude::Res<NestedSecurityPresentation>>,
     capture_reporter: Option<bevy::prelude::Res<crate::capture::CaptureReporterBridge>>,
     assets: Option<bevy::prelude::Res<crate::render_asset_readiness::AssetPreparationStatus>>,
+    content: Option<bevy::prelude::Res<crate::frame_content::RenderFrameContent>>,
+    mut sources: Option<bevy::prelude::ResMut<crate::content_source::ExtractedContentSources>>,
 ) {
     if targets.lifecycle.state() != KmsRenderLifecycleState::Active {
         return;
@@ -5888,7 +5914,39 @@ fn present_output_frames(
         &extracted,
         security_presentations.as_deref(),
         capture_reporter.as_deref(),
+        FrameContentReport {
+            // Written views render this update's scene, so this update's
+            // content record is what each displayed flip shows.
+            content: content.map(|content| content.0.clone()),
+            sources: sources.as_deref_mut(),
+        },
     );
+}
+
+/// This update's content record, handed to displayed flips.
+#[derive(Default)]
+struct FrameContentReport<'a> {
+    content: Option<crate::protocol::presentation::FrameContent>,
+    sources: Option<&'a mut crate::content_source::ExtractedContentSources>,
+}
+
+impl FrameContentReport<'_> {
+    /// The content for one displayed flip. The content sources' accumulated
+    /// costs go with the first flip only, so a second output cannot count
+    /// them again, and are then consumed.
+    fn take_for_flip(&mut self) -> Option<crate::protocol::presentation::FrameContent> {
+        let content = self.content.as_mut()?;
+        let report = content.clone();
+        for source in &mut content.sources {
+            source.upload_bytes = 0;
+            source.damage_px = 0;
+            source.consumed_input = None;
+        }
+        if let Some(sources) = self.sources.as_deref_mut() {
+            sources.consume();
+        }
+        Some(report)
+    }
 }
 
 /// Bevy's final output pass is demand-driven: if no render node consumes an
@@ -6255,6 +6313,7 @@ fn present_selected_output_frames(
     extracted: &[ExtractedOutputView],
     security_presentations: Option<&NestedSecurityPresentation>,
     capture_reporter: Option<&crate::capture::CaptureReporterBridge>,
+    mut content: FrameContentReport<'_>,
 ) {
     let presenters = select_written_presenters(&mut targets.sources, extracted);
     let frame_events = targets.frame_events.clone();
@@ -6333,6 +6392,7 @@ fn present_selected_output_frames(
                     pipeline_readiness: targets.pipeline_readiness,
                     timestamp,
                     security_epochs,
+                    content: content.take_for_flip(),
                 })
             }
             Ok(PresentOutcome::Cancelled) => {
@@ -6930,6 +6990,7 @@ pub(crate) mod tests {
                             KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: frame_driver_view(
@@ -9326,6 +9387,7 @@ pub(crate) mod tests {
                             KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: wrong_view.clone(),
@@ -9419,6 +9481,7 @@ pub(crate) mod tests {
                             KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: view.clone(),
@@ -9463,6 +9526,7 @@ pub(crate) mod tests {
             }],
             Some(&security_presentations),
             None,
+            FrameContentReport::default(),
         );
 
         assert!(presented.load(Ordering::SeqCst));
@@ -9487,8 +9551,10 @@ pub(crate) mod tests {
                 timestamp: KmsPresentationTimestamp {
                     seconds: 1,
                     nanoseconds: 2,
+                    ..Default::default()
                 },
                 security_epochs: vec![73],
+                content: None,
             }
         );
         assert!(security_presentations.snapshot().is_empty());
@@ -9523,6 +9589,7 @@ pub(crate) mod tests {
                             KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: view.clone(),
@@ -9569,6 +9636,7 @@ pub(crate) mod tests {
             }],
             Some(&security_presentations),
             None,
+            FrameContentReport::default(),
         );
 
         assert_eq!(
@@ -9618,6 +9686,150 @@ pub(crate) mod tests {
         );
     }
 
+    /// An already-acquired frame whose present ends in `outcome`. Like the
+    /// production presenter, only a completed flip leaves a kernel stamp.
+    fn flip_source(handle: u64, outcome: PresentOutcome) -> OutputFrameSource {
+        let stamp = Arc::new(Mutex::new(None));
+        let flipped = Arc::clone(&stamp);
+        let displayed = matches!(outcome, PresentOutcome::Displayed);
+        OutputFrameSource {
+            next_frame_token: 1,
+            pending_frame_token: Some(1),
+            pending_scene_revision: None,
+            pending_capture_presentations: Vec::new(),
+            pending_presentation_timestamp: Some(stamp),
+            generation: 5,
+            handle: ManualTextureViewHandle(handle),
+            extent: (320, 240),
+            acquire: Box::new(
+                || -> Result<AcquiredOutputFrame, KmsRenderPlatformFailure> {
+                    panic!("the frame is already acquired")
+                },
+            ),
+            ready_generation: Some(5),
+            current_ready_generation: Some(5),
+            pending_present: Some(fallible_present_output_frame(move |_| {
+                if displayed {
+                    *flipped.lock().expect("stamp lock") = Some(KmsPresentationTimestamp {
+                        seconds: 4,
+                        nanoseconds: 8,
+                        sequence: 77,
+                        hw_clock: true,
+                        refresh_nanos: 16_666_666,
+                    });
+                }
+                Ok(outcome)
+            })),
+            pending_security_presentations: Vec::new(),
+            pending_resume_first_flip: None,
+        }
+    }
+
+    fn written_view(key: &OutputKey, handle: u64) -> ExtractedOutputView {
+        ExtractedOutputView {
+            key: key.clone(),
+            generation: 5,
+            handle: ManualTextureViewHandle(handle),
+            ready: true,
+            written: true,
+        }
+    }
+
+    #[test]
+    fn only_a_completed_flip_carries_frame_content_and_consumes_source_costs() {
+        let key = blocked_output().key;
+        let mut second_key = key.clone();
+        second_key.connector_name.push_str("-2");
+        let content = crate::protocol::presentation::FrameContent {
+            sources: vec![crate::protocol::presentation::FrameSource {
+                id: "probe".into(),
+                revision: 3,
+                shown: true,
+                upload_bytes: 40,
+                damage_px: 9,
+                consumed_input: Some(2),
+            }],
+            ..Default::default()
+        };
+        let mut sources = crate::content_source::ExtractedContentSources(content.sources.clone());
+        let deadline = PresentDeadline::bounded(Instant::now() + Duration::from_secs(1));
+
+        // A frame that never flipped reports no content and keeps the costs.
+        let (sender, events) = mpsc::channel();
+        let mut targets = KmsRenderTargets::new(deadline);
+        targets.frame_events = Some(sender);
+        targets
+            .sources
+            .insert(key.clone(), flip_source(90, PresentOutcome::Cancelled));
+        present_selected_output_frames(
+            &mut targets,
+            &[written_view(&key, 90)],
+            None,
+            None,
+            FrameContentReport {
+                content: Some(content.clone()),
+                sources: Some(&mut sources),
+            },
+        );
+        assert!(matches!(
+            events.try_iter().collect::<Vec<_>>().as_slice(),
+            [KmsRenderFrameEvent::PresentationCancelled { .. }]
+        ));
+        assert_eq!(sources.0, content.sources);
+
+        // Two outputs flip: each carries the content, the costs go once.
+        let (sender, events) = mpsc::channel();
+        let mut targets = KmsRenderTargets::new(deadline);
+        targets.frame_events = Some(sender);
+        targets
+            .sources
+            .insert(key.clone(), flip_source(91, PresentOutcome::Displayed));
+        targets
+            .sources
+            .insert(second_key.clone(), flip_source(92, PresentOutcome::Displayed));
+        present_selected_output_frames(
+            &mut targets,
+            &[written_view(&key, 91), written_view(&second_key, 92)],
+            None,
+            None,
+            FrameContentReport {
+                content: Some(content.clone()),
+                sources: Some(&mut sources),
+            },
+        );
+        let reported = events
+            .try_iter()
+            .map(|event| match event {
+                KmsRenderFrameEvent::FrameSubmitted {
+                    key,
+                    timestamp,
+                    content,
+                    ..
+                } => (key, timestamp, content),
+                other => panic!("unexpected frame event {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let mut costless = content.clone();
+        costless.sources[0].upload_bytes = 0;
+        costless.sources[0].damage_px = 0;
+        costless.sources[0].consumed_input = None;
+        let stamp = KmsPresentationTimestamp {
+            seconds: 4,
+            nanoseconds: 8,
+            sequence: 77,
+            hw_clock: true,
+            refresh_nanos: 16_666_666,
+        };
+        assert_eq!(
+            reported,
+            vec![
+                (key, stamp, Some(content)),
+                (second_key, stamp, Some(costless.clone())),
+            ]
+        );
+        assert_eq!(sources.0, costless.sources);
+    }
+
     #[test]
     fn authority_class_present_failure_is_reply_carried_without_stopping_worker() {
         let output = blocked_output();
@@ -9659,6 +9871,7 @@ pub(crate) mod tests {
                             KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: view.clone(),
@@ -9694,6 +9907,7 @@ pub(crate) mod tests {
             }],
             None,
             None,
+            FrameContentReport::default(),
         );
 
         let failure = match frame_events
@@ -10054,6 +10268,7 @@ pub(crate) mod tests {
                             KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: view.clone(),
@@ -10096,6 +10311,7 @@ pub(crate) mod tests {
             }],
             None,
             None,
+            FrameContentReport::default(),
         );
         world.run_system_once(acquire_output_frames).unwrap();
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 0);
@@ -10111,6 +10327,7 @@ pub(crate) mod tests {
             }],
             None,
             None,
+            FrameContentReport::default(),
         );
         world.run_system_once(acquire_output_frames).unwrap();
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 0);
@@ -10139,6 +10356,7 @@ pub(crate) mod tests {
                 }],
                 None,
                 None,
+                FrameContentReport::default(),
             );
             world.run_system_once(acquire_output_frames).unwrap();
         }
@@ -10158,6 +10376,7 @@ pub(crate) mod tests {
             }],
             None,
             None,
+            FrameContentReport::default(),
         );
 
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 1);
@@ -10176,8 +10395,10 @@ pub(crate) mod tests {
                 timestamp: KmsPresentationTimestamp {
                     seconds: 1,
                     nanoseconds: 2,
+                    ..Default::default()
                 },
                 security_epochs: Vec::new(),
+                content: None,
             }
         );
     }
@@ -10501,6 +10722,7 @@ pub(crate) mod tests {
                     presentation_timestamp: Arc::new(Mutex::new(Some(KmsPresentationTimestamp {
                         seconds: 1,
                         nanoseconds: 2,
+                        ..Default::default()
                     }))),
                     view: view.clone(),
                     present: Box::new(move || present_barrier.enter_and_wait()),
@@ -10836,7 +11058,13 @@ pub(crate) mod tests {
                 written: true,
             })
             .collect::<Vec<_>>();
-        present_selected_output_frames(&mut targets, &extracted, None, None);
+        present_selected_output_frames(
+            &mut targets,
+            &extracted,
+            None,
+            None,
+            FrameContentReport::default(),
+        );
     }
 
     pub(crate) fn while_worker_teardown_is_blocked(

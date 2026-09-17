@@ -563,7 +563,7 @@ Absent by design after P-1:
 
 The compositor advertises the core compositor, subcompositor, seat, output,
 shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
-presentation-time (nested only, see below), XDG shell and XDG decoration globals needed by its desktop
+presentation-time (see below), XDG shell and XDG decoration globals needed by its desktop
 clients.
 
 | Protocol | Version | Current support |
@@ -573,7 +573,7 @@ clients.
 | `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
 | `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
-| `wp_presentation` | 2 | Nested mode only for now (see Presentation feedback below); the KMS backend does not advertise it until it reports page flips. |
+| `wp_presentation` | 2 | Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below). |
 
 ### Presentation feedback
 
@@ -615,8 +615,25 @@ client waits on feedback nothing will resolve.
   `tv` is CLOCK_MONOTONIC when the frame was handed to the host (not first
   photon), `flags` is 0, `seq` is 0 and `refresh` is 0 (unknown). It is
   reported only after the swapchain image was actually presented.
-- **KMS backend:** not advertised yet. It will report the page-flip time,
-  vblank sequence and the flags the kernel proves.
+- **KMS backend:** advertised in client-content mode (not in
+  `--first-light`, which draws no clients). A frame is reported only
+  after its atomic commit's page-flip event arrived; a cancelled or failed
+  flip reports nothing, and its commits keep waiting.
+  - `tv` is the kernel's page-flip time. At startup comp asks DRM whether
+    those stamps are CLOCK_MONOTONIC (`DRM_CAP_TIMESTAMP_MONOTONIC`). If they
+    are not, each stamp is moved from CLOCK_REALTIME by the offset between
+    the two clocks sampled when the event is read. If the capability query
+    fails, or a claimed MONOTONIC stamp lies in the future (after which the
+    capability is not trusted again), `tv` is the time the event was read.
+  - `flags` are `vsync` (there are no async flips) and `hw_completion` (the
+    flip-complete event), plus `hw_clock` only when `tv` is the kernel's own
+    MONOTONIC stamp. Never `zero_copy`: client buffers are composited into
+    scanout buffers, not scanned out directly.
+  - `seq` is the CRTC's vblank counter at the flip.
+  - `refresh` is the scanned-out mode's period, `1e12 / refresh_mHz` ns.
+  - With several outputs, each flip carries the frame's content and the first
+    presented one wins; content-source costs are counted with the first flip
+    only.
 - **SHM clients:** a surface counts as sampling its newest buffer once the
   GPU image is prepared. Bevy drops the old GPU image while a replacement is
   pending, so a pending upload is reported as not shown rather than stale.
