@@ -27,6 +27,8 @@ iced = { version = "=0.14.0", default-features = false, optional = true, feature
 
 [dev-dependencies]
 iced_runtime = { version = "=0.14.0", default-features = false }
+# The compiler feature, so the rung test can compile every shipped scheme.
+cosmix-design = { path = "../cosmix-design", features = ["compiler"] }
 
 [[example]]
 name = "gallery"

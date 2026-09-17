@@ -78,6 +78,8 @@ Tokens::default()                           // preview palette only
 tokens.text_input(status) -> text_input::Style
 tokens.menu_style() -> MenuStyle
 tokens.audio_style() -> AudioStyle
+tokens.background(rung) -> Color            // 0 window, 1 strip, 2 raised
+tokens::{BACKGROUND_RUNGS, BACKGROUND_NAMES}   // palette.background.1..3
 tokens::colour(LinearRgba) -> iced::Color   // linear -> encoded sRGB
 Tokens { surface, text, popover, popover_text, card, card_text, primary,
          primary_text, destructive, destructive_text, muted_surface,
@@ -208,6 +210,14 @@ Contracts a host must honour:
   mid-drag never jumps. A double-click resets (fader: `default_db`, knob: 0).
   Toggles flip on press. Each change is published at once; hosts that record
   automation or undo should group on `on_release`.
+- **Background rungs.** Draw panels, strips and boards from
+  `tokens.background(rung)`, not from the semantic pairs. The pairs can all
+  resolve to one surface — in Ocean dark, base, card, popover and muted are
+  the same near-black — so a mixer built from them is flat. The rungs are
+  the design's own `palette.background.1..3`, kept in its order: elevation,
+  not brightness, so a dark scheme climbs away from black and a light one
+  away from white. A design missing a rung is rejected rather than
+  flattened. `AudioStyle::background` is rung 1.
 - **Gain taper.** `Fader` and `LevelMeter` share one curve. Give both the
   same `Taper` and their scales line up: the fader's travel and unity tick,
   the meter's zone boundaries (-12 dB and -3 dB), its markers, and the floor
