@@ -1012,3 +1012,140 @@ fn the_ime_caret_is_published_in_both_spaces() {
     // Exactly the UiScale factor apart, which is the double-count this field exists to avoid.
     assert!(close(output_logical.min, ime.cursor.min * ui_scale));
 }
+
+// ---- host ingress (comp's one queue) ----
+
+fn press(key: &str) -> KeyboardInput {
+    KeyboardInput {
+        key_code: KeyCode::KeyA,
+        logical_key: Key::Character(key.into()),
+        state: ButtonState::Pressed,
+        text: Some(key.into()),
+        repeat: false,
+        window: Entity::PLACEHOLDER,
+    }
+}
+
+fn host_key(key: &str, pressed: bool) -> crate::surface::SurfaceEvent {
+    crate::surface::SurfaceEvent::Key {
+        key: crate::surface::Key::Character(key.into()),
+        latin: None,
+        text: pressed.then(|| key.to_owned()),
+        pressed,
+        repeat: false,
+        modifiers: crate::surface::Modifiers::default(),
+    }
+}
+
+#[test]
+fn host_pushed_input_reaches_the_owner_in_order_beside_the_message_path() {
+    use crate::SceneIcedInput;
+    use crate::surface::SurfaceEvent as E;
+    let (mut h, log) = recording();
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(1);
+    assert_eq!(take(&log), vec![E::Focus(true)]);
+
+    // One update carrying both paths: Bevy messages and the host queue.
+    h.app.world_mut().write_message(press("m"));
+    {
+        let mut host = h.app.world_mut().resource_mut::<SceneIcedInput>();
+        host.push(host_key("h1", true));
+        host.push(host_key("h2", true));
+        host.push_to(h.surface, host_key("h3", true));
+    }
+    h.run(1);
+    let events = take(&log);
+    // The message path first, then the host queue in push order: within the
+    // queue the interleave comp sent is preserved exactly.
+    // The message path fills `latin` from the key code; the host names its
+    // own, and this fake host leaves it unset.
+    let from_messages = E::Key {
+        key: crate::surface::Key::Character("m".into()),
+        latin: Some('a'),
+        text: Some("m".into()),
+        pressed: true,
+        repeat: false,
+        modifiers: crate::surface::Modifiers::default(),
+    };
+    assert_eq!(
+        events,
+        vec![
+            from_messages,
+            host_key("h1", true),
+            host_key("h2", true),
+            host_key("h3", true),
+        ]
+    );
+}
+
+#[test]
+fn losing_focus_releases_the_keys_the_surface_believes_are_held() {
+    use crate::surface::SurfaceEvent as E;
+    let (mut h, log) = recording();
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(1);
+    take(&log);
+    h.app.world_mut().write_message(press("a"));
+    h.app.world_mut().write_message(press("b"));
+    h.run(1);
+    assert_eq!(take(&log).len(), 2);
+
+    h.app.world_mut().resource_mut::<InputFocus>().clear();
+    h.run(1);
+    assert_eq!(
+        take(&log),
+        vec![host_key("a", false), host_key("b", false), E::Focus(false)],
+        "both keys are released, then focus goes"
+    );
+
+    // A key released before the focus loss is not released twice.
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(1);
+    h.app.world_mut().write_message(press("c"));
+    h.run(1);
+    h.app.world_mut().write_message(KeyboardInput {
+        state: ButtonState::Released,
+        ..press("c")
+    });
+    h.run(1);
+    take(&log);
+    h.app.world_mut().resource_mut::<InputFocus>().clear();
+    h.run(1);
+    assert_eq!(take(&log), vec![E::Focus(false)]);
+}
+
+#[test]
+fn a_dropped_batch_clears_the_composition_and_repaints() {
+    use crate::SceneIcedInput;
+    use crate::surface::{ImeEvent, SurfaceEvent as E};
+    let (mut h, log) = recording();
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(2);
+    take(&log);
+    let before = h.totals();
+    h.app
+        .world_mut()
+        .resource_mut::<SceneIcedInput>()
+        .note_dropped(h.surface, 7);
+    h.run(2);
+    assert_eq!(take(&log), vec![E::Ime(ImeEvent::Disabled)]);
+    assert_eq!(h.totals().dropped - before.dropped, 7);
+    // The surface repaints in full, because its model may be behind.
+    assert_eq!(
+        h.app.world().resource::<SceneIcedCounters>().last_rects,
+        vec![Rect::new(0, 0, 200, 100)]
+    );
+}

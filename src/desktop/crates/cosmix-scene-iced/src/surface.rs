@@ -76,6 +76,10 @@ pub struct Modifiers {
     pub control: bool,
     pub alt: bool,
     pub logo: bool,
+    /// Lock states, which a host that carries its own seat modifiers can
+    /// report; a host reading them from `ButtonInput` leaves them false.
+    pub caps_lock: bool,
+    pub num_lock: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

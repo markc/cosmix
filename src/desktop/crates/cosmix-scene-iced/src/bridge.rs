@@ -69,6 +69,10 @@ pub(crate) struct SurfaceState {
     size: UVec2,
     scale: f32,
     events: Vec<SurfaceEvent>,
+    /// Keys forwarded as pressed and not yet released. On a focus loss the
+    /// seat's own releases go to whoever holds the keyboard now, so the
+    /// bridge has to release them itself.
+    held: Vec<Key>,
     hovered: bool,
     repaint: bool,
     last: Processed,
@@ -148,6 +152,45 @@ pub struct ImeOutput {
     pub cursor_physical: bevy::math::Rect,
 }
 
+/// Input from a host that does not speak Bevy's messages: comp delivers
+/// keys, IME and focus on ONE queue in arrival order (`NativeInput`), and a
+/// message per kind would split that stream into two typed ones and lose the
+/// interleave. A single queue drained in push order keeps it.
+///
+/// `push` targets whichever surface holds focus when the queue is drained;
+/// `push_to` names one. Both are read by `route_keyboard`, after this
+/// update's Bevy messages.
+#[derive(Resource, Default)]
+pub struct SceneIcedInput {
+    queued: Vec<(Option<Entity>, Ingress)>,
+}
+
+#[derive(Clone, Debug)]
+enum Ingress {
+    Event(SurfaceEvent),
+    /// The host's queue overflowed: this many events never arrived.
+    Dropped(u64),
+}
+
+impl SceneIcedInput {
+    /// Deliver to the focused surface.
+    pub fn push(&mut self, event: SurfaceEvent) {
+        self.queued.push((None, Ingress::Event(event)));
+    }
+
+    /// Deliver to one surface, whatever holds focus.
+    pub fn push_to(&mut self, surface: Entity, event: SurfaceEvent) {
+        self.queued.push((Some(surface), Ingress::Event(event)));
+    }
+
+    /// The host lost `events` before they reached the bridge. The surface's
+    /// model may be behind, so its next frame repaints in full and any open
+    /// composition is cleared: a dropped batch may have carried its end.
+    pub fn note_dropped(&mut self, surface: Entity, events: u64) {
+        self.queued.push((Some(surface), Ingress::Dropped(events)));
+    }
+}
+
 /// Keyboard focus and IME state of the iced surfaces.
 ///
 /// `owner` is the surface holding Bevy's `InputFocus`. Keyboard input and
@@ -174,6 +217,8 @@ pub struct FrameCounters {
     pub own_added: u64,
     pub own_modified: u64,
     pub allocations: u64,
+    /// Input events a host lost before they reached the bridge.
+    pub dropped: u64,
     /// Surface size changes served by the existing texture.
     pub resizes: u64,
     pub draws: u64,
@@ -191,6 +236,7 @@ impl FrameCounters {
         self.own_added += other.own_added;
         self.own_modified += other.own_modified;
         self.allocations += other.allocations;
+        self.dropped += other.dropped;
         self.resizes += other.resizes;
         self.draws += other.draws;
         self.rects_queued += other.rects_queued;
@@ -206,6 +252,7 @@ impl FrameCounters {
             "own_added": self.own_added,
             "own_modified": self.own_modified,
             "allocations": self.allocations,
+            "dropped": self.dropped,
             "resizes": self.resizes,
             "draws": self.draws,
             "rects_queued": self.rects_queued,
@@ -443,6 +490,7 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
             size: UVec2::ZERO,
             scale: 0.0,
             events: Vec::new(),
+            held: Vec::new(),
             hovered: false,
             repaint: false,
             last: Processed::default(),
@@ -709,6 +757,7 @@ fn convert_button(button: BevyButton) -> Option<PointerButton> {
 /// Quoin's and the layer host's own handlers, and any global shortcut system.
 /// CTK text fields act only on keys while they hold `InputFocus`, which they
 /// cannot while a surface does, so text never reaches both.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn route_keyboard(
     mut keys: MessageReader<KeyboardInput>,
     mut ime: MessageReader<ExternalImeEvent>,
@@ -716,6 +765,8 @@ pub(crate) fn route_keyboard(
     buttons: Option<Res<ButtonInput<KeyCode>>>,
     mut surfaces: Query<(&IcedSurface, &mut SurfaceState)>,
     mut focus: ResMut<SceneIcedFocus>,
+    mut host: ResMut<SceneIcedInput>,
+    mut counters: ResMut<SceneIcedCounters>,
 ) {
     let current = input_focus
         .and_then(|focus| focus.get())
@@ -724,6 +775,17 @@ pub(crate) fn route_keyboard(
         if let Some(old) = focus.owner
             && let Ok((_, mut state)) = surfaces.get_mut(old)
         {
+            // The seat's own releases go to whoever holds the keyboard now.
+            for key in std::mem::take(&mut state.held) {
+                state.events.push(SurfaceEvent::Key {
+                    key,
+                    latin: None,
+                    text: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                });
+            }
             state.events.push(SurfaceEvent::Focus(false));
         }
         focus.scene = None;
@@ -749,11 +811,14 @@ pub(crate) fn route_keyboard(
         logo: b.any_pressed([KeyCode::SuperLeft, KeyCode::SuperRight]),
     });
     for input in keys.read() {
+        let key = convert_key(&input.logical_key);
+        let pressed = input.state == ButtonState::Pressed;
+        hold(&mut state.held, &key, pressed);
         state.events.push(SurfaceEvent::Key {
-            key: convert_key(&input.logical_key),
+            key,
             latin: latin(input.key_code),
             text: input.text.as_ref().map(ToString::to_string),
-            pressed: input.state == ButtonState::Pressed,
+            pressed,
             repeat: input.repeat,
             modifiers,
         });
@@ -771,6 +836,54 @@ pub(crate) fn route_keyboard(
             ExternalImeKind::Enabled | ExternalImeKind::DeleteSurrounding { .. } => continue,
         };
         state.events.push(SurfaceEvent::Ime(event));
+    }
+    drop(state);
+    for (target, ingress) in std::mem::take(&mut host.queued) {
+        let Some(target) = target.or(owner) else {
+            continue;
+        };
+        let Ok((_, mut state)) = surfaces.get_mut(target) else {
+            continue;
+        };
+        match ingress {
+            Ingress::Event(event) => {
+                if let SurfaceEvent::Key { key, pressed, .. } = &event {
+                    hold(&mut state.held, key, *pressed);
+                }
+                if event == SurfaceEvent::Focus(false) {
+                    for key in std::mem::take(&mut state.held) {
+                        state.events.push(SurfaceEvent::Key {
+                            key,
+                            latin: None,
+                            text: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: Modifiers::default(),
+                        });
+                    }
+                }
+                state.events.push(event);
+            }
+            Ingress::Dropped(events) => {
+                counters.current.dropped += events;
+                // The model may be behind, and a dropped batch can have
+                // carried the end of a composition.
+                state.events.push(SurfaceEvent::Ime(ImeEvent::Disabled));
+                state.repaint = true;
+            }
+        }
+    }
+}
+
+/// Track what the surface believes is held, so a focus loss can release it.
+fn hold(held: &mut Vec<Key>, key: &Key, pressed: bool) {
+    let at = held.iter().position(|held| held == key);
+    match (pressed, at) {
+        (true, None) => held.push(key.clone()),
+        (false, Some(at)) => {
+            held.remove(at);
+        }
+        _ => {}
     }
 }
 

@@ -24,8 +24,8 @@ use cosmix_shell::runtime::{CursorShapeRequest, ExternalImeEvent};
 
 pub use bridge::{
     FrameCounters, IcedSurface, IcedSurfaceGeometry, ImeOutput, RendererFactory, SceneIcedCounters,
-    SceneIcedFactory, SceneIcedFocus, SceneIcedStats, SceneIcedWake, SceneIcedWakeHook,
-    SceneIcedWaker, scales,
+    SceneIcedFactory, SceneIcedFocus, SceneIcedInput, SceneIcedStats, SceneIcedWake,
+    SceneIcedWakeHook, SceneIcedWaker, scales,
 };
 
 /// The `adapter` argument of `shell.scene.load` that selects this adapter.
@@ -53,6 +53,7 @@ impl Plugin for SceneIcedPlugin {
             .init_resource::<bridge::Mounts>()
             .init_resource::<SceneIcedCounters>()
             .init_resource::<SceneIcedFocus>()
+            .init_resource::<SceneIcedInput>()
             .init_resource::<SceneIcedWake>()
             .init_resource::<SceneIcedWaker>()
             .add_systems(First, bridge::roll_counters)
